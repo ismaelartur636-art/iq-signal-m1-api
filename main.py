@@ -530,6 +530,9 @@ def calculate_signal(
         "reference_candle": reference,
         "next_candle": next_candle
     }
+    
+
+HTML_PAGE = """
 <script>
 
 async function getSignal() {
