@@ -643,7 +643,6 @@ data.next ??
 "--";
 
 }
-}
 
 function formatNumber(value) {
 
