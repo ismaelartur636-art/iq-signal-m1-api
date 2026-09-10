@@ -3,20 +3,22 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
 
+# =========================================================
+# CONFIGURAÇÃO
+# =========================================================
+
 app = FastAPI(
     title="Ismael Trade",
-    version="6.0.0"
+    version="7.0.0"
 )
-
 
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 URL = "https://api.twelvedata.com/time_series"
-
 
 ALLOWED_INTERVALS = {
     "1min",
@@ -24,7 +26,6 @@ ALLOWED_INTERVALS = {
     "15min",
     "30min"
 }
-
 
 ASSETS = [
     "EUR/USD",
@@ -42,7 +43,11 @@ ASSETS = [
 ]
 
 
-HTML_PAGE = """
+# =========================================================
+# HTML
+# =========================================================
+
+HTML_PAGE = r"""
 <!DOCTYPE html>
 <html lang="pt-BR">
 
@@ -51,7 +56,7 @@ HTML_PAGE = """
 <meta charset="UTF-8">
 
 <meta name="viewport"
-content="width=device-width, initial-scale=1">
+      content="width=device-width, initial-scale=1">
 
 <title>Ismael Trade</title>
 
@@ -63,36 +68,38 @@ content="width=device-width, initial-scale=1">
 
 body {
     margin: 0;
-    font-family: Arial, sans-serif;
-    background: #080d18;
+    font-family: Arial, Helvetica, sans-serif;
+    background: #070b14;
     color: white;
 }
 
 .container {
-    max-width: 560px;
+    width: 100%;
+    max-width: 620px;
     margin: auto;
-    padding: 18px;
+    padding: 15px;
 }
 
 .title {
     text-align: center;
-    font-size: 32px;
-    font-weight: bold;
+    font-size: 30px;
+    font-weight: 900;
     margin-top: 10px;
+    letter-spacing: 1px;
 }
 
 .subtitle {
     text-align: center;
     color: #94a3b8;
-    margin: 5px 0 20px;
+    margin: 5px 0 18px;
 }
 
 .card {
     background: #111827;
     border-radius: 18px;
-    padding: 18px;
+    padding: 17px;
     margin-bottom: 15px;
-    box-shadow: 0 5px 20px rgba(0,0,0,.25);
+    box-shadow: 0 5px 22px rgba(0,0,0,.25);
 }
 
 label {
@@ -105,11 +112,11 @@ label {
 select,
 button {
     width: 100%;
-    padding: 14px;
     border: 0;
     border-radius: 12px;
+    padding: 14px;
     font-size: 16px;
-    margin-bottom: 15px;
+    margin-bottom: 12px;
 }
 
 select {
@@ -124,11 +131,23 @@ button {
     cursor: pointer;
 }
 
+button:active {
+    transform: scale(.99);
+}
+
+.secondary {
+    background: #334155;
+}
+
+.danger {
+    background: #7f1d1d;
+}
+
 .signal {
     text-align: center;
-    font-size: 42px;
-    font-weight: bold;
-    padding: 24px;
+    font-size: 44px;
+    font-weight: 900;
+    padding: 25px 10px;
     border-radius: 15px;
     background: #1e293b;
 }
@@ -148,7 +167,9 @@ button {
 .info {
     display: flex;
     justify-content: space-between;
-    padding: 10px 0;
+    align-items: center;
+    gap: 10px;
+    padding: 11px 0;
     border-bottom: 1px solid #273449;
 }
 
@@ -158,27 +179,85 @@ button {
 
 .value {
     font-weight: bold;
+    text-align: right;
+}
+
+.stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+}
+
+.stat {
+    background: #1e293b;
+    border-radius: 14px;
+    padding: 14px 6px;
+    text-align: center;
+}
+
+.stat-title {
+    color: #94a3b8;
+    font-size: 12px;
+    margin-bottom: 8px;
+}
+
+.stat-value {
+    font-size: 25px;
+    font-weight: 900;
+}
+
+.win {
+    color: #22c55e;
+}
+
+.loss {
+    color: #ef4444;
+}
+
+.accuracy {
+    color: #38bdf8;
+}
+
+.params-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.params-title {
+    font-size: 18px;
+    font-weight: bold;
+}
+
+.toggle {
+    width: auto;
+    padding: 9px 12px;
+    margin: 0;
+    font-size: 13px;
+    background: #475569;
 }
 
 .loading {
+    display: none;
     text-align: center;
     color: #60a5fa;
-    display: none;
-    margin-top: 5px;
+    margin: 8px 0;
 }
 
 .warning {
-    font-size: 12px;
     color: #94a3b8;
+    font-size: 12px;
     line-height: 1.6;
     text-align: center;
 }
 
 .time {
     text-align: center;
-    color: #94a3b8;
-    font-size: 13px;
-    margin-bottom: 10px;
+    color: #64748b;
+    font-size: 12px;
+    margin: 8px 0 15px;
 }
 
 .assetrow {
@@ -202,301 +281,485 @@ button {
     color: #facc15;
 }
 
-.rowtitle {
+.status {
+    text-align: center;
+    padding: 10px;
+    border-radius: 10px;
+    background: #0f172a;
+    color: #94a3b8;
+    font-size: 13px;
+}
+
+.result-box {
+    text-align: center;
+    padding: 14px;
+    border-radius: 12px;
+    background: #0f172a;
     font-weight: bold;
-    margin-bottom: 10px;
+}
+
+@media (max-width: 420px) {
+
+    .title {
+        font-size: 26px;
+    }
+
+    .signal {
+        font-size: 38px;
+    }
+
+    .stat-value {
+        font-size: 21px;
+    }
+
 }
 
 </style>
 
 </head>
 
+
 <body>
 
 <div class="container">
 
-<div class="title">
-ISMAEL TRADE
-</div>
+    <div class="title">
+        ISMAEL TRADE
+    </div>
 
-<div class="subtitle">
-Sistema de análise probabilística
-</div>
+    <div class="subtitle">
+        Sistema de análise probabilística
+    </div>
 
 
-<div class="card">
+    <!-- CONTROLES -->
 
-<label>Ativo</label>
+    <div class="card">
 
-<select id="symbol">
+        <label>Ativo</label>
 
-<option value="ALL">
-TODOS OS ATIVOS
-</option>
+        <select id="symbol">
 
-<option value="EUR/USD">EUR/USD</option>
-<option value="GBP/USD">GBP/USD</option>
-<option value="USD/JPY">USD/JPY</option>
-<option value="AUD/USD">AUD/USD</option>
-<option value="USD/CAD">USD/CAD</option>
-<option value="USD/CHF">USD/CHF</option>
-<option value="NZD/USD">NZD/USD</option>
-<option value="EUR/JPY">EUR/JPY</option>
-<option value="GBP/JPY">GBP/JPY</option>
-<option value="EUR/GBP">EUR/GBP</option>
-<option value="BTC/USD">BTC/USD</option>
-<option value="ETH/USD">ETH/USD</option>
+            <option value="ALL">
+                TODOS OS ATIVOS
+            </option>
 
-</select>
+            <option value="EUR/USD">EUR/USD</option>
+            <option value="GBP/USD">GBP/USD</option>
+            <option value="USD/JPY">USD/JPY</option>
+            <option value="AUD/USD">AUD/USD</option>
+            <option value="USD/CAD">USD/CAD</option>
+            <option value="USD/CHF">USD/CHF</option>
+            <option value="NZD/USD">NZD/USD</option>
+            <option value="EUR/JPY">EUR/JPY</option>
+            <option value="GBP/JPY">GBP/JPY</option>
+            <option value="EUR/GBP">EUR/GBP</option>
+            <option value="BTC/USD">BTC/USD</option>
+            <option value="ETH/USD">ETH/USD</option>
 
+        </select>
 
-<label>
-Tempo gráfico
-</label>
 
-<select id="interval">
+        <label>
+            Tempo gráfico
+        </label>
 
-<option value="1min">
-M1
-</option>
+        <select id="interval">
 
-<option value="5min">
-M5
-</option>
+            <option value="1min">M1</option>
+            <option value="5min">M5</option>
+            <option value="15min">M15</option>
+            <option value="30min">M30</option>
 
-<option value="15min">
-M15
-</option>
+        </select>
 
-<option value="30min">
-M30
-</option>
 
-</select>
+        <button onclick="analisar()">
+            ANALISAR AGORA
+        </button>
 
 
-<button onclick="analisar()">
-ANALISAR AGORA
-</button>
+        <button
+            class="secondary"
+            onclick="toggleParametros()"
+            id="toggleButton">
+            ⚙️ PARÂMETROS: VISÍVEIS
+        </button>
 
 
-<div id="loading"
-class="loading">
+        <button
+            class="danger"
+            onclick="limparEstatisticas()">
+            LIMPAR WIN/LOSS
+        </button>
 
-Analisando mercado...
 
-</div>
+        <div id="loading" class="loading">
+            Analisando mercado...
+        </div>
 
-</div>
+    </div>
 
 
-<div id="singleCard"
-class="card">
+    <!-- SINAL -->
 
-<div id="signal"
-class="signal wait">
+    <div id="singleCard" class="card">
 
-WAIT
+        <div id="signal"
+             class="signal wait">
+            WAIT
+        </div>
 
-</div>
+    </div>
 
-</div>
 
+    <!-- ESTATÍSTICAS -->
 
-<div id="details"
-class="card">
+    <div class="card">
 
-<div class="info">
+        <div class="params-title">
+            📊 RESULTADOS
+        </div>
 
-<span>
-Confiança
-</span>
+        <br>
 
-<span id="confidence"
-class="value">
---
-</span>
+        <div class="stats">
 
-</div>
+            <div class="stat">
 
+                <div class="stat-title">
+                    WIN
+                </div>
 
-<div class="info">
+                <div id="wins"
+                     class="stat-value win">
+                    0
+                </div>
 
-<span>
-EMA 3
-</span>
+            </div>
 
-<span id="ema3"
-class="value">
---
-</span>
 
-</div>
+            <div class="stat">
 
+                <div class="stat-title">
+                    LOSS
+                </div>
 
-<div class="info">
+                <div id="losses"
+                     class="stat-value loss">
+                    0
+                </div>
 
-<span>
-EMA 7
-</span>
+            </div>
 
-<span id="ema7"
-class="value">
---
-</span>
 
-</div>
+            <div class="stat">
 
+                <div class="stat-title">
+                    ASSERTIVIDADE
+                </div>
 
-<div class="info">
+                <div id="accuracy"
+                     class="stat-value accuracy">
+                    --
+                </div>
 
-<span>
-RSI 14
-</span>
+            </div>
 
-<span id="rsi"
-class="value">
---
-</span>
+        </div>
 
-</div>
+    </div>
 
 
-<div class="info">
+    <!-- RESULTADO PENDENTE -->
 
-<span>
-ADX 21
-</span>
+    <div class="card">
 
-<span id="adx21"
-class="value">
---
-</span>
+        <div class="params-title">
+            🎯 ÚLTIMO RESULTADO
+        </div>
 
-</div>
+        <br>
 
+        <div id="lastResult"
+             class="result-box">
+            Aguardando resultado...
+        </div>
 
-<div class="info">
+    </div>
 
-<span>
-ADX 48
-</span>
 
-<span id="adx48"
-class="value">
---
-</span>
+    <!-- PARÂMETROS -->
 
-</div>
+    <div id="parametersCard"
+         class="card">
 
-</div>
+        <div class="params-header">
 
+            <div class="params-title">
+                ⚙️ PARÂMETROS DOS INDICADORES
+            </div>
 
-<div id="referenceCard"
-class="card">
+            <button
+                class="toggle"
+                onclick="toggleParametros()"
+                id="toggleButton2">
+                OCULTAR
+            </button>
 
-<div class="info">
+        </div>
 
-<span>
-Vela de referência
-</span>
 
-<span id="reference"
-class="value">
---
-</span>
+        <div class="info">
 
-</div>
+            <span>EMA 3</span>
 
+            <span id="ema3"
+                  class="value">
+                --
+            </span>
 
-<div class="info">
+        </div>
 
-<span>
-Próxima vela
-</span>
 
-<span id="next"
-class="value">
---
-</span>
+        <div class="info">
 
-</div>
+            <span>EMA 7</span>
 
+            <span id="ema7"
+                  class="value">
+                --
+            </span>
 
-<div class="info">
+        </div>
 
-<span>
-Ativo
-</span>
 
-<span id="asset"
-class="value">
---
-</span>
+        <div class="info">
 
-</div>
+            <span>RSI 14</span>
 
+            <span id="rsi"
+                  class="value">
+                --
+            </span>
 
-<div class="info">
+        </div>
 
-<span>
-Timeframe
-</span>
 
-<span id="tf"
-class="value">
---
-</span>
+        <div class="info">
 
-</div>
+            <span>ADX 21</span>
 
-</div>
+            <span id="adx21"
+                  class="value">
+                --
+            </span>
 
+        </div>
 
-<div id="allCard"
-class="card"
-style="display:none">
 
-<div class="rowtitle">
-Resultado dos ativos
-</div>
+        <div class="info">
 
-<div id="allResults"></div>
+            <span>ADX 48</span>
 
-</div>
+            <span id="adx48"
+                  class="value">
+                --
+            </span>
 
+        </div>
 
-<div class="card">
 
-<div class="warning">
+        <div class="info">
 
-⚠️ O sinal é probabilístico e não garante WIN.
+            <span>CALL SCORE</span>
 
-<br><br>
+            <span id="callScore"
+                  class="value">
+                --
+            </span>
 
-Os preços da Twelve Data podem apresentar
-diferenças em relação aos ativos OTC da IQ Option.
+        </div>
 
-<br><br>
 
-Este sistema não executa operações automaticamente.
+        <div class="info">
 
-</div>
+            <span>PUT SCORE</span>
 
-</div>
+            <span id="putScore"
+                  class="value">
+                --
+            </span>
 
+        </div>
 
-<div class="time"
-id="updated">
+    </div>
 
-Aguardando análise...
 
-</div>
+    <!-- REFERÊNCIA -->
+
+    <div id="referenceCard"
+         class="card">
+
+        <div class="info">
+
+            <span>
+                Vela de referência
+            </span>
+
+            <span id="reference"
+                  class="value">
+                --
+            </span>
+
+        </div>
+
+
+        <div class="info">
+
+            <span>
+                Próxima vela
+            </span>
+
+            <span id="next"
+                  class="value">
+                --
+            </span>
+
+        </div>
+
+
+        <div class="info">
+
+            <span>
+                Entrada
+            </span>
+
+            <span id="entry"
+                  class="value">
+                --
+            </span>
+
+        </div>
+
+
+        <div class="info">
+
+            <span>
+                Expiração
+            </span>
+
+            <span id="expiration"
+                  class="value">
+                1 vela
+            </span>
+
+        </div>
+
+
+        <div class="info">
+
+            <span>
+                Ativo
+            </span>
+
+            <span id="asset"
+                  class="value">
+                --
+            </span>
+
+        </div>
+
+
+        <div class="info">
+
+            <span>
+                Timeframe
+            </span>
+
+            <span id="tf"
+                  class="value">
+                --
+            </span>
+
+        </div>
+
+    </div>
+
+
+    <!-- TODOS OS ATIVOS -->
+
+    <div id="allCard"
+         class="card"
+         style="display:none">
+
+        <div class="params-title">
+            📈 RESULTADO DOS ATIVOS
+        </div>
+
+        <br>
+
+        <div id="allResults"></div>
+
+    </div>
+
+
+    <!-- STATUS -->
+
+    <div class="card">
+
+        <div id="status"
+             class="status">
+            Sistema pronto.
+        </div>
+
+    </div>
+
+
+    <!-- AVISO -->
+
+    <div class="card">
+
+        <div class="warning">
+
+            ⚠️ O sinal é probabilístico e não garante WIN.
+
+            <br><br>
+
+            Este sistema utiliza dados do mercado normal
+            fornecidos pela Twelve Data.
+
+            <br><br>
+
+            Os resultados de WIN/LOSS são calculados
+            com base no comportamento da vela seguinte
+            recebido pela fonte de dados.
+
+            <br><br>
+
+            O sistema não executa operações automaticamente.
+
+        </div>
+
+    </div>
+
+
+    <div id="updated"
+         class="time">
+
+        Aguardando análise...
+
+    </div>
 
 </div>
 
 
 <script>
+
+
+// =========================================================
+// CONFIGURAÇÕES
+// =========================================================
 
 const ASSETS = [
     "EUR/USD",
@@ -513,8 +776,247 @@ const ASSETS = [
     "ETH/USD"
 ];
 
+const STATS_KEY = "ismael_trade_stats_v7";
 
-async function getSignal(symbol, interval) {
+const PARAMS_KEY = "ismael_trade_params_visible_v7";
+
+const PENDING_KEY = "ismael_trade_pending_v7";
+
+
+// =========================================================
+// ESTATÍSTICAS
+// =========================================================
+
+function getStats() {
+
+    try {
+
+        const data =
+            JSON.parse(
+                localStorage.getItem(STATS_KEY)
+            );
+
+        if (data) {
+            return data;
+        }
+
+    } catch (error) {
+        console.log(error);
+    }
+
+    return {
+        wins: 0,
+        losses: 0
+    };
+}
+
+
+function saveStats(stats) {
+
+    localStorage.setItem(
+        STATS_KEY,
+        JSON.stringify(stats)
+    );
+
+}
+
+
+function updateStatsScreen() {
+
+    const stats = getStats();
+
+    document.getElementById(
+        "wins"
+    ).innerText = stats.wins;
+
+
+    document.getElementById(
+        "losses"
+    ).innerText = stats.losses;
+
+
+    const total =
+        stats.wins + stats.losses;
+
+
+    let accuracy = "--";
+
+
+    if (total > 0) {
+
+        accuracy =
+            (
+                stats.wins /
+                total *
+                100
+            ).toFixed(1) + "%";
+
+    }
+
+
+    document.getElementById(
+        "accuracy"
+    ).innerText = accuracy;
+
+}
+
+
+function limparEstatisticas() {
+
+    if (
+        !confirm(
+            "Deseja realmente zerar WIN e LOSS?"
+        )
+    ) {
+        return;
+    }
+
+
+    localStorage.removeItem(
+        STATS_KEY
+    );
+
+    localStorage.removeItem(
+        PENDING_KEY
+    );
+
+
+    updateStatsScreen();
+
+
+    document.getElementById(
+        "lastResult"
+    ).innerText =
+        "Estatísticas zeradas.";
+
+}
+
+
+// =========================================================
+// PARÂMETROS VISÍVEIS / OCULTOS
+// =========================================================
+
+function parametrosVisiveis() {
+
+    const saved =
+        localStorage.getItem(
+            PARAMS_KEY
+        );
+
+    if (saved === null) {
+        return true;
+    }
+
+    return saved === "true";
+
+}
+
+
+function aplicarVisibilidade() {
+
+    const visible =
+        parametrosVisiveis();
+
+
+    const card =
+        document.getElementById(
+            "parametersCard"
+        );
+
+
+    const button =
+        document.getElementById(
+            "toggleButton"
+        );
+
+
+    const button2 =
+        document.getElementById(
+            "toggleButton2"
+        );
+
+
+    card.style.display =
+        visible ? "block" : "none";
+
+
+    button.innerText =
+        visible
+            ? "⚙️ PARÂMETROS: VISÍVEIS"
+            : "⚙️ PARÂMETROS: OCULTOS";
+
+
+    button2.innerText =
+        visible
+            ? "OCULTAR"
+            : "MOSTRAR";
+
+}
+
+
+function toggleParametros() {
+
+    const current =
+        parametrosVisiveis();
+
+
+    localStorage.setItem(
+        PARAMS_KEY,
+        String(!current)
+    );
+
+
+    aplicarVisibilidade();
+
+}
+
+
+// =========================================================
+// PENDÊNCIAS
+// =========================================================
+
+function getPending() {
+
+    try {
+
+        const data =
+            JSON.parse(
+                localStorage.getItem(
+                    PENDING_KEY
+                )
+            );
+
+        if (Array.isArray(data)) {
+            return data;
+        }
+
+    } catch (error) {
+        console.log(error);
+    }
+
+    return [];
+
+}
+
+
+function savePending(data) {
+
+    localStorage.setItem(
+        PENDING_KEY,
+        JSON.stringify(data)
+    );
+
+}
+
+
+// =========================================================
+// BUSCAR SINAL
+// =========================================================
+
+async function getSignal(
+    symbol,
+    interval
+) {
 
     const url =
         "/signal?symbol=" +
@@ -522,13 +1024,18 @@ async function getSignal(symbol, interval) {
         "&interval=" +
         encodeURIComponent(interval);
 
-    const response = await fetch(url);
+
+    const response =
+        await fetch(url);
+
 
     let data;
 
+
     try {
 
-        data = await response.json();
+        data =
+            await response.json();
 
     } catch (error) {
 
@@ -538,34 +1045,299 @@ async function getSignal(symbol, interval) {
 
     }
 
+
     if (!response.ok) {
 
         throw new Error(
-            data.detail || "Erro na análise."
+            data.detail ||
+            "Erro na análise."
         );
 
     }
 
+
     return data;
+
 }
 
+
+// =========================================================
+// BUSCAR RESULTADO
+// =========================================================
+
+async function getResult(
+    pending
+) {
+
+    const url =
+        "/result?symbol=" +
+        encodeURIComponent(
+            pending.symbol
+        ) +
+        "&interval=" +
+        encodeURIComponent(
+            pending.interval
+        ) +
+        "&reference_candle=" +
+        encodeURIComponent(
+            pending.reference_candle
+        ) +
+        "&direction=" +
+        encodeURIComponent(
+            pending.direction
+        );
+
+
+    const response =
+        await fetch(url);
+
+
+    let data;
+
+
+    try {
+
+        data =
+            await response.json();
+
+    } catch (error) {
+
+        return {
+            status: "WAIT"
+        };
+
+    }
+
+
+    if (!response.ok) {
+
+        return {
+            status: "WAIT"
+        };
+
+    }
+
+
+    return data;
+
+}
+
+
+// =========================================================
+// REGISTRAR NOVO SINAL
+// =========================================================
+
+function registerSignal(data) {
+
+    if (
+        !data ||
+        !data.signal ||
+        !data.reference_candle
+    ) {
+        return;
+    }
+
+
+    if (
+        data.signal !== "CALL" &&
+        data.signal !== "PUT"
+    ) {
+        return;
+    }
+
+
+    const pending =
+        getPending();
+
+
+    const key =
+        data.symbol +
+        "|" +
+        data.interval +
+        "|" +
+        data.reference_candle +
+        "|" +
+        data.signal;
+
+
+    const exists =
+        pending.some(
+            function(item) {
+
+                return item.key === key;
+
+            }
+        );
+
+
+    if (exists) {
+        return;
+    }
+
+
+    pending.push({
+
+        key: key,
+
+        symbol: data.symbol,
+
+        interval: data.interval,
+
+        reference_candle:
+            data.reference_candle,
+
+        direction:
+            data.signal,
+
+        created_at:
+            new Date().toISOString()
+
+    });
+
+
+    // Mantém somente os últimos 20
+    while (pending.length > 20) {
+        pending.shift();
+    }
+
+
+    savePending(pending);
+
+}
+
+
+// =========================================================
+// CONFERIR RESULTADOS
+// =========================================================
+
+async function checkPendingResults() {
+
+    const pending =
+        getPending();
+
+
+    if (!pending.length) {
+        return;
+    }
+
+
+    const remaining = [];
+
+
+    for (
+        const item of pending
+    ) {
+
+        try {
+
+            const result =
+                await getResult(item);
+
+
+            if (
+                result.status === "WIN"
+            ) {
+
+                const stats =
+                    getStats();
+
+
+                stats.wins += 1;
+
+
+                saveStats(stats);
+
+
+                document.getElementById(
+                    "lastResult"
+                ).innerHTML =
+                    "✅ WIN — " +
+                    item.direction +
+                    " — " +
+                    item.symbol;
+
+
+                updateStatsScreen();
+
+
+                continue;
+
+            }
+
+
+            if (
+                result.status === "LOSS"
+            ) {
+
+                const stats =
+                    getStats();
+
+
+                stats.losses += 1;
+
+
+                saveStats(stats);
+
+
+                document.getElementById(
+                    "lastResult"
+                ).innerHTML =
+                    "❌ LOSS — " +
+                    item.direction +
+                    " — " +
+                    item.symbol;
+
+
+                updateStatsScreen();
+
+
+                continue;
+
+            }
+
+
+            remaining.push(item);
+
+        } catch (error) {
+
+            remaining.push(item);
+
+        }
+
+    }
+
+
+    savePending(remaining);
+
+}
+
+
+// =========================================================
+// MOSTRAR SINAL
+// =========================================================
 
 function mostrarResultado(data) {
 
     const signal =
-        document.getElementById("signal");
+        document.getElementById(
+            "signal"
+        );
 
 
     signal.innerText =
         data.signal || "WAIT";
 
 
-    if (data.signal === "CALL") {
+    if (
+        data.signal === "CALL"
+    ) {
 
         signal.className =
             "signal call";
 
-    } else if (data.signal === "PUT") {
+    } else if (
+        data.signal === "PUT"
+    ) {
 
         signal.className =
             "signal put";
@@ -576,14 +1348,6 @@ function mostrarResultado(data) {
             "signal wait";
 
     }
-
-
-    document.getElementById(
-        "confidence"
-    ).innerText =
-        data.confidence != null
-            ? data.confidence + "%"
-            : "--";
 
 
     document.getElementById(
@@ -627,30 +1391,74 @@ function mostrarResultado(data) {
 
 
     document.getElementById(
+        "callScore"
+    ).innerText =
+        data.call_score != null
+            ? data.call_score
+            : "--";
+
+
+    document.getElementById(
+        "putScore"
+    ).innerText =
+        data.put_score != null
+            ? data.put_score
+            : "--";
+
+
+    document.getElementById(
         "reference"
     ).innerText =
-        data.reference_candle || "--";
+        data.reference_candle ||
+        "--";
 
 
     document.getElementById(
         "next"
     ).innerText =
-        data.next_candle || "--";
+        data.next_candle ||
+        "--";
+
+
+    document.getElementById(
+        "entry"
+    ).innerText =
+        data.next_candle ||
+        "--";
 
 
     document.getElementById(
         "asset"
     ).innerText =
-        data.symbol || "--";
+        data.symbol ||
+        "--";
 
 
     document.getElementById(
         "tf"
     ).innerText =
-        data.interval || "--";
+        data.interval ||
+        "--";
+
+
+    document.getElementById(
+        "status"
+    ).innerText =
+        data.signal === "WAIT"
+            ? "Sem entrada confirmada neste momento."
+            : "Sinal " +
+              data.signal +
+              " identificado para a próxima vela.";
+
+
+    registerSignal(data);
 
 }
 
+
+// =========================================================
+// ANALISAR
+// =========================================================
 
 async function analisar() {
 
@@ -678,7 +1486,9 @@ async function analisar() {
 
     try {
 
-        if (symbol === "ALL") {
+        if (
+            symbol === "ALL"
+        ) {
 
             document.getElementById(
                 "singleCard"
@@ -687,7 +1497,7 @@ async function analisar() {
 
 
             document.getElementById(
-                "details"
+                "parametersCard"
             ).style.display =
                 "none";
 
@@ -716,6 +1526,7 @@ async function analisar() {
 
             const results =
                 await Promise.all(
+
                     ASSETS.map(
                         async function(asset) {
 
@@ -729,15 +1540,20 @@ async function analisar() {
                             } catch (error) {
 
                                 return {
+
                                     symbol: asset,
+
                                     signal: "ERRO",
+
                                     confidence: 0
+
                                 };
 
                             }
 
                         }
                     )
+
                 );
 
 
@@ -745,41 +1561,62 @@ async function analisar() {
                 results.map(
                     function(data) {
 
-                        let cls = "yellow";
+                        let cls =
+                            "yellow";
 
 
                         if (
-                            data.signal === "CALL"
+                            data.signal ===
+                            "CALL"
                         ) {
 
-                            cls = "green";
+                            cls =
+                                "green";
 
                         } else if (
-                            data.signal === "PUT"
+                            data.signal ===
+                            "PUT"
                         ) {
 
-                            cls = "red";
+                            cls =
+                                "red";
 
                         }
 
 
                         return (
+
                             '<div class="assetrow">' +
+
                             '<span>' +
+
                             data.symbol +
+
                             '</span>' +
+
                             '<b class="' +
                             cls +
                             '">' +
+
                             data.signal +
-                            ' ' +
-                            (data.confidence || 0) +
-                            '%' +
+
+                            " " +
+
+                            (
+                                data.confidence ||
+                                0
+                            ) +
+
+                            "%" +
+
                             '</b>' +
+
                             '</div>'
+
                         );
 
                     }
+
                 ).join("");
 
 
@@ -787,12 +1624,6 @@ async function analisar() {
 
             document.getElementById(
                 "singleCard"
-            ).style.display =
-                "block";
-
-
-            document.getElementById(
-                "details"
             ).style.display =
                 "block";
 
@@ -807,6 +1638,9 @@ async function analisar() {
                 "allCard"
             ).style.display =
                 "none";
+
+
+            aplicarVisibilidade();
 
 
             const data =
@@ -825,17 +1659,20 @@ async function analisar() {
             "updated"
         ).innerText =
             "Última análise: " +
-            new Date().toLocaleTimeString(
-                "pt-BR"
-            );
+            new Date()
+                .toLocaleTimeString(
+                    "pt-BR"
+                );
 
 
     } catch (error) {
 
-        alert(
+        document.getElementById(
+            "status"
+        ).innerText =
             error.message ||
-            "Erro desconhecido."
-        );
+            "Erro desconhecido.";
+
 
     } finally {
 
@@ -847,12 +1684,35 @@ async function analisar() {
 }
 
 
+// =========================================================
+// INICIALIZAÇÃO
+// =========================================================
+
+updateStatsScreen();
+
+aplicarVisibilidade();
+
 analisar();
 
 
+// Atualiza análise a cada 60 segundos
 setInterval(
     analisar,
     60000
+);
+
+
+// Verifica WIN/LOSS a cada 15 segundos
+setInterval(
+    checkPendingResults,
+    15000
+);
+
+
+// Primeira verificação
+setTimeout(
+    checkPendingResults,
+    5000
 );
 
 </script>
@@ -869,6 +1729,7 @@ setInterval(
 
 @app.get("/", response_class=HTMLResponse)
 def root():
+
     return HTML_PAGE
 
 
@@ -882,7 +1743,7 @@ def health():
     return {
         "ok": True,
         "app": "Ismael Trade",
-        "version": "6.0.0"
+        "version": "7.0.0"
     }
 
 
@@ -894,9 +1755,10 @@ def health():
 def server_time():
 
     return {
-        "utc": datetime.now(
-            timezone.utc
-        ).isoformat()
+        "utc":
+            datetime.now(
+                timezone.utc
+            ).isoformat()
     }
 
 
@@ -921,6 +1783,14 @@ async def get_candles(
         )
 
 
+    if symbol not in ASSETS:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Ativo não suportado."
+        )
+
+
     if interval not in ALLOWED_INTERVALS:
 
         raise HTTPException(
@@ -932,19 +1802,15 @@ async def get_candles(
         )
 
 
-    if symbol not in ASSETS:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Ativo não suportado."
-        )
-
-
     try:
 
-        requested_size = int(size)
+        requested_size =
+            int(size)
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError
+    ):
 
         requested_size = 200
 
@@ -959,12 +1825,22 @@ async def get_candles(
 
 
     params = {
+
         "symbol": symbol,
+
         "interval": interval,
-        "outputsize": outputsize,
+
+        "outputsize":
+            outputsize,
+
         "apikey": KEY,
-        "timezone": "America/Sao_Paulo",
-        "format": "JSON"
+
+        "timezone":
+            "America/Sao_Paulo",
+
+        "format":
+            "JSON"
+
     }
 
 
@@ -974,16 +1850,19 @@ async def get_candles(
             timeout=20
         ) as client:
 
-            response = await client.get(
-                URL,
-                params=params
-            )
+            response =
+                await client.get(
+                    URL,
+                    params=params
+                )
+
 
             response.raise_for_status()
 
-            data: dict[str, Any] = (
+
+            data: dict[str, Any] =
                 response.json()
-            )
+
 
     except httpx.HTTPError as exc:
 
@@ -991,7 +1870,7 @@ async def get_candles(
             status_code=502,
             detail=(
                 "Erro ao consultar "
-                "a fonte de dados."
+                "a Twelve Data."
             )
         ) from exc
 
@@ -1007,10 +1886,11 @@ async def get_candles(
         )
 
 
-    values = data.get(
-        "values",
-        []
-    )
+    values =
+        data.get(
+            "values",
+            []
+        )
 
 
     if not values:
@@ -1028,7 +1908,7 @@ async def get_candles(
 
 
 # =========================================================
-# CANDLES
+# CANDLES ENDPOINT
 # =========================================================
 
 @app.get("/candles")
@@ -1038,20 +1918,33 @@ async def candles(
     outputsize: int = 100
 ):
 
-    values = await get_candles(
-        symbol,
-        interval,
-        outputsize
-    )
+    values =
+        await get_candles(
+            symbol,
+            interval,
+            outputsize
+        )
 
 
     return {
+
         "ok": True,
-        "source": "Twelve Data",
-        "symbol": symbol,
-        "interval": interval,
-        "count": len(values),
-        "values": values
+
+        "source":
+            "Twelve Data",
+
+        "symbol":
+            symbol,
+
+        "interval":
+            interval,
+
+        "count":
+            len(values),
+
+        "values":
+            values
+
     }
 
 
@@ -1069,24 +1962,27 @@ def ema(
         return None
 
 
-    alpha = 2.0 / (
-        period + 1.0
-    )
+    alpha =
+        2.0 / (
+            period + 1.0
+        )
 
 
-    value = (
-        sum(values[:period])
-        / period
-    )
+    value =
+        sum(
+            values[:period]
+        ) / period
 
 
     for price in values[period:]:
 
-        value = (
-            price * alpha
-            +
-            value * (1.0 - alpha)
-        )
+        value =
+            (
+                price * alpha
+            ) + (
+                value *
+                (1.0 - alpha)
+            )
 
 
     return value
@@ -1107,7 +2003,6 @@ def rsi(
 
 
     gains = []
-
     losses = []
 
 
@@ -1116,42 +2011,34 @@ def rsi(
         len(values)
     ):
 
-        change = (
+        change =
             values[i] -
             values[i - 1]
-        )
 
 
         if change > 0:
 
             gains.append(change)
+            losses.append(0.0)
 
         else:
 
             gains.append(0.0)
-
-
-        if change < 0:
-
             losses.append(
                 abs(change)
             )
 
-        else:
 
-            losses.append(0.0)
-
-
-    average_gain = (
-        sum(gains[:period])
-        / period
-    )
+    average_gain =
+        sum(
+            gains[:period]
+        ) / period
 
 
-    average_loss = (
-        sum(losses[:period])
-        / period
-    )
+    average_loss =
+        sum(
+            losses[:period]
+        ) / period
 
 
     for i in range(
@@ -1159,24 +2046,26 @@ def rsi(
         len(gains)
     ):
 
-        average_gain = (
+        average_gain =
             (
-                (period - 1)
-                * average_gain
-            )
-            +
-            gains[i]
-        ) / period
+                (
+                    (period - 1)
+                    * average_gain
+                )
+                +
+                gains[i]
+            ) / period
 
 
-        average_loss = (
+        average_loss =
             (
-                (period - 1)
-                * average_loss
-            )
-            +
-            losses[i]
-        ) / period
+                (
+                    (period - 1)
+                    * average_loss
+                )
+                +
+                losses[i]
+            ) / period
 
 
     if average_loss == 0:
@@ -1184,10 +2073,9 @@ def rsi(
         return 100.0
 
 
-    rs = (
+    rs =
         average_gain /
         average_loss
-    )
 
 
     return (
@@ -1204,133 +2092,142 @@ def rsi(
 # =========================================================
 
 def adx(
-    values,
+    candles_data,
     period=14
 ):
 
-    if len(values) < (
-        2 * period + 2
+    if len(candles_data) < (
+        period * 2 + 5
     ):
 
         return None
 
 
-    data = list(
-        reversed(values)
-    )
+    data =
+        list(
+            reversed(
+                candles_data
+            )
+        )
 
 
     highs = [
-        float(candle["high"])
-        for candle in data
+        float(x["high"])
+        for x in data
     ]
-
 
     lows = [
-        float(candle["low"])
-        for candle in data
+        float(x["low"])
+        for x in data
     ]
 
-
     closes = [
-        float(candle["close"])
-        for candle in data
+        float(x["close"])
+        for x in data
     ]
 
 
     tr = []
-
     plus_dm = []
-
     minus_dm = []
 
 
     for i in range(
         1,
-        len(closes)
+        len(data)
     ):
 
-        true_range = max(
-            highs[i] - lows[i],
-            abs(
-                highs[i] -
-                closes[i - 1]
-            ),
-            abs(
-                lows[i] -
-                closes[i - 1]
-            )
-        )
+        high =
+            highs[i]
 
-
-        up_move = (
-            highs[i] -
-            highs[i - 1]
-        )
-
-
-        down_move = (
-            lows[i - 1] -
+        low =
             lows[i]
-        )
+
+        previous_high =
+            highs[i - 1]
+
+        previous_low =
+            lows[i - 1]
+
+        previous_close =
+            closes[i - 1]
 
 
-        if (
-            up_move > down_move
-            and up_move > 0
-        ):
-
-            plus_dm.append(
-                up_move
+        true_range =
+            max(
+                high - low,
+                abs(
+                    high -
+                    previous_close
+                ),
+                abs(
+                    low -
+                    previous_close
+                )
             )
 
-        else:
 
-            plus_dm.append(
-                0.0
-            )
+        up_move =
+            high -
+            previous_high
 
 
-        if (
-            down_move > up_move
-            and down_move > 0
-        ):
+        down_move =
+            previous_low -
+            low
 
-            minus_dm.append(
-                down_move
-            )
 
-        else:
+        plus =
+            up_move if (
+                up_move > down_move
+                and up_move > 0
+            ) else 0.0
 
-            minus_dm.append(
-                0.0
-            )
+
+        minus =
+            down_move if (
+                down_move > up_move
+                and down_move > 0
+            ) else 0.0
 
 
         tr.append(
             true_range
         )
 
+        plus_dm.append(
+            plus
+        )
 
-    atr = (
-        sum(tr[:period])
-        / period
-    )
-
-
-    plus = (
-        sum(plus_dm[:period])
-        / period
-    )
+        minus_dm.append(
+            minus
+        )
 
 
-    minus = (
-        sum(minus_dm[:period])
-        / period
-    )
+    if len(tr) < period + 1:
+
+        return None
 
 
-    dx = []
+    atr =
+        sum(
+            tr[:period]
+        ) / period
+
+
+    plus_smoothed =
+        sum(
+            plus_dm[:period]
+        ) / period
+
+
+    minus_smoothed =
+        sum(
+            minus_dm[:period]
+        ) / period
+
+
+    dx_values = []
 
 
     for i in range(
@@ -1338,254 +2235,310 @@ def adx(
         len(tr)
     ):
 
-        atr = (
+        atr =
             (
-                (period - 1)
-                * atr
-            )
-            +
-            tr[i]
-        ) / period
+                (
+                    atr *
+                    (period - 1)
+                )
+                +
+                tr[i]
+            ) / period
 
 
-        plus = (
+        plus_smoothed =
             (
-                (period - 1)
-                * plus
-            )
-            +
-            plus_dm[i]
-        ) / period
+                (
+                    plus_smoothed *
+                    (period - 1)
+                )
+                +
+                plus_dm[i]
+            ) / period
 
 
-        minus = (
+        minus_smoothed =
             (
-                (period - 1)
-                * minus
-            )
-            +
-            minus_dm[i]
-        ) / period
+                (
+                    minus_smoothed *
+                    (period - 1)
+                )
+                +
+                minus_dm[i]
+            ) / period
 
 
-        if atr != 0:
+        if atr == 0:
 
-            plus_di = (
-                100.0 *
-                plus /
+            dx_values.append(0.0)
+
+            continue
+
+
+        plus_di =
+            100.0 * (
+                plus_smoothed /
                 atr
             )
 
-            minus_di = (
-                100.0 *
-                minus /
+
+        minus_di =
+            100.0 * (
+                minus_smoothed /
                 atr
             )
 
-        else:
 
-            plus_di = 0.0
-
-            minus_di = 0.0
-
-
-        total = (
+        denominator =
             plus_di +
             minus_di
-        )
 
 
-        if total != 0:
+        if denominator == 0:
 
-            current_dx = (
-                100.0 *
-                abs(
-                    plus_di -
-                    minus_di
-                )
-                /
-                total
-            )
+            dx = 0.0
 
         else:
 
-            current_dx = 0.0
+            dx =
+                100.0 * (
+                    abs(
+                        plus_di -
+                        minus_di
+                    )
+                    /
+                    denominator
+                )
 
 
-        dx.append(
-            current_dx
-        )
+        dx_values.append(dx)
 
 
-    if len(dx) < period:
+    if len(dx_values) < period:
 
         return None
 
 
-    value = (
-        sum(dx[:period])
-        / period
-    )
-
-
-    for item in dx[period:]:
-
-        value = (
-            (
-                (period - 1)
-                * value
-            )
-            +
-            item
+    adx_value =
+        sum(
+            dx_values[:period]
         ) / period
 
 
-    return value
+    for i in range(
+        period,
+        len(dx_values)
+    ):
+
+        adx_value =
+            (
+                (
+                    adx_value *
+                    (period - 1)
+                )
+                +
+                dx_values[i]
+            ) / period
+
+
+    return adx_value
 
 
 # =========================================================
-# ANÁLISE
+# ANALISAR MERCADO
 # =========================================================
 
 def analyze(values):
 
-    if len(values) < 100:
+    if len(values) < 80:
 
-        return {
-            "signal": "WAIT",
-            "confidence": 0,
-            "reason": "Dados insuficientes."
-        }
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Quantidade insuficiente "
+                "de candles para análise."
+            )
+        )
 
 
-    # A primeira vela retornada pela Twelve Data
-    # é a vela mais recente.
+    # Twelve Data retorna do mais recente
+    # para o mais antigo.
     #
-    # Ela é ignorada para a análise principal.
-    # Dessa forma usamos a vela fechada anterior.
+    # values[0] = candle atual
+    # values[1] = último candle fechado
+    #
+    # Para evitar utilizar a vela em formação,
+    # os indicadores são calculados somente
+    # com candles fechados.
 
-    closed = values[1:]
+    closed =
+        values[1:]
+
+
+    closed_chronological =
+        list(
+            reversed(
+                closed
+            )
+        )
 
 
     closes = [
-        float(candle["close"])
-        for candle in reversed(closed)
+        float(x["close"])
+        for x in closed_chronological
     ]
 
 
-    ema3 = ema(
-        closes,
-        3
-    )
-
-
-    ema7 = ema(
-        closes,
-        7
-    )
-
-
-    rsi14 = rsi(
-        closes,
-        14
-    )
-
-
-    adx21 = adx(
-        closed,
-        21
-    )
-
-
-    adx48 = adx(
-        closed,
-        48
-    )
-
-
-    if any(
-        value is None
-        for value in (
-            ema3,
-            ema7,
-            rsi14,
-            adx21,
-            adx48
+    ema3_value =
+        ema(
+            closes,
+            3
         )
+
+
+    ema7_value =
+        ema(
+            closes,
+            7
+        )
+
+
+    rsi14_value =
+        rsi(
+            closes,
+            14
+        )
+
+
+    adx21_value =
+        adx(
+            closed,
+            21
+        )
+
+
+    adx48_value =
+        adx(
+            closed,
+            48
+        )
+
+
+    if (
+        ema3_value is None
+        or
+        ema7_value is None
+        or
+        rsi14_value is None
+        or
+        adx21_value is None
+        or
+        adx48_value is None
     ):
 
         return {
-            "signal": "WAIT",
-            "confidence": 0,
-            "reason": (
-                "Dados insuficientes "
-                "para os filtros."
-            )
+
+            "signal":
+                "WAIT",
+
+            "confidence":
+                0,
+
+            "ema3":
+                None,
+
+            "ema7":
+                None,
+
+            "rsi14":
+                None,
+
+            "adx21":
+                None,
+
+            "adx48":
+                None,
+
+            "call_score":
+                0,
+
+            "put_score":
+                0
+
         }
 
 
     call_score = 0
-
     put_score = 0
 
 
-    # EMA 3 x EMA 7
+    # =====================================================
+    # CALL
+    # =====================================================
 
-    if ema3 > ema7:
+    if ema3_value > ema7_value:
 
         call_score += 2
 
-    elif ema3 < ema7:
 
-        put_score += 2
+    if 52 <= rsi14_value <= 70:
+
+        call_score += 1
 
 
-    # RSI
+    if adx21_value >= 20:
+
+        call_score += 1
+
+
+    if adx48_value >= 18:
+
+        call_score += 1
+
 
     if (
-        rsi14 >= 52
-        and
-        rsi14 < 70
+        adx21_value >
+        adx48_value
     ):
 
         call_score += 1
 
-    elif (
-        rsi14 > 30
-        and
-        rsi14 <= 48
+
+    # =====================================================
+    # PUT
+    # =====================================================
+
+    if ema3_value < ema7_value:
+
+        put_score += 2
+
+
+    if 30 <= rsi14_value <= 48:
+
+        put_score += 1
+
+
+    if adx21_value >= 20:
+
+        put_score += 1
+
+
+    if adx48_value >= 18:
+
+        put_score += 1
+
+
+    if (
+        adx21_value >
+        adx48_value
     ):
 
         put_score += 1
 
 
-    # ADX 21
+    signal = "WAIT"
+    confidence = 0
 
-    if adx21 >= 20:
-
-        if ema3 > ema7:
-
-            call_score += 1
-
-        elif ema3 < ema7:
-
-            put_score += 1
-
-
-    # ADX 48
-
-    if adx48 >= 20:
-
-        if ema3 > ema7:
-
-            call_score += 1
-
-        elif ema3 < ema7:
-
-            put_score += 1
-
-
-    # DECISÃO
 
     if (
         call_score >= 4
@@ -1595,7 +2548,14 @@ def analyze(values):
 
         signal = "CALL"
 
-        score = call_score
+        confidence =
+            min(
+                95,
+                70 +
+                (
+                    call_score - 4
+                ) * 5
+            )
 
 
     elif (
@@ -1606,77 +2566,51 @@ def analyze(values):
 
         signal = "PUT"
 
-        score = put_score
-
-
-    else:
-
-        signal = "WAIT"
-
-        score = max(
-            call_score,
-            put_score
-        )
-
-
-    # Confiança é uma pontuação
-    # probabilística, não uma garantia.
-
-    if signal != "WAIT":
-
-        confidence = min(
-            95,
-            50 + score * 8
-        )
-
-    else:
-
-        confidence = (
-            50 + score * 3
-        )
+        confidence =
+            min(
+                95,
+                70 +
+                (
+                    put_score - 4
+                ) * 5
+            )
 
 
     return {
-        "signal": signal,
-        "confidence": confidence,
 
-        "reference_candle":
-            closed[0].get(
-                "datetime"
-            ),
+        "signal":
+            signal,
 
-        "next_candle":
-            values[0].get(
-                "datetime"
-            ),
+        "confidence":
+            confidence,
 
         "ema3":
             round(
-                ema3,
+                ema3_value,
                 6
             ),
 
         "ema7":
             round(
-                ema7,
+                ema7_value,
                 6
             ),
 
         "rsi14":
             round(
-                rsi14,
+                rsi14_value,
                 2
             ),
 
         "adx21":
             round(
-                adx21,
+                adx21_value,
                 2
             ),
 
         "adx48":
             round(
-                adx48,
+                adx48_value,
                 2
             ),
 
@@ -1684,52 +2618,53 @@ def analyze(values):
             call_score,
 
         "put_score":
-            put_score,
+            put_score
 
-        "non_repaint_reference":
-            True
     }
 
 
 # =========================================================
-# SINAL
+# SIGNAL ENDPOINT
 # =========================================================
 
 @app.get("/signal")
 async def signal(
-    symbol: str = "EUR/USD",
-    interval: str = "1min"
+    symbol: str = Query(
+        "EUR/USD"
+    ),
+
+    interval: str = Query(
+        "1min"
+    )
 ):
 
-    if symbol not in ASSETS:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Ativo não suportado."
+    values =
+        await get_candles(
+            symbol,
+            interval,
+            250
         )
 
 
-    if interval not in ALLOWED_INTERVALS:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Intervalo inválido."
-        )
+    analysis =
+        analyze(values)
 
 
-    values = await get_candles(
-        symbol,
-        interval,
-        200
-    )
+    # Candle 0:
+    # atual/em formação
+    #
+    # Candle 1:
+    # último candle fechado
+
+    current_candle =
+        values[0]
 
 
-    result = analyze(
-        values
-    )
+    reference_candle =
+        values[1]
 
 
-    result.update({
+    return {
 
         "ok": True,
 
@@ -1742,19 +2677,310 @@ async def signal(
         "interval":
             interval,
 
-        "expiry":
-            "1 vela do intervalo selecionado",
+        "signal":
+            analysis["signal"],
+
+        "confidence":
+            analysis["confidence"],
+
+        "reference_candle":
+            reference_candle["datetime"],
+
+        "next_candle":
+            current_candle["datetime"],
+
+        "entry":
+            current_candle["datetime"],
+
+        "expiration":
+            "1 vela",
+
+        "ema3":
+            analysis["ema3"],
+
+        "ema7":
+            analysis["ema7"],
+
+        "rsi14":
+            analysis["rsi14"],
+
+        "adx21":
+            analysis["adx21"],
+
+        "adx48":
+            analysis["adx48"],
+
+        "call_score":
+            analysis["call_score"],
+
+        "put_score":
+            analysis["put_score"],
+
+        "non_repaint_reference":
+            True,
 
         "warning":
             (
                 "Sinal probabilístico; "
                 "não garante WIN. "
-                "A fonte Twelve Data pode "
-                "não coincidir com os preços "
-                "OTC da IQ Option."
+                "Análise baseada em candles "
+                "fechados da Twelve Data."
             )
 
-    })
+    }
 
 
-    return result
+# =========================================================
+# RESULTADO WIN / LOSS
+# =========================================================
+
+@app.get("/result")
+async def result(
+    symbol: str = Query(...),
+
+    interval: str = Query(...),
+
+    reference_candle: str = Query(...),
+
+    direction: str = Query(...)
+):
+
+    if direction not in (
+        "CALL",
+        "PUT"
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail="Direção inválida."
+        )
+
+
+    values =
+        await get_candles(
+            symbol,
+            interval,
+            250
+        )
+
+
+    # Ordena do mais antigo
+    # para o mais recente.
+
+    chronological =
+        list(
+            reversed(
+                values
+            )
+        )
+
+
+    reference_index = -1
+
+
+    for i, candle in enumerate(
+        chronological
+    ):
+
+        if (
+            candle.get(
+                "datetime"
+            )
+            ==
+            reference_candle
+        ):
+
+            reference_index = i
+
+            break
+
+
+    if reference_index < 0:
+
+        return {
+
+            "ok": True,
+
+            "status":
+                "WAIT",
+
+            "message":
+                "Vela de referência ainda não localizada."
+
+        }
+
+
+    next_index =
+        reference_index + 1
+
+
+    if next_index >= len(
+        chronological
+    ):
+
+        return {
+
+            "ok": True,
+
+            "status":
+                "WAIT",
+
+            "message":
+                "Aguardando próxima vela."
+
+        }
+
+
+    next_candle =
+        chronological[
+            next_index
+        ]
+
+
+    try:
+
+        open_price =
+            float(
+                next_candle["open"]
+            )
+
+        close_price =
+            float(
+                next_candle["close"]
+            )
+
+    except (
+        TypeError,
+        ValueError,
+        KeyError
+    ):
+
+        return {
+
+            "ok": True,
+
+            "status":
+                "WAIT"
+
+        }
+
+
+    # Se a vela ainda estiver em formação,
+    # não registra resultado.
+
+    try:
+
+        candle_time =
+            datetime.strptime(
+                next_candle["datetime"],
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+        now =
+            datetime.now()
+
+        interval_minutes = {
+            "1min": 1,
+            "5min": 5,
+            "15min": 15,
+            "30min": 30
+        }.get(
+            interval,
+            1
+        )
+
+
+        elapsed =
+            (
+                now -
+                candle_time
+            ).total_seconds()
+
+
+        if elapsed < (
+            interval_minutes * 60
+        ):
+
+            return {
+
+                "ok": True,
+
+                "status":
+                    "WAIT",
+
+                "message":
+                    "Aguardando fechamento da vela."
+
+            }
+
+    except Exception:
+
+        pass
+
+
+    if close_price == open_price:
+
+        return {
+
+            "ok": True,
+
+            "status":
+                "DRAW",
+
+            "open":
+                open_price,
+
+            "close":
+                close_price,
+
+            "candle":
+                next_candle["datetime"]
+
+        }
+
+
+    candle_up =
+        close_price > open_price
+
+
+    if (
+        direction == "CALL"
+        and
+        candle_up
+    ):
+
+        status = "WIN"
+
+    elif (
+        direction == "PUT"
+        and
+        not candle_up
+    ):
+
+        status = "WIN"
+
+    else:
+
+        status = "LOSS"
+
+
+    return {
+
+        "ok": True,
+
+        "status":
+            status,
+
+        "direction":
+            direction,
+
+        "open":
+            open_price,
+
+        "close":
+            close_price,
+
+        "candle":
+            next_candle["datetime"]
+
+    }
