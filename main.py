@@ -1,19 +1,19 @@
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 app = FastAPI(
     title="Ismael Trade",
-    version="5.0.0"
+    version="6.0.0"
 )
 
-KEY = os.getenv(
-    "TWELVE_DATA_API_KEY",
-    ""
-)
+# A chave deve ser cadastrada no Render:
+# Environment -> TWELVE_DATA_API_KEY
+KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 URL = "https://api.twelvedata.com/time_series"
 
@@ -38,719 +38,202 @@ ASSETS = [
     "BTC/USD",
     "ETH/USD"
 ]
-HTML_PAGE = """
-<!DOCTYPE html>
-<html lang="pt-BR">
 
-<head>
 
-<meta charset="UTF-8">
-
-<meta name="viewport"
-content="width=device-width, initial-scale=1.0">
-
-<title>ISMAEL TRADE</title>
-
-<style>
-
-body {
-    margin: 0;
-    padding: 15px;
-    background: #111827;
-    color: white;
-    font-family: Arial, sans-serif;
-}
-
-.container {
-    max-width: 600px;
-    margin: auto;
-}
-
-h1 {
-    text-align: center;
-    margin-bottom: 5px;
-}
-
-.subtitle {
-    text-align: center;
-    color: #9ca3af;
-    margin-bottom: 20px;
-}
-
-label {
-    display: block;
-    margin-top: 12px;
-    margin-bottom: 5px;
-}
-
-select,
-button {
-    width: 100%;
-    padding: 13px;
-    border-radius: 8px;
-    border: none;
-    font-size: 16px;
-}
-
-select {
-    background: #1f2937;
-    color: white;
-}
-
-button {
-    margin-top: 18px;
-    background: #2563eb;
-    color: white;
-    font-weight: bold;
-}
-
-button:active {
-    transform: scale(0.98);
-}
-
-#loading {
-    display: none;
-    text-align: center;
-    margin: 15px;
-}
-
-.card {
-    background: #1f2937;
-    border-radius: 12px;
-    padding: 15px;
-    margin-top: 15px;
-}
-
-.signal {
-    text-align: center;
-    font-size: 42px;
-    font-weight: bold;
-    padding: 20px;
-    border-radius: 10px;
-}
-
-.call {
-    background: #065f46;
-}
-
-.put {
-    background: #991b1b;
-}
-
-.wait {
-    background: #374151;
-}
-
-.grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-}
-
-.item {
-    background: #111827;
-    padding: 10px;
-    border-radius: 8px;
-}
-
-.value {
-    font-weight: bold;
-    margin-top: 5px;
-}
-
-.all-item {
-    background: #111827;
-    padding: 12px;
-    margin-bottom: 8px;
-    border-radius: 8px;
-}
-
-.mini-call {
-    color: #34d399;
-    font-weight: bold;
-}
-
-.mini-put {
-    color: #f87171;
-    font-weight: bold;
-}
-
-.mini-wait {
-    color: #9ca3af;
-    font-weight: bold;
-}
-
-.warning {
-    color: #fbbf24;
-    font-size: 13px;
-    line-height: 1.5;
-}
-
-</style>
-
-</head>
-
-<body>
-
-<div class="container">
-
-<h1>ISMAEL TRADE</h1>
-
-<div class="subtitle">
-Análise probabilística de mercado
-</div>
-
-<label>Ativo</label>
-
-<select id="asset">
-
-<option value="TODOS">
-TODOS OS ATIVOS
-</option>
-
-<option value="EUR/USD">
-EUR/USD
-</option>
-
-<option value="GBP/USD">
-GBP/USD
-</option>
-
-<option value="USD/JPY">
-USD/JPY
-</option>
-
-<option value="AUD/USD">
-AUD/USD
-</option>
-
-<option value="USD/CAD">
-USD/CAD
-</option>
-
-<option value="USD/CHF">
-USD/CHF
-</option>
-
-<option value="NZD/USD">
-NZD/USD
-</option>
-
-<option value="EUR/JPY">
-EUR/JPY
-</option>
-
-<option value="GBP/JPY">
-GBP/JPY
-</option>
-
-<option value="EUR/GBP">
-EUR/GBP
-</option>
-
-<option value="BTC/USD">
-BTC/USD
-</option>
-
-<option value="ETH/USD">
-ETH/USD
-</option>
-
-</select>
-
-<label>Timeframe</label>
-
-<select id="timeframe">
-
-<option value="1min">
-M1
-</option>
-
-<option value="5min">
-M5
-</option>
-
-<option value="15min">
-M15
-</option>
-
-<option value="30min">
-M30
-</option>
-
-</select>
-
-<button id="analyzeBtn">
-ANALISAR AGORA
-</button>
-
-<div id="loading">
-Analisando mercado...
-</div>
-
-<div class="card" id="singleResult">
-
-<div id="signal"
-class="signal wait">
-AGUARDANDO
-</div>
-
-<div class="grid">
-
-<div class="item">
-Confiança
-<div class="value" id="confidence">--</div>
-</div>
-
-<div class="item">
-Ativo
-<div class="value" id="assetName">--</div>
-</div>
-
-<div class="item">
-Timeframe
-<div class="value" id="intervalName">--</div>
-</div>
-
-<div class="item">
-Próxima vela
-<div class="value" id="next">--</div>
-</div>
-
-</div>
-
-</div>
-
-
-<div class="card">
-
-<h3>Indicadores</h3>
-
-<div class="grid">
-
-<div class="item">
-EMA 3
-<div class="value" id="ema3">--</div>
-</div>
-
-<div class="item">
-EMA 7
-<div class="value" id="ema7">--</div>
-</div>
-
-<div class="item">
-RSI 14
-<div class="value" id="rsi">--</div>
-</div>
-
-<div class="item">
-ADX 21
-<div class="value" id="adx21">--</div>
-</div>
-
-<div class="item">
-ADX 48
-<div class="value" id="adx48">--</div>
-</div>
-
-</div>
-
-</div>
-
-
-<div class="card">
-
-<h3>Referência da análise</h3>
-
-<div class="grid">
-
-<div class="item">
-Vela de referência
-<div class="value" id="reference">--</div>
-</div>
-
-<div class="item">
-Próxima vela
-<div class="value" id="next">--</div>
-</div>
-
-</div>
-
-</div>
-
-
-<div class="card"
-id="allResult"
-style="display:none;">
-
-<h3>Análise de todos os ativos</h3>
-
-<div id="allResults"></div>
-
-</div>
-
-
-<div class="card warning">
-
-<b>Atenção:</b><br><br>
-
-Este sistema apresenta uma análise
-probabilística baseada em dados de mercado.
-
-O sinal não garante WIN e pode ocorrer LOSS.
-
-Os dados da Twelve Data podem ser
-diferentes dos dados da IQ Option,
-principalmente em ativos OTC.
-
-O sistema não executa operações
-automaticamente.
-
-</div>
-
-
-<div class="card">
-
-Última atualização:
-
-<span id="updated">
---
-</span>
-
-</div>
-<script>
-
-const ASSETS = [
-    "EUR/USD",
-    "GBP/USD",
-    "USD/JPY",
-    "AUD/USD",
-    "USD/CAD",
-    "USD/CHF",
-    "NZD/USD",
-    "EUR/JPY",
-    "GBP/JPY",
-    "EUR/GBP",
-    "BTC/USD",
-    "ETH/USD"
-];
-
-
-async function getSignal(symbol, interval) {
-
-    const url =
-        "/signal?symbol=" +
-        encodeURIComponent(symbol) +
-        "&interval=" +
-        interval;
-
-    const response =
-        await fetch(url);
-
-    const data =
-        await response.json();
-
-    if (!response.ok) {
-        throw new Error(
-            data.detail ||
-            "Erro na análise."
-        );
+async def get_candles(
+    symbol: str,
+    interval: str = "1min",
+    outputsize: int = 100
+) -> list[dict[str, Any]]:
+
+    if not KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="TWELVE_DATA_API_KEY não configurada no Render."
+        )
+
+    if symbol not in ASSETS:
+        raise HTTPException(
+            status_code=400,
+            detail="Ativo não permitido."
+        )
+
+    if interval not in ALLOWED_INTERVALS:
+        raise HTTPException(
+            status_code=400,
+            detail="Timeframe inválido."
+        )
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": max(60, min(outputsize, 500)),
+        "apikey": KEY,
+        "format": "JSON"
     }
 
-    return data;
-}
+    try:
 
+        async with httpx.AsyncClient(
+            timeout=20.0
+        ) as client:
 
-function mostrarResultado(data) {
+            response = await client.get(
+                URL,
+                params=params
+            )
+
+    except httpx.RequestError as error:
 
-    const signal =
-        document.getElementById("signal");
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Erro de conexão com o provedor "
+                "de dados: "
+                + error.__class__.__name__
+            )
+        )
 
-    signal.innerText =
-        data.signal || "WAIT";
+    # CORREÇÃO DO ERRO:
+    # Não tentar response.json() sem verificar
+    # se a resposta realmente é JSON.
+
+    content_type = (
+        response.headers
+        .get("content-type", "")
+        .lower()
+    )
 
-    if (data.signal === "CALL") {
+    if "json" not in content_type:
 
-        signal.className =
-            "signal call";
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "O provedor de dados retornou "
+                "uma resposta que não é JSON."
+            )
+        )
 
-    } else if (data.signal === "PUT") {
+    try:
 
-        signal.className =
-            "signal put";
+        data = response.json()
 
-    } else {
+    except ValueError:
 
-        signal.className =
-            "signal wait";
-    }
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Resposta inválida do provedor "
+                "de dados: JSON malformado."
+            )
+        )
 
+    if response.status_code >= 400:
 
-    document.getElementById(
-        "confidence"
-    ).innerText =
-        (data.confidence ?? "--") + "%";
+        detail = None
 
+        if isinstance(data, dict):
+            detail = data.get("message")
 
-    document.getElementById(
-        "ema3"
-    ).innerText =
-        data.ema3 ?? "--";
+        raise HTTPException(
+            status_code=502,
+            detail=detail or "Erro no provedor de dados."
+        )
 
+    if not isinstance(data, dict):
 
-    document.getElementById(
-        "ema7"
-    ).innerText =
-        data.ema7 ?? "--";
+        raise HTTPException(
+            status_code=502,
+            detail="Formato inesperado da resposta."
+        )
 
+    if data.get("status") == "error":
 
-    document.getElementById(
-        "rsi"
-    ).innerText =
-        data.rsi14 ?? "--";
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                data.get("message")
+                or "Erro retornado pelo provedor."
+            )
+        )
 
+    values = data.get("values")
 
-    document.getElementById(
-        "adx21"
-    ).innerText =
-        data.adx21 ?? "--";
+    if not isinstance(values, list):
 
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "O provedor não retornou "
+                "dados de candles."
+            )
+        )
 
-    document.getElementById(
-        "adx48"
-    ).innerText =
-        data.adx48 ?? "--";
-}
-async function analisar() {
+    candles = []
 
-    const symbol =
-        document.getElementById("asset").value;
+    for item in values:
 
-    const interval =
-        document.getElementById("timeframe").value;
+        try:
 
-    const loading =
-        document.getElementById("loading");
+            candles.append({
+                "datetime": item["datetime"],
+                "open": float(item["open"]),
+                "high": float(item["high"]),
+                "low": float(item["low"]),
+                "close": float(item["close"])
+            })
 
-    loading.style.display = "block";
+        except (
+            KeyError,
+            TypeError,
+            ValueError
+        ):
 
+            continue
 
-    try {
+    if len(candles) < 60:
 
-        if (symbol === "TODOS") {
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Dados insuficientes para análise. "
+                f"Recebidos: {len(candles)} candles."
+            )
+        )
 
-            const resultados = [];
+    return candles
 
-            for (const ativo of ASSETS) {
 
-                try {
+def ema(
+    values: list[float],
+    period: int
+) -> float | None:
 
-                    const data =
-                        await getSignal(
-                            ativo,
-                            interval
-                        );
-
-                    resultados.push(data);
-
-                } catch (error) {
-
-                    console.log(
-                        "Erro em " + ativo,
-                        error
-                    );
-                }
-            }
-
-
-            const container =
-                document.getElementById(
-                    "allResults"
-                );
-
-            container.innerHTML = "";
-
-
-            resultados.forEach(data => {
-
-                const item =
-                    document.createElement("div");
-
-                item.className =
-                    "all-item";
-
-
-                let classe =
-                    "mini-wait";
-
-                if (data.signal === "CALL") {
-                    classe = "mini-call";
-                }
-
-                if (data.signal === "PUT") {
-                    classe = "mini-put";
-                }
-
-
-                item.innerHTML =
-                    "<b>" +
-                    data.symbol +
-                    "</b><br>" +
-
-                    "<span class='" +
-                    classe +
-                    "'>" +
-                    data.signal +
-                    "</span> " +
-
-                    data.confidence +
-                    "%";
-
-
-                container.appendChild(item);
-
-            });
-
-
-            document.getElementById(
-                "singleResult"
-            ).style.display = "none";
-
-
-            document.getElementById(
-                "allResult"
-            ).style.display = "block";
-
-
-        } else {
-
-            const data =
-                await getSignal(
-                    symbol,
-                    interval
-                );
-
-
-            mostrarResultado(data);
-
-
-            document.getElementById(
-                "singleResult"
-            ).style.display = "block";
-
-
-            document.getElementById(
-                "allResult"
-            ).style.display = "none";
-
-
-            document.getElementById(
-                "reference"
-            ).innerText =
-                data.reference_candle ?? "--";
-
-
-            document.getElementById(
-                "next"
-            ).innerText =
-                data.next_candle ?? "--";
-
-
-            document.getElementById(
-                "assetName"
-            ).innerText =
-                data.symbol ?? symbol;
-
-
-            document.getElementById(
-                "intervalName"
-            ).innerText =
-                data.interval ?? interval;
-
-        }
-
-
-        document.getElementById(
-            "updated"
-        ).innerText =
-            new Date().toLocaleTimeString(
-                "pt-BR"
-            );
-
-
-    } catch (error) {
-
-        alert(
-            error.message ||
-            "Erro ao realizar análise."
-        );
-
-    } finally {
-
-        loading.style.display = "none";
-    }
-}
-document
-    .getElementById("analyzeBtn")
-    .addEventListener(
-        "click",
-        analisar
-    );
-
-
-document
-    .getElementById("asset")
-    .addEventListener(
-        "change",
-        function() {
-
-            const todos =
-                this.value === "TODOS";
-
-            document.getElementById(
-                "singleResult"
-            ).style.display =
-                todos ? "none" : "block";
-
-            document.getElementById(
-                "allResult"
-            ).style.display =
-                todos ? "block" : "none";
-        }
-    );
-
-
-analisar();
-
-
-setInterval(
-    analisar,
-    60000
-);
-
-</script>
-
-</body>
-
-</html>
-"""
-def ema(values, period):
     if len(values) < period:
         return None
 
-    multiplier = 2 / (period + 1)
+    multiplier = 2.0 / (period + 1)
 
-    result = sum(values[:period]) / period
+    result = (
+        sum(values[:period])
+        / period
+    )
 
     for price in values[period:]:
+
         result = (
-            (price - result) * multiplier
+            (price - result)
+            * multiplier
         ) + result
 
     return result
 
 
-def rsi(values, period=14):
+def rsi(
+    values: list[float],
+    period: int = 14
+) -> float | None:
+
     if len(values) <= period:
         return None
 
@@ -758,69 +241,118 @@ def rsi(values, period=14):
     losses = []
 
     for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
+
+        change = (
+            values[i]
+            - values[i - 1]
+        )
 
         if change > 0:
+
             gains.append(change)
-            losses.append(0)
+            losses.append(0.0)
+
         else:
-            gains.append(0)
+
+            gains.append(0.0)
             losses.append(abs(change))
 
-    avg_gain = sum(
-        gains[:period]
-    ) / period
+    avg_gain = (
+        sum(gains[:period])
+        / period
+    )
 
-    avg_loss = sum(
-        losses[:period]
-    ) / period
+    avg_loss = (
+        sum(losses[:period])
+        / period
+    )
 
     for i in range(
         period,
         len(gains)
     ):
+
         avg_gain = (
-            (avg_gain * (period - 1))
+            (
+                avg_gain
+                * (period - 1)
+            )
             + gains[i]
         ) / period
 
         avg_loss = (
-            (avg_loss * (period - 1))
+            (
+                avg_loss
+                * (period - 1)
+            )
             + losses[i]
         ) / period
 
     if avg_loss == 0:
-        return 100.0
 
-    rs = avg_gain / avg_loss
+        if avg_gain > 0:
+            return 100.0
 
-    return 100 - (
-        100 / (1 + rs)
+        return 50.0
+
+    rs = (
+        avg_gain
+        / avg_loss
     )
-def adx(values, period):
+
+    return 100.0 - (
+        100.0 / (1.0 + rs)
+    )
+
+
+def adx(
+    values: list[float],
+    period: int
+) -> float | None:
+
     if len(values) < period + 1:
         return None
 
     changes = []
 
     for i in range(1, len(values)):
+
         changes.append(
             abs(
-                values[i] -
-                values[i - 1]
+                values[i]
+                - values[i - 1]
             )
         )
 
     if len(changes) < period:
         return None
 
-    return (
-        sum(changes[-period:]) /
-        period
+    average_change = (
+        sum(changes[-period:])
+        / period
+    )
+
+    reference = (
+        sum(values[-period:])
+        / period
+    )
+
+    if reference == 0:
+        return 0.0
+
+    return min(
+        100.0,
+        (
+            average_change
+            / reference
+        ) * 10000.0
     )
 
 
-def format_value(value):
+def format_value(
+    value: float | None
+) -> float | None:
+
     if value is None:
         return None
 
@@ -830,18 +362,24 @@ def format_value(value):
     )
 
 
-def calculate_signal(candles):
+def calculate_signal(
+    candles: list[dict[str, Any]]
+) -> dict[str, Any]:
+
     if len(candles) < 60:
+
         raise HTTPException(
             status_code=502,
             detail="Dados insuficientes para análise."
         )
 
+    # Retira a vela mais recente,
+    # tratando-a como vela em formação.
     closed = candles[1:]
 
     closes = [
-        float(c["close"])
-        for c in reversed(closed)
+        float(candle["close"])
+        for candle in reversed(closed)
     ]
 
     ema3 = ema(
@@ -872,8 +410,12 @@ def calculate_signal(candles):
     call_score = 0
     put_score = 0
 
+    # EMA 3 x EMA 7
 
-    if ema3 is not None and ema7 is not None:
+    if (
+        ema3 is not None
+        and ema7 is not None
+    ):
 
         if ema3 > ema7:
             call_score += 2
@@ -881,47 +423,69 @@ def calculate_signal(candles):
         elif ema3 < ema7:
             put_score += 2
 
+    # RSI 14
 
     if rsi14 is not None:
 
         if rsi14 < 30:
+
             call_score += 2
 
         elif rsi14 > 70:
+
             put_score += 2
 
         elif rsi14 >= 50:
+
             call_score += 1
 
         else:
+
             put_score += 1
 
+    # ADX 21
 
-    if adx21 is not None:
+    if (
+        adx21 is not None
+        and adx21 >= 20
+        and ema3 is not None
+        and ema7 is not None
+    ):
 
-        if adx21 >= 20:
+        if ema3 > ema7:
+            call_score += 1
 
-            if ema3 > ema7:
-                call_score += 1
+        elif ema3 < ema7:
+            put_score += 1
 
-            elif ema3 < ema7:
-                put_score += 1
+    # ADX 48
 
+    if (
+        adx48 is not None
+        and adx48 >= 20
+        and ema3 is not None
+        and ema7 is not None
+    ):
 
-    if adx48 is not None:
+        if ema3 > ema7:
+            call_score += 1
 
-        if adx48 >= 20:
+        elif ema3 < ema7:
+            put_score += 1
 
-            if ema3 > ema7:
-                call_score += 1
+    # Resultado
 
-            elif ema3 < ema7:
-                put_score += 1
-    if call_score >= 4 and call_score > put_score:
+    if (
+        call_score >= 4
+        and call_score > put_score
+    ):
 
         signal = "CALL"
 
-    elif put_score >= 4 and put_score > call_score:
+    elif (
+        put_score >= 4
+        and put_score > call_score
+    ):
 
         signal = "PUT"
 
@@ -929,19 +493,15 @@ def calculate_signal(candles):
 
         signal = "WAIT"
 
-
     total_score = max(
         call_score,
         put_score
     )
 
-    confidence = 59 + (
-        total_score * 5
+    confidence = min(
+        95,
+        59 + (total_score * 5)
     )
-
-    if confidence > 95:
-        confidence = 95
-
 
     reference = closed[0].get(
         "datetime",
@@ -959,7 +519,6 @@ def calculate_signal(candles):
 
         next_candle = "--"
 
-
     return {
         "signal": signal,
         "confidence": confidence,
@@ -971,48 +530,196 @@ def calculate_signal(candles):
         "reference_candle": reference,
         "next_candle": next_candle
     }
+<script>
+
+async function getSignal() {
+
+const asset = document.getElementById("asset").value;
+const interval = document.getElementById("interval").value;
+
+const loading = document.getElementById("loading");
+const error = document.getElementById("error");
+const result = document.getElementById("result");
+
+loading.innerText = "Analisando...";
+error.style.display = "none";
+
+try {
+
+const response = await fetch(
+"/signal?symbol=" +
+encodeURIComponent(asset) +
+"&interval=" +
+encodeURIComponent(interval)
+);
+
+const text = await response.text();
+
+let data;
+
+try {
+data = JSON.parse(text);
+} catch(e) {
+throw new Error(
+"Servidor não retornou JSON válido."
+);
+}
+
+if (!response.ok) {
+throw new Error(
+data.detail || data.error || "Erro no servidor."
+);
+}
+
+function mostrarResultado(data) {
+
+const signal = document.getElementById("signal");
+const result = document.getElementById("result");
+
+result.style.display = "block";
+
+let s = String(
+data.signal || data.direction || "AGUARDE"
+).toUpperCase();
+
+if (s.includes("CALL") || s.includes("BUY")) {
+signal.innerText = "CALL";
+signal.className = "signal call";
+}
+else if (s.includes("PUT") || s.includes("SELL")) {
+signal.innerText = "PUT";
+signal.className = "signal put";
+}
+else {
+signal.innerText = s;
+signal.className = "signal wait";
+}
+
+document.getElementById("confidence").innerText =
+"Probabilidade: " +
+(data.confidence ?? "--") + "%";
+
+mostrarResultado(data);
+
+} catch(err) {
+
+error.innerText = "Erro: " + err.message;
+error.style.display = "block";
+
+} finally {
+
+loading.innerText = "";
+
+}
+
+}
+
+document.getElementById("ema3").innerText =
+data.ema3 ?? "--";
+
+document.getElementById("ema7").innerText =
+data.ema7 ?? "--";
+
+document.getElementById("rsi").innerText =
+data.rsi ?? "--";
+
+document.getElementById("adx").innerText =
+data.adx ?? "--";
+
+document.getElementById("assetResult").innerText =
+data.symbol ?? "--";
+document.getElementById("intervalResult").innerText =
+data.interval ?? "--";
+
+document.getElementById("price").innerText =
+data.reference_price ??
+data.price ??
+data.close ??
+"--";
+
+document.getElementById("nextRef").innerText =
+data.next_candle ??
+data.next ??
+"--";
+
+}
+}
+
+function formatNumber(value) {
+
+if (value === undefined || value === null)
+return "--";
+
+const n = Number(value);
+
+if (Number.isNaN(n))
+return String(value);
+
+return n.toFixed(5);
+}
+
+</script>
+# ROTAS DA API
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "ISMAEL TRADE",
+        "version": APP_VERSION,
+        "key_configured": bool(KEY)
+    }
+
+
 @app.get("/candles")
 async def candles_endpoint(
-    symbol: str = "EUR/USD",
-    interval: str = "1min",
-    outputsize: int = 100
-):
-    return await get_candles(
-        symbol,
-        interval,
-        outputsize
-    )
-
-
-@app.get("/signal")
-async def signal_endpoint(
-    symbol: str = "EUR/USD",
+    symbol: str,
     interval: str = "1min"
 ):
-    if symbol not in ASSETS:
-        raise HTTPException(
-            status_code=400,
-            detail="Ativo não permitido."
-        )
-
     candles = await get_candles(
         symbol,
-        interval,
-        100
+        interval
+    )
+
+    return {
+        "status": "ok",
+        "symbol": symbol,
+        "interval": interval,
+        "count": len(candles),
+        "candles": candles
+    }
+@app.get("/signal")
+async def signal_endpoint(
+    symbol: str,
+    interval: str = "1min"
+):
+    candles = await get_candles(
+        symbol,
+        interval
     )
 
     result = calculate_signal(
         candles
     )
 
+    result["status"] = "ok"
     result["symbol"] = symbol
     result["interval"] = interval
+    return JSONResponse(
+        content=result
+    )
 
-    return result
-@app.get("/")
 
-async def root():
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return HTML_PAGE
+if __name__ == "__main__":
+    import uvicorn
 
-    return HTMLResponse(
-        content=HTML_PAGE
+    port = int(os.getenv("PORT", "8000"))
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port
     )
