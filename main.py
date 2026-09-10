@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "Ismael Trade"
-APP_VERSION = "7.0.0"
+APP_VERSION = "8.0.0"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -296,9 +296,105 @@ def analyze(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+
 def candle_is_closed(candle_time: datetime, interval: str) -> bool:
     minutes = ALLOWED_INTERVALS[interval]
     return now_sp() >= candle_time + timedelta(minutes=minutes)
+
+
+def body(c: Dict[str, Any]) -> float:
+    return abs(float(c["close"]) - float(c["open"]))
+
+
+def bull(c: Dict[str, Any]) -> bool:
+    return float(c["close"]) > float(c["open"])
+
+
+def bear(c: Dict[str, Any]) -> bool:
+    return float(c["close"]) < float(c["open"])
+
+
+def upper_wick(c: Dict[str, Any]) -> float:
+    return float(c["high"]) - max(float(c["open"]), float(c["close"]))
+
+
+def lower_wick(c: Dict[str, Any]) -> float:
+    return min(float(c["open"]), float(c["close"])) - float(c["low"])
+
+
+def candle_range(c: Dict[str, Any]) -> float:
+    return max(float(c["high"]) - float(c["low"]), 1e-12)
+
+
+def bullish_engulfing(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    return (bear(a) and bull(b) and float(b["open"]) <= float(a["close"])
+            and float(b["close"]) >= float(a["open"]) and body(b) > body(a))
+
+
+def bearish_engulfing(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    return (bull(a) and bear(b) and float(b["open"]) >= float(a["close"])
+            and float(b["close"]) <= float(a["open"]) and body(b) > body(a))
+
+
+def bottom_rejection(c: Dict[str, Any]) -> bool:
+    r = candle_range(c)
+    return (lower_wick(c) >= body(c) * 1.2 and lower_wick(c) >= upper_wick(c) * 1.5
+            and float(c["close"]) > float(c["low"]) + r * 0.55)
+
+
+def top_rejection(c: Dict[str, Any]) -> bool:
+    r = candle_range(c)
+    return (upper_wick(c) >= body(c) * 1.2 and upper_wick(c) >= lower_wick(c) * 1.5
+            and float(c["close"]) < float(c["high"]) - r * 0.55)
+
+
+def buyer_strength(c: Dict[str, Any]) -> bool:
+    r = candle_range(c)
+    return (bull(c) and body(c) / r >= 0.55
+            and (float(c["high"]) - float(c["close"])) / r <= 0.25)
+
+
+def seller_strength(c: Dict[str, Any]) -> bool:
+    r = candle_range(c)
+    return (bear(c) and body(c) / r >= 0.55
+            and (float(c["close"]) - float(c["low"])) / r <= 0.25)
+
+
+def sniper(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(rows) < 3:
+        return {"signal": "NEUTRO", "confidence": 0, "call_score": 0, "put_score": 0}
+    prev = rows[-2]
+    cur = rows[-1]
+    call = [
+        bullish_engulfing(prev, cur),
+        bottom_rejection(cur),
+        float(cur["high"]) > float(prev["high"]),
+        buyer_strength(cur),
+        bull(prev) or float(cur["close"]) > float(prev["close"]),
+    ]
+    put = [
+        bearish_engulfing(prev, cur),
+        top_rejection(cur),
+        float(cur["low"]) < float(prev["low"]),
+        seller_strength(cur),
+        bear(prev) or float(cur["close"]) < float(prev["close"]),
+    ]
+    cs = sum(call)
+    ps = sum(put)
+    if cs >= 3 and cs > ps:
+        sig, score = "CALL", cs
+    elif ps >= 3 and ps > cs:
+        sig, score = "PUT", ps
+    else:
+        sig, score = "NEUTRO", max(cs, ps)
+    conf = min(95, 55 + score * 8) if sig != "NEUTRO" else 0
+    return {
+        "signal": sig,
+        "confidence": conf,
+        "call_score": cs,
+        "put_score": ps,
+        "reference_candle": cur["datetime"],
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -310,220 +406,88 @@ async def home() -> HTMLResponse:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Ismael Trade</title>
 <style>
-*{box-sizing:border-box}
-body{margin:0;font-family:Arial,sans-serif;background:#0b1020;color:#f5f7ff}
-.container{max-width:760px;margin:auto;padding:18px}
-h1{margin:0 0 4px;font-size:28px}
-.sub{color:#aeb7cc;margin-bottom:16px}
-.card{background:#151c30;border:1px solid #29324b;border-radius:16px;padding:16px;margin:12px 0}
-.row{display:flex;gap:10px;flex-wrap:wrap}
-label{display:block;color:#aeb7cc;font-size:13px;margin-bottom:6px}
+*{box-sizing:border-box}body{margin:0;background:#0b1020;color:#f5f7ff;font-family:Arial,sans-serif}
+.container{max-width:760px;margin:auto;padding:16px}.card{background:#151c30;border:1px solid #29324b;
+border-radius:16px;padding:16px;margin:12px 0}.row{display:flex;gap:10px;flex-wrap:wrap}
+.field{flex:1;min-width:170px}label,.small{color:#aeb7cc;font-size:13px}label{display:block;margin-bottom:6px}
 select,button{width:100%;padding:12px;border-radius:10px;border:1px solid #34405e;background:#0f1526;color:#fff}
-.field{flex:1;min-width:180px}
-button{cursor:pointer;font-weight:bold}
-.signal{text-align:center;padding:22px;border-radius:14px;font-size:38px;font-weight:800;margin-top:12px}
-.call{background:#103c2b;color:#52f09d}
-.put{background:#481d28;color:#ff718b}
-.neutral{background:#2b3040;color:#d9deeb}
-.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
-.stat{background:#0f1526;border-radius:12px;padding:14px;text-align:center}
-.stat b{display:block;font-size:25px;margin-top:4px}
-.params{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.param{background:#0f1526;border-radius:10px;padding:10px}
-.small{font-size:12px;color:#aeb7cc}
-.value{font-weight:bold}
-.hidden{display:none}
-.good{color:#52f09d}.bad{color:#ff718b}
-.footer{font-size:12px;color:#7f8aa5;line-height:1.5}
-@media(max-width:520px){.grid{grid-template-columns:1fr 1fr}.params{grid-template-columns:1fr}}
+button{cursor:pointer;font-weight:bold}.signal{text-align:center;padding:20px;border-radius:14px;font-size:38px;font-weight:800}
+.call{background:#103c2b;color:#52f09d}.put{background:#481d28;color:#ff718b}.neutral{background:#2b3040;color:#d9deeb}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.stat{background:#0f1526;border-radius:12px;padding:13px;text-align:center}
+.stat b{display:block;font-size:24px;margin-top:5px}.good{color:#52f09d}.bad{color:#ff718b}
+.params{display:grid;grid-template-columns:1fr 1fr;gap:8px}.param{background:#0f1526;border-radius:10px;padding:10px}
+.hidden{display:none}.toggle{display:flex;align-items:center;justify-content:space-between;gap:10px}
+#timer{text-align:center;font-size:34px;font-weight:bold;margin:8px}h1{margin:5px 0}.sub{color:#aeb7cc}
+.footer{font-size:12px;color:#7f8aa5;line-height:1.5}@media(max-width:520px){.grid{grid-template-columns:1fr 1fr}.params{grid-template-columns:1fr}}
 </style>
 </head>
-<body>
-<div class="container">
-<h1>Ismael Trade</h1>
-<div class="sub">Analisador de sinais M1 • dados Twelve Data</div>
-
-<div class="card">
-<div class="row">
-<div class="field">
-<label>ATIVO</label>
-<select id="symbol">
-<option>EUR/USD</option><option>GBP/USD</option><option>USD/JPY</option>
-<option>AUD/USD</option><option>USD/CAD</option><option>USD/CHF</option>
-<option>NZD/USD</option><option>EUR/JPY</option><option>GBP/JPY</option>
-<option>EUR/GBP</option><option>BTC/USD</option><option>ETH/USD</option>
-</select>
+<body><div class="container">
+<h1>📈 Ismael Trade</h1><div class="sub">SNIPER • entrada em horário de Brasília</div>
+<div class="card"><div class="row">
+<div class="field"><label>ATIVO</label><select id="symbol">
+<option>EUR/USD</option><option>GBP/USD</option><option>USD/JPY</option><option>AUD/USD</option>
+<option>USD/CAD</option><option>USD/CHF</option><option>NZD/USD</option><option>EUR/JPY</option>
+<option>GBP/JPY</option><option>EUR/GBP</option><option>BTC/USD</option></select></div>
+<div class="field"><label>TEMPO</label><select id="interval">
+<option value="1min">M1</option><option value="5min">M5</option><option value="15min">M15</option>
+<option value="30min">M30</option></select></div></div>
+<button id="refresh" style="margin-top:10px">ATUALIZAR SINAL</button></div>
+<div class="card"><div class="toggle"><div><div class="small">🎯 ESTRATÉGIA</div><b>SNIPER</b></div>
+<button id="sniperBtn" style="width:auto">ATIVADA</button></div>
+<div class="small" style="margin-top:10px">Engolfo • rejeição • rompimento • força • estrutura</div></div>
+<div class="card"><div class="small">CRONÔMETRO DA VELA</div><div id="timer">--:--</div>
+<div id="entry" class="small">Entrada Brasília: --</div></div>
+<div class="card"><div class="small">SINAL</div><div id="signal" class="signal neutral">AGUARDANDO</div>
+<div class="row" style="margin-top:12px"><div class="field"><div class="small">Confiança</div><b id="confidence">--</b></div>
+<div class="field"><div class="small">Referência</div><b id="reference">--</b></div></div></div>
+<div class="card"><div class="small">RESULTADOS</div><div class="grid">
+<div class="stat">WIN<b id="wins" class="good">0</b></div><div class="stat">LOSS<b id="losses" class="bad">0</b></div>
+<div class="stat">ASSERT.<b id="accuracy">0%</b></div></div><button id="reset" style="margin-top:10px">ZERAR RESULTADOS</button></div>
+<div class="card"><div class="toggle"><div><div class="small">⚙️ PARÂMETROS DOS INDICADORES</div>
+<b id="paramStatus">OCULTO</b></div><button id="toggleParams" style="width:auto">MOSTRAR</button></div>
+<div id="paramsBox" class="params hidden" style="margin-top:12px">
+<div class="param">EMA 3</div><div class="param">EMA 7</div><div class="param">RSI 14</div>
+<div class="param">ADX 21</div><div class="param">ADX 48</div><div class="param">CALL Score <b id="callScore">--</b></div>
+<div class="param">PUT Score <b id="putScore">--</b></div></div></div>
+<div class="card footer">A SNIPER é uma estratégia algorítmica baseada nas regras fornecidas. O sinal é probabilístico,
+não garante WIN e não executa operações automaticamente. Os dados podem diferir da corretora.</div>
 </div>
-<div class="field">
-<label>TEMPO</label>
-<select id="interval">
-<option value="1min">M1</option><option value="5min">M5</option>
-<option value="15min">M15</option><option value="30min">M30</option>
-</select>
-</div>
-</div>
-<button id="refresh" style="margin-top:10px">ATUALIZAR SINAL</button>
-</div>
-
-<div class="card">
-<div class="small">SINAL</div>
-<div id="signal" class="signal neutral">AGUARDANDO</div>
-<div class="row" style="margin-top:12px">
-<div class="field"><div class="small">Confiança</div><div id="confidence" class="value">--</div></div>
-<div class="field"><div class="small">Referência</div><div id="reference" class="value">--</div></div>
-<div class="field"><div class="small">Próxima vela</div><div id="next" class="value">--</div></div>
-</div>
-</div>
-
-<div class="card">
-<div class="small">RESULTADOS</div>
-<div class="grid">
-<div class="stat"><span>WIN</span><b id="wins" class="good">0</b></div>
-<div class="stat"><span>LOSS</span><b id="losses" class="bad">0</b></div>
-<div class="stat"><span>ASSERTIVIDADE</span><b id="accuracy">0%</b></div>
-</div>
-<button id="reset" style="margin-top:10px">ZERAR RESULTADOS</button>
-</div>
-
-<div class="card">
-<div class="row" style="align-items:center;justify-content:space-between">
-<div>
-<div class="small">PARÂMETROS DOS INDICADORES</div>
-<div id="paramStatus" class="value">VISÍVEL</div>
-</div>
-<button id="toggleParams" style="width:auto">OCULTAR PARÂMETROS</button>
-</div>
-<div id="paramsBox" class="params" style="margin-top:12px">
-<div class="param"><span class="small">EMA rápida</span><div class="value">3</div></div>
-<div class="param"><span class="small">EMA lenta</span><div class="value">7</div></div>
-<div class="param"><span class="small">RSI</span><div class="value">14</div></div>
-<div class="param"><span class="small">ADX 1</span><div class="value">21</div></div>
-<div class="param"><span class="small">ADX 2</span><div class="value">48</div></div>
-<div class="param"><span class="small">Nível ADX</span><div class="value">20</div></div>
-<div class="param"><span class="small">CALL Score</span><div id="callScore" class="value">--</div></div>
-<div class="param"><span class="small">PUT Score</span><div id="putScore" class="value">--</div></div>
-<div class="param"><span class="small">EMA 3 atual</span><div id="ema3" class="value">--</div></div>
-<div class="param"><span class="small">EMA 7 atual</span><div id="ema7" class="value">--</div></div>
-<div class="param"><span class="small">RSI 14 atual</span><div id="rsi14" class="value">--</div></div>
-<div class="param"><span class="small">ADX 21 atual</span><div id="adx21" class="value">--</div></div>
-<div class="param"><span class="small">ADX 48 atual</span><div id="adx48" class="value">--</div></div>
-</div>
-</div>
-
-<div class="card footer">
-O sinal é probabilístico e não garante WIN. A análise usa velas fechadas para reduzir repintura. Os preços da Twelve Data podem apresentar diferenças em relação à cotação da sua corretora.
-</div>
-</div>
-
 <script>
-const $ = id => document.getElementById(id);
-let pending = JSON.parse(localStorage.getItem("is_trade_pending") || "null");
-let stats = JSON.parse(localStorage.getItem("is_trade_stats") || '{"wins":0,"losses":0}');
-let paramsVisible = localStorage.getItem("is_trade_params") !== "hidden";
-
-function save(){
-  localStorage.setItem("is_trade_stats", JSON.stringify(stats));
-  if(pending) localStorage.setItem("is_trade_pending", JSON.stringify(pending));
-  else localStorage.removeItem("is_trade_pending");
-}
-function renderStats(){
-  $("wins").textContent = stats.wins;
-  $("losses").textContent = stats.losses;
-  const total = stats.wins + stats.losses;
-  $("accuracy").textContent = total ? ((stats.wins/total)*100).toFixed(1)+"%" : "0%";
-}
-function renderParams(){
-  $("paramsBox").classList.toggle("hidden", !paramsVisible);
-  $("paramStatus").textContent = paramsVisible ? "VISÍVEL" : "OCULTO";
-  $("toggleParams").textContent = paramsVisible ? "OCULTAR PARÂMETROS" : "MOSTRAR PARÂMETROS";
-}
-function fmt(v){ return v == null ? "--" : v; }
-
-async function loadSignal(){
-  const symbol = $("symbol").value;
-  const interval = $("interval").value;
-  $("signal").textContent = "ANALISANDO...";
-  $("signal").className = "signal neutral";
-  try{
-    const r = await fetch(`/signal?symbol=${encodeURIComponent(symbol)}&interval=${interval}`);
-    const d = await r.json();
-    if(!r.ok) throw new Error(d.detail || "Erro");
-    $("signal").textContent = d.signal;
-    $("signal").className = "signal " + (d.signal==="CALL" ? "call" : d.signal==="PUT" ? "put" : "neutral");
-    $("confidence").textContent = d.confidence + "%";
-    $("reference").textContent = d.reference_candle;
-    $("next").textContent = d.next_candle;
-    $("callScore").textContent = d.call_score;
-    $("putScore").textContent = d.put_score;
-    $("ema3").textContent = fmt(d.ema3);
-    $("ema7").textContent = fmt(d.ema7);
-    $("rsi14").textContent = fmt(d.rsi14);
-    $("adx21").textContent = fmt(d.adx21);
-    $("adx48").textContent = fmt(d.adx48);
-
-    if(d.signal !== "NEUTRO"){
-      pending = {
-        symbol:symbol,
-        interval:interval,
-        reference_candle:d.reference_candle,
-        direction:d.signal
-      };
-      save();
-    }
-  }catch(e){
-    $("signal").textContent = "ERRO";
-    $("signal").className = "signal neutral";
-    $("confidence").textContent = e.message;
-  }
-}
-
-async function checkResult(){
-  if(!pending) return;
-  try{
-    const q = new URLSearchParams(pending).toString();
-    const r = await fetch(`/result?${q}`);
-    const d = await r.json();
-    if(!r.ok || !d.ok) return;
-    if(d.result === "WIN"){
-      stats.wins++;
-      pending = null;
-      save();
-      renderStats();
-    }else if(d.result === "LOSS"){
-      stats.losses++;
-      pending = null;
-      save();
-      renderStats();
-    }else if(d.result === "DRAW"){
-      pending = null;
-      save();
-    }
-  }catch(e){}
-}
-
-$("refresh").onclick = loadSignal;
-$("toggleParams").onclick = () => {
-  paramsVisible = !paramsVisible;
-  localStorage.setItem("is_trade_params", paramsVisible ? "visible" : "hidden");
-  renderParams();
-};
-$("reset").onclick = () => {
-  if(confirm("Zerar WIN e LOSS?")){
-    stats = {wins:0,losses:0};
-    pending = null;
-    save();
-    renderStats();
-  }
-};
-
-renderStats();
-renderParams();
-loadSignal();
-setInterval(loadSignal, 60000);
-setInterval(checkResult, 15000);
-</script>
-</body>
-</html>"""
+const $=id=>document.getElementById(id);
+let sniperOn=localStorage.getItem('sniper_on')!=='0';
+let stats=JSON.parse(localStorage.getItem('it_stats')||'{"wins":0,"losses":0}');
+let pending=JSON.parse(localStorage.getItem('it_pending')||'null');let left=0;
+function save(){localStorage.setItem('it_stats',JSON.stringify(stats));
+ if(pending)localStorage.setItem('it_pending',JSON.stringify(pending));else localStorage.removeItem('it_pending');}
+function statsUI(){wins.textContent=stats.wins;losses.textContent=stats.losses;
+ let n=stats.wins+stats.losses;accuracy.textContent=n?((stats.wins/n)*100).toFixed(1)+'%':'0%';}
+function modeUI(){sniperBtn.textContent=sniperOn?'ATIVADA':'DESATIVADA';}
+function toggleSniper(){sniperOn=!sniperOn;localStorage.setItem('sniper_on',sniperOn?'1':'0');modeUI();loadSignal();}
+async function loadSignal(){try{
+ let s=symbol.value,i=interval.value,mode=sniperOn?'SNIPER':'OFF';
+ let r=await fetch('/signal?symbol='+encodeURIComponent(s)+'&interval='+i+'&strategy='+mode);let d=await r.json();
+ if(!r.ok)throw Error(d.detail||'Erro');left=d.seconds_remaining||0;
+ signal.textContent=d.signal;signal.className='signal '+(d.signal==='CALL'?'call':d.signal==='PUT'?'put':'neutral');
+ confidence.textContent=(d.confidence||0)+'%';reference.textContent=d.reference_candle||'--';
+ entry.textContent='Entrada Brasília: '+(d.entry_brasilia||'--');callScore.textContent=d.call_score??'--';putScore.textContent=d.put_score??'--';
+ if(sniperOn&&d.signal!=='NEUTRO'){pending={symbol:s,interval:i,reference_candle:d.reference_candle,direction:d.signal};save();}
+ }catch(e){signal.textContent='ERRO';signal.className='signal neutral';confidence.textContent=e.message;}}
+async function checkResult(){if(!pending)return;try{
+ let q=new URLSearchParams(pending);let r=await fetch('/result?'+q.toString());let d=await r.json();
+ if(d.result==='WIN'){stats.wins++;pending=null;save();statsUI();}
+ else if(d.result==='LOSS'){stats.losses++;pending=null;save();statsUI();}
+ else if(d.result==='DRAW'){pending=null;save();}}
+ catch(e){}}
+setInterval(()=>{if(left>0)left--;let m=Math.floor(left/60),s=left%60;
+ timer.textContent=String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');},1000);
+setInterval(loadSignal,60000);setInterval(checkResult,15000);
+refresh.onclick=loadSignal;sniperBtn.onclick=toggleSniper;symbol.onchange=loadSignal;interval.onchange=loadSignal;
+let visible=localStorage.getItem('it_params')==='1';function paramsUI(){paramsBox.classList.toggle('hidden',!visible);
+ paramStatus.textContent=visible?'VISÍVEL':'OCULTO';toggleParams.textContent=visible?'OCULTAR':'MOSTRAR';}
+toggleParams.onclick=()=>{visible=!visible;localStorage.setItem('it_params',visible?'1':'0');paramsUI();};
+reset.onclick=()=>{if(confirm('Zerar WIN e LOSS?')){stats={wins:0,losses:0};pending=null;save();statsUI();}};
+modeUI();paramsUI();statsUI();loadSignal();checkResult();
+</script></body></html>"""
     return HTMLResponse(html)
 
 
@@ -535,106 +499,74 @@ async def health() -> Dict[str, Any]:
 @app.get("/server-time")
 async def server_time() -> Dict[str, str]:
     current = now_sp()
-    return {
-        "brasilia": current.isoformat(),
-        "utc": datetime.utcnow().isoformat() + "+00:00",
-    }
+    return {"brasilia": current.isoformat(), "utc": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/candles")
 async def candles(
-    symbol: str = "EUR/USD",
-    interval: str = "1min",
-    size: int = 120,
+    symbol: str = "EUR/USD", interval: str = "1min", size: int = 120
 ) -> Dict[str, Any]:
-    requested_size = int(size)
-    values = await get_candles(symbol, interval, requested_size)
-    return {
-        "ok": True,
-        "source": "Twelve Data",
-        "symbol": symbol,
-        "interval": interval,
-        "values": values,
-    }
+    if interval not in ALLOWED_INTERVALS:
+        raise HTTPException(400, "Intervalo inválido.")
+    values = await get_candles(symbol, interval, int(size))
+    return {"ok": True, "source": "Twelve Data", "symbol": symbol,
+            "interval": interval, "values": values}
 
 
 @app.get("/signal")
 async def signal(
-    symbol: str = "EUR/USD",
-    interval: str = "1min",
+    symbol: str = "EUR/USD", interval: str = "1min", strategy: str = "SNIPER"
 ) -> Dict[str, Any]:
-    values = await get_candles(symbol, interval, 150)
-    result = analyze(values)
-    result.update(
-        {
-            "source": "Twelve Data",
-            "symbol": symbol,
-            "interval": interval,
-            "expiry": "1 vela do intervalo selecionado",
-            "warning": "Sinal probabilístico; não garante WIN. A fonte Twelve Data pode não coincidir com os preços da corretora.",
-        }
-    )
+    if interval not in ALLOWED_INTERVALS:
+        raise HTTPException(400, "Intervalo inválido.")
+    values = await get_candles(symbol, interval, 160)
+    closed = values[:-1] if len(values) > 1 else values
+    result = sniper(closed) if strategy.upper() == "SNIPER" else {
+        "signal": "NEUTRO", "confidence": 0, "call_score": 0, "put_score": 0
+    }
+    now = now_sp()
+    period = ALLOWED_INTERVALS[interval] * 60
+    seconds = now.minute * 60 + now.second
+    remaining = period - (seconds % period)
+    result.update({
+        "ok": True, "strategy": strategy.upper(), "symbol": symbol,
+        "interval": interval, "entry_brasilia": now.strftime("%d/%m/%Y %H:%M:%S"),
+        "seconds_remaining": remaining, "non_repaint_reference": True,
+        "source": "Twelve Data",
+        "warning": "Sinal probabilístico; não garante WIN e não executa operações.",
+    })
     return result
 
 
 @app.get("/result")
 async def result(
-    symbol: str,
-    interval: str,
-    reference_candle: str,
-    direction: str,
+    symbol: str, interval: str, reference_candle: str, direction: str
 ) -> Dict[str, Any]:
     direction = direction.upper().strip()
     if direction not in {"CALL", "PUT"}:
-        raise HTTPException(status_code=400, detail="Direção inválida.")
-
-    values = await get_candles(symbol, interval, 150)
-    reference_dt = parse_time(reference_candle)
-
-    reference_index: Optional[int] = None
-    for i, candle in enumerate(values):
-        if parse_time(candle["datetime"]) == reference_dt:
-            reference_index = i
+        raise HTTPException(400, "Direção inválida.")
+    values = await get_candles(symbol, interval, 160)
+    ref = parse_time(reference_candle)
+    idx = None
+    for i, c in enumerate(values):
+        if parse_time(c["datetime"]) == ref:
+            idx = i
             break
-
-    if reference_index is None:
+    if idx is None or idx + 1 >= len(values):
         return {"ok": True, "status": "PENDING", "result": None}
-
-    next_index = reference_index + 1
-    if next_index >= len(values):
+    nxt = values[idx + 1]
+    if not candle_is_closed(parse_time(nxt["datetime"]), interval):
         return {"ok": True, "status": "PENDING", "result": None}
-
-    next_candle = values[next_index]
-    next_time = parse_time(next_candle["datetime"])
-
-    if not candle_is_closed(next_time, interval):
-        return {
-            "ok": True,
-            "status": "PENDING",
-            "result": None,
-            "next_candle": next_candle["datetime"],
-        }
-
-    candle_open = next_candle["open"]
-    candle_close = next_candle["close"]
-
-    if candle_close == candle_open:
-        outcome = "DRAW"
+    op, cl = float(nxt["open"]), float(nxt["close"])
+    if cl == op:
+        out = "DRAW"
     elif direction == "CALL":
-        outcome = "WIN" if candle_close > candle_open else "LOSS"
+        out = "WIN" if cl > op else "LOSS"
     else:
-        outcome = "WIN" if candle_close < candle_open else "LOSS"
-
-    return {
-        "ok": True,
-        "status": "CLOSED",
-        "result": outcome,
-        "direction": direction,
-        "reference_candle": reference_candle,
-        "result_candle": next_candle["datetime"],
-        "open": candle_open,
-        "close": candle_close,
-    }
+        out = "WIN" if cl < op else "LOSS"
+    return {"ok": True, "status": "CLOSED", "result": out,
+            "direction": direction, "reference_candle": reference_candle,
+            "result_candle": nxt["datetime"], "open": op, "close": cl}
 
 
 if __name__ == "__main__":
