@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
@@ -8,7 +8,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "Ismael Trade"
-APP_VERSION = "8.0.0"
+APP_VERSION = "8.1.0"
+LICENSE_EXPIRES = os.getenv("LICENSE_EXPIRES", "2026-12-31").strip()
+WHATSAPP_1 = "5584998411282"
+WHATSAPP_2 = "5584994499442"
+INSTAGRAM = "Ismaelartur26"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -52,6 +56,34 @@ def parse_time(value: str) -> datetime:
             except ValueError:
                 pass
     raise ValueError(f"Timestamp inválido: {value}")
+
+
+def license_status() -> Dict[str, Any]:
+    try:
+        expires = datetime.strptime(LICENSE_EXPIRES, "%Y-%m-%d").replace(tzinfo=SP_TZ)
+    except ValueError:
+        raise HTTPException(500, "LICENSE_EXPIRES inválida. Use AAAA-MM-DD.")
+    now = now_sp()
+    # A licença vale até o fim do dia configurado em Brasília.
+    expires_end = expires.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return {
+        "active": now <= expires_end,
+        "expires": expires.strftime("%d/%m/%Y"),
+        "expires_iso": LICENSE_EXPIRES,
+        "whatsapp": [WHATSAPP_1, WHATSAPP_2],
+        "instagram": INSTAGRAM,
+    }
+
+
+def require_license() -> None:
+    status = license_status()
+    if not status["active"]:
+        raise HTTPException(status_code=403, detail={
+            "message": "Licença expirada.",
+            "expires": status["expires"],
+            "whatsapp": status["whatsapp"],
+            "instagram": status["instagram"],
+        })
 
 
 async def get_candles(symbol: str, interval: str, outputsize: int = 120) -> List[Dict[str, Any]]:
@@ -418,7 +450,8 @@ button{cursor:pointer;font-weight:bold}.signal{text-align:center;padding:20px;bo
 .params{display:grid;grid-template-columns:1fr 1fr;gap:8px}.param{background:#0f1526;border-radius:10px;padding:10px}
 .hidden{display:none}.toggle{display:flex;align-items:center;justify-content:space-between;gap:10px}
 #timer{text-align:center;font-size:34px;font-weight:bold;margin:8px}h1{margin:5px 0}.sub{color:#aeb7cc}
-.footer{font-size:12px;color:#7f8aa5;line-height:1.5}@media(max-width:520px){.grid{grid-template-columns:1fr 1fr}.params{grid-template-columns:1fr}}
+.footer{font-size:12px;color:#7f8aa5;line-height:1.5}.license-overlay{position:fixed;inset:0;background:rgba(4,7,15,.96);display:flex;align-items:center;justify-content:center;padding:20px;z-index:9999}.license-box{width:min(460px,100%);background:#151c30;border:1px solid #394563;border-radius:20px;padding:28px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.45)}.license-icon{font-size:48px}.license-box h2{margin:10px 0;color:#ff718b}.license-box p{color:#c8cede;line-height:1.5}.license-date{margin:16px 0;color:#aeb7cc}.license-btn{display:block;text-decoration:none;background:#0f1526;color:#fff;border:1px solid #34405e;border-radius:10px;padding:13px;margin:9px 0;font-weight:bold}.license-btn:hover{filter:brightness(1.15)}
+@media(max-width:520px){.grid{grid-template-columns:1fr 1fr}.params{grid-template-columns:1fr}}
 </style>
 </head>
 <body><div class="container">
@@ -452,6 +485,18 @@ button{cursor:pointer;font-weight:bold}.signal{text-align:center;padding:20px;bo
 <div class="card footer">A SNIPER é uma estratégia algorítmica baseada nas regras fornecidas. O sinal é probabilístico,
 não garante WIN e não executa operações automaticamente. Os dados podem diferir da corretora.</div>
 </div>
+<div id="licenseOverlay" class="license-overlay hidden">
+  <div class="license-box">
+    <div class="license-icon">🔒</div>
+    <h2>LICENÇA EXPIRADA</h2>
+    <p>Sua licença do <b>Ismael Trade</b> expirou.</p>
+    <p>Para continuar utilizando o aplicativo, entre em contato para renovar sua licença.</p>
+    <div class="license-date" id="licenseDate">Vencimento: --</div>
+    <a id="wa1" class="license-btn" target="_blank" rel="noopener">📱 Renovar pelo WhatsApp 1</a>
+    <a id="wa2" class="license-btn" target="_blank" rel="noopener">📱 Renovar pelo WhatsApp 2</a>
+    <a id="ig" class="license-btn" target="_blank" rel="noopener">📸 Instagram @Ismaelartur26</a>
+  </div>
+</div>
 <script>
 const $=id=>document.getElementById(id);
 let sniperOn=localStorage.getItem('sniper_on')!=='0';
@@ -463,7 +508,21 @@ function statsUI(){wins.textContent=stats.wins;losses.textContent=stats.losses;
  let n=stats.wins+stats.losses;accuracy.textContent=n?((stats.wins/n)*100).toFixed(1)+'%':'0%';}
 function modeUI(){sniperBtn.textContent=sniperOn?'ATIVADA':'DESATIVADA';}
 function toggleSniper(){sniperOn=!sniperOn;localStorage.setItem('sniper_on',sniperOn?'1':'0');modeUI();loadSignal();}
-async function loadSignal(){try{
+async function checkLicense(){
+ try{
+  let r=await fetch('/license'); let d=await r.json();
+  if(!d.active){showExpired(d); return false;}
+  return true;
+ }catch(e){return true;}
+}
+function showExpired(d){
+ licenseOverlay.classList.remove('hidden');
+ licenseDate.textContent='Vencimento: '+(d.expires||'--');
+ wa1.href='https://wa.me/'+(d.whatsapp?.[0]||'5584998411282')+'?text='+encodeURIComponent('Olá Ismael Trade, quero renovar minha licença.');
+ wa2.href='https://wa.me/'+(d.whatsapp?.[1]||'5584994499442')+'?text='+encodeURIComponent('Olá Ismael Trade, quero renovar minha licença.');
+ ig.href='https://instagram.com/'+(d.instagram||'Ismaelartur26');
+}
+async function loadSignal(){if(!(await checkLicense()))return;try{
  let s=symbol.value,i=interval.value,mode=sniperOn?'SNIPER':'OFF';
  let r=await fetch('/signal?symbol='+encodeURIComponent(s)+'&interval='+i+'&strategy='+mode);let d=await r.json();
  if(!r.ok)throw Error(d.detail||'Erro');left=d.seconds_remaining||0;
@@ -472,7 +531,7 @@ async function loadSignal(){try{
  entry.textContent='Entrada Brasília: '+(d.entry_brasilia||'--');callScore.textContent=d.call_score??'--';putScore.textContent=d.put_score??'--';
  if(sniperOn&&d.signal!=='NEUTRO'){pending={symbol:s,interval:i,reference_candle:d.reference_candle,direction:d.signal};save();}
  }catch(e){signal.textContent='ERRO';signal.className='signal neutral';confidence.textContent=e.message;}}
-async function checkResult(){if(!pending)return;try{
+async function checkResult(){if(!pending)return;if(!(await checkLicense()))return;try{
  let q=new URLSearchParams(pending);let r=await fetch('/result?'+q.toString());let d=await r.json();
  if(d.result==='WIN'){stats.wins++;pending=null;save();statsUI();}
  else if(d.result==='LOSS'){stats.losses++;pending=null;save();statsUI();}
@@ -489,6 +548,11 @@ reset.onclick=()=>{if(confirm('Zerar WIN e LOSS?')){stats={wins:0,losses:0};pend
 modeUI();paramsUI();statsUI();loadSignal();checkResult();
 </script></body></html>"""
     return HTMLResponse(html)
+
+
+@app.get("/license")
+async def license() -> Dict[str, Any]:
+    return license_status()
 
 
 @app.get("/health")
@@ -517,6 +581,7 @@ async def candles(
 async def signal(
     symbol: str = "EUR/USD", interval: str = "1min", strategy: str = "SNIPER"
 ) -> Dict[str, Any]:
+    require_license()
     if interval not in ALLOWED_INTERVALS:
         raise HTTPException(400, "Intervalo inválido.")
     values = await get_candles(symbol, interval, 160)
@@ -542,6 +607,7 @@ async def signal(
 async def result(
     symbol: str, interval: str, reference_candle: str, direction: str
 ) -> Dict[str, Any]:
+    require_license()
     direction = direction.upper().strip()
     if direction not in {"CALL", "PUT"}:
         raise HTTPException(400, "Direção inválida.")
