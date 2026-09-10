@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "Ismael Trade"
 APP_VERSION = "8.1.0"
-LICENSE_EXPIRES = os.getenv("LICENSE_EXPIRES", "").strip() or "31/12/2026"
+LICENSE_EXPIRES = os.getenv("LICENSE_EXPIRES", "").strip() or "2026-12-31"
 WHATSAPP_1 = "5584998411282"
 WHATSAPP_2 = "5584994499442"
 INSTAGRAM = "Ismaelartur26"
