@@ -6,18 +6,17 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 
+
 app = FastAPI(
     title="Ismael Trade",
     version="6.0.0"
 )
 
-# ============================================================
-# CONFIGURAÇÃO
-# ============================================================
 
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 URL = "https://api.twelvedata.com/time_series"
+
 
 ALLOWED_INTERVALS = {
     "1min",
@@ -25,6 +24,7 @@ ALLOWED_INTERVALS = {
     "15min",
     "30min"
 }
+
 
 ASSETS = [
     "EUR/USD",
@@ -42,174 +42,169 @@ ASSETS = [
 ]
 
 
-# ============================================================
-# PÁGINA ISMAEL TRADE
-# ============================================================
-
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="pt-BR">
 
 <head>
+
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<meta name="viewport"
+content="width=device-width, initial-scale=1">
 
 <title>Ismael Trade</title>
 
 <style>
 
-*{
-    box-sizing:border-box;
+* {
+    box-sizing: border-box;
 }
 
-body{
-    margin:0;
-    font-family:Arial,sans-serif;
-    background:#080d18;
-    color:white;
+body {
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #080d18;
+    color: white;
 }
 
-.container{
-    max-width:560px;
-    margin:auto;
-    padding:18px;
+.container {
+    max-width: 560px;
+    margin: auto;
+    padding: 18px;
 }
 
-.title{
-    text-align:center;
-    font-size:32px;
-    font-weight:bold;
-    margin-top:10px;
+.title {
+    text-align: center;
+    font-size: 32px;
+    font-weight: bold;
+    margin-top: 10px;
 }
 
-.subtitle{
-    text-align:center;
-    color:#94a3b8;
-    margin:5px 0 20px;
+.subtitle {
+    text-align: center;
+    color: #94a3b8;
+    margin: 5px 0 20px;
 }
 
-.card{
-    background:#111827;
-    border-radius:18px;
-    padding:18px;
-    margin-bottom:15px;
-    box-shadow:0 5px 20px rgba(0,0,0,.25);
+.card {
+    background: #111827;
+    border-radius: 18px;
+    padding: 18px;
+    margin-bottom: 15px;
+    box-shadow: 0 5px 20px rgba(0,0,0,.25);
 }
 
-label{
-    display:block;
-    margin-bottom:7px;
-    color:#cbd5e1;
-    font-weight:bold;
+label {
+    display: block;
+    margin-bottom: 7px;
+    color: #cbd5e1;
+    font-weight: bold;
 }
 
 select,
-button{
-    width:100%;
-    padding:14px;
-    border:0;
-    border-radius:12px;
-    font-size:16px;
-    margin-bottom:15px;
+button {
+    width: 100%;
+    padding: 14px;
+    border: 0;
+    border-radius: 12px;
+    font-size: 16px;
+    margin-bottom: 15px;
 }
 
-select{
-    background:#1e293b;
-    color:white;
+select {
+    background: #1e293b;
+    color: white;
 }
 
-button{
-    background:#2563eb;
-    color:white;
-    font-weight:bold;
-    cursor:pointer;
+button {
+    background: #2563eb;
+    color: white;
+    font-weight: bold;
+    cursor: pointer;
 }
 
-button:active{
-    transform:scale(.98);
+.signal {
+    text-align: center;
+    font-size: 42px;
+    font-weight: bold;
+    padding: 24px;
+    border-radius: 15px;
+    background: #1e293b;
 }
 
-.signal{
-    text-align:center;
-    font-size:42px;
-    font-weight:bold;
-    padding:24px;
-    border-radius:15px;
-    background:#1e293b;
+.call {
+    color: #22c55e;
 }
 
-.call{
-    color:#22c55e;
+.put {
+    color: #ef4444;
 }
 
-.put{
-    color:#ef4444;
+.wait {
+    color: #facc15;
 }
 
-.wait{
-    color:#facc15;
+.info {
+    display: flex;
+    justify-content: space-between;
+    padding: 10px 0;
+    border-bottom: 1px solid #273449;
 }
 
-.info{
-    display:flex;
-    justify-content:space-between;
-    padding:10px 0;
-    border-bottom:1px solid #273449;
+.info:last-child {
+    border-bottom: 0;
 }
 
-.info:last-child{
-    border-bottom:0;
+.value {
+    font-weight: bold;
 }
 
-.value{
-    font-weight:bold;
+.loading {
+    text-align: center;
+    color: #60a5fa;
+    display: none;
+    margin-top: 5px;
 }
 
-.loading{
-    text-align:center;
-    color:#60a5fa;
-    display:none;
-    margin-top:5px;
+.warning {
+    font-size: 12px;
+    color: #94a3b8;
+    line-height: 1.6;
+    text-align: center;
 }
 
-.warning{
-    font-size:12px;
-    color:#94a3b8;
-    line-height:1.6;
-    text-align:center;
+.time {
+    text-align: center;
+    color: #94a3b8;
+    font-size: 13px;
+    margin-bottom: 10px;
 }
 
-.time{
-    text-align:center;
-    color:#94a3b8;
-    font-size:13px;
-    margin-bottom:10px;
+.assetrow {
+    display: flex;
+    justify-content: space-between;
+    background: #1e293b;
+    padding: 12px;
+    border-radius: 10px;
+    margin: 6px 0;
 }
 
-.assetrow{
-    display:flex;
-    justify-content:space-between;
-    background:#1e293b;
-    padding:12px;
-    border-radius:10px;
-    margin:6px 0;
+.green {
+    color: #22c55e;
 }
 
-.green{
-    color:#22c55e;
+.red {
+    color: #ef4444;
 }
 
-.red{
-    color:#ef4444;
+.yellow {
+    color: #facc15;
 }
 
-.yellow{
-    color:#facc15;
-}
-
-.rowtitle{
-    font-weight:bold;
-    margin-bottom:10px;
+.rowtitle {
+    font-weight: bold;
+    margin-bottom: 10px;
 }
 
 </style>
@@ -225,7 +220,7 @@ ISMAEL TRADE
 </div>
 
 <div class="subtitle">
-Sistema de análise probabilística M1
+Sistema de análise probabilística
 </div>
 
 
@@ -239,30 +234,43 @@ Sistema de análise probabilística M1
 TODOS OS ATIVOS
 </option>
 
-<option>EUR/USD</option>
-<option>GBP/USD</option>
-<option>USD/JPY</option>
-<option>AUD/USD</option>
-<option>USD/CAD</option>
-<option>USD/CHF</option>
-<option>NZD/USD</option>
-<option>EUR/JPY</option>
-<option>GBP/JPY</option>
-<option>EUR/GBP</option>
-<option>BTC/USD</option>
-<option>ETH/USD</option>
+<option value="EUR/USD">EUR/USD</option>
+<option value="GBP/USD">GBP/USD</option>
+<option value="USD/JPY">USD/JPY</option>
+<option value="AUD/USD">AUD/USD</option>
+<option value="USD/CAD">USD/CAD</option>
+<option value="USD/CHF">USD/CHF</option>
+<option value="NZD/USD">NZD/USD</option>
+<option value="EUR/JPY">EUR/JPY</option>
+<option value="GBP/JPY">GBP/JPY</option>
+<option value="EUR/GBP">EUR/GBP</option>
+<option value="BTC/USD">BTC/USD</option>
+<option value="ETH/USD">ETH/USD</option>
 
 </select>
 
 
-<label>Tempo gráfico</label>
+<label>
+Tempo gráfico
+</label>
 
 <select id="interval">
 
-<option value="1min">M1</option>
-<option value="5min">M5</option>
-<option value="15min">M15</option>
-<option value="30min">M30</option>
+<option value="1min">
+M1
+</option>
+
+<option value="5min">
+M5
+</option>
+
+<option value="15min">
+M15
+</option>
+
+<option value="30min">
+M30
+</option>
 
 </select>
 
@@ -271,83 +279,183 @@ TODOS OS ATIVOS
 ANALISAR AGORA
 </button>
 
-<div id="loading" class="loading">
+
+<div id="loading"
+class="loading">
+
 Analisando mercado...
-</div>
 
 </div>
 
+</div>
 
-<div id="singleCard" class="card">
 
-<div id="signal" class="signal wait">
+<div id="singleCard"
+class="card">
+
+<div id="signal"
+class="signal wait">
+
 WAIT
-</div>
 
 </div>
 
+</div>
 
-<div id="details" class="card">
+
+<div id="details"
+class="card">
 
 <div class="info">
-<span>Confiança</span>
-<span id="confidence" class="value">--</span>
+
+<span>
+Confiança
+</span>
+
+<span id="confidence"
+class="value">
+--
+</span>
+
 </div>
+
 
 <div class="info">
-<span>EMA 3</span>
-<span id="ema3" class="value">--</span>
+
+<span>
+EMA 3
+</span>
+
+<span id="ema3"
+class="value">
+--
+</span>
+
 </div>
+
 
 <div class="info">
-<span>EMA 7</span>
-<span id="ema7" class="value">--</span>
+
+<span>
+EMA 7
+</span>
+
+<span id="ema7"
+class="value">
+--
+</span>
+
 </div>
+
 
 <div class="info">
-<span>RSI 14</span>
-<span id="rsi" class="value">--</span>
+
+<span>
+RSI 14
+</span>
+
+<span id="rsi"
+class="value">
+--
+</span>
+
 </div>
+
 
 <div class="info">
-<span>ADX 21</span>
-<span id="adx21" class="value">--</span>
+
+<span>
+ADX 21
+</span>
+
+<span id="adx21"
+class="value">
+--
+</span>
+
 </div>
+
 
 <div class="info">
-<span>ADX 48</span>
-<span id="adx48" class="value">--</span>
-</div>
+
+<span>
+ADX 48
+</span>
+
+<span id="adx48"
+class="value">
+--
+</span>
 
 </div>
 
+</div>
 
-<div id="referenceCard" class="card">
+
+<div id="referenceCard"
+class="card">
 
 <div class="info">
-<span>Vela de referência</span>
-<span id="reference" class="value">--</span>
+
+<span>
+Vela de referência
+</span>
+
+<span id="reference"
+class="value">
+--
+</span>
+
 </div>
+
 
 <div class="info">
-<span>Próxima vela</span>
-<span id="next" class="value">--</span>
+
+<span>
+Próxima vela
+</span>
+
+<span id="next"
+class="value">
+--
+</span>
+
 </div>
+
 
 <div class="info">
-<span>Ativo</span>
-<span id="asset" class="value">--</span>
+
+<span>
+Ativo
+</span>
+
+<span id="asset"
+class="value">
+--
+</span>
+
 </div>
+
 
 <div class="info">
-<span>Timeframe</span>
-<span id="tf" class="value">--</span>
-</div>
+
+<span>
+Timeframe
+</span>
+
+<span id="tf"
+class="value">
+--
+</span>
 
 </div>
 
+</div>
 
-<div id="allCard" class="card" style="display:none">
+
+<div id="allCard"
+class="card"
+style="display:none">
 
 <div class="rowtitle">
 Resultado dos ativos
@@ -366,7 +474,8 @@ Resultado dos ativos
 
 <br><br>
 
-A fonte de dados pode apresentar diferenças em relação aos ativos OTC da IQ Option.
+Os preços da Twelve Data podem apresentar
+diferenças em relação aos ativos OTC da IQ Option.
 
 <br><br>
 
@@ -377,8 +486,11 @@ Este sistema não executa operações automaticamente.
 </div>
 
 
-<div class="time" id="updated">
+<div class="time"
+id="updated">
+
 Aguardando análise...
+
 </div>
 
 </div>
@@ -387,40 +499,46 @@ Aguardando análise...
 <script>
 
 const ASSETS = [
-"EUR/USD",
-"GBP/USD",
-"USD/JPY",
-"AUD/USD",
-"USD/CAD",
-"USD/CHF",
-"NZD/USD",
-"EUR/JPY",
-"GBP/JPY",
-"EUR/GBP",
-"BTC/USD",
-"ETH/USD"
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+    "AUD/USD",
+    "USD/CAD",
+    "USD/CHF",
+    "NZD/USD",
+    "EUR/JPY",
+    "GBP/JPY",
+    "EUR/GBP",
+    "BTC/USD",
+    "ETH/USD"
 ];
 
 
-async function getSignal(symbol, interval){
+async function getSignal(symbol, interval) {
 
     const url =
-        "/signal?symbol="
-        + encodeURIComponent(symbol)
-        + "&interval="
-        + encodeURIComponent(interval);
+        "/signal?symbol=" +
+        encodeURIComponent(symbol) +
+        "&interval=" +
+        encodeURIComponent(interval);
 
     const response = await fetch(url);
 
     let data;
 
-    try{
+    try {
+
         data = await response.json();
-    }catch{
-        throw new Error("Resposta inválida da API.");
+
+    } catch (error) {
+
+        throw new Error(
+            "Resposta inválida da API."
+        );
+
     }
 
-    if(!response.ok){
+    if (!response.ok) {
 
         throw new Error(
             data.detail || "Erro na análise."
@@ -432,93 +550,165 @@ async function getSignal(symbol, interval){
 }
 
 
-function mostrarResultado(data){
+function mostrarResultado(data) {
 
     const signal =
         document.getElementById("signal");
 
+
     signal.innerText =
         data.signal || "WAIT";
 
-    signal.className =
-        "signal " +
-        (
-            data.signal === "CALL"
-            ? "call"
-            : data.signal === "PUT"
-            ? "put"
-            : "wait"
-        );
+
+    if (data.signal === "CALL") {
+
+        signal.className =
+            "signal call";
+
+    } else if (data.signal === "PUT") {
+
+        signal.className =
+            "signal put";
+
+    } else {
+
+        signal.className =
+            "signal wait";
+
+    }
 
 
-    document.getElementById("confidence").innerText =
+    document.getElementById(
+        "confidence"
+    ).innerText =
         data.confidence != null
-        ? data.confidence + "%"
-        : "--";
+            ? data.confidence + "%"
+            : "--";
 
 
-    document.getElementById("ema3").innerText =
-        data.ema3 ?? "--";
+    document.getElementById(
+        "ema3"
+    ).innerText =
+        data.ema3 != null
+            ? data.ema3
+            : "--";
 
-    document.getElementById("ema7").innerText =
-        data.ema7 ?? "--";
 
-    document.getElementById("rsi").innerText =
-        data.rsi14 ?? "--";
+    document.getElementById(
+        "ema7"
+    ).innerText =
+        data.ema7 != null
+            ? data.ema7
+            : "--";
 
-    document.getElementById("adx21").innerText =
-        data.adx21 ?? "--";
 
-    document.getElementById("adx48").innerText =
-        data.adx48 ?? "--";
+    document.getElementById(
+        "rsi"
+    ).innerText =
+        data.rsi14 != null
+            ? data.rsi14
+            : "--";
 
-    document.getElementById("reference").innerText =
-        data.reference_candle ?? "--";
 
-    document.getElementById("next").innerText =
-        data.next_candle ?? "--";
+    document.getElementById(
+        "adx21"
+    ).innerText =
+        data.adx21 != null
+            ? data.adx21
+            : "--";
 
-    document.getElementById("asset").innerText =
-        data.symbol ?? "--";
 
-    document.getElementById("tf").innerText =
-        data.interval ?? "--";
+    document.getElementById(
+        "adx48"
+    ).innerText =
+        data.adx48 != null
+            ? data.adx48
+            : "--";
+
+
+    document.getElementById(
+        "reference"
+    ).innerText =
+        data.reference_candle || "--";
+
+
+    document.getElementById(
+        "next"
+    ).innerText =
+        data.next_candle || "--";
+
+
+    document.getElementById(
+        "asset"
+    ).innerText =
+        data.symbol || "--";
+
+
+    document.getElementById(
+        "tf"
+    ).innerText =
+        data.interval || "--";
+
 }
 
 
-async function analisar(){
+async function analisar() {
 
     const symbol =
-        document.getElementById("symbol").value;
+        document.getElementById(
+            "symbol"
+        ).value;
+
 
     const interval =
-        document.getElementById("interval").value;
+        document.getElementById(
+            "interval"
+        ).value;
+
 
     const loading =
-        document.getElementById("loading");
+        document.getElementById(
+            "loading"
+        );
 
-    loading.style.display = "block";
+
+    loading.style.display =
+        "block";
 
 
-    try{
+    try {
 
-        if(symbol === "ALL"){
+        if (symbol === "ALL") {
 
-            document.getElementById("singleCard").style.display =
+            document.getElementById(
+                "singleCard"
+            ).style.display =
                 "none";
 
-            document.getElementById("details").style.display =
+
+            document.getElementById(
+                "details"
+            ).style.display =
                 "none";
 
-            document.getElementById("referenceCard").style.display =
+
+            document.getElementById(
+                "referenceCard"
+            ).style.display =
                 "none";
 
-            document.getElementById("allCard").style.display =
+
+            document.getElementById(
+                "allCard"
+            ).style.display =
                 "block";
 
 
             const box =
-                document.getElementById("allResults");
+                document.getElementById(
+                    "allResults"
+                );
+
 
             box.innerHTML =
                 "Carregando...";
@@ -526,67 +716,96 @@ async function analisar(){
 
             const results =
                 await Promise.all(
+                    ASSETS.map(
+                        async function(asset) {
 
-                    ASSETS.map(async asset => {
+                            try {
 
-                        try{
+                                return await getSignal(
+                                    asset,
+                                    interval
+                                );
 
-                            return await getSignal(
-                                asset,
-                                interval
-                            );
+                            } catch (error) {
 
-                        }catch(error){
+                                return {
+                                    symbol: asset,
+                                    signal: "ERRO",
+                                    confidence: 0
+                                };
 
-                            return {
-                                symbol:asset,
-                                signal:"ERRO",
-                                confidence:0
-                            };
+                            }
 
                         }
-
-                    })
-
+                    )
                 );
 
 
             box.innerHTML =
-                results.map(data => {
+                results.map(
+                    function(data) {
 
-                    const cls =
-                        data.signal === "CALL"
-                        ? "green"
-                        : data.signal === "PUT"
-                        ? "red"
-                        : "yellow";
+                        let cls = "yellow";
 
 
-                    return `
-                    <div class="assetrow">
-                        <span>${data.symbol}</span>
-                        <b class="${cls}">
-                            ${data.signal}
-                            ${data.confidence || 0}%
-                        </b>
-                    </div>
-                    `;
+                        if (
+                            data.signal === "CALL"
+                        ) {
 
-                }).join("");
+                            cls = "green";
+
+                        } else if (
+                            data.signal === "PUT"
+                        ) {
+
+                            cls = "red";
+
+                        }
 
 
-        }else{
+                        return (
+                            '<div class="assetrow">' +
+                            '<span>' +
+                            data.symbol +
+                            '</span>' +
+                            '<b class="' +
+                            cls +
+                            '">' +
+                            data.signal +
+                            ' ' +
+                            (data.confidence || 0) +
+                            '%' +
+                            '</b>' +
+                            '</div>'
+                        );
 
-            document.getElementById("singleCard").style.display =
+                    }
+                ).join("");
+
+
+        } else {
+
+            document.getElementById(
+                "singleCard"
+            ).style.display =
                 "block";
 
-            document.getElementById("details").style.display =
+
+            document.getElementById(
+                "details"
+            ).style.display =
                 "block";
 
-            document.getElementById("referenceCard").style.display =
+
+            document.getElementById(
+                "referenceCard"
+            ).style.display =
                 "block";
 
-            document.getElementById("allCard").style.display =
+
+            document.getElementById(
+                "allCard"
+            ).style.display =
                 "none";
 
 
@@ -596,24 +815,29 @@ async function analisar(){
                     interval
                 );
 
+
             mostrarResultado(data);
 
         }
 
 
-        document.getElementById("updated").innerText =
-            "Última análise: "
-            + new Date().toLocaleTimeString("pt-BR");
+        document.getElementById(
+            "updated"
+        ).innerText =
+            "Última análise: " +
+            new Date().toLocaleTimeString(
+                "pt-BR"
+            );
 
 
-    }catch(error){
+    } catch (error) {
 
         alert(
             error.message ||
             "Erro desconhecido."
         );
 
-    }finally{
+    } finally {
 
         loading.style.display =
             "none";
@@ -624,6 +848,7 @@ async function analisar(){
 
 
 analisar();
+
 
 setInterval(
     analisar,
@@ -638,14 +863,18 @@ setInterval(
 """
 
 
-# ============================================================
-# ROTAS BÁSICAS
-# ============================================================
+# =========================================================
+# PÁGINA PRINCIPAL
+# =========================================================
 
 @app.get("/", response_class=HTMLResponse)
 def root():
     return HTML_PAGE
 
+
+# =========================================================
+# HEALTH
+# =========================================================
 
 @app.get("/health")
 def health():
@@ -657,20 +886,23 @@ def health():
     }
 
 
+# =========================================================
+# HORÁRIO DO SERVIDOR
+# =========================================================
+
 @app.get("/server-time")
 def server_time():
 
     return {
-        "utc":
-            datetime.now(
-                timezone.utc
-            ).isoformat()
+        "utc": datetime.now(
+            timezone.utc
+        ).isoformat()
     }
 
 
-# ============================================================
-# DADOS DE MERCADO
-# ============================================================
+# =========================================================
+# BUSCAR CANDLES
+# =========================================================
 
 async def get_candles(
     symbol: str,
@@ -682,8 +914,10 @@ async def get_candles(
 
         raise HTTPException(
             status_code=500,
-            detail=
-            "TWELVE_DATA_API_KEY não configurada no Render."
+            detail=(
+                "TWELVE_DATA_API_KEY "
+                "não configurada no Render."
+            )
         )
 
 
@@ -691,8 +925,10 @@ async def get_candles(
 
         raise HTTPException(
             status_code=400,
-            detail=
-            "Intervalo inválido. Use 1min, 5min, 15min ou 30min."
+            detail=(
+                "Intervalo inválido. "
+                "Use 1min, 5min, 15min ou 30min."
+            )
         )
 
 
@@ -704,25 +940,30 @@ async def get_candles(
         )
 
 
+    try:
+
+        requested_size = int(size)
+
+    except (TypeError, ValueError):
+
+        requested_size = 200
+
+
     outputsize = max(
         100,
-        min(int(size), 500)
+        min(
+            requested_size,
+            500
+        )
     )
 
 
     params = {
-
         "symbol": symbol,
-
         "interval": interval,
-
         "outputsize": outputsize,
-
         "apikey": KEY,
-
-        "timezone":
-            "America/Sao_Paulo",
-
+        "timezone": "America/Sao_Paulo",
         "format": "JSON"
     }
 
@@ -740,16 +981,18 @@ async def get_candles(
 
             response.raise_for_status()
 
-            data: dict[str, Any] =
+            data: dict[str, Any] = (
                 response.json()
-
+            )
 
     except httpx.HTTPError as exc:
 
         raise HTTPException(
             status_code=502,
-            detail=
-            f"Erro ao consultar a fonte de dados: {exc}"
+            detail=(
+                "Erro ao consultar "
+                "a fonte de dados."
+            )
         ) from exc
 
 
@@ -757,8 +1000,7 @@ async def get_candles(
 
         raise HTTPException(
             status_code=502,
-            detail=
-            data.get(
+            detail=data.get(
                 "message",
                 "Erro retornado pela Twelve Data."
             )
@@ -775,13 +1017,19 @@ async def get_candles(
 
         raise HTTPException(
             status_code=502,
-            detail=
-            "A fonte de dados não retornou candles."
+            detail=(
+                "A fonte de dados não "
+                "retornou candles."
+            )
         )
 
 
     return values
 
+
+# =========================================================
+# CANDLES
+# =========================================================
 
 @app.get("/candles")
 async def candles(
@@ -790,38 +1038,26 @@ async def candles(
     outputsize: int = 100
 ):
 
-    values =
-        await get_candles(
-            symbol,
-            interval,
-            outputsize
-        )
+    values = await get_candles(
+        symbol,
+        interval,
+        outputsize
+    )
 
 
     return {
-
         "ok": True,
-
-        "source":
-            "Twelve Data",
-
-        "symbol":
-            symbol,
-
-        "interval":
-            interval,
-
-        "count":
-            len(values),
-
-        "values":
-            values
+        "source": "Twelve Data",
+        "symbol": symbol,
+        "interval": interval,
+        "count": len(values),
+        "values": values
     }
 
 
-# ============================================================
+# =========================================================
 # EMA
-# ============================================================
+# =========================================================
 
 def ema(
     values,
@@ -829,36 +1065,36 @@ def ema(
 ):
 
     if len(values) < period:
+
         return None
 
 
-    alpha =
-        2.0 / (
-            period + 1.0
-        )
+    alpha = 2.0 / (
+        period + 1.0
+    )
 
 
-    value =
-        sum(
-            values[:period]
-        ) / period
+    value = (
+        sum(values[:period])
+        / period
+    )
 
 
     for price in values[period:]:
 
-        value =
-            price * alpha \
-            + value * (
-                1.0 - alpha
-            )
+        value = (
+            price * alpha
+            +
+            value * (1.0 - alpha)
+        )
 
 
     return value
 
 
-# ============================================================
+# =========================================================
 # RSI
-# ============================================================
+# =========================================================
 
 def rsi(
     values,
@@ -866,51 +1102,56 @@ def rsi(
 ):
 
     if len(values) < period + 1:
+
         return None
 
 
-    gains = [
+    gains = []
 
-        max(
+    losses = []
+
+
+    for i in range(
+        1,
+        len(values)
+    ):
+
+        change = (
             values[i] -
-            values[i - 1],
-            0.0
+            values[i - 1]
         )
 
-        for i in range(
-            1,
-            len(values)
-        )
 
-    ]
+        if change > 0:
 
+            gains.append(change)
 
-    losses = [
+        else:
 
-        max(
-            values[i - 1] -
-            values[i],
-            0.0
-        )
-
-        for i in range(
-            1,
-            len(values)
-        )
-
-    ]
+            gains.append(0.0)
 
 
-    average_gain =
-        sum(
-            gains[:period]
-        ) / period
+        if change < 0:
+
+            losses.append(
+                abs(change)
+            )
+
+        else:
+
+            losses.append(0.0)
 
 
-    average_loss =
-        sum(
-            losses[:period]
-        ) / period
+    average_gain = (
+        sum(gains[:period])
+        / period
+    )
+
+
+    average_loss = (
+        sum(losses[:period])
+        / period
+    )
 
 
     for i in range(
@@ -918,20 +1159,24 @@ def rsi(
         len(gains)
     ):
 
-        average_gain =
+        average_gain = (
             (
                 (period - 1)
                 * average_gain
-                + gains[i]
-            ) / period
+            )
+            +
+            gains[i]
+        ) / period
 
 
-        average_loss =
+        average_loss = (
             (
                 (period - 1)
                 * average_loss
-                + losses[i]
-            ) / period
+            )
+            +
+            losses[i]
+        ) / period
 
 
     if average_loss == 0:
@@ -939,21 +1184,24 @@ def rsi(
         return 100.0
 
 
-    rs =
+    rs = (
         average_gain /
         average_loss
+    )
 
 
     return (
         100.0 -
-        100.0 /
-        (1.0 + rs)
+        (
+            100.0 /
+            (1.0 + rs)
+        )
     )
 
 
-# ============================================================
+# =========================================================
 # ADX
-# ============================================================
+# =========================================================
 
 def adx(
     values,
@@ -967,30 +1215,33 @@ def adx(
         return None
 
 
-    data =
-        list(
-            reversed(values)
-        )
+    data = list(
+        reversed(values)
+    )
 
 
     highs = [
-        float(x["high"])
-        for x in data
+        float(candle["high"])
+        for candle in data
     ]
+
 
     lows = [
-        float(x["low"])
-        for x in data
+        float(candle["low"])
+        for candle in data
     ]
 
+
     closes = [
-        float(x["close"])
-        for x in data
+        float(candle["close"])
+        for candle in data
     ]
 
 
     tr = []
+
     plus_dm = []
+
     minus_dm = []
 
 
@@ -1000,59 +1251,60 @@ def adx(
     ):
 
         true_range = max(
-
-            highs[i] -
-            lows[i],
-
+            highs[i] - lows[i],
             abs(
                 highs[i] -
                 closes[i - 1]
             ),
-
             abs(
                 lows[i] -
                 closes[i - 1]
             )
-
         )
 
 
-        up_move =
+        up_move = (
             highs[i] -
             highs[i - 1]
+        )
 
 
-        down_move =
+        down_move = (
             lows[i - 1] -
             lows[i]
-
-
-        plus_dm.append(
-
-            up_move
-            if (
-                up_move >
-                down_move
-                and
-                up_move > 0
-            )
-            else 0.0
-
         )
 
 
-        minus_dm.append(
+        if (
+            up_move > down_move
+            and up_move > 0
+        ):
 
-            down_move
-            if (
-                down_move >
+            plus_dm.append(
                 up_move
-                and
-                down_move > 0
             )
-            else 0.0
 
-        )
+        else:
+
+            plus_dm.append(
+                0.0
+            )
+
+
+        if (
+            down_move > up_move
+            and down_move > 0
+        ):
+
+            minus_dm.append(
+                down_move
+            )
+
+        else:
+
+            minus_dm.append(
+                0.0
+            )
 
 
         tr.append(
@@ -1060,22 +1312,22 @@ def adx(
         )
 
 
-    atr =
-        sum(
-            tr[:period]
-        ) / period
+    atr = (
+        sum(tr[:period])
+        / period
+    )
 
 
-    plus =
-        sum(
-            plus_dm[:period]
-        ) / period
+    plus = (
+        sum(plus_dm[:period])
+        / period
+    )
 
 
-    minus =
-        sum(
-            minus_dm[:period]
-        ) / period
+    minus = (
+        sum(minus_dm[:period])
+        / period
+    )
 
 
     dx = []
@@ -1086,189 +1338,198 @@ def adx(
         len(tr)
     ):
 
-        atr =
+        atr = (
             (
                 (period - 1)
                 * atr
-                + tr[i]
-            ) / period
+            )
+            +
+            tr[i]
+        ) / period
 
 
-        plus =
+        plus = (
             (
                 (period - 1)
                 * plus
-                + plus_dm[i]
-            ) / period
+            )
+            +
+            plus_dm[i]
+        ) / period
 
 
-        minus =
+        minus = (
             (
                 (period - 1)
                 * minus
-                + minus_dm[i]
-            ) / period
+            )
+            +
+            minus_dm[i]
+        ) / period
 
 
-        plus_di =
-            100.0 * plus / atr \
-            if atr else 0.0
+        if atr != 0:
+
+            plus_di = (
+                100.0 *
+                plus /
+                atr
+            )
+
+            minus_di = (
+                100.0 *
+                minus /
+                atr
+            )
+
+        else:
+
+            plus_di = 0.0
+
+            minus_di = 0.0
 
 
-        minus_di =
-            100.0 * minus / atr \
-            if atr else 0.0
-
-
-        total =
+        total = (
             plus_di +
             minus_di
+        )
+
+
+        if total != 0:
+
+            current_dx = (
+                100.0 *
+                abs(
+                    plus_di -
+                    minus_di
+                )
+                /
+                total
+            )
+
+        else:
+
+            current_dx = 0.0
 
 
         dx.append(
-
-            100.0 *
-            abs(
-                plus_di -
-                minus_di
-            ) / total
-
-            if total
-            else 0.0
-
+            current_dx
         )
 
 
     if len(dx) < period:
+
         return None
 
 
-    value =
-        sum(
-            dx[:period]
-        ) / period
+    value = (
+        sum(dx[:period])
+        / period
+    )
 
 
     for item in dx[period:]:
 
-        value =
+        value = (
             (
                 (period - 1)
                 * value
-                + item
-            ) / period
+            )
+            +
+            item
+        ) / period
 
 
     return value
 
 
-# ============================================================
-# ANÁLISE ISMAEL TRADE
-# ============================================================
+# =========================================================
+# ANÁLISE
+# =========================================================
 
 def analyze(values):
 
     if len(values) < 100:
 
         return {
-
-            "signal":
-                "WAIT",
-
-            "confidence":
-                0,
-
-            "reason":
-                "Dados insuficientes."
+            "signal": "WAIT",
+            "confidence": 0,
+            "reason": "Dados insuficientes."
         }
 
 
-    # A Twelve Data normalmente entrega
-    # a vela mais recente primeiro.
+    # A primeira vela retornada pela Twelve Data
+    # é a vela mais recente.
     #
-    # Ignoramos a vela mais recente para
-    # reduzir sinais baseados em vela ainda aberta.
+    # Ela é ignorada para a análise principal.
+    # Dessa forma usamos a vela fechada anterior.
 
-    closed =
-        values[1:]
+    closed = values[1:]
 
 
     closes = [
-
-        float(
-            candle["close"]
-        )
-
-        for candle in reversed(
-            closed
-        )
-
+        float(candle["close"])
+        for candle in reversed(closed)
     ]
 
 
-    ema3 =
-        ema(
-            closes,
-            3
+    ema3 = ema(
+        closes,
+        3
+    )
+
+
+    ema7 = ema(
+        closes,
+        7
+    )
+
+
+    rsi14 = rsi(
+        closes,
+        14
+    )
+
+
+    adx21 = adx(
+        closed,
+        21
+    )
+
+
+    adx48 = adx(
+        closed,
+        48
+    )
+
+
+    if any(
+        value is None
+        for value in (
+            ema3,
+            ema7,
+            rsi14,
+            adx21,
+            adx48
         )
-
-
-    ema7 =
-        ema(
-            closes,
-            7
-        )
-
-
-    rsi14 =
-        rsi(
-            closes,
-            14
-        )
-
-
-    adx21 =
-        adx(
-            closed,
-            21
-        )
-
-
-    adx48 =
-        adx(
-            closed,
-            48
-        )
-
-
-    if None in (
-        ema3,
-        ema7,
-        rsi14,
-        adx21,
-        adx48
     ):
 
         return {
-
-            "signal":
-                "WAIT",
-
-            "confidence":
-                0,
-
-            "reason":
-                "Dados insuficientes para os filtros."
+            "signal": "WAIT",
+            "confidence": 0,
+            "reason": (
+                "Dados insuficientes "
+                "para os filtros."
+            )
         }
 
 
     call_score = 0
+
     put_score = 0
 
 
-    # --------------------------------------------------------
     # EMA 3 x EMA 7
-    # --------------------------------------------------------
 
     if ema3 > ema7:
 
@@ -1279,22 +1540,26 @@ def analyze(values):
         put_score += 2
 
 
-    # --------------------------------------------------------
     # RSI
-    # --------------------------------------------------------
 
-    if 52 <= rsi14 < 70:
+    if (
+        rsi14 >= 52
+        and
+        rsi14 < 70
+    ):
 
         call_score += 1
 
-    elif 30 < rsi14 <= 48:
+    elif (
+        rsi14 > 30
+        and
+        rsi14 <= 48
+    ):
 
         put_score += 1
 
 
-    # --------------------------------------------------------
     # ADX 21
-    # --------------------------------------------------------
 
     if adx21 >= 20:
 
@@ -1307,9 +1572,7 @@ def analyze(values):
             put_score += 1
 
 
-    # --------------------------------------------------------
     # ADX 48
-    # --------------------------------------------------------
 
     if adx48 >= 20:
 
@@ -1322,9 +1585,7 @@ def analyze(values):
             put_score += 1
 
 
-    # --------------------------------------------------------
     # DECISÃO
-    # --------------------------------------------------------
 
     if (
         call_score >= 4
@@ -1352,38 +1613,32 @@ def analyze(values):
 
         signal = "WAIT"
 
-        score =
-            max(
-                call_score,
-                put_score
-            )
+        score = max(
+            call_score,
+            put_score
+        )
 
 
-    # --------------------------------------------------------
-    # CONFIANÇA
-    # --------------------------------------------------------
+    # Confiança é uma pontuação
+    # probabilística, não uma garantia.
 
     if signal != "WAIT":
 
-        confidence =
-            min(
-                95,
-                50 + score * 8
-            )
+        confidence = min(
+            95,
+            50 + score * 8
+        )
 
     else:
 
-        confidence =
+        confidence = (
             50 + score * 3
+        )
 
 
     return {
-
-        "signal":
-            signal,
-
-        "confidence":
-            confidence,
+        "signal": signal,
+        "confidence": confidence,
 
         "reference_candle":
             closed[0].get(
@@ -1436,9 +1691,9 @@ def analyze(values):
     }
 
 
-# ============================================================
-# ENDPOINT DE SINAL
-# ============================================================
+# =========================================================
+# SINAL
+# =========================================================
 
 @app.get("/signal")
 async def signal(
@@ -1458,29 +1713,25 @@ async def signal(
 
         raise HTTPException(
             status_code=400,
-            detail=
-            "Intervalo inválido."
+            detail="Intervalo inválido."
         )
 
 
-    values =
-        await get_candles(
-            symbol,
-            interval,
-            200
-        )
+    values = await get_candles(
+        symbol,
+        interval,
+        200
+    )
 
 
-    result =
-        analyze(
-            values
-        )
+    result = analyze(
+        values
+    )
 
 
     result.update({
 
-        "ok":
-            True,
+        "ok": True,
 
         "source":
             "Twelve Data",
@@ -1495,9 +1746,14 @@ async def signal(
             "1 vela do intervalo selecionado",
 
         "warning":
-            "Sinal probabilístico; não garante WIN. "
-            "A fonte Twelve Data pode não coincidir "
-            "com os preços OTC da IQ Option."
+            (
+                "Sinal probabilístico; "
+                "não garante WIN. "
+                "A fonte Twelve Data pode "
+                "não coincidir com os preços "
+                "OTC da IQ Option."
+            )
+
     })
 
 
