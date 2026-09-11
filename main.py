@@ -9,8 +9,8 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_NAME = "TRADE SNIPER"
-APP_VERSION = "8.9.0"
+APP_NAME = "Ismael Trade"
+APP_VERSION = "9.0.1"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -63,6 +63,11 @@ RATE_LIMIT_COOLDOWN_SECONDS = 20.0
 CANDLE_CACHE: Dict[tuple, tuple] = {}
 CANDLE_LOCKS: Dict[tuple, asyncio.Lock] = {}
 RATE_LIMIT_UNTIL = 0.0
+RADAR_CACHE: Dict[tuple, tuple] = {}
+RADAR_SYMBOLS = [
+    "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF",
+]
+RADAR_TTL_SECONDS = 45.0
 
 
 def now_sp() -> datetime:
@@ -602,6 +607,98 @@ def analyze(candles: List[Dict[str, Any]], strategy: str = "rsi") -> Dict[str, A
     }
 
 
+
+def radar_score(analysis: Dict[str, Any], strategy: str) -> Dict[str, Any]:
+    """Converte a análise da estratégia em proximidade de CALL/PUT para o radar."""
+    strategy = strategy.lower().strip()
+    if strategy == "rsi":
+        r9 = float(analysis.get("rsi9", 50.0))
+        r14 = float(analysis.get("rsi14", 50.0))
+        bull = max(0.0, min(100.0, 50.0 + ((r9 - 50.0) + (r14 - 50.0)) * 1.5))
+        bear = max(0.0, min(100.0, 50.0 + ((50.0 - r9) + (50.0 - r14)) * 1.5))
+    elif strategy == "old_sniper":
+        bull = min(100.0, 50.0 + float(analysis.get("bull_score", 0)) * 10.0)
+        bear = min(100.0, 50.0 + float(analysis.get("bear_score", 0)) * 10.0)
+    elif strategy == "sniper_02":
+        bull = 90.0 if analysis.get("call_setup") else 50.0
+        bear = 90.0 if analysis.get("put_setup") else 50.0
+    else:
+        bull_score = float(analysis.get("call_score", 0))
+        bear_score = float(analysis.get("put_score", 0))
+        bull = min(99.0, 50.0 + bull_score * 5.0)
+        bear = min(99.0, 50.0 + bear_score * 5.0)
+
+    if bull >= bear and bull >= 58.0:
+        direction = "CALL"
+        proximity = int(round(bull))
+    elif bear > bull and bear >= 58.0:
+        direction = "PUT"
+        proximity = int(round(bear))
+    else:
+        direction = "NEUTRO"
+        proximity = int(round(max(bull, bear)))
+    return {"direction": direction, "proximity": max(0, min(99, proximity)),
+            "call_proximity": int(round(bull)), "put_proximity": int(round(bear))}
+
+
+@app.get("/radar")
+async def radar(
+    interval: str = "1min",
+    strategy: str = "rsi",
+) -> Dict[str, Any]:
+    require_active_license()
+    if interval not in ALLOWED_INTERVALS:
+        raise HTTPException(status_code=400, detail="Timeframe inválido.")
+    if strategy not in {"rsi", "old_sniper", "sniper_02", "sniper_03"}:
+        raise HTTPException(status_code=400, detail="Estratégia inválida.")
+
+    cache_key = (interval, strategy)
+    cached = RADAR_CACHE.get(cache_key)
+    now_mono = time.monotonic()
+    if cached and (now_mono - cached[0]) < RADAR_TTL_SECONDS:
+        return cached[1]
+
+    # Para evitar estourar rapidamente o limite da Twelve Data, o radar
+    # usa primeiro dados já em cache e completa apenas o necessário.
+    results: List[Dict[str, Any]] = []
+    errors = 0
+    for symbol_name in RADAR_SYMBOLS:
+        try:
+            values = await get_candles(symbol_name, interval, 100)
+            analysis = analyze(values, strategy)
+            proximity = radar_score(analysis, strategy)
+            results.append({
+                "symbol": symbol_name,
+                "signal": analysis["signal"],
+                "direction": proximity["direction"],
+                "proximity": proximity["proximity"],
+                "call_proximity": proximity["call_proximity"],
+                "put_proximity": proximity["put_proximity"],
+                "confidence": int(analysis.get("confidence", 50)),
+                "reference_candle": analysis.get("reference_candle"),
+            })
+        except HTTPException:
+            errors += 1
+            continue
+        except Exception:
+            errors += 1
+            continue
+
+    results.sort(key=lambda x: (x["direction"] == "NEUTRO", -x["proximity"]))
+    payload = {
+        "ok": True,
+        "interval": interval,
+        "strategy": strategy,
+        "symbols_checked": len(results),
+        "errors": errors,
+        "results": results,
+        "warning": "Radar probabilístico: proximidade não é garantia de sinal ou WIN.",
+    }
+    RADAR_CACHE[cache_key] = (time.monotonic(), payload)
+    return payload
+
+
+
 def candle_is_closed(candle_time: datetime, interval: str) -> bool:
     minutes = ALLOWED_INTERVALS[interval]
     return now_sp() >= candle_time + timedelta(minutes=minutes)
@@ -650,6 +747,7 @@ button{cursor:pointer;font-weight:bold}
 .countdown{font-size:25px;font-weight:800}
 .entry{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
 .entryBox{background:#0f1526;border-radius:12px;padding:12px}
+.radarRow{display:grid;grid-template-columns:110px 1fr 48px;gap:10px;align-items:center;background:#0f1526;border-radius:12px;padding:10px;margin:7px 0}.radarMeter{height:9px;background:#252c40;border-radius:999px;overflow:hidden}.radarFill{height:100%;border-radius:999px}.radarFill.call{background:#2ee88a}.radarFill.put{background:#ff718b}.radarFill.neutral{background:#8892a8}
 @media(max-width:520px){.entry{grid-template-columns:1fr}}
 @media(max-width:520px){.grid{grid-template-columns:1fr 1fr}.params{grid-template-columns:1fr}}
 </style>
@@ -740,12 +838,14 @@ button{cursor:pointer;font-weight:bold}
 <button id="reset" style="margin-top:10px">ZERAR RESULTADOS</button>
 </div>
 
-<div class="card"><div class="small">CONFIGURAÇÃO DAS ESTRATÉGIAS</div><div class="params" style="margin-top:12px">
-<div class="param"><span class="small">Estratégia ativa</span><div id="strategyStatus" class="value">SNIPER X</div></div><div class="param"><span class="small">Modo geral</span><div id="modeStatus" class="value">ONLINE</div></div>
-<div class="param"><span class="small">RSI 9 atual</span><div id="rsi9" class="value">--</div></div><div class="param"><span class="small">RSI 14 atual</span><div id="rsi14" class="value">--</div></div>
-<div class="param"><span class="small">Engolfo</span><div id="engulf" class="value">--</div></div><div class="param"><span class="small">Rejeição</span><div id="rejection" class="value">--</div></div>
-<div class="param"><span class="small">Rompimento</span><div id="breakout" class="value">--</div></div><div class="param"><span class="small">Força / Estrutura</span><div id="strength" class="value">--</div></div>
-</div></div>
+<div class="card" id="radarCard">
+<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+<div><div class="small">RADAR DE OPORTUNIDADES</div><div class="sniperTitle">PARES PRÓXIMOS DE SINAL</div></div>
+<div id="radarStatus" class="badge">AGUARDANDO</div>
+</div>
+<div class="small" style="margin-top:8px">Mostra os pares com maior proximidade de CALL ou PUT na estratégia ativa.</div>
+<div id="radarList" style="margin-top:12px"></div>
+</div>
 
 <div class="card footer">
 O sinal é probabilístico e não garante WIN. A análise usa velas fechadas para reduzir repintura. Os preços da Twelve Data podem apresentar diferenças em relação à cotação da sua corretora.
@@ -756,7 +856,6 @@ O sinal é probabilístico e não garante WIN. A análise usa velas fechadas par
 const $ = id => document.getElementById(id);
 let pending = JSON.parse(localStorage.getItem("is_trade_pending") || "null");
 let stats = JSON.parse(localStorage.getItem("is_trade_stats") || '{"wins":0,"losses":0}');
-let paramsVisible = localStorage.getItem("is_trade_params") !== "hidden";
 let isOnline = true;
 let rsiOnline = localStorage.getItem("is_trade_rsi_online") !== "off";
 let oldOnline = localStorage.getItem("is_trade_old_online") === "on";
@@ -787,7 +886,7 @@ function activeStrategy(){
   if(sniper03Online)return "sniper_03";
   return null;
 }
-function renderMode(){setStrategyButton("rsiToggle",rsiOnline);setStrategyButton("oldToggle",oldOnline);setStrategyButton("sniper02Toggle",sniper02Online);setStrategyButton("sniper03Toggle",sniper03Online);const active=activeStrategy();$("modeStatus").textContent=isOnline&&active?"ONLINE":"OFFLINE";$("strategyStatus").textContent=active==="old_sniper"?"SNIPER 01":active==="sniper_02"?"SNIPER 02":active==="sniper_03"?"SNIPER 03":active==="rsi"?"SNIPER X":"NENHUMA";if(!isOnline||!active){$("signal").textContent="OFFLINE";$("signal").className="signal neutral";}}
+function renderMode(){setStrategyButton("rsiToggle",rsiOnline);setStrategyButton("oldToggle",oldOnline);setStrategyButton("sniper02Toggle",sniper02Online);setStrategyButton("sniper03Toggle",sniper03Online);const active=activeStrategy();if(!isOnline||!active){$("signal").textContent="OFFLINE";$("signal").className="signal neutral";}}
 
 function fmt(v){ return v == null ? "--" : v; }
 
@@ -922,11 +1021,35 @@ async function checkResult(){
 }
 
 
-$("refresh").onclick = loadSignal;
-$("rsiToggle").onclick=()=>{rsiOnline=!rsiOnline;if(rsiOnline)selectedStrategy="rsi";localStorage.setItem("is_trade_rsi_online",rsiOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&rsiOnline)loadSignal();};
-$("oldToggle").onclick=()=>{oldOnline=!oldOnline;if(oldOnline)selectedStrategy="old_sniper";localStorage.setItem("is_trade_old_online",oldOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&oldOnline)loadSignal();};
-$("sniper02Toggle").onclick=()=>{sniper02Online=!sniper02Online;if(sniper02Online)selectedStrategy="sniper_02";localStorage.setItem("is_trade_sniper02_online",sniper02Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper02Online)loadSignal();};
-$("sniper03Toggle").onclick=()=>{sniper03Online=!sniper03Online;if(sniper03Online)selectedStrategy="sniper_03";localStorage.setItem("is_trade_sniper03_online",sniper03Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper03Online)loadSignal();};
+function radarRow(item){
+  const cls=item.direction==="CALL"?"call":item.direction==="PUT"?"put":"neutral";
+  const label=item.direction==="NEUTRO"?(item.proximity>=75?"PRÓXIMO":"OBSERVAR"):item.direction;
+  return `<div class="radarRow"><div><b>${item.symbol}</b><div class="small">${label} • confiança ${item.confidence}%</div></div><div class="radarMeter"><div class="radarFill ${cls}" style="width:${item.proximity}%"></div></div><b>${item.proximity}%</b></div>`;
+}
+async function loadRadar(){
+  const strategy=activeStrategy();
+  if(!isOnline||!strategy){$("radarStatus").textContent="OFFLINE";$("radarList").innerHTML="<div class='small'>Ative uma estratégia para iniciar o radar.</div>";return;}
+  $("radarStatus").textContent="ANALISANDO";
+  try{
+    const interval=$("interval").value;
+    const r=await fetch(`/radar?interval=${encodeURIComponent(interval)}&strategy=${encodeURIComponent(strategy)}`,{cache:"no-store"});
+    const d=await r.json();
+    if(!r.ok){const msg=d.detail&&typeof d.detail==="object"?d.detail.message:(d.detail||"Erro no radar.");throw new Error(msg);}
+    const items=(d.results||[]);
+    $("radarStatus").textContent=items.length?`${items.length} PARES`:"SEM DADOS";
+    $("radarList").innerHTML=items.length?items.map(radarRow).join(""):"<div class='small'>Nenhum par disponível no momento.</div>";
+  }catch(e){
+    $("radarStatus").textContent="AGUARDAR";
+    $("radarList").innerHTML=`<div class='small'>Radar temporariamente indisponível: ${e.message||"erro de dados"}</div>`;
+  }
+}
+
+
+$("refresh").onclick = ()=>{loadSignal();loadRadar();};
+$("rsiToggle").onclick=()=>{rsiOnline=!rsiOnline;if(rsiOnline)selectedStrategy="rsi";localStorage.setItem("is_trade_rsi_online",rsiOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&rsiOnline){loadSignal();loadRadar();}};
+$("oldToggle").onclick=()=>{oldOnline=!oldOnline;if(oldOnline)selectedStrategy="old_sniper";localStorage.setItem("is_trade_old_online",oldOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&oldOnline){loadSignal();loadRadar();}};
+$("sniper02Toggle").onclick=()=>{sniper02Online=!sniper02Online;if(sniper02Online)selectedStrategy="sniper_02";localStorage.setItem("is_trade_sniper02_online",sniper02Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper02Online){loadSignal();loadRadar();}};
+$("sniper03Toggle").onclick=()=>{sniper03Online=!sniper03Online;if(sniper03Online)selectedStrategy="sniper_03";localStorage.setItem("is_trade_sniper03_online",sniper03Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper03Online){loadSignal();loadRadar();}};
 $("reset").onclick = () => {
   if(confirm("Zerar WIN e LOSS?")){
     stats = {wins:0,losses:0};
@@ -944,6 +1067,7 @@ setInterval(updateClock, 1000);
 setInterval(updateCountdown, 250);
 syncServerClock();
 loadLicense();
+loadRadar();
 // Se não houver operação pendente, atualiza somente na virada da vela.
 let lastEntrySlot = "";
 setInterval(() => {
@@ -961,6 +1085,7 @@ setInterval(() => {
 if(pending) scheduleResultCheck();
 setInterval(syncServerClock, 30000);
 setInterval(loadLicense, 60000);
+setInterval(loadRadar, 45000);
 </script>
 </body>
 </html>"""
