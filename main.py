@@ -9,7 +9,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_NAME = "Ismael Trade"
+APP_NAME = "TRADE SNIPER"
 APP_VERSION = "9.0.2"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
