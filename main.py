@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "Ismael Trade"
-APP_VERSION = "9.0.3"
+APP_VERSION = "9.0.4"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -1040,8 +1040,8 @@ async function loadSignal(){
     $("next").textContent = d.entry_time || d.next_candle;
     $("entryTime").textContent = (d.entry_time || d.next_candle || "--").split(" ")[1] || "--";
     $("expiry").textContent = (d.expiry_time || "").split(" ")[1] || "--";
-    $("rsi9").textContent = fmt(d.rsi9);
-    $("rsi14").textContent = fmt(d.rsi14);
+    if($("rsi9")) $("rsi9").textContent = fmt(d.rsi9);
+    if($("rsi14")) $("rsi14").textContent = fmt(d.rsi14);
     if($("engulf")) $("engulf").textContent = d.bullish_engulfing || d.bearish_engulfing ? "SIM" : "NÃO";
     if($("rejection")) $("rejection").textContent = d.bullish_rejection || d.bearish_rejection ? "SIM" : "NÃO";
     if($("breakout")) $("breakout").textContent = d.bullish_breakout || d.bearish_breakout ? "SIM" : "NÃO";
