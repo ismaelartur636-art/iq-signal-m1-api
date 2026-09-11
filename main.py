@@ -6,11 +6,37 @@ from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+# IA/ML real: ensemble leve para rodar no Render sem depender de modelos gigantes.
+try:
+    from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    SKLEARN_OK = True
+except Exception:
+    SKLEARN_OK = False
+
+# XGBoost é opcional. Se estiver instalado, entra como modelo de maior peso
+# no ensemble; se não estiver, o sistema continua funcionando com scikit-learn.
+try:
+    from xgboost import XGBClassifier
+    XGBOOST_OK = True
+except Exception:
+    XGBOOST_OK = False
+
+# LightGBM é opcional. Quando disponível, acrescenta um segundo modelo
+# de gradient boosting rápido e independente ao ensemble.
+try:
+    from lightgbm import LGBMClassifier
+    LIGHTGBM_OK = True
+except Exception:
+    LIGHTGBM_OK = False
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "Ismael Trade"
-APP_VERSION = "9.0.4"
+APP_VERSION = "9.2.0"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -68,6 +94,12 @@ RADAR_SYMBOLS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF",
 ]
 RADAR_TTL_SECONDS = 120.0
+
+# Cache dos modelos por ativo/timeframe. O treinamento é feito apenas quando
+# o cache expira, reduzindo CPU e evitando treinar a cada atualização da tela.
+AI_MODEL_CACHE: Dict[tuple, tuple] = {}
+AI_MODEL_TTL_SECONDS = 300.0
+
 
 
 def now_sp() -> datetime:
@@ -146,7 +178,7 @@ async def get_candles(symbol: str, interval: str, outputsize: int = 100) -> List
         params = {
             "symbol": SYMBOLS[symbol],
             "interval": interval,
-            "outputsize": min(max(int(outputsize), 20), 120),
+            "outputsize": min(max(int(outputsize), 20), 500),
             "timezone": "America/Sao_Paulo",
             "order": "ASC",
         }
@@ -321,11 +353,7 @@ def adx(candles: List[Dict[str, Any]], period: int) -> List[float]:
 
 
 def analyze(candles: List[Dict[str, Any]], strategy: str = "rsi") -> Dict[str, Any]:
-    """Analisa somente candles fechados para reduzir repintura.
-
-    SNIPER 01: leitura de price action/confluência por candles.
-    SNIPER X: confluência RSI 9 + RSI 14.
-    """
+    """Analisa somente candles fechados para reduzir repintura. SNIPER 01: leitura de price action/confluência por candles. SNIPER X: confluência RSI 9 + RSI 14. """
     if len(candles) < 30:
         raise HTTPException(status_code=422, detail="Dados insuficientes para análise.")
 
@@ -611,9 +639,7 @@ def analyze(candles: List[Dict[str, Any]], strategy: str = "rsi") -> Dict[str, A
 
 
 def detect_market_trend(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Detecta a tendência usando somente candles fechados.
-    EMA 9/20/50 + inclinação da EMA 20.
-    """
+    """Detecta a tendência usando somente candles fechados. EMA 9/20/50 + inclinação da EMA 20. """
     closed = candles[:-1]
     if len(closed) < 55:
         return {"trend": "NEUTRA", "trend_text": "Tendência neutra", "trend_score": 0}
@@ -652,6 +678,9 @@ def radar_score(analysis: Dict[str, Any], strategy: str) -> Dict[str, Any]:
     elif strategy == "sniper_02":
         bull = 90.0 if analysis.get("call_setup") else 50.0
         bear = 90.0 if analysis.get("put_setup") else 50.0
+    elif strategy == "ai":
+        bull = float(analysis.get("p_up", 50.0))
+        bear = float(analysis.get("p_down", 50.0))
     else:
         bull_score = float(analysis.get("call_score", 0))
         bear_score = float(analysis.get("put_score", 0))
@@ -679,7 +708,7 @@ async def radar(
     require_active_license()
     if interval not in ALLOWED_INTERVALS:
         raise HTTPException(status_code=400, detail="Timeframe inválido.")
-    if strategy not in {"rsi", "old_sniper", "sniper_02", "sniper_03"}:
+    if strategy not in {"rsi", "old_sniper", "sniper_02", "sniper_03", "ai"}:
         raise HTTPException(status_code=400, detail="Estratégia inválida.")
 
     cache_key = (interval, strategy)
@@ -694,8 +723,17 @@ async def radar(
     errors = 0
     for symbol_name in RADAR_SYMBOLS:
         try:
-            values = await get_candles(symbol_name, interval, 100)
-            analysis = analyze(values, strategy)
+            values = await get_candles(symbol_name, interval, 240 if strategy == "ai" else 100)
+            if strategy == "ai":
+                ml = await asyncio.to_thread(predict_ai_ensemble, symbol_name, interval, values)
+                if ml.get("ready"):
+                    analysis = {"signal": ml.get("signal", "NEUTRO"), "confidence": ml.get("confidence", 50),
+                                "p_up": ml.get("p_up", 50), "p_down": ml.get("p_down", 50),
+                                "agreement": ml.get("agreement", 0)}
+                else:
+                    analysis = {"signal":"NEUTRO", "confidence":50, "p_up":50, "p_down":50}
+            else:
+                analysis = analyze(values, strategy)
             proximity = radar_score(analysis, strategy)
             results.append({
                 "symbol": symbol_name,
@@ -736,548 +774,7 @@ def candle_is_closed(candle_time: datetime, interval: str) -> bool:
 
 @app.get("/", response_class=HTMLResponse)
 async def home() -> HTMLResponse:
-    html = r"""<!doctype html>
-<html lang="pt-BR">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ismael Trade</title>
-<style>
-*{box-sizing:border-box}
-body{margin:0;font-family:Arial,sans-serif;background:#0b1020;color:#f5f7ff}
-.container{max-width:760px;margin:auto;padding:18px}
-h1{margin:0 0 4px;font-size:28px}
-.sub{color:#aeb7cc;margin-bottom:16px}
-.card{background:#151c30;border:1px solid #29324b;border-radius:16px;padding:16px;margin:12px 0}
-.row{display:flex;gap:10px;flex-wrap:wrap}
-label{display:block;color:#aeb7cc;font-size:13px;margin-bottom:6px}
-select,button{width:100%;padding:12px;border-radius:10px;border:1px solid #34405e;background:#0f1526;color:#fff}
-.field{flex:1;min-width:180px}
-button{cursor:pointer;font-weight:bold}
-.signal{text-align:center;padding:22px;border-radius:14px;font-size:38px;font-weight:800;margin-top:12px}
-.call{background:#103c2b;color:#52f09d}
-.put{background:#481d28;color:#ff718b}
-.neutral{background:#2b3040;color:#d9deeb}
-.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
-.stat{background:#0f1526;border-radius:12px;padding:14px;text-align:center}
-.stat b{display:block;font-size:25px;margin-top:4px}
-.params{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.param{background:#0f1526;border-radius:10px;padding:10px}
-.small{font-size:12px;color:#aeb7cc}
-.value{font-weight:bold}
-.hidden{display:none}
-.good{color:#52f09d}.bad{color:#ff718b}
-.footer{font-size:12px;color:#7f8aa5;line-height:1.5}
-.clock{font-size:30px;font-weight:800;letter-spacing:1px}
-.clockLabel{font-size:11px;color:#8f9ab2;text-transform:uppercase}
-.onlineBtn{border-radius:999px;padding:10px 16px;font-weight:800}.onlineBtn.online{background:#0d3b2a;border-color:#2ee88a;color:#52f09d}.onlineBtn.offline{background:#431b25;border-color:#ff718b;color:#ff718b}
-.badge{display:inline-block;padding:7px 11px;border-radius:999px;background:#0f1526;border:1px solid #34405e;font-size:12px;font-weight:800}
-.sniper{border:1px solid #394765;background:linear-gradient(135deg,#151c30,#10172a)}
-.aiCard{border:1px solid #6b55a3;background:linear-gradient(135deg,#1b1733,#10172a)}
-.aiMain{font-size:24px;font-weight:800;margin:10px 0}.aiMeta{font-size:13px;color:#aeb7cc}.aiReason{font-size:13px;color:#d9deeb;line-height:1.5;margin-top:8px}
-.sniperTitle{font-size:20px;font-weight:800;margin:4px 0}
-.countdown{font-size:25px;font-weight:800}
-.entry{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
-.entryBox{background:#0f1526;border-radius:12px;padding:12px}
-.radarRow{display:grid;grid-template-columns:110px 1fr 48px;gap:10px;align-items:center;background:#0f1526;border-radius:12px;padding:10px;margin:7px 0}.radarMeter{height:9px;background:#252c40;border-radius:999px;overflow:hidden}.radarFill{height:100%;border-radius:999px}.radarFill.call{background:#2ee88a}.radarFill.put{background:#ff718b}.radarFill.neutral{background:#8892a8}
-@media(max-width:520px){.entry{grid-template-columns:1fr}}
-@media(max-width:520px){.grid{grid-template-columns:1fr 1fr}.params{grid-template-columns:1fr}}
-</style>
-</head>
-<body>
-<div class="container">
-<h1>Ismael Trade</h1>
-<div class="sub">Analisador de sinais M1 • dados Twelve Data</div>
-
-<div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:12px">
-<div><div class="clockLabel">HORÁRIO DE BRASÍLIA</div><div id="clock" class="clock">--:--:--</div><div id="dateBr" class="small">--/--/----</div></div>
-<div class="badge">● MERCADO • MONITORANDO</div>
-</div>
-
-<div class="card" id="licenseCard">
-<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
-<div><div class="small">LICENÇA ISMAEL TRADE</div><div id="licenseStatus" class="value">VERIFICANDO...</div></div>
-<div><div class="small">VALIDADE</div><div id="licenseExpires" class="value">--</div></div>
-</div>
-<div class="small" style="margin-top:10px">Renovação: WhatsApp <b>55 84 99841-1282</b> / <b>55 84 99449-9442</b> • Instagram <b>@Ismaelartur26</b></div>
-</div>
-
-<div class="card">
-<div class="row">
-<div class="field">
-<label>ATIVO</label>
-<select id="symbol">
-<option>EUR/USD</option><option>GBP/USD</option><option>USD/JPY</option>
-<option>AUD/USD</option><option>USD/CAD</option><option>USD/CHF</option>
-<option>NZD/USD</option><option>EUR/JPY</option><option>GBP/JPY</option>
-<option>EUR/GBP</option><option>BTC/USD</option><option>ETH/USD</option>
-</select>
-</div>
-<div class="field">
-<label>TEMPO</label>
-<select id="interval">
-<option value="1min">M1</option><option value="5min">M5</option>
-<option value="15min">M15</option><option value="30min">M30</option>
-</select>
-</div>
-</div>
-<button id="refresh" style="margin-top:10px">ATUALIZAR SINAL</button>
-</div>
-
-<div class="card sniper">
-<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
-<div><div class="sniperTitle">SNIPER X</div></div>
-<button id="rsiToggle" class="onlineBtn online" style="width:auto;margin:0">● ONLINE</button>
-</div></div>
-<div class="card sniper">
-<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
-<div><div class="sniperTitle">SNIPER 01</div></div>
-<button id="oldToggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button>
-</div></div>
-<div class="card sniper">
-<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
-<div><div class="sniperTitle">SNIPER 02</div></div>
-<button id="sniper02Toggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button>
-</div></div>
-<div class="card sniper">
-<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
-<div><div class="sniperTitle">SNIPER 03</div></div>
-<button id="sniper03Toggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button>
-</div></div>
-
-<div class="card aiCard">
-<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
-<div><div class="sniperTitle">🤖 INTELIGÊNCIA ARTIFICIAL</div><div class="small">Trade Sniper AI • confluência de mercado</div></div>
-<button id="aiToggle" class="onlineBtn online" style="width:auto;margin:0">● ONLINE</button>
-</div>
-<div id="aiStatus" class="small" style="margin-top:10px">IA aguardando análise...</div>
-<div id="aiMain" class="aiMain">AGUARDANDO</div>
-<div id="aiMeta" class="aiMeta">Selecione ativo e tempo para analisar.</div>
-<div id="aiReason" class="aiReason"></div>
-</div>
-
-<div class="card">
-<div class="small">SINAL</div>
-<div id="signal" class="signal neutral">AGUARDANDO</div>
-<div id="signalError" class="small" style="display:none;margin-top:8px"></div>
-<div class="entry">
-<div class="entryBox"><div class="small">HORÁRIO DE ENTRADA</div><div id="entryTime" class="value">--</div></div>
-<div class="entryBox"><div class="small">EXPIRAÇÃO</div><div id="expiry" class="value">--</div></div>
-</div>
-<div style="margin-top:12px"><div class="small">CRONÔMETRO DE ENTRADA / PRÓXIMA VELA</div><div id="countdown" class="countdown">--:--</div></div>
-<div class="row" style="margin-top:12px">
-<div class="field"><div class="small">Confiança</div><div id="confidence" class="value">--</div></div>
-<div class="field"><div class="small">Referência</div><div id="reference" class="value">--</div></div>
-<div class="field"><div class="small">Próxima vela</div><div id="next" class="value">--</div></div>
-</div>
-</div>
-
-<div class="card">
-<div class="small">RESULTADOS</div>
-<div class="grid">
-<div class="stat"><span>WIN</span><b id="wins" class="good">0</b></div>
-<div class="stat"><span>LOSS</span><b id="losses" class="bad">0</b></div>
-<div class="stat"><span>ASSERTIVIDADE</span><b id="accuracy">0%</b></div>
-</div>
-<button id="reset" style="margin-top:10px">ZERAR RESULTADOS DO ATIVO</button>
-</div>
-
-<div class="card">
-<div class="small">RESULTADOS GERAIS — TODOS OS ATIVOS</div>
-<div class="grid">
-<div class="stat"><span>WIN GERAL</span><b id="allWins" class="good">0</b></div>
-<div class="stat"><span>LOSS GERAL</span><b id="allLosses" class="bad">0</b></div>
-<div class="stat"><span>ASSERTIVIDADE GERAL</span><b id="allAccuracy">0%</b></div>
-</div>
-<button id="resetAll" style="margin-top:10px">ZERAR RESULTADOS GERAIS</button>
-</div>
-
-<div class="card" id="radarCard">
-<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
-<div><div class="small">RADAR DE OPORTUNIDADES</div><div class="sniperTitle">PARES PRÓXIMOS DE SINAL</div></div>
-<div id="radarStatus" class="badge">AGUARDANDO</div>
-</div>
-<div class="small" style="margin-top:8px">Mostra os pares com maior proximidade de CALL ou PUT na estratégia ativa.</div>
-<div id="radarList" style="margin-top:12px"></div>
-</div>
-
-<div class="card footer">
-O sinal é probabilístico e não garante WIN. A análise usa velas fechadas para reduzir repintura. Os preços da Twelve Data podem apresentar diferenças em relação à cotação da sua corretora.
-</div>
-</div>
-
-<script>
-const $ = id => document.getElementById(id);
-let pending = JSON.parse(localStorage.getItem("is_trade_pending") || "null");
-let statsByKey = JSON.parse(localStorage.getItem("is_trade_stats_by_key") || "{}");
-let statsAll = JSON.parse(localStorage.getItem("is_trade_stats_all") || '{"wins":0,"losses":0}');
-let stats = {wins:0,losses:0};
-let isOnline = true;
-let rsiOnline = localStorage.getItem("is_trade_rsi_online") !== "off";
-let oldOnline = localStorage.getItem("is_trade_old_online") === "on";
-let sniper02Online = localStorage.getItem("is_trade_sniper02_online") === "on";
-let sniper03Online = localStorage.getItem("is_trade_sniper03_online") === "on";
-let aiOnline = localStorage.getItem("is_trade_ai_online") !== "off";
-let selectedStrategy = localStorage.getItem("is_trade_selected_strategy") || (oldOnline ? "old_sniper" : sniper03Online ? "sniper_03" : sniper02Online ? "sniper_02" : "rsi");
-
-function statsKey(symbol, interval, strategy){
-  return `${symbol}|${interval}|${strategy || "auto"}`;
-}
-function currentStatsKey(){
-  const symbol = $("symbol")?.value || "EUR/USD";
-  const interval = $("interval")?.value || "1min";
-  const strategy = activeStrategy();
-  return statsKey(symbol, interval, strategy);
-}
-function getCurrentStats(){
-  const key = currentStatsKey();
-  if(!statsByKey[key]) statsByKey[key] = {wins:0,losses:0};
-  return statsByKey[key];
-}
-// Migra resultados antigos, que eram globais, somente para o ativo atual.
-if(Object.keys(statsByKey).length===0){
-  try{
-    const legacy=JSON.parse(localStorage.getItem("is_trade_stats")||"null");
-    if(legacy && ((Number(legacy.wins)||0)+(Number(legacy.losses)||0)>0)){
-      const lw=Number(legacy.wins)||0, ll=Number(legacy.losses)||0;
-      statsByKey[statsKey($("symbol")?.value||"EUR/USD",$("interval")?.value||"1min",selectedStrategy)]={wins:lw,losses:ll};
-      if((Number(statsAll.wins)||0)+(Number(statsAll.losses)||0)===0){
-        statsAll={wins:lw,losses:ll};
-      }
-    }
-  }catch(e){}
-}
-function save(){
-  localStorage.setItem("is_trade_stats_by_key", JSON.stringify(statsByKey));
-  localStorage.setItem("is_trade_stats_all", JSON.stringify(statsAll));
-  localStorage.setItem("is_trade_stats", JSON.stringify(getCurrentStats()));
-  if(pending) localStorage.setItem("is_trade_pending", JSON.stringify(pending));
-  else localStorage.removeItem("is_trade_pending");
-}
-function renderStats(){
-  stats = getCurrentStats();
-
-  // Resultado somente do ativo/timeframe/estratégia selecionados.
-  $("wins").textContent = stats.wins;
-  $("losses").textContent = stats.losses;
-  const total = stats.wins + stats.losses;
-  $("accuracy").textContent = total ? ((stats.wins/total)*100).toFixed(1)+"%" : "0%";
-
-  // Resultado acumulado de todos os ativos.
-  if($("allWins")) $("allWins").textContent = statsAll.wins;
-  if($("allLosses")) $("allLosses").textContent = statsAll.losses;
-  const allTotal = statsAll.wins + statsAll.losses;
-  if($("allAccuracy")) $("allAccuracy").textContent =
-      allTotal ? ((statsAll.wins/allTotal)*100).toFixed(1)+"%" : "0%";
-}
-function setStrategyButton(id, online){const b=$(id);b.textContent=online?"● ONLINE":"● OFFLINE";b.className=online?"onlineBtn online":"onlineBtn offline";}
-function activeStrategy(){
-  if(selectedStrategy==="rsi" && rsiOnline)return "rsi";
-  if(selectedStrategy==="old_sniper" && oldOnline)return "old_sniper";
-  if(selectedStrategy==="sniper_02" && sniper02Online)return "sniper_02";
-  if(selectedStrategy==="sniper_03" && sniper03Online)return "sniper_03";
-  if(rsiOnline)return "rsi";
-  if(oldOnline)return "old_sniper";
-  if(sniper02Online)return "sniper_02";
-  if(sniper03Online)return "sniper_03";
-  return null;
-}
-function renderMode(){setStrategyButton("rsiToggle",rsiOnline);setStrategyButton("oldToggle",oldOnline);setStrategyButton("sniper02Toggle",sniper02Online);setStrategyButton("sniper03Toggle",sniper03Online);const active=activeStrategy();if(!isOnline||!active){$("signal").textContent="OFFLINE";$("signal").className="signal neutral";}}
-
-function fmt(v){ return v == null ? "--" : v; }
-
-let resultTimer = null;
-
-// Alerta sonoro de 5 segundos para novos sinais CALL/PUT.
-// O navegador exige uma interação do usuário antes de liberar áudio em muitos celulares.
-let audioCtx = null;
-let lastSoundSignal = localStorage.getItem("is_trade_last_sound_signal") || "";
-
-function unlockAudio(){
-  try{
-    if(!audioCtx){
-      const AC = window.AudioContext || window.webkitAudioContext;
-      if(!AC) return;
-      audioCtx = new AC();
-    }
-    if(audioCtx.state === "suspended") audioCtx.resume();
-  }catch(e){}
-}
-
-function playSignalSound(direction){
-  if(direction !== "CALL" && direction !== "PUT") return;
-  try{
-    unlockAudio();
-    if(!audioCtx || audioCtx.state === "suspended") return;
-
-    const now = audioCtx.currentTime;
-    const osc = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-    osc.type = "sine";
-    osc.frequency.setValueAtTime(direction === "CALL" ? 880 : 440, now);
-    gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.exponentialRampToValueAtTime(0.16, now + 0.03);
-    gain.gain.setValueAtTime(0.16, now + 4.7);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + 5.0);
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    osc.start(now);
-    osc.stop(now + 5.02);
-  }catch(e){}
-}
-
-// Libera o áudio após qualquer toque/clique do usuário.
-document.addEventListener("pointerdown", unlockAudio, {passive:true});
-document.addEventListener("touchstart", unlockAudio, {passive:true});
-
-function alertNewSignal(direction, referenceCandle, entryTime){
-  if(direction !== "CALL" && direction !== "PUT") return;
-  const key = `${referenceCandle || ""}|${entryTime || ""}|${direction}`;
-  if(key === lastSoundSignal) return;
-  lastSoundSignal = key;
-  localStorage.setItem("is_trade_last_sound_signal", key);
-  playSignalSound(direction);
-}
-
-function showError(message){
-  $("signal").textContent = "SEM DADOS";
-  $("signal").className = "signal neutral";
-  $("confidence").textContent = "--";
-  if($("signalError")){
-    $("signalError").textContent = message || "Não foi possível atualizar o sinal.";
-    $("signalError").style.display = "block";
-  }
-}
-function updateClock(){
-  const now = new Date();
-  const parts = new Intl.DateTimeFormat("pt-BR", {timeZone:"America/Sao_Paulo",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}).formatToParts(now);
-  const get = k => parts.find(p => p.type === k)?.value || "00";
-  $("clock").textContent = `${get("hour")}:${get("minute")}:${get("second")}`;
-  $("dateBr").textContent = new Intl.DateTimeFormat("pt-BR", {timeZone:"America/Sao_Paulo",day:"2-digit",month:"2-digit",year:"numeric"}).format(now);
-}
-let serverOffsetMs = 0;
-function updateCountdown(){
-  const interval = $("interval").value;
-  const minutes = ({"1min":1,"5min":5,"15min":15,"30min":30})[interval] || 1;
-  const now = new Date(Date.now() + serverOffsetMs);
-  const block = minutes*60*1000;
-  const next = Math.ceil(now.getTime()/block)*block;
-  const total = Math.max(0, Math.floor((next-now.getTime())/1000));
-  const mm = String(Math.floor(total/60)).padStart(2,"0");
-  const ss = String(total%60).padStart(2,"0");
-  $("countdown").textContent = `${mm}:${ss}`;
-}
-async function syncServerClock(){
-  try{
-    const t0=Date.now();
-    const r=await fetch("/server-time",{cache:"no-store"});
-    const d=await r.json();
-    const t1=Date.now();
-    const serverMs=new Date(d.brasilia).getTime();
-    serverOffsetMs=serverMs-((t0+t1)/2);
-  }catch(e){}
-}
-async function loadLicense(){
-  try{
-    const r=await fetch("/license",{cache:"no-store"});
-    const d=await r.json();
-    if(d.active){
-      $("licenseStatus").textContent="● LICENÇA ATIVA";
-      $("licenseStatus").className="value good";
-    }else{
-      $("licenseStatus").textContent="● LICENÇA EXPIRADA";
-      $("licenseStatus").className="value bad";
-    }
-    $("licenseExpires").textContent=d.expires || "--";
-  }catch(e){ $("licenseStatus").textContent="NÃO VERIFICADA"; }
-}
-
-
-function scheduleResultCheck(){
-  if(resultTimer) clearTimeout(resultTimer);
-  if(!pending) return;
-
-  const minutes = ({"1min":1,"5min":5,"15min":15,"30min":30})[pending.interval] || 1;
-  const refMs = new Date(pending.reference_candle.replace(" ", "T") + (pending.reference_candle.length <= 16 ? ":00" : "" )).getTime();
-  if(Number.isNaN(refMs)){
-    resultTimer = setTimeout(checkResult, minutes * 60 * 1000 + 5000);
-    return;
-  }
-
-  // Entrada no fechamento da referência; resultado no fechamento da vela seguinte.
-  const due = refMs + (2 * minutes * 60 * 1000) + 3000;
-  const wait = Math.max(1000, due - Date.now());
-  resultTimer = setTimeout(checkResult, wait);
-}
-
-let ultimoSinalFalado=localStorage.getItem("is_trade_last_voice_signal")||"";
-function falarSinal(direcao,tendencia,confianca){
- if(direcao!=="CALL"&&direcao!=="PUT")return;
- const dirTexto=direcao==="CALL"?"sinal de compra":"sinal de venda";
- const tendenciaTexto=tendencia==="ALTA"?"tendência do gráfico é de alta":tendencia==="BAIXA"?"tendência do gráfico é de baixa":"tendência do gráfico é neutra";
- const mensagem=`${dirTexto}. ${tendenciaTexto}. Confiança ${Math.round(Number(confianca)||0)} por cento.`;
- const chave=`${direcao}|${tendencia}|${confianca}|${$("entryTime").textContent}`;
- if(chave===ultimoSinalFalado)return; ultimoSinalFalado=chave; localStorage.setItem("is_trade_last_voice_signal",chave);
- if(!("speechSynthesis" in window))return; window.speechSynthesis.cancel(); const voz=new SpeechSynthesisUtterance(mensagem); voz.lang="pt-BR"; voz.rate=.92; voz.pitch=1; voz.volume=1; window.speechSynthesis.speak(voz);
-}
-
-async function loadAI(){
- const status=$("aiStatus"),main=$("aiMain"),meta=$("aiMeta"),reason=$("aiReason");
- if(!status||!main||!aiOnline)return;
- status.textContent="ANALISANDO 240 VELAS...";
- try{const symbol=$("symbol").value,interval=$("interval").value;const r=await fetch(`/ai-analysis?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`,{cache:"no-store"});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.detail||"Falha na IA");const a=d.analysis,t=d.trend||{};main.textContent=`${a.signal} — ${a.confidence}%`;main.className="aiMain "+(a.signal==="CALL"?"good":a.signal==="PUT"?"bad":"");meta.textContent=`Qualidade: ${a.quality} | Regime: ${a.regime} | Tendência: ${t.trend||"NEUTRA"} | RSI 9: ${a.rsi9??"-"}`;reason.textContent=a.reason||"";status.textContent="● IA ONLINE • atualizada";}catch(e){status.textContent="IA AGUARDAR";main.textContent="ERRO NA ANÁLISE";meta.textContent=e.message||"";reason.textContent="";}}
-
-async function loadSignal(){
-  if(!isOnline){
-    renderMode();
-    return;
-  }
-
-  const symbol = $("symbol").value;
-  const interval = $("interval").value;
-  const strategy = activeStrategy();
-
-  if(!strategy){
-    renderMode();
-    return;
-  }
-
-  $("signal").textContent = "ANALISANDO...";
-  $("signal").className = "signal neutral";
-
-  if($("signalError")){
-    $("signalError").textContent = "";
-    $("signalError").style.display = "none";
-  }
-
-  try{
-    const r = await fetch(
-      `/signal?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&strategy=${encodeURIComponent(strategy)}`,
-      {cache:"no-store"}
-    );
-
-    const d = await r.json();
-
-    if(!r.ok){
-      const msg = d.detail && typeof d.detail === "object"
-        ? d.detail.message
-        : (d.detail || "Erro ao consultar o sinal.");
-      throw new Error(msg);
-    }
-
-    const signal = d.signal || "NEUTRO";
-
-    $("signal").textContent = signal;
-    $("signal").className = "signal " + (
-      signal === "CALL" ? "call" :
-      signal === "PUT" ? "put" : "neutral"
-    );
-
-    if($("confidence"))
-      $("confidence").textContent = `${Number(d.confidence || 0)}%`;
-
-    if($("reference"))
-      $("reference").textContent = d.reference_candle || "--";
-
-    if($("next"))
-      $("next").textContent = d.entry_time || d.next_candle || "--";
-
-    if($("entryTime")){
-      const entry = d.entry_time || d.next_candle || "";
-      $("entryTime").textContent = entry.includes(" ") ? entry.split(" ")[1] : (entry || "--");
-    }
-
-    if($("expiry")){
-      const expiry = d.expiry_time || "";
-      $("expiry").textContent = expiry.includes(" ") ? expiry.split(" ")[1] : (expiry || "--");
-    }
-
-    if($("trend"))
-      $("trend").textContent = d.trend_text || d.trend || "Tendência neutra";
-
-    // Campos opcionais: nunca podem interromper a exibição do sinal.
-    if($("rsi9")) $("rsi9").textContent = fmt(d.rsi9);
-    if($("rsi14")) $("rsi14").textContent = fmt(d.rsi14);
-
-    if($("engulf"))
-      $("engulf").textContent = (d.bullish_engulfing || d.bearish_engulfing) ? "SIM" : "NÃO";
-
-    if($("rejection"))
-      $("rejection").textContent = (d.bullish_rejection || d.bearish_rejection) ? "SIM" : "NÃO";
-
-    if($("breakout"))
-      $("breakout").textContent = (d.bullish_breakout || d.bearish_breakout) ? "SIM" : "NÃO";
-
-    if($("strength"))
-      $("strength").textContent = (d.bullish_strength || d.bearish_strength) ? "SIM" : "NÃO";
-
-    if($("signalError")){
-      $("signalError").textContent = "";
-      $("signalError").style.display = "none";
-    }
-
-    // Voz somente para CALL/PUT.
-    if(signal === "CALL" || signal === "PUT"){
-      falarSinal(signal, d.trend || "NEUTRA", d.confidence || 0);
-
-      pending = {
-        symbol,
-        interval,
-        strategy,
-        reference_candle: d.reference_candle,
-        entry_time: d.entry_time,
-        direction: signal
-      };
-
-      save();
-      scheduleResultCheck();
-    }
-
-  }catch(e){
-    console.error("ERRO LOAD SIGNAL:", e);
-    showError(e.message || "Erro ao consultar o sinal.");
-  }
-}
-
-async function checkResult(){
-  if(!pending) return;
-  try{
-    const q = new URLSearchParams(pending).toString();
-    const r = await fetch(`/result?${q}`, {cache:"no-store"});
-    const d = await r.json();
-    if(!r.ok) return;
-    if(d.result === "WIN"){
-      const key=statsKey(pending.symbol,pending.interval,pending.strategy);
-      if(!statsByKey[key]) statsByKey[key]={wins:0,losses:0};
-      statsByKey[key].wins++;
-      statsAll.wins++;
-      pending=null; save(); renderStats();
-    }else if(d.result === "LOSS"){
-      const key=statsKey(pending.symbol,pending.interval,pending.strategy);
-      if(!statsByKey[key]) statsByKey[key]={wins:0,losses:0};
-      statsByKey[key].losses++;
-      statsAll.losses++;
-      pending=null; save(); renderStats();
-    }else if(d.result === "DRAW"){
-      pending = null; save();
-    }else{
-      // Se ainda não fechou, não fica consultando a cada 15 segundos.
-      scheduleResultCheck();
-    }
-  }catch(e){
-    scheduleResultCheck();
-  }
-}
-
-
-function radarRow(item){
-  const cls=item.direction==="CALL"?"call":item.direction==="PUT"?"put":"neutral";
-  const label=item.direction==="NEUTRO"?(item.proximity>=75?"PRÓXIMO":"OBSERVAR"):item.direction;
-  return `<div class="radarRow"><div><b>${item.symbol}</b><div class="small">${label} • confiança ${item.confidence}%</div></div><div class="radarMeter"><div class="radarFill ${cls}" style="width:${item.proximity}%"></div></div><b>${item.proximity}%</b></div>`;
-}
-async function loadRadar(){
-  const strategy=activeStrategy();
-  if(!isOnline||!strategy){$("radarStatus").textContent="OFFLINE";$("radarList").innerHTML="<div class='small'>Ative uma estratégia para iniciar o radar.</div>";return;}
+    html = r"""<!doctype html> <html lang="pt-BR"> <head> <meta charset="utf-8"> <meta name="viewport" content="width=device-width,initial-scale=1"> <title>Ismael Trade</title> <style> *{box-sizing:border-box} body{margin:0;font-family:Arial,sans-serif;background:#0b1020;color:#f5f7ff} .container{max-width:760px;margin:auto;padding:18px} h1{margin:0 0 4px;font-size:28px} .sub{color:#aeb7cc;margin-bottom:16px} .card{background:#151c30;border:1px solid #29324b;border-radius:16px;padding:16px;margin:12px 0} .row{display:flex;gap:10px;flex-wrap:wrap} label{display:block;color:#aeb7cc;font-size:13px;margin-bottom:6px} select,button{width:100%;padding:12px;border-radius:10px;border:1px solid #34405e;background:#0f1526;color:#fff} .field{flex:1;min-width:180px} button{cursor:pointer;font-weight:bold} .signal{text-align:center;padding:22px;border-radius:14px;font-size:38px;font-weight:800;margin-top:12px} .call{background:#103c2b;color:#52f09d} .put{background:#481d28;color:#ff718b} .neutral{background:#2b3040;color:#d9deeb} .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px} .stat{background:#0f1526;border-radius:12px;padding:14px;text-align:center} .stat b{display:block;font-size:25px;margin-top:4px} .params{display:grid;grid-template-columns:1fr 1fr;gap:8px} .param{background:#0f1526;border-radius:10px;padding:10px} .small{font-size:12px;color:#aeb7cc} .value{font-weight:bold} .hidden{display:none} .good{color:#52f09d}.bad{color:#ff718b} .footer{font-size:12px;color:#7f8aa5;line-height:1.5} .clock{font-size:30px;font-weight:800;letter-spacing:1px} .clockLabel{font-size:11px;color:#8f9ab2;text-transform:uppercase} .onlineBtn{border-radius:999px;padding:10px 16px;font-weight:800}.onlineBtn.online{background:#0d3b2a;border-color:#2ee88a;color:#52f09d}.onlineBtn.offline{background:#431b25;border-color:#ff718b;color:#ff718b} .badge{display:inline-block;padding:7px 11px;border-radius:999px;background:#0f1526;border:1px solid #34405e;font-size:12px;font-weight:800} .sniper{border:1px solid #394765;background:linear-gradient(135deg,#151c30,#10172a)} .aiCard{border:1px solid #6b55a3;background:linear-gradient(135deg,#1b1733,#10172a)} .aiMain{font-size:24px;font-weight:800;margin:10px 0}.aiMeta{font-size:13px;color:#aeb7cc}.aiReason{font-size:13px;color:#d9deeb;line-height:1.5;margin-top:8px} .sniperTitle{font-size:20px;font-weight:800;margin:4px 0} .countdown{font-size:25px;font-weight:800} .entry{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px} .entryBox{background:#0f1526;border-radius:12px;padding:12px} .radarRow{display:grid;grid-template-columns:110px 1fr 48px;gap:10px;align-items:center;background:#0f1526;border-radius:12px;padding:10px;margin:7px 0}.radarMeter{height:9px;background:#252c40;border-radius:999px;overflow:hidden}.radarFill{height:100%;border-radius:999px}.radarFill.call{background:#2ee88a}.radarFill.put{background:#ff718b}.radarFill.neutral{background:#8892a8} @media(max-width:520px){.entry{grid-template-columns:1fr}} @media(max-width:520px){.grid{grid-template-columns:1fr 1fr}.params{grid-template-columns:1fr}} </style> </head> <body> <div class="container"> <h1>Ismael Trade</h1> <div class="sub">Analisador de sinais M1 • dados Twelve Data</div> <div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:12px"> <div><div class="clockLabel">HORÁRIO DE BRASÍLIA</div><div id="clock" class="clock">--:--:--</div><div id="dateBr" class="small">--/--/----</div></div> <div class="badge">● MERCADO • MONITORANDO</div> </div> <div class="card" id="licenseCard"> <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"> <div><div class="small">LICENÇA ISMAEL TRADE</div><div id="licenseStatus" class="value">VERIFICANDO...</div></div> <div><div class="small">VALIDADE</div><div id="licenseExpires" class="value">--</div></div> </div> <div class="small" style="margin-top:10px">Renovação: WhatsApp <b>55 84 99841-1282</b> / <b>55 84 99449-9442</b> • Instagram <b>@Ismaelartur26</b></div> </div> <div class="card"> <div class="row"> <div class="field"> <label>ATIVO</label> <select id="symbol"> <option>EUR/USD</option><option>GBP/USD</option><option>USD/JPY</option> <option>AUD/USD</option><option>USD/CAD</option><option>USD/CHF</option> <option>NZD/USD</option><option>EUR/JPY</option><option>GBP/JPY</option> <option>EUR/GBP</option><option>BTC/USD</option><option>ETH/USD</option> </select> </div> <div class="field"> <label>TEMPO</label> <select id="interval"> <option value="1min">M1</option><option value="5min">M5</option> <option value="15min">M15</option><option value="30min">M30</option> </select> </div> </div> <button id="refresh" style="margin-top:10px">ATUALIZAR SINAL</button> </div> <div class="card sniper"> <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"> <div><div class="sniperTitle">SNIPER X</div></div> <button id="rsiToggle" class="onlineBtn online" style="width:auto;margin:0">● ONLINE</button> </div></div> <div class="card sniper"> <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"> <div><div class="sniperTitle">SNIPER 01</div></div> <button id="oldToggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button> </div></div> <div class="card sniper"> <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"> <div><div class="sniperTitle">SNIPER 02</div></div> <button id="sniper02Toggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button> </div></div> <div class="card sniper"> <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"> <div><div class="sniperTitle">SNIPER 03</div></div> <button id="sniper03Toggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button> </div></div> <div class="card aiCard"> <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"> <div><div class="sniperTitle">🤖 SNIPER IA V3</div><div class="small">IA ML • XGBoost + LightGBM + RF + GB + filtro de regime</div></div> <button id="aiToggle" class="onlineBtn online" style="width:auto;margin:0">● ONLINE</button> </div> <div id="aiStatus" class="small" style="margin-top:10px">IA aguardando análise...</div> <div id="aiMain" class="aiMain">AGUARDANDO</div> <div id="aiMeta" class="aiMeta">Selecione ativo e tempo para analisar.</div> <div id="aiReason" class="aiReason"></div> </div> <div class="card"> <div class="small">SINAL</div> <div id="signal" class="signal neutral">AGUARDANDO</div> <div id="signalError" class="small" style="display:none;margin-top:8px"></div> <div class="entry"> <div class="entryBox"><div class="small">HORÁRIO DE ENTRADA</div><div id="entryTime" class="value">--</div></div> <div class="entryBox"><div class="small">EXPIRAÇÃO</div><div id="expiry" class="value">--</div></div> </div> <div style="margin-top:12px"><div class="small">CRONÔMETRO DE ENTRADA / PRÓXIMA VELA</div><div id="countdown" class="countdown">--:--</div></div> <div class="row" style="margin-top:12px"> <div class="field"><div class="small">Confiança</div><div id="confidence" class="value">--</div></div> <div class="field"><div class="small">Referência</div><div id="reference" class="value">--</div></div> <div class="field"><div class="small">Próxima vela</div><div id="next" class="value">--</div></div> </div> </div> <div class="card"> <div class="small">RESULTADOS</div> <div class="grid"> <div class="stat"><span>WIN</span><b id="wins" class="good">0</b></div> <div class="stat"><span>LOSS</span><b id="losses" class="bad">0</b></div> <div class="stat"><span>ASSERTIVIDADE</span><b id="accuracy">0%</b></div> </div> <button id="reset" style="margin-top:10px">ZERAR RESULTADOS DO ATIVO</button> </div> <div class="card"> <div class="small">RESULTADOS GERAIS — TODOS OS ATIVOS</div> <div class="grid"> <div class="stat"><span>WIN GERAL</span><b id="allWins" class="good">0</b></div> <div class="stat"><span>LOSS GERAL</span><b id="allLosses" class="bad">0</b></div> <div class="stat"><span>ASSERTIVIDADE GERAL</span><b id="allAccuracy">0%</b></div> </div> <button id="resetAll" style="margin-top:10px">ZERAR RESULTADOS GERAIS</button> </div> <div class="card" id="radarCard"> <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"> <div><div class="small">RADAR DE OPORTUNIDADES</div><div class="sniperTitle">PARES PRÓXIMOS DE SINAL</div></div> <div id="radarStatus" class="badge">AGUARDANDO</div> </div> <div class="small" style="margin-top:8px">Mostra os pares com maior proximidade de CALL ou PUT na estratégia ativa.</div> <div id="radarList" style="margin-top:12px"></div> </div> <div class="card footer"> O sinal é probabilístico e não garante WIN. A análise usa velas fechadas para reduzir repintura. Os preços da Twelve Data podem apresentar diferenças em relação à cotação da sua corretora. </div> </div> <script> const $ = id => document.getElementById(id); let pending = JSON.parse(localStorage.getItem("is_trade_pending") || "null"); let statsByKey = JSON.parse(localStorage.getItem("is_trade_stats_by_key") || "{}"); let statsAll = JSON.parse(localStorage.getItem("is_trade_stats_all") || '{"wins":0,"losses":0}'); let stats = {wins:0,losses:0}; let isOnline = true; let rsiOnline = localStorage.getItem("is_trade_rsi_online") !== "off"; let oldOnline = localStorage.getItem("is_trade_old_online") === "on"; let sniper02Online = localStorage.getItem("is_trade_sniper02_online") === "on"; let sniper03Online = localStorage.getItem("is_trade_sniper03_online") === "on"; let aiOnline = localStorage.getItem("is_trade_ai_online") !== "off"; let selectedStrategy = localStorage.getItem("is_trade_selected_strategy") || (aiOnline ? "ai" : oldOnline ? "old_sniper" : sniper03Online ? "sniper_03" : sniper02Online ? "sniper_02" : "rsi"); function statsKey(symbol, interval, strategy){ return `${symbol}|${interval}|${strategy || "auto"}`; } function currentStatsKey(){ const symbol = $("symbol")?.value || "EUR/USD"; const interval = $("interval")?.value || "1min"; const strategy = activeStrategy(); return statsKey(symbol, interval, strategy); } function getCurrentStats(){ const key = currentStatsKey(); if(!statsByKey[key]) statsByKey[key] = {wins:0,losses:0}; return statsByKey[key]; } // Migra resultados antigos, que eram globais, somente para o ativo atual. if(Object.keys(statsByKey).length===0){ try{ const legacy=JSON.parse(localStorage.getItem("is_trade_stats")||"null"); if(legacy && ((Number(legacy.wins)||0)+(Number(legacy.losses)||0)>0)){ const lw=Number(legacy.wins)||0, ll=Number(legacy.losses)||0; statsByKey[statsKey($("symbol")?.value||"EUR/USD",$("interval")?.value||"1min",selectedStrategy)]={wins:lw,losses:ll}; if((Number(statsAll.wins)||0)+(Number(statsAll.losses)||0)===0){ statsAll={wins:lw,losses:ll}; } } }catch(e){} } function save(){ localStorage.setItem("is_trade_stats_by_key", JSON.stringify(statsByKey)); localStorage.setItem("is_trade_stats_all", JSON.stringify(statsAll)); localStorage.setItem("is_trade_stats", JSON.stringify(getCurrentStats())); if(pending) localStorage.setItem("is_trade_pending", JSON.stringify(pending)); else localStorage.removeItem("is_trade_pending"); } function renderStats(){ stats = getCurrentStats(); // Resultado somente do ativo/timeframe/estratégia selecionados. $("wins").textContent = stats.wins; $("losses").textContent = stats.losses; const total = stats.wins + stats.losses; $("accuracy").textContent = total ? ((stats.wins/total)*100).toFixed(1)+"%" : "0%"; // Resultado acumulado de todos os ativos. if($("allWins")) $("allWins").textContent = statsAll.wins; if($("allLosses")) $("allLosses").textContent = statsAll.losses; const allTotal = statsAll.wins + statsAll.losses; if($("allAccuracy")) $("allAccuracy").textContent = allTotal ? ((statsAll.wins/allTotal)*100).toFixed(1)+"%" : "0%"; } function setStrategyButton(id, online){const b=$(id);b.textContent=online?"● ONLINE":"● OFFLINE";b.className=online?"onlineBtn online":"onlineBtn offline";} function activeStrategy(){ if(selectedStrategy==="ai" && aiOnline)return "ai"; if(selectedStrategy==="rsi" && rsiOnline)return "rsi"; if(selectedStrategy==="old_sniper" && oldOnline)return "old_sniper"; if(selectedStrategy==="sniper_02" && sniper02Online)return "sniper_02"; if(selectedStrategy==="sniper_03" && sniper03Online)return "sniper_03"; if(aiOnline)return "ai"; if(rsiOnline)return "rsi"; if(oldOnline)return "old_sniper"; if(sniper02Online)return "sniper_02"; if(sniper03Online)return "sniper_03"; return null; } function renderMode(){setStrategyButton("rsiToggle",rsiOnline);setStrategyButton("oldToggle",oldOnline);setStrategyButton("sniper02Toggle",sniper02Online);setStrategyButton("sniper03Toggle",sniper03Online);const active=activeStrategy();if(!isOnline||!active){$("signal").textContent="OFFLINE";$("signal").className="signal neutral";}} function fmt(v){ return v == null ? "--" : v; } let resultTimer = null; // Voz automática para CALL/PUT. // Em celulares, o navegador pode exigir um toque inicial para liberar a voz. let ultimoSinalFalado=localStorage.getItem("is_trade_last_voice_signal")||""; function falarSinal(direcao,tendencia,confianca,modelo){ if(direcao!=="CALL"&&direcao!=="PUT")return; const dirTexto=direcao==="CALL"?"sinal de compra":"sinal de venda"; const tendenciaTexto=tendencia==="ALTA"?"tendência do gráfico é de alta":tendencia==="BAIXA"?"tendência do gráfico é de baixa":"tendência do gráfico é neutra"; const extra=modelo?` Modelo ${modelo}.`:""; const mensagem=`${dirTexto}. ${tendenciaTexto}. Confiança ${Math.round(Number(confianca)||0)} por cento.${extra}`; const chave=`${direcao}|${tendencia}|${confianca}|${modelo||""}|${$("entryTime")?.textContent||""}`; if(chave===ultimoSinalFalado)return; ultimoSinalFalado=chave; localStorage.setItem("is_trade_last_voice_signal",chave); if(!("speechSynthesis" in window))return; window.speechSynthesis.cancel(); const voz=new SpeechSynthesisUtterance(mensagem); voz.lang="pt-BR"; voz.rate=.92; voz.pitch=1; voz.volume=1; window.speechSynthesis.speak(voz); } function showError(message){ $("signal").textContent = "SEM DADOS"; $("signal").className = "signal neutral"; $("confidence").textContent = "--"; if($("signalError")){ $("signalError").textContent = message || "Não foi possível atualizar o sinal."; $("signalError").style.display = "block"; } } function updateClock(){ const now = new Date(); const parts = new Intl.DateTimeFormat("pt-BR", {timeZone:"America/Sao_Paulo",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}).formatToParts(now); const get = k => parts.find(p => p.type === k)?.value || "00"; $("clock").textContent = `${get("hour")}:${get("minute")}:${get("second")}`; $("dateBr").textContent = new Intl.DateTimeFormat("pt-BR", {timeZone:"America/Sao_Paulo",day:"2-digit",month:"2-digit",year:"numeric"}).format(now); } let serverOffsetMs = 0; function updateCountdown(){ const interval = $("interval").value; const minutes = ({"1min":1,"5min":5,"15min":15,"30min":30})[interval] || 1; const now = new Date(Date.now() + serverOffsetMs); const block = minutes*60*1000; const next = Math.ceil(now.getTime()/block)*block; const total = Math.max(0, Math.floor((next-now.getTime())/1000)); const mm = String(Math.floor(total/60)).padStart(2,"0"); const ss = String(total%60).padStart(2,"0"); $("countdown").textContent = `${mm}:${ss}`; } async function syncServerClock(){ try{ const t0=Date.now(); const r=await fetch("/server-time",{cache:"no-store"}); const d=await r.json(); const t1=Date.now(); const serverMs=new Date(d.brasilia).getTime(); serverOffsetMs=serverMs-((t0+t1)/2); }catch(e){} } async function loadLicense(){ try{ const r=await fetch("/license",{cache:"no-store"}); const d=await r.json(); if(d.active){ $("licenseStatus").textContent="● LICENÇA ATIVA"; $("licenseStatus").className="value good"; }else{ $("licenseStatus").textContent="● LICENÇA EXPIRADA"; $("licenseStatus").className="value bad"; } $("licenseExpires").textContent=d.expires || "--"; }catch(e){ $("licenseStatus").textContent="NÃO VERIFICADA"; } } function scheduleResultCheck(){ if(resultTimer) clearTimeout(resultTimer); if(!pending) return; const minutes = ({"1min":1,"5min":5,"15min":15,"30min":30})[pending.interval] || 1; const refMs = new Date(pending.reference_candle.replace(" ", "T") + (pending.reference_candle.length <= 16 ? ":00" : "" )).getTime(); if(Number.isNaN(refMs)){ resultTimer = setTimeout(checkResult, minutes * 60 * 1000 + 5000); return; } // Entrada no fechamento da referência; resultado no fechamento da vela seguinte. const due = refMs + (2 * minutes * 60 * 1000) + 3000; const wait = Math.max(1000, due - Date.now()); resultTimer = setTimeout(checkResult, wait); } async function loadAI(){ const status=$("aiStatus"),main=$("aiMain"),meta=$("aiMeta"),reason=$("aiReason"); if(!status||!main||!aiOnline)return; status.textContent="ANALISANDO 240 VELAS..."; try{const symbol=$("symbol").value,interval=$("interval").value;const r=await fetch(`/ai-analysis?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`,{cache:"no-store"});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.detail||"Falha na IA");const a=d.analysis,t=d.trend||{};main.textContent=`${a.signal} — ${a.confidence}%`;main.className="aiMain "+(a.signal==="CALL"?"good":a.signal==="PUT"?"bad":"");meta.textContent=`Qualidade: ${a.quality} | Regime: ${a.regime} | Tendência: ${t.trend||"NEUTRA"} | RSI 9: ${a.rsi9??"-"} | IA ML: ${a.ml?"SIM":"FALLBACK"}`;reason.textContent=a.reason||"";status.textContent="● IA ONLINE • atualizada"; if(a.signal==="CALL"||a.signal==="PUT"){falarSinal(a.signal,t.trend||a.regime||"NEUTRA",a.confidence,(a.models||[]).join(", "));}}catch(e){status.textContent="IA AGUARDAR";main.textContent="ERRO NA ANÁLISE";meta.textContent=e.message||"";reason.textContent="";}} async function loadSignal(){ if(!isOnline){ renderMode(); return; } const symbol = $("symbol").value; const interval = $("interval").value; const strategy = activeStrategy(); if(!strategy){ renderMode(); return; } $("signal").textContent = "ANALISANDO..."; $("signal").className = "signal neutral"; if($("signalError")){ $("signalError").textContent = ""; $("signalError").style.display = "none"; } try{ const r = await fetch( `/signal?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&strategy=${encodeURIComponent(strategy)}`, {cache:"no-store"} ); const d = await r.json(); if(!r.ok){ const msg = d.detail && typeof d.detail === "object" ? d.detail.message : (d.detail || "Erro ao consultar o sinal."); throw new Error(msg); } const signal = d.signal || "NEUTRO"; $("signal").textContent = signal; $("signal").className = "signal " + ( signal === "CALL" ? "call" : signal === "PUT" ? "put" : "neutral" ); if($("confidence")) $("confidence").textContent = `${Number(d.confidence || 0)}%`; if($("reference")) $("reference").textContent = d.reference_candle || "--"; if($("next")) $("next").textContent = d.entry_time || d.next_candle || "--"; if($("entryTime")){ const entry = d.entry_time || d.next_candle || ""; $("entryTime").textContent = entry.includes(" ") ? entry.split(" ")[1] : (entry || "--"); } if($("expiry")){ const expiry = d.expiry_time || ""; $("expiry").textContent = expiry.includes(" ") ? expiry.split(" ")[1] : (expiry || "--"); } if($("trend")) $("trend").textContent = d.trend_text || d.trend || "Tendência neutra"; // Campos opcionais: nunca podem interromper a exibição do sinal. if($("rsi9")) $("rsi9").textContent = fmt(d.rsi9); if($("rsi14")) $("rsi14").textContent = fmt(d.rsi14); if($("engulf")) $("engulf").textContent = (d.bullish_engulfing || d.bearish_engulfing) ? "SIM" : "NÃO"; if($("rejection")) $("rejection").textContent = (d.bullish_rejection || d.bearish_rejection) ? "SIM" : "NÃO"; if($("breakout")) $("breakout").textContent = (d.bullish_breakout || d.bearish_breakout) ? "SIM" : "NÃO"; if($("strength")) $("strength").textContent = (d.bullish_strength || d.bearish_strength) ? "SIM" : "NÃO"; if($("signalError")){ $("signalError").textContent = ""; $("signalError").style.display = "none"; } // Voz somente para CALL/PUT. if(signal === "CALL" || signal === "PUT"){ falarSinal(signal, d.trend || "NEUTRA", d.confidence || 0, (d.models || []).join(", ") || d.strategy || ""); pending = { symbol, interval, strategy, reference_candle: d.reference_candle, entry_time: d.entry_time, direction: signal }; save(); scheduleResultCheck(); } }catch(e){ console.error("ERRO LOAD SIGNAL:", e); showError(e.message || "Erro ao consultar o sinal."); } } async function checkResult(){ if(!pending) return; try{ const q = new URLSearchParams(pending).toString(); const r = await fetch(`/result?${q}`, {cache:"no-store"}); const d = await r.json(); if(!r.ok) return; if(d.result === "WIN"){ const key=statsKey(pending.symbol,pending.interval,pending.strategy); if(!statsByKey[key]) statsByKey[key]={wins:0,losses:0}; statsByKey[key].wins++; statsAll.wins++; pending=null; save(); renderStats(); }else if(d.result === "LOSS"){ const key=statsKey(pending.symbol,pending.interval,pending.strategy); if(!statsByKey[key]) statsByKey[key]={wins:0,losses:0}; statsByKey[key].losses++; statsAll.losses++; pending=null; save(); renderStats(); }else if(d.result === "DRAW"){ pending = null; save(); }else{ // Se ainda não fechou, não fica consultando a cada 15 segundos. scheduleResultCheck(); } }catch(e){ scheduleResultCheck(); } } function radarRow(item){ const cls=item.direction==="CALL"?"call":item.direction==="PUT"?"put":"neutral"; const label=item.direction==="NEUTRO"?(item.proximity>=75?"PRÓXIMO":"OBSERVAR"):item.direction; return `<div class="radarRow"><div><b>${item.symbol}</b><div class="small">${label} • confiança ${item.confidence}%</div></div><div class="radarMeter"><div class="radarFill ${cls}" style="width:${item.proximity}%"></div></div><b>${item.proximity}%</b></div>`; } async function loadRadar(){ const strategy=activeStrategy(); if(!isOnline||!strategy){$("radarStatus").textContent="OFFLINE";$("radarList").innerHTML="<div class='small'>Ative uma estratégia para iniciar o radar.</div>";return;}
   $("radarStatus").textContent="ANALISANDO";
   try{
     const interval=$("interval").value;
@@ -1307,7 +804,16 @@ $("rsiToggle").onclick=()=>{rsiOnline=!rsiOnline;if(rsiOnline)selectedStrategy="
 $("oldToggle").onclick=()=>{oldOnline=!oldOnline;if(oldOnline)selectedStrategy="old_sniper";localStorage.setItem("is_trade_old_online",oldOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();renderStats();if(isOnline&&oldOnline){loadSignal();loadAI();loadRadar();}};
 $("sniper02Toggle").onclick=()=>{sniper02Online=!sniper02Online;if(sniper02Online)selectedStrategy="sniper_02";localStorage.setItem("is_trade_sniper02_online",sniper02Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();renderStats();if(isOnline&&sniper02Online){loadSignal();loadAI();loadRadar();}};
 $("sniper03Toggle").onclick=()=>{sniper03Online=!sniper03Online;if(sniper03Online)selectedStrategy="sniper_03";localStorage.setItem("is_trade_sniper03_online",sniper03Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();renderStats();if(isOnline&&sniper03Online){loadSignal();loadAI();loadRadar();}};
-$("aiToggle").onclick=()=>{aiOnline=!aiOnline;localStorage.setItem("is_trade_ai_online",aiOnline?"on":"off");const b=$("aiToggle");b.textContent=aiOnline?"● ONLINE":"● OFFLINE";b.className="onlineBtn "+(aiOnline?"online":"offline");if(aiOnline)loadAI();};
+$("aiToggle").onclick=()=>{
+  aiOnline=!aiOnline;
+  if(aiOnline) selectedStrategy="ai";
+  else if(selectedStrategy==="ai") selectedStrategy=rsiOnline?"rsi":oldOnline?"old_sniper":sniper02Online?"sniper_02":sniper03Online?"sniper_03":"rsi";
+  localStorage.setItem("is_trade_ai_online",aiOnline?"on":"off");
+  localStorage.setItem("is_trade_selected_strategy",selectedStrategy);
+  const b=$("aiToggle"); b.textContent=aiOnline?"● ONLINE":"● OFFLINE"; b.className="onlineBtn "+(aiOnline?"online":"offline");
+  pending=null; save(); renderMode(); renderStats();
+  if(isOnline){loadSignal();loadAI();loadRadar();}
+};
 
 $("reset").onclick = () => {
   if(confirm("Zerar WIN e LOSS somente do ativo/timeframe/estratégia atual?")){
@@ -1364,207 +870,10 @@ setInterval(syncServerClock, 30000);
 setInterval(loadLicense, 60000);
 setInterval(loadRadar, 120000);
 setInterval(loadAI, 60000);
-</script>
-</body>
-</html>"""
-    return HTMLResponse(html)
+</script> </body>
+</html>""" return HTMLResponse(html) @app.get("/health") async def health() -> Dict[str, Any]: return {"ok": True, "app": APP_NAME, "version": APP_VERSION} @app.get("/server-time") async def server_time() -> Dict[str, str]: current = now_sp() return { "brasilia": current.isoformat(), "utc": datetime.utcnow().isoformat() + "+00:00", } @app.get("/license") async def license() -> Dict[str, Any]: return {"ok": True, **license_status()} def require_active_license() -> None: status = license_status() if not status["active"]: raise HTTPException(status_code=403, detail={"error": "LICENSE_EXPIRED", **status}) @app.get("/candles") async def candles( symbol: str = "EUR/USD", interval: str = "1min", size: int = 120, ) -> Dict[str, Any]: require_active_license() requested_size = int(size) values = await get_candles(symbol, interval, requested_size) return { "ok": True, "source": "Twelve Data", "symbol": symbol, "interval": interval, "values": values, } def ai_feature_vector(candles: List[Dict[str, Any]], i: int) -> List[float]: """Extrai características somente até o candle i (sem olhar o futuro).""" closes = [float(c["close"]) for c in candles[: i + 1]] opens = [float(c["open"]) for c in candles[: i + 1]] highs = [float(c["high"]) for c in candles[: i + 1]] lows = [float(c["low"]) for c in candles[: i + 1]] vols = [float(c.get("volume", 0) or 0) for c in candles[: i + 1]] def ret(n: int) -> float: if len(closes) <= n or closes[-1] == 0: return 0.0 return (closes[-1] / closes[-1 - n]) - 1.0 ranges = [max(h - l, 1e-12) for h, l in zip(highs, lows)] bodies = [abs(c - o) / r for c, o, r in zip(closes, opens, ranges)] tr = true_ranges(candles[: i + 1]) atr14 = sum(tr[-14:]) / min(14, len(tr)) if tr else 0.0 atr_ratio = atr14 / max(closes[-1], 1e-12) e9 = ema(closes, 9)[-1] e20 = ema(closes, 20)[-1] e50 = ema(closes, 50)[-1] r9 = rsi(closes, 9)[-1] r14 = rsi(closes, 14)[-1] vol10 = 0.0 if len(closes) >= 11: mean10 = sum(closes[-10:]) / 10.0 vol10 = (sum((x - mean10) ** 2 for x in closes[-10:]) / 10.0) ** 0.5 / max(mean10, 1e-12) avg_vol = sum(vols[-20:]) / max(1, min(20, len(vols))) vol_ratio = vols[-1] / avg_vol if avg_vol > 0 else 1.0 slope20 = 0.0 e20_series = ema(closes, 20) if len(e20_series) >= 6: slope20 = (e20_series[-1] - e20_series[-6]) / max(closes[-1], 1e-12) return [ ret(1), ret(2), ret(3), ret(5), ret(10), (closes[-1] - e9) / max(closes[-1], 1e-12), (e9 - e20) / max(closes[-1], 1e-12), (e20 - e50) / max(closes[-1], 1e-12), slope20, r9 / 100.0, r14 / 100.0, bodies[-1], (max(highs[-1] - max(opens[-1], closes[-1]), 0.0)) / ranges[-1], (max(min(opens[-1], closes[-1]) - lows[-1], 0.0)) / ranges[-1], atr_ratio, vol10, vol_ratio, ] def train_ai_ensemble(candles: List[Dict[str, Any]]) -> Dict[str, Any]: """Treina o ensemble V3 em ordem temporal.
 
-
-@app.get("/health")
-async def health() -> Dict[str, Any]:
-    return {"ok": True, "app": APP_NAME, "version": APP_VERSION}
-
-
-@app.get("/server-time")
-async def server_time() -> Dict[str, str]:
-    current = now_sp()
-    return {
-        "brasilia": current.isoformat(),
-        "utc": datetime.utcnow().isoformat() + "+00:00",
-    }
-
-
-@app.get("/license")
-async def license() -> Dict[str, Any]:
-    return {"ok": True, **license_status()}
-
-
-def require_active_license() -> None:
-    status = license_status()
-    if not status["active"]:
-        raise HTTPException(status_code=403, detail={"error": "LICENSE_EXPIRED", **status})
-
-
-@app.get("/candles")
-async def candles(
-    symbol: str = "EUR/USD",
-    interval: str = "1min",
-    size: int = 120,
-) -> Dict[str, Any]:
-    require_active_license()
-    requested_size = int(size)
-    values = await get_candles(symbol, interval, requested_size)
-    return {
-        "ok": True,
-        "source": "Twelve Data",
-        "symbol": symbol,
-        "interval": interval,
-        "values": values,
-    }
-
-
-@app.get("/ai-analysis")
-async def ai_analysis(symbol: str = "EUR/USD", interval: str = "1min") -> Dict[str, Any]:
-    require_active_license()
-    if interval not in ALLOWED_INTERVALS:
-        raise HTTPException(status_code=400, detail="Timeframe inválido.")
-    values = await get_candles(symbol, interval, 240)
-    closed = values[:-1]
-    if len(closed) < 60:
-        analysis = {"signal":"NEUTRO","confidence":50,"quality":"BAIXA","regime":"INDEFINIDO","reason":"Dados insuficientes para a IA."}
-    else:
-        closes=[float(c["close"]) for c in closed]
-        e9=ema(closes,9); e20=ema(closes,20); e50=ema(closes,50)
-        r9=float(rsi(closes,9)[-1]); r14=float(rsi(closes,14)[-1])
-        bull=bear=0.0; reasons=[]
-        if e9[-1]>e20[-1]: bull+=2; reasons.append("EMA 9 acima da EMA 20")
-        else: bear+=2; reasons.append("EMA 9 abaixo da EMA 20")
-        if e20[-1]>e50[-1]: bull+=2
-        else: bear+=2
-        slope=e20[-1]-e20[-6]
-        tr=true_ranges(closed); atr=sum(tr[-14:])/14 if len(tr)>=14 else 0
-        threshold=max(atr*0.05,abs(closes[-1])*0.00001)
-        if slope>threshold: bull+=1.5
-        elif slope<-threshold: bear+=1.5
-        if r9<35 and r14<45: bull+=1.5; reasons.append("RSI favorece recuperação")
-        elif r9>65 and r14>55: bear+=1.5; reasons.append("RSI favorece pressão vendedora")
-        last=closed[-1]; strength=abs(float(last["close"])-float(last["open"]))/max(float(last["high"])-float(last["low"]),1e-12)
-        if float(last["close"])>float(last["open"]) and strength>=.55: bull+=1
-        elif float(last["close"])<float(last["open"]) and strength>=.55: bear+=1
-        diff=abs(bull-bear)
-        signal="CALL" if bull>bear and bull>=5 and diff>=2 else "PUT" if bear>bull and bear>=5 and diff>=2 else "NEUTRO"
-        confidence=int(max(50,min(95,58+diff*6))) if signal!="NEUTRO" else int(max(50,min(65,50+diff*4)))
-        quality="ALTA" if confidence>=75 else "MÉDIA" if confidence>=60 else "BAIXA"
-        regime="ALTA" if e9[-1]>e20[-1]>e50[-1] else "BAIXA" if e9[-1]<e20[-1]<e50[-1] else "LATERAL"
-        analysis={"signal":signal,"confidence":confidence,"quality":quality,"regime":regime,"reason":("IA: "+("COMPRA" if signal=="CALL" else "VENDA" if signal=="PUT" else "AGUARDAR")+". "+"; ".join(reasons[:3])),"rsi9":round(r9,2),"rsi14":round(r14,2),"non_repaint":True}
-    return {"ok":True,"source":"Twelve Data","symbol":symbol,"interval":interval,"analysis":analysis,"trend":detect_market_trend(values)}
-
-
-@app.get("/signal")
-async def signal(
-    symbol: str = "EUR/USD",
-    interval: str = "1min",
-    strategy: str = "rsi",
-) -> Dict[str, Any]:
-    require_active_license()
-    if strategy not in {"rsi", "old_sniper", "sniper_02", "sniper_03"}:
-        raise HTTPException(status_code=400, detail="Estratégia inválida.")
-    values = await get_candles(symbol, interval, 240)
-    result = analyze(values, strategy)
-    trend_info = detect_market_trend(values)
-    result.update(trend_info)
-    # A análise usa a última vela fechada. A entrada deve ser na próxima
-    # abertura futura, nunca em uma vela cujo início já passou.
-    minutes = ALLOWED_INTERVALS[interval]
-    current = now_sp()
-    block_seconds = minutes * 60
-    epoch = int(current.timestamp())
-    next_epoch = ((epoch // block_seconds) + 1) * block_seconds
-    entry_dt = datetime.fromtimestamp(next_epoch, tz=SP_TZ)
-    expiry_dt = entry_dt + timedelta(minutes=minutes)
-
-    result.update(
-        {
-            "source": "Twelve Data",
-            "symbol": symbol,
-            "interval": interval,
-            "entry_time": entry_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            "next_candle": entry_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            "expiry_time": expiry_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            "expiry": "1 vela do intervalo selecionado",
-            "warning": "Sinal probabilístico; não garante WIN. A fonte Twelve Data pode não coincidir com os preços da corretora.",
-        }
-    )
-    return result
-
-
-@app.get("/result")
-async def result(
-    symbol: str,
-    interval: str,
-    reference_candle: str,
-    direction: str,
-    entry_time: Optional[str] = None,
-) -> Dict[str, Any]:
-    require_active_license()
-    direction = direction.upper().strip()
-    if direction not in {"CALL", "PUT"}:
-        raise HTTPException(status_code=400, detail="Direção inválida.")
-
-    values = await get_candles(symbol, interval, 100)
-    reference_dt = parse_time(reference_candle)
-
-    reference_index: Optional[int] = None
-    for i, candle in enumerate(values):
-        if parse_time(candle["datetime"]) == reference_dt:
-            reference_index = i
-            break
-
-    if reference_index is None:
-        return {"ok": True, "status": "PENDING", "result": None}
-
-    if entry_time:
-        entry_dt = parse_time(entry_time)
-        entry_index: Optional[int] = None
-        for i, candle in enumerate(values):
-            if parse_time(candle["datetime"]) == entry_dt:
-                entry_index = i
-                break
-        if entry_index is None or entry_index + 1 >= len(values):
-            return {"ok": True, "status": "PENDING", "result": None}
-        result_candle = values[entry_index]
-        result_index = entry_index
-        result_time = parse_time(result_candle["datetime"])
-        if not candle_is_closed(result_time, interval):
-            return {"ok": True, "status": "PENDING", "result": None, "entry_candle": result_candle["datetime"]}
-        reference_close = result_candle["open"]
-        result_close = result_candle["close"]
-        result_candle_time = result_candle["datetime"]
-    else:
-        next_index = reference_index + 1
-        if next_index >= len(values):
-            return {"ok": True, "status": "PENDING", "result": None}
-        next_candle = values[next_index]
-        next_time = parse_time(next_candle["datetime"])
-        if not candle_is_closed(next_time, interval):
-            return {"ok": True, "status": "PENDING", "result": None, "next_candle": next_candle["datetime"]}
-        reference_close = values[reference_index]["close"]
-        result_close = next_candle["close"]
-        result_candle_time = next_candle["datetime"]
-
-    # A entrada é considerada no fechamento da vela de referência.
-    # A expiração de 1 vela compara o fechamento seguinte com essa entrada.
-    tolerance = max(abs(reference_close) * 1e-10, 1e-12)
-    if abs(result_close - reference_close) <= tolerance:
-        outcome = "DRAW"
-    elif direction == "CALL":
-        outcome = "WIN" if result_close > reference_close else "LOSS"
-    else:
-        outcome = "WIN" if result_close < reference_close else "LOSS"
-
-    return {
-        "ok": True,
-        "status": "CLOSED",
-        "result": outcome,
-        "direction": direction,
-        "reference_candle": reference_candle,
-        "result_candle": result_candle_time,
-        "entry_close": reference_close,
-        "result_close": result_close,
-    }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-
+    O alvo é o próximo candle fechado. A divisão é cronológica para evitar
+    vazamento de futuro. Além da acurácia, calcula um teste recente (holdout)
+    e mantém o modelo somente se houver classes e dados suficientes.
+    """ if not SKLEARN_OK: return {"ready": False, "reason": "scikit-learn não instalado"} closed = candles[:-1] if len(closed) < 100: return {"ready": False, "reason": "Poucas velas para treinar a IA V3"} X: List[List[float]] = [] y: List[int] = [] last_usable = len(closed) - 1 for i in range(50, last_usable): X.append(ai_feature_vector(closed, i)) y.append(1 if closed[i + 1]["close"] > closed[i]["close"] else 0) if len(X) < 60 or len(set(y)) < 2: return {"ready": False, "reason": "Classes insuficientes para treinar a IA V3"} split = max(40, int(len(X) * 0.80)) if split >= len(X): split = len(X) - 10 X_train, X_val = X[:split], X[split:] y_train, y_val = y[:split], y[split:] models = [ ("LOGISTIC", make_pipeline(StandardScaler(), LogisticRegression(max_iter=700, class_weight="balanced"))), ("RANDOM_FOREST", RandomForestClassifier( n_estimators=260, max_depth=7, min_samples_leaf=3, random_state=42, class_weight="balanced_subsample", n_jobs=-1 )), ("GRADIENT_BOOSTING", HistGradientBoostingClassifier( max_iter=220, learning_rate=0.04, max_leaf_nodes=15, l2_regularization=0.8, random_state=42 )), ] if XGBOOST_OK: models.append(("XGBOOST", XGBClassifier( n_estimators=280, max_depth=4, learning_rate=0.035, subsample=0.85, colsample_bytree=0.85, min_child_weight=4, reg_lambda=2.5, reg_alpha=0.15, objective="binary:logistic", eval_metric="logloss", random_state=42, n_jobs=2, tree_method="hist" ))) if LIGHTGBM_OK: models.append(("LIGHTGBM", LGBMClassifier( n_estimators=220, learning_rate=0.035, num_leaves=15, max_depth=5, min_child_samples=8, subsample=0.85, colsample_bytree=0.85, reg_lambda=2.0, reg_alpha=0.1, objective="binary", random_state=42, n_jobs=2, verbosity=-1 ))) trained = [] validation_scores = [] validation_probs = [] for name, model in models: try: model.fit(X_train, y_train) if X_val: pred = model.predict(X_val) score = sum(int(a == b) for a, b in zip(pred, y_val)) / len(y_val) validation_scores.append(float(score)) try: probs = [float(v[1]) for v in model.predict_proba(X_val)] validation_probs.extend(probs) except Exception: pass trained.append((name, model)) except Exception: continue if not trained: return {"ready": False, "reason": "Falha ao treinar os modelos"} return { "ready": True, "models": trained, "validation_accuracy": round(sum(validation_scores) / len(validation_scores) * 100, 1) if validation_scores else 0.0, "samples": len(X_train), "validation_samples": len(X_val), "data_candles": len(closed), "xgboost": XGBOOST_OK, "lightgbm": LIGHTGBM_OK, "training": "temporal_80_20", } def predict_ai_ensemble(symbol: str, interval: str, candles: List[Dict[str, Any]]) -> Dict[str, Any]: key = (symbol, interval) now = time.monotonic() cached = AI_MODEL_CACHE.get(key) if not cached or (now - cached[0]) >= AI_MODEL_TTL_SECONDS: trained = train_ai_ensemble(candles) AI_MODEL_CACHE[key] = (now, trained) else: trained = cached[1] if not trained.get("ready"): return {"ready": False, "reason": trained.get("reason", "IA indisponível")} closed = candles[:-1] x = ai_feature_vector(closed, len(closed) - 1) probabilities = [] model_names = [] for name, model in trained["models"]: try: p = float(model.predict_proba([x])[0][1]) probabilities.append(p) model_names.append(name) except Exception: continue if not probabilities: return {"ready": False, "reason": "Nenhum modelo conseguiu gerar previsão"} # Boosting recebe peso moderadamente maior; Random Forest/Logistic/GB # continuam como confirmação independente. Nenhum modelo decide sozinho. weights = [] for name in model_names: weights.append(1.25 if name in {"XGBOOST", "LIGHTGBM"} else 1.0) p_up = sum(p * w for p, w in zip(probabilities, weights)) / max(sum(weights), 1e-12) p_down = 1.0 - p_up spread = abs(p_up - 0.5) * 2.0 # Zona neutra: evita forçar CALL/PUT quando a IA está indecisa. if p_up >= 0.62: signal = "CALL" probability = p_up elif p_up <= 0.38: signal = "PUT" probability = p_down else: signal = "NEUTRO" probability = max(p_up, p_down) confidence = int(round(50 + spread * 45)) if signal == "NEUTRO" else int(round(55 + (probability - 0.50) * 100)) confidence = max(50, min(95, confidence)) agreement = sum((p >= 0.5) == (p_up >= 0.5) for p in probabilities) / len(probabilities) return { "ready": True, "signal": signal, "p_up": round(p_up * 100, 2), "p_down": round(p_down * 100, 2), "confidence": confidence, "agreement": round(agreement * 100, 1), "models": model_names, "validation_accuracy": trained.get("validation_accuracy", 0), "samples": trained.get("samples", 0), "validation_samples": trained.get("validation_samples", 0), "data_candles": trained.get("data_candles", 0), "training": trained.get("training", "temporal_80_20"), "xgboost": trained.get("xgboost", False), "lightgbm": trained.get("lightgbm", False), } @app.get("/ai-analysis") async def ai_analysis(symbol: str = "EUR/USD", interval: str = "1min") -> Dict[str, Any]: require_active_license() if interval not in ALLOWED_INTERVALS: raise HTTPException(status_code=400, detail="Timeframe inválido.") values = await get_candles(symbol, interval, 240) closed = values[:-1] if len(closed) < 60: analysis = {"signal":"NEUTRO","confidence":50,"quality":"BAIXA","regime":"INDEFINIDO","reason":"Dados insuficientes para a IA."} return {"ok":True,"source":"Twelve Data","symbol":symbol,"interval":interval,"analysis":analysis,"trend":detect_market_trend(values)} closes=[float(c["close"]) for c in closed] e9=ema(closes,9); e20=ema(closes,20); e50=ema(closes,50) r9=float(rsi(closes,9)[-1]); r14=float(rsi(closes,14)[-1]) trend=detect_market_trend(values) ml = await asyncio.to_thread(predict_ai_ensemble, symbol, interval, values) # Filtro de regime/confluência: a ML tem prioridade, mas não é obrigada a # operar contra uma tendência extremamente forte sem confirmação. if ml.get("ready"): signal = ml["signal"] p_up = ml["p_up"] regime = "ALTA" if e9[-1]>e20[-1]>e50[-1] else "BAIXA" if e9[-1]<e20[-1]<e50[-1] else "LATERAL" reasons = [f"Ensemble ML: alta {p_up:.1f}% / baixa {ml['p_down']:.1f}%", f"Concordância dos modelos: {ml['agreement']:.0f}%"] if regime == "ALTA" and signal == "CALL": reasons.append("Regime de alta confirma a compra") elif regime == "BAIXA" and signal == "PUT": reasons.append("Regime de baixa confirma a venda") elif regime in {"ALTA", "BAIXA"} and signal != "NEUTRO": reasons.append("Sinal ML contra o regime: confiança reduzida") if signal != "NEUTRO" and ((regime == "ALTA" and signal == "PUT") or (regime == "BAIXA" and signal == "CALL")): ml["confidence"] = max(50, ml["confidence"] - 8) confidence = int(ml["confidence"]) quality = "ALTA" if confidence >= 78 and ml["agreement"] >= 66 else "MÉDIA" if confidence >= 65 else "BAIXA" analysis={ "signal":signal, "confidence":confidence, "quality":quality, "regime":regime, "reason":"IA REAL: " + "; ".join(reasons), "rsi9":round(r9,2), "rsi14":round(r14,2), "p_up":ml["p_up"], "p_down":ml["p_down"], "agreement":ml["agreement"], "validation_accuracy":ml["validation_accuracy"], "samples":ml["samples"], "models":ml["models"], "data_candles":ml.get("data_candles", 0), "training":ml.get("training", "temporal_80_20"), "xgboost":ml.get("xgboost", False), "lightgbm":ml.get("lightgbm", False), "non_repaint":True, "ml":True, } else: # Fallback determinístico para o painel continuar funcionando caso # scikit-learn não esteja disponível no servidor. bull=bear=0.0; reasons=[] if e9[-1]>e20[-1]: bull+=2; reasons.append("EMA 9 acima da EMA 20") else: bear+=2; reasons.append("EMA 9 abaixo da EMA 20") if e20[-1]>e50[-1]: bull+=2 else: bear+=2 if r9<35 and r14<45: bull+=1.5; reasons.append("RSI favorece recuperação") elif r9>65 and r14>55: bear+=1.5; reasons.append("RSI favorece pressão vendedora") diff=abs(bull-bear) signal="CALL" if bull>bear and bull>=5 and diff>=2 else "PUT" if bear>bull and bear>=5 and diff>=2 else "NEUTRO" confidence=int(max(50,min(95,58+diff*6))) if signal!="NEUTRO" else int(max(50,min(65,50+diff*4))) regime="ALTA" if e9[-1]>e20[-1]>e50[-1] else "BAIXA" if e9[-1]<e20[-1]<e50[-1] else "LATERAL" analysis={"signal":signal,"confidence":confidence,"quality":"MÉDIA" if confidence>=60 else "BAIXA","regime":regime,"reason":"IA FALLBACK: "+"; ".join(reasons[:3]),"rsi9":round(r9,2),"rsi14":round(r14,2),"non_repaint":True,"ml":False} return {"ok":True,"source":"Twelve Data","symbol":symbol,"interval":interval,"analysis":analysis,"trend":trend} @app.get("/signal") async def signal( symbol: str = "EUR/USD", interval: str = "1min", strategy: str = "rsi", ) -> Dict[str, Any]: require_active_license() if strategy not in {"rsi", "old_sniper", "sniper_02", "sniper_03", "ai"}: raise HTTPException(status_code=400, detail="Estratégia inválida.") values = await get_candles(symbol, interval, 240) if strategy == "ai": ml = await asyncio.to_thread(predict_ai_ensemble, symbol, interval, values) trend_info = detect_market_trend(values) if ml.get("ready"): regime = "ALTA" if trend_info.get("trend") == "ALTA" else "BAIXA" if trend_info.get("trend") == "BAIXA" else "LATERAL" signal_value = ml.get("signal", "NEUTRO") confidence_value = int(ml.get("confidence", 50)) if regime == "ALTA" and signal_value == "PUT": confidence_value = max(50, confidence_value - 8) if regime == "BAIXA" and signal_value == "CALL": confidence_value = max(50, confidence_value - 8) result = { "signal": signal_value, "confidence": confidence_value, "strategy": "SNIPER IA V3", "strategy_code": "ai", "p_up": ml.get("p_up", 50), "p_down": ml.get("p_down", 50), "agreement": ml.get("agreement", 0), "models": ml.get("models", []), "validation_accuracy": ml.get("validation_accuracy", 0), "regime": regime, "non_repaint_reference": True, "ok": True } else: result = {"signal":"NEUTRO", "confidence":50, "strategy":"SNIPER IA V3", "strategy_code":"ai", "reason":ml.get("reason", "IA indisponível"), "non_repaint_reference":True, "ok":True} else: result = analyze(values, strategy) trend_info = detect_market_trend(values) result.update(trend_info) # A análise usa a última vela fechada. A entrada deve ser na próxima # abertura futura, nunca em uma vela cujo início já passou. minutes = ALLOWED_INTERVALS[interval] current = now_sp() block_seconds = minutes * 60 epoch = int(current.timestamp()) next_epoch = ((epoch // block_seconds) + 1) * block_seconds entry_dt = datetime.fromtimestamp(next_epoch, tz=SP_TZ) expiry_dt = entry_dt + timedelta(minutes=minutes) result.update( { "source": "Twelve Data", "symbol": symbol, "interval": interval, "entry_time": entry_dt.strftime("%Y-%m-%d %H:%M:%S"), "next_candle": entry_dt.strftime("%Y-%m-%d %H:%M:%S"), "expiry_time": expiry_dt.strftime("%Y-%m-%d %H:%M:%S"), "expiry": "1 vela do intervalo selecionado", "warning": "Sinal probabilístico; não garante WIN. A fonte Twelve Data pode não coincidir com os preços da corretora.", } ) return result @app.get("/result") async def result( symbol: str, interval: str, reference_candle: str, direction: str, entry_time: Optional[str] = None, ) -> Dict[str, Any]: require_active_license() direction = direction.upper().strip() if direction not in {"CALL", "PUT"}: raise HTTPException(status_code=400, detail="Direção inválida.") values = await get_candles(symbol, interval, 100) reference_dt = parse_time(reference_candle) reference_index: Optional[int] = None for i, candle in enumerate(values): if parse_time(candle["datetime"]) == reference_dt: reference_index = i break if reference_index is None: return {"ok": True, "status": "PENDING", "result": None} if entry_time: entry_dt = parse_time(entry_time) entry_index: Optional[int] = None for i, candle in enumerate(values): if parse_time(candle["datetime"]) == entry_dt: entry_index = i break if entry_index is None or entry_index + 1 >= len(values): return {"ok": True, "status": "PENDING", "result": None} result_candle = values[entry_index] result_index = entry_index result_time = parse_time(result_candle["datetime"]) if not candle_is_closed(result_time, interval): return {"ok": True, "status": "PENDING", "result": None, "entry_candle": result_candle["datetime"]} reference_close = result_candle["open"] result_close = result_candle["close"] result_candle_time = result_candle["datetime"] else: next_index = reference_index + 1 if next_index >= len(values): return {"ok": True, "status": "PENDING", "result": None} next_candle = values[next_index] next_time = parse_time(next_candle["datetime"]) if not candle_is_closed(next_time, interval): return {"ok": True, "status": "PENDING", "result": None, "next_candle": next_candle["datetime"]} reference_close = values[reference_index]["close"] result_close = next_candle["close"] result_candle_time = next_candle["datetime"] # A entrada é considerada no fechamento da vela de referência. # A expiração de 1 vela compara o fechamento seguinte com essa entrada. tolerance = max(abs(reference_close) * 1e-10, 1e-12) if abs(result_close - reference_close) <= tolerance: outcome = "DRAW" elif direction == "CALL": outcome = "WIN" if result_close > reference_close else "LOSS" else: outcome = "WIN" if result_close < reference_close else "LOSS" return { "ok": True, "status": "CLOSED", "result": outcome, "direction": direction, "reference_candle": reference_candle, "result_candle": result_candle_time, "entry_close": reference_close, "result_close": result_close, } if __name__ == "__main__": import uvicorn uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
