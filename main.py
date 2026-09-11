@@ -9,8 +9,8 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
-APP_NAME = "TRADE SNIPER"
-APP_VERSION = "9.0.2"
+APP_NAME = "Ismael Trade"
+APP_VERSION = "9.0.3"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -895,6 +895,57 @@ function fmt(v){ return v == null ? "--" : v; }
 
 let resultTimer = null;
 
+// Alerta sonoro de 5 segundos para novos sinais CALL/PUT.
+// O navegador exige uma interação do usuário antes de liberar áudio em muitos celulares.
+let audioCtx = null;
+let lastSoundSignal = localStorage.getItem("is_trade_last_sound_signal") || "";
+
+function unlockAudio(){
+  try{
+    if(!audioCtx){
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if(!AC) return;
+      audioCtx = new AC();
+    }
+    if(audioCtx.state === "suspended") audioCtx.resume();
+  }catch(e){}
+}
+
+function playSignalSound(direction){
+  if(direction !== "CALL" && direction !== "PUT") return;
+  try{
+    unlockAudio();
+    if(!audioCtx || audioCtx.state === "suspended") return;
+
+    const now = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(direction === "CALL" ? 880 : 440, now);
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.16, now + 0.03);
+    gain.gain.setValueAtTime(0.16, now + 4.7);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 5.0);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 5.02);
+  }catch(e){}
+}
+
+// Libera o áudio após qualquer toque/clique do usuário.
+document.addEventListener("pointerdown", unlockAudio, {passive:true});
+document.addEventListener("touchstart", unlockAudio, {passive:true});
+
+function alertNewSignal(direction, referenceCandle, entryTime){
+  if(direction !== "CALL" && direction !== "PUT") return;
+  const key = `${referenceCandle || ""}|${entryTime || ""}|${direction}`;
+  if(key === lastSoundSignal) return;
+  lastSoundSignal = key;
+  localStorage.setItem("is_trade_last_sound_signal", key);
+  playSignalSound(direction);
+}
+
 function showError(message){
   $("signal").textContent = "SEM DADOS";
   $("signal").className = "signal neutral";
@@ -997,6 +1048,7 @@ async function loadSignal(){
     if($("strength")) $("strength").textContent = (d.bullish_strength || d.bearish_strength) ? "SIM" : "NÃO";
 
     if(d.signal !== "NEUTRO"){
+      alertNewSignal(d.signal, d.reference_candle, d.entry_time);
       pending = {symbol, interval, reference_candle:d.reference_candle, entry_time:d.entry_time, direction:d.signal};
       save();
       scheduleResultCheck();
