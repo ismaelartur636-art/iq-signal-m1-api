@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 
 APP_NAME = "Trade sniper"
-APP_VERSION = "9.1.0"
+APP_VERSION = "10.0.0"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -514,6 +514,267 @@ def analyze(candles, strategy="rsi"):
     }
 
 
+
+# ============================================================
+# IA HÍBRIDA DE ANÁLISE — TRADE SNIPER 10
+# ------------------------------------------------------------
+# Modelo leve, determinístico e executável no próprio servidor.
+# Ele combina características de preço/volume/RSI/EMA/ATR e
+# valida o contexto contra padrões históricos recentes.
+#
+# Não "adivinha" o mercado: calcula uma probabilidade/score
+# baseado nas condições observadas. O score não é garantia de
+# WIN e deve ser tratado como apoio à decisão.
+# ============================================================
+
+def _clamp(value, low=0.0, high=1.0):
+    return max(low, min(high, float(value)))
+
+
+def _safe_mean(values):
+    return sum(values) / len(values) if values else 0.0
+
+
+def _std(values):
+    if len(values) < 2:
+        return 0.0
+    m = _safe_mean(values)
+    return (sum((x - m) ** 2 for x in values) / len(values)) ** 0.5
+
+
+def ai_analyze(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Camada de IA híbrida para classificação CALL/PUT/NEUTRO.
+
+    Usa apenas velas já disponíveis e fecha a análise no último
+    candle fechado, reduzindo risco de repaint no sinal histórico.
+    """
+    if len(candles) < 60:
+        return {
+            "signal": "NEUTRO",
+            "confidence": 0.0,
+            "score": 0.0,
+            "quality": "DADOS_INSUFICIENTES",
+            "features": {},
+            "reason": "São necessárias pelo menos 60 velas para a análise da IA.",
+        }
+
+    closed = candles[:-1]
+    closes = [c["close"] for c in closed]
+    highs = [c["high"] for c in closed]
+    lows = [c["low"] for c in closed]
+    opens = [c["open"] for c in closed]
+    volumes = [c.get("volume", 0.0) for c in closed]
+
+    e9 = ema(closes, 9)
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    r9 = rsi(closes, 9)
+    r14 = rsi(closes, 14)
+    trs = true_ranges(closed)
+    atr14 = _safe_mean(trs[-14:]) if trs else 0.0
+
+    last = closed[-1]
+    prev = closed[-2]
+    price = last["close"]
+
+    body = abs(last["close"] - last["open"])
+    rng = max(last["high"] - last["low"], 1e-12)
+    body_ratio = body / rng
+    upper_wick = last["high"] - max(last["open"], last["close"])
+    lower_wick = min(last["open"], last["close"]) - last["low"]
+
+    # Tendência em múltiplos horizontes.
+    trend_fast = (e9[-1] - e20[-1]) / max(atr14, 1e-12)
+    trend_slow = (e20[-1] - e50[-1]) / max(atr14, 1e-12)
+    slope20 = (e20[-1] - e20[-6]) / max(atr14, 1e-12)
+
+    trend_call = (
+        (1 if trend_fast > 0 else -1)
+        + (1 if trend_slow > 0 else -1)
+        + (1 if slope20 > 0 else -1)
+    ) / 3.0
+
+    # Momentum.
+    rsi_bias = ((r9[-1] - 50.0) / 50.0 + (r14[-1] - 50.0) / 50.0) / 2.0
+
+    # Estrutura local: fechamento comparado à faixa das últimas 20 velas.
+    look = 20
+    hh = max(highs[-look:])
+    ll = min(lows[-look:])
+    pos = (price - ll) / max(hh - ll, 1e-12)
+    structure_bias = (pos - 0.5) * 2.0
+
+    # Força da vela atual.
+    candle_bias = (last["close"] - last["open"]) / rng
+
+    # Rejeição de extremos.
+    rejection_bias = 0.0
+    if lower_wick / rng > 0.45 and last["close"] > last["open"]:
+        rejection_bias += 0.35
+    if upper_wick / rng > 0.45 and last["close"] < last["open"]:
+        rejection_bias -= 0.35
+
+    # Volume relativo, quando o provedor disponibiliza volume.
+    recent_vol = volumes[-21:-1]
+    vol_mean = _safe_mean(recent_vol)
+    volume_factor = (
+        _clamp(volumes[-1] / vol_mean, 0.25, 2.5)
+        if vol_mean > 0 and volumes[-1] > 0
+        else 1.0
+    )
+    volume_bias = candle_bias * (volume_factor - 1.0)
+
+    # Volatilidade: evita premiar movimentos muito pequenos.
+    recent_ranges = [c["high"] - c["low"] for c in closed[-20:]]
+    avg_range = _safe_mean(recent_ranges)
+    volatility_factor = _clamp(
+        (last["high"] - last["low"]) / max(avg_range, 1e-12),
+        0.0, 3.0
+    )
+
+    # Padrão de 2 velas: continuidade/engolfo simples.
+    pattern_bias = 0.0
+    if last["close"] > last["open"] and prev["close"] < prev["open"]:
+        if last["close"] >= prev["open"] and last["open"] <= prev["close"]:
+            pattern_bias += 0.75
+    elif last["close"] < last["open"] and prev["close"] > prev["open"]:
+        if last["close"] <= prev["open"] and last["open"] >= prev["close"]:
+            pattern_bias -= 0.75
+    else:
+        pattern_bias += 0.20 * candle_bias
+
+    # Regime: tendência ou lateralização.
+    regime = "TENDENCIA" if abs(trend_slow) >= 0.35 else "LATERAL"
+
+    raw = (
+        0.32 * trend_call
+        + 0.22 * rsi_bias
+        + 0.12 * structure_bias
+        + 0.12 * candle_bias
+        + 0.08 * rejection_bias
+        + 0.06 * pattern_bias
+        + 0.05 * volume_bias
+        + 0.03 * slope20 / max(abs(slope20), 1.0)
+    )
+
+    # Aumenta confiança quando há confirmação de regime/força.
+    confirmation = 0.0
+    if regime == "TENDENCIA" and trend_call * rsi_bias > 0:
+        confirmation += 0.10
+    if body_ratio >= 0.55:
+        confirmation += 0.05
+    if volatility_factor >= 0.80:
+        confirmation += 0.03
+    if abs(pattern_bias) >= 0.50:
+        confirmation += 0.04
+
+    # Penaliza conflito entre tendência e momentum.
+    conflict = 0.0
+    if trend_call * rsi_bias < -0.20:
+        conflict = 0.12
+
+    directional = _clamp(abs(raw), 0.0, 1.0)
+    confidence = _clamp(
+        50.0 + directional * 43.0 + confirmation * 100.0 - conflict * 100.0,
+        50.0, 98.0
+    )
+
+    # Zona neutra para evitar excesso de sinais.
+    if abs(raw) < 0.18 or confidence < 62.0:
+        signal = "NEUTRO"
+        quality = "BAIXA"
+    elif raw > 0:
+        signal = "CALL"
+        quality = "ALTA" if confidence >= 78 else "MEDIA"
+    else:
+        signal = "PUT"
+        quality = "ALTA" if confidence >= 78 else "MEDIA"
+
+    return {
+        "signal": signal,
+        "confidence": round(confidence, 1),
+        "score": round(raw * 100.0, 1),
+        "quality": quality,
+        "regime": regime,
+        "features": {
+            "rsi9": round(r9[-1], 2),
+            "rsi14": round(r14[-1], 2),
+            "ema9": round(e9[-1], 8),
+            "ema20": round(e20[-1], 8),
+            "ema50": round(e50[-1], 8),
+            "atr14": round(atr14, 8),
+            "body_ratio": round(body_ratio, 3),
+            "volatility_factor": round(volatility_factor, 3),
+            "trend_score": round(trend_call, 3),
+            "structure_score": round(structure_bias, 3),
+            "pattern_score": round(pattern_bias, 3),
+        },
+        "reason": (
+            f"Regime {regime}; tendência={trend_call:+.2f}; "
+            f"RSI={r9[-1]:.1f}/{r14[-1]:.1f}; "
+            f"força da vela={body_ratio:.2f}."
+        ),
+        "non_repaint_reference": True,
+    }
+
+
+def ai_historical_validation(
+    candles: List[Dict[str, Any]],
+    min_history: int = 60,
+    max_samples: int = 120,
+) -> Dict[str, Any]:
+    """
+    Validação walk-forward simples da própria IA.
+
+    Cada amostra só usa informação anterior ao candle seguinte.
+    Serve para medir o comportamento recente do classificador,
+    não para prometer rentabilidade futura.
+    """
+    if len(candles) < min_history + 2:
+        return {
+            "samples": 0,
+            "wins": 0,
+            "losses": 0,
+            "draws": 0,
+            "accuracy": 0.0,
+        }
+
+    start = max(min_history, len(candles) - max_samples - 1)
+    wins = losses = draws = 0
+
+    for i in range(start, len(candles) - 1):
+        try:
+            sample = candles[:i + 1]
+            prediction = ai_analyze(sample)
+            direction = prediction.get("signal", "NEUTRO")
+            if direction not in ("CALL", "PUT"):
+                continue
+
+            outcome = result_from_prices(
+                direction,
+                candles[i - 1]["close"],
+                candles[i]["close"],
+            )
+            if outcome == "WIN":
+                wins += 1
+            elif outcome == "LOSS":
+                losses += 1
+            else:
+                draws += 1
+        except Exception:
+            continue
+
+    resolved = wins + losses
+    accuracy = wins / resolved * 100.0 if resolved else 0.0
+    return {
+        "samples": wins + losses + draws,
+        "wins": wins,
+        "losses": losses,
+        "draws": draws,
+        "accuracy": round(accuracy, 1),
+    }
+
 def radar_score(analysis, strategy):
     if strategy == "rsi":
         r9, r14 = float(analysis.get("rsi9", 50)), float(analysis.get("rsi14", 50))
@@ -591,6 +852,35 @@ async def radar(interval="1min", strategy="rsi"):
     }
     RADAR_CACHE[cache_key] = (time.monotonic(), payload)
     return payload
+
+
+
+@app.get("/ai-analysis")
+async def ai_analysis_endpoint(symbol="EUR/USD", interval="1min"):
+    require_active_license()
+    if symbol not in SYMBOLS:
+        raise HTTPException(status_code=400, detail="Ativo inválido.")
+    if interval not in ALLOWED_INTERVALS:
+        raise HTTPException(status_code=400, detail="Timeframe inválido.")
+
+    values = await get_candles(symbol, interval, 240)
+    analysis = ai_analyze(values)
+    validation = ai_historical_validation(values)
+
+    return {
+        "ok": True,
+        "engine": "Trade Sniper AI Hybrid 1.0",
+        "symbol": symbol,
+        "interval": interval,
+        "analysis": analysis,
+        "recent_validation": validation,
+        "updated_at": now_sp().strftime("%Y-%m-%d %H:%M:%S"),
+        "warning": (
+            "A confiança é uma pontuação estatística do modelo e não "
+            "garante o próximo resultado. A cotação da corretora pode "
+            "diferir da Twelve Data."
+        ),
+    }
 
 
 @app.get("/sniper-ranking")
@@ -1131,6 +1421,37 @@ function rankingRow(x,pos){
  const pct=Number(x.accuracy||0);
  return `<div class="rankRow"><div><span class="rankPos">${pos}º ${x.strategy}</span><div class="rankBar"><div style="width:${pct}%"></div></div></div><b class="good">${x.wins}</b><b class="bad">${x.losses}</b><b>${pct.toFixed(1)}%</b><b class="rankSignals">${x.signals}</b></div>`
 }
+
+async function loadAI() {
+  const status = document.getElementById("aiStatus");
+  const main = document.getElementById("aiMain");
+  const meta = document.getElementById("aiMeta");
+  const reason = document.getElementById("aiReason");
+  if (!status || !main) return;
+
+  try {
+    status.textContent = "Analisando últimas 240 velas...";
+    const r = await fetch(
+      `/ai-analysis?symbol=${encodeURIComponent(symbolSelect.value)}&interval=${encodeURIComponent(intervalSelect.value)}`
+    );
+    const data = await r.json();
+    if (!r.ok || !data.ok) throw new Error(data.detail || "Falha na IA");
+
+    const a = data.analysis;
+    main.textContent = `${a.signal} — ${a.confidence}%`;
+    meta.textContent =
+      `Qualidade: ${a.quality} | Regime: ${a.regime || "-"} | ` +
+      `Validação recente: ${data.recent_validation.accuracy}%`;
+    reason.textContent = a.reason || "";
+    status.textContent = "IA atualizada";
+  } catch (e) {
+    status.textContent = "IA indisponível";
+    main.textContent = e.message || "Erro na análise";
+    meta.textContent = "";
+    reason.textContent = "";
+  }
+}
+
 async function loadRanking(){
  const s=$("symbol").value,i=$("interval").value;
  $("rankingStatus").textContent="ANALISANDO";
@@ -1188,6 +1509,7 @@ renderMode();updateClock();updateCountdown();
 setInterval(updateClock,1000);
 setInterval(updateCountdown,250);
 syncServerClock();loadLicense();loadSignal();loadRadar();loadRanking();
+    loadAI();
 
 let lastEntrySlot="";
 setInterval(()=>{
