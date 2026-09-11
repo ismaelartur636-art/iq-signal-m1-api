@@ -6,7 +6,7 @@ import re
 
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -19,26 +19,39 @@ from fastapi.responses import HTMLResponse
 
 app = FastAPI(
     title="MEGA IA",
-    version="12.1.0"
+    version="12.2.0"
 )
 
 BR_TZ = ZoneInfo("America/Sao_Paulo")
 UTC = timezone.utc
 
-TD_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
-OAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+TD_KEY = os.getenv(
+    "TWELVE_DATA_API_KEY",
+    ""
+).strip()
+
+OAI_KEY = os.getenv(
+    "OPENAI_API_KEY",
+    ""
+).strip()
 
 OAI_MODEL = os.getenv(
     "OPENAI_MODEL",
     "gpt-5.6-luna"
-)
+).strip()
 
 OAI_MIN = float(
-    os.getenv("OPENAI_MIN_CONFIDENCE", "70")
+    os.getenv(
+        "OPENAI_MIN_CONFIDENCE",
+        "70"
+    )
 )
 
 OAI_TIMEOUT = float(
-    os.getenv("OPENAI_TIMEOUT", "15")
+    os.getenv(
+        "OPENAI_TIMEOUT",
+        "15"
+    )
 )
 
 LICENSE = os.getenv(
@@ -66,9 +79,10 @@ IG = os.getenv(
 # TWELVE DATA
 # ============================================================
 
-TD_URL = "https://api.twelvedata.com/time_series"
+TD_URL = (
+    "https://api.twelvedata.com/time_series"
+)
 
-# Intervalos em segundos
 INTERVALS = {
     "1min": 60,
     "5min": 300,
@@ -97,55 +111,59 @@ SYMBOLS = [
 # OPENAI
 # ============================================================
 
-OAI_URL = "https://api.openai.com/v1/responses"
+OAI_URL = (
+    "https://api.openai.com/v1/responses"
+)
 
 
 # ============================================================
 # CACHE
 # ============================================================
 
-# Cache de candles:
-# chave -> {
-#   "time": timestamp,
-#   "data": candles
-# }
-candle_cache: Dict[str, Dict[str, Any]] = {}
+candle_cache: Dict[
+    str,
+    Dict[str, Any]
+] = {}
 
-# Cache dos sinais
-signal_cache: Dict[str, Any] = {}
+signal_cache: Dict[
+    str,
+    Any
+] = {}
 
-# Cache da IA
-oai_cache: Dict[str, Any] = {}
+oai_cache: Dict[
+    str,
+    Any
+] = {}
 
-# Resultados
-results: Dict[str, Any] = {}
+results: Dict[
+    str,
+    Any
+] = {}
 
 
 # ============================================================
-# CONTROLE DE REQUISIÇÕES TWELVE DATA
+# CONTROLE TWELVE DATA
 # ============================================================
 
-# Tempo mínimo entre chamadas para a Twelve Data.
-#
-# O valor padrão de 8 segundos foi escolhido para evitar
-# excesso de chamadas em planos com limite por minuto.
-#
-# Pode ser alterado no Render:
-#
-# TD_MIN_INTERVAL=8
-#
 TD_MIN_INTERVAL = float(
-    os.getenv("TD_MIN_INTERVAL", "8")
+    os.getenv(
+        "TD_MIN_INTERVAL",
+        "8"
+    )
 )
 
-# Tempo de validade do cache de candles
 TD_CACHE_SECONDS = float(
-    os.getenv("TD_CACHE_SECONDS", "20")
+    os.getenv(
+        "TD_CACHE_SECONDS",
+        "20"
+    )
 )
 
-# Número máximo de tentativas
 TD_MAX_RETRIES = int(
-    os.getenv("TD_MAX_RETRIES", "3")
+    os.getenv(
+        "TD_MAX_RETRIES",
+        "3"
+    )
 )
 
 td_lock = asyncio.Lock()
@@ -158,26 +176,45 @@ last_td_request = 0.0
 # ============================================================
 
 def now():
-    return datetime.now(BR_TZ)
+
+    return datetime.now(
+        BR_TZ
+    )
 
 
 def iso(d):
-    return d.astimezone(BR_TZ).isoformat()
+
+    return d.astimezone(
+        BR_TZ
+    ).isoformat()
 
 
 def parse(s):
+
     d = datetime.fromisoformat(
-        s.replace("Z", "+00:00")
+        str(s).replace(
+            "Z",
+            "+00:00"
+        )
     )
 
     if d.tzinfo is None:
-        d = d.replace(tzinfo=UTC)
 
-    return d.astimezone(BR_TZ)
+        d = d.replace(
+            tzinfo=UTC
+        )
+
+    return d.astimezone(
+        BR_TZ
+    )
 
 
 def clamp(x, a, b):
-    return max(a, min(b, x))
+
+    return max(
+        a,
+        min(b, x)
+    )
 
 
 # ============================================================
@@ -187,14 +224,24 @@ def clamp(x, a, b):
 def ema(v, p):
 
     if len(v) < p:
+
         return None
 
-    k = 2 / (p + 1)
+    k = 2 / (
+        p + 1
+    )
 
-    e = sum(v[:p]) / p
+    e = sum(
+        v[:p]
+    ) / p
 
     for x in v[p:]:
-        e = x * k + e * (1 - k)
+
+        e = (
+            x * k
+            +
+            e * (1 - k)
+        )
 
     return e
 
@@ -202,26 +249,55 @@ def ema(v, p):
 def rsi(v, p=14):
 
     if len(v) < p + 1:
+
         return None
 
     gains = []
     losses = []
 
-    for i in range(1, len(v)):
+    for i in range(
+        1,
+        len(v)
+    ):
 
-        d = v[i] - v[i - 1]
+        d = (
+            v[i]
+            -
+            v[i - 1]
+        )
 
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
+        gains.append(
+            max(d, 0)
+        )
 
-    avg_gain = sum(gains[-p:]) / p
-    avg_loss = sum(losses[-p:]) / p
+        losses.append(
+            max(-d, 0)
+        )
+
+    avg_gain = (
+        sum(gains[-p:])
+        / p
+    )
+
+    avg_loss = (
+        sum(losses[-p:])
+        / p
+    )
 
     if avg_loss == 0:
+
         return 100
 
-    return 100 - 100 / (
-        1 + avg_gain / avg_loss
+    return (
+        100
+        -
+        100 /
+        (
+            1
+            +
+            avg_gain /
+            avg_loss
+        )
     )
 
 
@@ -235,17 +311,23 @@ async def wait_td_slot():
 
     async with td_lock:
 
-        elapsed = time.monotonic() - last_td_request
+        elapsed = (
+            time.monotonic()
+            -
+            last_td_request
+        )
 
         if elapsed < TD_MIN_INTERVAL:
 
-            wait_time = (
-                TD_MIN_INTERVAL - elapsed
+            await asyncio.sleep(
+                TD_MIN_INTERVAL
+                -
+                elapsed
             )
 
-            await asyncio.sleep(wait_time)
-
-        last_td_request = time.monotonic()
+        last_td_request = (
+            time.monotonic()
+        )
 
 
 # ============================================================
@@ -262,31 +344,55 @@ async def candles(
 
         raise HTTPException(
             status_code=500,
-            detail="TWELVE_DATA_API_KEY não configurada."
+            detail=(
+                "TWELVE_DATA_API_KEY "
+                "não configurada."
+            )
+        )
+
+    if symbol not in SYMBOLS:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Ativo inválido."
+        )
+
+    if interval not in INTERVALS:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Intervalo inválido."
         )
 
     n = int(
-        clamp(n, 10, 100)
+        clamp(
+            n,
+            10,
+            100
+        )
     )
 
-    cache_key = f"{symbol}|{interval}|{n}"
+    cache_key = (
+        f"{symbol}|"
+        f"{interval}|"
+        f"{n}"
+    )
 
-    # --------------------------------------------------------
-    # CACHE
-    # --------------------------------------------------------
-
-    cached = candle_cache.get(cache_key)
+    cached = candle_cache.get(
+        cache_key
+    )
 
     if cached:
 
         age = (
-            time.time() - cached["time"]
+            time.time()
+            -
+            cached["time"]
         )
 
         if age < TD_CACHE_SECONDS:
 
             return cached["data"]
-
 
     params = {
         "symbol": symbol,
@@ -296,14 +402,13 @@ async def candles(
         "format": "JSON"
     }
 
+    last_error = (
+        "Erro desconhecido."
+    )
 
-    # --------------------------------------------------------
-    # TENTATIVAS
-    # --------------------------------------------------------
-
-    last_error = None
-
-    for attempt in range(TD_MAX_RETRIES):
+    for attempt in range(
+        TD_MAX_RETRIES
+    ):
 
         try:
 
@@ -318,38 +423,54 @@ async def candles(
                     params=params
                 )
 
-
             # ------------------------------------------------
             # RATE LIMIT
             # ------------------------------------------------
 
             if response.status_code == 429:
 
-                retry_after = response.headers.get(
-                    "Retry-After"
+                retry_after = (
+                    response.headers.get(
+                        "Retry-After"
+                    )
                 )
 
                 try:
+
                     wait_seconds = float(
                         retry_after
                     )
-                except:
+
+                except Exception:
 
                     wait_seconds = (
-                        10 * (attempt + 1)
+                        10
+                        *
+                        (attempt + 1)
                     )
 
-                await asyncio.sleep(
-                    min(wait_seconds, 30)
-                )
-
                 last_error = (
-                    "Twelve Data: limite de "
-                    "requisições atingido."
+                    "Twelve Data: "
+                    "limite de requisições "
+                    "atingido."
                 )
 
-                continue
+                if (
+                    attempt
+                    <
+                    TD_MAX_RETRIES - 1
+                ):
 
+                    await asyncio.sleep(
+                        min(
+                            wait_seconds,
+                            30
+                        )
+                    )
+
+                    continue
+
+                break
 
             # ------------------------------------------------
             # OUTROS ERROS HTTP
@@ -358,9 +479,10 @@ async def candles(
             if response.status_code >= 400:
 
                 try:
-                    error_data = response.json()
 
-                    message = error_data.get(
+                    data = response.json()
+
+                    message = data.get(
                         "message",
                         f"HTTP {response.status_code}"
                     )
@@ -368,62 +490,97 @@ async def candles(
                 except Exception:
 
                     message = (
-                        f"HTTP {response.status_code}"
+                        f"HTTP "
+                        f"{response.status_code}"
                     )
 
-                raise HTTPException(
-                    status_code=502,
-                    detail=message
-                )
+                last_error = message
 
+                if (
+                    attempt
+                    <
+                    TD_MAX_RETRIES - 1
+                ):
+
+                    await asyncio.sleep(
+                        2
+                        *
+                        (attempt + 1)
+                    )
+
+                    continue
+
+                break
 
             data = response.json()
 
-
             # ------------------------------------------------
-            # ERRO DA TWELVE DATA
+            # ERRO TWELVE DATA
             # ------------------------------------------------
 
-            if data.get("status") == "error":
+            if data.get(
+                "status"
+            ) == "error":
 
                 message = data.get(
                     "message",
                     "Erro Twelve Data."
                 )
 
+                last_error = message
+
+                low = message.lower()
+
                 if (
-                    "limit" in message.lower()
-                    or "rate" in message.lower()
-                    or "too many" in message.lower()
+                    "limit" in low
+                    or
+                    "rate" in low
+                    or
+                    "too many" in low
                 ):
 
-                    last_error = message
+                    if (
+                        attempt
+                        <
+                        TD_MAX_RETRIES - 1
+                    ):
 
-                    await asyncio.sleep(
-                        10 * (attempt + 1)
-                    )
+                        await asyncio.sleep(
+                            10
+                            *
+                            (attempt + 1)
+                        )
 
-                    continue
+                        continue
 
-                raise HTTPException(
-                    status_code=502,
-                    detail=message
-                )
-
+                break
 
             values = data.get(
                 "values",
                 []
             )
 
-
             if not values:
 
-                raise HTTPException(
-                    status_code=502,
-                    detail="Nenhum candle recebido."
+                last_error = (
+                    "Nenhum candle recebido."
                 )
 
+                if (
+                    attempt
+                    <
+                    TD_MAX_RETRIES - 1
+                ):
+
+                    await asyncio.sleep(
+                        2
+                        *
+                        (attempt + 1)
+                    )
+
+                    continue
+
+                break
 
             # ------------------------------------------------
             # NORMALIZAR
@@ -431,84 +588,119 @@ async def candles(
 
             out = []
 
-            for item in reversed(values):
+            for item in reversed(
+                values
+            ):
 
                 try:
 
                     out.append(
                         {
-                            "datetime": item["datetime"],
-                            "open": float(item["open"]),
-                            "high": float(item["high"]),
-                            "low": float(item["low"]),
-                            "close": float(item["close"]),
-                            "volume": float(
-                                item.get(
-                                    "volume",
-                                    0
-                                ) or 0
-                            )
+                            "datetime":
+                                item[
+                                    "datetime"
+                                ],
+
+                            "open":
+                                float(
+                                    item["open"]
+                                ),
+
+                            "high":
+                                float(
+                                    item["high"]
+                                ),
+
+                            "low":
+                                float(
+                                    item["low"]
+                                ),
+
+                            "close":
+                                float(
+                                    item["close"]
+                                ),
+
+                            "volume":
+                                float(
+                                    item.get(
+                                        "volume",
+                                        0
+                                    )
+                                    or 0
+                                )
                         }
                     )
 
                 except Exception:
-                    continue
 
+                    continue
 
             if not out:
 
-                raise HTTPException(
-                    status_code=502,
-                    detail="Candles inválidos recebidos."
+                last_error = (
+                    "Candles inválidos "
+                    "recebidos."
                 )
 
+                break
 
             # ------------------------------------------------
-            # SALVAR CACHE
+            # CACHE
             # ------------------------------------------------
 
-            candle_cache[cache_key] = {
-                "time": time.time(),
-                "data": out
+            candle_cache[
+                cache_key
+            ] = {
+                "time":
+                    time.time(),
+
+                "data":
+                    out
             }
 
             return out
 
-
-        except HTTPException:
-            raise
-
-
         except Exception as exc:
 
-            last_error = str(exc)
+            last_error = str(
+                exc
+            )
 
-            if attempt < TD_MAX_RETRIES - 1:
+            if (
+                attempt
+                <
+                TD_MAX_RETRIES - 1
+            ):
 
                 await asyncio.sleep(
-                    2 * (attempt + 1)
+                    2
+                    *
+                    (attempt + 1)
                 )
 
-
     # --------------------------------------------------------
-    # SE TIVER CACHE ANTIGO, USA COMO FALLBACK
+    # CACHE ANTIGO
     # --------------------------------------------------------
 
     cached = candle_cache.get(
         cache_key
     )
 
-    if cached:
+    if cached and cached.get(
+        "data"
+    ):
 
-        return cached["data"]
-
+        return cached[
+            "data"
+        ]
 
     raise HTTPException(
         status_code=503,
         detail=(
-            "Twelve Data temporariamente "
-            "indisponível ou limite de requisições "
-            "atingido."
+            "Twelve Data indisponível: "
+            +
+            last_error
         )
     )
 
@@ -524,9 +716,10 @@ def local_ai(cs):
         return {
             "direction": "NEUTRO",
             "confidence": 0,
-            "confirmed": False
+            "confirmed": False,
+            "reason":
+                "Poucos candles disponíveis."
         }
-
 
     values = [
         c["close"]
@@ -548,85 +741,126 @@ def local_ai(cs):
         14
     )
 
-
     last = cs[-1]
     prev = cs[-2]
 
-
     votes = {
-        "CALL": 0,
-        "PUT": 0
+        "CALL": 0.0,
+        "PUT": 0.0
     }
 
-
     # EMA
-    if fast is not None and slow is not None:
+    if (
+        fast is not None
+        and
+        slow is not None
+    ):
 
         if fast > slow:
-            votes["CALL"] += 1
+
+            votes[
+                "CALL"
+            ] += 1.0
 
         elif fast < slow:
-            votes["PUT"] += 1
 
+            votes[
+                "PUT"
+            ] += 1.0
 
     # RSI
     if rsi_value is not None:
 
         if rsi_value <= 35:
 
-            votes["CALL"] += 1.2
+            votes[
+                "CALL"
+            ] += 1.2
 
         elif rsi_value >= 65:
 
-            votes["PUT"] += 1.2
+            votes[
+                "PUT"
+            ] += 1.2
 
         elif rsi_value > 50:
 
-            votes["CALL"] += 0.4
+            votes[
+                "CALL"
+            ] += 0.4
 
         elif rsi_value < 50:
 
-            votes["PUT"] += 0.4
+            votes[
+                "PUT"
+            ] += 0.4
 
-
-    # Direção do último candle
+    # Direção
     if last["close"] > prev["close"]:
 
-        votes["CALL"] += 0.7
+        votes[
+            "CALL"
+        ] += 0.7
 
     elif last["close"] < prev["close"]:
 
-        votes["PUT"] += 0.7
+        votes[
+            "PUT"
+        ] += 0.7
 
-
-    # Força do candle
+    # Força
     candle_range = max(
-        last["high"] - last["low"],
+        last["high"]
+        -
+        last["low"],
         1e-12
     )
 
-    body_ratio = abs(
-        last["close"] - last["open"]
-    ) / candle_range
-
+    body_ratio = (
+        abs(
+            last["close"]
+            -
+            last["open"]
+        )
+        /
+        candle_range
+    )
 
     if body_ratio >= 0.6:
 
-        if last["close"] > last["open"]:
+        if (
+            last["close"]
+            >
+            last["open"]
+        ):
 
-            votes["CALL"] += 0.7
+            votes[
+                "CALL"
+            ] += 0.7
 
-        else:
+        elif (
+            last["close"]
+            <
+            last["open"]
+        ):
 
-            votes["PUT"] += 0.7
+            votes[
+                "PUT"
+            ] += 0.7
 
-
-    # Resultado
-    if votes["CALL"] > votes["PUT"]:
+    if (
+        votes["CALL"]
+        >
+        votes["PUT"]
+    ):
 
         direction = "CALL"
 
-    elif votes["PUT"] > votes["CALL"]:
+    elif (
+        votes["PUT"]
+        >
+        votes["CALL"]
+    ):
 
         direction = "PUT"
 
@@ -634,39 +868,77 @@ def local_ai(cs):
 
         direction = "NEUTRO"
 
-
     total = sum(
         votes.values()
     )
-
 
     if total:
 
         confidence = (
             50
-            + abs(
+            +
+            abs(
                 votes["CALL"]
-                - votes["PUT"]
-            ) / total
-            * 45
+                -
+                votes["PUT"]
+            )
+            /
+            total
+            *
+            45
         )
 
     else:
 
         confidence = 0
 
-
     return {
-        "direction": direction,
-        "confidence": round(
-            clamp(
-                confidence,
-                0,
-                97
+        "direction":
+            direction,
+
+        "confidence":
+            round(
+                clamp(
+                    confidence,
+                    0,
+                    97
+                ),
+                1
             ),
-            1
-        ),
-        "confirmed": confidence >= 65
+
+        "confirmed":
+            confidence >= 65,
+
+        "reason":
+            (
+                "EMA3/7, "
+                "RSI14="
+                +
+                (
+                    str(
+                        round(
+                            rsi_value,
+                            1
+                        )
+                    )
+                    if
+                    rsi_value
+                    is not None
+                    else
+                    "--"
+                )
+                +
+                ", força do candle="
+                +
+                str(
+                    round(
+                        body_ratio * 100,
+                        1
+                    )
+                )
+                +
+                "%"
+            )
     }
 
 
@@ -677,6 +949,7 @@ def local_ai(cs):
 def json_extract(s):
 
     if not s:
+
         return None
 
     s = re.sub(
@@ -687,11 +960,14 @@ def json_extract(s):
     )
 
     try:
-        return json.loads(s)
+
+        return json.loads(
+            s
+        )
 
     except Exception:
-        pass
 
+        pass
 
     match = re.search(
         r"\{.*\}",
@@ -700,8 +976,8 @@ def json_extract(s):
     )
 
     if not match:
-        return None
 
+        return None
 
     try:
 
@@ -728,9 +1004,13 @@ async def openai_confirm(
     if not OAI_KEY:
 
         return {
-            "available": False
-        }
+            "available":
+                False,
 
+            "error":
+                "OPENAI_API_KEY "
+                "não configurada."
+        }
 
     key = (
         f"{symbol}|"
@@ -738,29 +1018,45 @@ async def openai_confirm(
         f"{cs[-1]['datetime']}"
     )
 
-
-    cached = oai_cache.get(key)
+    cached = oai_cache.get(
+        key
+    )
 
     if cached:
 
-        if time.time() - cached[0] < 55:
+        if (
+            time.time()
+            -
+            cached[0]
+            <
+            55
+        ):
 
             return cached[1]
 
-
     data = [
         {
-            "time": c["datetime"],
-            "o": c["open"],
-            "h": c["high"],
-            "l": c["low"],
-            "c": c["close"],
-            "v": c["volume"]
+            "time":
+                c["datetime"],
+
+            "o":
+                c["open"],
+
+            "h":
+                c["high"],
+
+            "l":
+                c["low"],
+
+            "c":
+                c["close"],
+
+            "v":
+                c["volume"]
         }
 
         for c in cs[-40:]
     ]
-
 
     prompt = f"""
 Você é o módulo de confirmação da MEGA IA.
@@ -769,6 +1065,7 @@ Ativo: {symbol}
 Timeframe: {interval}
 
 Use somente candles fechados.
+Não invente dados futuros.
 
 Analise:
 - tendência
@@ -777,8 +1074,6 @@ Analise:
 - força
 - volatilidade
 - possível reversão
-
-Não invente dados futuros.
 
 Direção preliminar:
 {local["direction"]}
@@ -800,7 +1095,6 @@ Candles:
 {json.dumps(data)}
 """
 
-
     try:
 
         async with httpx.AsyncClient(
@@ -809,39 +1103,83 @@ Candles:
 
             response = await client.post(
                 OAI_URL,
+
                 headers={
                     "Authorization":
                         f"Bearer {OAI_KEY}",
+
                     "Content-Type":
                         "application/json"
                 },
+
                 json={
-                    "model": OAI_MODEL,
-                    "input": prompt
+                    "model":
+                        OAI_MODEL,
+
+                    "input":
+                        prompt
                 }
             )
 
+        if response.status_code >= 400:
 
-        response.raise_for_status()
+            try:
 
-        response_data = response.json()
+                error_data = (
+                    response.json()
+                )
+
+                message = (
+                    error_data
+                    .get(
+                        "error",
+                        {}
+                    )
+                    .get(
+                        "message",
+                        f"OpenAI HTTP "
+                        f"{response.status_code}"
+                    )
+                )
+
+            except Exception:
+
+                message = (
+                    f"OpenAI HTTP "
+                    f"{response.status_code}"
+                )
+
+            return {
+                "available":
+                    False,
+
+                "error":
+                    message
+            }
+
+        response_data = (
+            response.json()
+        )
 
         text = response_data.get(
             "output_text",
             ""
         )
 
-
         if not text:
 
-            for item in response_data.get(
-                "output",
-                []
+            for item in (
+                response_data.get(
+                    "output",
+                    []
+                )
             ):
 
-                for content in item.get(
-                    "content",
-                    []
+                for content in (
+                    item.get(
+                        "content",
+                        []
+                    )
                 ):
 
                     if content.get(
@@ -851,26 +1189,30 @@ Candles:
                         "text"
                     ):
 
-                        text += content.get(
-                            "text",
-                            ""
+                        text += (
+                            content.get(
+                                "text",
+                                ""
+                            )
                         )
-
 
         parsed = json_extract(
             text
         )
-
 
         if not isinstance(
             parsed,
             dict
         ):
 
-            raise ValueError(
-                "Resposta JSON inválida."
-            )
+            return {
+                "available":
+                    False,
 
+                "error":
+                    "Resposta JSON "
+                    "da OpenAI inválida."
+            }
 
         direction = str(
             parsed.get(
@@ -878,7 +1220,6 @@ Candles:
                 "NEUTRO"
             )
         ).upper()
-
 
         if direction not in (
             "CALL",
@@ -888,48 +1229,85 @@ Candles:
 
             direction = "NEUTRO"
 
+        try:
+
+            confidence = float(
+                parsed.get(
+                    "confidence",
+                    0
+                )
+            )
+
+        except Exception:
+
+            confidence = 0
+
+        risk = str(
+            parsed.get(
+                "risk",
+                "HIGH"
+            )
+        ).upper()
+
+        if risk not in (
+            "LOW",
+            "MEDIUM",
+            "HIGH"
+        ):
+
+            risk = "HIGH"
 
         out = {
-            "available": True,
-            "direction": direction,
-            "confidence": clamp(
-                float(
+            "available":
+                True,
+
+            "direction":
+                direction,
+
+            "confidence":
+                clamp(
+                    confidence,
+                    0,
+                    100
+                ),
+
+            "confirmed":
+                bool(
                     parsed.get(
-                        "confidence",
-                        0
+                        "confirmed",
+                        False
                     )
                 ),
-                0,
-                100
-            ),
-            "confirmed": bool(
-                parsed.get(
-                    "confirmed",
-                    False
-                )
-            ),
-            "risk": str(
-                parsed.get(
-                    "risk",
-                    "HIGH"
-                )
-            ).upper()
+
+            "reason":
+                str(
+                    parsed.get(
+                        "reason",
+                        ""
+                    )
+                ),
+
+            "risk":
+                risk
         }
 
-
-        oai_cache[key] = (
+        oai_cache[
+            key
+        ] = (
             time.time(),
             out
         )
 
-
         return out
 
-
-    except Exception:
+    except Exception as exc:
 
         return {
-            "available": False
+            "available":
+                False,
+
+            "error":
+                str(exc)
         }
 
 
@@ -937,7 +1315,9 @@ Candles:
 # PRÓXIMA ENTRADA
 # ============================================================
 
-def next_entry(interval):
+def next_entry(
+    interval
+):
 
     seconds = INTERVALS[
         interval
@@ -948,7 +1328,13 @@ def next_entry(interval):
     )
 
     next_timestamp = (
-        (timestamp // seconds) + 1
+        (
+            timestamp
+            //
+            seconds
+        )
+        +
+        1
     ) * seconds
 
     return datetime.fromtimestamp(
@@ -967,13 +1353,9 @@ async def signal(
 ):
 
     key = (
-        f"{symbol}|{interval}"
+        f"{symbol}|"
+        f"{interval}"
     )
-
-
-    # --------------------------------------------------------
-    # CACHE DO SINAL
-    # --------------------------------------------------------
 
     cached = signal_cache.get(
         key
@@ -983,12 +1365,13 @@ async def signal(
 
         if (
             time.time()
-            - cached[0]
-            < 8
+            -
+            cached[0]
+            <
+            8
         ):
 
             return cached[1]
-
 
     # --------------------------------------------------------
     # CANDLES
@@ -1004,24 +1387,62 @@ async def signal(
 
     except HTTPException as exc:
 
-        # Se já houver sinal em cache,
-        # mantém o último sinal.
-
         if cached:
 
             old = dict(
                 cached[1]
             )
 
-            old["status"] = (
-                "DADOS TEMPORARIAMENTE "
+            old[
+                "status"
+            ] = (
+                "DADOS "
+                "TEMPORARIAMENTE "
                 "INDISPONÍVEIS"
+            )
+
+            old[
+                "error"
+            ] = str(
+                exc.detail
             )
 
             return old
 
-        raise exc
+        # Não esconder o erro.
+        return {
+            "symbol":
+                symbol,
 
+            "interval":
+                interval,
+
+            "direction":
+                "NEUTRO",
+
+            "confidence":
+                0,
+
+            "entry_time":
+                "",
+
+            "expiry_time":
+                "",
+
+            "status":
+                "ERRO NOS DADOS",
+
+            "ai_confirmed":
+                False,
+
+            "risk":
+                "HIGH",
+
+            "error":
+                str(
+                    exc.detail
+                )
+        }
 
     # --------------------------------------------------------
     # REMOVE CANDLE ATUAL
@@ -1029,17 +1450,17 @@ async def signal(
 
     if len(cs) > 1:
 
-        cs_closed = cs[:-1]
+        cs_closed = cs[
+            :-1
+        ]
 
     else:
 
         cs_closed = cs
 
-
     local = local_ai(
         cs_closed
     )
-
 
     entry = next_entry(
         interval
@@ -1047,30 +1468,87 @@ async def signal(
 
     expiry = (
         entry
-        + timedelta(
-            seconds=INTERVALS[interval]
+        +
+        timedelta(
+            seconds=
+            INTERVALS[
+                interval
+            ]
         )
     )
 
-
     base = {
-        "symbol": symbol,
-        "interval": interval,
-        "direction": "NEUTRO",
-        "confidence": local["confidence"],
-        "entry_time": iso(entry),
-        "expiry_time": iso(expiry),
-        "status": "AGUARDANDO",
-        "ai_confirmed": False,
-        "risk": "HIGH"
+        "symbol":
+            symbol,
+
+        "interval":
+            interval,
+
+        "direction":
+            "NEUTRO",
+
+        "confidence":
+            local[
+                "confidence"
+            ],
+
+        "entry_time":
+            iso(entry),
+
+        "expiry_time":
+            iso(expiry),
+
+        "status":
+            "ANALISANDO",
+
+        "ai_confirmed":
+            False,
+
+        "risk":
+            "MEDIUM",
+
+        "local_reason":
+            local.get(
+                "reason",
+                ""
+            ),
+
+        "error":
+            "",
+
+        "ai_error":
+            ""
     }
 
+    # --------------------------------------------------------
+    # SEM DIREÇÃO
+    # --------------------------------------------------------
+
+    if (
+        local[
+            "direction"
+        ]
+        ==
+        "NEUTRO"
+    ):
+
+        base[
+            "status"
+        ] = (
+            "SEM OPORTUNIDADE"
+        )
+
+        base[
+            "risk"
+        ] = "HIGH"
 
     # --------------------------------------------------------
-    # CONFIRMAÇÃO IA
+    # CONFIRMAÇÃO
     # --------------------------------------------------------
 
-    if local["confirmed"]:
+    elif local[
+        "confirmed"
+    ]:
 
         ai = await openai_confirm(
             symbol,
@@ -1079,84 +1557,162 @@ async def signal(
             local
         )
 
+        base[
+            "ai_error"
+        ] = ai.get(
+            "error",
+            ""
+        )
 
+        # IA confirmou
         if (
-            ai.get("available")
-            and ai["direction"]
-            == local["direction"]
-            and ai["confirmed"]
-            and ai["confidence"]
-            >= OAI_MIN
-            and ai.get("risk")
-            != "HIGH"
+            ai.get(
+                "available"
+            )
+            and
+            ai.get(
+                "direction"
+            )
+            ==
+            local[
+                "direction"
+            ]
+            and
+            ai.get(
+                "confirmed"
+            )
+            and
+            ai.get(
+                "confidence",
+                0
+            )
+            >=
+            OAI_MIN
+            and
+            ai.get(
+                "risk"
+            )
+            !=
+            "HIGH"
         ):
 
             final_confidence = (
-                local["confidence"]
-                * 0.45
+                local[
+                    "confidence"
+                ]
+                *
+                0.45
                 +
-                ai["confidence"]
-                * 0.55
+                ai[
+                    "confidence"
+                ]
+                *
+                0.55
             )
-
 
             base.update(
-                direction=local["direction"],
-                confidence=round(
-                    clamp(
-                        final_confidence,
-                        0,
-                        97
+                direction=
+                    local[
+                        "direction"
+                    ],
+
+                confidence=
+                    round(
+                        clamp(
+                            final_confidence,
+                            0,
+                            97
+                        ),
+                        1
                     ),
-                    1
-                ),
-                status="SINAL LIBERADO",
-                ai_confirmed=True,
-                risk=ai.get(
-                    "risk",
-                    "MEDIUM"
-                )
+
+                status=
+                    "SINAL LIBERADO",
+
+                ai_confirmed=
+                    True,
+
+                risk=
+                    ai.get(
+                        "risk",
+                        "MEDIUM"
+                    )
             )
 
-
+        # OpenAI indisponível:
+        # usa análise local.
         elif not ai.get(
             "available"
         ):
 
             base.update(
-                direction=local["direction"],
-                status="SINAL LOCAL",
-                ai_confirmed=False,
-                risk="MEDIUM"
+                direction=
+                    local[
+                        "direction"
+                    ],
+
+                status=
+                    "SINAL LOCAL",
+
+                ai_confirmed=
+                    False,
+
+                risk=
+                    "MEDIUM"
             )
 
-
+        # IA discordou
         else:
 
             base.update(
-                confidence=round(
-                    min(
-                        local["confidence"],
-                        ai["confidence"]
+                direction=
+                    "NEUTRO",
+
+                confidence=
+                    round(
+                        min(
+                            local[
+                                "confidence"
+                            ],
+
+                            ai.get(
+                                "confidence",
+                                0
+                            )
+                        ),
+                        1
                     ),
-                    1
-                ),
-                status=(
+
+                status=
                     "AGUARDANDO "
-                    "CONFIRMAÇÃO"
-                ),
-                risk=ai.get(
-                    "risk",
-                    "HIGH"
-                )
+                    "CONFIRMAÇÃO",
+
+                ai_confirmed=
+                    False,
+
+                risk=
+                    ai.get(
+                        "risk",
+                        "HIGH"
+                    )
             )
 
+    else:
 
-    signal_cache[key] = (
+        base[
+            "status"
+        ] = "MONITORANDO"
+
+        base[
+            "risk"
+        ] = "MEDIUM"
+
+    signal_cache[
+        key
+    ] = (
         time.time(),
         base
     )
-
 
     return base
 
@@ -1169,22 +1725,72 @@ async def signal(
 async def health():
 
     return {
-        "status": "ok",
-        "app": "MEGA IA",
-        "version": "12.1.0",
-        "brasilia_time": iso(
-            now()
-        ),
-        "twelve_data_configured": bool(
-            TD_KEY
-        ),
-        "openai_configured": bool(
-            OAI_KEY
-        ),
+        "status":
+            "ok",
+
+        "app":
+            "MEGA IA",
+
+        "version":
+            "12.2.0",
+
+        "brasilia_time":
+            iso(now()),
+
+        "twelve_data_configured":
+            bool(TD_KEY),
+
+        "openai_configured":
+            bool(OAI_KEY),
+
+        "openai_model":
+            OAI_MODEL,
+
         "td_cache_seconds":
             TD_CACHE_SECONDS,
+
         "td_min_interval":
             TD_MIN_INTERVAL
+    }
+
+
+# ============================================================
+# DIAGNÓSTICO
+# ============================================================
+
+@app.get("/diagnostic")
+async def diagnostic(
+    symbol="EUR/USD",
+    interval="1min"
+):
+
+    value = await signal(
+        symbol,
+        interval
+    )
+
+    return {
+        "ok":
+            value.get(
+                "status"
+            )
+            not in (
+                "ERRO NOS DADOS",
+            ),
+
+        "signal":
+            value,
+
+        "config": {
+            "twelve_data_configured":
+                bool(TD_KEY),
+
+            "openai_configured":
+                bool(OAI_KEY),
+
+            "openai_model":
+                OAI_MODEL
+        }
     }
 
 
@@ -1196,9 +1802,9 @@ async def health():
 async def server_time():
 
     return {
-        "datetime": iso(
-            now()
-        ),
+        "datetime":
+            iso(now()),
+
         "timezone":
             "America/Sao_Paulo"
     }
@@ -1222,13 +1828,15 @@ async def license_info():
             0,
             (
                 expiration
-                - now().date()
+                -
+                now().date()
             ).days
         )
 
         active = (
             now().date()
-            <= expiration
+            <=
+            expiration
         )
 
     except Exception:
@@ -1236,14 +1844,24 @@ async def license_info():
         active = False
         days = 0
 
-
     return {
-        "active": active,
-        "expires": LICENSE,
-        "days_remaining": days,
-        "whatsapp_1": WA1,
-        "whatsapp_2": WA2,
-        "instagram": IG
+        "active":
+            active,
+
+        "expires":
+            LICENSE,
+
+        "days_remaining":
+            days,
+
+        "whatsapp_1":
+            WA1,
+
+        "whatsapp_2":
+            WA2,
+
+        "instagram":
+            IG
     }
 
 
@@ -1265,7 +1883,6 @@ async def get_candles(
             "Ativo inválido."
         )
 
-
     if interval not in INTERVALS:
 
         raise HTTPException(
@@ -1273,21 +1890,25 @@ async def get_candles(
             "Intervalo inválido."
         )
 
-
     return {
-        "symbol": symbol,
-        "interval": interval,
-        "candles": await candles(
+        "symbol":
             symbol,
+
+        "interval":
             interval,
-            int(
-                clamp(
-                    limit,
-                    10,
-                    100
+
+        "candles":
+            await candles(
+                symbol,
+                interval,
+                int(
+                    clamp(
+                        limit,
+                        10,
+                        100
+                    )
                 )
             )
-        )
     }
 
 
@@ -1303,14 +1924,14 @@ async def signal_ai(
 
     if (
         symbol not in SYMBOLS
-        or interval not in INTERVALS
+        or
+        interval not in INTERVALS
     ):
 
         raise HTTPException(
             400,
             "Ativo ou intervalo inválido."
         )
-
 
     return await signal(
         symbol,
@@ -1349,9 +1970,9 @@ async def ai_analysis(
         interval
     )
 
-
     return {
-        key: s.get(key)
+        key:
+            s.get(key)
 
         for key in (
             "symbol",
@@ -1360,7 +1981,10 @@ async def ai_analysis(
             "confidence",
             "status",
             "ai_confirmed",
-            "risk"
+            "risk",
+            "error",
+            "ai_error",
+            "local_reason"
         )
     }
 
@@ -1381,21 +2005,7 @@ async def radar(
             "Intervalo inválido."
         )
 
-
     output = []
-
-
-    # --------------------------------------------------------
-    # IMPORTANTE:
-    #
-    # Não fazemos asyncio.gather() aqui.
-    #
-    # Isso era uma das causas do 429:
-    #
-    # 12 símbolos = várias requisições simultâneas.
-    #
-    # Agora cada símbolo é processado separadamente.
-    # --------------------------------------------------------
 
     for symbol in SYMBOLS:
 
@@ -1406,32 +2016,57 @@ async def radar(
                 interval
             )
 
-
             output.append(
                 {
-                    "symbol": symbol,
+                    "symbol":
+                        symbol,
+
                     "direction":
-                        value["direction"],
+                        value.get(
+                            "direction",
+                            "NEUTRO"
+                        ),
+
                     "confidence":
-                        value["confidence"],
+                        value.get(
+                            "confidence",
+                            0
+                        ),
+
                     "status":
-                        value["status"]
+                        value.get(
+                            "status",
+                            "SEM DADOS"
+                        ),
+
+                    "error":
+                        value.get(
+                            "error",
+                            ""
+                        )
                 }
             )
 
-
-        except Exception:
+        except Exception as exc:
 
             output.append(
                 {
-                    "symbol": symbol,
-                    "direction": "NEUTRO",
-                    "confidence": 0,
+                    "symbol":
+                        symbol,
+
+                    "direction":
+                        "NEUTRO",
+
+                    "confidence":
+                        0,
+
                     "status":
-                        "SEM DADOS"
+                        "SEM DADOS",
+
+                    "error":
+                        str(exc)
                 }
             )
-
 
     return output
 
@@ -1445,8 +2080,11 @@ async def ranking():
 
     return [
         {
-            "name": name,
-            "score": 0
+            "name":
+                name,
+
+            "score":
+                0
         }
 
         for name in (
@@ -1470,35 +2108,50 @@ async def performance(
     wins = sum(
         1
         for x in results.values()
-        if x.get("result") == "WIN"
+        if x.get(
+            "result"
+        ) == "WIN"
     )
-
 
     losses = sum(
         1
         for x in results.values()
-        if x.get("result") == "LOSS"
+        if x.get(
+            "result"
+        ) == "LOSS"
     )
 
-
-    total = wins + losses
-
+    total = (
+        wins
+        +
+        losses
+    )
 
     accuracy = (
         round(
-            wins / total * 100,
+            wins
+            /
+            total
+            *
+            100,
             2
         )
         if total
         else 0
     )
 
-
     return {
-        "wins": wins,
-        "losses": losses,
-        "total": total,
-        "accuracy": accuracy
+        "wins":
+            wins,
+
+        "losses":
+            losses,
+
+        "total":
+            total,
+
+        "accuracy":
+            accuracy
     }
 
 
@@ -1521,7 +2174,6 @@ async def result(
             "expiry_time é obrigatório."
         )
 
-
     key = (
         f"{symbol}|"
         f"{interval}|"
@@ -1529,21 +2181,23 @@ async def result(
         f"{expiry_time}"
     )
 
-
     if key in results:
 
-        return results[key]
-
+        return results[
+            key
+        ]
 
     if now() < parse(
         expiry_time
     ):
 
         return {
-            "status": "PENDENTE",
-            "result": None
-        }
+            "status":
+                "PENDENTE",
 
+            "result":
+                None
+        }
 
     try:
 
@@ -1558,54 +2212,66 @@ async def result(
         return {
             "status":
                 "AGUARDANDO DADOS",
-            "result": None
+
+            "result":
+                None
         }
 
-
     target = None
-
 
     for c in cs:
 
         try:
 
-            if parse(
-                c["datetime"]
-            ) >= parse(
-                expiry_time
+            if (
+                parse(
+                    c[
+                        "datetime"
+                    ]
+                )
+                >=
+                parse(
+                    expiry_time
+                )
             ):
 
                 target = c
                 break
 
         except Exception:
-            continue
 
+            continue
 
     if not target:
 
         return {
             "status":
                 "AGUARDANDO CANDLE",
-            "result": None
+
+            "result":
+                None
         }
 
-
-    direction = direction.upper()
-
+    direction = (
+        direction.upper()
+    )
 
     if (
         direction == "CALL"
-        and target["close"]
-        > target["open"]
+        and
+        target["close"]
+        >
+        target["open"]
     ):
 
         res = "WIN"
 
     elif (
         direction == "PUT"
-        and target["close"]
-        < target["open"]
+        and
+        target["close"]
+        <
+        target["open"]
     ):
 
         res = "WIN"
@@ -1614,17 +2280,22 @@ async def result(
 
         res = "LOSS"
 
-
     output = {
-        "status": "FINALIZADA",
-        "result": res,
+        "status":
+            "FINALIZADA",
+
+        "result":
+            res,
+
         "candle_time":
-            target["datetime"]
+            target[
+                "datetime"
+            ]
     }
 
-
-    results[key] = output
-
+    results[
+        key
+    ] = output
 
     return output
 
@@ -1662,7 +2333,7 @@ body{
 margin:0;
 background:#070b12;
 color:#eaf2ff;
-font-family:Arial
+font-family:Arial,sans-serif
 }
 
 .wrap{
@@ -1726,6 +2397,10 @@ border-radius:12px;
 padding:11px
 }
 
+button{
+cursor:pointer
+}
+
 .radar{
 display:grid;
 grid-template-columns:
@@ -1743,6 +2418,13 @@ border-radius:12px
 small{
 color:#8291a8;
 font-size:11px
+}
+
+.error{
+color:#ff9a9a;
+font-size:12px;
+margin-top:8px;
+word-break:break-word
 }
 
 @media(max-width:700px){
@@ -1790,7 +2472,9 @@ grid-column:span 1
 ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA
 </small>
 
-<div id="clock"></div>
+<div id="clock">
+--:--:-- • Brasília
+</div>
 
 <div class="controls">
 
@@ -1798,14 +2482,25 @@ ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA
 
 <select id="interval">
 
-<option>1min</option>
-<option>5min</option>
-<option>15min</option>
-<option>30min</option>
+<option value="1min">
+1min
+</option>
+
+<option value="5min">
+5min
+</option>
+
+<option value="15min">
+15min
+</option>
+
+<option value="30min">
+30min
+</option>
 
 </select>
 
-<button onclick="voice()">
+<button id="voiceButton">
 🔊 Ativar voz
 </button>
 
@@ -1833,6 +2528,12 @@ AGUARDANDO
 
 <div id="confidence">
 Confiança: --
+</div>
+
+<div
+id="signalError"
+class="error"
+>
 </div>
 
 </div>
@@ -1963,6 +2664,11 @@ id="radar"
 class="radar"
 style="margin-top:12px"
 >
+
+<div>
+Radar iniciando...
+</div>
+
 </div>
 
 </div>
@@ -1988,7 +2694,9 @@ Verificando...
 
 <script>
 
-const syms=[
+const API_BASE = '';
+
+const syms = [
 'EUR/USD',
 'GBP/USD',
 'USD/JPY',
@@ -2003,22 +2711,120 @@ const syms=[
 'ETH/USD'
 ];
 
-const S=
-document.getElementById('symbol');
+
+const el = {
+
+symbol:
+document.getElementById(
+'symbol'
+),
+
+interval:
+document.getElementById(
+'interval'
+),
+
+voiceButton:
+document.getElementById(
+'voiceButton'
+),
+
+clock:
+document.getElementById(
+'clock'
+),
+
+direction:
+document.getElementById(
+'direction'
+),
+
+confidence:
+document.getElementById(
+'confidence'
+),
+
+entry:
+document.getElementById(
+'entry'
+),
+
+countdown:
+document.getElementById(
+'countdown'
+),
+
+status:
+document.getElementById(
+'status'
+),
+
+risk:
+document.getElementById(
+'risk'
+),
+
+wins:
+document.getElementById(
+'wins'
+),
+
+losses:
+document.getElementById(
+'losses'
+),
+
+accuracy:
+document.getElementById(
+'accuracy'
+),
+
+result:
+document.getElementById(
+'result'
+),
+
+radar:
+document.getElementById(
+'radar'
+),
+
+license:
+document.getElementById(
+'license'
+),
+
+signalError:
+document.getElementById(
+'signalError'
+)
+
+};
+
 
 syms.forEach(
-x=>S.add(
+x =>
+el.symbol.add(
 new Option(x,x)
 )
 );
 
 
-let cur=null;
-let voiceEnabled=false;
-let last='';
-let five=false;
-let entered=false;
-let reskey='';
+let cur = null;
+
+let voiceEnabled = false;
+
+let lastAnnounced = '';
+
+let five = false;
+
+let entered = false;
+
+let reskey = '';
+
+let radarBusy = false;
+
+let signalBusy = false;
 
 
 function speak(text){
@@ -2026,108 +2832,134 @@ function speak(text){
 if(
 !voiceEnabled ||
 !window.speechSynthesis
-)return;
+)
+return;
 
 speechSynthesis.cancel();
 
-const u=
+const u =
 new SpeechSynthesisUtterance(
 text
 );
 
-u.lang='pt-BR';
+u.lang = 'pt-BR';
 
-speechSynthesis.speak(u);
+speechSynthesis.speak(
+u
+);
 
 }
 
 
-function voice(){
+el.voiceButton.onclick =
+() => {
 
-voiceEnabled=true;
+voiceEnabled = true;
 
 speak(
 'Voz da Mega IA ativada.'
 );
 
-}
+};
 
 
 function ft(x){
 
-return x
-?
-new Date(x)
-.toLocaleTimeString(
+if(!x)
+return '--:--:--';
+
+const d =
+new Date(x);
+
+if(
+Number.isNaN(
+d.getTime()
+)
+)
+return '--:--:--';
+
+return d.toLocaleTimeString(
 'pt-BR',
 {
 hour12:false
 }
-)
-:
-'--:--:--';
+);
 
 }
 
 
 async function get(url){
 
-const r=
+const r =
 await fetch(
-url,
+API_BASE + url,
 {
 cache:'no-store'
 }
 );
 
-if(!r.ok){
-
-throw new Error(
-'HTTP '+r.status
-);
-
-}
-
-return r.json();
-
-}
-
-
-async function sig(){
+let data = null;
 
 try{
 
-cur=
-await get(
-'/signal-ai?symbol='
-+
-encodeURIComponent(S.value)
-+
-'&interval='
-+
-interval.value
-);
+data = await r.json();
 
+}catch(e){
 
-const d=
-document.getElementById(
-'direction'
-);
+data = null;
 
+}
 
-d.textContent=
-cur.direction;
+if(!r.ok){
 
-
-d.className=
-'big '
-+
+const detail =
+data &&
 (
-cur.direction==='CALL'
+data.detail ||
+data.message
+)
+?
+(
+data.detail ||
+data.message
+)
+:
+'HTTP ' + r.status;
+
+throw new Error(
+detail
+);
+
+}
+
+return data;
+
+}
+
+
+function renderSignal(
+data
+){
+
+cur = data;
+
+const direction =
+data.direction ||
+'NEUTRO';
+
+
+el.direction.textContent =
+direction;
+
+
+el.direction.className =
+'big ' +
+(
+direction === 'CALL'
 ?
 'call'
 :
-cur.direction==='PUT'
+direction === 'PUT'
 ?
 'put'
 :
@@ -2135,71 +2967,114 @@ cur.direction==='PUT'
 );
 
 
-confidence.textContent=
-'Confiança: '
-+
-cur.confidence
+el.confidence.textContent =
+'Confiança: ' +
+(
+typeof data.confidence ===
+'number'
+?
+data.confidence
+:
+'--'
+)
 +
 '%';
 
 
-entry.textContent=
+el.entry.textContent =
 ft(
-cur.entry_time
+data.entry_time
 );
 
 
-status.textContent=
-cur.status;
+el.status.textContent =
+data.status ||
+'MONITORANDO';
 
 
-risk.textContent=
-'Risco: '
-+
-cur.risk;
+el.risk.textContent =
+'Risco: ' +
+(
+data.risk ||
+'--'
+);
 
 
-const k=
-cur.symbol
-+
-'|'
-+
-cur.entry_time
-+
-'|'
-+
-cur.direction;
+el.signalError.textContent =
+data.error ||
+data.ai_error ||
+'';
+
+
+const k =
+(data.symbol || '') +
+'|' +
+(data.entry_time || '') +
+'|' +
+direction;
 
 
 if(
-k!==last &&
-cur.direction!=='NEUTRO'
+k !== lastAnnounced &&
+direction !== 'NEUTRO' &&
+data.entry_time
 ){
 
-last=k;
+lastAnnounced = k;
 
 speak(
-'Atenção. A Mega IA encontrou uma oportunidade no '
-+
-cur.symbol.replace('/',' ')
-+
-'. Sinal '
-+
-cur.direction
-+
-'. Entrada programada para '
-+
-ft(cur.entry_time)
-+
+'Atenção. A Mega IA encontrou uma oportunidade no ' +
+(data.symbol || '')
+.replace('/',' ') +
+'. Sinal ' +
+direction +
+'. Entrada programada para ' +
+ft(data.entry_time) +
 '.'
 );
 
 }
 
+}
+
+
+async function sig(){
+
+if(signalBusy)
+return;
+
+signalBusy = true;
+
+try{
+
+const data =
+await get(
+'/signal-ai?symbol=' +
+encodeURIComponent(
+el.symbol.value
+) +
+'&interval=' +
+encodeURIComponent(
+el.interval.value
+)
+);
+
+renderSignal(
+data
+);
+
 }catch(e){
 
-status.textContent=
-'DADOS TEMPORARIAMENTE INDISPONÍVEIS';
+el.status.textContent =
+'ERRO DE CONEXÃO';
+
+el.signalError.textContent =
+e.message ||
+'Falha ao consultar sinal.';
+
+}finally{
+
+signalBusy = false;
 
 }
 
@@ -2210,19 +3085,21 @@ async function perf(){
 
 try{
 
-const p=
+const p =
 await get(
 '/performance'
 );
 
-wins.textContent=
-p.wins;
+el.wins.textContent =
+p.wins ?? 0;
 
-losses.textContent=
-p.losses;
+el.losses.textContent =
+p.losses ?? 0;
 
-accuracy.textContent=
-p.accuracy
+el.accuracy.textContent =
+(
+p.accuracy ?? 0
+)
 +
 '%';
 
@@ -2233,59 +3110,104 @@ p.accuracy
 
 async function rad(){
 
+if(radarBusy)
+return;
+
+radarBusy = true;
+
 try{
 
-const a=
+el.radar.innerHTML =
+'<div>Radar atualizando...</div>';
+
+const a =
 await get(
-'/radar?interval='
-+
-interval.value
+'/radar?interval=' +
+encodeURIComponent(
+el.interval.value
+)
 );
 
+if(
+!Array.isArray(a)
+||
+!a.length
+){
 
-document.getElementById(
-'radar'
-).innerHTML=
+el.radar.innerHTML =
+'<div>Sem oportunidades no momento.</div>';
+
+return;
+
+}
+
+
+el.radar.innerHTML =
 a.map(
-x=>
-`
+x => {
+
+const direction =
+x.direction ||
+'NEUTRO';
+
+return `
 <div>
 <b>${x.symbol}</b>
 <br>
 
 <span class="${
-x.direction==='CALL'
+direction === 'CALL'
 ?
 'call'
 :
-x.direction==='PUT'
+direction === 'PUT'
 ?
 'put'
 :
 'neutral'
 }">
-${x.direction}
+${direction}
 </span>
 
 •
-${x.confidence}%
+${x.confidence ?? 0}%
 
 <br>
 
 <small>
-${x.status}
+${x.status || 'SEM DADOS'}
 </small>
 
+${
+x.error
+?
+`<div class="error">
+${x.error}
+</div>`
+:
+''
+}
+
 </div>
-`
+`;
+
+}
 ).join('');
+
 
 }catch(e){
 
-document.getElementById(
-'radar'
-).innerHTML=
-'<div>Radar aguardando dados...</div>';
+el.radar.innerHTML =
+`<div class="error">
+Radar: ${
+e.message ||
+'sem dados'
+}
+</div>`;
+
+}finally{
+
+radarBusy = false;
 
 }
 
@@ -2296,13 +3218,12 @@ async function lic(){
 
 try{
 
-const x=
+const x =
 await get(
 '/license'
 );
 
-
-license.textContent=
+el.license.textContent =
 x.active
 ?
 `● LICENÇA ATIVA • ${x.expires} • ${x.days_remaining} dias restantes`
@@ -2311,7 +3232,7 @@ x.active
 
 }catch(e){
 
-license.textContent=
+el.license.textContent =
 'Não foi possível verificar a licença.';
 
 }
@@ -2323,13 +3244,15 @@ async function clk(){
 
 try{
 
-const x=
+const x =
 await get(
 '/server-time'
 );
 
-clock.textContent=
-ft(x.datetime)
+el.clock.textContent =
+ft(
+x.datetime
+)
 +
 ' • Brasília';
 
@@ -2340,40 +3263,49 @@ ft(x.datetime)
 
 function cd(){
 
-if(!cur)
+if(
+!cur ||
+!cur.entry_time
+){
+
+el.countdown.textContent =
+'--';
+
 return;
 
+}
 
-const n=
+
+const n =
 Math.ceil(
 (
 new Date(
 cur.entry_time
-)
+).getTime()
 -
 Date.now()
-) / 1000
+)
+/
+1000
 );
 
 
-countdown.textContent=
-n>0
+el.countdown.textContent =
+n > 0
 ?
-'Entrada em '
-+
-n
-+
+'Entrada em ' +
+n +
 's'
 :
 'Entrada liberada';
 
 
 if(
-n===5 &&
+n === 5 &&
 !five
 ){
 
-five=true;
+five = true;
 
 speak(
 'Atenção. Entrada em 5 segundos.'
@@ -2383,20 +3315,25 @@ speak(
 
 
 if(
-n<=0 &&
-n>-2 &&
+n <= 0 &&
+n > -2 &&
 !entered
 ){
 
-entered=true;
+entered = true;
+
+if(
+cur.direction !==
+'NEUTRO'
+){
 
 speak(
-'Entrada liberada. '
-+
-cur.direction
-+
+'Entrada liberada. ' +
+cur.direction +
 ' agora.'
 );
+
+}
 
 }
 
@@ -2407,30 +3344,28 @@ async function resultCheck(){
 
 if(
 !cur ||
-cur.direction==='NEUTRO'
-)return;
-
+cur.direction ===
+'NEUTRO'
+)
+return;
 
 try{
 
-const x=
+const x =
 await get(
-'/result?symbol='
-+
+'/result?symbol=' +
 encodeURIComponent(
 cur.symbol
-)
-+
-'&interval='
-+
+) +
+'&interval=' +
+encodeURIComponent(
 cur.interval
-+
-'&direction='
-+
+) +
+'&direction=' +
+encodeURIComponent(
 cur.direction
-+
-'&expiry_time='
-+
+) +
+'&expiry_time=' +
 encodeURIComponent(
 cur.expiry_time
 )
@@ -2439,27 +3374,22 @@ cur.expiry_time
 
 if(x.result){
 
-result.textContent=
+el.result.textContent =
 x.result;
 
-
-const k=
-cur.symbol
-+
-'|'
-+
+const k =
+cur.symbol +
+'|' +
 cur.expiry_time;
 
 
-if(k!==reskey){
+if(k !== reskey){
 
-reskey=k;
+reskey = k;
 
 speak(
-'Operação finalizada. Resultado '
-+
-x.result
-+
+'Operação finalizada. Resultado ' +
+x.result +
 '.'
 );
 
@@ -2474,22 +3404,38 @@ perf();
 }
 
 
-S.onchange=()=>{
+el.symbol.onchange =
+() => {
 
-last='';
-five=false;
-entered=false;
+lastAnnounced = '';
+
+five = false;
+
+entered = false;
+
+cur = null;
+
+el.result.textContent =
+'--';
 
 sig();
 
 };
 
 
-interval.onchange=()=>{
+el.interval.onchange =
+() => {
 
-last='';
-five=false;
-entered=false;
+lastAnnounced = '';
+
+five = false;
+
+entered = false;
+
+cur = null;
+
+el.result.textContent =
+'--';
 
 sig();
 
@@ -2508,10 +3454,6 @@ lic();
 
 clk();
 
-
-/*
-   Não consultar a API a cada segundo.
-*/
 
 setInterval(
 sig,
