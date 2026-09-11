@@ -14,16 +14,22 @@ from fastapi.responses import HTMLResponse
 
 
 # ============================================================
-# CONFIGURAÇÃO
+# MEGA IA
+# VERSÃO 12.3.0
 # ============================================================
 
 app = FastAPI(
     title="MEGA IA",
-    version="12.2.0"
+    version="12.3.0"
 )
 
 BR_TZ = ZoneInfo("America/Sao_Paulo")
 UTC = timezone.utc
+
+
+# ============================================================
+# CONFIGURAÇÕES
+# ============================================================
 
 TD_KEY = os.getenv(
     "TWELVE_DATA_API_KEY",
@@ -35,29 +41,37 @@ OAI_KEY = os.getenv(
     ""
 ).strip()
 
+# OpenAI é opcional.
+# Se não houver modelo configurado, a análise local continua funcionando.
 OAI_MODEL = os.getenv(
     "OPENAI_MODEL",
-    "gpt-5.6-luna"
+    ""
 ).strip()
 
-OAI_MIN = float(
-    os.getenv(
-        "OPENAI_MIN_CONFIDENCE",
-        "70"
+try:
+    OAI_MIN = float(
+        os.getenv(
+            "OPENAI_MIN_CONFIDENCE",
+            "70"
+        )
     )
-)
+except Exception:
+    OAI_MIN = 70.0
 
-OAI_TIMEOUT = float(
-    os.getenv(
-        "OPENAI_TIMEOUT",
-        "15"
+try:
+    OAI_TIMEOUT = float(
+        os.getenv(
+            "OPENAI_TIMEOUT",
+            "12"
+        )
     )
-)
+except Exception:
+    OAI_TIMEOUT = 12.0
 
 LICENSE = os.getenv(
     "LICENSE_EXPIRES",
     "2026-12-31"
-)
+).strip()
 
 WA1 = os.getenv(
     "WHATSAPP_1",
@@ -140,30 +154,66 @@ results: Dict[
     Any
 ] = {}
 
+# Cache específico do Radar.
+radar_cache: Dict[
+    str,
+    Dict[str, Any]
+] = {}
+
+radar_refresh_tasks: Dict[
+    str,
+    asyncio.Task
+] = {}
+
 
 # ============================================================
 # CONTROLE TWELVE DATA
 # ============================================================
 
-TD_MIN_INTERVAL = float(
-    os.getenv(
-        "TD_MIN_INTERVAL",
-        "8"
+try:
+    TD_MIN_INTERVAL = float(
+        os.getenv(
+            "TD_MIN_INTERVAL",
+            "8"
+        )
     )
+except Exception:
+    TD_MIN_INTERVAL = 8.0
+
+try:
+    TD_CACHE_SECONDS = float(
+        os.getenv(
+            "TD_CACHE_SECONDS",
+            "20"
+        )
+    )
+except Exception:
+    TD_CACHE_SECONDS = 20.0
+
+try:
+    TD_MAX_RETRIES = int(
+        os.getenv(
+            "TD_MAX_RETRIES",
+            "2"
+        )
+    )
+except Exception:
+    TD_MAX_RETRIES = 2
+
+# Evita valores absurdos.
+TD_MIN_INTERVAL = max(
+    1.0,
+    min(TD_MIN_INTERVAL, 30.0)
 )
 
-TD_CACHE_SECONDS = float(
-    os.getenv(
-        "TD_CACHE_SECONDS",
-        "20"
-    )
+TD_CACHE_SECONDS = max(
+    5.0,
+    min(TD_CACHE_SECONDS, 120.0)
 )
 
-TD_MAX_RETRIES = int(
-    os.getenv(
-        "TD_MAX_RETRIES",
-        "3"
-    )
+TD_MAX_RETRIES = max(
+    1,
+    min(TD_MAX_RETRIES, 3)
 )
 
 td_lock = asyncio.Lock()
@@ -176,18 +226,16 @@ last_td_request = 0.0
 # ============================================================
 
 def now():
-
     return datetime.now(
         BR_TZ
     )
 
 
 def iso(d):
-
     return d.astimezone(
         BR_TZ
     ).isoformat()
-
+    
 
 def parse(s):
 
@@ -199,7 +247,6 @@ def parse(s):
     )
 
     if d.tzinfo is None:
-
         d = d.replace(
             tzinfo=UTC
         )
@@ -210,7 +257,6 @@ def parse(s):
 
 
 def clamp(x, a, b):
-
     return max(
         a,
         min(b, x)
@@ -224,7 +270,6 @@ def clamp(x, a, b):
 def ema(v, p):
 
     if len(v) < p:
-
         return None
 
     k = 2 / (
@@ -236,7 +281,6 @@ def ema(v, p):
     ) / p
 
     for x in v[p:]:
-
         e = (
             x * k
             +
@@ -249,7 +293,6 @@ def ema(v, p):
 def rsi(v, p=14):
 
     if len(v) < p + 1:
-
         return None
 
     gains = []
@@ -285,7 +328,6 @@ def rsi(v, p=14):
     )
 
     if avg_loss == 0:
-
         return 100
 
     return (
@@ -346,7 +388,7 @@ async def candles(
             status_code=500,
             detail=(
                 "TWELVE_DATA_API_KEY "
-                "não configurada."
+                "não configurada no Render."
             )
         )
 
@@ -391,7 +433,6 @@ async def candles(
         )
 
         if age < TD_CACHE_SECONDS:
-
             return cached["data"]
 
     params = {
@@ -415,7 +456,7 @@ async def candles(
             await wait_td_slot()
 
             async with httpx.AsyncClient(
-                timeout=15
+                timeout=12
             ) as client:
 
                 response = await client.get(
@@ -429,31 +470,17 @@ async def candles(
 
             if response.status_code == 429:
 
-                retry_after = (
-                    response.headers.get(
-                        "Retry-After"
-                    )
-                )
-
-                try:
-
-                    wait_seconds = float(
-                        retry_after
-                    )
-
-                except Exception:
-
-                    wait_seconds = (
-                        10
-                        *
-                        (attempt + 1)
-                    )
-
                 last_error = (
-                    "Twelve Data: "
-                    "limite de requisições "
-                    "atingido."
+                    "Twelve Data atingiu "
+                    "o limite de requisições."
                 )
+
+                # Se existe cache antigo,
+                # devolve imediatamente.
+                if cached and cached.get(
+                    "data"
+                ):
+                    return cached["data"]
 
                 if (
                     attempt
@@ -462,10 +489,7 @@ async def candles(
                 ):
 
                     await asyncio.sleep(
-                        min(
-                            wait_seconds,
-                            30
-                        )
+                        3
                     )
 
                     continue
@@ -473,7 +497,7 @@ async def candles(
                 break
 
             # ------------------------------------------------
-            # OUTROS ERROS HTTP
+            # ERRO HTTP
             # ------------------------------------------------
 
             if response.status_code >= 400:
@@ -504,15 +528,28 @@ async def candles(
 
                     await asyncio.sleep(
                         2
-                        *
-                        (attempt + 1)
                     )
 
                     continue
 
                 break
 
-            data = response.json()
+            # ------------------------------------------------
+            # JSON
+            # ------------------------------------------------
+
+            try:
+
+                data = response.json()
+
+            except Exception:
+
+                last_error = (
+                    "Resposta inválida "
+                    "do Twelve Data."
+                )
+
+                break
 
             # ------------------------------------------------
             # ERRO TWELVE DATA
@@ -529,7 +566,10 @@ async def candles(
 
                 last_error = message
 
-                low = message.lower()
+                low = (
+                    str(message)
+                    .lower()
+                )
 
                 if (
                     "limit" in low
@@ -539,6 +579,11 @@ async def candles(
                     "too many" in low
                 ):
 
+                    if cached and cached.get(
+                        "data"
+                    ):
+                        return cached["data"]
+
                     if (
                         attempt
                         <
@@ -546,14 +591,16 @@ async def candles(
                     ):
 
                         await asyncio.sleep(
-                            10
-                            *
-                            (attempt + 1)
+                            3
                         )
 
                         continue
 
                 break
+
+            # ------------------------------------------------
+            # VALUES
+            # ------------------------------------------------
 
             values = data.get(
                 "values",
@@ -574,8 +621,6 @@ async def candles(
 
                     await asyncio.sleep(
                         2
-                        *
-                        (attempt + 1)
                     )
 
                     continue
@@ -597,9 +642,7 @@ async def candles(
                     out.append(
                         {
                             "datetime":
-                                item[
-                                    "datetime"
-                                ],
+                                item["datetime"],
 
                             "open":
                                 float(
@@ -675,8 +718,6 @@ async def candles(
 
                 await asyncio.sleep(
                     2
-                    *
-                    (attempt + 1)
                 )
 
     # --------------------------------------------------------
@@ -714,9 +755,15 @@ def local_ai(cs):
     if len(cs) < 35:
 
         return {
-            "direction": "NEUTRO",
-            "confidence": 0,
-            "confirmed": False,
+            "direction":
+                "NEUTRO",
+
+            "confidence":
+                0,
+
+            "confirmed":
+                False,
+
             "reason":
                 "Poucos candles disponíveis."
         }
@@ -749,7 +796,10 @@ def local_ai(cs):
         "PUT": 0.0
     }
 
+    # ========================================================
     # EMA
+    # ========================================================
+
     if (
         fast is not None
         and
@@ -768,7 +818,10 @@ def local_ai(cs):
                 "PUT"
             ] += 1.0
 
+    # ========================================================
     # RSI
+    # ========================================================
+
     if rsi_value is not None:
 
         if rsi_value <= 35:
@@ -795,7 +848,10 @@ def local_ai(cs):
                 "PUT"
             ] += 0.4
 
-    # Direção
+    # ========================================================
+    # DIREÇÃO
+    # ========================================================
+
     if last["close"] > prev["close"]:
 
         votes[
@@ -808,7 +864,10 @@ def local_ai(cs):
             "PUT"
         ] += 0.7
 
-    # Força
+    # ========================================================
+    # FORÇA DO CANDLE
+    # ========================================================
+
     candle_range = max(
         last["high"]
         -
@@ -826,7 +885,7 @@ def local_ai(cs):
         candle_range
     )
 
-    if body_ratio >= 0.6:
+    if body_ratio >= 0.60:
 
         if (
             last["close"]
@@ -847,6 +906,10 @@ def local_ai(cs):
             votes[
                 "PUT"
             ] += 0.7
+
+    # ========================================================
+    # DIREÇÃO FINAL
+    # ========================================================
 
     if (
         votes["CALL"]
@@ -872,7 +935,7 @@ def local_ai(cs):
         votes.values()
     )
 
-    if total:
+    if total > 0:
 
         confidence = (
             50
@@ -892,22 +955,41 @@ def local_ai(cs):
 
         confidence = 0
 
+    confidence = round(
+        clamp(
+            confidence,
+            0,
+            97
+        ),
+        1
+    )
+
+    # ========================================================
+    # LIMITE LOCAL
+    #
+    # Reduzido para 58 para evitar que a aplicação fique
+    # eternamente em MONITORANDO.
+    # ========================================================
+
+    confirmed = (
+        direction
+        in (
+            "CALL",
+            "PUT"
+        )
+        and
+        confidence >= 58
+    )
+
     return {
         "direction":
             direction,
 
         "confidence":
-            round(
-                clamp(
-                    confidence,
-                    0,
-                    97
-                ),
-                1
-            ),
+            confidence,
 
         "confirmed":
-            confidence >= 65,
+            confirmed,
 
         "reason":
             (
@@ -921,14 +1003,11 @@ def local_ai(cs):
                             1
                         )
                     )
-                    if
-                    rsi_value
-                    is not None
-                    else
-                    "--"
+                    if rsi_value is not None
+                    else "--"
                 )
                 +
-                ", força do candle="
+                ", força="
                 +
                 str(
                     round(
@@ -943,13 +1022,12 @@ def local_ai(cs):
 
 
 # ============================================================
-# JSON OPENAI
+# EXTRAIR JSON OPENAI
 # ============================================================
 
 def json_extract(s):
 
     if not s:
-
         return None
 
     s = re.sub(
@@ -976,7 +1054,6 @@ def json_extract(s):
     )
 
     if not match:
-
         return None
 
     try:
@@ -991,7 +1068,7 @@ def json_extract(s):
 
 
 # ============================================================
-# CONFIRMAÇÃO OPENAI
+# OPENAI
 # ============================================================
 
 async def openai_confirm(
@@ -1001,6 +1078,7 @@ async def openai_confirm(
     local
 ):
 
+    # OpenAI não pode impedir o sinal local.
     if not OAI_KEY:
 
         return {
@@ -1008,8 +1086,27 @@ async def openai_confirm(
                 False,
 
             "error":
-                "OPENAI_API_KEY "
-                "não configurada."
+                "OpenAI não configurada."
+        }
+
+    if not OAI_MODEL:
+
+        return {
+            "available":
+                False,
+
+            "error":
+                "OPENAI_MODEL não configurado."
+        }
+
+    if not cs:
+
+        return {
+            "available":
+                False,
+
+            "error":
+                "Sem candles para análise."
         }
 
     key = (
@@ -1081,7 +1178,7 @@ Direção preliminar:
 Confiança preliminar:
 {local["confidence"]}
 
-Retorne somente JSON válido:
+Retorne somente JSON:
 
 {{
   "direction":"CALL|PUT|NEUTRO",
@@ -1210,8 +1307,7 @@ Candles:
                     False,
 
                 "error":
-                    "Resposta JSON "
-                    "da OpenAI inválida."
+                    "Resposta JSON da OpenAI inválida."
             }
 
         direction = str(
@@ -1313,6 +1409,8 @@ Candles:
 
 # ============================================================
 # PRÓXIMA ENTRADA
+#
+# Entrada = 5 segundos antes da próxima vela.
 # ============================================================
 
 def next_entry(
@@ -1337,8 +1435,27 @@ def next_entry(
         1
     ) * seconds
 
+    # Entrada 5 segundos antes do fechamento
+    # da vela seguinte.
+    entry_timestamp = (
+        next_timestamp
+        -
+        5
+    )
+
+    # Segurança: nunca retornar uma entrada já passada.
+    if entry_timestamp <= timestamp:
+
+        next_timestamp += seconds
+
+        entry_timestamp = (
+            next_timestamp
+            -
+            5
+        )
+
     return datetime.fromtimestamp(
-        next_timestamp,
+        entry_timestamp,
         tz=BR_TZ
     )
 
@@ -1349,7 +1466,8 @@ def next_entry(
 
 async def signal(
     symbol,
-    interval
+    interval,
+    use_ai=True
 ):
 
     key = (
@@ -1368,7 +1486,7 @@ async def signal(
             -
             cached[0]
             <
-            8
+            7
         ):
 
             return cached[1]
@@ -1396,8 +1514,7 @@ async def signal(
             old[
                 "status"
             ] = (
-                "DADOS "
-                "TEMPORARIAMENTE "
+                "DADOS TEMPORARIAMENTE "
                 "INDISPONÍVEIS"
             )
 
@@ -1409,7 +1526,6 @@ async def signal(
 
             return old
 
-        # Não esconder o erro.
         return {
             "symbol":
                 symbol,
@@ -1441,11 +1557,14 @@ async def signal(
             "error":
                 str(
                     exc.detail
-                )
+                ),
+
+            "ai_error":
+                ""
         }
 
     # --------------------------------------------------------
-    # REMOVE CANDLE ATUAL
+    # SOMENTE CANDLE FECHADO
     # --------------------------------------------------------
 
     if len(cs) > 1:
@@ -1466,6 +1585,8 @@ async def signal(
         interval
     )
 
+    # Expiração:
+    # próxima vela completa.
     expiry = (
         entry
         +
@@ -1517,7 +1638,14 @@ async def signal(
             "",
 
         "ai_error":
-            ""
+            "",
+
+        "data_time":
+            (
+                cs_closed[-1]["datetime"]
+                if cs_closed
+                else ""
+            )
     }
 
     # --------------------------------------------------------
@@ -1525,9 +1653,7 @@ async def signal(
     # --------------------------------------------------------
 
     if (
-        local[
-            "direction"
-        ]
+        local["direction"]
         ==
         "NEUTRO"
     ):
@@ -1543,107 +1669,37 @@ async def signal(
         ] = "HIGH"
 
     # --------------------------------------------------------
-    # CONFIRMAÇÃO
+    # LOCAL NÃO CONFIRMADO
     # --------------------------------------------------------
 
-    elif local[
+    elif not local[
         "confirmed"
     ]:
 
-        ai = await openai_confirm(
-            symbol,
-            interval,
-            cs_closed,
-            local
+        base[
+            "direction"
+        ] = local[
+            "direction"
+        ]
+
+        base[
+            "status"
+        ] = (
+            "MONITORANDO"
         )
 
         base[
-            "ai_error"
-        ] = ai.get(
-            "error",
-            ""
-        )
+            "risk"
+        ] = "MEDIUM"
 
-        # IA confirmou
-        if (
-            ai.get(
-                "available"
-            )
-            and
-            ai.get(
-                "direction"
-            )
-            ==
-            local[
-                "direction"
-            ]
-            and
-            ai.get(
-                "confirmed"
-            )
-            and
-            ai.get(
-                "confidence",
-                0
-            )
-            >=
-            OAI_MIN
-            and
-            ai.get(
-                "risk"
-            )
-            !=
-            "HIGH"
-        ):
+    # --------------------------------------------------------
+    # SINAL LOCAL / OPENAI
+    # --------------------------------------------------------
 
-            final_confidence = (
-                local[
-                    "confidence"
-                ]
-                *
-                0.45
-                +
-                ai[
-                    "confidence"
-                ]
-                *
-                0.55
-            )
+    else:
 
-            base.update(
-                direction=
-                    local[
-                        "direction"
-                    ],
-
-                confidence=
-                    round(
-                        clamp(
-                            final_confidence,
-                            0,
-                            97
-                        ),
-                        1
-                    ),
-
-                status=
-                    "SINAL LIBERADO",
-
-                ai_confirmed=
-                    True,
-
-                risk=
-                    ai.get(
-                        "risk",
-                        "MEDIUM"
-                    )
-            )
-
-        # OpenAI indisponível:
-        # usa análise local.
-        elif not ai.get(
-            "available"
-        ):
+        # Radar não usa OpenAI.
+        if not use_ai:
 
             base.update(
                 direction=
@@ -1661,51 +1717,150 @@ async def signal(
                     "MEDIUM"
             )
 
-        # IA discordou
         else:
 
-            base.update(
-                direction=
-                    "NEUTRO",
-
-                confidence=
-                    round(
-                        min(
-                            local[
-                                "confidence"
-                            ],
-
-                            ai.get(
-                                "confidence",
-                                0
-                            )
-                        ),
-                        1
-                    ),
-
-                status=
-                    "AGUARDANDO "
-                    "CONFIRMAÇÃO",
-
-                ai_confirmed=
-                    False,
-
-                risk=
-                    ai.get(
-                        "risk",
-                        "HIGH"
-                    )
+            ai = await openai_confirm(
+                symbol,
+                interval,
+                cs_closed,
+                local
             )
 
-    else:
+            base[
+                "ai_error"
+            ] = ai.get(
+                "error",
+                ""
+            )
 
-        base[
-            "status"
-        ] = "MONITORANDO"
+            # =================================================
+            # OPENAI CONFIRMOU
+            # =================================================
 
-        base[
-            "risk"
-        ] = "MEDIUM"
+            if (
+                ai.get(
+                    "available"
+                )
+                and
+                ai.get(
+                    "direction"
+                )
+                ==
+                local[
+                    "direction"
+                ]
+                and
+                ai.get(
+                    "confirmed"
+                )
+                and
+                ai.get(
+                    "confidence",
+                    0
+                )
+                >=
+                OAI_MIN
+                and
+                ai.get(
+                    "risk",
+                    "HIGH"
+                )
+                !=
+                "HIGH"
+            ):
+
+                final_confidence = (
+                    local[
+                        "confidence"
+                    ]
+                    *
+                    0.45
+                    +
+                    ai[
+                        "confidence"
+                    ]
+                    *
+                    0.55
+                )
+
+                base.update(
+                    direction=
+                        local[
+                            "direction"
+                        ],
+
+                    confidence=
+                        round(
+                            clamp(
+                                final_confidence,
+                                0,
+                                97
+                            ),
+                            1
+                        ),
+
+                    status=
+                        "SINAL LIBERADO",
+
+                    ai_confirmed=
+                        True,
+
+                    risk=
+                        ai.get(
+                            "risk",
+                            "MEDIUM"
+                        )
+                )
+
+            # =================================================
+            # OPENAI INDISPONÍVEL
+            # =================================================
+
+            elif not ai.get(
+                "available"
+            ):
+
+                # IMPORTANTE:
+                # não fica AGUARDANDO.
+                base.update(
+                    direction=
+                        local[
+                            "direction"
+                        ],
+
+                    status=
+                        "SINAL LOCAL",
+
+                    ai_confirmed=
+                        False,
+
+                    risk=
+                        "MEDIUM"
+                )
+
+            # =================================================
+            # OPENAI DISCORDOU
+            # =================================================
+
+            else:
+
+                # Não bloqueamos indefinidamente.
+                # Mantemos o sinal local visível.
+                base.update(
+                    direction=
+                        local[
+                            "direction"
+                        ],
+
+                    status=
+                        "SINAL LOCAL / IA DIVERGENTE",
+
+                    ai_confirmed=
+                        False,
+
+                    risk=
+                        "HIGH"
+                )
 
     signal_cache[
         key
@@ -1715,6 +1870,135 @@ async def signal(
     )
 
     return base
+
+
+# ============================================================
+# RADAR - ATUALIZAÇÃO EM SEGUNDO PLANO
+# ============================================================
+
+async def refresh_radar(
+    interval
+):
+
+    try:
+
+        output = []
+
+        for symbol in SYMBOLS:
+
+            try:
+
+                # IMPORTANTE:
+                # Radar NÃO chama OpenAI.
+                # Isso reduz muito o tempo de atualização.
+                value = await signal(
+                    symbol,
+                    interval,
+                    use_ai=False
+                )
+
+                output.append(
+                    {
+                        "symbol":
+                            symbol,
+
+                        "direction":
+                            value.get(
+                                "direction",
+                                "NEUTRO"
+                            ),
+
+                        "confidence":
+                            value.get(
+                                "confidence",
+                                0
+                            ),
+
+                        "status":
+                            value.get(
+                                "status",
+                                "SEM DADOS"
+                            ),
+
+                        "error":
+                            value.get(
+                                "error",
+                                ""
+                            )
+                    }
+                )
+
+            except Exception as exc:
+
+                output.append(
+                    {
+                        "symbol":
+                            symbol,
+
+                        "direction":
+                            "NEUTRO",
+
+                        "confidence":
+                            0,
+
+                        "status":
+                            "SEM DADOS",
+
+                        "error":
+                            str(exc)
+                    }
+                )
+
+        radar_cache[
+            interval
+        ] = {
+            "time":
+                time.time(),
+
+            "data":
+                output
+        }
+
+    except Exception:
+        pass
+
+    finally:
+
+        radar_refresh_tasks.pop(
+            interval,
+            None
+        )
+
+
+def start_radar_refresh(
+    interval
+):
+
+    existing = radar_refresh_tasks.get(
+        interval
+    )
+
+    if (
+        existing
+        and
+        not existing.done()
+    ):
+        return
+
+    try:
+
+        task = asyncio.create_task(
+            refresh_radar(
+                interval
+            )
+        )
+
+        radar_refresh_tasks[
+            interval
+        ] = task
+
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -1732,7 +2016,7 @@ async def health():
             "MEGA IA",
 
         "version":
-            "12.2.0",
+            "12.3.0",
 
         "brasilia_time":
             iso(now()),
@@ -1744,13 +2028,21 @@ async def health():
             bool(OAI_KEY),
 
         "openai_model":
-            OAI_MODEL,
+            OAI_MODEL
+            if OAI_MODEL
+            else
+            "LOCAL_ONLY",
 
         "td_cache_seconds":
             TD_CACHE_SECONDS,
 
         "td_min_interval":
-            TD_MIN_INTERVAL
+            TD_MIN_INTERVAL,
+
+        "radar_cached_intervals":
+            list(
+                radar_cache.keys()
+            )
     }
 
 
@@ -1766,7 +2058,8 @@ async def diagnostic(
 
     value = await signal(
         symbol,
-        interval
+        interval,
+        use_ai=True
     )
 
     return {
@@ -1790,6 +2083,23 @@ async def diagnostic(
 
             "openai_model":
                 OAI_MODEL
+                if OAI_MODEL
+                else
+                "LOCAL_ONLY"
+        },
+
+        "cache": {
+            "candles":
+                len(candle_cache),
+
+            "signals":
+                len(signal_cache),
+
+            "openai":
+                len(oai_cache),
+
+            "radar":
+                len(radar_cache)
         }
     }
 
@@ -1935,7 +2245,8 @@ async def signal_ai(
 
     return await signal(
         symbol,
-        interval
+        interval,
+        use_ai=True
     )
 
 
@@ -1951,7 +2262,8 @@ async def get_signal(
 
     return await signal(
         symbol,
-        interval
+        interval,
+        use_ai=True
     )
 
 
@@ -1967,7 +2279,8 @@ async def ai_analysis(
 
     s = await signal(
         symbol,
-        interval
+        interval,
+        use_ai=True
     )
 
     return {
@@ -1984,7 +2297,8 @@ async def ai_analysis(
             "risk",
             "error",
             "ai_error",
-            "local_reason"
+            "local_reason",
+            "data_time"
         )
     }
 
@@ -2005,70 +2319,67 @@ async def radar(
             "Intervalo inválido."
         )
 
-    output = []
+    cached = radar_cache.get(
+        interval
+    )
 
-    for symbol in SYMBOLS:
+    # --------------------------------------------------------
+    # PRIMEIRA RESPOSTA:
+    # responde imediatamente.
+    # --------------------------------------------------------
 
-        try:
+    if not cached:
 
-            value = await signal(
-                symbol,
-                interval
-            )
+        start_radar_refresh(
+            interval
+        )
 
-            output.append(
-                {
-                    "symbol":
-                        symbol,
+        return [
+            {
+                "symbol":
+                    symbol,
 
-                    "direction":
-                        value.get(
-                            "direction",
-                            "NEUTRO"
-                        ),
+                "direction":
+                    "NEUTRO",
 
-                    "confidence":
-                        value.get(
-                            "confidence",
-                            0
-                        ),
+                "confidence":
+                    0,
 
-                    "status":
-                        value.get(
-                            "status",
-                            "SEM DADOS"
-                        ),
+                "status":
+                    "CARREGANDO",
 
-                    "error":
-                        value.get(
-                            "error",
-                            ""
-                        )
-                }
-            )
+                "error":
+                    ""
+            }
 
-        except Exception as exc:
+            for symbol in SYMBOLS
+        ]
 
-            output.append(
-                {
-                    "symbol":
-                        symbol,
+    # --------------------------------------------------------
+    # CACHE EXISTENTE
+    # --------------------------------------------------------
 
-                    "direction":
-                        "NEUTRO",
+    age = (
+        time.time()
+        -
+        cached.get(
+            "time",
+            0
+        )
+    )
 
-                    "confidence":
-                        0,
+    # Se o cache estiver velho,
+    # inicia atualização em segundo plano.
+    if age > 60:
 
-                    "status":
-                        "SEM DADOS",
+        start_radar_refresh(
+            interval
+        )
 
-                    "error":
-                        str(exc)
-                }
-            )
-
-    return output
+    return cached.get(
+        "data",
+        []
+    )
 
 
 # ============================================================
@@ -2187,9 +2498,20 @@ async def result(
             key
         ]
 
-    if now() < parse(
-        expiry_time
-    ):
+    try:
+
+        expiration_dt = parse(
+            expiry_time
+        )
+
+    except Exception:
+
+        raise HTTPException(
+            400,
+            "expiry_time inválido."
+        )
+
+    if now() < expiration_dt:
 
         return {
             "status":
@@ -2225,14 +2547,10 @@ async def result(
 
             if (
                 parse(
-                    c[
-                        "datetime"
-                    ]
+                    c["datetime"]
                 )
                 >=
-                parse(
-                    expiry_time
-                )
+                expiration_dt
             ):
 
                 target = c
@@ -2288,9 +2606,7 @@ async def result(
             res,
 
         "candle_time":
-            target[
-                "datetime"
-            ]
+            target["datetime"]
     }
 
     results[
@@ -2427,6 +2743,10 @@ margin-top:8px;
 word-break:break-word
 }
 
+.ok{
+color:#4cff9b
+}
+
 @media(max-width:700px){
 
 .grid{
@@ -2523,7 +2843,7 @@ SINAL ATUAL
 id="direction"
 class="big neutral"
 >
-AGUARDANDO
+CONECTANDO
 </div>
 
 <div id="confidence">
@@ -2534,6 +2854,7 @@ Confiança: --
 id="signalError"
 class="error"
 >
+Conectando ao servidor...
 </div>
 
 </div>
@@ -2570,7 +2891,7 @@ id="status"
 class="big"
 style="font-size:20px"
 >
-MONITORANDO
+CONECTANDO
 </div>
 
 <div id="risk">
@@ -2881,7 +3202,8 @@ return '--:--:--';
 return d.toLocaleTimeString(
 'pt-BR',
 {
-hour12:false
+hour12:false,
+timeZone:'America/Sao_Paulo'
 }
 );
 
@@ -2947,10 +3269,8 @@ const direction =
 data.direction ||
 'NEUTRO';
 
-
 el.direction.textContent =
 direction;
-
 
 el.direction.className =
 'big ' +
@@ -3003,6 +3323,7 @@ data.risk ||
 el.signalError.textContent =
 data.error ||
 data.ai_error ||
+data.local_reason ||
 '';
 
 
@@ -3017,7 +3338,14 @@ direction;
 if(
 k !== lastAnnounced &&
 direction !== 'NEUTRO' &&
-data.entry_time
+data.entry_time &&
+(
+data.status === 'SINAL LIBERADO'
+||
+data.status === 'SINAL LOCAL'
+||
+data.status === 'SINAL LOCAL / IA DIVERGENTE'
+)
 ){
 
 lastAnnounced = k;
@@ -3065,8 +3393,23 @@ data
 
 }catch(e){
 
+el.direction.textContent =
+'SEM DADOS';
+
+el.direction.className =
+'big neutral';
+
+el.confidence.textContent =
+'Confiança: --';
+
+el.entry.textContent =
+'--:--:--';
+
 el.status.textContent =
 'ERRO DE CONEXÃO';
+
+el.risk.textContent =
+'Risco: --';
 
 el.signalError.textContent =
 e.message ||
@@ -3108,6 +3451,35 @@ p.accuracy ?? 0
 }
 
 
+function escapeHtml(value){
+
+return String(
+value ?? ''
+)
+.replace(
+/&/g,
+'&amp;'
+)
+.replace(
+/</g,
+'&lt;'
+)
+.replace(
+/>/g,
+'&gt;'
+)
+.replace(
+/"/g,
+'&quot;'
+)
+.replace(
+/'/g,
+'&#039;'
+);
+
+}
+
+
 async function rad(){
 
 if(radarBusy)
@@ -3116,9 +3488,6 @@ return;
 radarBusy = true;
 
 try{
-
-el.radar.innerHTML =
-'<div>Radar atualizando...</div>';
 
 const a =
 await get(
@@ -3135,7 +3504,7 @@ if(
 ){
 
 el.radar.innerHTML =
-'<div>Sem oportunidades no momento.</div>';
+'<div>Sem dados do radar.</div>';
 
 return;
 
@@ -3150,9 +3519,26 @@ const direction =
 x.direction ||
 'NEUTRO';
 
+const safeSymbol =
+escapeHtml(
+x.symbol
+);
+
+const safeStatus =
+escapeHtml(
+x.status ||
+'SEM DADOS'
+);
+
+const safeError =
+escapeHtml(
+x.error ||
+''
+);
+
 return `
 <div>
-<b>${x.symbol}</b>
+<b>${safeSymbol}</b>
 <br>
 
 <span class="${
@@ -3175,14 +3561,14 @@ ${x.confidence ?? 0}%
 <br>
 
 <small>
-${x.status || 'SEM DADOS'}
+${safeStatus}
 </small>
 
 ${
-x.error
+safeError
 ?
 `<div class="error">
-${x.error}
+${safeError}
 </div>`
 :
 ''
@@ -3200,8 +3586,10 @@ ${x.error}
 el.radar.innerHTML =
 `<div class="error">
 Radar: ${
+escapeHtml(
 e.message ||
 'sem dados'
+)
 }
 </div>`;
 
@@ -3349,6 +3737,11 @@ cur.direction ===
 )
 return;
 
+if(
+!cur.expiry_time
+)
+return;
+
 try{
 
 const x =
@@ -3381,7 +3774,6 @@ const k =
 cur.symbol +
 '|' +
 cur.expiry_time;
-
 
 if(k !== reskey){
 
@@ -3418,6 +3810,15 @@ cur = null;
 el.result.textContent =
 '--';
 
+el.direction.textContent =
+'CONECTANDO';
+
+el.entry.textContent =
+'--:--:--';
+
+el.status.textContent =
+'MONITORANDO';
+
 sig();
 
 };
@@ -3436,6 +3837,15 @@ cur = null;
 
 el.result.textContent =
 '--';
+
+el.direction.textContent =
+'CONECTANDO';
+
+el.entry.textContent =
+'--:--:--';
+
+el.status.textContent =
+'MONITORANDO';
 
 sig();
 
@@ -3469,7 +3879,7 @@ perf,
 
 setInterval(
 rad,
-120000
+30000
 );
 
 
