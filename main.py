@@ -6,8 +6,9 @@ from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
 import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 
-# IA/ML real: ensemble leve para rodar no Render sem depender de modelos gigantes.
 try:
     from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
     from sklearn.linear_model import LogisticRegression
@@ -17,92 +18,44 @@ try:
 except Exception:
     SKLEARN_OK = False
 
-# XGBoost é opcional. Se estiver instalado, entra como modelo de maior peso
-# no ensemble; se não estiver, o sistema continua funcionando com scikit-learn.
 try:
     from xgboost import XGBClassifier
     XGBOOST_OK = True
 except Exception:
     XGBOOST_OK = False
 
-# LightGBM é opcional. Quando disponível, acrescenta um segundo modelo
-# de gradient boosting rápido e independente ao ensemble.
 try:
     from lightgbm import LGBMClassifier
     LIGHTGBM_OK = True
 except Exception:
     LIGHTGBM_OK = False
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-
-# V9.2.1: bibliotecas de boosting são opcionais. Se uma delas não estiver
-# disponível no ambiente do Render, o aplicativo continua com scikit-learn.
 
 APP_NAME = "Ismael Trade"
-APP_VERSION = "9.2.1"
+APP_VERSION = "9.2.2"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
-
-# Licença do aplicativo
 LICENSE_EXPIRES = os.getenv("ISMAEL_TRADE_LICENSE_EXPIRES", "2026-12-31").strip()
 LICENSE_WHATSAPP_1 = "55 84 99841-1282"
 LICENSE_WHATSAPP_2 = "55 84 99449-9442"
 LICENSE_INSTAGRAM = "@Ismaelartur26"
 
-def license_status() -> Dict[str, Any]:
-    try:
-        expires = datetime.strptime(LICENSE_EXPIRES, "%Y-%m-%d").replace(tzinfo=SP_TZ)
-    except ValueError:
-        expires = datetime(2026, 12, 31, 23, 59, 59, tzinfo=SP_TZ)
-    expires_end = expires.replace(hour=23, minute=59, second=59)
-    current = now_sp()
-    active = current <= expires_end
-    return {
-        "active": active,
-        "expires": expires_end.strftime("%d/%m/%Y"),
-        "expires_iso": expires_end.isoformat(),
-        "whatsapp_1": LICENSE_WHATSAPP_1,
-        "whatsapp_2": LICENSE_WHATSAPP_2,
-        "instagram": LICENSE_INSTAGRAM,
-    }
-
 ALLOWED_INTERVALS = {"1min": 1, "5min": 5, "15min": 15, "30min": 30}
-SYMBOLS = {
-    "EUR/USD": "EUR/USD",
-    "GBP/USD": "GBP/USD",
-    "USD/JPY": "USD/JPY",
-    "AUD/USD": "AUD/USD",
-    "USD/CAD": "USD/CAD",
-    "USD/CHF": "USD/CHF",
-    "NZD/USD": "NZD/USD",
-    "EUR/JPY": "EUR/JPY",
-    "GBP/JPY": "GBP/JPY",
-    "EUR/GBP": "EUR/GBP",
-    "BTC/USD": "BTC/USD",
-    "ETH/USD": "ETH/USD",
-}
+SYMBOLS = {x: x for x in [
+    "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF",
+    "NZD/USD", "EUR/JPY", "GBP/JPY", "EUR/GBP", "BTC/USD", "ETH/USD"
+]}
+RADAR_SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF"]
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
-
-# Cache local para evitar chamadas repetidas à Twelve Data.
-# Isso reduz bastante o consumo de créditos e evita chamadas simultâneas.
-CACHE_TTL_SECONDS = 60.0
-RATE_LIMIT_COOLDOWN_SECONDS = 20.0
 CANDLE_CACHE: Dict[tuple, tuple] = {}
 CANDLE_LOCKS: Dict[tuple, asyncio.Lock] = {}
-RATE_LIMIT_UNTIL = 0.0
 RADAR_CACHE: Dict[tuple, tuple] = {}
-RADAR_SYMBOLS = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF",
-]
-RADAR_TTL_SECONDS = 120.0
-
-# Cache dos modelos por ativo/timeframe. O treinamento é feito apenas quando
-# o cache expira, reduzindo CPU e evitando treinar a cada atualização da tela.
 AI_MODEL_CACHE: Dict[tuple, tuple] = {}
+CACHE_TTL_SECONDS = 60.0
+RADAR_TTL_SECONDS = 120.0
 AI_MODEL_TTL_SECONDS = 300.0
-
+RATE_LIMIT_UNTIL = 0.0
 
 
 def now_sp() -> datetime:
@@ -110,141 +63,98 @@ def now_sp() -> datetime:
 
 
 def parse_time(value: str) -> datetime:
-    text = value.strip()
+    text = str(value).strip().replace("\u00a0", " ")
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:
         dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=SP_TZ)
-        return dt.astimezone(SP_TZ)
     except ValueError:
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
             try:
                 return datetime.strptime(text, fmt).replace(tzinfo=SP_TZ)
             except ValueError:
-                pass
-    raise ValueError(f"Timestamp inválido: {value}")
+                continue
+        raise ValueError(f"Timestamp inválido: {value}")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=SP_TZ)
+    return dt.astimezone(SP_TZ)
+
+
+def license_status() -> Dict[str, Any]:
+    try:
+        expires = datetime.strptime(LICENSE_EXPIRES, "%Y-%m-%d").replace(tzinfo=SP_TZ)
+    except ValueError:
+        expires = datetime(2026, 12, 31, tzinfo=SP_TZ)
+    expires = expires.replace(hour=23, minute=59, second=59)
+    active = now_sp() <= expires
+    return {"active": active, "expires": expires.strftime("%d/%m/%Y"),
+            "expires_iso": expires.isoformat(), "whatsapp_1": LICENSE_WHATSAPP_1,
+            "whatsapp_2": LICENSE_WHATSAPP_2, "instagram": LICENSE_INSTAGRAM}
+
+
+def require_active_license() -> None:
+    status = license_status()
+    if not status["active"]:
+        raise HTTPException(status_code=403, detail={"error": "LICENSE_EXPIRED", **status})
 
 
 async def get_candles(symbol: str, interval: str, outputsize: int = 100) -> List[Dict[str, Any]]:
     global RATE_LIMIT_UNTIL
-
     if not KEY:
         raise HTTPException(status_code=500, detail="TWELVE_DATA_API_KEY não configurada no Render.")
-
     if symbol not in SYMBOLS:
         raise HTTPException(status_code=400, detail="Ativo inválido.")
-
     if interval not in ALLOWED_INTERVALS:
         raise HTTPException(status_code=400, detail="Timeframe inválido.")
 
     key = (symbol, interval)
     now = time.monotonic()
-
     cached = CANDLE_CACHE.get(key)
-    if cached and (now - cached[0]) < CACHE_TTL_SECONDS:
+    if cached and now - cached[0] < CACHE_TTL_SECONDS:
         return cached[1]
-
+    if now < RATE_LIMIT_UNTIL and cached:
+        return cached[1]
     if now < RATE_LIMIT_UNTIL:
-        if cached:
-            return cached[1]
         remaining = max(1, int(RATE_LIMIT_UNTIL - now))
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error": "RATE_LIMIT",
-                "message": f"Limite da Twelve Data atingido. Aguarde {remaining}s e tente novamente.",
-                "retry_after": remaining,
-            },
-        )
+        raise HTTPException(status_code=429, detail={"error": "RATE_LIMIT", "retry_after": remaining})
 
     lock = CANDLE_LOCKS.setdefault(key, asyncio.Lock())
     async with lock:
-        # Outra requisição pode ter preenchido o cache enquanto aguardávamos o lock.
         now = time.monotonic()
         cached = CANDLE_CACHE.get(key)
-        if cached and (now - cached[0]) < CACHE_TTL_SECONDS:
+        if cached and now - cached[0] < CACHE_TTL_SECONDS:
             return cached[1]
-
-        if now < RATE_LIMIT_UNTIL:
-            remaining = max(1, int(RATE_LIMIT_UNTIL - now))
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "error": "RATE_LIMIT",
-                    "message": f"Limite da Twelve Data atingido. Aguarde {remaining}s e tente novamente.",
-                    "retry_after": remaining,
-                },
-            )
-
-        params = {
-            "symbol": SYMBOLS[symbol],
-            "interval": interval,
-            "outputsize": min(max(int(outputsize), 20), 500),
-            "timezone": "America/Sao_Paulo",
-            "order": "ASC",
-        }
-
-        headers = {"Authorization": f"apikey {KEY}"}
-
+        params = {"symbol": SYMBOLS[symbol], "interval": interval,
+                  "outputsize": min(max(int(outputsize), 20), 500),
+                  "timezone": "America/Sao_Paulo", "order": "ASC"}
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
-                response = await client.get(BASE_URL, params=params, headers=headers)
+                response = await client.get(BASE_URL, params=params,
+                                            headers={"Authorization": f"apikey {KEY}"})
         except httpx.RequestError as exc:
             raise HTTPException(status_code=502, detail="Não foi possível conectar à Twelve Data.") from exc
-
         if response.status_code == 429:
-            retry_header = response.headers.get("Retry-After", "")
-            try:
-                retry_after = max(5, min(int(float(retry_header)), 120)) if retry_header else RATE_LIMIT_COOLDOWN_SECONDS
-            except ValueError:
-                retry_after = RATE_LIMIT_COOLDOWN_SECONDS
-            RATE_LIMIT_UNTIL = time.monotonic() + retry_after
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "error": "RATE_LIMIT",
-                    "message": f"A Twelve Data informou limite de requisições. Aguarde {int(retry_after)}s.",
-                    "retry_after": int(retry_after),
-                },
-            )
-
+            RATE_LIMIT_UNTIL = time.monotonic() + 20
+            raise HTTPException(status_code=429, detail={"error": "RATE_LIMIT", "retry_after": 20})
         if response.status_code >= 400:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Twelve Data retornou HTTP {response.status_code}.",
-            )
-
+            raise HTTPException(status_code=502, detail=f"Twelve Data retornou HTTP {response.status_code}.")
         try:
             data = response.json()
         except ValueError as exc:
             raise HTTPException(status_code=502, detail="Resposta inválida da Twelve Data.") from exc
-
         if data.get("status") == "error" or "values" not in data:
-            message = data.get("message", "Resposta inválida da Twelve Data.")
-            raise HTTPException(status_code=502, detail=message)
-
-        candles: List[Dict[str, Any]] = []
+            raise HTTPException(status_code=502, detail=data.get("message", "Resposta inválida da Twelve Data."))
+        candles = []
         for item in data["values"]:
             try:
-                candles.append(
-                    {
-                        "datetime": item["datetime"],
-                        "open": float(item["open"]),
-                        "high": float(item["high"]),
-                        "low": float(item["low"]),
-                        "close": float(item["close"]),
-                        "volume": float(item.get("volume", 0) or 0),
-                    }
-                )
+                candles.append({"datetime": item["datetime"], "open": float(item["open"]),
+                                "high": float(item["high"]), "low": float(item["low"]),
+                                "close": float(item["close"]), "volume": float(item.get("volume", 0) or 0)})
             except (KeyError, TypeError, ValueError):
                 continue
-
         candles.sort(key=lambda x: parse_time(x["datetime"]))
         if len(candles) < 20:
             raise HTTPException(status_code=502, detail="Poucas velas retornadas pela Twelve Data.")
-
         CANDLE_CACHE[key] = (time.monotonic(), candles)
         return candles
 
@@ -253,630 +163,295 @@ def ema(values: List[float], period: int) -> List[float]:
     if not values:
         return []
     alpha = 2.0 / (period + 1.0)
-    result = [values[0]]
+    out = [values[0]]
     for value in values[1:]:
-        result.append((value * alpha) + (result[-1] * (1.0 - alpha)))
-    return result
+        out.append(value * alpha + out[-1] * (1.0 - alpha))
+    return out
 
 
 def rsi(values: List[float], period: int = 14) -> List[float]:
     if len(values) < period + 1:
         return [50.0] * len(values)
-
-    gains = [0.0]
-    losses = [0.0]
+    gains, losses = [0.0], [0.0]
     for i in range(1, len(values)):
         change = values[i] - values[i - 1]
-        gains.append(max(change, 0.0))
-        losses.append(max(-change, 0.0))
-
-    result = [50.0] * len(values)
-    avg_gain = sum(gains[1 : period + 1]) / period
-    avg_loss = sum(losses[1 : period + 1]) / period
-
-    def calc(g: float, l: float) -> float:
-        if l == 0:
-            return 100.0 if g > 0 else 50.0
-        rs = g / l
-        return 100.0 - (100.0 / (1.0 + rs))
-
-    result[period] = calc(avg_gain, avg_loss)
-
+        gains.append(max(change, 0.0)); losses.append(max(-change, 0.0))
+    out = [50.0] * len(values)
+    ag = sum(gains[1:period + 1]) / period
+    al = sum(losses[1:period + 1]) / period
+    def calc(g, l):
+        if l == 0: return 100.0 if g > 0 else 50.0
+        return 100.0 - 100.0 / (1.0 + g / l)
+    out[period] = calc(ag, al)
     for i in range(period + 1, len(values)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
-        result[i] = calc(avg_gain, avg_loss)
-
-    return result
-
-
-def true_ranges(candles: List[Dict[str, Any]]) -> List[float]:
-    tr: List[float] = []
-    for i, candle in enumerate(candles):
-        if i == 0:
-            tr.append(candle["high"] - candle["low"])
-            continue
-        previous_close = candles[i - 1]["close"]
-        tr.append(
-            max(
-                candle["high"] - candle["low"],
-                abs(candle["high"] - previous_close),
-                abs(candle["low"] - previous_close),
-            )
-        )
-    return tr
+        ag = ((ag * (period - 1)) + gains[i]) / period
+        al = ((al * (period - 1)) + losses[i]) / period
+        out[i] = calc(ag, al)
+    return out
 
 
-def adx(candles: List[Dict[str, Any]], period: int) -> List[float]:
-    n = len(candles)
-    if n < period + 2:
-        return [0.0] * n
-
-    tr = true_ranges(candles)
-    plus_dm = [0.0] * n
-    minus_dm = [0.0] * n
-
-    for i in range(1, n):
-        up_move = candles[i]["high"] - candles[i - 1]["high"]
-        down_move = candles[i - 1]["low"] - candles[i]["low"]
-        if up_move > down_move and up_move > 0:
-            plus_dm[i] = up_move
-        if down_move > up_move and down_move > 0:
-            minus_dm[i] = down_move
-
-    result = [0.0] * n
-    atr = sum(tr[1 : period + 1]) / period
-    plus = sum(plus_dm[1 : period + 1]) / period
-    minus = sum(minus_dm[1 : period + 1]) / period
-
-    dx_values: List[float] = [0.0] * n
-
-    for i in range(period, n):
-        if i > period:
-            atr = ((atr * (period - 1)) + tr[i]) / period
-            plus = ((plus * (period - 1)) + plus_dm[i]) / period
-            minus = ((minus * (period - 1)) + minus_dm[i]) / period
-
-        plus_di = 100.0 * plus / atr if atr else 0.0
-        minus_di = 100.0 * minus / atr if atr else 0.0
-        denom = plus_di + minus_di
-        dx_values[i] = 100.0 * abs(plus_di - minus_di) / denom if denom else 0.0
-
-    start = period
-    if n > start + period:
-        initial = dx_values[start : start + period]
-        adx_value = sum(initial) / len(initial)
-        result[start + period - 1] = adx_value
-
-        for i in range(start + period, n):
-            adx_value = ((adx_value * (period - 1)) + dx_values[i]) / period
-            result[i] = adx_value
-
-    return result
+def true_ranges(candles):
+    out = []
+    for i, c in enumerate(candles):
+        if i == 0: out.append(c["high"] - c["low"]); continue
+        pc = candles[i - 1]["close"]
+        out.append(max(c["high"] - c["low"], abs(c["high"] - pc), abs(c["low"] - pc)))
+    return out
 
 
-def analyze(candles: List[Dict[str, Any]], strategy: str = "rsi") -> Dict[str, Any]:
-    """Analisa somente candles fechados para reduzir repintura. SNIPER 01: leitura de price action/confluência por candles. SNIPER X: confluência RSI 9 + RSI 14. """
+def body(c): return abs(c["close"] - c["open"])
+def rng(c): return max(c["high"] - c["low"], 1e-12)
+
+
+def analyze(candles, strategy="rsi"):
     if len(candles) < 30:
         raise HTTPException(status_code=422, detail="Dados insuficientes para análise.")
-
     closed = candles[:-1]
-    reference = closed[-1]
-    previous = closed[-2]
-    next_candle = candles[-1]
+    reference, next_candle, previous = closed[-1], candles[-1], closed[-2]
     strategy = strategy.lower().strip()
-
-    def body(c):
-        return abs(c["close"] - c["open"])
-
-    def rng(c):
-        return max(c["high"] - c["low"], 1e-12)
+    bullish = reference["close"] > reference["open"]
+    bearish = reference["close"] < reference["open"]
 
     if strategy == "old_sniper":
-        # SNIPER 01 — Price Action:
-        # CALL: engolfo de alta, rejeição de fundo, rompimento da máxima,
-        # vela de força compradora e confirmação pela estrutura anterior.
-        # PUT: condições equivalentes para baixa.
-        prev_body = body(previous)
-        ref_body = body(reference)
-        ref_range = rng(reference)
-        ref_upper = reference["high"] - max(reference["open"], reference["close"])
-        ref_lower = min(reference["open"], reference["close"]) - reference["low"]
-
-        bullish = reference["close"] > reference["open"]
-        bearish = reference["close"] < reference["open"]
-        prev_bearish = previous["close"] < previous["open"]
-        prev_bullish = previous["close"] > previous["open"]
-
-        bull_engulf = (bullish and prev_bearish and
-                       reference["open"] <= previous["close"] and
-                       reference["close"] >= previous["open"])
-        bear_engulf = (bearish and prev_bullish and
-                       reference["open"] >= previous["close"] and
-                       reference["close"] <= previous["open"])
-
-        # Rejeição: pavio contrário relativamente grande.
-        bull_rejection = bullish and ref_lower >= max(ref_body * 1.2, ref_range * 0.30)
-        bear_rejection = bearish and ref_upper >= max(ref_body * 1.2, ref_range * 0.30)
-
+        rb, rr = body(reference), rng(reference)
+        lower = min(reference["open"], reference["close"]) - reference["low"]
+        upper = reference["high"] - max(reference["open"], reference["close"])
+        prev_bull = previous["close"] > previous["open"]
+        prev_bear = previous["close"] < previous["open"]
+        bull_engulf = bullish and prev_bear and reference["open"] <= previous["close"] and reference["close"] >= previous["open"]
+        bear_engulf = bearish and prev_bull and reference["open"] >= previous["close"] and reference["close"] <= previous["open"]
+        bull_rej = bullish and lower >= max(rb * 1.2, rr * .30)
+        bear_rej = bearish and upper >= max(rb * 1.2, rr * .30)
         bull_break = reference["high"] > previous["high"] and reference["close"] > previous["high"]
         bear_break = reference["low"] < previous["low"] and reference["close"] < previous["low"]
-
-        bull_strength = bullish and ref_body >= ref_range * 0.60 and ref_upper <= ref_range * 0.20
-        bear_strength = bearish and ref_body >= ref_range * 0.60 and ref_lower <= ref_range * 0.20
-
-        # Estrutura: fechamento na metade correspondente e direção coerente.
-        bull_structure = bullish and reference["close"] >= previous["close"]
-        bear_structure = bearish and reference["close"] <= previous["close"]
-
-        bull_flags = [bull_engulf, bull_rejection, bull_break, bull_strength, bull_structure]
-        bear_flags = [bear_engulf, bear_rejection, bear_break, bear_strength, bear_structure]
-        bull_score = sum(bull_flags)
-        bear_score = sum(bear_flags)
-
-        if bull_score >= 3 and bull_score > bear_score:
-            signal = "CALL"
-            confidence = min(95, 55 + bull_score * 7)
-        elif bear_score >= 3 and bear_score > bull_score:
-            signal = "PUT"
-            confidence = min(95, 55 + bear_score * 7)
-        else:
-            signal = "NEUTRO"
-            confidence = 50
-
-        return {
-            "signal": signal,
-            "confidence": int(confidence),
-            "reference_candle": reference["datetime"],
-            "next_candle": next_candle["datetime"],
-            "strategy": "SNIPER 01",
-            "strategy_code": "old_sniper",
-            "bull_score": bull_score,
-            "bear_score": bear_score,
-            "bullish_engulfing": bull_engulf,
-            "bearish_engulfing": bear_engulf,
-            "bullish_rejection": bull_rejection,
-            "bearish_rejection": bear_rejection,
-            "bullish_breakout": bull_break,
-            "bearish_breakout": bear_break,
-            "bullish_strength": bull_strength,
-            "bearish_strength": bear_strength,
-            "structure_confirmation": bull_structure if signal == "CALL" else bear_structure if signal == "PUT" else False,
-            "non_repaint_reference": True,
-            "ok": True,
-        }
+        bull_strength = bullish and rb >= rr * .60 and upper <= rr * .20
+        bear_strength = bearish and rb >= rr * .60 and lower <= rr * .20
+        bull_score = sum([bull_engulf, bull_rej, bull_break, bull_strength, reference["close"] >= previous["close"]])
+        bear_score = sum([bear_engulf, bear_rej, bear_break, bear_strength, reference["close"] <= previous["close"]])
+        if bull_score >= 3 and bull_score > bear_score: signal, confidence = "CALL", min(95, 55 + bull_score * 7)
+        elif bear_score >= 3 and bear_score > bull_score: signal, confidence = "PUT", min(95, 55 + bear_score * 7)
+        else: signal, confidence = "NEUTRO", 50
+        return {"signal": signal, "confidence": int(confidence), "strategy": "SNIPER 01", "strategy_code": strategy,
+                "bull_score": bull_score, "bear_score": bear_score, "reference_candle": reference["datetime"],
+                "next_candle": next_candle["datetime"], "non_repaint_reference": True, "ok": True}
 
     if strategy == "sniper_02":
-        # SNIPER 02 — rompimento + reteste + rejeição + confirmação.
-        # Não entra no primeiro rompimento.
-        # Usa apenas candles fechados para reduzir repintura.
-        if len(closed) < 25:
-            raise HTTPException(status_code=422, detail="Dados insuficientes para SNIPER 02.")
-
-        # Níveis simples de suporte/resistência por swing, usando histórico anterior
-        # ao movimento recente. Isso evita usar o próprio candle de rompimento como nível.
         lookback = closed[-22:-4]
-        resistance = max(c["high"] for c in lookback)
-        support = min(c["low"] for c in lookback)
-        recent = closed[-4:]
+        resistance, support = max(c["high"] for c in lookback), min(c["low"] for c in lookback)
+        call_setup = put_setup = False
+        for j in range(max(2, len(closed) - 5), len(closed) - 2):
+            br, retest, conf = closed[j], closed[j + 1], closed[j + 2]
+            b, r = body(retest), rng(retest)
+            low_wick = min(retest["open"], retest["close"]) - retest["low"]
+            high_wick = retest["high"] - max(retest["open"], retest["close"])
+            hammer = low_wick >= max(b * 2, r * .45) and high_wick <= r * .20
+            star = high_wick >= max(b * 2, r * .45) and low_wick <= r * .20
+            if br["close"] > resistance and retest["low"] <= resistance * 1.0015 and (hammer or (retest["close"] > retest["open"])) and conf["close"] > conf["open"] and conf["close"] > retest["high"]:
+                call_setup = True
+            if br["close"] < support and retest["high"] >= support * .9985 and (star or (retest["close"] < retest["open"])) and conf["close"] < conf["open"] and conf["close"] < retest["low"]:
+                put_setup = True
+        signal = "CALL" if call_setup and not put_setup else "PUT" if put_setup and not call_setup else "NEUTRO"
+        return {"signal": signal, "confidence": 88 if signal != "NEUTRO" else 50, "strategy": "SNIPER 02", "strategy_code": strategy,
+                "call_setup": call_setup, "put_setup": put_setup, "support": support, "resistance": resistance,
+                "reference_candle": reference["datetime"], "next_candle": next_candle["datetime"], "non_repaint_reference": True, "ok": True}
 
-        def bullish_pin(c):
-            b = body(c); r = rng(c)
-            lower = min(c["open"], c["close"]) - c["low"]
-            upper = c["high"] - max(c["open"], c["close"])
-            return c["close"] > c["open"] and lower >= max(b * 1.5, r * 0.40) and upper <= r * 0.25
-
-        def bearish_pin(c):
-            b = body(c); r = rng(c)
-            upper = c["high"] - max(c["open"], c["close"])
-            lower = min(c["open"], c["close"]) - c["low"]
-            return c["close"] < c["open"] and upper >= max(b * 1.5, r * 0.40) and lower <= r * 0.25
-
-        def hammer(c):
-            b = body(c); r = rng(c)
-            lower = min(c["open"], c["close"]) - c["low"]
-            upper = c["high"] - max(c["open"], c["close"])
-            return lower >= max(b * 2.0, r * 0.45) and upper <= r * 0.20
-
-        def shooting_star(c):
-            b = body(c); r = rng(c)
-            upper = c["high"] - max(c["open"], c["close"])
-            lower = min(c["open"], c["close"]) - c["low"]
-            return upper >= max(b * 2.0, r * 0.45) and lower <= r * 0.20
-
-        def bull_engulf(a, b):
-            return (b["close"] > b["open"] and a["close"] < a["open"] and
-                    b["open"] <= a["close"] and b["close"] >= a["open"])
-
-        def bear_engulf(a, b):
-            return (b["close"] < b["open"] and a["close"] > a["open"] and
-                    b["open"] >= a["close"] and b["close"] <= a["open"])
-
-        # Procura uma sequência fechada: rompimento, retorno ao nível, rejeição e confirmação.
-        call_setup = False
-        put_setup = False
-        call_pattern = ""
-        put_pattern = ""
-        for j in range(max(2, len(closed) - 5), len(closed) - 1):
-            breakout = closed[j]
-            retest = closed[j + 1]
-            confirmation = closed[j + 2] if j + 2 < len(closed) else None
-            if confirmation is None:
-                continue
-
-            # CALL: fechamento acima da resistência, depois reteste sem operar no rompimento.
-            if breakout["close"] > resistance:
-                touched = retest["low"] <= resistance * 1.0015
-                rejection = touched and (hammer(retest) or bullish_pin(retest) or
-                                         bull_engulf(closed[j], retest))
-                confirmed = (confirmation["close"] > confirmation["open"] and
-                             confirmation["close"] > retest["high"])
-                if rejection and confirmed:
-                    call_setup = True
-                    call_pattern = ("Martelo" if hammer(retest) else
-                                    "Pin Bar de alta" if bullish_pin(retest) else
-                                    "Engolfo de alta")
-
-            # PUT: fechamento abaixo do suporte, depois reteste sem operar no rompimento.
-            if breakout["close"] < support:
-                touched = retest["high"] >= support * 0.9985
-                rejection = touched and (shooting_star(retest) or bearish_pin(retest) or
-                                         bear_engulf(closed[j], retest))
-                confirmed = (confirmation["close"] < confirmation["open"] and
-                             confirmation["close"] < retest["low"])
-                if rejection and confirmed:
-                    put_setup = True
-                    put_pattern = ("Shooting Star" if shooting_star(retest) else
-                                   "Pin Bar de baixa" if bearish_pin(retest) else
-                                   "Engolfo de baixa")
-
-        if call_setup and not put_setup:
-            signal = "CALL"; confidence = 88
-        elif put_setup and not call_setup:
-            signal = "PUT"; confidence = 88
-        else:
-            signal = "NEUTRO"; confidence = 50
-
-        return {
-            "signal": signal,
-            "confidence": confidence,
-            "reference_candle": reference["datetime"],
-            "next_candle": next_candle["datetime"],
-            "strategy": "SNIPER 02",
-            "strategy_code": "sniper_02",
-            "resistance": resistance,
-            "support": support,
-            "call_setup": call_setup,
-            "put_setup": put_setup,
-            "call_pattern": call_pattern,
-            "put_pattern": put_pattern,
-            "no_first_breakout": True,
-            "non_repaint_reference": True,
-            "ok": True,
-        }
-
+    closes = [c["close"] for c in closed]
+    r9, r14 = rsi(closes, 9)[-1], rsi(closes, 14)[-1]
     if strategy == "sniper_03":
-        # SNIPER 03 — Tendência + Retração + LTA/LTB + zonas fortes.
-        if len(closed) < 45:
-            raise HTTPException(status_code=422, detail="Dados insuficientes para SNIPER 03.")
-        closes = [c["close"] for c in closed]; highs=[c["high"] for c in closed]; lows=[c["low"] for c in closed]
-        ema20=ema(closes,20); ema50=ema(closes,50)
-        trv=true_ranges(closed); atr=sum(trv[-14:])/14
-        tol=max(atr*0.35, abs(reference["close"])*0.0005)
-        def pl(i): return i>=2 and i+2<len(closed) and lows[i]<=lows[i-1] and lows[i]<=lows[i-2] and lows[i]<lows[i+1] and lows[i]<lows[i+2]
-        def ph(i): return i>=2 and i+2<len(closed) and highs[i]>=highs[i-1] and highs[i]>=highs[i-2] and highs[i]>highs[i+1] and highs[i]>highs[i+2]
-        lp=[i for i in range(max(2,len(closed)-35),len(closed)-2) if pl(i)]
-        hp=[i for i in range(max(2,len(closed)-35),len(closed)-2) if ph(i)]
-        lta_level=ltb_level=None; lta_valid=ltb_valid=False
-        if len(lp)>=2:
-            a,b=lp[-2],lp[-1]
-            if lows[b]>lows[a]:
-                slope=(lows[b]-lows[a])/(b-a); lta_level=lows[b]+slope*(len(closed)-1-b); lta_valid=slope>0 and lta_level<=reference["high"]+tol
-        if len(hp)>=2:
-            a,b=hp[-2],hp[-1]
-            if highs[b]<highs[a]:
-                slope=(highs[b]-highs[a])/(b-a); ltb_level=highs[b]+slope*(len(closed)-1-b); ltb_valid=slope<0 and ltb_level>=reference["low"]-tol
-        support_level=min((lows[i] for i in lp[-5:]),default=None)
-        resistance_level=max((highs[i] for i in hp[-5:]),default=None)
-        def zone_score(level,side):
-            if level is None:return 0
-            touches=reject=0
-            for c in closed[max(0,len(closed)-40):-1]:
-                if c["low"]<=level+tol and c["high"]>=level-tol:
-                    touches+=1
-                    if side=="support" and (c["close"]>c["open"] or min(c["open"],c["close"])-c["low"]>body(c)): reject+=1
-                    if side=="resistance" and (c["close"]<c["open"] or c["high"]-max(c["open"],c["close"])>body(c)): reject+=1
-            return touches+min(reject,3)
-        ss=zone_score(support_level,"support"); rs=zone_score(resistance_level,"resistance")
-        strong_support=support_level is not None and ss>=4; strong_resistance=resistance_level is not None and rs>=4
-        rb=body(reference); rr=rng(reference); lw=min(reference["open"],reference["close"])-reference["low"]; uw=reference["high"]-max(reference["open"],reference["close"])
-        bull_rej=reference["close"]>reference["open"] and lw>=max(rb*1.2,rr*.30); bear_rej=reference["close"]<reference["open"] and uw>=max(rb*1.2,rr*.30)
-        near_lta=lta_level is not None and abs(reference["low"]-lta_level)<=tol; near_ltb=ltb_level is not None and abs(reference["high"]-ltb_level)<=tol
-        near_sup=support_level is not None and abs(reference["low"]-support_level)<=tol; near_res=resistance_level is not None and abs(reference["high"]-resistance_level)<=tol
-        prior=closed[-6:-1]
-        up=ema20[-1]>ema50[-1] and ema20[-1]>ema20[-4] and reference["close"]>ema50[-1]
-        down=ema20[-1]<ema50[-1] and ema20[-1]<ema20[-4] and reference["close"]<ema50[-1]
-        pull_call=any(c["close"]<c["open"] for c in prior[-3:]) and (near_lta or near_sup or abs(reference["low"]-ema20[-1])<=tol)
-        pull_put=any(c["close"]>c["open"] for c in prior[-3:]) and (near_ltb or near_res or abs(reference["high"]-ema20[-1])<=tol)
-        conf_call=reference["close"]>reference["open"] and reference["close"]>=previous["high"]
-        conf_put=reference["close"]<reference["open"] and reference["close"]<=previous["low"]
-        call_score=(2 if up else 0)+(2 if lta_valid else 0)+(2 if strong_support else 0)+(2 if pull_call else 0)+(1 if bull_rej else 0)+(2 if conf_call else 0)+(1 if near_lta else 0)+(1 if near_sup else 0)
-        put_score=(2 if down else 0)+(2 if ltb_valid else 0)+(2 if strong_resistance else 0)+(2 if pull_put else 0)+(1 if bear_rej else 0)+(2 if conf_put else 0)+(1 if near_ltb else 0)+(1 if near_res else 0)
-        if call_score>=8 and call_score>put_score: signal="CALL"; confidence=min(95,55+call_score*4)
-        elif put_score>=8 and put_score>call_score: signal="PUT"; confidence=min(95,55+put_score*4)
-        else: signal="NEUTRO"; confidence=50
-        return {"signal":signal,"confidence":confidence,"reference_candle":reference["datetime"],"next_candle":next_candle["datetime"],"strategy":"SNIPER 03","strategy_code":"sniper_03","trend":"ALTA" if up else "BAIXA" if down else "NEUTRA","lta":round(lta_level,8) if lta_level is not None else None,"ltb":round(ltb_level,8) if ltb_level is not None else None,"support":round(support_level,8) if support_level is not None else None,"resistance":round(resistance_level,8) if resistance_level is not None else None,"strong_support":strong_support,"strong_resistance":strong_resistance,"near_lta":near_lta,"near_ltb":near_ltb,"near_support":near_sup,"near_resistance":near_res,"pullback_call":pull_call,"pullback_put":pull_put,"bullish_rejection":bull_rej,"bearish_rejection":bear_rej,"call_score":call_score,"put_score":put_score,"non_repaint_reference":True,"ok":True}
+        e20, e50 = ema(closes, 20)[-1], ema(closes, 50)[-1]
+        up = e20 > e50 and reference["close"] > e20
+        down = e20 < e50 and reference["close"] < e20
+        low_wick = min(reference["open"], reference["close"]) - reference["low"]
+        high_wick = reference["high"] - max(reference["open"], reference["close"])
+        bull = up and (low_wick > body(reference) or reference["close"] >= previous["high"])
+        bear = down and (high_wick > body(reference) or reference["close"] <= previous["low"])
+        signal = "CALL" if bull else "PUT" if bear else "NEUTRO"
+        return {"signal": signal, "confidence": 82 if signal != "NEUTRO" else 50, "strategy": "SNIPER 03", "strategy_code": strategy,
+                "trend": "ALTA" if up else "BAIXA" if down else "NEUTRA", "reference_candle": reference["datetime"],
+                "next_candle": next_candle["datetime"], "non_repaint_reference": True, "ok": True}
 
-    # SNIPER X — apenas RSI 9 + RSI 14 em confluência.
-    closes = [float(c["close"]) for c in closed]
-    rsi9_values = rsi(closes, 9)
-    rsi14_values = rsi(closes, 14)
-    i = len(closed) - 1
-    rsi9_value = rsi9_values[i]
-    rsi14_value = rsi14_values[i]
-
-    if rsi9_value > 50.0 and rsi14_value > 50.0:
-        signal = "CALL"
-    elif rsi9_value < 50.0 and rsi14_value < 50.0:
-        signal = "PUT"
-    else:
-        signal = "NEUTRO"
-
-    confidence = 50 if signal == "NEUTRO" else int(min(
-        95, 55 + min(abs(rsi9_value - 50), abs(rsi14_value - 50)) * 1.8
-    ))
-    return {
-        "signal": signal,
-        "confidence": confidence,
-        "reference_candle": reference["datetime"],
-        "next_candle": next_candle["datetime"],
-        "rsi9": round(rsi9_value, 2),
-        "rsi14": round(rsi14_value, 2),
-        "rsi_confluence": signal != "NEUTRO",
-        "strategy": "SNIPER X",
-        "strategy_code": "rsi",
-        "non_repaint_reference": True,
-        "ok": True,
-    }
+    signal = "CALL" if r9 > 50 and r14 > 50 else "PUT" if r9 < 50 and r14 < 50 else "NEUTRO"
+    confidence = 50 if signal == "NEUTRO" else int(min(95, 55 + min(abs(r9 - 50), abs(r14 - 50)) * 1.8))
+    return {"signal": signal, "confidence": confidence, "rsi9": round(r9, 2), "rsi14": round(r14, 2),
+            "rsi_confluence": signal != "NEUTRO", "strategy": "SNIPER X", "strategy_code": "rsi",
+            "reference_candle": reference["datetime"], "next_candle": next_candle["datetime"],
+            "non_repaint_reference": True, "ok": True}
 
 
-
-def detect_market_trend(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Detecta a tendência usando somente candles fechados. EMA 9/20/50 + inclinação da EMA 20. """
+def detect_market_trend(candles):
     closed = candles[:-1]
-    if len(closed) < 55:
-        return {"trend": "NEUTRA", "trend_text": "Tendência neutra", "trend_score": 0}
-
-    closes = [float(c["close"]) for c in closed]
-    e9 = ema(closes, 9)
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
+    if len(closed) < 55: return {"trend": "NEUTRA", "trend_text": "Tendência neutra", "trend_score": 0}
+    closes = [c["close"] for c in closed]
+    e9, e20, e50 = ema(closes, 9), ema(closes, 20), ema(closes, 50)
     slope = e20[-1] - e20[-6]
-    price = closes[-1]
-    atr_values = true_ranges(closed)
-    atr = sum(atr_values[-14:]) / 14 if len(atr_values) >= 14 else max(abs(price) * 0.0001, 1e-12)
-    threshold = max(atr * 0.05, abs(price) * 0.00001)
-
-    bull_score = int(e9[-1] > e20[-1]) + int(e20[-1] > e50[-1]) + int(price > e50[-1]) + int(slope > threshold)
-    bear_score = int(e9[-1] < e20[-1]) + int(e20[-1] < e50[-1]) + int(price < e50[-1]) + int(slope < -threshold)
-
-    if bull_score >= 3 and bull_score > bear_score:
-        return {"trend": "ALTA", "trend_text": "Tendência do gráfico é de alta", "trend_score": bull_score}
-    if bear_score >= 3 and bear_score > bull_score:
-        return {"trend": "BAIXA", "trend_text": "Tendência do gráfico é de baixa", "trend_score": bear_score}
-    return {"trend": "NEUTRA", "trend_text": "Tendência neutra", "trend_score": max(bull_score, bear_score)}
+    bull = int(e9[-1] > e20[-1]) + int(e20[-1] > e50[-1]) + int(closes[-1] > e50[-1]) + int(slope > 0)
+    bear = int(e9[-1] < e20[-1]) + int(e20[-1] < e50[-1]) + int(closes[-1] < e50[-1]) + int(slope < 0)
+    if bull >= 3 and bull > bear: return {"trend": "ALTA", "trend_text": "Tendência do gráfico é de alta", "trend_score": bull}
+    if bear >= 3 and bear > bull: return {"trend": "BAIXA", "trend_text": "Tendência do gráfico é de baixa", "trend_score": bear}
+    return {"trend": "NEUTRA", "trend_text": "Tendência neutra", "trend_score": max(bull, bear)}
 
 
-def radar_score(analysis: Dict[str, Any], strategy: str) -> Dict[str, Any]:
-    """Converte a análise da estratégia em proximidade de CALL/PUT para o radar."""
-    strategy = strategy.lower().strip()
-    if strategy == "rsi":
-        r9 = float(analysis.get("rsi9", 50.0))
-        r14 = float(analysis.get("rsi14", 50.0))
-        bull = max(0.0, min(100.0, 50.0 + ((r9 - 50.0) + (r14 - 50.0)) * 1.5))
-        bear = max(0.0, min(100.0, 50.0 + ((50.0 - r9) + (50.0 - r14)) * 1.5))
-    elif strategy == "old_sniper":
-        bull = min(100.0, 50.0 + float(analysis.get("bull_score", 0)) * 10.0)
-        bear = min(100.0, 50.0 + float(analysis.get("bear_score", 0)) * 10.0)
-    elif strategy == "sniper_02":
-        bull = 90.0 if analysis.get("call_setup") else 50.0
-        bear = 90.0 if analysis.get("put_setup") else 50.0
-    elif strategy == "ai":
-        bull = float(analysis.get("p_up", 50.0))
-        bear = float(analysis.get("p_down", 50.0))
+def ai_feature_vector(candles, i):
+    data = candles[:i + 1]
+    closes = [c["close"] for c in data]; opens = [c["open"] for c in data]
+    highs = [c["high"] for c in data]; lows = [c["low"] for c in data]
+    vols = [c.get("volume", 0) or 0 for c in data]
+    def ret(n): return closes[-1] / closes[-1-n] - 1 if len(closes) > n else 0.0
+    ranges = [max(h-l, 1e-12) for h,l in zip(highs,lows)]
+    bodies = [abs(c-o)/r for c,o,r in zip(closes,opens,ranges)]
+    tr = true_ranges(data); atr = sum(tr[-14:]) / min(14, len(tr))
+    e9, e20, e50 = ema(closes,9)[-1], ema(closes,20)[-1], ema(closes,50)[-1]
+    r9, r14 = rsi(closes,9)[-1], rsi(closes,14)[-1]
+    mean10 = sum(closes[-10:]) / min(10,len(closes)); vol10 = (sum((x-mean10)**2 for x in closes[-10:]) / min(10,len(closes))) ** .5 / max(mean10,1e-12)
+    avg_vol = sum(vols[-20:]) / max(1,min(20,len(vols))); vol_ratio = vols[-1]/avg_vol if avg_vol else 1
+    slope = (ema(closes,20)[-1]-ema(closes,20)[-6])/max(closes[-1],1e-12) if len(closes)>=6 else 0
+    return [ret(1),ret(2),ret(3),ret(5),ret(10),(closes[-1]-e9)/closes[-1],(e9-e20)/closes[-1],(e20-e50)/closes[-1],slope,r9/100,r14/100,bodies[-1],(highs[-1]-max(opens[-1],closes[-1]))/ranges[-1],(min(opens[-1],closes[-1])-lows[-1])/ranges[-1],atr/closes[-1],vol10,vol_ratio]
+
+
+def train_ai_ensemble(candles):
+    if not SKLEARN_OK: return {"ready": False, "reason": "scikit-learn não instalado"}
+    closed = candles[:-1]
+    if len(closed) < 100: return {"ready": False, "reason": "Poucas velas para treinar a IA V3"}
+    X, y = [], []
+    for i in range(50, len(closed)-1):
+        X.append(ai_feature_vector(closed, i)); y.append(1 if closed[i+1]["close"] > closed[i]["close"] else 0)
+    if len(X) < 60 or len(set(y)) < 2: return {"ready": False, "reason": "Classes insuficientes para treinar a IA V3"}
+    split = max(40, int(len(X)*.8)); split = min(split, len(X)-10)
+    models = [("LOGISTIC", make_pipeline(StandardScaler(), LogisticRegression(max_iter=700, class_weight="balanced"))),
+              ("RANDOM_FOREST", RandomForestClassifier(n_estimators=220,max_depth=7,min_samples_leaf=3,random_state=42,class_weight="balanced_subsample",n_jobs=-1)),
+              ("GRADIENT_BOOSTING", HistGradientBoostingClassifier(max_iter=180,learning_rate=.04,max_leaf_nodes=15,l2_regularization=.8,random_state=42))]
+    if XGBOOST_OK:
+        models.append(("XGBOOST", XGBClassifier(n_estimators=240,max_depth=4,learning_rate=.035,subsample=.85,colsample_bytree=.85,min_child_weight=4,reg_lambda=2.5,reg_alpha=.15,objective="binary:logistic",eval_metric="logloss",random_state=42,n_jobs=2,tree_method="hist")))
+    if LIGHTGBM_OK:
+        models.append(("LIGHTGBM", LGBMClassifier(n_estimators=200,learning_rate=.035,num_leaves=15,max_depth=5,min_child_samples=8,reg_lambda=2,reg_alpha=.1,objective="binary",random_state=42,n_jobs=2,verbosity=-1)))
+    trained, scores = [], []
+    for name, model in models:
+        try:
+            model.fit(X[:split],y[:split]); pred=model.predict(X[split:]); scores.append(sum(int(a==b) for a,b in zip(pred,y[split:]))/len(y[split:])); trained.append((name,model))
+        except Exception:
+            continue
+    if not trained: return {"ready": False, "reason": "Falha ao treinar os modelos"}
+    return {"ready":True,"models":trained,"validation_accuracy":round(sum(scores)/len(scores)*100,1) if scores else 0,"samples":split,"validation_samples":len(X)-split,"data_candles":len(closed),"xgboost":XGBOOST_OK,"lightgbm":LIGHTGBM_OK,"training":"temporal_80_20"}
+
+
+def predict_ai_ensemble(symbol, interval, candles):
+    key=(symbol,interval); now=time.monotonic(); cached=AI_MODEL_CACHE.get(key)
+    if not cached or now-cached[0] >= AI_MODEL_TTL_SECONDS:
+        trained=train_ai_ensemble(candles); AI_MODEL_CACHE[key]=(now,trained)
+    else: trained=cached[1]
+    if not trained.get("ready"): return {"ready":False,"reason":trained.get("reason","IA indisponível")}
+    closed=candles[:-1]; x=ai_feature_vector(closed,len(closed)-1); probs=[]; names=[]
+    for name,model in trained["models"]:
+        try: probs.append(float(model.predict_proba([x])[0][1])); names.append(name)
+        except Exception: pass
+    if not probs: return {"ready":False,"reason":"Nenhum modelo conseguiu gerar previsão"}
+    weights=[1.25 if n in {"XGBOOST","LIGHTGBM"} else 1.0 for n in names]
+    p_up=sum(p*w for p,w in zip(probs,weights))/sum(weights); p_down=1-p_up
+    if p_up >= .62: signal="CALL"; probability=p_up
+    elif p_up <= .38: signal="PUT"; probability=p_down
+    else: signal="NEUTRO"; probability=max(p_up,p_down)
+    confidence=50+abs(p_up-.5)*90 if signal=="NEUTRO" else 55+(probability-.5)*100
+    agreement=sum((p>=.5)==(p_up>=.5) for p in probs)/len(probs)*100
+    return {"ready":True,"signal":signal,"p_up":round(p_up*100,2),"p_down":round(p_down*100,2),"confidence":max(50,min(95,int(round(confidence)))),"agreement":round(agreement,1),"models":names,"validation_accuracy":trained["validation_accuracy"],"samples":trained["samples"],"validation_samples":trained["validation_samples"],"data_candles":trained["data_candles"],"training":trained["training"],"xgboost":trained["xgboost"],"lightgbm":trained["lightgbm"]}
+
+
+def entry_times(interval):
+    minutes=ALLOWED_INTERVALS[interval]; now=now_sp(); block=minutes*60; epoch=int(now.timestamp()); next_epoch=((epoch//block)+1)*block
+    entry=datetime.fromtimestamp(next_epoch,tz=SP_TZ); return entry, entry+timedelta(minutes=minutes)
+
+
+@app.get("/health")
+async def health(): return {"ok":True,"app":APP_NAME,"version":APP_VERSION}
+
+@app.get("/server-time")
+async def server_time(): return {"brasilia":now_sp().isoformat(),"utc":datetime.utcnow().isoformat()+"+00:00"}
+
+@app.get("/license")
+async def license(): return {"ok":True,**license_status()}
+
+@app.get("/candles")
+async def candles(symbol="EUR/USD", interval="1min", size=120):
+    require_active_license(); values=await get_candles(symbol,interval,int(size)); return {"ok":True,"source":"Twelve Data","symbol":symbol,"interval":interval,"values":values}
+
+@app.get("/ai-analysis")
+async def ai_analysis(symbol="EUR/USD", interval="1min"):
+    require_active_license(); values=await get_candles(symbol,interval,500); trend=detect_market_trend(values)
+    ml=await asyncio.to_thread(predict_ai_ensemble,symbol,interval,values)
+    closed=values[:-1]; closes=[c["close"] for c in closed]; r9=rsi(closes,9)[-1]; r14=rsi(closes,14)[-1]
+    if ml.get("ready"):
+        signal=ml["signal"]; regime=trend["trend"]
+        confidence=ml["confidence"]
+        if regime=="ALTA" and signal=="PUT" or regime=="BAIXA" and signal=="CALL": confidence=max(50,confidence-8)
+        quality="ALTA" if confidence>=78 and ml["agreement"]>=66 else "MÉDIA" if confidence>=65 else "BAIXA"
+        analysis={"signal":signal,"confidence":confidence,"quality":quality,"regime":regime,"rsi9":round(r9,2),"rsi14":round(r14,2),"p_up":ml["p_up"],"p_down":ml["p_down"],"agreement":ml["agreement"],"validation_accuracy":ml["validation_accuracy"],"samples":ml["samples"],"models":ml["models"],"data_candles":ml["data_candles"],"training":ml["training"],"xgboost":ml["xgboost"],"lightgbm":ml["lightgbm"],"non_repaint":True,"ml":True,"reason":"Ensemble ML com filtro de regime."}
     else:
-        bull_score = float(analysis.get("call_score", 0))
-        bear_score = float(analysis.get("put_score", 0))
-        bull = min(99.0, 50.0 + bull_score * 5.0)
-        bear = min(99.0, 50.0 + bear_score * 5.0)
+        e9,e20,e50=ema(closes,9)[-1],ema(closes,20)[-1],ema(closes,50)[-1]; bull=(e9>e20)+(e20>e50); bear=(e9<e20)+(e20<e50)
+        signal="CALL" if bull==2 and r9>50 and r14>50 else "PUT" if bear==2 and r9<50 and r14<50 else "NEUTRO"
+        analysis={"signal":signal,"confidence":60 if signal!="NEUTRO" else 50,"quality":"MÉDIA" if signal!="NEUTRO" else "BAIXA","regime":trend["trend"],"rsi9":round(r9,2),"rsi14":round(r14,2),"non_repaint":True,"ml":False,"reason":ml.get("reason","Fallback")}
+    return {"ok":True,"source":"Twelve Data","symbol":symbol,"interval":interval,"analysis":analysis,"trend":trend}
 
-    if bull >= bear and bull >= 58.0:
-        direction = "CALL"
-        proximity = int(round(bull))
-    elif bear > bull and bear >= 58.0:
-        direction = "PUT"
-        proximity = int(round(bear))
+@app.get("/signal")
+async def signal(symbol="EUR/USD", interval="1min", strategy="rsi"):
+    require_active_license()
+    if strategy not in {"rsi","old_sniper","sniper_02","sniper_03","ai"}: raise HTTPException(status_code=400,detail="Estratégia inválida.")
+    values=await get_candles(symbol,interval,500)
+    if strategy=="ai":
+        ml=await asyncio.to_thread(predict_ai_ensemble,symbol,interval,values); trend=detect_market_trend(values)
+        result={"signal":ml.get("signal","NEUTRO"),"confidence":ml.get("confidence",50),"strategy":"SNIPER IA V3","strategy_code":"ai","p_up":ml.get("p_up",50),"p_down":ml.get("p_down",50),"agreement":ml.get("agreement",0),"models":ml.get("models",[]),"validation_accuracy":ml.get("validation_accuracy",0),"regime":trend["trend"],"non_repaint_reference":True,"ok":True}
     else:
-        direction = "NEUTRO"
-        proximity = int(round(max(bull, bear)))
-    return {"direction": direction, "proximity": max(0, min(99, proximity)),
-            "call_proximity": int(round(bull)), "put_proximity": int(round(bear))}
+        result=analyze(values,strategy); result.update(detect_market_trend(values))
+    entry,expiry=entry_times(interval)
+    result.update({"source":"Twelve Data","symbol":symbol,"interval":interval,"entry_time":entry.strftime("%Y-%m-%d %H:%M:%S"),"next_candle":entry.strftime("%Y-%m-%d %H:%M:%S"),"expiry_time":expiry.strftime("%Y-%m-%d %H:%M:%S"),"expiry":"1 vela do intervalo selecionado","warning":"Sinal probabilístico; não garante WIN."})
+    return result
 
+@app.get("/result")
+async def result(symbol:str, interval:str, reference_candle:str, direction:str, entry_time:Optional[str]=None):
+    require_active_license(); direction=direction.upper().strip()
+    if direction not in {"CALL","PUT"}: raise HTTPException(status_code=400,detail="Direção inválida.")
+    values=await get_candles(symbol,interval,100); ref=parse_time(reference_candle)
+    idx=next((i for i,c in enumerate(values) if parse_time(c["datetime"])==ref),None)
+    if idx is None: return {"ok":True,"status":"PENDING","result":None}
+    if entry_time:
+        entry=parse_time(entry_time); eidx=next((i for i,c in enumerate(values) if parse_time(c["datetime"])==entry),None)
+        if eidx is None: return {"ok":True,"status":"PENDING","result":None}
+        candle=values[eidx]
+        if now_sp() < parse_time(candle["datetime"])+timedelta(minutes=ALLOWED_INTERVALS[interval]): return {"ok":True,"status":"PENDING","result":None}
+        entry_price=candle["open"]; close=candle["close"]; result_time=candle["datetime"]
+    else:
+        ridx=idx+1
+        if ridx>=len(values): return {"ok":True,"status":"PENDING","result":None}
+        candle=values[ridx]
+        if now_sp() < parse_time(candle["datetime"])+timedelta(minutes=ALLOWED_INTERVALS[interval]): return {"ok":True,"status":"PENDING","result":None}
+        entry_price=values[idx]["close"]; close=candle["close"]; result_time=candle["datetime"]
+    tol=max(abs(entry_price)*1e-10,1e-12)
+    outcome="DRAW" if abs(close-entry_price)<=tol else ("WIN" if close>entry_price else "LOSS") if direction=="CALL" else ("WIN" if close<entry_price else "LOSS")
+    return {"ok":True,"status":"CLOSED","result":outcome,"direction":direction,"reference_candle":reference_candle,"result_candle":result_time,"entry_close":entry_price,"result_close":close}
 
 @app.get("/radar")
-async def radar(
-    interval: str = "1min",
-    strategy: str = "rsi",
-) -> Dict[str, Any]:
+async def radar(interval="1min", strategy="rsi"):
     require_active_license()
-    if interval not in ALLOWED_INTERVALS:
-        raise HTTPException(status_code=400, detail="Timeframe inválido.")
-    if strategy not in {"rsi", "old_sniper", "sniper_02", "sniper_03", "ai"}:
-        raise HTTPException(status_code=400, detail="Estratégia inválida.")
-
-    cache_key = (interval, strategy)
-    cached = RADAR_CACHE.get(cache_key)
-    now_mono = time.monotonic()
-    if cached and (now_mono - cached[0]) < RADAR_TTL_SECONDS:
-        return cached[1]
-
-    # Para evitar estourar rapidamente o limite da Twelve Data, o radar
-    # usa primeiro dados já em cache e completa apenas o necessário.
-    results: List[Dict[str, Any]] = []
-    errors = 0
-    for symbol_name in RADAR_SYMBOLS:
+    if interval not in ALLOWED_INTERVALS or strategy not in {"rsi","old_sniper","sniper_02","sniper_03","ai"}: raise HTTPException(status_code=400,detail="Parâmetros inválidos.")
+    key=(interval,strategy); cached=RADAR_CACHE.get(key); now=time.monotonic()
+    if cached and now-cached[0]<RADAR_TTL_SECONDS: return cached[1]
+    results=[]
+    for symbol in RADAR_SYMBOLS:
         try:
-            values = await get_candles(symbol_name, interval, 240 if strategy == "ai" else 100)
-            if strategy == "ai":
-                ml = await asyncio.to_thread(predict_ai_ensemble, symbol_name, interval, values)
-                if ml.get("ready"):
-                    analysis = {"signal": ml.get("signal", "NEUTRO"), "confidence": ml.get("confidence", 50),
-                                "p_up": ml.get("p_up", 50), "p_down": ml.get("p_down", 50),
-                                "agreement": ml.get("agreement", 0)}
-                else:
-                    analysis = {"signal":"NEUTRO", "confidence":50, "p_up":50, "p_down":50}
-            else:
-                analysis = analyze(values, strategy)
-            proximity = radar_score(analysis, strategy)
-            results.append({
-                "symbol": symbol_name,
-                "signal": analysis["signal"],
-                "direction": proximity["direction"],
-                "proximity": proximity["proximity"],
-                "call_proximity": proximity["call_proximity"],
-                "put_proximity": proximity["put_proximity"],
-                "confidence": int(analysis.get("confidence", 50)),
-                "reference_candle": analysis.get("reference_candle"),
-            })
-        except HTTPException:
-            errors += 1
-            continue
-        except Exception:
-            errors += 1
-            continue
-
-    results.sort(key=lambda x: (x["direction"] == "NEUTRO", -x["proximity"]))
-    payload = {
-        "ok": True,
-        "interval": interval,
-        "strategy": strategy,
-        "symbols_checked": len(results),
-        "errors": errors,
-        "results": results,
-        "warning": "Radar probabilístico: proximidade não é garantia de sinal ou WIN.",
-    }
-    RADAR_CACHE[cache_key] = (time.monotonic(), payload)
-    return payload
-
-
-
-def candle_is_closed(candle_time: datetime, interval: str) -> bool:
-    minutes = ALLOWED_INTERVALS[interval]
-    return now_sp() >= candle_time + timedelta(minutes=minutes)
+            vals=await get_candles(symbol,interval,240 if strategy=="ai" else 100)
+            if strategy=="ai": a=await asyncio.to_thread(predict_ai_ensemble,symbol,interval,vals); signal_value=a.get("signal","NEUTRO"); confidence=a.get("confidence",50); up=a.get("p_up",50); down=a.get("p_down",50)
+            else: a=analyze(vals,strategy); signal_value=a["signal"]; confidence=a["confidence"]; up=50 if signal_value!="CALL" else confidence; down=50 if signal_value!="PUT" else confidence
+            direction="CALL" if up>=down and up>=58 else "PUT" if down>up and down>=58 else "NEUTRO"; proximity=int(max(up,down))
+            results.append({"symbol":symbol,"signal":signal_value,"direction":direction,"proximity":min(99,proximity),"call_proximity":int(up),"put_proximity":int(down),"confidence":int(confidence),"reference_candle":a.get("reference_candle")})
+        except Exception: continue
+    results.sort(key=lambda x:(x["direction"]=="NEUTRO",-x["proximity"]))
+    payload={"ok":True,"interval":interval,"strategy":strategy,"symbols_checked":len(results),"results":results,"warning":"Radar probabilístico; não garante WIN."}
+    RADAR_CACHE[key]=(time.monotonic(),payload); return payload
 
 
 @app.get("/", response_class=HTMLResponse)
-async def home() -> HTMLResponse:
-    html = r"""<!doctype html> <html lang="pt-BR"> <head> <meta charset="utf-8"> <meta name="viewport" content="width=device-width,initial-scale=1"> <title>Ismael Trade</title> <style> *{box-sizing:border-box} body{margin:0;font-family:Arial,sans-serif;background:#0b1020;color:#f5f7ff} .container{max-width:760px;margin:auto;padding:18px} h1{margin:0 0 4px;font-size:28px} .sub{color:#aeb7cc;margin-bottom:16px} .card{background:#151c30;border:1px solid #29324b;border-radius:16px;padding:16px;margin:12px 0} .row{display:flex;gap:10px;flex-wrap:wrap} label{display:block;color:#aeb7cc;font-size:13px;margin-bottom:6px} select,button{width:100%;padding:12px;border-radius:10px;border:1px solid #34405e;background:#0f1526;color:#fff} .field{flex:1;min-width:180px} button{cursor:pointer;font-weight:bold} .signal{text-align:center;padding:22px;border-radius:14px;font-size:38px;font-weight:800;margin-top:12px} .call{background:#103c2b;color:#52f09d} .put{background:#481d28;color:#ff718b} .neutral{background:#2b3040;color:#d9deeb} .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px} .stat{background:#0f1526;border-radius:12px;padding:14px;text-align:center} .stat b{display:block;font-size:25px;margin-top:4px} .params{display:grid;grid-template-columns:1fr 1fr;gap:8px} .param{background:#0f1526;border-radius:10px;padding:10px} .small{font-size:12px;color:#aeb7cc} .value{font-weight:bold} .hidden{display:none} .good{color:#52f09d}.bad{color:#ff718b} .footer{font-size:12px;color:#7f8aa5;line-height:1.5} .clock{font-size:30px;font-weight:800;letter-spacing:1px} .clockLabel{font-size:11px;color:#8f9ab2;text-transform:uppercase} .onlineBtn{border-radius:999px;padding:10px 16px;font-weight:800}.onlineBtn.online{background:#0d3b2a;border-color:#2ee88a;color:#52f09d}.onlineBtn.offline{background:#431b25;border-color:#ff718b;color:#ff718b} .badge{display:inline-block;padding:7px 11px;border-radius:999px;background:#0f1526;border:1px solid #34405e;font-size:12px;font-weight:800} .sniper{border:1px solid #394765;background:linear-gradient(135deg,#151c30,#10172a)} .aiCard{border:1px solid #6b55a3;background:linear-gradient(135deg,#1b1733,#10172a)} .aiMain{font-size:24px;font-weight:800;margin:10px 0}.aiMeta{font-size:13px;color:#aeb7cc}.aiReason{font-size:13px;color:#d9deeb;line-height:1.5;margin-top:8px} .sniperTitle{font-size:20px;font-weight:800;margin:4px 0} .countdown{font-size:25px;font-weight:800} .entry{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px} .entryBox{background:#0f1526;border-radius:12px;padding:12px} .radarRow{display:grid;grid-template-columns:110px 1fr 48px;gap:10px;align-items:center;background:#0f1526;border-radius:12px;padding:10px;margin:7px 0}.radarMeter{height:9px;background:#252c40;border-radius:999px;overflow:hidden}.radarFill{height:100%;border-radius:999px}.radarFill.call{background:#2ee88a}.radarFill.put{background:#ff718b}.radarFill.neutral{background:#8892a8} @media(max-width:520px){.entry{grid-template-columns:1fr}} @media(max-width:520px){.grid{grid-template-columns:1fr 1fr}.params{grid-template-columns:1fr}} </style> </head> <body> <div class="container"> <h1>Ismael Trade</h1> <div class="sub">Analisador de sinais M1 • dados Twelve Data</div> <div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:12px"> <div><div class="clockLabel">HORÁRIO DE BRASÍLIA</div><div id="clock" class="clock">--:--:--</div><div id="dateBr" class="small">--/--/----</div></div> <div class="badge">● MERCADO • MONITORANDO</div> </div> <div class="card" id="licenseCard"> <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"> <div><div class="small">LICENÇA ISMAEL TRADE</div><div id="licenseStatus" class="value">VERIFICANDO...</div></div> <div><div class="small">VALIDADE</div><div id="licenseExpires" class="value">--</div></div> </div> <div class="small" style="margin-top:10px">Renovação: WhatsApp <b>55 84 99841-1282</b> / <b>55 84 99449-9442</b> • Instagram <b>@Ismaelartur26</b></div> </div> <div class="card"> <div class="row"> <div class="field"> <label>ATIVO</label> <select id="symbol"> <option>EUR/USD</option><option>GBP/USD</option><option>USD/JPY</option> <option>AUD/USD</option><option>USD/CAD</option><option>USD/CHF</option> <option>NZD/USD</option><option>EUR/JPY</option><option>GBP/JPY</option> <option>EUR/GBP</option><option>BTC/USD</option><option>ETH/USD</option> </select> </div> <div class="field"> <label>TEMPO</label> <select id="interval"> <option value="1min">M1</option><option value="5min">M5</option> <option value="15min">M15</option><option value="30min">M30</option> </select> </div> </div> <button id="refresh" style="margin-top:10px">ATUALIZAR SINAL</button> </div> <div class="card sniper"> <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"> <div><div class="sniperTitle">SNIPER X</div></div> <button id="rsiToggle" class="onlineBtn online" style="width:auto;margin:0">● ONLINE</button> </div></div> <div class="card sniper"> <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"> <div><div class="sniperTitle">SNIPER 01</div></div> <button id="oldToggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button> </div></div> <div class="card sniper"> <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"> <div><div class="sniperTitle">SNIPER 02</div></div> <button id="sniper02Toggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button> </div></div> <div class="card sniper"> <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"> <div><div class="sniperTitle">SNIPER 03</div></div> <button id="sniper03Toggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button> </div></div> <div class="card aiCard"> <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"> <div><div class="sniperTitle">🤖 SNIPER IA V3</div><div class="small">IA ML • XGBoost + LightGBM + RF + GB + filtro de regime</div></div> <button id="aiToggle" class="onlineBtn online" style="width:auto;margin:0">● ONLINE</button> </div> <div id="aiStatus" class="small" style="margin-top:10px">IA aguardando análise...</div> <div id="aiMain" class="aiMain">AGUARDANDO</div> <div id="aiMeta" class="aiMeta">Selecione ativo e tempo para analisar.</div> <div id="aiReason" class="aiReason"></div> </div> <div class="card"> <div class="small">SINAL</div> <div id="signal" class="signal neutral">AGUARDANDO</div> <div id="signalError" class="small" style="display:none;margin-top:8px"></div> <div class="entry"> <div class="entryBox"><div class="small">HORÁRIO DE ENTRADA</div><div id="entryTime" class="value">--</div></div> <div class="entryBox"><div class="small">EXPIRAÇÃO</div><div id="expiry" class="value">--</div></div> </div> <div style="margin-top:12px"><div class="small">CRONÔMETRO DE ENTRADA / PRÓXIMA VELA</div><div id="countdown" class="countdown">--:--</div></div> <div class="row" style="margin-top:12px"> <div class="field"><div class="small">Confiança</div><div id="confidence" class="value">--</div></div> <div class="field"><div class="small">Referência</div><div id="reference" class="value">--</div></div> <div class="field"><div class="small">Próxima vela</div><div id="next" class="value">--</div></div> </div> </div> <div class="card"> <div class="small">RESULTADOS</div> <div class="grid"> <div class="stat"><span>WIN</span><b id="wins" class="good">0</b></div> <div class="stat"><span>LOSS</span><b id="losses" class="bad">0</b></div> <div class="stat"><span>ASSERTIVIDADE</span><b id="accuracy">0%</b></div> </div> <button id="reset" style="margin-top:10px">ZERAR RESULTADOS DO ATIVO</button> </div> <div class="card"> <div class="small">RESULTADOS GERAIS — TODOS OS ATIVOS</div> <div class="grid"> <div class="stat"><span>WIN GERAL</span><b id="allWins" class="good">0</b></div> <div class="stat"><span>LOSS GERAL</span><b id="allLosses" class="bad">0</b></div> <div class="stat"><span>ASSERTIVIDADE GERAL</span><b id="allAccuracy">0%</b></div> </div> <button id="resetAll" style="margin-top:10px">ZERAR RESULTADOS GERAIS</button> </div> <div class="card" id="radarCard"> <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"> <div><div class="small">RADAR DE OPORTUNIDADES</div><div class="sniperTitle">PARES PRÓXIMOS DE SINAL</div></div> <div id="radarStatus" class="badge">AGUARDANDO</div> </div> <div class="small" style="margin-top:8px">Mostra os pares com maior proximidade de CALL ou PUT na estratégia ativa.</div> <div id="radarList" style="margin-top:12px"></div> </div> <div class="card footer"> O sinal é probabilístico e não garante WIN. A análise usa velas fechadas para reduzir repintura. Os preços da Twelve Data podem apresentar diferenças em relação à cotação da sua corretora. </div> </div> <script> const $ = id => document.getElementById(id); let pending = JSON.parse(localStorage.getItem("is_trade_pending") || "null"); let statsByKey = JSON.parse(localStorage.getItem("is_trade_stats_by_key") || "{}"); let statsAll = JSON.parse(localStorage.getItem("is_trade_stats_all") || '{"wins":0,"losses":0}'); let stats = {wins:0,losses:0}; let isOnline = true; let rsiOnline = localStorage.getItem("is_trade_rsi_online") !== "off"; let oldOnline = localStorage.getItem("is_trade_old_online") === "on"; let sniper02Online = localStorage.getItem("is_trade_sniper02_online") === "on"; let sniper03Online = localStorage.getItem("is_trade_sniper03_online") === "on"; let aiOnline = localStorage.getItem("is_trade_ai_online") !== "off"; let selectedStrategy = localStorage.getItem("is_trade_selected_strategy") || (aiOnline ? "ai" : oldOnline ? "old_sniper" : sniper03Online ? "sniper_03" : sniper02Online ? "sniper_02" : "rsi"); function statsKey(symbol, interval, strategy){ return `${symbol}|${interval}|${strategy || "auto"}`; } function currentStatsKey(){ const symbol = $("symbol")?.value || "EUR/USD"; const interval = $("interval")?.value || "1min"; const strategy = activeStrategy(); return statsKey(symbol, interval, strategy); } function getCurrentStats(){ const key = currentStatsKey(); if(!statsByKey[key]) statsByKey[key] = {wins:0,losses:0}; return statsByKey[key]; } // Migra resultados antigos, que eram globais, somente para o ativo atual. if(Object.keys(statsByKey).length===0){ try{ const legacy=JSON.parse(localStorage.getItem("is_trade_stats")||"null"); if(legacy && ((Number(legacy.wins)||0)+(Number(legacy.losses)||0)>0)){ const lw=Number(legacy.wins)||0, ll=Number(legacy.losses)||0; statsByKey[statsKey($("symbol")?.value||"EUR/USD",$("interval")?.value||"1min",selectedStrategy)]={wins:lw,losses:ll}; if((Number(statsAll.wins)||0)+(Number(statsAll.losses)||0)===0){ statsAll={wins:lw,losses:ll}; } } }catch(e){} } function save(){ localStorage.setItem("is_trade_stats_by_key", JSON.stringify(statsByKey)); localStorage.setItem("is_trade_stats_all", JSON.stringify(statsAll)); localStorage.setItem("is_trade_stats", JSON.stringify(getCurrentStats())); if(pending) localStorage.setItem("is_trade_pending", JSON.stringify(pending)); else localStorage.removeItem("is_trade_pending"); } function renderStats(){ stats = getCurrentStats(); // Resultado somente do ativo/timeframe/estratégia selecionados. $("wins").textContent = stats.wins; $("losses").textContent = stats.losses; const total = stats.wins + stats.losses; $("accuracy").textContent = total ? ((stats.wins/total)*100).toFixed(1)+"%" : "0%"; // Resultado acumulado de todos os ativos. if($("allWins")) $("allWins").textContent = statsAll.wins; if($("allLosses")) $("allLosses").textContent = statsAll.losses; const allTotal = statsAll.wins + statsAll.losses; if($("allAccuracy")) $("allAccuracy").textContent = allTotal ? ((statsAll.wins/allTotal)*100).toFixed(1)+"%" : "0%"; } function setStrategyButton(id, online){const b=$(id);b.textContent=online?"● ONLINE":"● OFFLINE";b.className=online?"onlineBtn online":"onlineBtn offline";} function activeStrategy(){ if(selectedStrategy==="ai" && aiOnline)return "ai"; if(selectedStrategy==="rsi" && rsiOnline)return "rsi"; if(selectedStrategy==="old_sniper" && oldOnline)return "old_sniper"; if(selectedStrategy==="sniper_02" && sniper02Online)return "sniper_02"; if(selectedStrategy==="sniper_03" && sniper03Online)return "sniper_03"; if(aiOnline)return "ai"; if(rsiOnline)return "rsi"; if(oldOnline)return "old_sniper"; if(sniper02Online)return "sniper_02"; if(sniper03Online)return "sniper_03"; return null; } function renderMode(){setStrategyButton("rsiToggle",rsiOnline);setStrategyButton("oldToggle",oldOnline);setStrategyButton("sniper02Toggle",sniper02Online);setStrategyButton("sniper03Toggle",sniper03Online);const active=activeStrategy();if(!isOnline||!active){$("signal").textContent="OFFLINE";$("signal").className="signal neutral";}} function fmt(v){ return v == null ? "--" : v; } let resultTimer = null; // Voz automática para CALL/PUT. // Em celulares, o navegador pode exigir um toque inicial para liberar a voz. let ultimoSinalFalado=localStorage.getItem("is_trade_last_voice_signal")||""; function falarSinal(direcao,tendencia,confianca,modelo){ if(direcao!=="CALL"&&direcao!=="PUT")return; const dirTexto=direcao==="CALL"?"sinal de compra":"sinal de venda"; const tendenciaTexto=tendencia==="ALTA"?"tendência do gráfico é de alta":tendencia==="BAIXA"?"tendência do gráfico é de baixa":"tendência do gráfico é neutra"; const extra=modelo?` Modelo ${modelo}.`:""; const mensagem=`${dirTexto}. ${tendenciaTexto}. Confiança ${Math.round(Number(confianca)||0)} por cento.${extra}`; const chave=`${direcao}|${tendencia}|${confianca}|${modelo||""}|${$("entryTime")?.textContent||""}`; if(chave===ultimoSinalFalado)return; ultimoSinalFalado=chave; localStorage.setItem("is_trade_last_voice_signal",chave); if(!("speechSynthesis" in window))return; window.speechSynthesis.cancel(); const voz=new SpeechSynthesisUtterance(mensagem); voz.lang="pt-BR"; voz.rate=.92; voz.pitch=1; voz.volume=1; window.speechSynthesis.speak(voz); } function showError(message){ $("signal").textContent = "SEM DADOS"; $("signal").className = "signal neutral"; $("confidence").textContent = "--"; if($("signalError")){ $("signalError").textContent = message || "Não foi possível atualizar o sinal."; $("signalError").style.display = "block"; } } function updateClock(){ const now = new Date(); const parts = new Intl.DateTimeFormat("pt-BR", {timeZone:"America/Sao_Paulo",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}).formatToParts(now); const get = k => parts.find(p => p.type === k)?.value || "00"; $("clock").textContent = `${get("hour")}:${get("minute")}:${get("second")}`; $("dateBr").textContent = new Intl.DateTimeFormat("pt-BR", {timeZone:"America/Sao_Paulo",day:"2-digit",month:"2-digit",year:"numeric"}).format(now); } let serverOffsetMs = 0; function updateCountdown(){ const interval = $("interval").value; const minutes = ({"1min":1,"5min":5,"15min":15,"30min":30})[interval] || 1; const now = new Date(Date.now() + serverOffsetMs); const block = minutes*60*1000; const next = Math.ceil(now.getTime()/block)*block; const total = Math.max(0, Math.floor((next-now.getTime())/1000)); const mm = String(Math.floor(total/60)).padStart(2,"0"); const ss = String(total%60).padStart(2,"0"); $("countdown").textContent = `${mm}:${ss}`; } async function syncServerClock(){ try{ const t0=Date.now(); const r=await fetch("/server-time",{cache:"no-store"}); const d=await r.json(); const t1=Date.now(); const serverMs=new Date(d.brasilia).getTime(); serverOffsetMs=serverMs-((t0+t1)/2); }catch(e){} } async function loadLicense(){ try{ const r=await fetch("/license",{cache:"no-store"}); const d=await r.json(); if(d.active){ $("licenseStatus").textContent="● LICENÇA ATIVA"; $("licenseStatus").className="value good"; }else{ $("licenseStatus").textContent="● LICENÇA EXPIRADA"; $("licenseStatus").className="value bad"; } $("licenseExpires").textContent=d.expires || "--"; }catch(e){ $("licenseStatus").textContent="NÃO VERIFICADA"; } } function scheduleResultCheck(){ if(resultTimer) clearTimeout(resultTimer); if(!pending) return; const minutes = ({"1min":1,"5min":5,"15min":15,"30min":30})[pending.interval] || 1; const refMs = new Date(pending.reference_candle.replace(" ", "T") + (pending.reference_candle.length <= 16 ? ":00" : "" )).getTime(); if(Number.isNaN(refMs)){ resultTimer = setTimeout(checkResult, minutes * 60 * 1000 + 5000); return; } // Entrada no fechamento da referência; resultado no fechamento da vela seguinte. const due = refMs + (2 * minutes * 60 * 1000) + 3000; const wait = Math.max(1000, due - Date.now()); resultTimer = setTimeout(checkResult, wait); } async function loadAI(){ const status=$("aiStatus"),main=$("aiMain"),meta=$("aiMeta"),reason=$("aiReason"); if(!status||!main||!aiOnline)return; status.textContent="ANALISANDO 240 VELAS..."; try{const symbol=$("symbol").value,interval=$("interval").value;const r=await fetch(`/ai-analysis?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`,{cache:"no-store"});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.detail||"Falha na IA");const a=d.analysis,t=d.trend||{};main.textContent=`${a.signal} — ${a.confidence}%`;main.className="aiMain "+(a.signal==="CALL"?"good":a.signal==="PUT"?"bad":"");meta.textContent=`Qualidade: ${a.quality} | Regime: ${a.regime} | Tendência: ${t.trend||"NEUTRA"} | RSI 9: ${a.rsi9??"-"} | IA ML: ${a.ml?"SIM":"FALLBACK"}`;reason.textContent=a.reason||"";status.textContent="● IA ONLINE • atualizada"; if(a.signal==="CALL"||a.signal==="PUT"){falarSinal(a.signal,t.trend||a.regime||"NEUTRA",a.confidence,(a.models||[]).join(", "));}}catch(e){status.textContent="IA AGUARDAR";main.textContent="ERRO NA ANÁLISE";meta.textContent=e.message||"";reason.textContent="";}} async function loadSignal(){ if(!isOnline){ renderMode(); return; } const symbol = $("symbol").value; const interval = $("interval").value; const strategy = activeStrategy(); if(!strategy){ renderMode(); return; } $("signal").textContent = "ANALISANDO..."; $("signal").className = "signal neutral"; if($("signalError")){ $("signalError").textContent = ""; $("signalError").style.display = "none"; } try{ const r = await fetch( `/signal?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&strategy=${encodeURIComponent(strategy)}`, {cache:"no-store"} ); const d = await r.json(); if(!r.ok){ const msg = d.detail && typeof d.detail === "object" ? d.detail.message : (d.detail || "Erro ao consultar o sinal."); throw new Error(msg); } const signal = d.signal || "NEUTRO"; $("signal").textContent = signal; $("signal").className = "signal " + ( signal === "CALL" ? "call" : signal === "PUT" ? "put" : "neutral" ); if($("confidence")) $("confidence").textContent = `${Number(d.confidence || 0)}%`; if($("reference")) $("reference").textContent = d.reference_candle || "--"; if($("next")) $("next").textContent = d.entry_time || d.next_candle || "--"; if($("entryTime")){ const entry = d.entry_time || d.next_candle || ""; $("entryTime").textContent = entry.includes(" ") ? entry.split(" ")[1] : (entry || "--"); } if($("expiry")){ const expiry = d.expiry_time || ""; $("expiry").textContent = expiry.includes(" ") ? expiry.split(" ")[1] : (expiry || "--"); } if($("trend")) $("trend").textContent = d.trend_text || d.trend || "Tendência neutra"; // Campos opcionais: nunca podem interromper a exibição do sinal. if($("rsi9")) $("rsi9").textContent = fmt(d.rsi9); if($("rsi14")) $("rsi14").textContent = fmt(d.rsi14); if($("engulf")) $("engulf").textContent = (d.bullish_engulfing || d.bearish_engulfing) ? "SIM" : "NÃO"; if($("rejection")) $("rejection").textContent = (d.bullish_rejection || d.bearish_rejection) ? "SIM" : "NÃO"; if($("breakout")) $("breakout").textContent = (d.bullish_breakout || d.bearish_breakout) ? "SIM" : "NÃO"; if($("strength")) $("strength").textContent = (d.bullish_strength || d.bearish_strength) ? "SIM" : "NÃO"; if($("signalError")){ $("signalError").textContent = ""; $("signalError").style.display = "none"; } // Voz somente para CALL/PUT. if(signal === "CALL" || signal === "PUT"){ falarSinal(signal, d.trend || "NEUTRA", d.confidence || 0, (d.models || []).join(", ") || d.strategy || ""); pending = { symbol, interval, strategy, reference_candle: d.reference_candle, entry_time: d.entry_time, direction: signal }; save(); scheduleResultCheck(); } }catch(e){ console.error("ERRO LOAD SIGNAL:", e); showError(e.message || "Erro ao consultar o sinal."); } } async function checkResult(){ if(!pending) return; try{ const q = new URLSearchParams(pending).toString(); const r = await fetch(`/result?${q}`, {cache:"no-store"}); const d = await r.json(); if(!r.ok) return; if(d.result === "WIN"){ const key=statsKey(pending.symbol,pending.interval,pending.strategy); if(!statsByKey[key]) statsByKey[key]={wins:0,losses:0}; statsByKey[key].wins++; statsAll.wins++; pending=null; save(); renderStats(); }else if(d.result === "LOSS"){ const key=statsKey(pending.symbol,pending.interval,pending.strategy); if(!statsByKey[key]) statsByKey[key]={wins:0,losses:0}; statsByKey[key].losses++; statsAll.losses++; pending=null; save(); renderStats(); }else if(d.result === "DRAW"){ pending = null; save(); }else{ // Se ainda não fechou, não fica consultando a cada 15 segundos. scheduleResultCheck(); } }catch(e){ scheduleResultCheck(); } } function radarRow(item){ const cls=item.direction==="CALL"?"call":item.direction==="PUT"?"put":"neutral"; const label=item.direction==="NEUTRO"?(item.proximity>=75?"PRÓXIMO":"OBSERVAR"):item.direction; return `<div class="radarRow"><div><b>${item.symbol}</b><div class="small">${label} • confiança ${item.confidence}%</div></div><div class="radarMeter"><div class="radarFill ${cls}" style="width:${item.proximity}%"></div></div><b>${item.proximity}%</b></div>`; } async function loadRadar(){ const strategy=activeStrategy(); if(!isOnline||!strategy){$("radarStatus").textContent="OFFLINE";$("radarList").innerHTML="<div class='small'>Ative uma estratégia para iniciar o radar.</div>";return;}
-  $("radarStatus").textContent="ANALISANDO";
-  try{
-    const interval=$("interval").value;
-    const r=await fetch(`/radar?interval=${encodeURIComponent(interval)}&strategy=${encodeURIComponent(strategy)}`,{cache:"no-store"});
-    const d=await r.json();
-    if(!r.ok){const msg=d.detail&&typeof d.detail==="object"?d.detail.message:(d.detail||"Erro no radar.");throw new Error(msg);}
-    const items=(d.results||[]);
-    $("radarStatus").textContent=items.length?`${items.length} PARES`:"SEM DADOS";
-    $("radarList").innerHTML=items.length?items.map(radarRow).join(""):"<div class='small'>Nenhum par disponível no momento.</div>";
-  }catch(e){
-    $("radarStatus").textContent="AGUARDAR";
-    $("radarList").innerHTML=`<div class='small'>Radar temporariamente indisponível: ${e.message||"erro de dados"}</div>`;
-  }
-}
+async def home():
+    return HTMLResponse(f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{APP_NAME}</title><style>body{{margin:0;background:#0b1020;color:#fff;font-family:Arial}}.c{{max-width:760px;margin:auto;padding:18px}}.card{{background:#151c30;border:1px solid #29324b;border-radius:14px;padding:16px;margin:12px 0}}select,button{{padding:12px;border-radius:9px;background:#0f1526;color:#fff;border:1px solid #34405e}}select{{width:100%}}button{{cursor:pointer;font-weight:bold}}.row{{display:flex;gap:10px}}.row>*{{flex:1}}#signal{{font-size:42px;text-align:center;font-weight:800;padding:24px;border-radius:14px;margin-top:12px}}.call{{background:#103c2b;color:#52f09d}}.put{{background:#481d28;color:#ff718b}}.neutral{{background:#2b3040;color:#d9deeb}}.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}}.stat{{background:#0f1526;padding:14px;text-align:center;border-radius:10px}}.stat b{{display:block;font-size:25px;margin-top:5px}}</style></head><body><div class="c"><h1>Ismael Trade</h1><div>SNIPER IA V3 • M1/M5/M15/M30</div><div class="card"><div class="row"><select id="symbol">{''.join(f'<option>{s}</option>' for s in SYMBOLS)}</select><select id="interval"><option value="1min">M1</option><option value="5min">M5</option><option value="15min">M15</option><option value="30min">M30</option></select></div><button style="width:100%;margin-top:10px" onclick="load()">ATUALIZAR SINAL</button></div><div class="card"><div id="signal" class="neutral">AGUARDANDO</div><p id="meta">--</p><p id="ai">IA: --</p></div><div class="card"><div class="grid"><div class="stat">WIN<b id="w">0</b></div><div class="stat">LOSS<b id="l">0</b></div><div class="stat">ASSERTIVIDADE<b id="a">0%</b></div></div></div><div class="card">Licença: {license_status()['expires']}<br>WhatsApp: {LICENSE_WHATSAPP_1} / {LICENSE_WHATSAPP_2}<br>Instagram: {LICENSE_INSTAGRAM}</div></div><script>async function load(){{const s=document.getElementById('symbol').value,i=document.getElementById('interval').value;const r=await fetch(`/signal?symbol=${{encodeURIComponent(s)}}&interval=${{i}}&strategy=ai`);const d=await r.json();const e=document.getElementById('signal');e.textContent=d.signal||'ERRO';e.className=d.signal==='CALL'?'call':d.signal==='PUT'?'put':'neutral';document.getElementById('meta').textContent=`Confiança: ${{d.confidence||0}}% | Entrada: ${{d.entry_time||'--'}} | Expiração: ${{d.expiry_time||'--'}}`;document.getElementById('ai').textContent=`IA: alta ${{d.p_up||50}}% | baixa ${{d.p_down||50}}% | concordância ${{d.agreement||0}}%`}}</script></body></html>''')
 
 
-function onMarketChanged(){
-  renderStats();
-  loadSignal();
-  loadAI();
-  loadRadar();
-}
-$("symbol").addEventListener("change", onMarketChanged);
-$("interval").addEventListener("change", onMarketChanged);
-$("refresh").onclick = ()=>{loadSignal();loadAI();loadRadar();renderStats();};
-$("rsiToggle").onclick=()=>{rsiOnline=!rsiOnline;if(rsiOnline)selectedStrategy="rsi";localStorage.setItem("is_trade_rsi_online",rsiOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();renderStats();if(isOnline&&rsiOnline){loadSignal();loadAI();loadRadar();}};
-$("oldToggle").onclick=()=>{oldOnline=!oldOnline;if(oldOnline)selectedStrategy="old_sniper";localStorage.setItem("is_trade_old_online",oldOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();renderStats();if(isOnline&&oldOnline){loadSignal();loadAI();loadRadar();}};
-$("sniper02Toggle").onclick=()=>{sniper02Online=!sniper02Online;if(sniper02Online)selectedStrategy="sniper_02";localStorage.setItem("is_trade_sniper02_online",sniper02Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();renderStats();if(isOnline&&sniper02Online){loadSignal();loadAI();loadRadar();}};
-$("sniper03Toggle").onclick=()=>{sniper03Online=!sniper03Online;if(sniper03Online)selectedStrategy="sniper_03";localStorage.setItem("is_trade_sniper03_online",sniper03Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();renderStats();if(isOnline&&sniper03Online){loadSignal();loadAI();loadRadar();}};
-$("aiToggle").onclick=()=>{
-  aiOnline=!aiOnline;
-  if(aiOnline) selectedStrategy="ai";
-  else if(selectedStrategy==="ai") selectedStrategy=rsiOnline?"rsi":oldOnline?"old_sniper":sniper02Online?"sniper_02":sniper03Online?"sniper_03":"rsi";
-  localStorage.setItem("is_trade_ai_online",aiOnline?"on":"off");
-  localStorage.setItem("is_trade_selected_strategy",selectedStrategy);
-  const b=$("aiToggle"); b.textContent=aiOnline?"● ONLINE":"● OFFLINE"; b.className="onlineBtn "+(aiOnline?"online":"offline");
-  pending=null; save(); renderMode(); renderStats();
-  if(isOnline){loadSignal();loadAI();loadRadar();}
-};
-
-$("reset").onclick = () => {
-  if(confirm("Zerar WIN e LOSS somente do ativo/timeframe/estratégia atual?")){
-    statsByKey[currentStatsKey()] = {wins:0,losses:0};
-    stats = statsByKey[currentStatsKey()];
-    pending = null;
-    save();
-    renderStats();
-  }
-};
-
-$("resetAll").onclick = () => {
-  if(confirm("Zerar WIN e LOSS de TODOS os ativos?")){
-    statsByKey = {};
-    statsAll = {wins:0,losses:0};
-    stats = {wins:0,losses:0};
-    pending = null;
-    save();
-    renderStats();
-  }
-};
-
-renderStats();
-renderMode();
-const aiButton = $("aiToggle");
-if(aiButton){
-  aiButton.textContent = aiOnline ? "● ONLINE" : "● OFFLINE";
-  aiButton.className = "onlineBtn " + (aiOnline ? "online" : "offline");
-}
-updateClock();
-updateCountdown();
-setInterval(updateClock, 1000);
-setInterval(updateCountdown, 250);
-syncServerClock();
-loadLicense();
-loadAI();
-loadRadar();
-// Se não houver operação pendente, atualiza somente na virada da vela.
-let lastEntrySlot = "";
-setInterval(() => {
-  if(pending) return;
-  const interval = $("interval").value;
-  const mins = ({"1min":1,"5min":5,"15min":15,"30min":30})[interval] || 1;
-  const now = new Date(Date.now() + serverOffsetMs);
-  const slot = Math.floor(now.getTime()/(mins*60000));
-  const seconds = Math.floor((now.getTime()%(mins*60000))/1000);
-  if(seconds <= 3 && String(slot) !== lastEntrySlot){
-    lastEntrySlot = String(slot);
-    loadSignal();
-  }
-}, 1000);
-if(pending) scheduleResultCheck();
-setInterval(syncServerClock, 30000);
-setInterval(loadLicense, 60000);
-setInterval(loadRadar, 120000);
-setInterval(loadAI, 60000);
-</script> </body>
-</html>""" return HTMLResponse(html) @app.get("/health") async def health() -> Dict[str, Any]: return {"ok": True, "app": APP_NAME, "version": APP_VERSION} @app.get("/server-time") async def server_time() -> Dict[str, str]: current = now_sp() return { "brasilia": current.isoformat(), "utc": datetime.utcnow().isoformat() + "+00:00", } @app.get("/license") async def license() -> Dict[str, Any]: return {"ok": True, **license_status()} def require_active_license() -> None: status = license_status() if not status["active"]: raise HTTPException(status_code=403, detail={"error": "LICENSE_EXPIRED", **status}) @app.get("/candles") async def candles( symbol: str = "EUR/USD", interval: str = "1min", size: int = 120, ) -> Dict[str, Any]: require_active_license() requested_size = int(size) values = await get_candles(symbol, interval, requested_size) return { "ok": True, "source": "Twelve Data", "symbol": symbol, "interval": interval, "values": values, } def ai_feature_vector(candles: List[Dict[str, Any]], i: int) -> List[float]: """Extrai características somente até o candle i (sem olhar o futuro).""" closes = [float(c["close"]) for c in candles[: i + 1]] opens = [float(c["open"]) for c in candles[: i + 1]] highs = [float(c["high"]) for c in candles[: i + 1]] lows = [float(c["low"]) for c in candles[: i + 1]] vols = [float(c.get("volume", 0) or 0) for c in candles[: i + 1]] def ret(n: int) -> float: if len(closes) <= n or closes[-1] == 0: return 0.0 return (closes[-1] / closes[-1 - n]) - 1.0 ranges = [max(h - l, 1e-12) for h, l in zip(highs, lows)] bodies = [abs(c - o) / r for c, o, r in zip(closes, opens, ranges)] tr = true_ranges(candles[: i + 1]) atr14 = sum(tr[-14:]) / min(14, len(tr)) if tr else 0.0 atr_ratio = atr14 / max(closes[-1], 1e-12) e9 = ema(closes, 9)[-1] e20 = ema(closes, 20)[-1] e50 = ema(closes, 50)[-1] r9 = rsi(closes, 9)[-1] r14 = rsi(closes, 14)[-1] vol10 = 0.0 if len(closes) >= 11: mean10 = sum(closes[-10:]) / 10.0 vol10 = (sum((x - mean10) ** 2 for x in closes[-10:]) / 10.0) ** 0.5 / max(mean10, 1e-12) avg_vol = sum(vols[-20:]) / max(1, min(20, len(vols))) vol_ratio = vols[-1] / avg_vol if avg_vol > 0 else 1.0 slope20 = 0.0 e20_series = ema(closes, 20) if len(e20_series) >= 6: slope20 = (e20_series[-1] - e20_series[-6]) / max(closes[-1], 1e-12) return [ ret(1), ret(2), ret(3), ret(5), ret(10), (closes[-1] - e9) / max(closes[-1], 1e-12), (e9 - e20) / max(closes[-1], 1e-12), (e20 - e50) / max(closes[-1], 1e-12), slope20, r9 / 100.0, r14 / 100.0, bodies[-1], (max(highs[-1] - max(opens[-1], closes[-1]), 0.0)) / ranges[-1], (max(min(opens[-1], closes[-1]) - lows[-1], 0.0)) / ranges[-1], atr_ratio, vol10, vol_ratio, ] def train_ai_ensemble(candles: List[Dict[str, Any]]) -> Dict[str, Any]: """Treina o ensemble V3 em ordem temporal.
-
-    O alvo é o próximo candle fechado. A divisão é cronológica para evitar
-    vazamento de futuro. Além da acurácia, calcula um teste recente (holdout)
-    e mantém o modelo somente se houver classes e dados suficientes.
-    """ if not SKLEARN_OK: return {"ready": False, "reason": "scikit-learn não instalado"} closed = candles[:-1] if len(closed) < 100: return {"ready": False, "reason": "Poucas velas para treinar a IA V3"} X: List[List[float]] = [] y: List[int] = [] last_usable = len(closed) - 1 for i in range(50, last_usable): X.append(ai_feature_vector(closed, i)) y.append(1 if closed[i + 1]["close"] > closed[i]["close"] else 0) if len(X) < 60 or len(set(y)) < 2: return {"ready": False, "reason": "Classes insuficientes para treinar a IA V3"} split = max(40, int(len(X) * 0.80)) if split >= len(X): split = len(X) - 10 X_train, X_val = X[:split], X[split:] y_train, y_val = y[:split], y[split:] models = [ ("LOGISTIC", make_pipeline(StandardScaler(), LogisticRegression(max_iter=700, class_weight="balanced"))), ("RANDOM_FOREST", RandomForestClassifier( n_estimators=260, max_depth=7, min_samples_leaf=3, random_state=42, class_weight="balanced_subsample", n_jobs=-1 )), ("GRADIENT_BOOSTING", HistGradientBoostingClassifier( max_iter=220, learning_rate=0.04, max_leaf_nodes=15, l2_regularization=0.8, random_state=42 )), ] if XGBOOST_OK: models.append(("XGBOOST", XGBClassifier( n_estimators=280, max_depth=4, learning_rate=0.035, subsample=0.85, colsample_bytree=0.85, min_child_weight=4, reg_lambda=2.5, reg_alpha=0.15, objective="binary:logistic", eval_metric="logloss", random_state=42, n_jobs=2, tree_method="hist" ))) if LIGHTGBM_OK: models.append(("LIGHTGBM", LGBMClassifier( n_estimators=220, learning_rate=0.035, num_leaves=15, max_depth=5, min_child_samples=8, subsample=0.85, colsample_bytree=0.85, reg_lambda=2.0, reg_alpha=0.1, objective="binary", random_state=42, n_jobs=2, verbosity=-1 ))) trained = [] validation_scores = [] validation_probs = [] for name, model in models: try: model.fit(X_train, y_train) if X_val: pred = model.predict(X_val) score = sum(int(a == b) for a, b in zip(pred, y_val)) / len(y_val) validation_scores.append(float(score)) try: probs = [float(v[1]) for v in model.predict_proba(X_val)] validation_probs.extend(probs) except Exception: pass trained.append((name, model)) except Exception: continue if not trained: return {"ready": False, "reason": "Falha ao treinar os modelos"} return { "ready": True, "models": trained, "validation_accuracy": round(sum(validation_scores) / len(validation_scores) * 100, 1) if validation_scores else 0.0, "samples": len(X_train), "validation_samples": len(X_val), "data_candles": len(closed), "xgboost": XGBOOST_OK, "lightgbm": LIGHTGBM_OK, "training": "temporal_80_20", } def predict_ai_ensemble(symbol: str, interval: str, candles: List[Dict[str, Any]]) -> Dict[str, Any]: key = (symbol, interval) now = time.monotonic() cached = AI_MODEL_CACHE.get(key) if not cached or (now - cached[0]) >= AI_MODEL_TTL_SECONDS: trained = train_ai_ensemble(candles) AI_MODEL_CACHE[key] = (now, trained) else: trained = cached[1] if not trained.get("ready"): return {"ready": False, "reason": trained.get("reason", "IA indisponível")} closed = candles[:-1] x = ai_feature_vector(closed, len(closed) - 1) probabilities = [] model_names = [] for name, model in trained["models"]: try: p = float(model.predict_proba([x])[0][1]) probabilities.append(p) model_names.append(name) except Exception: continue if not probabilities: return {"ready": False, "reason": "Nenhum modelo conseguiu gerar previsão"} # Boosting recebe peso moderadamente maior; Random Forest/Logistic/GB # continuam como confirmação independente. Nenhum modelo decide sozinho. weights = [] for name in model_names: weights.append(1.25 if name in {"XGBOOST", "LIGHTGBM"} else 1.0) p_up = sum(p * w for p, w in zip(probabilities, weights)) / max(sum(weights), 1e-12) p_down = 1.0 - p_up spread = abs(p_up - 0.5) * 2.0 # Zona neutra: evita forçar CALL/PUT quando a IA está indecisa. if p_up >= 0.62: signal = "CALL" probability = p_up elif p_up <= 0.38: signal = "PUT" probability = p_down else: signal = "NEUTRO" probability = max(p_up, p_down) confidence = int(round(50 + spread * 45)) if signal == "NEUTRO" else int(round(55 + (probability - 0.50) * 100)) confidence = max(50, min(95, confidence)) agreement = sum((p >= 0.5) == (p_up >= 0.5) for p in probabilities) / len(probabilities) return { "ready": True, "signal": signal, "p_up": round(p_up * 100, 2), "p_down": round(p_down * 100, 2), "confidence": confidence, "agreement": round(agreement * 100, 1), "models": model_names, "validation_accuracy": trained.get("validation_accuracy", 0), "samples": trained.get("samples", 0), "validation_samples": trained.get("validation_samples", 0), "data_candles": trained.get("data_candles", 0), "training": trained.get("training", "temporal_80_20"), "xgboost": trained.get("xgboost", False), "lightgbm": trained.get("lightgbm", False), } @app.get("/ai-analysis") async def ai_analysis(symbol: str = "EUR/USD", interval: str = "1min") -> Dict[str, Any]: require_active_license() if interval not in ALLOWED_INTERVALS: raise HTTPException(status_code=400, detail="Timeframe inválido.") values = await get_candles(symbol, interval, 500) closed = values[:-1] if len(closed) < 60: analysis = {"signal":"NEUTRO","confidence":50,"quality":"BAIXA","regime":"INDEFINIDO","reason":"Dados insuficientes para a IA."} return {"ok":True,"source":"Twelve Data","symbol":symbol,"interval":interval,"analysis":analysis,"trend":detect_market_trend(values)} closes=[float(c["close"]) for c in closed] e9=ema(closes,9); e20=ema(closes,20); e50=ema(closes,50) r9=float(rsi(closes,9)[-1]); r14=float(rsi(closes,14)[-1]) trend=detect_market_trend(values) ml = await asyncio.to_thread(predict_ai_ensemble, symbol, interval, values) # Filtro de regime/confluência: a ML tem prioridade, mas não é obrigada a # operar contra uma tendência extremamente forte sem confirmação. if ml.get("ready"): signal = ml["signal"] p_up = ml["p_up"] regime = "ALTA" if e9[-1]>e20[-1]>e50[-1] else "BAIXA" if e9[-1]<e20[-1]<e50[-1] else "LATERAL" reasons = [f"Ensemble ML: alta {p_up:.1f}% / baixa {ml['p_down']:.1f}%", f"Concordância dos modelos: {ml['agreement']:.0f}%"] if regime == "ALTA" and signal == "CALL": reasons.append("Regime de alta confirma a compra") elif regime == "BAIXA" and signal == "PUT": reasons.append("Regime de baixa confirma a venda") elif regime in {"ALTA", "BAIXA"} and signal != "NEUTRO": reasons.append("Sinal ML contra o regime: confiança reduzida") if signal != "NEUTRO" and ((regime == "ALTA" and signal == "PUT") or (regime == "BAIXA" and signal == "CALL")): ml["confidence"] = max(50, ml["confidence"] - 8) confidence = int(ml["confidence"]) quality = "ALTA" if confidence >= 78 and ml["agreement"] >= 66 else "MÉDIA" if confidence >= 65 else "BAIXA" analysis={ "signal":signal, "confidence":confidence, "quality":quality, "regime":regime, "reason":"IA REAL: " + "; ".join(reasons), "rsi9":round(r9,2), "rsi14":round(r14,2), "p_up":ml["p_up"], "p_down":ml["p_down"], "agreement":ml["agreement"], "validation_accuracy":ml["validation_accuracy"], "samples":ml["samples"], "models":ml["models"], "data_candles":ml.get("data_candles", 0), "training":ml.get("training", "temporal_80_20"), "xgboost":ml.get("xgboost", False), "lightgbm":ml.get("lightgbm", False), "non_repaint":True, "ml":True, } else: # Fallback determinístico para o painel continuar funcionando caso # scikit-learn não esteja disponível no servidor. bull=bear=0.0; reasons=[] if e9[-1]>e20[-1]: bull+=2; reasons.append("EMA 9 acima da EMA 20") else: bear+=2; reasons.append("EMA 9 abaixo da EMA 20") if e20[-1]>e50[-1]: bull+=2 else: bear+=2 if r9<35 and r14<45: bull+=1.5; reasons.append("RSI favorece recuperação") elif r9>65 and r14>55: bear+=1.5; reasons.append("RSI favorece pressão vendedora") diff=abs(bull-bear) signal="CALL" if bull>bear and bull>=5 and diff>=2 else "PUT" if bear>bull and bear>=5 and diff>=2 else "NEUTRO" confidence=int(max(50,min(95,58+diff*6))) if signal!="NEUTRO" else int(max(50,min(65,50+diff*4))) regime="ALTA" if e9[-1]>e20[-1]>e50[-1] else "BAIXA" if e9[-1]<e20[-1]<e50[-1] else "LATERAL" analysis={"signal":signal,"confidence":confidence,"quality":"MÉDIA" if confidence>=60 else "BAIXA","regime":regime,"reason":"IA FALLBACK: "+"; ".join(reasons[:3]),"rsi9":round(r9,2),"rsi14":round(r14,2),"non_repaint":True,"ml":False} return {"ok":True,"source":"Twelve Data","symbol":symbol,"interval":interval,"analysis":analysis,"trend":trend} @app.get("/signal") async def signal( symbol: str = "EUR/USD", interval: str = "1min", strategy: str = "rsi", ) -> Dict[str, Any]: require_active_license() if strategy not in {"rsi", "old_sniper", "sniper_02", "sniper_03", "ai"}: raise HTTPException(status_code=400, detail="Estratégia inválida.") values = await get_candles(symbol, interval, 500) if strategy == "ai": ml = await asyncio.to_thread(predict_ai_ensemble, symbol, interval, values) trend_info = detect_market_trend(values) if ml.get("ready"): regime = "ALTA" if trend_info.get("trend") == "ALTA" else "BAIXA" if trend_info.get("trend") == "BAIXA" else "LATERAL" signal_value = ml.get("signal", "NEUTRO") confidence_value = int(ml.get("confidence", 50)) if regime == "ALTA" and signal_value == "PUT": confidence_value = max(50, confidence_value - 8) if regime == "BAIXA" and signal_value == "CALL": confidence_value = max(50, confidence_value - 8) result = { "signal": signal_value, "confidence": confidence_value, "strategy": "SNIPER IA V3", "strategy_code": "ai", "p_up": ml.get("p_up", 50), "p_down": ml.get("p_down", 50), "agreement": ml.get("agreement", 0), "models": ml.get("models", []), "validation_accuracy": ml.get("validation_accuracy", 0), "regime": regime, "non_repaint_reference": True, "ok": True } else: result = {"signal":"NEUTRO", "confidence":50, "strategy":"SNIPER IA V3", "strategy_code":"ai", "reason":ml.get("reason", "IA indisponível"), "non_repaint_reference":True, "ok":True} else: result = analyze(values, strategy) trend_info = detect_market_trend(values) result.update(trend_info) # A análise usa a última vela fechada. A entrada deve ser na próxima # abertura futura, nunca em uma vela cujo início já passou. minutes = ALLOWED_INTERVALS[interval] current = now_sp() block_seconds = minutes * 60 epoch = int(current.timestamp()) next_epoch = ((epoch // block_seconds) + 1) * block_seconds entry_dt = datetime.fromtimestamp(next_epoch, tz=SP_TZ) expiry_dt = entry_dt + timedelta(minutes=minutes) result.update( { "source": "Twelve Data", "symbol": symbol, "interval": interval, "entry_time": entry_dt.strftime("%Y-%m-%d %H:%M:%S"), "next_candle": entry_dt.strftime("%Y-%m-%d %H:%M:%S"), "expiry_time": expiry_dt.strftime("%Y-%m-%d %H:%M:%S"), "expiry": "1 vela do intervalo selecionado", "warning": "Sinal probabilístico; não garante WIN. A fonte Twelve Data pode não coincidir com os preços da corretora.", } ) return result @app.get("/result") async def result( symbol: str, interval: str, reference_candle: str, direction: str, entry_time: Optional[str] = None, ) -> Dict[str, Any]: require_active_license() direction = direction.upper().strip() if direction not in {"CALL", "PUT"}: raise HTTPException(status_code=400, detail="Direção inválida.") values = await get_candles(symbol, interval, 100) reference_dt = parse_time(reference_candle) reference_index: Optional[int] = None for i, candle in enumerate(values): if parse_time(candle["datetime"]) == reference_dt: reference_index = i break if reference_index is None: return {"ok": True, "status": "PENDING", "result": None} if entry_time: entry_dt = parse_time(entry_time) entry_index: Optional[int] = None for i, candle in enumerate(values): if parse_time(candle["datetime"]) == entry_dt: entry_index = i break if entry_index is None or entry_index + 1 >= len(values): return {"ok": True, "status": "PENDING", "result": None} result_candle = values[entry_index] result_index = entry_index result_time = parse_time(result_candle["datetime"]) if not candle_is_closed(result_time, interval): return {"ok": True, "status": "PENDING", "result": None, "entry_candle": result_candle["datetime"]} reference_close = result_candle["open"] result_close = result_candle["close"] result_candle_time = result_candle["datetime"] else: next_index = reference_index + 1 if next_index >= len(values): return {"ok": True, "status": "PENDING", "result": None} next_candle = values[next_index] next_time = parse_time(next_candle["datetime"]) if not candle_is_closed(next_time, interval): return {"ok": True, "status": "PENDING", "result": None, "next_candle": next_candle["datetime"]} reference_close = values[reference_index]["close"] result_close = next_candle["close"] result_candle_time = next_candle["datetime"] # A entrada é considerada no fechamento da vela de referência. # A expiração de 1 vela compara o fechamento seguinte com essa entrada. tolerance = max(abs(reference_close) * 1e-10, 1e-12) if abs(result_close - reference_close) <= tolerance: outcome = "DRAW" elif direction == "CALL": outcome = "WIN" if result_close > reference_close else "LOSS" else: outcome = "WIN" if result_close < reference_close else "LOSS" return { "ok": True, "status": "CLOSED", "result": outcome, "direction": direction, "reference_candle": reference_candle, "result_candle": result_candle_time, "entry_close": reference_close, "result_close": result_close, } if __name__ == "__main__": import uvicorn uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
