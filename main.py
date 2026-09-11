@@ -773,6 +773,8 @@ button{cursor:pointer;font-weight:bold}
 .onlineBtn{border-radius:999px;padding:10px 16px;font-weight:800}.onlineBtn.online{background:#0d3b2a;border-color:#2ee88a;color:#52f09d}.onlineBtn.offline{background:#431b25;border-color:#ff718b;color:#ff718b}
 .badge{display:inline-block;padding:7px 11px;border-radius:999px;background:#0f1526;border:1px solid #34405e;font-size:12px;font-weight:800}
 .sniper{border:1px solid #394765;background:linear-gradient(135deg,#151c30,#10172a)}
+.aiCard{border:1px solid #6b55a3;background:linear-gradient(135deg,#1b1733,#10172a)}
+.aiMain{font-size:24px;font-weight:800;margin:10px 0}.aiMeta{font-size:13px;color:#aeb7cc}.aiReason{font-size:13px;color:#d9deeb;line-height:1.5;margin-top:8px}
 .sniperTitle{font-size:20px;font-weight:800;margin:4px 0}
 .countdown{font-size:25px;font-weight:800}
 .entry{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
@@ -842,6 +844,17 @@ button{cursor:pointer;font-weight:bold}
 <div><div class="sniperTitle">SNIPER 03</div></div>
 <button id="sniper03Toggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button>
 </div></div>
+
+<div class="card aiCard">
+<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+<div><div class="sniperTitle">🤖 INTELIGÊNCIA ARTIFICIAL</div><div class="small">Trade Sniper AI • confluência de mercado</div></div>
+<button id="aiToggle" class="onlineBtn online" style="width:auto;margin:0">● ONLINE</button>
+</div>
+<div id="aiStatus" class="small" style="margin-top:10px">IA aguardando análise...</div>
+<div id="aiMain" class="aiMain">AGUARDANDO</div>
+<div id="aiMeta" class="aiMeta">Selecione ativo e tempo para analisar.</div>
+<div id="aiReason" class="aiReason"></div>
+</div>
 
 <div class="card">
 <div class="small">SINAL</div>
@@ -1045,6 +1058,23 @@ function scheduleResultCheck(){
   resultTimer = setTimeout(checkResult, wait);
 }
 
+let ultimoSinalFalado=localStorage.getItem("is_trade_last_voice_signal")||"";
+function falarSinal(direcao,tendencia,confianca){
+ if(direcao!=="CALL"&&direcao!=="PUT")return;
+ const dirTexto=direcao==="CALL"?"sinal de compra":"sinal de venda";
+ const tendenciaTexto=tendencia==="ALTA"?"tendência do gráfico é de alta":tendencia==="BAIXA"?"tendência do gráfico é de baixa":"tendência do gráfico é neutra";
+ const mensagem=`${dirTexto}. ${tendenciaTexto}. Confiança ${Math.round(Number(confianca)||0)} por cento.`;
+ const chave=`${direcao}|${tendencia}|${confianca}|${$("entryTime").textContent}`;
+ if(chave===ultimoSinalFalado)return; ultimoSinalFalado=chave; localStorage.setItem("is_trade_last_voice_signal",chave);
+ if(!("speechSynthesis" in window))return; window.speechSynthesis.cancel(); const voz=new SpeechSynthesisUtterance(mensagem); voz.lang="pt-BR"; voz.rate=.92; voz.pitch=1; voz.volume=1; window.speechSynthesis.speak(voz);
+}
+
+async function loadAI(){
+ const status=$("aiStatus"),main=$("aiMain"),meta=$("aiMeta"),reason=$("aiReason");
+ if(!status||!main||!aiOnline)return;
+ status.textContent="ANALISANDO 240 VELAS...";
+ try{const symbol=$("symbol").value,interval=$("interval").value;const r=await fetch(`/ai-analysis?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`,{cache:"no-store"});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.detail||"Falha na IA");const a=d.analysis,t=d.trend||{};main.textContent=`${a.signal} — ${a.confidence}%`;main.className="aiMain "+(a.signal==="CALL"?"good":a.signal==="PUT"?"bad":"");meta.textContent=`Qualidade: ${a.quality} | Regime: ${a.regime} | Tendência: ${t.trend||"NEUTRA"} | RSI 9: ${a.rsi9??"-"}`;reason.textContent=a.reason||"";status.textContent="● IA ONLINE • atualizada";}catch(e){status.textContent="IA AGUARDAR";main.textContent="ERRO NA ANÁLISE";meta.textContent=e.message||"";reason.textContent="";}}
+
 async function loadSignal(){
   if(!isOnline){ renderMode(); return; }
   const symbol = $("symbol").value;
@@ -1136,11 +1166,13 @@ async function loadRadar(){
 }
 
 
-$("refresh").onclick = ()=>{loadSignal();loadRadar();};
+$("refresh").onclick = ()=>{loadSignal();loadAI();loadRadar();};
 $("rsiToggle").onclick=()=>{rsiOnline=!rsiOnline;if(rsiOnline)selectedStrategy="rsi";localStorage.setItem("is_trade_rsi_online",rsiOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&rsiOnline){loadSignal();loadRadar();}};
 $("oldToggle").onclick=()=>{oldOnline=!oldOnline;if(oldOnline)selectedStrategy="old_sniper";localStorage.setItem("is_trade_old_online",oldOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&oldOnline){loadSignal();loadRadar();}};
 $("sniper02Toggle").onclick=()=>{sniper02Online=!sniper02Online;if(sniper02Online)selectedStrategy="sniper_02";localStorage.setItem("is_trade_sniper02_online",sniper02Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper02Online){loadSignal();loadRadar();}};
 $("sniper03Toggle").onclick=()=>{sniper03Online=!sniper03Online;if(sniper03Online)selectedStrategy="sniper_03";localStorage.setItem("is_trade_sniper03_online",sniper03Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper03Online){loadSignal();loadRadar();}};
+$("aiToggle").onclick=()=>{aiOnline=!aiOnline;localStorage.setItem("is_trade_ai_online",aiOnline?"on":"off");const b=$("aiToggle");b.textContent=aiOnline?"● ONLINE":"● OFFLINE";b.className="onlineBtn "+(aiOnline?"online":"offline");if(aiOnline)loadAI();};
+
 $("reset").onclick = () => {
   if(confirm("Zerar WIN e LOSS?")){
     stats = {wins:0,losses:0};
@@ -1158,6 +1190,7 @@ setInterval(updateClock, 1000);
 setInterval(updateCountdown, 250);
 syncServerClock();
 loadLicense();
+loadAI();
 loadRadar();
 // Se não houver operação pendente, atualiza somente na virada da vela.
 let lastEntrySlot = "";
@@ -1177,6 +1210,7 @@ if(pending) scheduleResultCheck();
 setInterval(syncServerClock, 30000);
 setInterval(loadLicense, 60000);
 setInterval(loadRadar, 120000);
+setInterval(loadAI, 60000);
 </script>
 </body>
 </html>"""
@@ -1224,6 +1258,43 @@ async def candles(
         "interval": interval,
         "values": values,
     }
+
+
+@app.get("/ai-analysis")
+async def ai_analysis(symbol: str = "EUR/USD", interval: str = "1min") -> Dict[str, Any]:
+    require_active_license()
+    if interval not in ALLOWED_INTERVALS:
+        raise HTTPException(status_code=400, detail="Timeframe inválido.")
+    values = await get_candles(symbol, interval, 240)
+    closed = values[:-1]
+    if len(closed) < 60:
+        analysis = {"signal":"NEUTRO","confidence":50,"quality":"BAIXA","regime":"INDEFINIDO","reason":"Dados insuficientes para a IA."}
+    else:
+        closes=[float(c["close"]) for c in closed]
+        e9=ema(closes,9); e20=ema(closes,20); e50=ema(closes,50)
+        r9=float(rsi(closes,9)[-1]); r14=float(rsi(closes,14)[-1])
+        bull=bear=0.0; reasons=[]
+        if e9[-1]>e20[-1]: bull+=2; reasons.append("EMA 9 acima da EMA 20")
+        else: bear+=2; reasons.append("EMA 9 abaixo da EMA 20")
+        if e20[-1]>e50[-1]: bull+=2
+        else: bear+=2
+        slope=e20[-1]-e20[-6]
+        tr=true_ranges(closed); atr=sum(tr[-14:])/14 if len(tr)>=14 else 0
+        threshold=max(atr*0.05,abs(closes[-1])*0.00001)
+        if slope>threshold: bull+=1.5
+        elif slope<-threshold: bear+=1.5
+        if r9<35 and r14<45: bull+=1.5; reasons.append("RSI favorece recuperação")
+        elif r9>65 and r14>55: bear+=1.5; reasons.append("RSI favorece pressão vendedora")
+        last=closed[-1]; strength=abs(float(last["close"])-float(last["open"]))/max(float(last["high"])-float(last["low"]),1e-12)
+        if float(last["close"])>float(last["open"]) and strength>=.55: bull+=1
+        elif float(last["close"])<float(last["open"]) and strength>=.55: bear+=1
+        diff=abs(bull-bear)
+        signal="CALL" if bull>bear and bull>=5 and diff>=2 else "PUT" if bear>bull and bear>=5 and diff>=2 else "NEUTRO"
+        confidence=int(max(50,min(95,58+diff*6))) if signal!="NEUTRO" else int(max(50,min(65,50+diff*4)))
+        quality="ALTA" if confidence>=75 else "MÉDIA" if confidence>=60 else "BAIXA"
+        regime="ALTA" if e9[-1]>e20[-1]>e50[-1] else "BAIXA" if e9[-1]<e20[-1]<e50[-1] else "LATERAL"
+        analysis={"signal":signal,"confidence":confidence,"quality":quality,"regime":regime,"reason":("IA: "+("COMPRA" if signal=="CALL" else "VENDA" if signal=="PUT" else "AGUARDAR")+". "+"; ".join(reasons[:3])),"rsi9":round(r9,2),"rsi14":round(r14,2),"non_repaint":True}
+    return {"ok":True,"source":"Twelve Data","symbol":symbol,"interval":interval,"analysis":analysis,"trend":detect_market_trend(values)}
 
 
 @app.get("/signal")
