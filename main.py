@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 
 APP_NAME = "Trade sniper"
-APP_VERSION = "10.1.0"
+APP_VERSION = "10.2.0"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -1643,23 +1643,14 @@ let sniper03Online=localStorage.getItem("is_trade_sniper03_online")==="on";
 let selectedStrategy=localStorage.getItem("is_trade_selected_strategy") ||
  (oldOnline?"old_sniper":sniper03Online?"sniper_03":sniper02Online?"sniper_02":"rsi");
 
-function setStrategyButton(id,on){
- const b=$(id);b.textContent=on?"● ONLINE":"● OFFLINE";
- b.className=on?"onlineBtn online":"onlineBtn offline"
-}
 function activeStrategy(){
- if(selectedStrategy==="rsi"&&rsiOnline)return"rsi";
- if(selectedStrategy==="old_sniper"&&oldOnline)return"old_sniper";
- if(selectedStrategy==="sniper_02"&&sniper02Online)return"sniper_02";
- if(selectedStrategy==="sniper_03"&&sniper03Online)return"sniper_03";
- if(rsiOnline)return"rsi";if(oldOnline)return"old_sniper";
- if(sniper02Online)return"sniper_02";if(sniper03Online)return"sniper_03";
- return null
+ return selectedStrategy || "rsi";
 }
 function renderMode(){
- setStrategyButton("rsiToggle",rsiOnline);setStrategyButton("oldToggle",oldOnline);
- setStrategyButton("sniper02Toggle",sniper02Online);setStrategyButton("sniper03Toggle",sniper03Online);
- if(!isOnline||!activeStrategy()){$("signal").textContent="OFFLINE";$("signal").className="signal neutral"}
+ if(!isOnline){
+  $("signal").textContent="OFFLINE";
+  $("signal").className="signal neutral";
+ }
 }
 
 let audioCtx=null,lastSoundSignal=localStorage.getItem("is_trade_last_sound_signal")||"";
@@ -1812,35 +1803,6 @@ function rankingRow(x,pos){
  return `<div class="rankRow"><div><span class="rankPos">${pos}º MOTOR INTERNO</span><div class="rankBar"><div style="width:${pct}%"></div></div></div><b class="good">${x.wins}</b><b class="bad">${x.losses}</b><b>${pct.toFixed(1)}%</b><b class="rankSignals">${x.signals}</b></div>`
 }
 
-async function loadAI() {
-  const status = document.getElementById("aiStatus");
-  const main = document.getElementById("aiMain");
-  const meta = document.getElementById("aiMeta");
-  const reason = document.getElementById("aiReason");
-  if (!status || !main) return;
-
-  try {
-    status.textContent = "Analisando últimas 240 velas...";
-    const r = await fetch(
-      `/ai-analysis?symbol=${encodeURIComponent(symbolSelect.value)}&interval=${encodeURIComponent(intervalSelect.value)}`
-    );
-    const data = await r.json();
-    if (!r.ok || !data.ok) throw new Error(data.detail || "Falha na IA");
-
-    const a = data.analysis;
-    main.textContent = `${a.signal} — ${a.confidence}%`;
-    meta.textContent =
-      `Qualidade: ${a.quality} | Regime: ${a.regime || "-"} | ` +
-      `Validação recente: ${data.recent_validation.accuracy}%`;
-    reason.textContent = a.reason || "";
-    status.textContent = "IA atualizada";
-  } catch (e) {
-    status.textContent = "IA indisponível";
-    main.textContent = e.message || "Erro na análise";
-    meta.textContent = "";
-    reason.textContent = "";
-  }
-}
 
 async function loadRanking(){
  const s=$("symbol").value,i=$("interval").value;
@@ -1877,10 +1839,6 @@ function toggle(name,key,strategy){
   loadRanking()
  }
 }
-$("rsiToggle").onclick=toggle("rsiOnline","is_trade_rsi_online","rsi");
-$("oldToggle").onclick=toggle("oldOnline","is_trade_old_online","old_sniper");
-$("sniper02Toggle").onclick=toggle("sniper02Online","is_trade_sniper02_online","sniper_02");
-$("sniper03Toggle").onclick=toggle("sniper03Online","is_trade_sniper03_online","sniper_03");
 
 $("reset").onclick=()=>{
  if(confirm("Zerar WIN e LOSS deste ATIVO/TEMPO/ESTRATÉGIA?")){
@@ -1898,8 +1856,7 @@ else renderStats();
 renderMode();updateClock();updateCountdown();
 setInterval(updateClock,1000);
 setInterval(updateCountdown,250);
-syncServerClock();loadLicense();loadSignal();loadRadar();loadRanking();
-    loadAI();
+syncServerClock().then(()=>{updateClock();updateCountdown()});loadLicense();loadSignal();loadRadar();loadRanking();
 
 let lastEntrySlot="";
 let lastAiRefresh=0;
