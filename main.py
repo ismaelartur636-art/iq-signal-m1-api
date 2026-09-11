@@ -10,10 +10,33 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "Ismael Trade"
-APP_VERSION = "8.6.0"
+APP_VERSION = "8.7.0"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
+
+# Licença do aplicativo
+LICENSE_EXPIRES = os.getenv("ISMAEL_TRADE_LICENSE_EXPIRES", "2026-12-31").strip()
+LICENSE_WHATSAPP_1 = "55 84 99841-1282"
+LICENSE_WHATSAPP_2 = "55 84 99449-9442"
+LICENSE_INSTAGRAM = "@Ismaelartur26"
+
+def license_status() -> Dict[str, Any]:
+    try:
+        expires = datetime.strptime(LICENSE_EXPIRES, "%Y-%m-%d").replace(tzinfo=SP_TZ)
+    except ValueError:
+        expires = datetime(2026, 12, 31, 23, 59, 59, tzinfo=SP_TZ)
+    expires_end = expires.replace(hour=23, minute=59, second=59)
+    current = now_sp()
+    active = current <= expires_end
+    return {
+        "active": active,
+        "expires": expires_end.strftime("%d/%m/%Y"),
+        "expires_iso": expires_end.isoformat(),
+        "whatsapp_1": LICENSE_WHATSAPP_1,
+        "whatsapp_2": LICENSE_WHATSAPP_2,
+        "instagram": LICENSE_INSTAGRAM,
+    }
 
 ALLOWED_INTERVALS = {"1min": 1, "5min": 5, "15min": 15, "30min": 30}
 SYMBOLS = {
@@ -480,6 +503,14 @@ button{cursor:pointer;font-weight:bold}
 <div class="badge">● MERCADO • MONITORANDO</div>
 </div>
 
+<div class="card" id="licenseCard">
+<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+<div><div class="small">LICENÇA ISMAEL TRADE</div><div id="licenseStatus" class="value">VERIFICANDO...</div></div>
+<div><div class="small">VALIDADE</div><div id="licenseExpires" class="value">--</div></div>
+</div>
+<div class="small" style="margin-top:10px">Renovação: WhatsApp <b>55 84 99841-1282</b> / <b>55 84 99449-9442</b> • Instagram <b>@Ismaelartur26</b></div>
+</div>
+
 <div class="card">
 <div class="row">
 <div class="field">
@@ -590,18 +621,41 @@ function updateClock(){
   $("clock").textContent = `${get("hour")}:${get("minute")}:${get("second")}`;
   $("dateBr").textContent = new Intl.DateTimeFormat("pt-BR", {timeZone:"America/Sao_Paulo",day:"2-digit",month:"2-digit",year:"numeric"}).format(now);
 }
+let serverOffsetMs = 0;
 function updateCountdown(){
   const interval = $("interval").value;
   const minutes = ({"1min":1,"5min":5,"15min":15,"30min":30})[interval] || 1;
-  const now = new Date();
-  const ms = now.getTime();
+  const now = new Date(Date.now() + serverOffsetMs);
   const block = minutes*60*1000;
-  const next = Math.ceil(ms/block)*block;
-  let left = Math.max(0, next-ms);
-  const total = Math.floor(left/1000);
+  const next = Math.ceil(now.getTime()/block)*block;
+  const total = Math.max(0, Math.floor((next-now.getTime())/1000));
   const mm = String(Math.floor(total/60)).padStart(2,"0");
   const ss = String(total%60).padStart(2,"0");
   $("countdown").textContent = `${mm}:${ss}`;
+}
+async function syncServerClock(){
+  try{
+    const t0=Date.now();
+    const r=await fetch("/server-time",{cache:"no-store"});
+    const d=await r.json();
+    const t1=Date.now();
+    const serverMs=new Date(d.brasilia).getTime();
+    serverOffsetMs=serverMs-((t0+t1)/2);
+  }catch(e){}
+}
+async function loadLicense(){
+  try{
+    const r=await fetch("/license",{cache:"no-store"});
+    const d=await r.json();
+    if(d.active){
+      $("licenseStatus").textContent="● LICENÇA ATIVA";
+      $("licenseStatus").className="value good";
+    }else{
+      $("licenseStatus").textContent="● LICENÇA EXPIRADA";
+      $("licenseStatus").className="value bad";
+    }
+    $("licenseExpires").textContent=d.expires || "--";
+  }catch(e){ $("licenseStatus").textContent="NÃO VERIFICADA"; }
 }
 
 
@@ -641,11 +695,9 @@ async function loadSignal(){
     $("signal").className = "signal " + (d.signal==="CALL" ? "call" : d.signal==="PUT" ? "put" : "neutral");
     $("confidence").textContent = d.confidence + "%";
     $("reference").textContent = d.reference_candle;
-    $("next").textContent = d.next_candle;
-    $("entryTime").textContent = d.next_candle;
-    const nextDt = new Date(d.next_candle.replace(" ","T"));
-    const mins = ({"1min":1,"5min":5,"15min":15,"30min":30})[interval] || 1;
-    $("expiry").textContent = Number.isNaN(nextDt.getTime()) ? "--" : new Date(nextDt.getTime()+mins*60000).toLocaleString("pt-BR", {hour:"2-digit",minute:"2-digit",second:"2-digit"});
+    $("next").textContent = d.entry_time || d.next_candle;
+    $("entryTime").textContent = (d.entry_time || d.next_candle || "--").split(" ")[1] || "--";
+    $("expiry").textContent = (d.expiry_time || "").split(" ")[1] || "--";
     $("rsi9").textContent = fmt(d.rsi9);
     $("rsi14").textContent = fmt(d.rsi14);
     if($("engulf")) $("engulf").textContent = d.bullish_engulfing || d.bearish_engulfing ? "SIM" : "NÃO";
@@ -654,7 +706,7 @@ async function loadSignal(){
     if($("strength")) $("strength").textContent = (d.bullish_strength || d.bearish_strength) ? "SIM" : "NÃO";
 
     if(d.signal !== "NEUTRO"){
-      pending = {symbol, interval, reference_candle:d.reference_candle, direction:d.signal};
+      pending = {symbol, interval, reference_candle:d.reference_candle, entry_time:d.entry_time, direction:d.signal};
       save();
       scheduleResultCheck();
     }
@@ -704,12 +756,25 @@ updateClock();
 updateCountdown();
 setInterval(updateClock, 1000);
 setInterval(updateCountdown, 250);
-loadSignal();
-if(pending) scheduleResultCheck();
-// Uma análise automática por minuto. O cache do servidor evita chamadas duplicadas.
+syncServerClock();
+loadLicense();
+// Se não houver operação pendente, atualiza somente na virada da vela.
+let lastEntrySlot = "";
 setInterval(() => {
-  if(!pending) loadSignal();
-}, 65000);
+  if(pending) return;
+  const interval = $("interval").value;
+  const mins = ({"1min":1,"5min":5,"15min":15,"30min":30})[interval] || 1;
+  const now = new Date(Date.now() + serverOffsetMs);
+  const slot = Math.floor(now.getTime()/(mins*60000));
+  const seconds = Math.floor((now.getTime()%(mins*60000))/1000);
+  if(seconds <= 3 && String(slot) !== lastEntrySlot){
+    lastEntrySlot = String(slot);
+    loadSignal();
+  }
+}, 1000);
+if(pending) scheduleResultCheck();
+setInterval(syncServerClock, 30000);
+setInterval(loadLicense, 60000);
 </script>
 </body>
 </html>"""
@@ -730,12 +795,24 @@ async def server_time() -> Dict[str, str]:
     }
 
 
+@app.get("/license")
+async def license() -> Dict[str, Any]:
+    return {"ok": True, **license_status()}
+
+
+def require_active_license() -> None:
+    status = license_status()
+    if not status["active"]:
+        raise HTTPException(status_code=403, detail={"error": "LICENSE_EXPIRED", **status})
+
+
 @app.get("/candles")
 async def candles(
     symbol: str = "EUR/USD",
     interval: str = "1min",
     size: int = 120,
 ) -> Dict[str, Any]:
+    require_active_license()
     requested_size = int(size)
     values = await get_candles(symbol, interval, requested_size)
     return {
@@ -753,15 +830,29 @@ async def signal(
     interval: str = "1min",
     strategy: str = "rsi",
 ) -> Dict[str, Any]:
+    require_active_license()
     if strategy not in {"rsi", "old_sniper"}:
         raise HTTPException(status_code=400, detail="Estratégia inválida.")
     values = await get_candles(symbol, interval, 100)
     result = analyze(values, strategy)
+    # A análise usa a última vela fechada. A entrada deve ser na próxima
+    # abertura futura, nunca em uma vela cujo início já passou.
+    minutes = ALLOWED_INTERVALS[interval]
+    current = now_sp()
+    block_seconds = minutes * 60
+    epoch = int(current.timestamp())
+    next_epoch = ((epoch // block_seconds) + 1) * block_seconds
+    entry_dt = datetime.fromtimestamp(next_epoch, tz=SP_TZ)
+    expiry_dt = entry_dt + timedelta(minutes=minutes)
+
     result.update(
         {
             "source": "Twelve Data",
             "symbol": symbol,
             "interval": interval,
+            "entry_time": entry_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "next_candle": entry_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "expiry_time": expiry_dt.strftime("%Y-%m-%d %H:%M:%S"),
             "expiry": "1 vela do intervalo selecionado",
             "warning": "Sinal probabilístico; não garante WIN. A fonte Twelve Data pode não coincidir com os preços da corretora.",
         }
@@ -775,7 +866,9 @@ async def result(
     interval: str,
     reference_candle: str,
     direction: str,
+    entry_time: Optional[str] = None,
 ) -> Dict[str, Any]:
+    require_active_license()
     direction = direction.upper().strip()
     if direction not in {"CALL", "PUT"}:
         raise HTTPException(status_code=400, detail="Direção inválida.")
@@ -792,23 +885,34 @@ async def result(
     if reference_index is None:
         return {"ok": True, "status": "PENDING", "result": None}
 
-    next_index = reference_index + 1
-    if next_index >= len(values):
-        return {"ok": True, "status": "PENDING", "result": None}
-
-    next_candle = values[next_index]
-    next_time = parse_time(next_candle["datetime"])
-
-    if not candle_is_closed(next_time, interval):
-        return {
-            "ok": True,
-            "status": "PENDING",
-            "result": None,
-            "next_candle": next_candle["datetime"],
-        }
-
-    reference_close = values[reference_index]["close"]
-    result_close = next_candle["close"]
+    if entry_time:
+        entry_dt = parse_time(entry_time)
+        entry_index: Optional[int] = None
+        for i, candle in enumerate(values):
+            if parse_time(candle["datetime"]) == entry_dt:
+                entry_index = i
+                break
+        if entry_index is None or entry_index + 1 >= len(values):
+            return {"ok": True, "status": "PENDING", "result": None}
+        result_candle = values[entry_index]
+        result_index = entry_index
+        result_time = parse_time(result_candle["datetime"])
+        if not candle_is_closed(result_time, interval):
+            return {"ok": True, "status": "PENDING", "result": None, "entry_candle": result_candle["datetime"]}
+        reference_close = result_candle["open"]
+        result_close = result_candle["close"]
+        result_candle_time = result_candle["datetime"]
+    else:
+        next_index = reference_index + 1
+        if next_index >= len(values):
+            return {"ok": True, "status": "PENDING", "result": None}
+        next_candle = values[next_index]
+        next_time = parse_time(next_candle["datetime"])
+        if not candle_is_closed(next_time, interval):
+            return {"ok": True, "status": "PENDING", "result": None, "next_candle": next_candle["datetime"]}
+        reference_close = values[reference_index]["close"]
+        result_close = next_candle["close"]
+        result_candle_time = next_candle["datetime"]
 
     # A entrada é considerada no fechamento da vela de referência.
     # A expiração de 1 vela compara o fechamento seguinte com essa entrada.
@@ -826,7 +930,7 @@ async def result(
         "result": outcome,
         "direction": direction,
         "reference_candle": reference_candle,
-        "result_candle": next_candle["datetime"],
+        "result_candle": result_candle_time,
         "entry_close": reference_close,
         "result_close": result_close,
     }
