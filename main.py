@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "Ismael Trade"
-APP_VERSION = "8.7.0"
+APP_VERSION = "8.8.0"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -408,6 +408,115 @@ def analyze(candles: List[Dict[str, Any]], strategy: str = "rsi") -> Dict[str, A
             "ok": True,
         }
 
+    if strategy == "sniper_02":
+        # SNIPER 02 — rompimento + reteste + rejeição + confirmação.
+        # Não entra no primeiro rompimento.
+        # Usa apenas candles fechados para reduzir repintura.
+        if len(closed) < 25:
+            raise HTTPException(status_code=422, detail="Dados insuficientes para SNIPER 02.")
+
+        # Níveis simples de suporte/resistência por swing, usando histórico anterior
+        # ao movimento recente. Isso evita usar o próprio candle de rompimento como nível.
+        lookback = closed[-22:-4]
+        resistance = max(c["high"] for c in lookback)
+        support = min(c["low"] for c in lookback)
+        recent = closed[-4:]
+
+        def bullish_pin(c):
+            b = body(c); r = rng(c)
+            lower = min(c["open"], c["close"]) - c["low"]
+            upper = c["high"] - max(c["open"], c["close"])
+            return c["close"] > c["open"] and lower >= max(b * 1.5, r * 0.40) and upper <= r * 0.25
+
+        def bearish_pin(c):
+            b = body(c); r = rng(c)
+            upper = c["high"] - max(c["open"], c["close"])
+            lower = min(c["open"], c["close"]) - c["low"]
+            return c["close"] < c["open"] and upper >= max(b * 1.5, r * 0.40) and lower <= r * 0.25
+
+        def hammer(c):
+            b = body(c); r = rng(c)
+            lower = min(c["open"], c["close"]) - c["low"]
+            upper = c["high"] - max(c["open"], c["close"])
+            return lower >= max(b * 2.0, r * 0.45) and upper <= r * 0.20
+
+        def shooting_star(c):
+            b = body(c); r = rng(c)
+            upper = c["high"] - max(c["open"], c["close"])
+            lower = min(c["open"], c["close"]) - c["low"]
+            return upper >= max(b * 2.0, r * 0.45) and lower <= r * 0.20
+
+        def bull_engulf(a, b):
+            return (b["close"] > b["open"] and a["close"] < a["open"] and
+                    b["open"] <= a["close"] and b["close"] >= a["open"])
+
+        def bear_engulf(a, b):
+            return (b["close"] < b["open"] and a["close"] > a["open"] and
+                    b["open"] >= a["close"] and b["close"] <= a["open"])
+
+        # Procura uma sequência fechada: rompimento, retorno ao nível, rejeição e confirmação.
+        call_setup = False
+        put_setup = False
+        call_pattern = ""
+        put_pattern = ""
+        for j in range(max(2, len(closed) - 5), len(closed) - 1):
+            breakout = closed[j]
+            retest = closed[j + 1]
+            confirmation = closed[j + 2] if j + 2 < len(closed) else None
+            if confirmation is None:
+                continue
+
+            # CALL: fechamento acima da resistência, depois reteste sem operar no rompimento.
+            if breakout["close"] > resistance:
+                touched = retest["low"] <= resistance * 1.0015
+                rejection = touched and (hammer(retest) or bullish_pin(retest) or
+                                         bull_engulf(closed[j], retest))
+                confirmed = (confirmation["close"] > confirmation["open"] and
+                             confirmation["close"] > retest["high"])
+                if rejection and confirmed:
+                    call_setup = True
+                    call_pattern = ("Martelo" if hammer(retest) else
+                                    "Pin Bar de alta" if bullish_pin(retest) else
+                                    "Engolfo de alta")
+
+            # PUT: fechamento abaixo do suporte, depois reteste sem operar no rompimento.
+            if breakout["close"] < support:
+                touched = retest["high"] >= support * 0.9985
+                rejection = touched and (shooting_star(retest) or bearish_pin(retest) or
+                                         bear_engulf(closed[j], retest))
+                confirmed = (confirmation["close"] < confirmation["open"] and
+                             confirmation["close"] < retest["low"])
+                if rejection and confirmed:
+                    put_setup = True
+                    put_pattern = ("Shooting Star" if shooting_star(retest) else
+                                   "Pin Bar de baixa" if bearish_pin(retest) else
+                                   "Engolfo de baixa")
+
+        if call_setup and not put_setup:
+            signal = "CALL"; confidence = 88
+        elif put_setup and not call_setup:
+            signal = "PUT"; confidence = 88
+        else:
+            signal = "NEUTRO"; confidence = 50
+
+        return {
+            "signal": signal,
+            "confidence": confidence,
+            "reference_candle": reference["datetime"],
+            "next_candle": next_candle["datetime"],
+            "strategy": "SNIPER 02",
+            "strategy_code": "sniper_02",
+            "resistance": resistance,
+            "support": support,
+            "call_setup": call_setup,
+            "put_setup": put_setup,
+            "call_pattern": call_pattern,
+            "put_pattern": put_pattern,
+            "no_first_breakout": True,
+            "non_repaint_reference": True,
+            "ok": True,
+        }
+
     # SNIPER X — apenas RSI 9 + RSI 14 em confluência.
     closes = [float(c["close"]) for c in closed]
     rsi9_values = rsi(closes, 9)
@@ -535,14 +644,19 @@ button{cursor:pointer;font-weight:bold}
 
 <div class="card sniper">
 <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
-<div><div class="small">ESTRATÉGIA 1</div><div class="sniperTitle">SNIPER X</div><div class="small">Confluência entre RSI 9 e RSI 14</div></div>
+<div><div class="sniperTitle">SNIPER X</div></div>
 <button id="rsiToggle" class="onlineBtn online" style="width:auto;margin:0">● ONLINE</button>
-</div><div style="margin-top:10px" class="badge">RSI 9 + RSI 14 • CONFLUÊNCIA</div></div>
+</div></div>
 <div class="card sniper">
 <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
-<div><div class="small">ESTRATÉGIA 2</div><div class="sniperTitle">SNIPER 01</div><div class="small">Price Action • 5 confirmações</div></div>
+<div><div class="sniperTitle">SNIPER 01</div></div>
 <button id="oldToggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button>
-</div><div style="margin-top:10px" class="badge">Engolfo • Rejeição • Rompimento • Força • Estrutura</div></div>
+</div></div>
+<div class="card sniper">
+<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+<div><div class="sniperTitle">SNIPER 02</div></div>
+<button id="sniper02Toggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button>
+</div></div>
 
 <div class="card">
 <div class="small">SINAL</div>
@@ -589,6 +703,8 @@ let paramsVisible = localStorage.getItem("is_trade_params") !== "hidden";
 let isOnline = true;
 let rsiOnline = localStorage.getItem("is_trade_rsi_online") !== "off";
 let oldOnline = localStorage.getItem("is_trade_old_online") === "on";
+let sniper02Online = localStorage.getItem("is_trade_sniper02_online") === "on";
+let selectedStrategy = localStorage.getItem("is_trade_selected_strategy") || (oldOnline ? "old_sniper" : sniper02Online ? "sniper_02" : "rsi");
 
 function save(){
   localStorage.setItem("is_trade_stats", JSON.stringify(stats));
@@ -602,8 +718,16 @@ function renderStats(){
   $("accuracy").textContent = total ? ((stats.wins/total)*100).toFixed(1)+"%" : "0%";
 }
 function setStrategyButton(id, online){const b=$(id);b.textContent=online?"● ONLINE":"● OFFLINE";b.className=online?"onlineBtn online":"onlineBtn offline";}
-function activeStrategy(){if(oldOnline)return "old_sniper";if(rsiOnline)return "rsi";return null;}
-function renderMode(){setStrategyButton("rsiToggle",rsiOnline);setStrategyButton("oldToggle",oldOnline);const active=activeStrategy();$("modeStatus").textContent=isOnline&&active?"ONLINE":"OFFLINE";$("strategyStatus").textContent=active==="old_sniper"?"SNIPER 01":active==="rsi"?"SNIPER X":"NENHUMA";if(!isOnline||!active){$("signal").textContent="OFFLINE";$("signal").className="signal neutral";}}
+function activeStrategy(){
+  if(selectedStrategy==="rsi" && rsiOnline)return "rsi";
+  if(selectedStrategy==="old_sniper" && oldOnline)return "old_sniper";
+  if(selectedStrategy==="sniper_02" && sniper02Online)return "sniper_02";
+  if(rsiOnline)return "rsi";
+  if(oldOnline)return "old_sniper";
+  if(sniper02Online)return "sniper_02";
+  return null;
+}
+function renderMode(){setStrategyButton("rsiToggle",rsiOnline);setStrategyButton("oldToggle",oldOnline);setStrategyButton("sniper02Toggle",sniper02Online);const active=activeStrategy();$("modeStatus").textContent=isOnline&&active?"ONLINE":"OFFLINE";$("strategyStatus").textContent=active==="old_sniper"?"SNIPER 01":active==="sniper_02"?"SNIPER 02":active==="rsi"?"SNIPER X":"NENHUMA";if(!isOnline||!active){$("signal").textContent="OFFLINE";$("signal").className="signal neutral";}}
 
 function fmt(v){ return v == null ? "--" : v; }
 
@@ -739,8 +863,9 @@ async function checkResult(){
 
 
 $("refresh").onclick = loadSignal;
-$("rsiToggle").onclick=()=>{rsiOnline=!rsiOnline;if(rsiOnline){oldOnline=false;localStorage.setItem("is_trade_old_online","off");}localStorage.setItem("is_trade_rsi_online",rsiOnline?"on":"off");pending=null;save();renderMode();if(isOnline&&rsiOnline)loadSignal();};
-$("oldToggle").onclick=()=>{oldOnline=!oldOnline;if(oldOnline){rsiOnline=false;localStorage.setItem("is_trade_rsi_online","off");}localStorage.setItem("is_trade_old_online",oldOnline?"on":"off");pending=null;save();renderMode();if(isOnline&&oldOnline)loadSignal();};
+$("rsiToggle").onclick=()=>{rsiOnline=!rsiOnline;if(rsiOnline)selectedStrategy="rsi";localStorage.setItem("is_trade_rsi_online",rsiOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&rsiOnline)loadSignal();};
+$("oldToggle").onclick=()=>{oldOnline=!oldOnline;if(oldOnline)selectedStrategy="old_sniper";localStorage.setItem("is_trade_old_online",oldOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&oldOnline)loadSignal();};
+$("sniper02Toggle").onclick=()=>{sniper02Online=!sniper02Online;if(sniper02Online)selectedStrategy="sniper_02";localStorage.setItem("is_trade_sniper02_online",sniper02Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper02Online)loadSignal();};
 $("reset").onclick = () => {
   if(confirm("Zerar WIN e LOSS?")){
     stats = {wins:0,losses:0};
@@ -831,7 +956,7 @@ async def signal(
     strategy: str = "rsi",
 ) -> Dict[str, Any]:
     require_active_license()
-    if strategy not in {"rsi", "old_sniper"}:
+    if strategy not in {"rsi", "old_sniper", "sniper_02"}:
         raise HTTPException(status_code=400, detail="Estratégia inválida.")
     values = await get_candles(symbol, interval, 100)
     result = analyze(values, strategy)
