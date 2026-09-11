@@ -756,8 +756,8 @@ button{cursor:pointer;font-weight:bold}
 </head>
 <body>
 <div class="container">
-<h1>Ismael Trade</h1>
-<div class="sub">ANÁLISE EM TEMPO REAL HORÁRIO DE BRASÍLIA• dados Twelve Data</div>
+<h1>📉 SNIPER</h1>
+<div class="sub">ANÁLISE EM TEMPO REAL HORÁRIO DE BRASÍLIA• </div>
 
 <div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:12px">
 <div><div class="clockLabel">HORÁRIO DE BRASÍLIA</div><div id="clock" class="clock">--:--:--</div><div id="dateBr" class="small">--/--/----</div></div>
