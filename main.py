@@ -879,7 +879,17 @@ button{cursor:pointer;font-weight:bold}
 <div class="stat"><span>LOSS</span><b id="losses" class="bad">0</b></div>
 <div class="stat"><span>ASSERTIVIDADE</span><b id="accuracy">0%</b></div>
 </div>
-<button id="reset" style="margin-top:10px">ZERAR RESULTADOS</button>
+<button id="reset" style="margin-top:10px">ZERAR RESULTADOS DO ATIVO</button>
+</div>
+
+<div class="card">
+<div class="small">RESULTADOS GERAIS — TODOS OS ATIVOS</div>
+<div class="grid">
+<div class="stat"><span>WIN GERAL</span><b id="allWins" class="good">0</b></div>
+<div class="stat"><span>LOSS GERAL</span><b id="allLosses" class="bad">0</b></div>
+<div class="stat"><span>ASSERTIVIDADE GERAL</span><b id="allAccuracy">0%</b></div>
+</div>
+<button id="resetAll" style="margin-top:10px">ZERAR RESULTADOS GERAIS</button>
 </div>
 
 <div class="card" id="radarCard">
@@ -899,7 +909,9 @@ O sinal é probabilístico e não garante WIN. A análise usa velas fechadas par
 <script>
 const $ = id => document.getElementById(id);
 let pending = JSON.parse(localStorage.getItem("is_trade_pending") || "null");
-let stats = JSON.parse(localStorage.getItem("is_trade_stats") || '{"wins":0,"losses":0}');
+let statsByKey = JSON.parse(localStorage.getItem("is_trade_stats_by_key") || "{}");
+let statsAll = JSON.parse(localStorage.getItem("is_trade_stats_all") || '{"wins":0,"losses":0}');
+let stats = {wins:0,losses:0};
 let isOnline = true;
 let rsiOnline = localStorage.getItem("is_trade_rsi_online") !== "off";
 let oldOnline = localStorage.getItem("is_trade_old_online") === "on";
@@ -907,16 +919,55 @@ let sniper02Online = localStorage.getItem("is_trade_sniper02_online") === "on";
 let sniper03Online = localStorage.getItem("is_trade_sniper03_online") === "on";
 let selectedStrategy = localStorage.getItem("is_trade_selected_strategy") || (oldOnline ? "old_sniper" : sniper03Online ? "sniper_03" : sniper02Online ? "sniper_02" : "rsi");
 
+function statsKey(symbol, interval, strategy){
+  return `${symbol}|${interval}|${strategy || "auto"}`;
+}
+function currentStatsKey(){
+  const symbol = $("symbol")?.value || "EUR/USD";
+  const interval = $("interval")?.value || "1min";
+  const strategy = activeStrategy();
+  return statsKey(symbol, interval, strategy);
+}
+function getCurrentStats(){
+  const key = currentStatsKey();
+  if(!statsByKey[key]) statsByKey[key] = {wins:0,losses:0};
+  return statsByKey[key];
+}
+// Migra resultados antigos, que eram globais, somente para o ativo atual.
+if(Object.keys(statsByKey).length===0){
+  try{
+    const legacy=JSON.parse(localStorage.getItem("is_trade_stats")||"null");
+    if(legacy && ((Number(legacy.wins)||0)+(Number(legacy.losses)||0)>0)){
+      const lw=Number(legacy.wins)||0, ll=Number(legacy.losses)||0;
+      statsByKey[statsKey($("symbol")?.value||"EUR/USD",$("interval")?.value||"1min",selectedStrategy)]={wins:lw,losses:ll};
+      if((Number(statsAll.wins)||0)+(Number(statsAll.losses)||0)===0){
+        statsAll={wins:lw,losses:ll};
+      }
+    }
+  }catch(e){}
+}
 function save(){
-  localStorage.setItem("is_trade_stats", JSON.stringify(stats));
+  localStorage.setItem("is_trade_stats_by_key", JSON.stringify(statsByKey));
+  localStorage.setItem("is_trade_stats_all", JSON.stringify(statsAll));
+  localStorage.setItem("is_trade_stats", JSON.stringify(getCurrentStats()));
   if(pending) localStorage.setItem("is_trade_pending", JSON.stringify(pending));
   else localStorage.removeItem("is_trade_pending");
 }
 function renderStats(){
+  stats = getCurrentStats();
+
+  // Resultado somente do ativo/timeframe/estratégia selecionados.
   $("wins").textContent = stats.wins;
   $("losses").textContent = stats.losses;
   const total = stats.wins + stats.losses;
   $("accuracy").textContent = total ? ((stats.wins/total)*100).toFixed(1)+"%" : "0%";
+
+  // Resultado acumulado de todos os ativos.
+  if($("allWins")) $("allWins").textContent = statsAll.wins;
+  if($("allLosses")) $("allLosses").textContent = statsAll.losses;
+  const allTotal = statsAll.wins + statsAll.losses;
+  if($("allAccuracy")) $("allAccuracy").textContent =
+      allTotal ? ((statsAll.wins/allTotal)*100).toFixed(1)+"%" : "0%";
 }
 function setStrategyButton(id, online){const b=$(id);b.textContent=online?"● ONLINE":"● OFFLINE";b.className=online?"onlineBtn online":"onlineBtn offline";}
 function activeStrategy(){
@@ -1110,7 +1161,7 @@ async function loadSignal(){
 
     if(d.signal !== "NEUTRO"){
       falarSinal(d.signal, d.trend, d.confidence);
-      pending = {symbol, interval, reference_candle:d.reference_candle, entry_time:d.entry_time, direction:d.signal};
+      pending = {symbol, interval, strategy, reference_candle:d.reference_candle, entry_time:d.entry_time, direction:d.signal};
       save();
       scheduleResultCheck();
     }
@@ -1127,9 +1178,17 @@ async function checkResult(){
     const d = await r.json();
     if(!r.ok) return;
     if(d.result === "WIN"){
-      stats.wins++; pending = null; save(); renderStats();
+      const key=statsKey(pending.symbol,pending.interval,pending.strategy);
+      if(!statsByKey[key]) statsByKey[key]={wins:0,losses:0};
+      statsByKey[key].wins++;
+      statsAll.wins++;
+      pending=null; save(); renderStats();
     }else if(d.result === "LOSS"){
-      stats.losses++; pending = null; save(); renderStats();
+      const key=statsKey(pending.symbol,pending.interval,pending.strategy);
+      if(!statsByKey[key]) statsByKey[key]={wins:0,losses:0};
+      statsByKey[key].losses++;
+      statsAll.losses++;
+      pending=null; save(); renderStats();
     }else if(d.result === "DRAW"){
       pending = null; save();
     }else{
@@ -1166,15 +1225,35 @@ async function loadRadar(){
 }
 
 
-$("refresh").onclick = ()=>{loadSignal();loadAI();loadRadar();};
-$("rsiToggle").onclick=()=>{rsiOnline=!rsiOnline;if(rsiOnline)selectedStrategy="rsi";localStorage.setItem("is_trade_rsi_online",rsiOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&rsiOnline){loadSignal();loadRadar();}};
-$("oldToggle").onclick=()=>{oldOnline=!oldOnline;if(oldOnline)selectedStrategy="old_sniper";localStorage.setItem("is_trade_old_online",oldOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&oldOnline){loadSignal();loadRadar();}};
-$("sniper02Toggle").onclick=()=>{sniper02Online=!sniper02Online;if(sniper02Online)selectedStrategy="sniper_02";localStorage.setItem("is_trade_sniper02_online",sniper02Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper02Online){loadSignal();loadRadar();}};
-$("sniper03Toggle").onclick=()=>{sniper03Online=!sniper03Online;if(sniper03Online)selectedStrategy="sniper_03";localStorage.setItem("is_trade_sniper03_online",sniper03Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper03Online){loadSignal();loadRadar();}};
+function onMarketChanged(){
+  renderStats();
+  loadSignal();
+  loadAI();
+  loadRadar();
+}
+$("symbol").addEventListener("change", onMarketChanged);
+$("interval").addEventListener("change", onMarketChanged);
+$("refresh").onclick = ()=>{loadSignal();loadAI();loadRadar();renderStats();};
+$("rsiToggle").onclick=()=>{rsiOnline=!rsiOnline;if(rsiOnline)selectedStrategy="rsi";localStorage.setItem("is_trade_rsi_online",rsiOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();renderStats();if(isOnline&&rsiOnline){loadSignal();loadAI();loadRadar();}};
+$("oldToggle").onclick=()=>{oldOnline=!oldOnline;if(oldOnline)selectedStrategy="old_sniper";localStorage.setItem("is_trade_old_online",oldOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();renderStats();if(isOnline&&oldOnline){loadSignal();loadAI();loadRadar();}};
+$("sniper02Toggle").onclick=()=>{sniper02Online=!sniper02Online;if(sniper02Online)selectedStrategy="sniper_02";localStorage.setItem("is_trade_sniper02_online",sniper02Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();renderStats();if(isOnline&&sniper02Online){loadSignal();loadAI();loadRadar();}};
+$("sniper03Toggle").onclick=()=>{sniper03Online=!sniper03Online;if(sniper03Online)selectedStrategy="sniper_03";localStorage.setItem("is_trade_sniper03_online",sniper03Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();renderStats();if(isOnline&&sniper03Online){loadSignal();loadAI();loadRadar();}};
 $("aiToggle").onclick=()=>{aiOnline=!aiOnline;localStorage.setItem("is_trade_ai_online",aiOnline?"on":"off");const b=$("aiToggle");b.textContent=aiOnline?"● ONLINE":"● OFFLINE";b.className="onlineBtn "+(aiOnline?"online":"offline");if(aiOnline)loadAI();};
 
 $("reset").onclick = () => {
-  if(confirm("Zerar WIN e LOSS?")){
+  if(confirm("Zerar WIN e LOSS somente do ativo/timeframe/estratégia atual?")){
+    statsByKey[currentStatsKey()] = {wins:0,losses:0};
+    stats = statsByKey[currentStatsKey()];
+    pending = null;
+    save();
+    renderStats();
+  }
+};
+
+$("resetAll").onclick = () => {
+  if(confirm("Zerar WIN e LOSS de TODOS os ativos?")){
+    statsByKey = {};
+    statsAll = {wins:0,losses:0};
     stats = {wins:0,losses:0};
     pending = null;
     save();
