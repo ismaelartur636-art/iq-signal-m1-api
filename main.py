@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "Ismael Trade"
-APP_VERSION = "9.0.3"
+APP_VERSION = "9.0.4"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -917,6 +917,7 @@ let rsiOnline = localStorage.getItem("is_trade_rsi_online") !== "off";
 let oldOnline = localStorage.getItem("is_trade_old_online") === "on";
 let sniper02Online = localStorage.getItem("is_trade_sniper02_online") === "on";
 let sniper03Online = localStorage.getItem("is_trade_sniper03_online") === "on";
+let aiOnline = localStorage.getItem("is_trade_ai_online") !== "off";
 let selectedStrategy = localStorage.getItem("is_trade_selected_strategy") || (oldOnline ? "old_sniper" : sniper03Online ? "sniper_03" : sniper02Online ? "sniper_02" : "rsi");
 
 function statsKey(symbol, interval, strategy){
@@ -1127,45 +1128,113 @@ async function loadAI(){
  try{const symbol=$("symbol").value,interval=$("interval").value;const r=await fetch(`/ai-analysis?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}`,{cache:"no-store"});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.detail||"Falha na IA");const a=d.analysis,t=d.trend||{};main.textContent=`${a.signal} — ${a.confidence}%`;main.className="aiMain "+(a.signal==="CALL"?"good":a.signal==="PUT"?"bad":"");meta.textContent=`Qualidade: ${a.quality} | Regime: ${a.regime} | Tendência: ${t.trend||"NEUTRA"} | RSI 9: ${a.rsi9??"-"}`;reason.textContent=a.reason||"";status.textContent="● IA ONLINE • atualizada";}catch(e){status.textContent="IA AGUARDAR";main.textContent="ERRO NA ANÁLISE";meta.textContent=e.message||"";reason.textContent="";}}
 
 async function loadSignal(){
-  if(!isOnline){ renderMode(); return; }
+  if(!isOnline){
+    renderMode();
+    return;
+  }
+
   const symbol = $("symbol").value;
   const interval = $("interval").value;
   const strategy = activeStrategy();
-  if(!strategy){ renderMode(); return; }
+
+  if(!strategy){
+    renderMode();
+    return;
+  }
+
   $("signal").textContent = "ANALISANDO...";
   $("signal").className = "signal neutral";
+
+  if($("signalError")){
+    $("signalError").textContent = "";
+    $("signalError").style.display = "none";
+  }
+
   try{
-    const r = await fetch(`/signal?symbol=${encodeURIComponent(symbol)}&interval=${interval}&strategy=${encodeURIComponent(strategy)}`, {cache:"no-store"});
+    const r = await fetch(
+      `/signal?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&strategy=${encodeURIComponent(strategy)}`,
+      {cache:"no-store"}
+    );
+
     const d = await r.json();
+
     if(!r.ok){
-      const msg = d.detail && typeof d.detail === "object" ? d.detail.message : (d.detail || "Erro ao consultar o sinal.");
+      const msg = d.detail && typeof d.detail === "object"
+        ? d.detail.message
+        : (d.detail || "Erro ao consultar o sinal.");
       throw new Error(msg);
     }
-    $("signal").textContent = d.signal;
-    $("signal").className = "signal " + (d.signal==="CALL" ? "call" : d.signal==="PUT" ? "put" : "neutral");
-    $("confidence").textContent = d.confidence + "%";
-    if($("trend")){
-      $("trend").textContent = d.trend_text || d.trend || "Tendência neutra";
-    }
-    if($("signalError")){ $("signalError").textContent = ""; $("signalError").style.display = "none"; }
-    $("reference").textContent = d.reference_candle;
-    $("next").textContent = d.entry_time || d.next_candle;
-    $("entryTime").textContent = (d.entry_time || d.next_candle || "--").split(" ")[1] || "--";
-    $("expiry").textContent = (d.expiry_time || "").split(" ")[1] || "--";
-    $("rsi9").textContent = fmt(d.rsi9);
-    $("rsi14").textContent = fmt(d.rsi14);
-    if($("engulf")) $("engulf").textContent = d.bullish_engulfing || d.bearish_engulfing ? "SIM" : "NÃO";
-    if($("rejection")) $("rejection").textContent = d.bullish_rejection || d.bearish_rejection ? "SIM" : "NÃO";
-    if($("breakout")) $("breakout").textContent = d.bullish_breakout || d.bearish_breakout ? "SIM" : "NÃO";
-    if($("strength")) $("strength").textContent = (d.bullish_strength || d.bearish_strength) ? "SIM" : "NÃO";
 
-    if(d.signal !== "NEUTRO"){
-      falarSinal(d.signal, d.trend, d.confidence);
-      pending = {symbol, interval, strategy, reference_candle:d.reference_candle, entry_time:d.entry_time, direction:d.signal};
+    const signal = d.signal || "NEUTRO";
+
+    $("signal").textContent = signal;
+    $("signal").className = "signal " + (
+      signal === "CALL" ? "call" :
+      signal === "PUT" ? "put" : "neutral"
+    );
+
+    if($("confidence"))
+      $("confidence").textContent = `${Number(d.confidence || 0)}%`;
+
+    if($("reference"))
+      $("reference").textContent = d.reference_candle || "--";
+
+    if($("next"))
+      $("next").textContent = d.entry_time || d.next_candle || "--";
+
+    if($("entryTime")){
+      const entry = d.entry_time || d.next_candle || "";
+      $("entryTime").textContent = entry.includes(" ") ? entry.split(" ")[1] : (entry || "--");
+    }
+
+    if($("expiry")){
+      const expiry = d.expiry_time || "";
+      $("expiry").textContent = expiry.includes(" ") ? expiry.split(" ")[1] : (expiry || "--");
+    }
+
+    if($("trend"))
+      $("trend").textContent = d.trend_text || d.trend || "Tendência neutra";
+
+    // Campos opcionais: nunca podem interromper a exibição do sinal.
+    if($("rsi9")) $("rsi9").textContent = fmt(d.rsi9);
+    if($("rsi14")) $("rsi14").textContent = fmt(d.rsi14);
+
+    if($("engulf"))
+      $("engulf").textContent = (d.bullish_engulfing || d.bearish_engulfing) ? "SIM" : "NÃO";
+
+    if($("rejection"))
+      $("rejection").textContent = (d.bullish_rejection || d.bearish_rejection) ? "SIM" : "NÃO";
+
+    if($("breakout"))
+      $("breakout").textContent = (d.bullish_breakout || d.bearish_breakout) ? "SIM" : "NÃO";
+
+    if($("strength"))
+      $("strength").textContent = (d.bullish_strength || d.bearish_strength) ? "SIM" : "NÃO";
+
+    if($("signalError")){
+      $("signalError").textContent = "";
+      $("signalError").style.display = "none";
+    }
+
+    // Voz somente para CALL/PUT.
+    if(signal === "CALL" || signal === "PUT"){
+      falarSinal(signal, d.trend || "NEUTRA", d.confidence || 0);
+
+      pending = {
+        symbol,
+        interval,
+        strategy,
+        reference_candle: d.reference_candle,
+        entry_time: d.entry_time,
+        direction: signal
+      };
+
       save();
       scheduleResultCheck();
     }
+
   }catch(e){
+    console.error("ERRO LOAD SIGNAL:", e);
     showError(e.message || "Erro ao consultar o sinal.");
   }
 }
@@ -1263,6 +1332,11 @@ $("resetAll").onclick = () => {
 
 renderStats();
 renderMode();
+const aiButton = $("aiToggle");
+if(aiButton){
+  aiButton.textContent = aiOnline ? "● ONLINE" : "● OFFLINE";
+  aiButton.className = "onlineBtn " + (aiOnline ? "online" : "offline");
+}
 updateClock();
 updateCountdown();
 setInterval(updateClock, 1000);
