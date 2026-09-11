@@ -1,6 +1,6 @@
-
 fastapi
 uvicorn[standard]
 httpx
 scikit-learn
 xgboost
+lightgbm
