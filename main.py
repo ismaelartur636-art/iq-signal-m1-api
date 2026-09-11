@@ -713,7 +713,7 @@ async def home() -> HTMLResponse:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ismael Trade</title>
+<title>📉 SNIPER</title>
 <style>
 *{box-sizing:border-box}
 body{margin:0;font-family:Arial,sans-serif;background:#0b1020;color:#f5f7ff}
@@ -757,7 +757,7 @@ button{cursor:pointer;font-weight:bold}
 <body>
 <div class="container">
 <h1>Ismael Trade</h1>
-<div class="sub">Analisador de sinais M1 • dados Twelve Data</div>
+<div class="sub">ANÁLISE EM TEMPO REAL HORÁRIO DE BRASÍLIA• dados Twelve Data</div>
 
 <div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:12px">
 <div><div class="clockLabel">HORÁRIO DE BRASÍLIA</div><div id="clock" class="clock">--:--:--</div><div id="dateBr" class="small">--/--/----</div></div>
@@ -766,7 +766,7 @@ button{cursor:pointer;font-weight:bold}
 
 <div class="card" id="licenseCard">
 <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
-<div><div class="small">LICENÇA ISMAEL TRADE</div><div id="licenseStatus" class="value">VERIFICANDO...</div></div>
+<div><div class="small">LICENÇA APROVADA</div><div id="licenseStatus" class="value">VERIFICANDO...</div></div>
 <div><div class="small">VALIDADE</div><div id="licenseExpires" class="value">--</div></div>
 </div>
 <div class="small" style="margin-top:10px">Renovação: WhatsApp <b>55 84 99841-1282</b> / <b>55 84 99449-9442</b> • Instagram <b>@Ismaelartur26</b></div>
