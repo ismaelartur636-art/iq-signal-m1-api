@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 
 APP_NAME = "Trade sniper"
-APP_VERSION = "10.0.0"
+APP_VERSION = "10.1.0"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -1197,6 +1197,7 @@ async def signal_ai(symbol="EUR/USD", interval="1min"):
         "engine": "ISMAEL TRADE AI MULTI-STRATEGY",
         "symbol": symbol,
         "interval": interval,
+        "reference_candle": values[-2]["datetime"] if len(values) >= 2 else "--",
         "signal": ai["signal"],
         "confidence": ai["confidence"],
         "quality": "MUITO_ALTA" if ai["confidence"] >= 85 else "ALTA" if ai["confidence"] >= 78 else "MEDIA" if ai["confidence"] >= 68 else "BAIXA",
@@ -1693,18 +1694,27 @@ function showError(m){
  $("signalError").style.display="block"
 }
 function updateClock(){
- const n=new Date();
+ const n=new Date(Date.now()+serverOffsetMs);
  const p=new Intl.DateTimeFormat("pt-BR",{timeZone:"America/Sao_Paulo",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}).formatToParts(n);
  const g=k=>p.find(x=>x.type===k)?.value||"00";
  $("clock").textContent=`${g("hour")}:${g("minute")}:${g("second")}`;
  $("dateBr").textContent=new Intl.DateTimeFormat("pt-BR",{timeZone:"America/Sao_Paulo",day:"2-digit",month:"2-digit",year:"numeric"}).format(n)
 }
 let serverOffsetMs=0;
+let serverClockOffsetMs=0;
+let entryEpochMs=0;
 function updateCountdown(){
- const m=({"1min":1,"5min":5,"15min":15,"30min":30})[$("interval").value]||1;
- const n=new Date(Date.now()+serverOffsetMs),b=m*60000,next=Math.ceil(n.getTime()/b)*b;
- const t=Math.max(0,Math.floor((next-n.getTime())/1000));
- $("countdown").textContent=`${String(Math.floor(t/60)).padStart(2,"0")}:${String(t%60).padStart(2,"0")}`
+ const timer=$("countdown");
+ if(!timer)return;
+ let t;
+ if(entryEpochMs){
+  t=Math.max(0,Math.ceil((entryEpochMs-(Date.now()+serverClockOffsetMs))/1000));
+ }else{
+  const m=({"1min":1,"5min":5,"15min":15,"30min":30})[$("interval").value]||1;
+  const n=new Date(Date.now()+serverOffsetMs),b=m*60000,next=Math.ceil(n.getTime()/b)*b;
+  t=Math.max(0,Math.ceil((next-n.getTime())/1000));
+ }
+ timer.textContent=`${String(Math.floor(t/60)).padStart(2,"0")}:${String(t%60).padStart(2,"0")}`;
 }
 async function syncServerClock(){
  try{
@@ -1729,43 +1739,57 @@ function scheduleResultCheck(){
 }
 async function loadSignal(){
  if(!isOnline){renderMode();return}
- const symbol=$("symbol").value,interval=$("interval").value,strategy=activeStrategy();
- if(!strategy){renderMode();return}
- loadStatsFor(symbol,interval,strategy);
- $("signal").textContent="ANALISANDO...";$("signal").className="signal neutral";
+ const symbol=$("symbol").value,interval=$("interval").value;
+ loadStatsFor(symbol,interval,activeStrategy()||"rsi");
+ $("signal").textContent="ANALISANDO...";
+ $("signal").className="signal neutral";
+ if($("aiQuality"))$("aiQuality").textContent="ANALISANDO";
+ if($("aiReason"))$("aiReason").textContent="A IA está analisando o gráfico...";
+ if($("aiEntryStatus"))$("aiEntryStatus").textContent="🤖 ANALISANDO O GRÁFICO...";
  try{
-  const r=await fetch(`/signal?symbol=${encodeURIComponent(symbol)}&interval=${interval}&strategy=${strategy}`,{cache:"no-store"});
+  const r=await fetch(`/signal-ai?symbol=${encodeURIComponent(symbol)}&interval=${interval}`,{cache:"no-store"});
   const d=await r.json();
-  if(!r.ok)throw new Error(d.detail?.message||d.detail||"Erro ao consultar o sinal.");
-  $("signal").textContent=d.signal;
+  if(!r.ok)throw new Error(d.detail?.message||d.detail||"Erro ao consultar a IA.");
+
+  if(d.now_epoch_ms){
+   serverClockOffsetMs=Number(d.now_epoch_ms)-Date.now();
+   serverOffsetMs=serverClockOffsetMs;
+  }
+  if(d.entry_epoch_ms)entryEpochMs=Number(d.entry_epoch_ms);
+
+  $("signal").textContent=d.signal||"AGUARDANDO";
   $("signal").className="signal "+(d.signal==="CALL"?"call":d.signal==="PUT"?"put":"neutral");
-  $("confidence").textContent=d.confidence+"%";
+  $("confidence").textContent=(d.confidence??"--")+"%";
   if($("aiQuality"))$("aiQuality").textContent=(d.quality||"ANALISANDO").replaceAll("_"," ");
-  if($("aiAgreement"))$("aiAgreement").textContent=(d.agreement??"--")+"/"+(d.engines??"--");
-  if($("aiConfidence"))$("aiConfidence").textContent=(d.ai_confidence??d.confidence??"--")+"%";
+  if($("aiAgreement"))$("aiAgreement").textContent=d.sniper_trigger?
+    `${d.sniper_trigger.name} • ${d.sniper_trigger.signal} • ${d.sniper_trigger.confidence}%`:"Nenhum Sniper";
+  if($("aiConfidence"))$("aiConfidence").textContent=(d.confidence??"--")+"%";
   if($("aiReason"))$("aiReason").textContent=d.reason||"Análise em andamento.";
-  $("signalError").style.display="none";
-  $("reference").textContent=d.reference_candle;
-  $("next").textContent=d.entry_time||d.next_candle;
-  $("entryTime").textContent=(d.entry_time||d.next_candle||"--").split(" ")[1]||"--";
-  $("expiry").textContent=(d.expiry_time||"").split(" ")[1]||"--";
-  if(d.signal!=="NEUTRO"){
+  if($("reference"))$("reference").textContent=d.reference_candle||"--";
+  if($("next"))$("next").textContent=d.next_candle||d.entry_time||"--";
+  if($("entryTime"))$("entryTime").textContent=(d.entry_time||"--").split(" ")[1]||"--";
+  if($("expiry"))$("expiry").textContent=(d.expiry_time||"--").split(" ")[1]||"--";
+  if($("signalError"))$("signalError").style.display="none";
+  if(typeof setAiEntryStatus==="function")setAiEntryStatus(d);
+
+  if(d.confirmed && (d.signal==="CALL"||d.signal==="PUT")){
    alertNewSignal(d.signal,d.reference_candle,d.entry_time);
    pending={symbol,interval,reference_candle:d.reference_candle,entry_time:d.entry_time,direction:d.signal};
-   save();scheduleResultCheck()
+   save();scheduleResultCheck();
+  }else{
+   pending=null;save();
   }
- }catch(e){showError(e.message)}
-}
-async function checkResult(){
- if(!pending)return;
- try{
-  const r=await fetch(`/result?${new URLSearchParams(pending).toString()}`,{cache:"no-store"}),d=await r.json();
-  if(!r.ok)return;
-  if(d.result==="WIN"){stats.wins++;pending=null;save();renderStats()}
-  else if(d.result==="LOSS"){stats.losses++;pending=null;save();renderStats()}
-  else if(d.result==="DRAW"){pending=null;save()}
-  else scheduleResultCheck()
- }catch(e){scheduleResultCheck()}
+ }catch(e){
+  $("signal").textContent="AGUARDANDO";
+  $("signal").className="signal neutral";
+  if($("aiQuality"))$("aiQuality").textContent="AGUARDAR";
+  if($("aiReason"))$("aiReason").textContent=e.message||"Erro na análise.";
+  if($("aiEntryStatus")){
+   $("aiEntryStatus").className="aiEntryStatus analyzing";
+   $("aiEntryStatus").textContent="⚠️ IA aguardando dados do servidor...";
+  }
+  showError(e.message);
+ }
 }
 function radarRow(i){
  const c=i.direction==="CALL"?"call":i.direction==="PUT"?"put":"neutral";
@@ -1878,14 +1902,17 @@ syncServerClock();loadLicense();loadSignal();loadRadar();loadRanking();
     loadAI();
 
 let lastEntrySlot="";
+let lastAiRefresh=0;
 setInterval(()=>{
- if(pending)return;
  const m=({"1min":1,"5min":5,"15min":15,"30min":30})[$("interval").value]||1;
  const n=new Date(Date.now()+serverOffsetMs);
  const slot=Math.floor(n.getTime()/(m*60000));
- const seconds=Math.floor((n.getTime()%(m*60000))/1000);
- if(seconds<=3&&String(slot)!==lastEntrySlot){
-  lastEntrySlot=String(slot);loadSignal()
+ const secondsInto=Math.floor((n.getTime()%(m*60000))/1000);
+ const nowMs=Date.now();
+ if(nowMs-lastAiRefresh>15000 || (secondsInto>=m*60-6 && String(slot)!==lastEntrySlot)){
+  lastAiRefresh=nowMs;
+  lastEntrySlot=String(slot);
+  loadSignal();
  }
 },1000);
 
@@ -1895,8 +1922,6 @@ setInterval(loadLicense,60000);
 setInterval(loadRadar,120000);
 setInterval(loadRanking,120000);
 
-let serverClockOffsetMs = 0;
-let entryEpochMs = 0;
 let statsWin = Number(localStorage.getItem("ismael_trade_win") || 0);
 let statsLoss = Number(localStorage.getItem("ismael_trade_loss") || 0);
 
