@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "Ismael Trade"
-APP_VERSION = "8.2.0"
+APP_VERSION = "8.6.0"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -290,83 +290,129 @@ def adx(candles: List[Dict[str, Any]], period: int) -> List[float]:
     return result
 
 
-def analyze(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # Somente velas fechadas são usadas na análise.
-    # A última vela pode ainda estar em formação.
-    if len(candles) < 60:
+def analyze(candles: List[Dict[str, Any]], strategy: str = "rsi") -> Dict[str, Any]:
+    """Analisa somente candles fechados para reduzir repintura.
+
+    SNIPER 01: leitura de price action/confluência por candles.
+    SNIPER X: confluência RSI 9 + RSI 14.
+    """
+    if len(candles) < 30:
         raise HTTPException(status_code=422, detail="Dados insuficientes para análise.")
 
     closed = candles[:-1]
-    closes = [c["close"] for c in closed]
+    reference = closed[-1]
+    previous = closed[-2]
+    next_candle = candles[-1]
+    strategy = strategy.lower().strip()
 
-    ema3_values = ema(closes, 3)
-    ema7_values = ema(closes, 7)
+    def body(c):
+        return abs(c["close"] - c["open"])
+
+    def rng(c):
+        return max(c["high"] - c["low"], 1e-12)
+
+    if strategy == "old_sniper":
+        # SNIPER 01 — Price Action:
+        # CALL: engolfo de alta, rejeição de fundo, rompimento da máxima,
+        # vela de força compradora e confirmação pela estrutura anterior.
+        # PUT: condições equivalentes para baixa.
+        prev_body = body(previous)
+        ref_body = body(reference)
+        ref_range = rng(reference)
+        ref_upper = reference["high"] - max(reference["open"], reference["close"])
+        ref_lower = min(reference["open"], reference["close"]) - reference["low"]
+
+        bullish = reference["close"] > reference["open"]
+        bearish = reference["close"] < reference["open"]
+        prev_bearish = previous["close"] < previous["open"]
+        prev_bullish = previous["close"] > previous["open"]
+
+        bull_engulf = (bullish and prev_bearish and
+                       reference["open"] <= previous["close"] and
+                       reference["close"] >= previous["open"])
+        bear_engulf = (bearish and prev_bullish and
+                       reference["open"] >= previous["close"] and
+                       reference["close"] <= previous["open"])
+
+        # Rejeição: pavio contrário relativamente grande.
+        bull_rejection = bullish and ref_lower >= max(ref_body * 1.2, ref_range * 0.30)
+        bear_rejection = bearish and ref_upper >= max(ref_body * 1.2, ref_range * 0.30)
+
+        bull_break = reference["high"] > previous["high"] and reference["close"] > previous["high"]
+        bear_break = reference["low"] < previous["low"] and reference["close"] < previous["low"]
+
+        bull_strength = bullish and ref_body >= ref_range * 0.60 and ref_upper <= ref_range * 0.20
+        bear_strength = bearish and ref_body >= ref_range * 0.60 and ref_lower <= ref_range * 0.20
+
+        # Estrutura: fechamento na metade correspondente e direção coerente.
+        bull_structure = bullish and reference["close"] >= previous["close"]
+        bear_structure = bearish and reference["close"] <= previous["close"]
+
+        bull_flags = [bull_engulf, bull_rejection, bull_break, bull_strength, bull_structure]
+        bear_flags = [bear_engulf, bear_rejection, bear_break, bear_strength, bear_structure]
+        bull_score = sum(bull_flags)
+        bear_score = sum(bear_flags)
+
+        if bull_score >= 3 and bull_score > bear_score:
+            signal = "CALL"
+            confidence = min(95, 55 + bull_score * 7)
+        elif bear_score >= 3 and bear_score > bull_score:
+            signal = "PUT"
+            confidence = min(95, 55 + bear_score * 7)
+        else:
+            signal = "NEUTRO"
+            confidence = 50
+
+        return {
+            "signal": signal,
+            "confidence": int(confidence),
+            "reference_candle": reference["datetime"],
+            "next_candle": next_candle["datetime"],
+            "strategy": "SNIPER 01",
+            "strategy_code": "old_sniper",
+            "bull_score": bull_score,
+            "bear_score": bear_score,
+            "bullish_engulfing": bull_engulf,
+            "bearish_engulfing": bear_engulf,
+            "bullish_rejection": bull_rejection,
+            "bearish_rejection": bear_rejection,
+            "bullish_breakout": bull_break,
+            "bearish_breakout": bear_break,
+            "bullish_strength": bull_strength,
+            "bearish_strength": bear_strength,
+            "structure_confirmation": bull_structure if signal == "CALL" else bear_structure if signal == "PUT" else False,
+            "non_repaint_reference": True,
+            "ok": True,
+        }
+
+    # SNIPER X — apenas RSI 9 + RSI 14 em confluência.
+    closes = [float(c["close"]) for c in closed]
+    rsi9_values = rsi(closes, 9)
     rsi14_values = rsi(closes, 14)
-    adx21_values = adx(closed, 21)
-    adx48_values = adx(closed, 48)
-
     i = len(closed) - 1
-    ema3_value = ema3_values[i]
-    ema7_value = ema7_values[i]
+    rsi9_value = rsi9_values[i]
     rsi14_value = rsi14_values[i]
-    adx21_value = adx21_values[i]
-    adx48_value = adx48_values[i]
 
-    call_score = 0
-    put_score = 0
-
-    if ema3_value > ema7_value:
-        call_score += 2
-    elif ema3_value < ema7_value:
-        put_score += 2
-
-    if rsi14_value >= 50:
-        call_score += 1
-    if rsi14_value <= 50:
-        put_score += 1
-
-    if adx21_value >= 20:
-        if ema3_value > ema7_value:
-            call_score += 1
-        elif ema3_value < ema7_value:
-            put_score += 1
-
-    if adx48_value >= 20:
-        if ema3_value > ema7_value:
-            call_score += 1
-        elif ema3_value < ema7_value:
-            put_score += 1
-
-    if rsi14_value < 30:
-        call_score += 1
-    elif rsi14_value > 70:
-        put_score += 1
-
-    if call_score >= 4 and call_score > put_score:
+    if rsi9_value > 50.0 and rsi14_value > 50.0:
         signal = "CALL"
-        confidence = min(95, 70 + (call_score - put_score) * 5)
-    elif put_score >= 4 and put_score > call_score:
+    elif rsi9_value < 50.0 and rsi14_value < 50.0:
         signal = "PUT"
-        confidence = min(95, 70 + (put_score - call_score) * 5)
     else:
         signal = "NEUTRO"
-        confidence = 50
 
-    reference = closed[-1]
-    next_candle = candles[-1]
-
+    confidence = 50 if signal == "NEUTRO" else int(min(
+        95, 55 + min(abs(rsi9_value - 50), abs(rsi14_value - 50)) * 1.8
+    ))
     return {
         "signal": signal,
         "confidence": confidence,
         "reference_candle": reference["datetime"],
         "next_candle": next_candle["datetime"],
-        "ema3": round(ema3_value, 8),
-        "ema7": round(ema7_value, 8),
+        "rsi9": round(rsi9_value, 2),
         "rsi14": round(rsi14_value, 2),
-        "adx21": round(adx21_value, 2),
-        "adx48": round(adx48_value, 2),
-        "call_score": call_score,
-        "put_score": put_score,
+        "rsi_confluence": signal != "NEUTRO",
+        "strategy": "SNIPER X",
+        "strategy_code": "rsi",
         "non_repaint_reference": True,
         "ok": True,
     }
@@ -411,6 +457,16 @@ button{cursor:pointer;font-weight:bold}
 .hidden{display:none}
 .good{color:#52f09d}.bad{color:#ff718b}
 .footer{font-size:12px;color:#7f8aa5;line-height:1.5}
+.clock{font-size:30px;font-weight:800;letter-spacing:1px}
+.clockLabel{font-size:11px;color:#8f9ab2;text-transform:uppercase}
+.onlineBtn{border-radius:999px;padding:10px 16px;font-weight:800}.onlineBtn.online{background:#0d3b2a;border-color:#2ee88a;color:#52f09d}.onlineBtn.offline{background:#431b25;border-color:#ff718b;color:#ff718b}
+.badge{display:inline-block;padding:7px 11px;border-radius:999px;background:#0f1526;border:1px solid #34405e;font-size:12px;font-weight:800}
+.sniper{border:1px solid #394765;background:linear-gradient(135deg,#151c30,#10172a)}
+.sniperTitle{font-size:20px;font-weight:800;margin:4px 0}
+.countdown{font-size:25px;font-weight:800}
+.entry{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+.entryBox{background:#0f1526;border-radius:12px;padding:12px}
+@media(max-width:520px){.entry{grid-template-columns:1fr}}
 @media(max-width:520px){.grid{grid-template-columns:1fr 1fr}.params{grid-template-columns:1fr}}
 </style>
 </head>
@@ -418,6 +474,11 @@ button{cursor:pointer;font-weight:bold}
 <div class="container">
 <h1>Ismael Trade</h1>
 <div class="sub">Analisador de sinais M1 • dados Twelve Data</div>
+
+<div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:12px">
+<div><div class="clockLabel">HORÁRIO DE BRASÍLIA</div><div id="clock" class="clock">--:--:--</div><div id="dateBr" class="small">--/--/----</div></div>
+<div class="badge">● MERCADO • MONITORANDO</div>
+</div>
 
 <div class="card">
 <div class="row">
@@ -441,9 +502,25 @@ button{cursor:pointer;font-weight:bold}
 <button id="refresh" style="margin-top:10px">ATUALIZAR SINAL</button>
 </div>
 
+<div class="card sniper">
+<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+<div><div class="small">ESTRATÉGIA 1</div><div class="sniperTitle">SNIPER X</div><div class="small">Confluência entre RSI 9 e RSI 14</div></div>
+<button id="rsiToggle" class="onlineBtn online" style="width:auto;margin:0">● ONLINE</button>
+</div><div style="margin-top:10px" class="badge">RSI 9 + RSI 14 • CONFLUÊNCIA</div></div>
+<div class="card sniper">
+<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+<div><div class="small">ESTRATÉGIA 2</div><div class="sniperTitle">SNIPER 01</div><div class="small">Price Action • 5 confirmações</div></div>
+<button id="oldToggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button>
+</div><div style="margin-top:10px" class="badge">Engolfo • Rejeição • Rompimento • Força • Estrutura</div></div>
+
 <div class="card">
 <div class="small">SINAL</div>
 <div id="signal" class="signal neutral">AGUARDANDO</div>
+<div class="entry">
+<div class="entryBox"><div class="small">HORÁRIO DE ENTRADA</div><div id="entryTime" class="value">--</div></div>
+<div class="entryBox"><div class="small">EXPIRAÇÃO</div><div id="expiry" class="value">--</div></div>
+</div>
+<div style="margin-top:12px"><div class="small">CRONÔMETRO DE ENTRADA / PRÓXIMA VELA</div><div id="countdown" class="countdown">--:--</div></div>
 <div class="row" style="margin-top:12px">
 <div class="field"><div class="small">Confiança</div><div id="confidence" class="value">--</div></div>
 <div class="field"><div class="small">Referência</div><div id="reference" class="value">--</div></div>
@@ -461,30 +538,12 @@ button{cursor:pointer;font-weight:bold}
 <button id="reset" style="margin-top:10px">ZERAR RESULTADOS</button>
 </div>
 
-<div class="card">
-<div class="row" style="align-items:center;justify-content:space-between">
-<div>
-<div class="small">PARÂMETROS DOS INDICADORES</div>
-<div id="paramStatus" class="value">VISÍVEL</div>
-</div>
-<button id="toggleParams" style="width:auto">OCULTAR PARÂMETROS</button>
-</div>
-<div id="paramsBox" class="params" style="margin-top:12px">
-<div class="param"><span class="small">EMA rápida</span><div class="value">3</div></div>
-<div class="param"><span class="small">EMA lenta</span><div class="value">7</div></div>
-<div class="param"><span class="small">RSI</span><div class="value">14</div></div>
-<div class="param"><span class="small">ADX 1</span><div class="value">21</div></div>
-<div class="param"><span class="small">ADX 2</span><div class="value">48</div></div>
-<div class="param"><span class="small">Nível ADX</span><div class="value">20</div></div>
-<div class="param"><span class="small">CALL Score</span><div id="callScore" class="value">--</div></div>
-<div class="param"><span class="small">PUT Score</span><div id="putScore" class="value">--</div></div>
-<div class="param"><span class="small">EMA 3 atual</span><div id="ema3" class="value">--</div></div>
-<div class="param"><span class="small">EMA 7 atual</span><div id="ema7" class="value">--</div></div>
-<div class="param"><span class="small">RSI 14 atual</span><div id="rsi14" class="value">--</div></div>
-<div class="param"><span class="small">ADX 21 atual</span><div id="adx21" class="value">--</div></div>
-<div class="param"><span class="small">ADX 48 atual</span><div id="adx48" class="value">--</div></div>
-</div>
-</div>
+<div class="card"><div class="small">CONFIGURAÇÃO DAS ESTRATÉGIAS</div><div class="params" style="margin-top:12px">
+<div class="param"><span class="small">Estratégia ativa</span><div id="strategyStatus" class="value">SNIPER X</div></div><div class="param"><span class="small">Modo geral</span><div id="modeStatus" class="value">ONLINE</div></div>
+<div class="param"><span class="small">RSI 9 atual</span><div id="rsi9" class="value">--</div></div><div class="param"><span class="small">RSI 14 atual</span><div id="rsi14" class="value">--</div></div>
+<div class="param"><span class="small">Engolfo</span><div id="engulf" class="value">--</div></div><div class="param"><span class="small">Rejeição</span><div id="rejection" class="value">--</div></div>
+<div class="param"><span class="small">Rompimento</span><div id="breakout" class="value">--</div></div><div class="param"><span class="small">Força / Estrutura</span><div id="strength" class="value">--</div></div>
+</div></div>
 
 <div class="card footer">
 O sinal é probabilístico e não garante WIN. A análise usa velas fechadas para reduzir repintura. Os preços da Twelve Data podem apresentar diferenças em relação à cotação da sua corretora.
@@ -496,6 +555,9 @@ const $ = id => document.getElementById(id);
 let pending = JSON.parse(localStorage.getItem("is_trade_pending") || "null");
 let stats = JSON.parse(localStorage.getItem("is_trade_stats") || '{"wins":0,"losses":0}');
 let paramsVisible = localStorage.getItem("is_trade_params") !== "hidden";
+let isOnline = true;
+let rsiOnline = localStorage.getItem("is_trade_rsi_online") !== "off";
+let oldOnline = localStorage.getItem("is_trade_old_online") === "on";
 
 function save(){
   localStorage.setItem("is_trade_stats", JSON.stringify(stats));
@@ -508,11 +570,10 @@ function renderStats(){
   const total = stats.wins + stats.losses;
   $("accuracy").textContent = total ? ((stats.wins/total)*100).toFixed(1)+"%" : "0%";
 }
-function renderParams(){
-  $("paramsBox").classList.toggle("hidden", !paramsVisible);
-  $("paramStatus").textContent = paramsVisible ? "VISÍVEL" : "OCULTO";
-  $("toggleParams").textContent = paramsVisible ? "OCULTAR PARÂMETROS" : "MOSTRAR PARÂMETROS";
-}
+function setStrategyButton(id, online){const b=$(id);b.textContent=online?"● ONLINE":"● OFFLINE";b.className=online?"onlineBtn online":"onlineBtn offline";}
+function activeStrategy(){if(oldOnline)return "old_sniper";if(rsiOnline)return "rsi";return null;}
+function renderMode(){setStrategyButton("rsiToggle",rsiOnline);setStrategyButton("oldToggle",oldOnline);const active=activeStrategy();$("modeStatus").textContent=isOnline&&active?"ONLINE":"OFFLINE";$("strategyStatus").textContent=active==="old_sniper"?"SNIPER 01":active==="rsi"?"SNIPER X":"NENHUMA";if(!isOnline||!active){$("signal").textContent="OFFLINE";$("signal").className="signal neutral";}}
+
 function fmt(v){ return v == null ? "--" : v; }
 
 let resultTimer = null;
@@ -522,6 +583,27 @@ function showError(message){
   $("signal").className = "signal neutral";
   $("confidence").textContent = message;
 }
+function updateClock(){
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat("pt-BR", {timeZone:"America/Sao_Paulo",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}).formatToParts(now);
+  const get = k => parts.find(p => p.type === k)?.value || "00";
+  $("clock").textContent = `${get("hour")}:${get("minute")}:${get("second")}`;
+  $("dateBr").textContent = new Intl.DateTimeFormat("pt-BR", {timeZone:"America/Sao_Paulo",day:"2-digit",month:"2-digit",year:"numeric"}).format(now);
+}
+function updateCountdown(){
+  const interval = $("interval").value;
+  const minutes = ({"1min":1,"5min":5,"15min":15,"30min":30})[interval] || 1;
+  const now = new Date();
+  const ms = now.getTime();
+  const block = minutes*60*1000;
+  const next = Math.ceil(ms/block)*block;
+  let left = Math.max(0, next-ms);
+  const total = Math.floor(left/1000);
+  const mm = String(Math.floor(total/60)).padStart(2,"0");
+  const ss = String(total%60).padStart(2,"0");
+  $("countdown").textContent = `${mm}:${ss}`;
+}
+
 
 function scheduleResultCheck(){
   if(resultTimer) clearTimeout(resultTimer);
@@ -541,12 +623,15 @@ function scheduleResultCheck(){
 }
 
 async function loadSignal(){
+  if(!isOnline){ renderMode(); return; }
   const symbol = $("symbol").value;
   const interval = $("interval").value;
+  const strategy = activeStrategy();
+  if(!strategy){ renderMode(); return; }
   $("signal").textContent = "ANALISANDO...";
   $("signal").className = "signal neutral";
   try{
-    const r = await fetch(`/signal?symbol=${encodeURIComponent(symbol)}&interval=${interval}`, {cache:"no-store"});
+    const r = await fetch(`/signal?symbol=${encodeURIComponent(symbol)}&interval=${interval}&strategy=${encodeURIComponent(strategy)}`, {cache:"no-store"});
     const d = await r.json();
     if(!r.ok){
       const msg = d.detail && typeof d.detail === "object" ? d.detail.message : (d.detail || "Erro ao consultar o sinal.");
@@ -557,13 +642,16 @@ async function loadSignal(){
     $("confidence").textContent = d.confidence + "%";
     $("reference").textContent = d.reference_candle;
     $("next").textContent = d.next_candle;
-    $("callScore").textContent = d.call_score;
-    $("putScore").textContent = d.put_score;
-    $("ema3").textContent = fmt(d.ema3);
-    $("ema7").textContent = fmt(d.ema7);
+    $("entryTime").textContent = d.next_candle;
+    const nextDt = new Date(d.next_candle.replace(" ","T"));
+    const mins = ({"1min":1,"5min":5,"15min":15,"30min":30})[interval] || 1;
+    $("expiry").textContent = Number.isNaN(nextDt.getTime()) ? "--" : new Date(nextDt.getTime()+mins*60000).toLocaleString("pt-BR", {hour:"2-digit",minute:"2-digit",second:"2-digit"});
+    $("rsi9").textContent = fmt(d.rsi9);
     $("rsi14").textContent = fmt(d.rsi14);
-    $("adx21").textContent = fmt(d.adx21);
-    $("adx48").textContent = fmt(d.adx48);
+    if($("engulf")) $("engulf").textContent = d.bullish_engulfing || d.bearish_engulfing ? "SIM" : "NÃO";
+    if($("rejection")) $("rejection").textContent = d.bullish_rejection || d.bearish_rejection ? "SIM" : "NÃO";
+    if($("breakout")) $("breakout").textContent = d.bullish_breakout || d.bearish_breakout ? "SIM" : "NÃO";
+    if($("strength")) $("strength").textContent = (d.bullish_strength || d.bearish_strength) ? "SIM" : "NÃO";
 
     if(d.signal !== "NEUTRO"){
       pending = {symbol, interval, reference_candle:d.reference_candle, direction:d.signal};
@@ -599,11 +687,8 @@ async function checkResult(){
 
 
 $("refresh").onclick = loadSignal;
-$("toggleParams").onclick = () => {
-  paramsVisible = !paramsVisible;
-  localStorage.setItem("is_trade_params", paramsVisible ? "visible" : "hidden");
-  renderParams();
-};
+$("rsiToggle").onclick=()=>{rsiOnline=!rsiOnline;if(rsiOnline){oldOnline=false;localStorage.setItem("is_trade_old_online","off");}localStorage.setItem("is_trade_rsi_online",rsiOnline?"on":"off");pending=null;save();renderMode();if(isOnline&&rsiOnline)loadSignal();};
+$("oldToggle").onclick=()=>{oldOnline=!oldOnline;if(oldOnline){rsiOnline=false;localStorage.setItem("is_trade_rsi_online","off");}localStorage.setItem("is_trade_old_online",oldOnline?"on":"off");pending=null;save();renderMode();if(isOnline&&oldOnline)loadSignal();};
 $("reset").onclick = () => {
   if(confirm("Zerar WIN e LOSS?")){
     stats = {wins:0,losses:0};
@@ -614,7 +699,11 @@ $("reset").onclick = () => {
 };
 
 renderStats();
-renderParams();
+renderMode();
+updateClock();
+updateCountdown();
+setInterval(updateClock, 1000);
+setInterval(updateCountdown, 250);
 loadSignal();
 if(pending) scheduleResultCheck();
 // Uma análise automática por minuto. O cache do servidor evita chamadas duplicadas.
@@ -662,9 +751,12 @@ async def candles(
 async def signal(
     symbol: str = "EUR/USD",
     interval: str = "1min",
+    strategy: str = "rsi",
 ) -> Dict[str, Any]:
+    if strategy not in {"rsi", "old_sniper"}:
+        raise HTTPException(status_code=400, detail="Estratégia inválida.")
     values = await get_candles(symbol, interval, 100)
-    result = analyze(values)
+    result = analyze(values, strategy)
     result.update(
         {
             "source": "Twelve Data",
