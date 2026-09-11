@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "Ismael Trade"
-APP_VERSION = "9.0.4"
+APP_VERSION = "9.0.5"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -858,8 +858,26 @@ O sinal é probabilístico e não garante WIN. A análise usa velas fechadas par
 <script>
 const $ = id => document.getElementById(id);
 let pending = JSON.parse(localStorage.getItem("is_trade_pending") || "null");
-let stats = JSON.parse(localStorage.getItem("is_trade_stats") || '{"wins":0,"losses":0}');
 let isOnline = true;
+
+// WIN/LOSS separados por ATIVO + TEMPO + ESTRATÉGIA.
+let statsKey = "";
+let stats = {wins:0, losses:0};
+
+function getStatsKey(symbol, interval, strategy){
+  return `${symbol}|${interval}|${strategy}`;
+}
+function loadStatsFor(symbol, interval, strategy){
+  statsKey = getStatsKey(symbol, interval, strategy);
+  const all = JSON.parse(localStorage.getItem("is_trade_stats_by_key") || "{}");
+  stats = all[statsKey] || {wins:0, losses:0};
+  renderStats();
+}
+function saveStats(){
+  const all = JSON.parse(localStorage.getItem("is_trade_stats_by_key") || "{}");
+  all[statsKey] = stats;
+  localStorage.setItem("is_trade_stats_by_key", JSON.stringify(all));
+}
 let rsiOnline = localStorage.getItem("is_trade_rsi_online") !== "off";
 let oldOnline = localStorage.getItem("is_trade_old_online") === "on";
 let sniper02Online = localStorage.getItem("is_trade_sniper02_online") === "on";
@@ -867,7 +885,7 @@ let sniper03Online = localStorage.getItem("is_trade_sniper03_online") === "on";
 let selectedStrategy = localStorage.getItem("is_trade_selected_strategy") || (oldOnline ? "old_sniper" : sniper03Online ? "sniper_03" : sniper02Online ? "sniper_02" : "rsi");
 
 function save(){
-  localStorage.setItem("is_trade_stats", JSON.stringify(stats));
+  saveStats();
   if(pending) localStorage.setItem("is_trade_pending", JSON.stringify(pending));
   else localStorage.removeItem("is_trade_pending");
 }
@@ -1023,6 +1041,10 @@ async function loadSignal(){
   const interval = $("interval").value;
   const strategy = activeStrategy();
   if(!strategy){ renderMode(); return; }
+
+  // Mostra o placar correspondente à configuração atual.
+  loadStatsFor(symbol, interval, strategy);
+
   $("signal").textContent = "ANALISANDO...";
   $("signal").className = "signal neutral";
   try{
@@ -1106,12 +1128,12 @@ async function loadRadar(){
 
 
 $("refresh").onclick = ()=>{loadSignal();loadRadar();};
-$("rsiToggle").onclick=()=>{rsiOnline=!rsiOnline;if(rsiOnline)selectedStrategy="rsi";localStorage.setItem("is_trade_rsi_online",rsiOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&rsiOnline){loadSignal();loadRadar();}};
-$("oldToggle").onclick=()=>{oldOnline=!oldOnline;if(oldOnline)selectedStrategy="old_sniper";localStorage.setItem("is_trade_old_online",oldOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&oldOnline){loadSignal();loadRadar();}};
-$("sniper02Toggle").onclick=()=>{sniper02Online=!sniper02Online;if(sniper02Online)selectedStrategy="sniper_02";localStorage.setItem("is_trade_sniper02_online",sniper02Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper02Online){loadSignal();loadRadar();}};
-$("sniper03Toggle").onclick=()=>{sniper03Online=!sniper03Online;if(sniper03Online)selectedStrategy="sniper_03";localStorage.setItem("is_trade_sniper03_online",sniper03Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper03Online){loadSignal();loadRadar();}};
+$("rsiToggle").onclick=()=>{rsiOnline=!rsiOnline;if(rsiOnline)selectedStrategy="rsi";localStorage.setItem("is_trade_rsi_online",rsiOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&rsiOnline){loadStatsFor($("symbol").value,$("interval").value,"rsi");loadSignal();loadRadar();}};
+$("oldToggle").onclick=()=>{oldOnline=!oldOnline;if(oldOnline)selectedStrategy="old_sniper";localStorage.setItem("is_trade_old_online",oldOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&oldOnline){loadStatsFor($("symbol").value,$("interval").value,"old_sniper");loadSignal();loadRadar();}};
+$("sniper02Toggle").onclick=()=>{sniper02Online=!sniper02Online;if(sniper02Online)selectedStrategy="sniper_02";localStorage.setItem("is_trade_sniper02_online",sniper02Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper02Online){loadStatsFor($("symbol").value,$("interval").value,"sniper_02");loadSignal();loadRadar();}};
+$("sniper03Toggle").onclick=()=>{sniper03Online=!sniper03Online;if(sniper03Online)selectedStrategy="sniper_03";localStorage.setItem("is_trade_sniper03_online",sniper03Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper03Online){loadStatsFor($("symbol").value,$("interval").value,"sniper_03");loadSignal();loadRadar();}};
 $("reset").onclick = () => {
-  if(confirm("Zerar WIN e LOSS?")){
+  if(confirm("Zerar WIN e LOSS deste ATIVO/TEMPO/ESTRATÉGIA?")){
     stats = {wins:0,losses:0};
     pending = null;
     save();
@@ -1119,7 +1141,26 @@ $("reset").onclick = () => {
   }
 };
 
-renderStats();
+$("symbol").addEventListener("change", ()=>{
+  pending = null;
+  save();
+  loadSignal();
+  loadRadar();
+});
+
+$("interval").addEventListener("change", ()=>{
+  pending = null;
+  save();
+  loadSignal();
+  loadRadar();
+});
+
+const initialStrategy = activeStrategy();
+if(initialStrategy){
+  loadStatsFor($("symbol").value, $("interval").value, initialStrategy);
+}else{
+  renderStats();
+}
 renderMode();
 updateClock();
 updateCountdown();
