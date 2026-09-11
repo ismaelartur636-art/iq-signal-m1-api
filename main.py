@@ -1,85 +1,117 @@
 import os
 import asyncio
 import time
+import json
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
 
 # ============================================================
-# CONFIGURAÇÃO
+# MEGA IA
 # ============================================================
 
-APP_NAME = "Trade Sniper"
-APP_VERSION = "10.2.0"
+APP_NAME = "MEGA IA"
+APP_VERSION = "11.0.0"
 
-KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+BR_TZ = ZoneInfo("America/Sao_Paulo")
+UTC = timezone.utc
+
+
+# ============================================================
+# CONFIGURAÇÃO TWELVE DATA
+# ============================================================
+
+TWELVE_DATA_API_KEY = os.getenv(
+    "TWELVE_DATA_API_KEY",
+    ""
+).strip()
 
 BASE_URL = "https://api.twelvedata.com/time_series"
 
-SP_TZ = ZoneInfo("America/Sao_Paulo")
+
+# ============================================================
+# LICENÇA
+# ============================================================
 
 LICENSE_EXPIRES = os.getenv(
-    "ISMAEL_TRADE_LICENSE_EXPIRES",
+    "LICENSE_EXPIRES",
     "2026-12-31"
-).strip()
+)
 
-LICENSE_WHATSAPP_1 = "55 84 99841-1282"
-LICENSE_WHATSAPP_2 = "55 84 99449-9442"
-LICENSE_INSTAGRAM = "@Ismaelartur26"
+WHATSAPP_1 = os.getenv(
+    "WHATSAPP_1",
+    "55 84 99841-1282"
+)
+
+WHATSAPP_2 = os.getenv(
+    "WHATSAPP_2",
+    "55 84 99449-9442"
+)
+
+INSTAGRAM = os.getenv(
+    "INSTAGRAM",
+    "@Ismaelartur26"
+)
+
+
+# ============================================================
+# CONFIGURAÇÕES DA IA
+# ============================================================
+
+ENTRY_WINDOW_SECONDS = 5
+
+AI_MIN_CONFIDENCE = 68.0
+
+CACHE_SECONDS = 20
+
+RADAR_CACHE_SECONDS = 90
+
+RANKING_CACHE_SECONDS = 180
 
 
 # ============================================================
 # TIMEFRAMES
 # ============================================================
 
-ALLOWED_INTERVALS = {
-    "1min": 1,
-    "5min": 5,
-    "15min": 15,
-    "30min": 30,
-}
-
-ENTRY_WINDOW_SECONDS = 5
-
-AI_MIN_CONFIDENCE = 68.0
-
-
-# ============================================================
-# ATIVOS
-# ============================================================
-
-SYMBOLS = {
-    "EUR/USD": "EUR/USD",
-    "GBP/USD": "GBP/USD",
-    "USD/JPY": "USD/JPY",
-    "AUD/USD": "AUD/USD",
-    "USD/CAD": "USD/CAD",
-    "USD/CHF": "USD/CHF",
-    "NZD/USD": "NZD/USD",
-    "EUR/JPY": "EUR/JPY",
-    "GBP/JPY": "GBP/JPY",
-    "EUR/GBP": "EUR/GBP",
-    "BTC/USD": "BTC/USD",
-    "ETH/USD": "ETH/USD",
+INTERVALS = {
+    "1min": 60,
+    "5min": 300,
+    "15min": 900,
+    "30min": 1800,
 }
 
 
 # ============================================================
-# ESTRATÉGIAS
+# PARES DISPONÍVEIS
 # ============================================================
 
-STRATEGIES = [
-    ("rsi", "SNIPER X"),
-    ("old_sniper", "SNIPER 01"),
-    ("sniper_02", "SNIPER 02"),
-    ("sniper_03", "SNIPER 03"),
+SYMBOLS = [
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+    "AUD/USD",
+    "USD/CAD",
+    "USD/CHF",
+    "NZD/USD",
+    "EUR/JPY",
+    "GBP/JPY",
+    "EUR/GBP",
+    "BTC/USD",
+    "ETH/USD",
 ]
 
+
+RADAR_SYMBOLS = SYMBOLS
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
 
 app = FastAPI(
     title=APP_NAME,
@@ -88,22 +120,30 @@ app = FastAPI(
 
 
 # ============================================================
-# CACHE / RATE LIMIT
+# CACHE
 # ============================================================
 
-CACHE_TTL_SECONDS = 60.0
-RATE_LIMIT_COOLDOWN_SECONDS = 20.0
+_candle_cache: Dict[
+    Tuple[str, str],
+    Tuple[float, List[Dict[str, Any]]]
+] = {}
 
-CANDLE_CACHE: Dict[tuple, tuple] = {}
-CANDLE_LOCKS: Dict[tuple, asyncio.Lock] = {}
+_radar_cache: Dict[
+    str,
+    Tuple[float, Any]
+] = {}
 
-RATE_LIMIT_UNTIL = 0.0
+_ranking_cache: Dict[
+    str,
+    Tuple[float, Any]
+] = {}
 
-RADAR_CACHE: Dict[tuple, tuple] = {}
-RADAR_TTL_SECONDS = 120.0
 
-RANKING_CACHE: Dict[tuple, tuple] = {}
-RANKING_TTL_SECONDS = 120.0
+# ============================================================
+# CONTROLE DE REQUISIÇÕES
+# ============================================================
+
+_api_lock = asyncio.Semaphore(4)
 
 
 # ============================================================
@@ -111,7 +151,75 @@ RANKING_TTL_SECONDS = 120.0
 # ============================================================
 
 def now_sp() -> datetime:
-    return datetime.now(SP_TZ)
+    return datetime.now(BR_TZ)
+
+
+def parse_dt(value: Any) -> Optional[datetime]:
+
+    if value is None:
+        return None
+
+    s = str(value).strip()
+
+    s = s.replace(
+        "Z",
+        "+00:00"
+    )
+
+    try:
+
+        dt = datetime.fromisoformat(s)
+
+    except ValueError:
+
+        dt = None
+
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+        ):
+
+            try:
+
+                dt = datetime.strptime(
+                    s,
+                    fmt
+                )
+
+                break
+
+            except ValueError:
+
+                pass
+
+        if dt is None:
+            return None
+
+    if dt.tzinfo is None:
+
+        dt = dt.replace(
+            tzinfo=UTC
+        )
+
+    return dt.astimezone(UTC)
+
+
+def fmt_br(dt: datetime) -> str:
+
+    return dt.astimezone(
+        BR_TZ
+    ).strftime(
+        "%H:%M:%S"
+    )
+
+
+def iso_br(dt: datetime) -> str:
+
+    return dt.astimezone(
+        BR_TZ
+    ).isoformat(
+        timespec="seconds"
+    )
 
 
 # ============================================================
@@ -121,32 +229,41 @@ def now_sp() -> datetime:
 def license_status() -> Dict[str, Any]:
 
     try:
-        expires = datetime.strptime(
+
+        exp = datetime.strptime(
             LICENSE_EXPIRES,
             "%Y-%m-%d"
-        ).replace(tzinfo=SP_TZ)
+        ).date()
 
     except ValueError:
-        expires = datetime(
+
+        exp = datetime(
             2026,
             12,
-            31,
-            tzinfo=SP_TZ
-        )
+            31
+        ).date()
 
-    expires = expires.replace(
-        hour=23,
-        minute=59,
-        second=59
-    )
+    today = now_sp().date()
+
+    active = today <= exp
 
     return {
-        "active": now_sp() <= expires,
-        "expires": expires.strftime("%d/%m/%Y"),
-        "expires_iso": expires.isoformat(),
-        "whatsapp_1": LICENSE_WHATSAPP_1,
-        "whatsapp_2": LICENSE_WHATSAPP_2,
-        "instagram": LICENSE_INSTAGRAM,
+
+        "active": active,
+
+        "expires": exp.isoformat(),
+
+        "days_remaining": max(
+            (exp - today).days,
+            0
+        ),
+
+        "whatsapp_1": WHATSAPP_1,
+
+        "whatsapp_2": WHATSAPP_2,
+
+        "instagram": INSTAGRAM,
+
     }
 
 
@@ -155,373 +272,273 @@ def require_active_license():
     status = license_status()
 
     if not status["active"]:
+
         raise HTTPException(
             status_code=403,
-            detail={
-                "error": "LICENSE_EXPIRED",
-                **status
-            }
+            detail="Licença expirada."
         )
 
 
 # ============================================================
-# DATA / HORA
-# ============================================================
-
-def parse_time(value: str) -> datetime:
-
-    text = value.strip()
-
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-
-    try:
-        dt = datetime.fromisoformat(text)
-
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=SP_TZ)
-
-        return dt.astimezone(SP_TZ)
-
-    except ValueError:
-        pass
-
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M"
-    ):
-
-        try:
-            return datetime.strptime(
-                text,
-                fmt
-            ).replace(tzinfo=SP_TZ)
-
-        except ValueError:
-            pass
-
-    raise ValueError(
-        f"Timestamp inválido: {value}"
-    )
-
-
-# ============================================================
-# BUSCA DE VELAS
+# CANDLES
 # ============================================================
 
 async def get_candles(
     symbol: str,
     interval: str,
-    outputsize: int = 100
+    outputsize: int = 240
 ) -> List[Dict[str, Any]]:
 
-    global RATE_LIMIT_UNTIL
+    if symbol not in SYMBOLS:
 
-    if not KEY:
+        raise HTTPException(
+            status_code=400,
+            detail="Par não disponível."
+        )
+
+    if interval not in INTERVALS:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Período inválido."
+        )
+
+    if not TWELVE_DATA_API_KEY:
+
         raise HTTPException(
             status_code=500,
             detail=(
-                "TWELVE_DATA_API_KEY não configurada "
-                "no Render."
+                "TWELVE_DATA_API_KEY "
+                "não configurada no Render."
             )
         )
 
-    if symbol not in SYMBOLS:
-        raise HTTPException(
-            status_code=400,
-            detail="Ativo inválido."
-        )
-
-    if interval not in ALLOWED_INTERVALS:
-        raise HTTPException(
-            status_code=400,
-            detail="Timeframe inválido."
-        )
-
-    requested = min(
-        max(int(outputsize), 20),
-        240
+    key = (
+        symbol,
+        interval
     )
 
-    key = (symbol, interval)
+    cached = _candle_cache.get(key)
 
-    now = time.monotonic()
+    if cached:
 
-    cached = CANDLE_CACHE.get(key)
+        age = time.time() - cached[0]
 
-    if (
-        cached
-        and now - cached[0] < CACHE_TTL_SECONDS
-        and len(cached[1]) >= requested
-    ):
-        return cached[1]
+        if (
+            age < CACHE_SECONDS
+            and
+            len(cached[1]) >= min(
+                outputsize,
+                240
+            )
+        ):
 
-    if now < RATE_LIMIT_UNTIL:
-
-        if cached:
             return cached[1]
 
-        remaining = max(
-            1,
-            int(RATE_LIMIT_UNTIL - now)
-        )
+    params = {
+
+        "symbol": symbol,
+
+        "interval": interval,
+
+        "outputsize": min(
+            max(outputsize, 80),
+            5000
+        ),
+
+        "apikey": TWELVE_DATA_API_KEY,
+
+        "format": "JSON",
+
+        "timezone": "UTC",
+
+    }
+
+    async with _api_lock:
+
+        async with httpx.AsyncClient(
+            timeout=15
+        ) as client:
+
+            response = await client.get(
+                BASE_URL,
+                params=params
+            )
+
+    if response.status_code != 200:
 
         raise HTTPException(
-            status_code=429,
-            detail={
-                "error": "RATE_LIMIT",
-                "message": (
-                    f"Limite da Twelve Data atingido. "
-                    f"Aguarde {remaining}s."
+            status_code=502,
+            detail=(
+                "Twelve Data HTTP "
+                f"{response.status_code}"
+            )
+        )
+
+    data = response.json()
+
+    if "values" not in data:
+
+        raise HTTPException(
+            status_code=502,
+            detail=data.get(
+                "message",
+                "Twelve Data não retornou candles."
+            )
+        )
+
+    result = []
+
+    for item in data["values"]:
+
+        dt = parse_dt(
+            item.get("datetime")
+        )
+
+        if not dt:
+            continue
+
+        try:
+
+            candle = {
+
+                "time": dt,
+
+                "open": float(
+                    item["open"]
                 ),
-                "retry_after": remaining,
-            }
-        )
 
-    lock = CANDLE_LOCKS.setdefault(
-        key,
-        asyncio.Lock()
+                "high": float(
+                    item["high"]
+                ),
+
+                "low": float(
+                    item["low"]
+                ),
+
+                "close": float(
+                    item["close"]
+                ),
+
+                "volume": float(
+                    item.get(
+                        "volume",
+                        0
+                    ) or 0
+                ),
+
+            }
+
+            result.append(candle)
+
+        except (
+            TypeError,
+            ValueError
+        ):
+
+            continue
+
+    result.sort(
+        key=lambda x: x["time"]
     )
 
-    async with lock:
+    _candle_cache[key] = (
+        time.time(),
+        result
+    )
 
-        now = time.monotonic()
-
-        cached = CANDLE_CACHE.get(key)
-
-        if (
-            cached
-            and now - cached[0] < CACHE_TTL_SECONDS
-            and len(cached[1]) >= requested
-        ):
-            return cached[1]
-
-        if now < RATE_LIMIT_UNTIL:
-
-            if cached:
-                return cached[1]
-
-            remaining = max(
-                1,
-                int(RATE_LIMIT_UNTIL - now)
-            )
-
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "error": "RATE_LIMIT",
-                    "message": (
-                        f"Limite da Twelve Data atingido. "
-                        f"Aguarde {remaining}s."
-                    ),
-                    "retry_after": remaining,
-                }
-            )
-
-        params = {
-            "symbol": SYMBOLS[symbol],
-            "interval": interval,
-            "outputsize": requested,
-            "timezone": "America/Sao_Paulo",
-            "order": "ASC",
-        }
-
-        try:
-
-            async with httpx.AsyncClient(
-                timeout=20.0
-            ) as client:
-
-                response = await client.get(
-                    BASE_URL,
-                    params=params,
-                    headers={
-                        "Authorization": f"apikey {KEY}"
-                    },
-                )
-
-        except httpx.RequestError as exc:
-
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Não foi possível conectar "
-                    "à Twelve Data."
-                )
-            ) from exc
-
-        if response.status_code == 429:
-
-            retry_header = response.headers.get(
-                "Retry-After",
-                ""
-            )
-
-            try:
-
-                retry_after = (
-                    max(
-                        5,
-                        min(
-                            int(float(retry_header)),
-                            120
-                        )
-                    )
-                    if retry_header
-                    else RATE_LIMIT_COOLDOWN_SECONDS
-                )
-
-            except ValueError:
-
-                retry_after = (
-                    RATE_LIMIT_COOLDOWN_SECONDS
-                )
-
-            RATE_LIMIT_UNTIL = (
-                time.monotonic()
-                + retry_after
-            )
-
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "error": "RATE_LIMIT",
-                    "message": (
-                        "A Twelve Data informou "
-                        "limite de requisições."
-                    ),
-                    "retry_after": int(
-                        retry_after
-                    ),
-                }
-            )
-
-        if response.status_code >= 400:
-
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"Twelve Data retornou "
-                    f"HTTP {response.status_code}."
-                )
-            )
-
-        try:
-
-            data = response.json()
-
-        except ValueError as exc:
-
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Resposta inválida da "
-                    "Twelve Data."
-                )
-            ) from exc
-
-        if (
-            data.get("status") == "error"
-            or "values" not in data
-        ):
-
-            raise HTTPException(
-                status_code=502,
-                detail=data.get(
-                    "message",
-                    "Resposta inválida da Twelve Data."
-                )
-            )
-
-        candles = []
-
-        for item in data["values"]:
-
-            try:
-
-                candles.append({
-                    "datetime": item["datetime"],
-                    "open": float(item["open"]),
-                    "high": float(item["high"]),
-                    "low": float(item["low"]),
-                    "close": float(item["close"]),
-                    "volume": float(
-                        item.get(
-                            "volume",
-                            0
-                        ) or 0
-                    ),
-                })
-
-            except (
-                KeyError,
-                TypeError,
-                ValueError
-            ):
-                continue
-
-        candles.sort(
-            key=lambda x: parse_time(
-                x["datetime"]
-            )
-        )
-
-        if len(candles) < 20:
-
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Poucas velas retornadas "
-                    "pela Twelve Data."
-                )
-            )
-
-        CANDLE_CACHE[key] = (
-            time.monotonic(),
-            candles
-        )
-
-        return candles
+    return result
 
 
 # ============================================================
-# INDICADORES
+# EMA
 # ============================================================
 
-def ema(values, period):
+def ema(
+    values: List[float],
+    period: int
+) -> List[float]:
 
     if not values:
         return []
 
-    alpha = 2.0 / (
+    multiplier = 2.0 / (
         period + 1.0
     )
 
-    result = [values[0]]
+    result = [
+        values[0]
+    ]
 
     for value in values[1:]:
 
+        previous = result[-1]
+
+        current = (
+            value * multiplier
+            +
+            previous * (
+                1 - multiplier
+            )
+        )
+
         result.append(
-            value * alpha
-            + result[-1] * (1.0 - alpha)
+            current
         )
 
     return result
 
 
-def rsi(values, period=14):
+# ============================================================
+# SMA
+# ============================================================
+
+def sma(
+    values: List[float],
+    period: int
+) -> float:
+
+    if not values:
+        return 0.0
+
+    count = min(
+        period,
+        len(values)
+    )
+
+    return sum(
+        values[-count:]
+    ) / count
+
+
+# ============================================================
+# RSI
+# ============================================================
+
+def rsi(
+    values: List[float],
+    period: int = 14
+) -> List[float]:
 
     if len(values) < period + 1:
-        return [50.0] * len(values)
 
-    gains = [0.0]
-    losses = [0.0]
+        return [
+            50.0
+        ] * len(values)
 
-    for i in range(1, len(values)):
+    gains = []
+
+    losses = []
+
+    for i in range(
+        1,
+        len(values)
+    ):
 
         change = (
             values[i]
-            - values[i - 1]
+            -
+            values[i - 1]
         )
 
         gains.append(
@@ -532,2635 +549,1435 @@ def rsi(values, period=14):
             max(-change, 0.0)
         )
 
-    result = [50.0] * len(values)
-
-    avg_gain = (
-        sum(gains[1:period + 1])
-        / period
+    average_gain = (
+        sum(gains[:period])
+        /
+        period
     )
 
-    avg_loss = (
-        sum(losses[1:period + 1])
-        / period
+    average_loss = (
+        sum(losses[:period])
+        /
+        period
     )
 
-    def calc(g, l):
+    result = [
+        50.0
+    ] * period
 
-        if l == 0:
+    if average_loss == 0:
 
-            return (
-                100.0
-                if g > 0
-                else 50.0
-            )
+        first_rsi = 100.0
 
-        return (
-            100.0
-            - 100.0
-            / (1.0 + g / l)
+    else:
+
+        relative_strength = (
+            average_gain
+            /
+            average_loss
         )
 
-    result[period] = calc(
-        avg_gain,
-        avg_loss
+        first_rsi = (
+            100
+            -
+            (
+                100
+                /
+                (
+                    1
+                    +
+                    relative_strength
+                )
+            )
+        )
+
+    result.append(
+        first_rsi
     )
 
     for i in range(
-        period + 1,
-        len(values)
+        period,
+        len(gains)
     ):
 
-        avg_gain = (
+        average_gain = (
             (
-                avg_gain * (period - 1)
-                + gains[i]
+                average_gain
+                *
+                (period - 1)
             )
-            / period
-        )
+            +
+            gains[i]
+        ) / period
 
-        avg_loss = (
+        average_loss = (
             (
-                avg_loss * (period - 1)
-                + losses[i]
+                average_loss
+                *
+                (period - 1)
             )
-            / period
-        )
+            +
+            losses[i]
+        ) / period
 
-        result[i] = calc(
-            avg_gain,
-            avg_loss
-        )
+        if average_loss == 0:
 
-    return result
-
-
-def true_ranges(candles):
-
-    result = []
-
-    for i, c in enumerate(candles):
-
-        if i == 0:
-
-            result.append(
-                c["high"] - c["low"]
-            )
+            current_rsi = 100.0
 
         else:
 
-            pc = candles[i - 1]["close"]
+            rs = (
+                average_gain
+                /
+                average_loss
+            )
 
-            result.append(
-                max(
-                    c["high"] - c["low"],
-                    abs(c["high"] - pc),
-                    abs(c["low"] - pc)
+            current_rsi = (
+                100
+                -
+                (
+                    100
+                    /
+                    (
+                        1 + rs
+                    )
                 )
             )
 
-    return result
+        result.append(
+            current_rsi
+        )
+
+    return result[
+        -len(values):
+    ]
 
 
 # ============================================================
-# UTILITÁRIOS DA IA
+# DESVIO PADRÃO
 # ============================================================
 
-def _clamp(
-    value,
-    low=0.0,
-    high=1.0
-):
+def stddev(
+    values: List[float],
+    period: int = 20
+) -> float:
 
-    return max(
-        low,
-        min(high, float(value))
-    )
+    data = values[
+        -period:
+    ]
 
+    if len(data) < 2:
 
-def _safe_mean(values):
-
-    return (
-        sum(values) / len(values)
-        if values
-        else 0.0
-    )
-
-
-def _std(values):
-
-    if len(values) < 2:
         return 0.0
 
-    m = _safe_mean(values)
+    mean = sum(data) / len(data)
 
-    return (
-        sum(
-            (x - m) ** 2
-            for x in values
-        )
-        / len(values)
-    ) ** 0.5
+    variance = sum(
+        (
+            value - mean
+        ) ** 2
+        for value in data
+    ) / len(data)
+
+    return variance ** 0.5
 
 
 # ============================================================
-# SNIPER / RSI / PRICE ACTION
+# ATR
 # ============================================================
 
-def analyze(
-    candles,
-    strategy="rsi"
-):
+def atr(
+    candles: List[Dict[str, Any]],
+    period: int = 14
+) -> float:
 
-    if len(candles) < 30:
+    if len(candles) < 2:
+        return 0.0
 
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Dados insuficientes "
-                "para análise."
-            )
+    true_ranges = []
+
+    for i in range(
+        1,
+        len(candles)
+    ):
+
+        current = candles[i]
+
+        previous_close = (
+            candles[i - 1]["close"]
         )
 
-    # IMPORTANTE:
-    # a última vela pode estar em formação.
-    # Portanto a análise usa somente velas fechadas.
-    closed = candles[:-1]
+        tr = max(
 
-    reference = closed[-1]
-    previous = closed[-2]
+            current["high"]
+            -
+            current["low"],
 
-    next_candle = candles[-1]
-
-    strategy = (
-        strategy
-        .lower()
-        .strip()
-    )
-
-    def body(c):
-
-        return abs(
-            c["close"] - c["open"]
-        )
-
-    def rng(c):
-
-        return max(
-            c["high"] - c["low"],
-            1e-12
-        )
-
-    # ========================================================
-    # RSI
-    # ========================================================
-
-    if strategy == "rsi":
-
-        closes = [
-            float(c["close"])
-            for c in closed
-        ]
-
-        rv9 = rsi(
-            closes,
-            9
-        )
-
-        rv14 = rsi(
-            closes,
-            14
-        )
-
-        i = len(closed) - 1
-
-        r9 = rv9[i]
-        r14 = rv14[i]
-
-        if r9 > 50 and r14 > 50:
-
-            signal = "CALL"
-
-        elif r9 < 50 and r14 < 50:
-
-            signal = "PUT"
-
-        else:
-
-            signal = "NEUTRO"
-
-        confidence = (
-            50
-            if signal == "NEUTRO"
-            else int(
-                min(
-                    95,
-                    55
-                    + min(
-                        abs(r9 - 50),
-                        abs(r14 - 50)
-                    ) * 1.8
-                )
-            )
-        )
-
-        return {
-            "signal": signal,
-            "confidence": confidence,
-            "reference_candle":
-                reference["datetime"],
-            "next_candle":
-                next_candle["datetime"],
-            "rsi9": round(r9, 2),
-            "rsi14": round(r14, 2),
-            "rsi_confluence":
-                signal != "NEUTRO",
-            "strategy": "SNIPER X",
-            "strategy_code": "rsi",
-            "non_repaint_reference": True,
-            "ok": True,
-        }
-
-    # ========================================================
-    # SNIPER 01
-    # ========================================================
-
-    if strategy == "old_sniper":
-
-        rb = body(reference)
-        rr = rng(reference)
-
-        upper = (
-            reference["high"]
-            - max(
-                reference["open"],
-                reference["close"]
-            )
-        )
-
-        lower = (
-            min(
-                reference["open"],
-                reference["close"]
-            )
-            - reference["low"]
-        )
-
-        bullish = (
-            reference["close"]
-            > reference["open"]
-        )
-
-        bearish = (
-            reference["close"]
-            < reference["open"]
-        )
-
-        prev_bearish = (
-            previous["close"]
-            < previous["open"]
-        )
-
-        prev_bullish = (
-            previous["close"]
-            > previous["open"]
-        )
-
-        bull_engulf = (
-            bullish
-            and prev_bearish
-            and reference["open"]
-            <= previous["close"]
-            and reference["close"]
-            >= previous["open"]
-        )
-
-        bear_engulf = (
-            bearish
-            and prev_bullish
-            and reference["open"]
-            >= previous["close"]
-            and reference["close"]
-            <= previous["open"]
-        )
-
-        bull_rej = (
-            bullish
-            and lower
-            >= max(
-                rb * 1.2,
-                rr * .30
-            )
-        )
-
-        bear_rej = (
-            bearish
-            and upper
-            >= max(
-                rb * 1.2,
-                rr * .30
-            )
-        )
-
-        bull_break = (
-            reference["high"]
-            > previous["high"]
-            and reference["close"]
-            > previous["high"]
-        )
-
-        bear_break = (
-            reference["low"]
-            < previous["low"]
-            and reference["close"]
-            < previous["low"]
-        )
-
-        bull_strength = (
-            bullish
-            and rb >= rr * .60
-            and upper <= rr * .20
-        )
-
-        bear_strength = (
-            bearish
-            and rb >= rr * .60
-            and lower <= rr * .20
-        )
-
-        bull_structure = (
-            bullish
-            and reference["close"]
-            >= previous["close"]
-        )
-
-        bear_structure = (
-            bearish
-            and reference["close"]
-            <= previous["close"]
-        )
-
-        bull_score = sum([
-            bull_engulf,
-            bull_rej,
-            bull_break,
-            bull_strength,
-            bull_structure
-        ])
-
-        bear_score = sum([
-            bear_engulf,
-            bear_rej,
-            bear_break,
-            bear_strength,
-            bear_structure
-        ])
-
-        if (
-            bull_score >= 3
-            and bull_score > bear_score
-        ):
-
-            signal = "CALL"
-            confidence = min(
-                95,
-                55 + bull_score * 7
-            )
-
-        elif (
-            bear_score >= 3
-            and bear_score > bull_score
-        ):
-
-            signal = "PUT"
-            confidence = min(
-                95,
-                55 + bear_score * 7
-            )
-
-        else:
-
-            signal = "NEUTRO"
-            confidence = 50
-
-        return {
-            "signal": signal,
-            "confidence": int(confidence),
-            "reference_candle":
-                reference["datetime"],
-            "next_candle":
-                next_candle["datetime"],
-            "strategy": "SNIPER 01",
-            "strategy_code":
-                "old_sniper",
-            "bull_score":
-                bull_score,
-            "bear_score":
-                bear_score,
-            "bullish_engulfing":
-                bull_engulf,
-            "bearish_engulfing":
-                bear_engulf,
-            "bullish_rejection":
-                bull_rej,
-            "bearish_rejection":
-                bear_rej,
-            "bullish_breakout":
-                bull_break,
-            "bearish_breakout":
-                bear_break,
-            "non_repaint_reference":
-                True,
-            "ok": True,
-        }
-
-    # ========================================================
-    # SNIPER 02
-    # ========================================================
-
-    if strategy == "sniper_02":
-
-        lookback = closed[-22:-4]
-
-        resistance = max(
-            c["high"]
-            for c in lookback
-        )
-
-        support = min(
-            c["low"]
-            for c in lookback
-        )
-
-        def bullish_pin(c):
-
-            b = body(c)
-            r = rng(c)
-
-            lo = (
-                min(
-                    c["open"],
-                    c["close"]
-                )
-                - c["low"]
-            )
-
-            up = (
-                c["high"]
-                - max(
-                    c["open"],
-                    c["close"]
-                )
-            )
-
-            return (
-                c["close"] > c["open"]
-                and lo >= max(
-                    b * 1.5,
-                    r * .40
-                )
-                and up <= r * .25
-            )
-
-        def bearish_pin(c):
-
-            b = body(c)
-            r = rng(c)
-
-            up = (
-                c["high"]
-                - max(
-                    c["open"],
-                    c["close"]
-                )
-            )
-
-            lo = (
-                min(
-                    c["open"],
-                    c["close"]
-                )
-                - c["low"]
-            )
-
-            return (
-                c["close"] < c["open"]
-                and up >= max(
-                    b * 1.5,
-                    r * .40
-                )
-                and lo <= r * .25
-            )
-
-        def hammer(c):
-
-            b = body(c)
-            r = rng(c)
-
-            lo = (
-                min(
-                    c["open"],
-                    c["close"]
-                )
-                - c["low"]
-            )
-
-            up = (
-                c["high"]
-                - max(
-                    c["open"],
-                    c["close"]
-                )
-            )
-
-            return (
-                lo >= max(
-                    b * 2,
-                    r * .45
-                )
-                and up <= r * .20
-            )
-
-        def shooting_star(c):
-
-            b = body(c)
-            r = rng(c)
-
-            up = (
-                c["high"]
-                - max(
-                    c["open"],
-                    c["close"]
-                )
-            )
-
-            lo = (
-                min(
-                    c["open"],
-                    c["close"]
-                )
-                - c["low"]
-            )
-
-            return (
-                up >= max(
-                    b * 2,
-                    r * .45
-                )
-                and lo <= r * .20
-            )
-
-        def bull_engulf(a, b):
-
-            return (
-                b["close"] > b["open"]
-                and a["close"] < a["open"]
-                and b["open"]
-                <= a["close"]
-                and b["close"]
-                >= a["open"]
-            )
-
-        def bear_engulf(a, b):
-
-            return (
-                b["close"] < b["open"]
-                and a["close"] > a["open"]
-                and b["open"]
-                >= a["close"]
-                and b["close"]
-                <= a["open"]
-            )
-
-        call_setup = False
-        put_setup = False
-
-        call_pattern = ""
-        put_pattern = ""
-
-        for j in range(
-            max(
-                2,
-                len(closed) - 5
-            ),
-            len(closed) - 2
-        ):
-
-            breakout = closed[j]
-            retest = closed[j + 1]
-            confirmation = closed[j + 2]
-
-            if breakout["close"] > resistance:
-
-                touched = (
-                    retest["low"]
-                    <= resistance * 1.0015
-                )
-
-                rejection = (
-                    touched
-                    and (
-                        hammer(retest)
-                        or bullish_pin(retest)
-                        or bull_engulf(
-                            breakout,
-                            retest
-                        )
-                    )
-                )
-
-                confirmed = (
-                    confirmation["close"]
-                    > confirmation["open"]
-                    and confirmation["close"]
-                    > retest["high"]
-                )
-
-                if rejection and confirmed:
-
-                    call_setup = True
-
-                    if hammer(retest):
-                        call_pattern = "Martelo"
-
-                    elif bullish_pin(retest):
-                        call_pattern = (
-                            "Pin Bar de alta"
-                        )
-
-                    else:
-                        call_pattern = (
-                            "Engolfo de alta"
-                        )
-
-            if breakout["close"] < support:
-
-                touched = (
-                    retest["high"]
-                    >= support * .9985
-                )
-
-                rejection = (
-                    touched
-                    and (
-                        shooting_star(retest)
-                        or bearish_pin(retest)
-                        or bear_engulf(
-                            breakout,
-                            retest
-                        )
-                    )
-                )
-
-                confirmed = (
-                    confirmation["close"]
-                    < confirmation["open"]
-                    and confirmation["close"]
-                    < retest["low"]
-                )
-
-                if rejection and confirmed:
-
-                    put_setup = True
-
-                    if shooting_star(retest):
-                        put_pattern = (
-                            "Shooting Star"
-                        )
-
-                    elif bearish_pin(retest):
-                        put_pattern = (
-                            "Pin Bar de baixa"
-                        )
-
-                    else:
-                        put_pattern = (
-                            "Engolfo de baixa"
-                        )
-
-        if call_setup and not put_setup:
-
-            signal = "CALL"
-            confidence = 88
-
-        elif put_setup and not call_setup:
-
-            signal = "PUT"
-            confidence = 88
-
-        else:
-
-            signal = "NEUTRO"
-            confidence = 50
-
-        return {
-            "signal": signal,
-            "confidence": confidence,
-            "reference_candle":
-                reference["datetime"],
-            "next_candle":
-                next_candle["datetime"],
-            "strategy": "SNIPER 02",
-            "strategy_code":
-                "sniper_02",
-            "resistance":
-                resistance,
-            "support":
-                support,
-            "call_setup":
-                call_setup,
-            "put_setup":
-                put_setup,
-            "call_pattern":
-                call_pattern,
-            "put_pattern":
-                put_pattern,
-            "non_repaint_reference":
-                True,
-            "ok": True,
-        }
-
-    # ========================================================
-    # SNIPER 03
-    # ========================================================
-
-    if strategy == "sniper_03":
-
-        if len(closed) < 45:
-
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Dados insuficientes "
-                    "para SNIPER 03."
-                )
-            )
-
-        closes = [
-            c["close"]
-            for c in closed
-        ]
-
-        highs = [
-            c["high"]
-            for c in closed
-        ]
-
-        lows = [
-            c["low"]
-            for c in closed
-        ]
-
-        ema20 = ema(
-            closes,
-            20
-        )
-
-        ema50 = ema(
-            closes,
-            50
-        )
-
-        trv = true_ranges(
-            closed
-        )
-
-        atr = (
-            sum(trv[-14:])
-            / 14
-        )
-
-        tol = max(
-            atr * .35,
             abs(
-                reference["close"]
-            ) * .0005
-        )
+                current["high"]
+                -
+                previous_close
+            ),
 
-        prior = closed[-6:-1]
-
-        up = (
-            ema20[-1]
-            > ema50[-1]
-            and ema20[-1]
-            > ema20[-4]
-            and reference["close"]
-            > ema50[-1]
-        )
-
-        down = (
-            ema20[-1]
-            < ema50[-1]
-            and ema20[-1]
-            < ema20[-4]
-            and reference["close"]
-            < ema50[-1]
-        )
-
-        rb = body(reference)
-        rr = rng(reference)
-
-        lw = (
-            min(
-                reference["open"],
-                reference["close"]
-            )
-            - reference["low"]
-        )
-
-        uw = (
-            reference["high"]
-            - max(
-                reference["open"],
-                reference["close"]
-            )
-        )
-
-        bull_rej = (
-            reference["close"]
-            > reference["open"]
-            and lw >= max(
-                rb * 1.2,
-                rr * .30
-            )
-        )
-
-        bear_rej = (
-            reference["close"]
-            < reference["open"]
-            and uw >= max(
-                rb * 1.2,
-                rr * .30
-            )
-        )
-
-        pull_call = (
-            any(
-                c["close"]
-                < c["open"]
-                for c in prior[-3:]
-            )
-            and (
-                abs(
-                    reference["low"]
-                    - ema20[-1]
-                ) <= tol
-            )
-        )
-
-        pull_put = (
-            any(
-                c["close"]
-                > c["open"]
-                for c in prior[-3:]
-            )
-            and (
-                abs(
-                    reference["high"]
-                    - ema20[-1]
-                ) <= tol
-            )
-        )
-
-        conf_call = (
-            reference["close"]
-            > reference["open"]
-            and reference["close"]
-            >= previous["high"]
-        )
-
-        conf_put = (
-            reference["close"]
-            < reference["open"]
-            and reference["close"]
-            <= previous["low"]
-        )
-
-        call_score = (
-            (2 if up else 0)
-            + (2 if pull_call else 0)
-            + (1 if bull_rej else 0)
-            + (2 if conf_call else 0)
-        )
-
-        put_score = (
-            (2 if down else 0)
-            + (2 if pull_put else 0)
-            + (1 if bear_rej else 0)
-            + (2 if conf_put else 0)
-        )
-
-        if (
-            call_score >= 5
-            and call_score > put_score
-        ):
-
-            signal = "CALL"
-
-            confidence = min(
-                95,
-                55 + call_score * 5
+            abs(
+                current["low"]
+                -
+                previous_close
             )
 
-        elif (
-            put_score >= 5
-            and put_score > call_score
-        ):
+        )
 
-            signal = "PUT"
+        true_ranges.append(
+            tr
+        )
 
-            confidence = min(
-                95,
-                55 + put_score * 5
-            )
-
-        else:
-
-            signal = "NEUTRO"
-            confidence = 50
-
-        return {
-            "signal": signal,
-            "confidence": confidence,
-            "reference_candle":
-                reference["datetime"],
-            "next_candle":
-                next_candle["datetime"],
-            "strategy": "SNIPER 03",
-            "strategy_code":
-                "sniper_03",
-            "trend":
-                "ALTA"
-                if up
-                else "BAIXA"
-                if down
-                else "NEUTRA",
-            "pullback_call":
-                pull_call,
-            "pullback_put":
-                pull_put,
-            "bullish_rejection":
-                bull_rej,
-            "bearish_rejection":
-                bear_rej,
-            "call_score":
-                call_score,
-            "put_score":
-                put_score,
-            "non_repaint_reference":
-                True,
-            "ok": True,
-        }
-
-    raise HTTPException(
-        status_code=400,
-        detail="Estratégia inválida."
+    return sma(
+        true_ranges,
+        period
     )
 
 
 # ============================================================
-# IA HÍBRIDA
+# CLAMP
 # ============================================================
 
-def ai_analyze(
-    candles: List[Dict[str, Any]]
-) -> Dict[str, Any]:
+def clamp(
+    value: float,
+    minimum: float,
+    maximum: float
+) -> float:
 
-    if len(candles) < 60:
+    return max(
+        minimum,
+        min(
+            maximum,
+            value
+        )
+    )
 
-        return {
-            "signal": "NEUTRO",
-            "confidence": 0.0,
-            "score": 0.0,
-            "quality":
-                "DADOS_INSUFICIENTES",
-            "features": {},
-            "reason": (
-                "São necessárias "
-                "pelo menos 60 velas."
-            ),
-        }
 
-    # Somente candles fechados
-    closed = candles[:-1]
+# ============================================================
+# DIREÇÃO DA VELA
+# ============================================================
+
+def candle_direction(
+    candle: Dict[str, Any]
+) -> int:
+
+    if candle["close"] > candle["open"]:
+
+        return 1
+
+    if candle["close"] < candle["open"]:
+
+        return -1
+
+    return 0
+
+
+# ============================================================
+# SNIPER RSI
+# ============================================================
+
+def sniper_rsi(
+    closed: List[Dict[str, Any]]
+) -> Tuple[str, float]:
 
     closes = [
-        c["close"]
-        for c in closed
+        candle["close"]
+        for candle in closed
     ]
 
-    highs = [
-        c["high"]
-        for c in closed
-    ]
+    if len(closes) < 30:
 
-    lows = [
-        c["low"]
-        for c in closed
-    ]
-
-    volumes = [
-        c.get(
-            "volume",
+        return (
+            "NONE",
             0.0
         )
-        for c in closed
-    ]
 
-    e9 = ema(
+    rsi9 = rsi(
         closes,
         9
-    )
+    )[-1]
 
-    e20 = ema(
-        closes,
-        20
-    )
-
-    e50 = ema(
-        closes,
-        50
-    )
-
-    r9 = rsi(
-        closes,
-        9
-    )
-
-    r14 = rsi(
+    rsi14 = rsi(
         closes,
         14
-    )
+    )[-1]
 
-    trs = true_ranges(
-        closed
-    )
-
-    atr14 = (
-        _safe_mean(
-            trs[-14:]
-        )
-        if trs
-        else 0.0
-    )
-
-    last = closed[-1]
-    prev = closed[-2]
+    candle = closed[-1]
 
     body = abs(
-        last["close"]
-        - last["open"]
+        candle["close"]
+        -
+        candle["open"]
     )
 
-    rng = max(
-        last["high"]
-        - last["low"],
+    candle_range = max(
+        candle["high"]
+        -
+        candle["low"],
         1e-12
     )
 
-    body_ratio = (
-        body / rng
+    # CALL
+
+    if (
+        rsi9 <= 35
+        and
+        rsi14 <= 45
+        and
+        candle["close"]
+        >
+        candle["open"]
+    ):
+
+        confidence = (
+
+            70
+
+            +
+
+            (
+                45
+                -
+                rsi14
+            )
+            * 0.7
+
+            +
+
+            (
+                35
+                -
+                rsi9
+            )
+            * 0.5
+
+            +
+
+            (
+                body
+                /
+                candle_range
+            )
+            * 5
+
+        )
+
+        return (
+            "CALL",
+            clamp(
+                confidence,
+                70,
+                94
+            )
+        )
+
+    # PUT
+
+    if (
+        rsi9 >= 65
+        and
+        rsi14 >= 55
+        and
+        candle["close"]
+        <
+        candle["open"]
+    ):
+
+        confidence = (
+
+            70
+
+            +
+
+            (
+                rsi14
+                -
+                55
+            )
+            * 0.7
+
+            +
+
+            (
+                rsi9
+                -
+                65
+            )
+            * 0.5
+
+            +
+
+            (
+                body
+                /
+                candle_range
+            )
+            * 5
+
+        )
+
+        return (
+            "PUT",
+            clamp(
+                confidence,
+                70,
+                94
+            )
+        )
+
+    # Momentum CALL
+
+    if (
+        rsi9 > 52
+        and
+        rsi14 > 50
+        and
+        candle["close"]
+        >
+        candle["open"]
+    ):
+
+        return (
+            "CALL",
+            64.0
+        )
+
+    # Momentum PUT
+
+    if (
+        rsi9 < 48
+        and
+        rsi14 < 50
+        and
+        candle["close"]
+        <
+        candle["open"]
+    ):
+
+        return (
+            "PUT",
+            64.0
+        )
+
+    return (
+        "NONE",
+        0.0
+    )
+
+
+# ============================================================
+# SNIPER TENDÊNCIA
+# ============================================================
+
+def sniper_trend(
+    closed: List[Dict[str, Any]]
+) -> Tuple[str, float]:
+
+    closes = [
+        candle["close"]
+        for candle in closed
+    ]
+
+    ema9 = ema(
+        closes,
+        9
+    )[-1]
+
+    ema20 = ema(
+        closes,
+        20
+    )[-1]
+
+    ema50 = ema(
+        closes,
+        50
+    )[-1]
+
+    close = closed[-1]["close"]
+
+    if (
+        ema9 > ema20
+        and
+        ema20 > ema50
+        and
+        close > ema9
+    ):
+
+        return (
+            "CALL",
+            72.0
+        )
+
+    if (
+        ema9 < ema20
+        and
+        ema20 < ema50
+        and
+        close < ema9
+    ):
+
+        return (
+            "PUT",
+            72.0
+        )
+
+    return (
+        "NONE",
+        0.0
+    )
+
+
+# ============================================================
+# SNIPER REJEIÇÃO
+# ============================================================
+
+def sniper_rejection(
+    closed: List[Dict[str, Any]]
+) -> Tuple[str, float]:
+
+    candle = closed[-1]
+
+    candle_range = max(
+        candle["high"]
+        -
+        candle["low"],
+        1e-12
+    )
+
+    body = abs(
+        candle["close"]
+        -
+        candle["open"]
     )
 
     upper_wick = (
-        last["high"]
-        - max(
-            last["open"],
-            last["close"]
+        candle["high"]
+        -
+        max(
+            candle["open"],
+            candle["close"]
         )
     )
 
     lower_wick = (
         min(
-            last["open"],
-            last["close"]
+            candle["open"],
+            candle["close"]
         )
-        - last["low"]
+        -
+        candle["low"]
     )
+
+    if (
+        lower_wick
+        >
+        body * 1.8
+
+        and
+
+        lower_wick
+        /
+        candle_range
+        >
+        0.45
+
+        and
+
+        candle["close"]
+        >
+        candle["open"]
+    ):
+
+        return (
+            "CALL",
+            74.0
+        )
+
+    if (
+        upper_wick
+        >
+        body * 1.8
+
+        and
+
+        upper_wick
+        /
+        candle_range
+        >
+        0.45
+
+        and
+
+        candle["close"]
+        <
+        candle["open"]
+    ):
+
+        return (
+            "PUT",
+            74.0
+        )
+
+    return (
+        "NONE",
+        0.0
+    )
+
+
+# ============================================================
+# SNIPER ROMPIMENTO
+# ============================================================
+
+def sniper_breakout(
+    closed: List[Dict[str, Any]]
+) -> Tuple[str, float]:
+
+    if len(closed) < 30:
+
+        return (
+            "NONE",
+            0.0
+        )
+
+    candle = closed[-1]
+
+    previous_highs = [
+        x["high"]
+        for x in closed[-21:-1]
+    ]
+
+    previous_lows = [
+        x["low"]
+        for x in closed[-21:-1]
+    ]
+
+    resistance = max(
+        previous_highs
+    )
+
+    support = min(
+        previous_lows
+    )
+
+    if (
+        candle["close"]
+        >
+        resistance
+
+        and
+
+        candle["close"]
+        >
+        candle["open"]
+    ):
+
+        return (
+            "CALL",
+            76.0
+        )
+
+    if (
+        candle["close"]
+        <
+        support
+
+        and
+
+        candle["close"]
+        <
+        candle["open"]
+    ):
+
+        return (
+            "PUT",
+            76.0
+        )
+
+    return (
+        "NONE",
+        0.0
+    )
+
+
+# ============================================================
+# CANDIDATOS INTERNOS
+#
+# Estes nomes NÃO são enviados ao frontend.
+# ============================================================
+
+def get_sniper_candidates(
+    closed: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+
+    strategies = [
+
+        (
+            "SNIPER X",
+            sniper_rsi
+        ),
+
+        (
+            "SNIPER 01",
+            sniper_trend
+        ),
+
+        (
+            "SNIPER 02",
+            sniper_rejection
+        ),
+
+        (
+            "SNIPER 03",
+            sniper_breakout
+        ),
+
+    ]
+
+    result = []
+
+    for name, function in strategies:
+
+        direction, confidence = (
+            function(closed)
+        )
+
+        if direction != "NONE":
+
+            result.append({
+
+                "name": name,
+
+                "direction": direction,
+
+                "confidence": round(
+                    confidence,
+                    2
+                ),
+
+            })
+
+    return result
+
+
+# ============================================================
+# MOTOR DA MEGA IA
+#
+# Os indicadores ficam somente no servidor.
+# ============================================================
+
+def ai_multi_strategy(
+    closed: List[Dict[str, Any]],
+    trigger: Dict[str, Any]
+) -> Dict[str, Any]:
+
+    closes = [
+        candle["close"]
+        for candle in closed
+    ]
+
+    ema9 = ema(
+        closes,
+        9
+    )[-1]
+
+    ema20 = ema(
+        closes,
+        20
+    )[-1]
+
+    ema50 = ema(
+        closes,
+        50
+    )[-1]
+
+    rsi9 = rsi(
+        closes,
+        9
+    )[-1]
+
+    rsi14 = rsi(
+        closes,
+        14
+    )[-1]
+
+    current = closed[-1]
+
+    previous = closed[-2]
+
+    current_atr = max(
+        atr(
+            closed,
+            14
+        ),
+        1e-12
+    )
+
+    candle_range = max(
+        current["high"]
+        -
+        current["low"],
+        1e-12
+    )
+
+    body = abs(
+        current["close"]
+        -
+        current["open"]
+    )
+
+    body_ratio = (
+        body
+        /
+        candle_range
+    )
+
+    upper_wick = (
+        current["high"]
+        -
+        max(
+            current["open"],
+            current["close"]
+        )
+    )
+
+    lower_wick = (
+        min(
+            current["open"],
+            current["close"]
+        )
+        -
+        current["low"]
+    )
+
+    direction = trigger[
+        "direction"
+    ]
+
+    score = 0.0
+
 
     # ========================================================
     # TENDÊNCIA
     # ========================================================
 
-    trend_fast = (
-        e9[-1]
-        - e20[-1]
-    ) / max(
-        atr14,
-        1e-12
-    )
+    if direction == "CALL":
 
-    trend_slow = (
-        e20[-1]
-        - e50[-1]
-    ) / max(
-        atr14,
-        1e-12
-    )
+        if ema9 > ema20:
+            score += 12
 
-    slope20 = (
-        e20[-1]
-        - e20[-6]
-    ) / max(
-        atr14,
-        1e-12
-    )
+        if ema20 > ema50:
+            score += 10
 
-    trend_call = (
-        (
-            1 if trend_fast > 0
-            else -1
-        )
-        + (
-            1 if trend_slow > 0
-            else -1
-        )
-        + (
-            1 if slope20 > 0
-            else -1
-        )
-    ) / 3.0
+    else:
+
+        if ema9 < ema20:
+            score += 12
+
+        if ema20 < ema50:
+            score += 10
+
 
     # ========================================================
-    # RSI
+    # MOMENTUM
     # ========================================================
 
-    rsi_bias = (
-        (
-            r9[-1] - 50
-        ) / 50
-        +
-        (
-            r14[-1] - 50
-        ) / 50
-    ) / 2
+    if direction == "CALL":
 
-    # ========================================================
-    # ESTRUTURA
-    # ========================================================
+        if (
+            rsi9 > 50
+            and
+            rsi14 > 50
+        ):
 
-    look = 20
+            score += 12
 
-    hh = max(
-        highs[-look:]
-    )
+    else:
 
-    ll = min(
-        lows[-look:]
-    )
+        if (
+            rsi9 < 50
+            and
+            rsi14 < 50
+        ):
 
-    pos = (
-        last["close"] - ll
-    ) / max(
-        hh - ll,
-        1e-12
-    )
+            score += 12
 
-    structure_bias = (
-        pos - 0.5
-    ) * 2.0
 
     # ========================================================
     # PRICE ACTION
     # ========================================================
 
-    candle_bias = (
-        last["close"]
-        - last["open"]
-    ) / rng
+    if direction == "CALL":
 
-    rejection_bias = 0.0
+        if current["close"] > current["open"]:
+            score += 9
 
-    if (
-        lower_wick / rng > 0.45
-        and last["close"]
-        > last["open"]
-    ):
+        if current["close"] > previous["high"]:
+            score += 10
 
-        rejection_bias += 0.35
-
-    if (
-        upper_wick / rng > 0.45
-        and last["close"]
-        < last["open"]
-    ):
-
-        rejection_bias -= 0.35
-
-    # ========================================================
-    # VOLUME
-    # ========================================================
-
-    recent_vol = (
-        volumes[-21:-1]
-    )
-
-    vol_mean = _safe_mean(
-        recent_vol
-    )
-
-    if (
-        vol_mean > 0
-        and volumes[-1] > 0
-    ):
-
-        volume_factor = _clamp(
-            volumes[-1]
-            / vol_mean,
-            0.25,
-            2.5
-        )
+        if lower_wick > body:
+            score += 6
 
     else:
 
-        volume_factor = 1.0
+        if current["close"] < current["open"]:
+            score += 9
 
-    volume_bias = (
-        candle_bias
-        * (
-            volume_factor
-            - 1.0
-        )
+        if current["close"] < previous["low"]:
+            score += 10
+
+        if upper_wick > body:
+            score += 6
+
+
+    # ========================================================
+    # BANDA / LOCALIZAÇÃO
+    # ========================================================
+
+    deviation = stddev(
+        closes,
+        20
     )
+
+    middle = sma(
+        closes,
+        20
+    )
+
+    upper_band = (
+        middle
+        +
+        2 * deviation
+    )
+
+    lower_band = (
+        middle
+        -
+        2 * deviation
+    )
+
+    if direction == "CALL":
+
+        if (
+            current["close"] > middle
+            and
+            current["close"] < upper_band
+        ):
+
+            score += 8
+
+    else:
+
+        if (
+            current["close"] < middle
+            and
+            current["close"] > lower_band
+        ):
+
+            score += 8
+
 
     # ========================================================
     # VOLATILIDADE
     # ========================================================
 
-    recent_ranges = [
-        c["high"] - c["low"]
-        for c in closed[-20:]
+    volatility_ratio = (
+        candle_range
+        /
+        current_atr
+    )
+
+    if (
+        0.35
+        <=
+        volatility_ratio
+        <=
+        2.8
+    ):
+
+        score += 8
+
+
+    # ========================================================
+    # CONTEXTO DAS ÚLTIMAS VELAS
+    # ========================================================
+
+    recent_directions = [
+
+        candle_direction(
+            candle
+        )
+
+        for candle
+        in closed[-4:]
+
     ]
 
-    avg_range = _safe_mean(
-        recent_ranges
-    )
+    if direction == "CALL":
 
-    volatility_factor = _clamp(
-        (
-            last["high"]
-            - last["low"]
-        )
-        / max(
-            avg_range,
-            1e-12
-        ),
-        0.0,
-        3.0
-    )
-
-    # ========================================================
-    # PADRÃO DE 2 VELAS
-    # ========================================================
-
-    pattern_bias = 0.0
-
-    if (
-        last["close"]
-        > last["open"]
-        and prev["close"]
-        < prev["open"]
-    ):
-
-        if (
-            last["close"]
-            >= prev["open"]
-            and last["open"]
-            <= prev["close"]
-        ):
-
-            pattern_bias += 0.75
-
-    elif (
-        last["close"]
-        < last["open"]
-        and prev["close"]
-        > prev["open"]
-    ):
-
-        if (
-            last["close"]
-            <= prev["open"]
-            and last["open"]
-            >= prev["close"]
-        ):
-
-            pattern_bias -= 0.75
+        if sum(recent_directions) > 0:
+            score += 5
 
     else:
 
-        pattern_bias += (
-            0.20
-            * candle_bias
-        )
+        if sum(recent_directions) < 0:
+            score += 5
+
 
     # ========================================================
-    # REGIME
+    # EVITA ENTRADA EXTREMAMENTE ESTICADA
     # ========================================================
 
-    regime = (
-        "TENDENCIA"
-        if abs(trend_slow) >= 0.35
-        else "LATERAL"
-    )
+    if direction == "CALL":
+
+        if rsi9 > 82:
+            score -= 8
+
+    else:
+
+        if rsi9 < 18:
+            score -= 8
+
 
     # ========================================================
-    # SCORE IA
+    # CONFIANÇA FINAL
     # ========================================================
 
-    raw = (
-        0.32 * trend_call
-        + 0.22 * rsi_bias
-        + 0.12 * structure_bias
-        + 0.12 * candle_bias
-        + 0.08 * rejection_bias
-        + 0.06 * pattern_bias
-        + 0.05 * volume_bias
-        + 0.03
-        * slope20
-        / max(
-            abs(slope20),
-            1.0
-        )
+    confidence = clamp(
+        50
+        +
+        score * 0.58,
+        50,
+        97
     )
 
-    confirmation = 0.0
-
-    if (
-        regime == "TENDENCIA"
-        and trend_call
-        * rsi_bias > 0
-    ):
-
-        confirmation += 0.10
-
-    if body_ratio >= 0.55:
-        confirmation += 0.05
-
-    if volatility_factor >= 0.80:
-        confirmation += 0.03
-
-    if abs(pattern_bias) >= 0.50:
-        confirmation += 0.04
-
-    conflict = 0.0
-
-    if (
-        trend_call
-        * rsi_bias < -0.20
-    ):
-
-        conflict = 0.12
-
-    directional = _clamp(
-        abs(raw),
-        0.0,
-        1.0
+    confirmed = (
+        confidence
+        >=
+        AI_MIN_CONFIDENCE
     )
 
-    confidence = _clamp(
-        50.0
-        + directional * 43.0
-        + confirmation * 100.0
-        - conflict * 100.0,
-        50.0,
-        98.0
-    )
 
-    if (
-        abs(raw) < 0.18
-        or confidence < 62.0
-    ):
+    if confirmed:
 
-        signal = "NEUTRO"
-        quality = "BAIXA"
+        final_direction = direction
 
-    elif raw > 0:
-
-        signal = "CALL"
-
-        quality = (
-            "ALTA"
-            if confidence >= 78
-            else "MEDIA"
+        message = (
+            "Condições favoráveis "
+            "identificadas. "
+            "Entrada programada."
         )
 
     else:
 
-        signal = "PUT"
+        final_direction = "NEUTRO"
 
-        quality = (
-            "ALTA"
-            if confidence >= 78
-            else "MEDIA"
+        message = (
+            "Condições insuficientes. "
+            "Aguardando uma oportunidade melhor."
         )
+
 
     return {
-        "signal": signal,
+
+        "direction":
+            final_direction,
+
         "confidence":
             round(
                 confidence,
-                1
-            ),
-        "score":
-            round(
-                raw * 100,
-                1
-            ),
-        "quality":
-            quality,
-        "regime":
-            regime,
-        "features": {
-            "rsi9":
-                round(
-                    r9[-1],
-                    2
-                ),
-            "rsi14":
-                round(
-                    r14[-1],
-                    2
-                ),
-            "ema9":
-                round(
-                    e9[-1],
-                    8
-                ),
-            "ema20":
-                round(
-                    e20[-1],
-                    8
-                ),
-            "ema50":
-                round(
-                    e50[-1],
-                    8
-                ),
-            "atr14":
-                round(
-                    atr14,
-                    8
-                ),
-            "body_ratio":
-                round(
-                    body_ratio,
-                    3
-                ),
-            "volatility_factor":
-                round(
-                    volatility_factor,
-                    3
-                ),
-            "trend_score":
-                round(
-                    trend_call,
-                    3
-                ),
-            "structure_score":
-                round(
-                    structure_bias,
-                    3
-                ),
-            "pattern_score":
-                round(
-                    pattern_bias,
-                    3
-                ),
-        },
-        "reason": (
-            f"Regime {regime}; "
-            f"tendência={trend_call:+.2f}; "
-            f"RSI={r9[-1]:.1f}/"
-            f"{r14[-1]:.1f}; "
-            f"força da vela="
-            f"{body_ratio:.2f}."
-        ),
-        "non_repaint_reference":
-            True,
-    }
-
-
-# ============================================================
-# IA MULTI-ESTRATÉGIA
-# ============================================================
-
-def ai_multi_strategy(
-    candles: List[Dict[str, Any]],
-    sniper_signal: str = "NEUTRO"
-) -> Dict[str, Any]:
-
-    if len(candles) < 60:
-
-        return {
-            "signal": "NEUTRO",
-            "confidence": 0.0,
-            "confirmed": False,
-            "reason": (
-                "Poucas velas para "
-                "análise multi-estratégia."
-            ),
-            "strategies": {},
-            "non_repaint_reference":
-                True,
-        }
-
-    closed = candles[:-1]
-
-    closes = [
-        float(c["close"])
-        for c in closed
-    ]
-
-    highs = [
-        float(c["high"])
-        for c in closed
-    ]
-
-    lows = [
-        float(c["low"])
-        for c in closed
-    ]
-
-    last = closed[-1]
-
-    e9 = ema(
-        closes,
-        9
-    )
-
-    e21 = ema(
-        closes,
-        21
-    )
-
-    e50 = ema(
-        closes,
-        50
-    )
-
-    r7 = rsi(
-        closes,
-        7
-    )
-
-    r14 = rsi(
-        closes,
-        14
-    )
-
-    trs = true_ranges(
-        closed
-    )
-
-    atr14 = (
-        sum(trs[-14:])
-        / 14.0
-    )
-
-    # ========================================================
-    # BOLLINGER
-    # ========================================================
-
-    n = min(
-        20,
-        len(closes)
-    )
-
-    mean20 = (
-        sum(closes[-n:])
-        / n
-    )
-
-    var20 = (
-        sum(
-            (
-                x - mean20
-            ) ** 2
-            for x in closes[-n:]
-        )
-        / n
-    )
-
-    sd20 = var20 ** 0.5
-
-    upper = (
-        mean20
-        + 2.0 * sd20
-    )
-
-    lower = (
-        mean20
-        - 2.0 * sd20
-    )
-
-    body = abs(
-        last["close"]
-        - last["open"]
-    )
-
-    rng = max(
-        last["high"]
-        - last["low"],
-        1e-12
-    )
-
-    upper_wick = (
-        last["high"]
-        - max(
-            last["open"],
-            last["close"]
-        )
-    )
-
-    lower_wick = (
-        min(
-            last["open"],
-            last["close"]
-        )
-        - last["low"]
-    )
-
-    scores = {
-        "CALL": 0.0,
-        "PUT": 0.0
-    }
-
-    reasons = []
-
-    def add(
-        direction,
-        weight,
-        text
-    ):
-
-        scores[direction] += weight
-        reasons.append(text)
-
-    # ========================================================
-    # 1 - TENDÊNCIA
-    # ========================================================
-
-    if (
-        e9[-1]
-        > e21[-1]
-        > e50[-1]
-        and closes[-1]
-        > e9[-1]
-    ):
-
-        add(
-            "CALL",
-            22,
-            "tendência de alta pelas EMA 9/21/50"
-        )
-
-    elif (
-        e9[-1]
-        < e21[-1]
-        < e50[-1]
-        and closes[-1]
-        < e9[-1]
-    ):
-
-        add(
-            "PUT",
-            22,
-            "tendência de baixa pelas EMA 9/21/50"
-        )
-
-    # ========================================================
-    # 2 - RSI
-    # ========================================================
-
-    if (
-        r7[-1] >= 55
-        and r14[-1] >= 52
-        and r7[-1] < 78
-    ):
-
-        add(
-            "CALL",
-            14,
-            "momentum comprador confirmado pelo RSI"
-        )
-
-    elif (
-        r7[-1] <= 45
-        and r14[-1] <= 48
-        and r7[-1] > 22
-    ):
-
-        add(
-            "PUT",
-            14,
-            "momentum vendedor confirmado pelo RSI"
-        )
-
-    # ========================================================
-    # 3 - PRICE ACTION
-    # ========================================================
-
-    if (
-        last["close"]
-        > last["open"]
-        and body / rng >= 0.55
-    ):
-
-        add(
-            "CALL",
-            12,
-            "vela de força compradora"
-        )
-
-    elif (
-        last["close"]
-        < last["open"]
-        and body / rng >= 0.55
-    ):
-
-        add(
-            "PUT",
-            12,
-            "vela de força vendedora"
-        )
-
-    # ========================================================
-    # 4 - REJEIÇÃO
-    # ========================================================
-
-    if (
-        lower_wick / rng >= 0.45
-        and last["close"]
-        > last["open"]
-    ):
-
-        add(
-            "CALL",
-            10,
-            "rejeição de preços baixos"
-        )
-
-    elif (
-        upper_wick / rng >= 0.45
-        and last["close"]
-        < last["open"]
-    ):
-
-        add(
-            "PUT",
-            10,
-            "rejeição de preços altos"
-        )
-
-    # ========================================================
-    # 5 - ESTRUTURA
-    # ========================================================
-
-    lookback = min(
-        12,
-        len(closed) - 2
-    )
-
-    recent_high = max(
-        highs[
-            -lookback - 1:-1
-        ]
-    )
-
-    recent_low = min(
-        lows[
-            -lookback - 1:-1
-        ]
-    )
-
-    if last["close"] > recent_high:
-
-        add(
-            "CALL",
-            14,
-            "rompimento da máxima recente"
-        )
-
-    elif last["close"] < recent_low:
-
-        add(
-            "PUT",
-            14,
-            "rompimento da mínima recente"
-        )
-
-    # ========================================================
-    # 6 - BOLLINGER
-    # ========================================================
-
-    if (
-        closes[-1] > mean20
-        and closes[-1] < upper
-    ):
-
-        add(
-            "CALL",
-            7,
-            "preço acima da média das Bollinger"
-        )
-
-    elif (
-        closes[-1] < mean20
-        and closes[-1] > lower
-    ):
-
-        add(
-            "PUT",
-            7,
-            "preço abaixo da média das Bollinger"
-        )
-
-    # ========================================================
-    # 7 - VOLATILIDADE
-    # ========================================================
-
-    avg_range = (
-        sum(
-            c["high"]
-            - c["low"]
-            for c in closed[-20:]
-        )
-        / 20.0
-    )
-
-    if (
-        atr14 > 0
-        and rng >= avg_range * 0.75
-    ):
-
-        if last["close"] > last["open"]:
-
-            add(
-                "CALL",
-                5,
-                "volatilidade compatível com movimento comprador"
-            )
-
-        elif last["close"] < last["open"]:
-
-            add(
-                "PUT",
-                5,
-                "volatilidade compatível com movimento vendedor"
-            )
-
-    # ========================================================
-    # 8 - SNIPER COMO GATILHO
-    # ========================================================
-
-    if sniper_signal == "CALL":
-
-        scores["CALL"] += 12
-
-        reasons.append(
-            "Sniper confirmou CALL"
-        )
-
-    elif sniper_signal == "PUT":
-
-        scores["PUT"] += 12
-
-        reasons.append(
-            "Sniper confirmou PUT"
-        )
-
-    # ========================================================
-    # DECISÃO
-    # ========================================================
-
-    if scores["CALL"] > scores["PUT"]:
-
-        best = "CALL"
-
-    elif scores["PUT"] > scores["CALL"]:
-
-        best = "PUT"
-
-    else:
-
-        best = "NEUTRO"
-
-    total = (
-        scores["CALL"]
-        + scores["PUT"]
-    )
-
-    if (
-        best == "NEUTRO"
-        or total <= 0
-    ):
-
-        confidence = 50.0
-
-    else:
-
-        dominance = (
-            max(
-                scores["CALL"],
-                scores["PUT"]
-            )
-            / total
-        )
-
-        confidence = (
-            50.0
-            + dominance * 45.0
-        )
-
-    # ========================================================
-    # CONFIRMAÇÃO FINAL
-    # ========================================================
-
-    confirmed = (
-        sniper_signal
-        in ("CALL", "PUT")
-        and best == sniper_signal
-        and confidence
-        >= AI_MIN_CONFIDENCE
-    )
-
-    if not confirmed:
-
-        final_signal = "NEUTRO"
-
-        reason = (
-            "IA analisando: "
-            "o Sniper e as estratégias "
-            "internas ainda não formaram "
-            "confirmação suficiente."
-        )
-
-    else:
-
-        final_signal = best
-
-        reason = (
-            f"IA confirmou {best}. "
-            f"Score CALL="
-            f"{scores['CALL']:.1f}; "
-            f"Score PUT="
-            f"{scores['PUT']:.1f}."
-        )
-
-    return {
-        "signal":
-            final_signal,
-
-        "confidence":
-            round(
-                _clamp(
-                    confidence,
-                    50.0,
-                    97.0
-                ),
-                1
+                2
             ),
 
         "confirmed":
             confirmed,
 
-        "reason":
-            reason,
+        "message":
+            message,
 
-        "strategies": {
-
-            "tendencia":
-                (
-                    "ALTA"
-                    if e9[-1]
-                    > e21[-1]
-                    > e50[-1]
-                    else "BAIXA"
-                    if e9[-1]
-                    < e21[-1]
-                    < e50[-1]
-                    else "LATERAL"
-                ),
-
-            "momentum":
-                (
-                    "CALL"
-                    if (
-                        r7[-1] > 55
-                        and r14[-1] > 52
-                    )
-                    else "PUT"
-                    if (
-                        r7[-1] < 45
-                        and r14[-1] < 48
-                    )
-                    else "NEUTRO"
-                ),
-
-            "price_action":
-                (
-                    "CALL"
-                    if (
-                        last["close"]
-                        > last["open"]
-                        and body / rng
-                        >= 0.55
-                    )
-                    else "PUT"
-                    if (
-                        last["close"]
-                        < last["open"]
-                        and body / rng
-                        >= 0.55
-                    )
-                    else "NEUTRO"
-                ),
-
-            "estrutura":
-                (
-                    "CALL"
-                    if last["close"]
-                    > recent_high
-                    else "PUT"
-                    if last["close"]
-                    < recent_low
-                    else "NEUTRO"
-                ),
-
-            "volatilidade":
-                (
-                    "OK"
-                    if (
-                        atr14 > 0
-                        and rng
-                        >= avg_range * 0.75
-                    )
-                    else "FRACA"
-                ),
-
-            "bollinger":
-                (
-                    "ACIMA_MEDIA"
-                    if closes[-1] > mean20
-                    else "ABAIXO_MEDIA"
-                ),
-        },
-
-        "score_call":
-            round(
-                scores["CALL"],
-                1
-            ),
-
-        "score_put":
-            round(
-                scores["PUT"],
-                1
-            ),
-
-        "non_repaint_reference":
-            True,
     }
 
 
 # ============================================================
-# IA FINAL
+# PRÓXIMO HORÁRIO DE ENTRADA
 # ============================================================
 
-async def build_ai_signal(
+def next_entry_time(
+    last_closed: datetime,
+    interval: str
+) -> datetime:
+
+    seconds = INTERVALS[
+        interval
+    ]
+
+    entry = (
+        last_closed
+        +
+        timedelta(
+            seconds=seconds
+        )
+    )
+
+    now = datetime.now(
+        UTC
+    )
+
+    while entry <= now:
+
+        entry += timedelta(
+            seconds=seconds
+        )
+
+    return entry
+
+
+# ============================================================
+# CONSTRUIR SINAL
+# ============================================================
+
+async def build_signal(
     symbol: str,
     interval: str
-):
+) -> Dict[str, Any]:
 
-    values = await get_candles(
+    require_active_license()
+
+    candles = await get_candles(
         symbol,
         interval,
         240
     )
 
-    # --------------------------------------------------------
-    # PRIMEIRO: RSI + SNIPERS
-    # --------------------------------------------------------
+    if len(candles) < 80:
 
-    sniper_candidates = []
-
-    for (
-        strategy_code,
-        internal_name
-    ) in STRATEGIES:
-
-        try:
-
-            result = analyze(
-                values,
-                strategy_code
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Histórico insuficiente "
+                "para análise."
             )
+        )
 
-            if result.get(
-                "signal"
-            ) in (
-                "CALL",
-                "PUT"
-            ):
 
-                sniper_candidates.append({
+    # ========================================================
+    # IMPORTANTE:
+    # A ÚLTIMA VELA É DESCARTADA.
+    #
+    # A IA trabalha somente com velas fechadas.
+    # ========================================================
 
-                    "code":
-                        strategy_code,
+    closed = candles[:-1]
 
-                    "name":
-                        internal_name,
 
-                    "signal":
-                        result["signal"],
+    # ========================================================
+    # PROCURA UMA OPORTUNIDADE
+    # ========================================================
 
-                    "confidence":
-                        float(
-                            result.get(
-                                "confidence",
-                                50
-                            )
-                        ),
-                })
+    candidates = (
+        get_sniper_candidates(
+            closed
+        )
+    )
 
-        except Exception:
 
-            continue
+    # Nenhum gatilho
+    if not candidates:
 
-    # --------------------------------------------------------
-    # ESCOLHE O MELHOR SNIPER
-    # --------------------------------------------------------
+        return {
+
+            "app": APP_NAME,
+
+            "symbol": symbol,
+
+            "interval": interval,
+
+            "signal": "NEUTRO",
+
+            "confidence": 0.0,
+
+            "status": "MONITORANDO",
+
+            "message": (
+                "A Mega IA está "
+                "monitorando o mercado."
+            ),
+
+            "entry_time": None,
+
+            "entry_time_br": None,
+
+            "entry_epoch": None,
+
+            "expiry_time": None,
+
+            "expiry_time_br": None,
+
+            "expiry_epoch": None,
+
+            "seconds_to_entry": None,
+
+            "voice_event":
+                "monitoring",
+
+            "non_repaint_reference":
+                True,
+
+            "server_time_br":
+                iso_br(
+                    now_sp()
+                ),
+
+        }
+
+
+    # ========================================================
+    # UM ÚNICO SNIPER PODE ACIONAR A IA
+    # ========================================================
 
     trigger = max(
-        sniper_candidates,
-        key=lambda x: x["confidence"],
-        default=None
+        candidates,
+        key=lambda x:
+            x["confidence"]
     )
 
-    sniper_signal = (
-        trigger["signal"]
-        if trigger
-        else "NEUTRO"
-    )
 
-    # --------------------------------------------------------
-    # IA TRABALHA JUNTO COM O RSI
-    # --------------------------------------------------------
+    # ========================================================
+    # IA CONFIRMA
+    # ========================================================
 
     ai = ai_multi_strategy(
-        values,
-        sniper_signal
+        closed,
+        trigger
     )
 
-    # --------------------------------------------------------
-    # HORÁRIO DA PRÓXIMA VELA
-    # --------------------------------------------------------
 
-    minutes = ALLOWED_INTERVALS[
+    # ========================================================
+    # IA NÃO CONFIRMOU
+    # ========================================================
+
+    if (
+        not ai["confirmed"]
+        or
+        ai["direction"]
+        !=
+        trigger["direction"]
+    ):
+
+        return {
+
+            "app": APP_NAME,
+
+            "symbol": symbol,
+
+            "interval": interval,
+
+            "signal": "NEUTRO",
+
+            "confidence":
+                ai["confidence"],
+
+            "status":
+                "MONITORANDO",
+
+            "message": (
+                "Uma oportunidade foi "
+                "detectada, mas a IA "
+                "ainda não confirmou "
+                "a entrada."
+            ),
+
+            "entry_time": None,
+
+            "entry_time_br": None,
+
+            "entry_epoch": None,
+
+            "expiry_time": None,
+
+            "expiry_time_br": None,
+
+            "expiry_epoch": None,
+
+            "seconds_to_entry": None,
+
+            "voice_event":
+                "monitoring",
+
+            "non_repaint_reference":
+                True,
+
+            "server_time_br":
+                iso_br(
+                    now_sp()
+                ),
+
+        }
+
+
+    # ========================================================
+    # HORÁRIO DA ENTRADA
+    # ========================================================
+
+    entry = next_entry_time(
+        closed[-1]["time"],
         interval
-    ]
-
-    current = now_sp()
-
-    block = minutes * 60
-
-    now_epoch = current.timestamp()
-
-    next_epoch = (
-        (
-            int(now_epoch)
-            // block
-        )
-        + 1
-    ) * block
-
-    entry_dt = datetime.fromtimestamp(
-        next_epoch,
-        tz=SP_TZ
     )
 
-    expiry_dt = (
-        entry_dt
-        + timedelta(
-            minutes=minutes
+
+    expiry = (
+        entry
+        +
+        timedelta(
+            seconds=INTERVALS[
+                interval
+            ]
         )
     )
 
-    remaining = max(
-        0.0,
-        next_epoch
-        - now_epoch
+
+    now = datetime.now(
+        UTC
     )
+
+
+    seconds_to_entry = max(
+
+        0,
+
+        int(
+            (
+                entry
+                -
+                now
+            ).total_seconds()
+        )
+
+    )
+
 
     in_entry_window = (
-        0.0
-        < remaining
-        <= ENTRY_WINDOW_SECONDS
+        seconds_to_entry
+        <=
+        ENTRY_WINDOW_SECONDS
     )
 
-    # --------------------------------------------------------
-    # STATUS
-    # --------------------------------------------------------
 
-    if ai["confirmed"]:
+    # ========================================================
+    # EVENTO DE VOZ
+    # ========================================================
 
-        if in_entry_window:
+    if in_entry_window:
 
-            entry_status = "ENTRAR"
+        voice_event = "entry_now"
 
-            entry_message = (
-                f"MOMENTO DE ENTRADA — "
-                f"{ai['signal']}"
-            )
+        status = "ENTRAR_AGORA"
 
-        else:
-
-            entry_status = "AGUARDE"
-
-            entry_message = (
-                f"IA CONFIRMOU "
-                f"{ai['signal']}. "
-                f"Aguarde a janela "
-                f"de entrada às "
-                f"{entry_dt.strftime('%H:%M:%S')}."
-            )
-
-    elif trigger:
-
-        entry_status = "ANALISANDO"
-
-        entry_message = (
-            f"IA ANALISANDO — "
-            f"{trigger['name']} deu "
-            f"{trigger['signal']}, "
-            f"mas a IA ainda não confirmou."
+        message = (
+            f"Entrada liberada para "
+            f"{ai['direction']}."
         )
 
     else:
 
-        entry_status = "ANALISANDO"
+        voice_event = "opportunity"
 
-        entry_message = (
-            "IA ANALISANDO O GRÁFICO — "
-            "aguardando um Sniper gerar sinal."
+        status = (
+            "OPORTUNIDADE_ENCONTRADA"
         )
 
-    confidence = float(
-        ai.get(
-            "confidence",
-            0
+        message = (
+            "A Mega IA encontrou "
+            "uma oportunidade e "
+            "está aguardando o "
+            "horário de entrada."
         )
-    )
 
-    if confidence >= 85:
 
-        quality = "MUITO_ALTA"
-
-    elif confidence >= 78:
-
-        quality = "ALTA"
-
-    elif confidence >= 68:
-
-        quality = "MEDIA"
-
-    else:
-
-        quality = "BAIXA"
+    # ========================================================
+    # RESPOSTA PÚBLICA
+    #
+    # NÃO RETORNAMOS:
+    # RSI
+    # EMA
+    # ADX
+    # Bollinger
+    # ATR
+    # nomes dos Snipers
+    # pesos
+    # fórmulas
+    # parâmetros internos
+    # ========================================================
 
     return {
 
-        "ok":
-            True,
+        "app": APP_NAME,
 
-        "source":
-            "Twelve Data",
+        "symbol": symbol,
 
-        "engine":
-            "ISMAEL TRADE AI + RSI + SNIPERS",
-
-        "version":
-            APP_VERSION,
-
-        "symbol":
-            symbol,
-
-        "interval":
-            interval,
-
-        "reference_candle":
-            values[-2]["datetime"],
+        "interval": interval,
 
         "signal":
-            ai["signal"],
+            ai["direction"],
 
         "confidence":
-            confidence,
+            ai["confidence"],
 
-        "quality":
-            quality,
+        "status":
+            status,
 
-        "confirmed":
-            ai["confirmed"],
+        "message":
+            message,
 
-        "reason":
-            ai["reason"],
+        "entry_time":
+            entry.astimezone(
+                BR_TZ
+            ).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
 
-        "strategies":
-            ai["strategies"],
+        "entry_time_br":
+            fmt_br(entry),
 
-        "score_call":
-            ai["score_call"],
+        "entry_epoch":
+            int(
+                entry.timestamp()
+            ),
 
-        "score_put":
-            ai["score_put"],
+        "expiry_time":
+            expiry.astimezone(
+                BR_TZ
+            ).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
 
-        "sniper_trigger":
-            trigger,
+        "expiry_time_br":
+            fmt_br(expiry),
 
-        "sniper_signal":
-            sniper_signal,
+        "expiry_epoch":
+            int(
+                expiry.timestamp()
+            ),
 
-        "entry_status":
-            entry_status,
-
-        "entry_message":
-            entry_message,
+        "seconds_to_entry":
+            seconds_to_entry,
 
         "entry_window_seconds":
             ENTRY_WINDOW_SECONDS,
 
-        "in_entry_window":
-            in_entry_window,
-
-        "seconds_to_entry":
-            int(remaining),
-
-        "now_epoch":
-            int(now_epoch),
-
-        "now_epoch_ms":
-            int(now_epoch * 1000),
-
-        "now_sp":
-            current.strftime(
-                "%d/%m/%Y %H:%M:%S"
-            ),
-
-        "entry_epoch":
-            int(next_epoch),
-
-        "entry_epoch_ms":
-            int(next_epoch * 1000),
-
-        "entry_time":
-            entry_dt.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-
-        "next_candle":
-            entry_dt.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-
-        "expiry_time":
-            expiry_dt.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-
-        "expiry":
-            "1 vela do intervalo selecionado",
+        "voice_event":
+            voice_event,
 
         "non_repaint_reference":
             True,
 
-        "warning":
-            (
-                "Análise probabilística. "
-                "Não existe garantia de WIN. "
-                "A cotação da corretora pode "
-                "diferir da Twelve Data."
-            ),
-    }
-
-
-# ============================================================
-# ENDPOINT PRINCIPAL DA IA
-# ============================================================
-
-@app.get("/signal-ai")
-async def signal_ai(
-    symbol="EUR/USD",
-    interval="1min"
-):
-
-    require_active_license()
-
-    if symbol not in SYMBOLS:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Ativo inválido."
-        )
-
-    if interval not in ALLOWED_INTERVALS:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Timeframe inválido."
-        )
-
-    return await build_ai_signal(
-        symbol,
-        interval
-    )
-
-
-# ============================================================
-# ENDPOINT SOMENTE IA
-# ============================================================
-
-@app.get("/ai-analysis")
-async def ai_analysis_endpoint(
-    symbol="EUR/USD",
-    interval="1min"
-):
-
-    require_active_license()
-
-    if symbol not in SYMBOLS:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Ativo inválido."
-        )
-
-    if interval not in ALLOWED_INTERVALS:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Timeframe inválido."
-        )
-
-    values = await get_candles(
-        symbol,
-        interval,
-        240
-    )
-
-    analysis = ai_analyze(
-        values
-    )
-
-    return {
-        "ok": True,
-        "engine":
-            "Trade Sniper AI Hybrid",
-        "symbol":
-            symbol,
-        "interval":
-            interval,
-        "analysis":
-            analysis,
-        "updated_at":
-            now_sp().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-        "warning":
-            (
-                "A confiança é uma pontuação "
-                "do modelo e não garante o "
-                "próximo resultado."
-            ),
-    }
-
-
-# ============================================================
-# ENDPOINT RSI / SNIPER
-# ============================================================
-
-@app.get("/signal")
-async def signal(
-    symbol="EUR/USD",
-    interval="1min",
-    strategy="rsi"
-):
-
-    require_active_license()
-
-    if strategy not in dict(
-        STRATEGIES
-    ):
-
-        raise HTTPException(
-            status_code=400,
-            detail="Estratégia inválida."
-        )
-
-    values = await get_candles(
-        symbol,
-        interval,
-        100
-    )
-
-    result = analyze(
-        values,
-        strategy
-    )
-
-    minutes = ALLOWED_INTERVALS[
-        interval
-    ]
-
-    current = now_sp()
-
-    block = minutes * 60
-
-    next_epoch = (
-        (
-            int(current.timestamp())
-            // block
-        )
-        + 1
-    ) * block
-
-    entry_dt = datetime.fromtimestamp(
-        next_epoch,
-        tz=SP_TZ
-    )
-
-    expiry_dt = (
-        entry_dt
-        + timedelta(
-            minutes=minutes
-        )
-    )
-
-    result.update({
-
-        "source":
-            "Twelve Data",
-
-        "symbol":
-            symbol,
-
-        "interval":
-            interval,
-
-        "entry_time":
-            entry_dt.strftime(
-                "%Y-%m-%d %H:%M:%S"
+        "server_time_br":
+            iso_br(
+                now_sp()
             ),
 
-        "next_candle":
-            entry_dt.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-
-        "expiry_time":
-            expiry_dt.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-
-        "expiry":
-            "1 vela do intervalo selecionado",
-
-        "warning":
-            "Sinal probabilístico; não garante WIN.",
-    })
-
-    return result
-
-
-# ============================================================
-# VELAS
-# ============================================================
-
-@app.get("/candles")
-async def candles(
-    symbol="EUR/USD",
-    interval="1min",
-    size=120
-):
-
-    require_active_license()
-
-    values = await get_candles(
-        symbol,
-        interval,
-        int(size)
-    )
-
-    return {
-        "ok": True,
-        "source":
-            "Twelve Data",
-        "symbol":
-            symbol,
-        "interval":
-            interval,
-        "values":
-            values,
     }
 
 
@@ -3168,382 +1985,2968 @@ async def candles(
 # RADAR
 # ============================================================
 
-def radar_score(
-    analysis,
-    strategy
-):
+async def radar_data():
 
-    if strategy == "rsi":
+    require_active_license()
 
-        r9 = float(
-            analysis.get(
-                "rsi9",
-                50
+    cache_key = "all"
+
+    cached = _radar_cache.get(
+        cache_key
+    )
+
+    if cached:
+
+        age = (
+            time.time()
+            -
+            cached[0]
+        )
+
+        if age < RADAR_CACHE_SECONDS:
+
+            return cached[1]
+
+
+    result = []
+
+
+    for symbol in RADAR_SYMBOLS:
+
+        try:
+
+            data = await build_signal(
+                symbol,
+                "1min"
             )
-        )
 
-        r14 = float(
-            analysis.get(
-                "rsi14",
-                50
-            )
-        )
+            if data["signal"] in (
+                "CALL",
+                "PUT"
+            ):
 
-        bull = max(
-            0,
-            min(
-                100,
-                50
-                + (
-                    r9
-                    - 50
-                    + r14
-                    - 50
-                ) * 1.5
-            )
-        )
+                result.append({
 
-        bear = max(
-            0,
-            min(
-                100,
-                50
-                + (
-                    50
-                    - r9
-                    + 50
-                    - r14
-                ) * 1.5
-            )
-        )
+                    "symbol":
+                        symbol,
 
-    elif strategy == "old_sniper":
+                    "signal":
+                        data["signal"],
 
-        bull = min(
-            100,
-            50
-            + float(
-                analysis.get(
-                    "bull_score",
-                    0
-                )
-            ) * 10
-        )
+                    "confidence":
+                        data["confidence"],
 
-        bear = min(
-            100,
-            50
-            + float(
-                analysis.get(
-                    "bear_score",
-                    0
-                )
-            ) * 10
-        )
+                    "entry_time":
+                        data["entry_time_br"],
 
-    elif strategy == "sniper_02":
+                    "status":
+                        data["status"],
 
-        bull = (
-            90
-            if analysis.get(
-                "call_setup"
-            )
-            else 50
-        )
+                })
 
-        bear = (
-            90
-            if analysis.get(
-                "put_setup"
-            )
-            else 50
-        )
+        except Exception:
 
-    else:
-
-        bull = min(
-            99,
-            50
-            + float(
-                analysis.get(
-                    "call_score",
-                    0
-                )
-            ) * 5
-        )
-
-        bear = min(
-            99,
-            50
-            + float(
-                analysis.get(
-                    "put_score",
-                    0
-                )
-            ) * 5
-        )
-
-    if (
-        bull >= bear
-        and bull >= 58
-    ):
-
-        direction = "CALL"
-        proximity = round(bull)
-
-    elif (
-        bear > bull
-        and bear >= 58
-    ):
-
-        direction = "PUT"
-        proximity = round(bear)
-
-    else:
-
-        direction = "NEUTRO"
-        proximity = round(
-            max(
-                bull,
-                bear
-            )
-        )
-
-    return {
-        "direction":
-            direction,
-        "proximity":
-            max(
-                0,
-                min(
-                    99,
-                    proximity
-                )
-            ),
-        "call_proximity":
-            round(bull),
-        "put_proximity":
-            round(bear),
-    }
+            continue
 
 
-@app.get("/radar")
-async def radar(
-    interval="1min",
-    strategy="rsi"
+    result.sort(
+        key=lambda x:
+            x["confidence"],
+        reverse=True
+    )
+
+
+    _radar_cache[
+        cache_key
+    ] = (
+        time.time(),
+        result
+    )
+
+
+    return result
+
+
+# ============================================================
+# RANKING
+# ============================================================
+
+async def ranking_data(
+    interval: str = "1min"
 ):
 
     require_active_license()
 
-    if (
+    cached = _ranking_cache.get(
         interval
-        not in ALLOWED_INTERVALS
-        or strategy
-        not in dict(STRATEGIES)
-    ):
+    )
 
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Timeframe ou estratégia inválida."
-            )
+    if cached:
+
+        age = (
+            time.time()
+            -
+            cached[0]
         )
 
-    cache_key = (
-        interval,
-        strategy
-    )
+        if age < RANKING_CACHE_SECONDS:
 
-    cached = RADAR_CACHE.get(
-        cache_key
-    )
+            return cached[1]
 
-    if (
-        cached
-        and time.monotonic()
-        - cached[0]
-        < RADAR_TTL_SECONDS
-    ):
 
-        return cached[1]
+    candles_by_symbol = {}
 
-    results = []
-    errors = 0
 
-    radar_symbols = [
-        "EUR/USD",
-        "GBP/USD",
-        "USD/JPY",
-        "AUD/USD",
-        "USD/CAD",
-        "USD/CHF"
-    ]
-
-    for symbol_name in radar_symbols:
+    for symbol in SYMBOLS:
 
         try:
 
-            values = await get_candles(
-                symbol_name,
+            candles_by_symbol[
+                symbol
+            ] = await get_candles(
+                symbol,
                 interval,
-                100
+                240
             )
-
-            a = analyze(
-                values,
-                strategy
-            )
-
-            p = radar_score(
-                a,
-                strategy
-            )
-
-            results.append({
-
-                "symbol":
-                    symbol_name,
-
-                "signal":
-                    a["signal"],
-
-                "direction":
-                    p["direction"],
-
-                "proximity":
-                    p["proximity"],
-
-                "call_proximity":
-                    p["call_proximity"],
-
-                "put_proximity":
-                    p["put_proximity"],
-
-                "confidence":
-                    int(
-                        a.get(
-                            "confidence",
-                            50
-                        )
-                    ),
-
-                "reference_candle":
-                    a.get(
-                        "reference_candle"
-                    ),
-            })
 
         except Exception:
 
-            errors += 1
+            continue
 
-    results.sort(
-        key=lambda x: (
-            x["direction"]
-            == "NEUTRO",
-            -x["proximity"]
+
+    since = (
+        datetime.now(UTC)
+        -
+        timedelta(hours=3)
+    )
+
+
+    stats = {
+
+        "SNIPER X": {
+            "signals": 0,
+            "wins": 0
+        },
+
+        "SNIPER 01": {
+            "signals": 0,
+            "wins": 0
+        },
+
+        "SNIPER 02": {
+            "signals": 0,
+            "wins": 0
+        },
+
+        "SNIPER 03": {
+            "signals": 0,
+            "wins": 0
+        },
+
+    }
+
+
+    for candles in (
+        candles_by_symbol.values()
+    ):
+
+        if len(candles) < 90:
+            continue
+
+
+        closed = candles[:-1]
+
+
+        for i in range(
+            60,
+            len(closed) - 1
+        ):
+
+            if (
+                closed[i]["time"]
+                <
+                since
+            ):
+
+                continue
+
+
+            sample = closed[
+                :i + 1
+            ]
+
+
+            candidates = (
+                get_sniper_candidates(
+                    sample
+                )
+            )
+
+
+            for candidate in candidates:
+
+                name = candidate[
+                    "name"
+                ]
+
+                direction = candidate[
+                    "direction"
+                ]
+
+
+                stats[name][
+                    "signals"
+                ] += 1
+
+
+                next_candle = (
+                    closed[i + 1]
+                )
+
+
+                win = (
+
+                    direction == "CALL"
+
+                    and
+
+                    next_candle[
+                        "close"
+                    ]
+                    >
+                    next_candle[
+                        "open"
+                    ]
+
+                ) or (
+
+                    direction == "PUT"
+
+                    and
+
+                    next_candle[
+                        "close"
+                    ]
+                    <
+                    next_candle[
+                        "open"
+                    ]
+
+                )
+
+
+                if win:
+
+                    stats[name][
+                        "wins"
+                    ] += 1
+
+
+    result = []
+
+
+    for name, values in (
+        stats.items()
+    ):
+
+        total = int(
+            values["signals"]
+        )
+
+        wins = int(
+            values["wins"]
+        )
+
+        losses = max(
+            total - wins,
+            0
+        )
+
+
+        accuracy = (
+
+            wins
+            /
+            total
+            *
+            100
+
+            if total
+
+            else
+
+            0.0
+
+        )
+
+
+        result.append({
+
+            "name":
+                name,
+
+            "signals":
+                total,
+
+            "wins":
+                wins,
+
+            "losses":
+                losses,
+
+            "accuracy":
+                round(
+                    accuracy,
+                    2
+                ),
+
+        })
+
+
+    result.sort(
+
+        key=lambda x:
+            (
+                x["accuracy"],
+                x["wins"]
+            ),
+
+        reverse=True
+
+    )
+
+
+    for position, item in enumerate(
+        result,
+        1
+    ):
+
+        item["rank"] = position
+
+
+    _ranking_cache[
+        interval
+    ] = (
+        time.time(),
+        result
+    )
+
+
+    return result
+
+
+# ============================================================
+# LOCALIZAR VELA
+# ============================================================
+
+def find_candle(
+    candles: List[Dict[str, Any]],
+    target: datetime
+) -> Optional[
+    Dict[str, Any]
+]:
+
+    target = (
+        target
+        .astimezone(UTC)
+        .replace(
+            microsecond=0
         )
     )
 
-    payload = {
 
-        "ok":
-            True,
+    for candle in candles:
 
-        "interval":
-            interval,
+        current = (
+            candle["time"]
+            .replace(
+                microsecond=0
+            )
+        )
 
-        "strategy":
-            strategy,
+        if current == target:
 
-        "symbols_checked":
-            len(results),
+            return candle
 
-        "errors":
-            errors,
 
-        "results":
-            results,
+    return None
 
-        "warning":
+
+# ============================================================
+# HOME
+# ============================================================
+
+HOME_HTML = """
+<!doctype html>
+
+<html lang="pt-BR">
+
+<head>
+
+<meta charset="utf-8">
+
+<meta
+name="viewport"
+content="width=device-width,initial-scale=1"
+>
+
+<title>MEGA IA</title>
+
+
+<style>
+
+/* =========================================================
+   RESET
+========================================================= */
+
+* {
+    box-sizing: border-box;
+}
+
+
+/* =========================================================
+   BODY
+========================================================= */
+
+body {
+
+    margin: 0;
+
+    background:
+        radial-gradient(
+            circle at 20% 0%,
+            #073363 0,
+            #031322 30%,
+            #020814 70%
+        );
+
+    color: #eaf4ff;
+
+    font-family:
+        Inter,
+        Arial,
+        sans-serif;
+
+    min-height: 100vh;
+
+}
+
+
+/* =========================================================
+   APP
+========================================================= */
+
+.app {
+
+    max-width: 1450px;
+
+    margin: auto;
+
+    padding: 16px;
+
+}
+
+
+/* =========================================================
+   HERO
+========================================================= */
+
+.hero {
+
+    min-height: 190px;
+
+    border:
+        1px solid #12365d;
+
+    border-radius: 22px;
+
+    padding: 20px;
+
+    display: flex;
+
+    align-items: center;
+
+    gap: 24px;
+
+    background:
+        radial-gradient(
+            circle at 20% 20%,
+            #06356a 0,
+            #031322 45%,
+            #020814 100%
+        );
+
+    box-shadow:
+        0 0 35px #001d3d;
+
+}
+
+
+.robot {
+
+    width: 120px;
+
+    height: 120px;
+
+    border-radius: 50%;
+
+    display: grid;
+
+    place-items: center;
+
+    border:
+        2px solid #0b9cff;
+
+    background:
+        #06182c;
+
+    font-size: 64px;
+
+    box-shadow:
+        0 0 30px #007cff;
+
+}
+
+
+.brand h1 {
+
+    font-size: 48px;
+
+    margin: 0;
+
+    letter-spacing: 2px;
+
+}
+
+
+.brand p {
+
+    margin: 7px 0;
+
+    color: #7ccaff;
+
+    letter-spacing: 2px;
+
+}
+
+
+.status {
+
+    margin-left: auto;
+
+    border:
+        1px solid #17456d;
+
+    border-radius: 14px;
+
+    padding: 14px 18px;
+
+    min-width: 220px;
+
+}
+
+
+.dot {
+
+    display: inline-block;
+
+    width: 10px;
+
+    height: 10px;
+
+    border-radius: 50%;
+
+    background: #18e69a;
+
+    box-shadow:
+        0 0 12px #18e69a;
+
+}
+
+
+/* =========================================================
+   GRID
+========================================================= */
+
+.grid {
+
+    display: grid;
+
+    grid-template-columns:
+        280px
+        1fr
+        330px;
+
+    gap: 16px;
+
+    margin-top: 16px;
+
+}
+
+
+/* =========================================================
+   CARD
+========================================================= */
+
+.card {
+
+    background:
+        linear-gradient(
+            145deg,
+            #061426,
+            #030b15
+        );
+
+    border:
+        1px solid #123250;
+
+    border-radius: 18px;
+
+    padding: 16px;
+
+    box-shadow:
+        0 10px 30px #0008;
+
+}
+
+
+.title {
+
+    font-weight: 800;
+
+    font-size: 17px;
+
+    margin-bottom: 12px;
+
+    color: #d9eeff;
+
+}
+
+
+/* =========================================================
+   SELECT
+========================================================= */
+
+select {
+
+    width: 100%;
+
+    background: #071a2d;
+
+    color: white;
+
+    border:
+        1px solid #1b5c8d;
+
+    border-radius: 11px;
+
+    padding: 12px;
+
+    margin-bottom: 10px;
+
+}
+
+
+/* =========================================================
+   PARES
+========================================================= */
+
+.pair {
+
+    width: 100%;
+
+    text-align: left;
+
+    padding: 12px;
+
+    border:
+        1px solid #123250;
+
+    background: #061526;
+
+    color: #dcecff;
+
+    border-radius: 10px;
+
+    margin: 4px 0;
+
+    cursor: pointer;
+
+}
+
+
+.pair.active {
+
+    border-color: #00a8ff;
+
+    background: #082847;
+
+}
+
+
+/* =========================================================
+   CENTRO
+========================================================= */
+
+.center {
+
+    text-align: center;
+
+}
+
+
+.asset {
+
+    font-size: 25px;
+
+    font-weight: 800;
+
+    margin: 6px;
+
+}
+
+
+.badge {
+
+    display: inline-block;
+
+    padding: 7px 12px;
+
+    border-radius: 99px;
+
+    background: #08243c;
+
+    color: #7fcfff;
+
+}
+
+
+/* =========================================================
+   SIGNAL
+========================================================= */
+
+.signal {
+
+    font-size: 54px;
+
+    font-weight: 900;
+
+    margin: 20px auto;
+
+    padding: 15px;
+
+    border-radius: 30px;
+
+    max-width: 500px;
+
+}
+
+
+.call {
+
+    color: #19f59e;
+
+    border:
+        2px solid #13d982;
+
+    box-shadow:
+        0 0 35px #00e98a55;
+
+}
+
+
+.put {
+
+    color: #ff5368;
+
+    border:
+        2px solid #ff425b;
+
+    box-shadow:
+        0 0 35px #ff284655;
+
+}
+
+
+.neutral {
+
+    color: #ffc54d;
+
+    border:
+        2px solid #a96d00;
+
+}
+
+
+/* =========================================================
+   CONFIDENCE
+========================================================= */
+
+.conf {
+
+    font-size: 18px;
+
+}
+
+
+.conf strong {
+
+    font-size: 34px;
+
+}
+
+
+/* =========================================================
+   ENTRY
+========================================================= */
+
+.entry {
+
+    margin-top: 16px;
+
+    padding: 18px;
+
+    border-radius: 16px;
+
+    border:
+        2px solid #b87900;
+
+    background: #171102;
+
+}
+
+
+.entry.now {
+
+    border-color: #00ed9b;
+
+    background: #021a13;
+
+    box-shadow:
+        0 0 35px #00ed9b44;
+
+}
+
+
+.entry h2 {
+
+    margin: 0;
+
+    color: #ffc84d;
+
+}
+
+
+.entry.now h2 {
+
+    color: #20f6a2;
+
+}
+
+
+.count {
+
+    font-size: 36px;
+
+    font-weight: 900;
+
+    margin: 8px;
+
+}
+
+
+/* =========================================================
+   VOICE
+========================================================= */
+
+.voice {
+
+    width: 100%;
+
+    padding: 13px;
+
+    border-radius: 12px;
+
+    border:
+        1px solid #158cff;
+
+    background: #082442;
+
+    color: white;
+
+    font-weight: 800;
+
+    cursor: pointer;
+
+    margin-top: 10px;
+
+}
+
+
+.voice.on {
+
+    border-color: #16e69a;
+
+    background: #063324;
+
+}
+
+
+/* =========================================================
+   MESSAGE
+========================================================= */
+
+.ai-msg {
+
+    text-align: left;
+
+    margin-top: 16px;
+
+    padding: 15px;
+
+    border:
+        1px solid #075fa2;
+
+    border-radius: 14px;
+
+    background: #041525;
+
+}
+
+
+.robotmini {
+
+    font-size: 28px;
+
+}
+
+
+/* =========================================================
+   STATS
+========================================================= */
+
+.stats {
+
+    display: grid;
+
+    grid-template-columns:
+        1fr 1fr;
+
+    gap: 10px;
+
+}
+
+
+.stat {
+
+    padding: 14px;
+
+    border:
+        1px solid #153a5b;
+
+    border-radius: 12px;
+
+}
+
+
+.num {
+
+    font-size: 26px;
+
+    font-weight: 900;
+
+}
+
+
+.good {
+
+    color: #1df2a1;
+
+}
+
+
+.bad {
+
+    color: #ff5468;
+
+}
+
+
+/* =========================================================
+   RANKING
+========================================================= */
+
+.rankrow {
+
+    display: grid;
+
+    grid-template-columns:
+        28px
+        1fr
+        60px;
+
+    gap: 7px;
+
+    padding: 11px 0;
+
+    border-bottom:
+        1px solid #12304a;
+
+}
+
+
+/* =========================================================
+   SMALL
+========================================================= */
+
+.small {
+
+    color: #83a6c4;
+
+    font-size: 13px;
+
+}
+
+
+/* =========================================================
+   CLOCK
+========================================================= */
+
+.clock {
+
+    font-size: 32px;
+
+    font-weight: 900;
+
+    color: #5bc5ff;
+
+}
+
+
+/* =========================================================
+   FOOTER
+========================================================= */
+
+.footer {
+
+    margin-top: 16px;
+
+    text-align: center;
+
+    color: #7190aa;
+
+    font-size: 12px;
+
+}
+
+
+/* =========================================================
+   RESPONSIVE
+========================================================= */
+
+@media (
+    max-width: 1050px
+) {
+
+    .grid {
+
+        grid-template-columns: 1fr;
+
+    }
+
+    .hero {
+
+        flex-wrap: wrap;
+
+    }
+
+    .status {
+
+        margin-left: 0;
+
+    }
+
+    .brand h1 {
+
+        font-size: 38px;
+
+    }
+
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+
+<div class="app">
+
+
+<!-- =====================================================
+     CABEÇALHO
+===================================================== -->
+
+<section class="hero">
+
+
+    <div class="robot">
+
+        🤖
+
+    </div>
+
+
+    <div class="brand">
+
+        <h1>
+
+            MEGA IA
+
+        </h1>
+
+
+        <p>
+
+            ANÁLISE INTELIGENTE • ENTRADAS EM TEMPO REAL
+
+        </p>
+
+    </div>
+
+
+    <div class="status">
+
+        <span class="dot"></span>
+
+        <b> IA ONLINE </b>
+
+        <br>
+
+        <span class="small">
+
+            Monitorando o mercado
+
+        </span>
+
+    </div>
+
+
+</section>
+
+
+
+<!-- =====================================================
+     GRID PRINCIPAL
+===================================================== -->
+
+<div class="grid">
+
+
+<!-- =====================================================
+     ESQUERDA
+===================================================== -->
+
+<aside>
+
+
+<div class="card">
+
+
+    <div class="title">
+
+        🔄 PARES DISPONÍVEIS
+
+    </div>
+
+
+    <div id="pairs">
+
+    </div>
+
+
+</div>
+
+
+
+<div
+    class="card"
+    style="margin-top:16px"
+>
+
+
+    <div class="title">
+
+        ⏱️ TEMPO GRÁFICO
+
+    </div>
+
+
+    <select id="interval">
+
+        <option value="1min">
+
+            1 minuto
+
+        </option>
+
+        <option value="5min">
+
+            5 minutos
+
+        </option>
+
+        <option value="15min">
+
+            15 minutos
+
+        </option>
+
+        <option value="30min">
+
+            30 minutos
+
+        </option>
+
+    </select>
+
+
+</div>
+
+
+</aside>
+
+
+
+<!-- =====================================================
+     CENTRO
+===================================================== -->
+
+<main class="card center">
+
+
+    <div class="small">
+
+        ANÁLISE DO ATIVO
+
+    </div>
+
+
+    <div
+        class="asset"
+        id="asset"
+    >
+
+        EUR/USD
+
+    </div>
+
+
+    <span
+        class="badge"
+        id="tf"
+    >
+
+        1 minuto
+
+    </span>
+
+
+    <div
+        id="signal"
+        class="signal neutral"
+    >
+
+        AGUARDANDO
+
+    </div>
+
+
+    <div class="conf">
+
+        Confiança da IA
+
+        <br>
+
+        <strong id="confidence">
+
+            --%
+
+        </strong>
+
+    </div>
+
+
+
+    <!-- =================================================
+         MOMENTO DE ENTRADA
+    ================================================== -->
+
+    <div
+        id="entryBox"
+        class="entry"
+    >
+
+
+        <h2 id="entryTitle">
+
+            MOMENTO DA ENTRADA
+
+        </h2>
+
+
+        <div id="entryText">
+
+            A Mega IA está procurando
+            uma oportunidade.
+
+        </div>
+
+
+        <div
+            class="count"
+            id="countdown"
+        >
+
+            --:--
+
+        </div>
+
+
+    </div>
+
+
+
+    <!-- =================================================
+         VOZ
+    ================================================== -->
+
+    <button
+        id="voiceButton"
+        class="voice"
+        onclick="toggleVoice()"
+    >
+
+        🔇 ATIVAR VOZ DA MEGA IA
+
+    </button>
+
+
+
+    <!-- =================================================
+         MENSAGEM DA IA
+    ================================================== -->
+
+    <div class="ai-msg">
+
+
+        <span class="robotmini">
+
+            🤖
+
+        </span>
+
+
+        <b>
+
+            MEGA IA
+
+        </b>
+
+
+        <div
+            id="aiMessage"
+            style="margin-top:7px"
+        >
+
+            Monitorando o mercado...
+
+        </div>
+
+
+    </div>
+
+
+</main>
+
+
+
+<!-- =====================================================
+     DIREITA
+===================================================== -->
+
+<aside>
+
+
+<div class="card">
+
+
+    <div class="title">
+
+        📊 DESEMPENHO
+
+    </div>
+
+
+    <div class="stats">
+
+
+        <div class="stat">
+
+            Win
+
+            <div
+                id="wins"
+                class="num good"
+            >
+
+                0
+
+            </div>
+
+        </div>
+
+
+        <div class="stat">
+
+            Loss
+
+            <div
+                id="losses"
+                class="num bad"
+            >
+
+                0
+
+            </div>
+
+        </div>
+
+
+        <div class="stat">
+
+            Assertividade
+
+            <div
+                id="accuracy"
+                class="num"
+            >
+
+                0%
+
+            </div>
+
+        </div>
+
+
+        <div class="stat">
+
+            Sinais
+
+            <div
+                id="signals"
+                class="num"
+            >
+
+                0
+
+            </div>
+
+        </div>
+
+
+    </div>
+
+
+</div>
+
+
+
+<!-- =====================================================
+     RANKING
+===================================================== -->
+
+<div
+    class="card"
+    style="margin-top:16px"
+>
+
+
+    <div class="title">
+
+        🔥 RANKING — 3 HORAS
+
+    </div>
+
+
+    <div id="ranking">
+
+        <span class="small">
+
+            Carregando...
+
+        </span>
+
+    </div>
+
+
+</div>
+
+
+
+<!-- =====================================================
+     HORÁRIO
+===================================================== -->
+
+<div
+    class="card"
+    style="margin-top:16px"
+>
+
+
+    <div class="title">
+
+        ⏰ HORÁRIO DE BRASÍLIA
+
+    </div>
+
+
+    <div
+        class="clock"
+        id="clock"
+    >
+
+        --:--:--
+
+    </div>
+
+
+    <div
+        class="small"
+        id="date"
+    >
+
+        --/--/----
+
+    </div>
+
+
+</div>
+
+
+</aside>
+
+
+</div>
+
+
+
+<!-- =====================================================
+     RADAR
+===================================================== -->
+
+<div
+    class="card"
+    style="margin-top:16px"
+>
+
+
+    <div class="title">
+
+        📡 RADAR — PARES PRÓXIMOS DE SINAL
+
+    </div>
+
+
+    <div
+        id="radar"
+        class="small"
+    >
+
+        Analisando...
+
+    </div>
+
+
+</div>
+
+
+
+<!-- =====================================================
+     FOOTER
+===================================================== -->
+
+<div class="footer">
+
+    MEGA IA • Sistema de análise técnica automatizada
+
+    •
+
+    Licença
+
+    <span id="license">
+
+        verificando...
+
+    </span>
+
+</div>
+
+
+</div>
+
+
+
+<script>
+
+
+// =========================================================
+// CONFIGURAÇÃO
+// =========================================================
+
+const SYMBOLS = %SYMBOLS%;
+
+
+let selectedSymbol =
+    "EUR/USD";
+
+
+let voiceEnabled =
+    false;
+
+
+let lastOpportunity =
+    "";
+
+
+let lastEntry =
+    "";
+
+
+let lastResult =
+    "";
+
+
+let trackedSignal =
+    null;
+
+
+let wins =
+    Number(
+        localStorage.getItem(
+            "mega_wins"
+        ) || 0
+    );
+
+
+let losses =
+    Number(
+        localStorage.getItem(
+            "mega_losses"
+        ) || 0
+    );
+
+
+let signalCount =
+    Number(
+        localStorage.getItem(
+            "mega_signals"
+        ) || 0
+    );
+
+
+// =========================================================
+// ATALHO
+// =========================================================
+
+function $(id) {
+
+    return document.getElementById(id);
+
+}
+
+
+// =========================================================
+// PARES
+// =========================================================
+
+function renderPairs() {
+
+    $("pairs").innerHTML =
+        SYMBOLS.map(
+            symbol => `
+
+                <button
+                    class="pair ${
+                        symbol === selectedSymbol
+                        ? "active"
+                        : ""
+                    }"
+                    onclick="selectPair('${symbol}')"
+                >
+
+                    ${symbol}
+
+                    <span
+                        style="
+                            float:right;
+                            color:#18e69a
+                        "
+                    >
+
+                        ●
+
+                    </span>
+
+                </button>
+
+            `
+        ).join("");
+
+}
+
+
+function selectPair(symbol) {
+
+    selectedSymbol =
+        symbol;
+
+    renderPairs();
+
+    loadSignal();
+
+}
+
+
+// =========================================================
+// INTERVALO
+// =========================================================
+
+function selectedInterval() {
+
+    return $("interval").value;
+
+}
+
+
+// =========================================================
+// VOZ
+// =========================================================
+
+function speak(text) {
+
+    if (
+        !voiceEnabled
+        ||
+        !("speechSynthesis" in window)
+    ) {
+
+        return;
+
+    }
+
+
+    speechSynthesis.cancel();
+
+
+    const utterance =
+        new SpeechSynthesisUtterance(
+            text
+        );
+
+
+    utterance.lang =
+        "pt-BR";
+
+
+    utterance.rate =
+        0.94;
+
+
+    utterance.pitch =
+        0.90;
+
+
+    utterance.volume =
+        1.0;
+
+
+    const voices =
+        speechSynthesis.getVoices();
+
+
+    const brazilVoice =
+        voices.find(
+            voice =>
+                (
+                    voice.lang || ""
+                )
+                .toLowerCase()
+                .startsWith(
+                    "pt-br"
+                )
+        );
+
+
+    if (brazilVoice) {
+
+        utterance.voice =
+            brazilVoice;
+
+    }
+
+
+    speechSynthesis.speak(
+        utterance
+    );
+
+}
+
+
+// =========================================================
+// ATIVAR VOZ
+// =========================================================
+
+function toggleVoice() {
+
+    if (
+        !("speechSynthesis" in window)
+    ) {
+
+        alert(
+            "Seu navegador não suporta voz."
+        );
+
+        return;
+
+    }
+
+
+    voiceEnabled =
+        !voiceEnabled;
+
+
+    $("voiceButton")
+        .classList
+        .toggle(
+            "on",
+            voiceEnabled
+        );
+
+
+    $("voiceButton").textContent =
+        voiceEnabled
+        ? "🔊 VOZ ATIVADA"
+        : "🔇 ATIVAR VOZ DA MEGA IA";
+
+
+    if (voiceEnabled) {
+
+        speak(
+            "Mega IA ativada. Monitoramento iniciado."
+        );
+
+    } else {
+
+        speechSynthesis.cancel();
+
+    }
+
+}
+
+
+// =========================================================
+// VOZ - OPORTUNIDADE
+// =========================================================
+
+function sayOpportunity(data) {
+
+    if (!voiceEnabled) {
+
+        return;
+
+    }
+
+
+    const key =
+
+        (data.symbol || "")
+        +
+        "_"
+        +
+        (data.interval || "")
+        +
+        "_"
+        +
+        (data.signal || "")
+        +
+        "_"
+        +
+        (data.entry_time || "");
+
+
+    if (
+        key === lastOpportunity
+    ) {
+
+        return;
+
+    }
+
+
+    lastOpportunity =
+        key;
+
+
+    const asset =
+        (
+            data.symbol || ""
+        )
+        .replace(
+            "/",
+            " "
+        );
+
+
+    speak(
+
+        `Atenção. A Mega IA encontrou ` +
+        `uma oportunidade no ${asset}. ` +
+        `Sinal ${data.signal}. ` +
+        `Entrada programada para ` +
+        `${data.entry_time_br}.`
+
+    );
+
+}
+
+
+// =========================================================
+// VOZ - ENTRADA
+// =========================================================
+
+function sayEntry(data) {
+
+    if (!voiceEnabled) {
+
+        return;
+
+    }
+
+
+    const key =
+
+        (data.symbol || "")
+        +
+        "_"
+        +
+        (data.interval || "")
+        +
+        "_"
+        +
+        (data.signal || "")
+        +
+        "_"
+        +
+        (data.entry_time || "");
+
+
+    if (
+        key === lastEntry
+    ) {
+
+        return;
+
+    }
+
+
+    lastEntry =
+        key;
+
+
+    speak(
+
+        `Entrada liberada. ` +
+        `${data.signal} agora.`
+
+    );
+
+}
+
+
+// =========================================================
+// CONTADOR
+// =========================================================
+
+function formatCountdown(
+    seconds
+) {
+
+    seconds =
+        Math.max(
+            0,
+            Math.floor(
+                seconds
+            )
+        );
+
+
+    const minutes =
+        Math.floor(
+            seconds / 60
+        )
+        .toString()
+        .padStart(
+            2,
+            "0"
+        );
+
+
+    const secs =
+        (
+            seconds % 60
+        )
+        .toString()
+        .padStart(
+            2,
+            "0"
+        );
+
+
+    return (
+        minutes
+        +
+        ":"
+        +
+        secs
+    );
+
+}
+
+
+// =========================================================
+// ESTATÍSTICAS
+// =========================================================
+
+function updateStats() {
+
+    $("wins").textContent =
+        wins;
+
+
+    $("losses").textContent =
+        losses;
+
+
+    $("signals").textContent =
+        signalCount;
+
+
+    const total =
+        wins + losses;
+
+
+    $("accuracy").textContent =
+
+        total
+
+        ?
+
+        (
             (
-                "Radar probabilístico. "
-                "Proximidade não é garantia "
-                "de sinal ou WIN."
-            ),
+                wins / total
+            )
+            *
+            100
+        ).toFixed(1)
+        + "%"
+
+        :
+
+        "0%";
+
+}
+
+
+// =========================================================
+// CARREGAR SINAL
+// =========================================================
+
+async function loadSignal() {
+
+    try {
+
+        const url =
+
+            `/signal-ai?symbol=` +
+            `${encodeURIComponent(
+                selectedSymbol
+            )}` +
+            `&interval=` +
+            `${selectedInterval()}`;
+
+
+        const response =
+            await fetch(url);
+
+
+        const data =
+            await response.json();
+
+
+        trackedSignal =
+            data;
+
+
+        $("asset").textContent =
+            data.symbol
+            ||
+            selectedSymbol;
+
+
+        const names = {
+
+            "1min":
+                "1 minuto",
+
+            "5min":
+                "5 minutos",
+
+            "15min":
+                "15 minutos",
+
+            "30min":
+                "30 minutos"
+
+        };
+
+
+        $("tf").textContent =
+            names[
+                data.interval
+            ]
+            ||
+            data.interval;
+
+
+        const signal =
+            data.signal
+            ||
+            "NEUTRO";
+
+
+        $("confidence").textContent =
+
+            Number(
+                data.confidence
+                ||
+                0
+            ).toFixed(1)
+            +
+            "%";
+
+
+        $("aiMessage").textContent =
+            data.message
+            ||
+            "Monitorando o mercado.";
+
+
+        const signalBox =
+            $("signal");
+
+
+        if (
+            signal === "CALL"
+        ) {
+
+            signalBox.className =
+                "signal call";
+
+            signalBox.textContent =
+                "CALL ↑";
+
+        }
+
+        else if (
+            signal === "PUT"
+        ) {
+
+            signalBox.className =
+                "signal put";
+
+            signalBox.textContent =
+                "PUT ↓";
+
+        }
+
+        else {
+
+            signalBox.className =
+                "signal neutral";
+
+            signalBox.textContent =
+                "AGUARDANDO";
+
+        }
+
+
+        // =================================================
+        // EXISTE OPORTUNIDADE
+        // =================================================
+
+        if (
+            signal === "CALL"
+            ||
+            signal === "PUT"
+        ) {
+
+
+            if (
+                data.voice_event
+                ===
+                "opportunity"
+            ) {
+
+                sayOpportunity(
+                    data
+                );
+
+            }
+
+
+            if (
+                data.voice_event
+                ===
+                "entry_now"
+            ) {
+
+                sayEntry(
+                    data
+                );
+
+            }
+
+
+            if (
+                data.entry_epoch
+            ) {
+
+                $("entryText").innerHTML =
+
+                    `Entrada programada: ` +
+                    `<b>${data.entry_time_br}</b>` +
+                    `<br>` +
+                    `Expiração: ${data.expiry_time_br}`;
+
+
+                $("entryBox")
+                    .classList
+                    .toggle(
+                        "now",
+                        data.status
+                        ===
+                        "ENTRAR_AGORA"
+                    );
+
+            }
+
+        }
+
+        else {
+
+            $("entryText").textContent =
+                "A Mega IA está procurando uma oportunidade.";
+
+
+            $("countdown").textContent =
+                "--:--";
+
+
+            $("entryBox")
+                .classList
+                .remove(
+                    "now"
+                );
+
+        }
+
+
     }
 
-    RADAR_CACHE[
-        cache_key
-    ] = (
-        time.monotonic(),
-        payload
+    catch (error) {
+
+        $("aiMessage").textContent =
+            "Não foi possível atualizar a análise agora.";
+
+    }
+
+}
+
+
+// =========================================================
+// CONTAGEM REGRESSIVA
+// =========================================================
+
+function updateCountdown() {
+
+    if (
+        !trackedSignal
+        ||
+        !trackedSignal.entry_epoch
+    ) {
+
+        return;
+
+    }
+
+
+    const now =
+        Math.floor(
+            Date.now() / 1000
+        );
+
+
+    const seconds =
+        trackedSignal.entry_epoch
+        -
+        now;
+
+
+    $("countdown").textContent =
+        formatCountdown(
+            seconds
+        );
+
+
+    // =====================================================
+    // AVISOS DOS 5 SEGUNDOS
+    // =====================================================
+
+    if (
+        seconds <= 5
+        &&
+        seconds > 0
+        &&
+        trackedSignal.signal
+    ) {
+
+        if (
+            trackedSignal._spokenSecond
+            !==
+            seconds
+        ) {
+
+            trackedSignal._spokenSecond =
+                seconds;
+
+
+            if (
+                seconds === 5
+            ) {
+
+                speak(
+                    "Atenção. Entrada em 5 segundos."
+                );
+
+            }
+
+            else if (
+                seconds === 4
+            ) {
+
+                speak(
+                    "Entrada em 4 segundos."
+                );
+
+            }
+
+            else if (
+                seconds === 3
+            ) {
+
+                speak(
+                    "Entrada em 3 segundos."
+                );
+
+            }
+
+            else if (
+                seconds === 2
+            ) {
+
+                speak(
+                    "Entrada em 2 segundos."
+                );
+
+            }
+
+            else if (
+                seconds === 1
+            ) {
+
+                speak(
+                    "Entrada em 1 segundo."
+                );
+
+            }
+
+        }
+
+    }
+
+
+    // =====================================================
+    // ENTRADA
+    // =====================================================
+
+    if (
+        seconds <= 0
+        &&
+        trackedSignal.signal
+    ) {
+
+        if (
+            trackedSignal.status
+            !==
+            "ENTRAR_AGORA"
+        ) {
+
+            trackedSignal.status =
+                "ENTRAR_AGORA";
+
+
+            $("entryBox")
+                .classList
+                .add(
+                    "now"
+                );
+
+
+            sayEntry(
+                trackedSignal
+            );
+
+        }
+
+    }
+
+}
+
+
+// =========================================================
+// RANKING
+// =========================================================
+
+async function loadRanking() {
+
+    try {
+
+        const url =
+            `/sniper-ranking?interval=` +
+            `${selectedInterval()}`;
+
+
+        const response =
+            await fetch(url);
+
+
+        const data =
+            await response.json();
+
+
+        const items =
+            data.items || [];
+
+
+        $("ranking").innerHTML =
+
+            items
+            .slice(
+                0,
+                4
+            )
+            .map(
+                item => `
+
+                    <div class="rankrow">
+
+                        <b>
+                            ${item.rank}
+                        </b>
+
+                        <div>
+
+                            <b>
+                                ${item.name}
+                            </b>
+
+                            <br>
+
+                            <span class="small">
+
+                                ${item.wins}W /
+                                ${item.losses}L
+
+                            </span>
+
+                        </div>
+
+                        <b>
+
+                            ${Number(
+                                item.accuracy
+                            ).toFixed(1)}%
+
+                        </b>
+
+                    </div>
+
+                `
+            )
+            .join("");
+
+
+        if (!items.length) {
+
+            $("ranking").textContent =
+                "Sem dados suficientes.";
+
+        }
+
+
+    }
+
+    catch (error) {
+
+        $("ranking").textContent =
+            "Ranking indisponível.";
+
+    }
+
+}
+
+
+// =========================================================
+// RADAR
+// =========================================================
+
+async function loadRadar() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/radar"
+            );
+
+
+        const data =
+            await response.json();
+
+
+        const items =
+            data.items || [];
+
+
+        $("radar").innerHTML =
+
+            items
+            .slice(
+                0,
+                8
+            )
+            .map(
+                item => `
+
+                    <span
+                        style="
+                            display:inline-block;
+                            padding:10px 14px;
+                            margin:4px;
+                            border:1px solid #164568;
+                            border-radius:12px
+                        "
+                    >
+
+                        <b>
+                            ${item.symbol}
+                        </b>
+
+                        <span
+                            class="${
+                                item.signal === "CALL"
+                                ? "good"
+                                : "bad"
+                            }"
+                        >
+
+                            ${item.signal}
+
+                        </span>
+
+                        ${Number(
+                            item.confidence
+                        ).toFixed(0)}%
+
+                    </span>
+
+                `
+            )
+            .join("");
+
+
+        if (!items.length) {
+
+            $("radar").textContent =
+                "Nenhuma oportunidade confirmada neste momento.";
+
+        }
+
+
+    }
+
+    catch (error) {
+
+        $("radar").textContent =
+            "Radar indisponível.";
+
+    }
+
+}
+
+
+// =========================================================
+// LICENÇA
+// =========================================================
+
+async function loadLicense() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/license"
+            );
+
+
+        const data =
+            await response.json();
+
+
+        if (data.active) {
+
+            $("license").textContent =
+
+                `ATIVA • validade ${data.expires}`;
+
+        }
+
+        else {
+
+            $("license").textContent =
+
+                `EXPIRADA • ${data.expires}`;
+
+        }
+
+
+    }
+
+    catch (error) {
+
+        $("license").textContent =
+            "não verificada";
+
+    }
+
+}
+
+
+// =========================================================
+// RESULTADO
+// =========================================================
+
+async function checkResult() {
+
+    if (
+        !trackedSignal
+        ||
+        !trackedSignal.entry_time
+        ||
+        !trackedSignal.signal
+    ) {
+
+        return;
+
+    }
+
+
+    const key =
+
+        trackedSignal.symbol
+        +
+        "_"
+        +
+        trackedSignal.entry_time
+        +
+        "_"
+        +
+        trackedSignal.signal;
+
+
+    if (
+        key === lastResult
+    ) {
+
+        return;
+
+    }
+
+
+    const now =
+        Math.floor(
+            Date.now() / 1000
+        );
+
+
+    if (
+        !trackedSignal.expiry_epoch
+        ||
+        now
+        <
+        trackedSignal.expiry_epoch + 2
+    ) {
+
+        return;
+
+    }
+
+
+    try {
+
+        const url =
+
+            `/result?symbol=` +
+            `${encodeURIComponent(
+                trackedSignal.symbol
+            )}` +
+            `&interval=` +
+            `${trackedSignal.interval}` +
+            `&direction=` +
+            `${trackedSignal.signal}` +
+            `&entry_time=` +
+            `${encodeURIComponent(
+                trackedSignal.entry_time
+            )}`;
+
+
+        const response =
+            await fetch(url);
+
+
+        const data =
+            await response.json();
+
+
+        if (
+            data.result === "WIN"
+            ||
+            data.result === "LOSS"
+        ) {
+
+
+            lastResult =
+                key;
+
+
+            if (
+                data.result === "WIN"
+            ) {
+
+                wins++;
+
+                signalCount++;
+
+                localStorage.setItem(
+                    "mega_wins",
+                    wins
+                );
+
+                localStorage.setItem(
+                    "mega_signals",
+                    signalCount
+                );
+
+
+                speak(
+                    "Operação finalizada. Resultado WIN."
+                );
+
+            }
+
+            else {
+
+                losses++;
+
+                signalCount++;
+
+                localStorage.setItem(
+                    "mega_losses",
+                    losses
+                );
+
+                localStorage.setItem(
+                    "mega_signals",
+                    signalCount
+                );
+
+
+                speak(
+                    "Operação finalizada. Resultado LOSS."
+                );
+
+            }
+
+
+            updateStats();
+
+        }
+
+    }
+
+    catch (error) {
+
+        console.log(
+            "Resultado ainda indisponível."
+        );
+
+    }
+
+}
+
+
+// =========================================================
+// RELÓGIO DE BRASÍLIA
+// =========================================================
+
+function updateClock() {
+
+    const now =
+        new Date();
+
+
+    $("clock").textContent =
+
+        now.toLocaleTimeString(
+            "pt-BR",
+            {
+                hour12: false
+            }
+        );
+
+
+    $("date").textContent =
+
+        now.toLocaleDateString(
+            "pt-BR"
+        );
+
+}
+
+
+// =========================================================
+// INICIALIZAÇÃO
+// =========================================================
+
+$("interval")
+    .addEventListener(
+        "change",
+        function() {
+
+            loadSignal();
+
+            loadRanking();
+
+        }
+    );
+
+
+renderPairs();
+
+updateStats();
+
+loadLicense();
+
+loadSignal();
+
+loadRanking();
+
+loadRadar();
+
+updateClock();
+
+
+// Relógio
+setInterval(
+    updateClock,
+    1000
+);
+
+
+// Contador
+setInterval(
+    updateCountdown,
+    250
+);
+
+
+// Atualização da análise
+setInterval(
+    loadSignal,
+    5000
+);
+
+
+// Verificação do resultado
+setInterval(
+    checkResult,
+    5000
+);
+
+
+// Radar
+setInterval(
+    loadRadar,
+    90000
+);
+
+
+// Ranking
+setInterval(
+    loadRanking,
+    180000
+);
+
+
+</script>
+
+
+</body>
+
+</html>
+""".replace(
+    "%SYMBOLS%",
+    json.dumps(
+        SYMBOLS
     )
-
-    return payload
-
-
-# ============================================================
-# HORÁRIO DO SERVIDOR
-# ============================================================
-
-@app.get("/server-time")
-async def server_time():
-
-    current = now_sp()
-
-    return {
-
-        "brasilia":
-            current.isoformat(),
-
-        "utc":
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
-    }
+)
 
 
 # ============================================================
-# LICENÇA
-# ============================================================
-
-@app.get("/license")
-async def license():
-
-    return {
-        "ok": True,
-        **license_status()
-    }
-
-
-# ============================================================
-# HEALTH
-# ============================================================
-
-@app.get("/health")
-async def health():
-
-    return {
-
-        "ok": True,
-
-        "app":
-            APP_NAME,
-
-        "version":
-            APP_VERSION,
-
-        "engine":
-            "ISMAEL TRADE AI + RSI + SNIPERS",
-
-        "status":
-            "online",
-    }
-
-
-# ============================================================
-# PÁGINA INICIAL
+# ENDPOINTS
 # ============================================================
 
 @app.get(
@@ -3552,284 +4955,336 @@ async def health():
 )
 async def home():
 
-    html = """
-<!DOCTYPE html>
-<html lang="pt-BR">
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta name="viewport"
-      content="width=device-width, initial-scale=1.0">
-
-<title>Ismael Trade AI</title>
-
-<style>
-
-body {
-    background: #07111f;
-    color: white;
-    font-family: Arial, sans-serif;
-    margin: 0;
-    padding: 20px;
-}
-
-.card {
-    max-width: 700px;
-    margin: auto;
-    background: #0d1b2d;
-    border-radius: 18px;
-    padding: 25px;
-    box-shadow: 0 0 30px rgba(0,0,0,.4);
-}
-
-h1 {
-    text-align: center;
-}
-
-.status {
-    text-align: center;
-    margin: 15px 0;
-    padding: 12px;
-    border-radius: 10px;
-    background: #10253d;
-}
-
-.signal {
-    text-align: center;
-    font-size: 38px;
-    font-weight: bold;
-    margin: 25px 0;
-}
-
-.info {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-}
-
-.box {
-    background: #10253d;
-    padding: 15px;
-    border-radius: 10px;
-}
-
-button {
-    width: 100%;
-    padding: 15px;
-    border: 0;
-    border-radius: 10px;
-    margin-top: 20px;
-    font-weight: bold;
-    cursor: pointer;
-}
-
-</style>
-
-</head>
-
-<body>
-
-<div class="card">
-
-<h1>🧠 ISMAEL TRADE AI</h1>
-
-<div class="status">
-ANÁLISE EM TEMPO REAL
-</div>
-
-<div id="clock" class="status">
-HORÁRIO DE BRASÍLIA
-</div>
-
-<div id="signal"
-     class="signal">
-AGUARDANDO
-</div>
-
-<div class="info">
-
-<div class="box">
-<b>ATIVO</b>
-<div id="symbol">
-EUR/USD
-</div>
-</div>
-
-<div class="box">
-<b>TIMEFRAME</b>
-<div id="interval">
-M1
-</div>
-</div>
-
-<div class="box">
-<b>CONFIANÇA IA</b>
-<div id="confidence">
---
-</div>
-</div>
-
-<div class="box">
-<b>QUALIDADE</b>
-<div id="quality">
---
-</div>
-</div>
-
-<div class="box">
-<b>SNIPER</b>
-<div id="sniper">
---
-</div>
-</div>
-
-<div class="box">
-<b>STATUS</b>
-<div id="entry_status">
---
-</div>
-</div>
-
-<div class="box">
-<b>ENTRADA</b>
-<div id="entry">
---
-</div>
-</div>
-
-<div class="box">
-<b>EXPIRAÇÃO</b>
-<div id="expiry">
---
-</div>
-</div>
-
-</div>
-
-<button onclick="updateSignal()">
-ATUALIZAR SINAL
-</button>
-
-<div class="status"
-     id="reason">
-IA analisando...
-</div>
-
-<div class="status">
-
-Renovação:
-<br>
-
-WhatsApp:
-55 84 99841-1282
-<br>
-55 84 99449-9442
-
-<br><br>
-
-Instagram:
-@Ismaelartur26
-
-</div>
-
-</div>
+    return HOME_HTML
 
 
-<script>
+@app.get("/health")
+async def health():
 
-async function updateSignal() {
+    return {
 
-    try {
+        "ok": True,
 
-        const response =
-            await fetch(
-                "/signal-ai?symbol=EUR/USD&interval=1min"
-            );
+        "app": APP_NAME,
 
-        const data =
-            await response.json();
+        "version":
+            APP_VERSION,
 
-        document.getElementById(
-            "clock"
-        ).innerText =
-            data.now_sp || "--";
-
-        document.getElementById(
-            "signal"
-        ).innerText =
-            data.signal || "NEUTRO";
-
-        document.getElementById(
-            "confidence"
-        ).innerText =
-            (data.confidence || 0) + "%";
-
-        document.getElementById(
-            "quality"
-        ).innerText =
-            data.quality || "--";
-
-        document.getElementById(
-            "sniper"
-        ).innerText =
-            data.sniper_signal || "NEUTRO";
-
-        document.getElementById(
-            "entry_status"
-        ).innerText =
-            data.entry_status || "--";
-
-        document.getElementById(
-            "entry"
-        ).innerText =
-            data.entry_time || "--";
-
-        document.getElementById(
-            "expiry"
-        ).innerText =
-            data.expiry_time || "--";
-
-        document.getElementById(
-            "reason"
-        ).innerText =
-            data.entry_message ||
-            data.reason ||
-            "IA analisando...";
-
-    } catch (error) {
-
-        document.getElementById(
-            "reason"
-        ).innerText =
-            "Erro ao consultar a API.";
+        "time_br":
+            iso_br(
+                now_sp()
+            ),
 
     }
-}
 
 
-updateSignal();
+@app.get("/server-time")
+async def server_time():
 
-setInterval(
-    updateSignal,
-    5000
-);
+    current = now_sp()
 
-</script>
+    return {
 
-</body>
+        "datetime":
+            iso_br(current),
 
-</html>
-"""
+        "time":
+            current.strftime(
+                "%H:%M:%S"
+            ),
 
-    return HTMLResponse(
-        html
+        "date":
+            current.strftime(
+                "%d/%m/%Y"
+            ),
+
+        "timezone":
+            "America/Sao_Paulo",
+
+    }
+
+
+@app.get("/license")
+async def license():
+
+    return license_status()
+
+
+@app.get("/candles")
+async def candles(
+    symbol: str = Query(...),
+    interval: str = Query("1min"),
+    outputsize: int = Query(
+        240,
+        ge=80,
+        le=5000
+    )
+):
+
+    values = await get_candles(
+        symbol,
+        interval,
+        outputsize
     )
 
 
+    return {
+
+        "symbol":
+            symbol,
+
+        "interval":
+            interval,
+
+        "values": [
+
+            {
+                **candle,
+
+                "time":
+                    iso_br(
+                        candle["time"]
+                    ),
+
+            }
+
+            for candle
+            in values
+
+        ],
+
+    }
+
+
+@app.get("/signal-ai")
+async def signal_ai(
+    symbol: str = Query(
+        "EUR/USD"
+    ),
+    interval: str = Query(
+        "1min"
+    )
+):
+
+    return await build_signal(
+        symbol,
+        interval
+    )
+
+
+@app.get("/ai-analysis")
+async def ai_analysis(
+    symbol: str = Query(
+        "EUR/USD"
+    ),
+    interval: str = Query(
+        "1min"
+    )
+):
+
+    return await build_signal(
+        symbol,
+        interval
+    )
+
+
+@app.get("/signal")
+async def signal(
+    symbol: str = Query(
+        "EUR/USD"
+    ),
+    interval: str = Query(
+        "1min"
+    )
+):
+
+    return await build_signal(
+        symbol,
+        interval
+    )
+
+
+@app.get("/radar")
+async def radar():
+
+    return {
+
+        "items":
+            await radar_data(),
+
+        "updated_at":
+            iso_br(
+                now_sp()
+            ),
+
+    }
+
+
+@app.get("/sniper-ranking")
+async def sniper_ranking(
+    interval: str = Query(
+        "1min"
+    )
+):
+
+    return {
+
+        "interval":
+            interval,
+
+        "period":
+            "3h",
+
+        "items":
+            await ranking_data(
+                interval
+            ),
+
+    }
+
+
+@app.get("/result")
+async def result(
+    symbol: str = Query(...),
+    interval: str = Query(
+        "1min"
+    ),
+    direction: str = Query(...),
+    entry_time: str = Query(...)
+):
+
+    require_active_license()
+
+
+    dt = parse_dt(
+        entry_time
+    )
+
+
+    if not dt:
+
+        raise HTTPException(
+            status_code=400,
+            detail="entry_time inválido."
+        )
+
+
+    candles = await get_candles(
+        symbol,
+        interval,
+        300
+    )
+
+
+    candle = find_candle(
+        candles,
+        dt
+    )
+
+
+    if not candle:
+
+        return {
+
+            "status":
+                "PENDING",
+
+            "result":
+                "PENDING",
+
+            "message":
+                "A vela da entrada ainda não está disponível.",
+
+        }
+
+
+    direction = direction.upper()
+
+
+    if direction not in (
+        "CALL",
+        "PUT"
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "direction deve ser "
+                "CALL ou PUT."
+            )
+        )
+
+
+    if (
+        candle["close"]
+        ==
+        candle["open"]
+    ):
+
+        outcome = "DRAW"
+
+    elif (
+
+        direction == "CALL"
+
+        and
+
+        candle["close"]
+        >
+        candle["open"]
+
+    ) or (
+
+        direction == "PUT"
+
+        and
+
+        candle["close"]
+        <
+        candle["open"]
+
+    ):
+
+        outcome = "WIN"
+
+    else:
+
+        outcome = "LOSS"
+
+
+    return {
+
+        "status":
+            "CLOSED",
+
+        "result":
+            outcome,
+
+        "symbol":
+            symbol,
+
+        "interval":
+            interval,
+
+        "direction":
+            direction,
+
+        "entry_time":
+            iso_br(
+                candle["time"]
+            ),
+
+        "open":
+            candle["open"],
+
+        "close":
+            candle["close"],
+
+    }
+
+
 # ============================================================
-# EXECUÇÃO
+# EXECUÇÃO LOCAL
 # ============================================================
 
 if __name__ == "__main__":
@@ -3837,12 +5292,16 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
+
         app,
+
         host="0.0.0.0",
+
         port=int(
             os.getenv(
                 "PORT",
                 "8000"
             )
         )
+
     )
