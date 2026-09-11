@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "Ismael Trade"
-APP_VERSION = "8.8.0"
+APP_VERSION = "8.9.0"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -517,6 +517,58 @@ def analyze(candles: List[Dict[str, Any]], strategy: str = "rsi") -> Dict[str, A
             "ok": True,
         }
 
+    if strategy == "sniper_03":
+        # SNIPER 03 — Tendência + Retração + LTA/LTB + zonas fortes.
+        if len(closed) < 45:
+            raise HTTPException(status_code=422, detail="Dados insuficientes para SNIPER 03.")
+        closes = [c["close"] for c in closed]; highs=[c["high"] for c in closed]; lows=[c["low"] for c in closed]
+        ema20=ema(closes,20); ema50=ema(closes,50)
+        trv=true_ranges(closed); atr=sum(trv[-14:])/14
+        tol=max(atr*0.35, abs(reference["close"])*0.0005)
+        def pl(i): return i>=2 and i+2<len(closed) and lows[i]<=lows[i-1] and lows[i]<=lows[i-2] and lows[i]<lows[i+1] and lows[i]<lows[i+2]
+        def ph(i): return i>=2 and i+2<len(closed) and highs[i]>=highs[i-1] and highs[i]>=highs[i-2] and highs[i]>highs[i+1] and highs[i]>highs[i+2]
+        lp=[i for i in range(max(2,len(closed)-35),len(closed)-2) if pl(i)]
+        hp=[i for i in range(max(2,len(closed)-35),len(closed)-2) if ph(i)]
+        lta_level=ltb_level=None; lta_valid=ltb_valid=False
+        if len(lp)>=2:
+            a,b=lp[-2],lp[-1]
+            if lows[b]>lows[a]:
+                slope=(lows[b]-lows[a])/(b-a); lta_level=lows[b]+slope*(len(closed)-1-b); lta_valid=slope>0 and lta_level<=reference["high"]+tol
+        if len(hp)>=2:
+            a,b=hp[-2],hp[-1]
+            if highs[b]<highs[a]:
+                slope=(highs[b]-highs[a])/(b-a); ltb_level=highs[b]+slope*(len(closed)-1-b); ltb_valid=slope<0 and ltb_level>=reference["low"]-tol
+        support_level=min((lows[i] for i in lp[-5:]),default=None)
+        resistance_level=max((highs[i] for i in hp[-5:]),default=None)
+        def zone_score(level,side):
+            if level is None:return 0
+            touches=reject=0
+            for c in closed[max(0,len(closed)-40):-1]:
+                if c["low"]<=level+tol and c["high"]>=level-tol:
+                    touches+=1
+                    if side=="support" and (c["close"]>c["open"] or min(c["open"],c["close"])-c["low"]>body(c)): reject+=1
+                    if side=="resistance" and (c["close"]<c["open"] or c["high"]-max(c["open"],c["close"])>body(c)): reject+=1
+            return touches+min(reject,3)
+        ss=zone_score(support_level,"support"); rs=zone_score(resistance_level,"resistance")
+        strong_support=support_level is not None and ss>=4; strong_resistance=resistance_level is not None and rs>=4
+        rb=body(reference); rr=rng(reference); lw=min(reference["open"],reference["close"])-reference["low"]; uw=reference["high"]-max(reference["open"],reference["close"])
+        bull_rej=reference["close"]>reference["open"] and lw>=max(rb*1.2,rr*.30); bear_rej=reference["close"]<reference["open"] and uw>=max(rb*1.2,rr*.30)
+        near_lta=lta_level is not None and abs(reference["low"]-lta_level)<=tol; near_ltb=ltb_level is not None and abs(reference["high"]-ltb_level)<=tol
+        near_sup=support_level is not None and abs(reference["low"]-support_level)<=tol; near_res=resistance_level is not None and abs(reference["high"]-resistance_level)<=tol
+        prior=closed[-6:-1]
+        up=ema20[-1]>ema50[-1] and ema20[-1]>ema20[-4] and reference["close"]>ema50[-1]
+        down=ema20[-1]<ema50[-1] and ema20[-1]<ema20[-4] and reference["close"]<ema50[-1]
+        pull_call=any(c["close"]<c["open"] for c in prior[-3:]) and (near_lta or near_sup or abs(reference["low"]-ema20[-1])<=tol)
+        pull_put=any(c["close"]>c["open"] for c in prior[-3:]) and (near_ltb or near_res or abs(reference["high"]-ema20[-1])<=tol)
+        conf_call=reference["close"]>reference["open"] and reference["close"]>=previous["high"]
+        conf_put=reference["close"]<reference["open"] and reference["close"]<=previous["low"]
+        call_score=(2 if up else 0)+(2 if lta_valid else 0)+(2 if strong_support else 0)+(2 if pull_call else 0)+(1 if bull_rej else 0)+(2 if conf_call else 0)+(1 if near_lta else 0)+(1 if near_sup else 0)
+        put_score=(2 if down else 0)+(2 if ltb_valid else 0)+(2 if strong_resistance else 0)+(2 if pull_put else 0)+(1 if bear_rej else 0)+(2 if conf_put else 0)+(1 if near_ltb else 0)+(1 if near_res else 0)
+        if call_score>=8 and call_score>put_score: signal="CALL"; confidence=min(95,55+call_score*4)
+        elif put_score>=8 and put_score>call_score: signal="PUT"; confidence=min(95,55+put_score*4)
+        else: signal="NEUTRO"; confidence=50
+        return {"signal":signal,"confidence":confidence,"reference_candle":reference["datetime"],"next_candle":next_candle["datetime"],"strategy":"SNIPER 03","strategy_code":"sniper_03","trend":"ALTA" if up else "BAIXA" if down else "NEUTRA","lta":round(lta_level,8) if lta_level is not None else None,"ltb":round(ltb_level,8) if ltb_level is not None else None,"support":round(support_level,8) if support_level is not None else None,"resistance":round(resistance_level,8) if resistance_level is not None else None,"strong_support":strong_support,"strong_resistance":strong_resistance,"near_lta":near_lta,"near_ltb":near_ltb,"near_support":near_sup,"near_resistance":near_res,"pullback_call":pull_call,"pullback_put":pull_put,"bullish_rejection":bull_rej,"bearish_rejection":bear_rej,"call_score":call_score,"put_score":put_score,"non_repaint_reference":True,"ok":True}
+
     # SNIPER X — apenas RSI 9 + RSI 14 em confluência.
     closes = [float(c["close"]) for c in closed]
     rsi9_values = rsi(closes, 9)
@@ -657,6 +709,11 @@ button{cursor:pointer;font-weight:bold}
 <div><div class="sniperTitle">SNIPER 02</div></div>
 <button id="sniper02Toggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button>
 </div></div>
+<div class="card sniper">
+<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+<div><div class="sniperTitle">SNIPER 03</div></div>
+<button id="sniper03Toggle" class="onlineBtn offline" style="width:auto;margin:0">● OFFLINE</button>
+</div></div>
 
 <div class="card">
 <div class="small">SINAL</div>
@@ -704,7 +761,8 @@ let isOnline = true;
 let rsiOnline = localStorage.getItem("is_trade_rsi_online") !== "off";
 let oldOnline = localStorage.getItem("is_trade_old_online") === "on";
 let sniper02Online = localStorage.getItem("is_trade_sniper02_online") === "on";
-let selectedStrategy = localStorage.getItem("is_trade_selected_strategy") || (oldOnline ? "old_sniper" : sniper02Online ? "sniper_02" : "rsi");
+let sniper03Online = localStorage.getItem("is_trade_sniper03_online") === "on";
+let selectedStrategy = localStorage.getItem("is_trade_selected_strategy") || (oldOnline ? "old_sniper" : sniper03Online ? "sniper_03" : sniper02Online ? "sniper_02" : "rsi");
 
 function save(){
   localStorage.setItem("is_trade_stats", JSON.stringify(stats));
@@ -722,12 +780,14 @@ function activeStrategy(){
   if(selectedStrategy==="rsi" && rsiOnline)return "rsi";
   if(selectedStrategy==="old_sniper" && oldOnline)return "old_sniper";
   if(selectedStrategy==="sniper_02" && sniper02Online)return "sniper_02";
+  if(selectedStrategy==="sniper_03" && sniper03Online)return "sniper_03";
   if(rsiOnline)return "rsi";
   if(oldOnline)return "old_sniper";
   if(sniper02Online)return "sniper_02";
+  if(sniper03Online)return "sniper_03";
   return null;
 }
-function renderMode(){setStrategyButton("rsiToggle",rsiOnline);setStrategyButton("oldToggle",oldOnline);setStrategyButton("sniper02Toggle",sniper02Online);const active=activeStrategy();$("modeStatus").textContent=isOnline&&active?"ONLINE":"OFFLINE";$("strategyStatus").textContent=active==="old_sniper"?"SNIPER 01":active==="sniper_02"?"SNIPER 02":active==="rsi"?"SNIPER X":"NENHUMA";if(!isOnline||!active){$("signal").textContent="OFFLINE";$("signal").className="signal neutral";}}
+function renderMode(){setStrategyButton("rsiToggle",rsiOnline);setStrategyButton("oldToggle",oldOnline);setStrategyButton("sniper02Toggle",sniper02Online);setStrategyButton("sniper03Toggle",sniper03Online);const active=activeStrategy();$("modeStatus").textContent=isOnline&&active?"ONLINE":"OFFLINE";$("strategyStatus").textContent=active==="old_sniper"?"SNIPER 01":active==="sniper_02"?"SNIPER 02":active==="sniper_03"?"SNIPER 03":active==="rsi"?"SNIPER X":"NENHUMA";if(!isOnline||!active){$("signal").textContent="OFFLINE";$("signal").className="signal neutral";}}
 
 function fmt(v){ return v == null ? "--" : v; }
 
@@ -866,6 +926,7 @@ $("refresh").onclick = loadSignal;
 $("rsiToggle").onclick=()=>{rsiOnline=!rsiOnline;if(rsiOnline)selectedStrategy="rsi";localStorage.setItem("is_trade_rsi_online",rsiOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&rsiOnline)loadSignal();};
 $("oldToggle").onclick=()=>{oldOnline=!oldOnline;if(oldOnline)selectedStrategy="old_sniper";localStorage.setItem("is_trade_old_online",oldOnline?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&oldOnline)loadSignal();};
 $("sniper02Toggle").onclick=()=>{sniper02Online=!sniper02Online;if(sniper02Online)selectedStrategy="sniper_02";localStorage.setItem("is_trade_sniper02_online",sniper02Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper02Online)loadSignal();};
+$("sniper03Toggle").onclick=()=>{sniper03Online=!sniper03Online;if(sniper03Online)selectedStrategy="sniper_03";localStorage.setItem("is_trade_sniper03_online",sniper03Online?"on":"off");localStorage.setItem("is_trade_selected_strategy",selectedStrategy);pending=null;save();renderMode();if(isOnline&&sniper03Online)loadSignal();};
 $("reset").onclick = () => {
   if(confirm("Zerar WIN e LOSS?")){
     stats = {wins:0,losses:0};
@@ -956,7 +1017,7 @@ async def signal(
     strategy: str = "rsi",
 ) -> Dict[str, Any]:
     require_active_license()
-    if strategy not in {"rsi", "old_sniper", "sniper_02"}:
+    if strategy not in {"rsi", "old_sniper", "sniper_02", "sniper_03"}:
         raise HTTPException(status_code=400, detail="Estratégia inválida.")
     values = await get_candles(symbol, interval, 100)
     result = analyze(values, strategy)
