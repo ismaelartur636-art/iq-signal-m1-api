@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 APP_NAME = "Ismael Trade"
-APP_VERSION = "9.0.1"
+APP_VERSION = "9.0.2"
 KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 BASE_URL = "https://api.twelvedata.com/time_series"
 SP_TZ = ZoneInfo("America/Sao_Paulo")
@@ -58,7 +58,7 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 # Cache local para evitar chamadas repetidas à Twelve Data.
 # Isso reduz bastante o consumo de créditos e evita chamadas simultâneas.
-CACHE_TTL_SECONDS = 12.0
+CACHE_TTL_SECONDS = 60.0
 RATE_LIMIT_COOLDOWN_SECONDS = 20.0
 CANDLE_CACHE: Dict[tuple, tuple] = {}
 CANDLE_LOCKS: Dict[tuple, asyncio.Lock] = {}
@@ -67,7 +67,7 @@ RADAR_CACHE: Dict[tuple, tuple] = {}
 RADAR_SYMBOLS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF",
 ]
-RADAR_TTL_SECONDS = 45.0
+RADAR_TTL_SECONDS = 120.0
 
 
 def now_sp() -> datetime:
@@ -112,6 +112,8 @@ async def get_candles(symbol: str, interval: str, outputsize: int = 100) -> List
         return cached[1]
 
     if now < RATE_LIMIT_UNTIL:
+        if cached:
+            return cached[1]
         remaining = max(1, int(RATE_LIMIT_UNTIL - now))
         raise HTTPException(
             status_code=429,
@@ -816,6 +818,7 @@ button{cursor:pointer;font-weight:bold}
 <div class="card">
 <div class="small">SINAL</div>
 <div id="signal" class="signal neutral">AGUARDANDO</div>
+<div id="signalError" class="small" style="display:none;margin-top:8px"></div>
 <div class="entry">
 <div class="entryBox"><div class="small">HORÁRIO DE ENTRADA</div><div id="entryTime" class="value">--</div></div>
 <div class="entryBox"><div class="small">EXPIRAÇÃO</div><div id="expiry" class="value">--</div></div>
@@ -893,9 +896,13 @@ function fmt(v){ return v == null ? "--" : v; }
 let resultTimer = null;
 
 function showError(message){
-  $("signal").textContent = "ERRO";
+  $("signal").textContent = "SEM DADOS";
   $("signal").className = "signal neutral";
-  $("confidence").textContent = message;
+  $("confidence").textContent = "--";
+  if($("signalError")){
+    $("signalError").textContent = message || "Não foi possível atualizar o sinal.";
+    $("signalError").style.display = "block";
+  }
 }
 function updateClock(){
   const now = new Date();
@@ -977,6 +984,7 @@ async function loadSignal(){
     $("signal").textContent = d.signal;
     $("signal").className = "signal " + (d.signal==="CALL" ? "call" : d.signal==="PUT" ? "put" : "neutral");
     $("confidence").textContent = d.confidence + "%";
+    if($("signalError")){ $("signalError").textContent = ""; $("signalError").style.display = "none"; }
     $("reference").textContent = d.reference_candle;
     $("next").textContent = d.entry_time || d.next_candle;
     $("entryTime").textContent = (d.entry_time || d.next_candle || "--").split(" ")[1] || "--";
@@ -1085,7 +1093,7 @@ setInterval(() => {
 if(pending) scheduleResultCheck();
 setInterval(syncServerClock, 30000);
 setInterval(loadLicense, 60000);
-setInterval(loadRadar, 45000);
+setInterval(loadRadar, 120000);
 </script>
 </body>
 </html>"""
