@@ -1,5 +1,6 @@
+
 fastapi
 uvicorn[standard]
 httpx
-scikit-learn
-xgboost
+git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
+websocket-client==0.56
