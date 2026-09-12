@@ -326,9 +326,25 @@ async def candles_open(symbol, interval, n=80):
         raise HTTPException(502, "Nenhum candle recebido.")
     return out
 
-def iq_active(symbol):
-    # Nomes usados pela IQ Option para os pares OTC.
-    return symbol.replace("/", "") + "-OTC"
+def iq_active_candidates(symbol):
+    base = symbol.replace("/", "").upper()
+    # A IQ Option pode expor o ativo OTC com nomes diferentes conforme a conta/mercado.
+    return [f"{base}-OTC", f"{base}_OTC", base]
+
+def iq_find_active(client, symbol):
+    candidates = iq_active_candidates(symbol)
+    try:
+        opened = client.get_all_open_time() or {}
+        for market_name in ("turbo", "binary", "digital"):
+            items = opened.get(market_name, {}) or {}
+            for name in candidates:
+                info = items.get(name)
+                if isinstance(info, dict) and info.get("open"):
+                    return name
+    except Exception:
+        pass
+    # Mesmo sem a tabela de abertura, tenta o nome OTC padrão.
+    return candidates[0]
 
 def iq_seconds(interval):
     return INTERVALS[interval]
@@ -352,11 +368,25 @@ def iq_connect_blocking():
 
 def iq_candles_blocking(symbol, interval, n):
     client = iq_connect_blocking()
-    active = iq_active(symbol)
     duration = iq_seconds(interval)
-    data = client.get_candles(active, duration, n, time.time())
+    candidates = iq_active_candidates(symbol)
+    active = iq_find_active(client, symbol)
+    ordered = [active] + [x for x in candidates if x != active]
+    last_error = None
+    data = None
+    used = None
+    for name in ordered:
+        try:
+            chunk = client.get_candles(name, duration, n, time.time())
+            if chunk:
+                data = chunk
+                used = name
+                break
+        except Exception as exc:
+            last_error = exc
     if not data:
-        raise RuntimeError(f"A IQ Option não retornou candles para {active}.")
+        detail = f" Último erro: {last_error}" if last_error else ""
+        raise RuntimeError(f"A IQ Option não retornou candles OTC para {symbol}. Tentados: {', '.join(ordered)}.{detail}")
     out=[]
     for x in data:
         try:
@@ -367,6 +397,8 @@ def iq_candles_blocking(symbol, interval, n):
         except Exception:
             continue
     out.sort(key=lambda z:z["datetime"])
+    if len(out) < 5:
+        raise RuntimeError(f"A IQ Option retornou poucos candles para {used}: {len(out)}")
     return out
 
 async def candles(symbol, interval, n=80, market="OPEN"):
