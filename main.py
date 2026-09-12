@@ -13,6 +13,9 @@ from fastapi.responses import HTMLResponse, FileResponse
 
 app = FastAPI(title="MEGA IA", version="14.0.0")
 
+IMAGE_PATH = os.path.join(os.path.dirname(__file__), "mega_ia.png")
+
+
 BR_TZ = ZoneInfo("America/Sao_Paulo")
 UTC = timezone.utc
 
@@ -320,12 +323,7 @@ async def openai_confirm(symbol, interval, cs, analysis):
     if key in oai_cache and time.time() - oai_cache[key][0] < 55:
         return oai_cache[key][1]
     data = [{"time": c["datetime"], "o": c["open"], "h": c["high"], "l": c["low"], "c": c["close"], "v": c["volume"]} for c in cs[-40:]]
-    prompt = f'''Você é o módulo de confirmação da MEGA IA. Ativo {symbol}, timeframe {interval}.
-Use SOMENTE candles fechados. Não invente dados futuros.
-Estratégias: Bollinger 20/2 + Estocástico 14,3,3 e EMA 9/21 + RSI 7.
-Análise técnica preliminar: {json.dumps(analysis, ensure_ascii=False)}
-Retorne SOMENTE JSON: {{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
-Candles: {json.dumps(data, ensure_ascii=False)}'''
+    prompt = f'''Você é o módulo de confirmação da MEGA IA. Ativo {symbol}, timeframe {interval}. Use SOMENTE candles fechados. Não invente dados futuros. Estratégias: Bollinger 20/2 + Estocástico 14,3,3 e EMA 9/21 + RSI 7. Análise técnica preliminar: {json.dumps(analysis, ensure_ascii=False)} Retorne SOMENTE JSON: {{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"reason":"curto","risk":"LOW|MEDIUM|HIGH"}} Candles: {json.dumps(data, ensure_ascii=False)}'''
     try:
         async with httpx.AsyncClient(timeout=OAI_TIMEOUT) as client:
             response = await client.post(OAI_URL, headers={"Authorization": f"Bearer {OAI_KEY}", "Content-Type": "application/json"},
@@ -418,18 +416,21 @@ async def license_info():
     return {"active": active, "expires": LICENSE, "days_remaining": days, "whatsapp_1": WA1, "whatsapp_2": WA2, "instagram": IG}
 
 
+
 @app.get("/mega-ia.png")
-async def mega_image():
+async def mega_ia_image():
     if not os.path.exists(IMAGE_PATH):
-        raise HTTPException(404, "Imagem mega_ia.png não encontrada no servidor.")
+        raise HTTPException(404, "Imagem MEGA IA não encontrada.")
     return FileResponse(IMAGE_PATH, media_type="image/png")
 
 
 @app.get("/candles")
-async def get_candles(symbol="EUR/USD", interval="1min", limit=50):
+async def candles_endpoint(symbol: str = "EUR/USD", interval: str = "1min", n: int = 80):
     if symbol not in SYMBOLS or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
-    return {"symbol": symbol, "interval": interval, "candles": await candles(symbol, interval, int(clamp(limit, 10, 100)))}
+    n = max(20, min(int(n), 150))
+    values = await candles(symbol, interval, n)
+    return {"symbol": symbol, "interval": interval, "candles": values}
 
 
 @app.get("/signal-ai")
@@ -443,10 +444,15 @@ async def get_signal(symbol="EUR/USD", interval="1min"):
 
 
 @app.get("/ai-analysis")
-async def ai_analysis(symbol="EUR/USD", interval="1min"):
-    s = await signal(symbol, interval)
-    return s
-
+async def ai_analysis(symbol: str = "EUR/USD", interval: str = "M1"):
+    """Retorna somente os dados destinados ao painel; estratégias ficam internas."""
+    data = await signal(symbol, interval)
+    public_keys = [
+        "symbol", "interval", "direction", "confidence", "status",
+        "ai_confirmed", "risk", "entry_time", "announce_time",
+        "expiry_time", "non_repaint"
+    ]
+    return {k: data.get(k) for k in public_keys}
 
 @app.get("/radar")
 async def radar(interval="1min"):
@@ -493,68 +499,10 @@ async def result(symbol="EUR/USD", interval="1min", direction="CALL", expiry_tim
     return out
 
 
-HTML_PAGE = r'''<!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MEGA IA</title>
-<style>
-body{margin:0;background:#050913;color:#eef5ff;font-family:Arial,sans-serif}.wrap{max-width:1150px;margin:auto;padding:16px}
-.card{background:#0d1625;border:1px solid #1d3049;border-radius:18px;padding:16px;box-shadow:0 10px 30px #0005;margin-top:12px}
-.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.signal{grid-column:span 2;text-align:center;min-height:270px}
-.big{font-size:32px;font-weight:800;margin:8px}.call{color:#45ff9b}.put{color:#ff5c7a}.neutral{color:#ffd166}.label{font-size:11px;color:#8190a8}
-.controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}select,button{background:#111f33;color:#fff;border:1px solid #2b4463;border-radius:12px;padding:11px}button{cursor:pointer}
-.ai-img{display:none;width:100%;max-width:560px;height:270px;object-fit:cover;border-radius:18px;border:1px solid #168cff66;box-shadow:0 0 35px #008cff55;margin:12px auto;animation:pulse 1.2s infinite alternate}
-@keyframes pulse{from{filter:brightness(.8)}to{filter:brightness(1.25);box-shadow:0 0 45px #008cff99}}
-.radar{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.radar div{background:#101b2b;padding:10px;border-radius:12px}
-.strategy{line-height:1.65}.status-analysis{color:#33baff}
-@media(max-width:720px){.grid{grid-template-columns:1fr 1fr}.signal{grid-column:span 2}.radar{grid-template-columns:1fr 1fr}.ai-img{height:220px}}
-@media(max-width:450px){.grid{grid-template-columns:1fr}.signal{grid-column:span 1}.radar{grid-template-columns:1fr}}
-</style></head>
-<body><div class="wrap">
-<h1>🤖 MEGA IA</h1><div class="label">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div><div id="clock"></div>
-<div class="controls"><select id="symbol"></select><select id="interval"><option>1min</option><option>5min</option><option>15min</option><option>30min</option></select><button id="voiceBtn" onclick="voice()">🔊 Ativar voz</button></div>
-<img id="aiImage" class="ai-img" src="/mega-ia.png" alt="MEGA IA analisando o mercado">
-<div id="analysisText" class="card status-analysis" style="display:none;text-align:center;font-size:20px">🧠 ESTOU ANALISANDO O MERCADO, AGUARDE...</div>
-<div class="grid">
-<div class="card signal"><div class="label">SINAL ATUAL</div><div id="direction" class="big neutral">AGUARDANDO</div><div id="confidence">Confiança: --</div><div id="strategyName">Estratégia: --</div></div>
-<div class="card"><div class="label">ENTRADA</div><div id="entry" class="big">--:--:--</div><div id="countdown">--</div></div>
-<div class="card"><div class="label">STATUS IA</div><div id="status" class="big" style="font-size:18px">MONITORANDO</div><div id="risk">Risco: --</div></div></div>
-<div class="grid"><div class="card"><div class="label">WIN</div><div id="wins" class="big call">0</div></div><div class="card"><div class="label">LOSS</div><div id="losses" class="big put">0</div></div><div class="card"><div class="label">ASSERTIVIDADE</div><div id="accuracy" class="big">0%</div></div><div class="card"><div class="label">RESULTADO</div><div id="result" class="big">--</div></div></div>
-<div class="card strategy"><b>📊 Estratégias ativas</b><br>1) Bollinger <b>20/2</b> + Estocástico <b>14,3,3</b>: rompimento e fechamento fora da banda + zona extrema + cruzamento de retorno.<br>2) EMA <b>9/21</b> + RSI <b>7</b>: cruzamento das médias + RSI acima/abaixo de 50 e ainda dentro de 70/30.<br><small>Somente candles fechados são usados para evitar repintura. A entrada é programada para a abertura da próxima vela e o aviso ocorre 5 segundos antes.</small></div>
-<div class="card"><b>Radar de oportunidades</b><div id="radar" class="radar"></div></div>
-<div class="card"><div class="label">LICENÇA</div><div id="license">Verificando...</div></div>
-</div>
-<script>
-const syms=['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD'];
-const S=document.getElementById('symbol');syms.forEach(x=>S.add(new Option(x,x)));
-let cur=null,voiceEnabled=false,lastSignalVoice='',lastAnalysis=0,five=false,entered=false,reskey='';
-function speak(t){if(!voiceEnabled||!window.speechSynthesis)return;speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.lang='pt-BR';u.rate=.95;speechSynthesis.speak(u)}
-function voice(){voiceEnabled=true;voiceBtn.textContent='🔊 Voz ativada';speak('Voz da Mega IA ativada.');setTimeout(()=>sig(true),650)}
-function ft(x){return x?new Date(x).toLocaleTimeString('pt-BR',{hour12:false}):'--:--:--'}
-async function get(u){const r=await fetch(u,{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);return r.json()}
-async function sig(announce=false){
- if(announce&&voiceEnabled&&Date.now()-lastAnalysis>2500){lastAnalysis=Date.now();document.getElementById('aiImage').style.display='block';analysisText.style.display='block';status.textContent='ANALISANDO O MERCADO...';speak('Estou analisando o mercado, aguarde.')}
- try{
-  cur=await get(`/signal-ai?symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}`);
-  document.getElementById('aiImage').style.display=announce?'block':'none';analysisText.style.display=announce?'block':'none';
-  direction.textContent=cur.direction;direction.className='big '+(cur.direction==='CALL'?'call':cur.direction==='PUT'?'put':'neutral');
-  confidence.textContent='Confiança: '+cur.confidence+'%';entry.textContent=ft(cur.entry_time);status.textContent=cur.status;risk.textContent='Risco: '+cur.risk;strategyName.textContent='Estratégia: '+(cur.strategy||'--');
-  if(cur.direction!=='NEUTRO'){
-   const k=cur.symbol+'|'+cur.interval+'|'+cur.entry_time+'|'+cur.direction;
-   if(k!==lastSignalVoice){lastSignalVoice=k;if(voiceEnabled){speak(cur.direction==='CALL'?'Análise concluída. Sinal de CALL identificado.':'Análise concluída. Sinal de PUT identificado.')}}
-  }else if(announce&&voiceEnabled){speak('Análise concluída. Não há oportunidade segura no momento.')}
-  five=false;entered=false;
- }catch(e){status.textContent='ERRO DE DADOS';if(announce&&voiceEnabled)speak('Não foi possível concluir a análise. Aguarde.')}
-}
-async function perf(){try{const p=await get('/performance');wins.textContent=p.wins;losses.textContent=p.losses;accuracy.textContent=p.accuracy+'%'}catch(e){}}
-async function rad(){try{const a=await get('/radar?interval='+encodeURIComponent(interval.value));radar.innerHTML=a.map(x=>`<div><b>${x.symbol}</b><br><span class="${x.direction==='CALL'?'call':x.direction==='PUT'?'put':'neutral'}">${x.direction}</span> • ${x.confidence}%<br><small>${x.status}</small></div>`).join('')}catch(e){}}
-async function lic(){try{const x=await get('/license');license.textContent=x.active?`● LICENÇA ATIVA • ${x.expires} • ${x.days_remaining} dias restantes`:`● LICENÇA EXPIRADA • ${x.whatsapp_1} / ${x.whatsapp_2} • ${x.instagram}`}catch(e){}}
-async function clk(){try{const x=await get('/server-time');clock.textContent=ft(x.datetime)+' • Brasília'}catch(e){}}
-function cd(){if(!cur)return;const n=Math.ceil((new Date(cur.entry_time)-Date.now())/1000);countdown.textContent=n>0?'Entrada em '+n+'s':'Entrada liberada';if(n===5&&!five){five=true;if(voiceEnabled)speak('Atenção. Entrada em 5 segundos.')}if(n<=0&&n>-2&&!entered){entered=true;if(voiceEnabled&&cur.direction!=='NEUTRO')speak('Entrada liberada. '+cur.direction+' agora.')}}
-async function resultCheck(){if(!cur||cur.direction==='NEUTRO')return;try{const x=await get(`/result?symbol=${encodeURIComponent(cur.symbol)}&interval=${cur.interval}&direction=${cur.direction}&expiry_time=${encodeURIComponent(cur.expiry_time)}`);if(x.result){result.textContent=x.result;const k=cur.symbol+'|'+cur.expiry_time;if(k!==reskey){reskey=k;if(voiceEnabled)speak('Operação finalizada. Resultado '+x.result+'.')}perf()}}catch(e){}}
-S.onchange=()=>{lastSignalVoice='';sig(true);rad()};interval.onchange=()=>{lastSignalVoice='';sig(true);rad()};
-sig(false);perf();rad();lic();clk();setInterval(()=>sig(false),5000);setInterval(perf,5000);setInterval(rad,90000);setInterval(resultCheck,3000);setInterval(clk,1000);setInterval(cd,250);
-</script></body></html>'''
+HTML_PAGE = r'''<!doctype html> <html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"> <title>MEGA IA</title> <style> body{margin:0;background:#050913;color:#eef5ff;font-family:Arial,sans-serif}.wrap{max-width:1150px;margin:auto;padding:16px} .card{background:#0d1625;border:1px solid #1d3049;border-radius:18px;padding:16px;box-shadow:0 10px 30px #0005;margin-top:12px} .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.signal{grid-column:span 2;text-align:center;min-height:270px} .big{font-size:32px;font-weight:800;margin:8px}.call{color:#45ff9b}.put{color:#ff5c7a}.neutral{color:#ffd166}.label{font-size:11px;color:#8190a8} .controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}select,button{background:#111f33;color:#fff;border:1px solid #2b4463;border-radius:12px;padding:11px}button{cursor:pointer} .ai-img{display:none;width:100%;max-width:560px;height:270px;object-fit:cover;border-radius:18px;border:1px solid #168cff66;box-shadow:0 0 35px #008cff55;margin:12px auto;animation:pulse 1.2s infinite alternate} @keyframes pulse{from{filter:brightness(.8)}to{filter:brightness(1.25);box-shadow:0 0 45px #008cff99}} .radar{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.radar div{background:#101b2b;padding:10px;border-radius:12px} .strategy{line-height:1.65}.status-analysis{color:#33baff}.tabs{display:flex;gap:8px;margin-top:12px}.tabbtn.active{border-color:#168cff;box-shadow:0 0 15px #168cff44}.tab{display:none}.tab.active{display:block}.chartbox{position:relative;height:430px;background:#07101c;border:1px solid #1d3049;border-radius:16px;overflow:hidden}.chartbox canvas{width:100%;height:100%;display:block}.chartmeta{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px}.chartbadge{padding:7px 10px;border-radius:10px;background:#101b2b;color:#b8c7dd;font-size:12px} @media(max-width:720px){.grid{grid-template-columns:1fr 1fr}.signal{grid-column:span 2}.radar{grid-template-columns:1fr 1fr}.ai-img{height:220px}} @media(max-width:450px){.grid{grid-template-columns:1fr}.signal{grid-column:span 1}.radar{grid-template-columns:1fr}} </style></head> <body><div class="wrap"> <h1>🤖 MEGA IA</h1><div class="label">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div><div id="clock"></div> <div class="controls"><select id="symbol"></select><select id="interval"><option>1min</option><option>5min</option><option>15min</option><option>30min</option></select><button id="voiceBtn" onclick="voice()">🔊 Ativar voz</button></div> <div class="tabs"><button class="tabbtn active" id="tabMain">📊 Painel</button><button class="tabbtn" id="tabChart">📈 Gráfico</button></div> <div id="mainTab" class="tab active"> <img id="aiImage" class="ai-img" src="__MEGA_IMAGE__" alt="MEGA IA analisando o mercado"> <div id="analysisText" class="card status-analysis" style="display:none;text-align:center;font-size:20px">🧠 ESTOU ANALISANDO O MERCADO, AGUARDE...</div> <div class="grid"> <div class="card signal"><div class="label">SINAL ATUAL</div><div id="direction" class="big neutral">AGUARDANDO</div><div id="confidence">Confiança: --</div></div> <div class="card"><div class="label">ENTRADA</div><div id="entry" class="big">--:--:--</div><div id="countdown">--</div></div> <div class="card"><div class="label">STATUS IA</div><div id="status" class="big" style="font-size:18px">MONITORANDO</div><div id="risk">Risco: --</div></div></div> <div class="grid"><div class="card"><div class="label">WIN</div><div id="wins" class="big call">0</div></div><div class="card"><div class="label">LOSS</div><div id="losses" class="big put">0</div></div><div class="card"><div class="label">ASSERTIVIDADE</div><div id="accuracy" class="big">0%</div></div><div class="card"><div class="label">RESULTADO</div><div id="result" class="big">--</div></div></div> </div> <div id="chartTab" class="tab"> <div class="card"><div class="chartmeta"><b>📈 Gráfico espelhado</b><span class="chartbadge" id="chartInfo">--</span></div><div class="chartbox"><canvas id="priceChart"></canvas></div><div class="label" style="margin-top:8px">O gráfico acompanha o mesmo par e período selecionados no painel.</div></div> </div> <div class="card"><b>Radar de oportunidades</b><div id="radar" class="radar"></div></div> <div class="card"><div class="label">LICENÇA</div><div id="license">Verificando...</div></div> </div> <script> const syms=['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD']; const S=document.getElementById('symbol');syms.forEach(x=>S.add(new Option(x,x))); let cur=null,voiceEnabled=false,lastSignalVoice='',lastAnalysis=0,five=false,entered=false,reskey=''; function speak(t){if(!voiceEnabled||!window.speechSynthesis)return;speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.lang='pt-BR';u.rate=.95;speechSynthesis.speak(u)} function voice(){voiceEnabled=true;voiceBtn.textContent='🔊 Voz ativada';speak('Voz da Mega IA ativada.');setTimeout(()=>sig(true),650)} function ft(x){return x?new Date(x).toLocaleTimeString('pt-BR',{hour12:false}):'--:--:--'} async function get(u){const r=await fetch(u,{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);return r.json()} let chartTimer=null; const chartCanvas=document.getElementById('priceChart'); const chartCtx=chartCanvas.getContext('2d'); function resizeChart(){const r=chartCanvas.getBoundingClientRect();const d=window.devicePixelRatio||1;chartCanvas.width=Math.max(1,r.width*d);chartCanvas.height=Math.max(1,r.height*d);chartCtx.setTransform(d,0,0,d,0,0);if(chartData.length)drawChart(chartData);} let chartData=[]; function drawChart(a){ const w=chartCanvas.clientWidth,h=chartCanvas.clientHeight;chartCtx.clearRect(0,0,w,h);if(!a.length)return; const pad={l:55,r:12,t:18,b:28},cw=w-pad.l-pad.r,ch=h-pad.t-pad.b; let lo=Math.min(...a.map(c=>Number(c.low))),hi=Math.max(...a.map(c=>Number(c.high)));const extra=(hi-lo)*.08||1;lo-=extra;hi+=extra; const px=i=>pad.l+(i/(a.length-1||1))*cw;const py=v=>pad.t+(hi-v)/(hi-lo)*ch; chartCtx.strokeStyle='#19304a';chartCtx.lineWidth=1;chartCtx.font='11px Arial';chartCtx.fillStyle='#8190a8'; for(let j=0;j<5;j++){const y=pad.t+j*ch/4;chartCtx.beginPath();chartCtx.moveTo(pad.l,y);chartCtx.lineTo(w-pad.r,y);chartCtx.stroke();const v=hi-(hi-lo)*j/4;chartCtx.fillText(v.toFixed(5),4,y+4)} const step=Math.max(2,cw/a.length*.72); a.forEach((c,i)=>{const x=px(i),o=Number(c.open),cl=Number(c.close),hh=Number(c.high),ll=Number(c.low);const up=cl>=o;chartCtx.strokeStyle=up?'#45ff9b':'#ff5c7a';chartCtx.fillStyle=up?'#45ff9b':'#ff5c7a';chartCtx.beginPath();chartCtx.moveTo(x,py(hh));chartCtx.lineTo(x,py(ll));chartCtx.stroke();const top=py(Math.max(o,cl)),bot=py(Math.min(o,cl));chartCtx.fillRect(x-step/2,top,step,Math.max(1,bot-top));if(i%Math.ceil(a.length/6)===0){chartCtx.fillStyle='#8190a8';chartCtx.fillText(new Date(c.datetime).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),x-18,h-7)}}); if(cur&&cur.direction&&cur.direction!=='NEUTRO'){const idx=a.findIndex(c=>c.datetime===cur.reference_candle);if(idx>=0){const x=px(idx),v=cur.direction==='CALL'?Number(a[idx].low):Number(a[idx].high);chartCtx.fillStyle=cur.direction==='CALL'?'#45ff9b':'#ff5c7a';chartCtx.beginPath();chartCtx.arc(x,py(v),6,0,Math.PI*2);chartCtx.fill();chartCtx.font='bold 12px Arial';chartCtx.fillText(cur.direction,x+8,py(v)-8)}} } async function loadChart(){try{const d=await get(`/candles?symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&n=80`);chartData=d.candles||[];chartInfo.textContent=d.symbol+' • '+d.interval;drawChart(chartData)}catch(e){chartInfo.textContent='Erro no gráfico'}} function showTab(which){const main=which==='main';mainTab.classList.toggle('active',main);chartTab.classList.toggle('active',!main);tabMain.classList.toggle('active',main);tabChart.classList.toggle('active',!main);if(!main){loadChart();setTimeout(resizeChart,50)}} tabMain.onclick=()=>showTab('main');tabChart.onclick=()=>showTab('chart');window.addEventListener('resize',resizeChart); async function sig(announce=false){ if(announce&&voiceEnabled&&Date.now()-lastAnalysis>2500){lastAnalysis=Date.now();document.getElementById('aiImage').style.display='block';analysisText.style.display='block';status.textContent='ANALISANDO O MERCADO...';speak('Estou analisando o mercado, aguarde.')} try{ cur=await get(`/signal-ai?symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}`); document.getElementById('aiImage').style.display=announce?'block':'none';analysisText.style.display=announce?'block':'none'; direction.textContent=cur.direction;direction.className='big '+(cur.direction==='CALL'?'call':cur.direction==='PUT'?'put':'neutral'); confidence.textContent='Confiança: '+cur.confidence+'%';entry.textContent=ft(cur.entry_time);status.textContent=cur.status;risk.textContent='Risco: '+cur.risk; if(cur.direction!=='NEUTRO'){ const k=cur.symbol+'|'+cur.interval+'|'+cur.entry_time+'|'+cur.direction; if(k!==lastSignalVoice){lastSignalVoice=k;if(voiceEnabled){speak(cur.direction==='CALL'?'Análise concluída. Sinal de CALL identificado.':'Análise concluída. Sinal de PUT identificado.')}} }else if(announce&&voiceEnabled){speak('Análise concluída. Não há oportunidade segura no momento.')} five=false;entered=false; }catch(e){status.textContent='ERRO DE DADOS';if(announce&&voiceEnabled)speak('Não foi possível concluir a análise. Aguarde.')} } async function perf(){try{const p=await get('/performance');wins.textContent=p.wins;losses.textContent=p.losses;accuracy.textContent=p.accuracy+'%'}catch(e){}} async function rad(){try{const a=await get('/radar?interval='+encodeURIComponent(interval.value));radar.innerHTML=a.map(x=>`<div><b>${x.symbol}</b><br><span class="${x.direction==='CALL'?'call':x.direction==='PUT'?'put':'neutral'}">${x.direction}</span> • ${x.confidence}%<br><small>${x.status}</small></div>`).join('')}catch(e){}} async function lic(){try{const x=await get('/license');license.textContent=x.active?`● LICENÇA ATIVA • ${x.expires} • ${x.days_remaining} dias restantes`:`● LICENÇA EXPIRADA • ${x.whatsapp_1} / ${x.whatsapp_2} • ${x.instagram}`}catch(e){}} async function clk(){try{const x=await get('/server-time');clock.textContent=ft(x.datetime)+' • Brasília'}catch(e){}} function cd(){if(!cur)return;const n=Math.ceil((new Date(cur.entry_time)-Date.now())/1000);countdown.textContent=n>0?'Entrada em '+n+'s':'Entrada liberada';if(n===5&&!five){five=true;if(voiceEnabled)speak('Atenção. Entrada em 5 segundos.')}if(n<=0&&n>-2&&!entered){entered=true;if(voiceEnabled&&cur.direction!=='NEUTRO')speak('Entrada liberada. '+cur.direction+' agora.')}} async function resultCheck(){if(!cur||cur.direction==='NEUTRO')return;try{const x=await get(`/result?symbol=${encodeURIComponent(cur.symbol)}&interval=${cur.interval}&direction=${cur.direction}&expiry_time=${encodeURIComponent(cur.expiry_time)}`);if(x.result){result.textContent=x.result;const k=cur.symbol+'|'+cur.expiry_time;if(k!==reskey){reskey=k;if(voiceEnabled)speak('Operação finalizada. Resultado '+x.result+'.')}perf()}}catch(e){}} S.onchange=()=>{lastSignalVoice='';sig(true);rad();if(chartTab.classList.contains('active'))loadChart()};interval.onchange=()=>{lastSignalVoice='';sig(true);rad();if(chartTab.classList.contains('active'))loadChart()}; sig(false);perf();rad();lic();clk();setInterval(()=>sig(false),5000);setInterval(()=>{if(chartTab.classList.contains('active'))loadChart()},5000);setInterval(perf,5000);setInterval(rad,90000);setInterval(resultCheck,3000);setInterval(clk,1000);setInterval(cd,250); </script></body></html>'''
 
+
+HTML_PAGE = HTML_PAGE.replace("__MEGA_IMAGE__", "/mega-ia.png")
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -564,4 +512,3 @@ async def home():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-
