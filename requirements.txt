@@ -1,5 +1,5 @@
-fastapi
-uvicorn[standard]
-httpx
-git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
-websocket-client==0.56
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+httpx>=0.28,<1
+git+https://github.com/victalejo/iqoptionapi.git
+websocket-client>=1.5,<2
