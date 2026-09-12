@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="30.0.0")
+app = FastAPI(title="MEGA IA", version="32.0.0")
 
 IMAGE_PATH = os.path.join(os.path.dirname(__file__), "mega_ia.png")
 ICON_512_PATH = os.path.join(os.path.dirname(__file__), "mega_ia_icon.png")
@@ -888,6 +888,18 @@ def entry_window(interval):
     return entry - timedelta(seconds=15), entry, entry + timedelta(seconds=INTERVALS[interval])
 
 
+def neutral_signal(symbol, interval, market, status, reason, *, confidence=0, source_state="UNAVAILABLE"):
+    """Resposta segura: o painel nunca quebra porque uma fonte externa caiu."""
+    return {
+        "symbol": symbol, "interval": interval, "market": market,
+        "direction": "NEUTRO", "confidence": round(float(confidence or 0), 1),
+        "entry_time": None, "announce_time": None, "expiry_time": None,
+        "status": status, "ai_confirmed": False, "risk": "HIGH",
+        "strategy": "Proteção de disponibilidade", "reason": str(reason)[:300],
+        "non_repaint": True, "technical": {}, "source_state": source_state
+    }
+
+
 async def signal(symbol, interval, market="OPEN", iq_state=None):
     if symbol not in SYMBOLS or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
@@ -912,7 +924,22 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
             cache[key] = (time.time(), neutral)
             return neutral
 
-    raw = await candles(symbol, interval, 90, market, iq_state)
+    try:
+        raw = await candles(symbol, interval, 90, market, iq_state)
+    except HTTPException as exc:
+        status = "FONTE EM LIMITE" if market == "OPEN" and exc.status_code in (429, 503) else ("IQ OPTION RECONECTANDO" if market == "OTC" else "FONTE INDISPONÍVEL")
+        out = neutral_signal(symbol, interval, market, status, exc.detail, source_state="DEGRADED")
+        cache[key] = (time.time(), out)
+        return out
+    except Exception as exc:
+        status = "IQ OPTION RECONECTANDO" if market == "OTC" else "FONTE INDISPONÍVEL"
+        out = neutral_signal(symbol, interval, market, status, str(exc), source_state="DEGRADED")
+        cache[key] = (time.time(), out)
+        return out
+    if len(raw) < 25:
+        out = neutral_signal(symbol, interval, market, "AGUARDANDO DADOS", "Ainda não há candles suficientes para uma análise segura.", source_state="WAITING")
+        cache[key] = (time.time(), out)
+        return out
     # Mercado aberto pode exibir cache antigo no gráfico durante um 429, mas nunca
     # libera CALL/PUT usando um lote velho demais.
     if market == "OPEN":
@@ -957,14 +984,26 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
         base["expiry_time"] = iso(expiry)
         base["reference_candle"] = closed[-1]["datetime"] if closed else None
 
+    base["source_state"] = "READY"
     cache[key] = (time.time(), base)
     return base
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "app": "MEGA IA", "version": "30.0.0", "brasilia_time": iso(now()),
-            "twelve_data_configured": bool(TD_KEY), "iq_option_otc_library": bool(IQ_Option is not None), "openai_configured": bool(OAI_KEY), "openai_model_configured": bool(OAI_MODEL)}
+    now_ts = time.time()
+    return {
+        "status": "ok", "app": "MEGA IA", "version": "32.0.0", "brasilia_time": iso(now()),
+        "twelve_data": {
+            "configured": bool(TD_KEY),
+            "backoff": now_ts < td_backoff_until,
+            "retry_in": max(0, int(td_backoff_until - now_ts)),
+            "cache_items": len(td_candle_cache),
+            "last_reason": td_backoff_reason[:120],
+        },
+        "iq_option": {"library": bool(IQ_Option is not None), "sessions": len(iq_sessions)},
+        "openai": {"configured": bool(OAI_KEY and OAI_MODEL)}
+    }
 
 
 @app.get("/server-time")
@@ -1026,11 +1065,11 @@ async def mega_ia_icon_192():
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = {
-        "id": "/mega-ia-trader-v30",
+        "id": "/mega-ia-trader-v32",
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v28",
+        "start_url": "/?pwa=v32",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
@@ -1038,19 +1077,19 @@ async def manifest():
         "theme_color": "#07182b",
         "icons": [
             {
-                "src": "/mega-ia-icon-192.png?v=30",
+                "src": "/mega-ia-icon-192.png?v=32",
                 "sizes": "192x192",
                 "type": "image/png",
                 "purpose": "any"
             },
             {
-                "src": "/mega-ia-icon.png?v=30",
+                "src": "/mega-ia-icon.png?v=32",
                 "sizes": "512x512",
                 "type": "image/png",
                 "purpose": "any"
             },
             {
-                "src": "/mega-ia-icon.png?v=30",
+                "src": "/mega-ia-icon.png?v=32",
                 "sizes": "512x512",
                 "type": "image/png",
                 "purpose": "maskable"
@@ -1124,46 +1163,20 @@ async def iq_logout(request: Request, response: Response):
 async def otc_status(request: Request):
     if IQ_Option is None:
         return {"configured": False, "connected": False, "message": "Biblioteca IQ Option não foi carregada."}
-    state = _session_state(request, required=False)
+    state=_session_state(request, required=False)
     if not state:
         return {"configured": True, "connected": False, "message": "Conecte sua conta na aba Conta IQ Option."}
-    # Ao atualizar a página, preserve a sessão já autenticada.
-    # Só tenta reconectar se o websocket realmente caiu; o cookie não é descartado.
-    client = state.get("client")
-    try:
-        connected = bool(client and getattr(client, "check_connect", lambda: False)())
-    except Exception:
-        connected = False
-    if not connected:
-        # Um refresh não é logout. Enquanto o circuit breaker estiver ativo,
-        # /otc-status apenas informa o estado e NÃO abre outro websocket.
-        reconnect_after = float(state.get("reconnect_after", 0.0) or 0.0)
-        if state.get("reconnecting") or time.time() < reconnect_after:
-            wait = max(1, int(reconnect_after - time.time() + 0.999)) if reconnect_after else 2
-            return {
-                "configured": True, "connected": False, "reconnecting": True,
-                "message": f"Sessão IQ Option mantida. Reconectando em {wait}s...",
-                "email_masked": _mask_email(state.get("email", "")), "pairs": len(OTC_BASE)
-            }
-        try:
-            async with state["lock"]:
-                client = await asyncio.wait_for(asyncio.to_thread(iq_connect_blocking, state), timeout=15)
-            connected = _iq_is_connected(state)
-        except Exception as exc:
-            state["last_error"] = str(exc)[:300]
-            return {
-                "configured": True, "connected": False,
-                "reconnecting": True,
-                "message": "Sessão IQ Option mantida. Reconectando...",
-                "email_masked": _mask_email(state.get("email", "")),
-                "pairs": len(OTC_BASE)
-            }
-    return {
-        "configured": True, "connected": connected,
-        "message": "IQ Option OTC conectada." if connected else "Sessão preservada. Reconectando à IQ Option...",
-        "email_masked": _mask_email(state.get("email", "")),
-        "pairs": len(OTC_BASE)
-    }
+    connected=_iq_is_connected(state)
+    reconnect_after=float(state.get("reconnect_after",0) or 0)
+    reconnecting=bool(state.get("reconnecting")) or (not connected and time.time()<reconnect_after)
+    if connected:
+        msg="IQ Option OTC conectada."
+    elif reconnecting:
+        wait=max(1,int(reconnect_after-time.time()+0.999)) if reconnect_after>time.time() else 2
+        msg=f"Sessão preservada. Reconexão disponível em {wait}s."
+    else:
+        msg="Sessão preservada. O próximo pedido de dados tentará reconectar."
+    return {"configured":True,"connected":connected,"reconnecting":reconnecting,"message":msg,"email_masked":_mask_email(state.get("email","")),"pairs":len(OTC_BASE)}
 
 
 @app.get("/candles")
@@ -1172,24 +1185,49 @@ async def candles_endpoint(request: Request, symbol: str = "EUR/USD", interval: 
     if symbol not in SYMBOLS or interval not in INTERVALS or market not in ("OPEN", "OTC"):
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     n = max(20, min(int(n), 150))
-    values = await candles(symbol, interval, n, market, _session_state(request, required=(market == "OTC")))
-    return {"symbol": symbol, "interval": interval, "market": market, "candles": values}
+    state = _session_state(request, required=False)
+    try:
+        if market == "OTC" and not state:
+            return {"ok": False, "symbol": symbol, "interval": interval, "market": market, "candles": [], "status": "LOGIN NECESSÁRIO", "message": "Conecte sua conta IQ Option."}
+        values = await candles(symbol, interval, n, market, state)
+        return {"ok": True, "symbol": symbol, "interval": interval, "market": market, "candles": values, "status": "OK"}
+    except HTTPException as exc:
+        # Mantém HTTP 200 para o gráfico/painel continuarem vivos; a mensagem vai no corpo.
+        stale=[]
+        if market == "OPEN":
+            item=td_candle_cache.get(f"{symbol}|{interval}")
+            if item: stale=item[1][-n:]
+        elif state:
+            item=state.setdefault("candle_cache",{}).get(f"{symbol}|{interval}")
+            if item: stale=item[1][-n:]
+        return {"ok": False, "symbol": symbol, "interval": interval, "market": market, "candles": stale, "status": "TEMPORARIAMENTE INDISPONÍVEL", "message": str(exc.detail)[:220], "stale": bool(stale)}
+    except Exception as exc:
+        return {"ok": False, "symbol": symbol, "interval": interval, "market": market, "candles": [], "status": "TEMPORARIAMENTE INDISPONÍVEL", "message": str(exc)[:220]}
 
 
 @app.get("/signal-ai")
 async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN"):
-    return await signal(symbol, interval, market, _session_state(request, required=(market.upper() == "OTC")))
+    market=(market or "OPEN").upper()
+    if symbol not in SYMBOLS or interval not in INTERVALS or market not in ("OPEN","OTC"):
+        raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
+    state=_session_state(request, required=False)
+    if market == "OTC" and not state:
+        return neutral_signal(symbol, interval, market, "LOGIN IQ OPTION NECESSÁRIO", "Conecte sua conta IQ Option para receber candles OTC.", source_state="LOGIN_REQUIRED")
+    try:
+        return await signal(symbol, interval, market, state)
+    except Exception as exc:
+        return neutral_signal(symbol, interval, market, "FONTE TEMPORARIAMENTE INDISPONÍVEL", str(exc), source_state="DEGRADED")
 
 
 @app.get("/signal")
 async def get_signal(request: Request, symbol="EUR/USD", interval="1min", market="OPEN"):
-    return await signal(symbol, interval, market, _session_state(request, required=(market.upper() == "OTC")))
+    return await signal_ai(request, symbol, interval, market)
 
 
 @app.get("/ai-analysis")
 async def ai_analysis(request: Request, symbol: str = "EUR/USD", interval: str = "1min", market: str = "OPEN"):
     """Retorna somente os dados destinados ao painel; estratégias ficam internas."""
-    data = await signal(symbol, interval, market, _session_state(request, required=(market.upper() == "OTC")))
+    data = await signal_ai(request, symbol, interval, market)
     public_keys = [
         "symbol", "interval", "direction", "confidence", "status",
         "ai_confirmed", "risk", "entry_time", "announce_time",
@@ -1199,88 +1237,54 @@ async def ai_analysis(request: Request, symbol: str = "EUR/USD", interval: str =
 
 @app.get("/radar")
 async def radar(request: Request, interval="1min", market="OPEN"):
+    """Radar de baixo consumo. Nunca compete com o par principal. OPEN: atualiza no máximo um par por chamada (frontend chama a cada 90s). OTC: somente lê caches já obtidos pelo painel/gráfico; não abre requisições extras. """
     market=(market or "OPEN").upper()
     if interval not in INTERVALS or market not in ("OPEN", "OTC"):
         raise HTTPException(400, "Intervalo inválido.")
-    rkey=f"{market}|{interval}"
-    if rkey in radar_cache and time.time() - radar_cache[rkey][0] < 55:
-        return radar_cache[rkey][1]
-    market=(market or "OPEN").upper()
+
     if market == "OTC":
-        state = _session_state(request, required=True)
-        sid = state.get("session_id", "")
-        rkey=f"{sid}|OTC|{interval}"
-        if rkey in radar_cache and time.time() - radar_cache[rkey][0] < 25:
-            return radar_cache[rkey][1]
-        reconnect_after = float(state.get("reconnect_after", 0.0) or 0.0)
-        previous = radar_cache.get(rkey)
-        if previous:
-            out = list(previous[1])
-        else:
-            out = [{"symbol": sym + " • OTC", "direction": "NEUTRO", "confidence": 0, "status": "AGUARDANDO LEITURA"} for sym in SYMBOLS]
-
-        if state.get("reconnecting") or time.time() < reconnect_after or not _iq_is_connected(state):
-            for item in out:
-                if item.get("status") in ("AGUARDANDO LEITURA", "SEM DADOS"):
-                    item["status"] = "IQ OPTION RECONECTANDO"
-            return out
-
-        idx = int(state.get("radar_index", 0)) % len(SYMBOLS)
-        batch = [SYMBOLS[idx], SYMBOLS[(idx + 1) % len(SYMBOLS)]]
-        state["radar_index"] = (idx + 2) % len(SYMBOLS)
-        by_symbol = {item["symbol"].replace(" • OTC", ""): i for i,item in enumerate(out)}
-        for sym in batch:
+        state=_session_state(request, required=False)
+        if not state:
+            return [{"symbol": s+" • OTC", "direction":"NEUTRO", "confidence":0, "status":"LOGIN IQ OPTION"} for s in SYMBOLS]
+        out=[]
+        cc=state.setdefault("candle_cache",{})
+        for sym in SYMBOLS:
+            item=cc.get(f"{sym}|{interval}")
+            if not item or time.time()-item[0] > 120:
+                out.append({"symbol":sym+" • OTC","direction":"NEUTRO","confidence":0,"status":"AGUARDANDO DADOS"})
+                continue
             try:
-                raw = await candles(sym, interval, 90, "OTC", state)
-                closed = raw[:-1] if len(raw) > 1 else raw
-                tech = local_engine(closed)
-                direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
-                conf = tech["confidence"] if direction != "NEUTRO" else min(tech["confidence"], 69)
-                status = "OPORTUNIDADE TÉCNICA" if direction != "NEUTRO" else "MONITORANDO"
-                item = {"symbol": sym + " • OTC", "direction": direction, "confidence": round(conf,1), "status": status}
+                raw=item[1]
+                tech=local_engine(raw[:-1] if len(raw)>1 else raw)
+                direction=tech["direction"] if tech.get("confirmed") else "NEUTRO"
+                out.append({"symbol":sym+" • OTC","direction":direction,"confidence":round(tech.get("confidence",0),1),"status":"OPORTUNIDADE TÉCNICA" if direction!="NEUTRO" else "MONITORANDO"})
             except Exception:
-                item = {"symbol": sym + " • OTC", "direction": "NEUTRO", "confidence": 0, "status": "SEM DADOS"}
-            pos = by_symbol.get(sym)
-            if pos is None:
-                out.append(item)
-            else:
-                out[pos] = item
-        radar_cache[rkey]=(time.time(),out)
+                out.append({"symbol":sym+" • OTC","direction":"NEUTRO","confidence":0,"status":"SEM DADOS"})
         return out
-    # Mercado aberto: nunca dispara 13 consultas simultâneas. O radar é incremental,
-    # atualizando apenas 2 pares por ciclo e reutilizando o cache compartilhado.
-    previous = radar_cache.get(rkey)
-    if previous:
-        out = list(previous[1])
-    else:
-        out = [{"symbol": sym, "direction": "NEUTRO", "confidence": 0, "status": "AGUARDANDO LEITURA"} for sym in SYMBOLS]
-    idx_key = f"OPEN_RADAR_INDEX|{interval}"
-    idx = int(cache.get(idx_key, (0, 0))[1] or 0) % len(SYMBOLS)
-    batch = [SYMBOLS[idx], SYMBOLS[(idx + 1) % len(SYMBOLS)]]
-    cache[idx_key] = (time.time(), (idx + 2) % len(SYMBOLS))
-    by_symbol = {item["symbol"]: i for i, item in enumerate(out)}
-    for sym in batch:
+
+    rkey=f"OPEN|{interval}"
+    previous=radar_cache.get(rkey)
+    out=list(previous[1]) if previous else [{"symbol":sym,"direction":"NEUTRO","confidence":0,"status":"AGUARDANDO LEITURA"} for sym in SYMBOLS]
+    # Se a Twelve Data estiver em backoff, radar vira somente leitura de cache.
+    if time.time() >= td_backoff_until:
+        idx_key=f"OPEN_RADAR_INDEX|{interval}"
+        idx=int(cache.get(idx_key,(0,0))[1] or 0)%len(SYMBOLS)
+        sym=SYMBOLS[idx]
+        cache[idx_key]=(time.time(),(idx+1)%len(SYMBOLS))
+        by={x["symbol"]:i for i,x in enumerate(out)}
         try:
-            raw = await candles(sym, interval, 90, "OPEN", None)
-            age = _td_cache_age(sym, interval)
-            safe_age = max(75.0, INTERVALS[interval] * 0.75)
-            if age > safe_age:
-                item = {"symbol": sym, "direction": "NEUTRO", "confidence": 0, "status": "AGUARDANDO DADOS"}
+            raw=await candles(sym, interval, 90, "OPEN", None)
+            age=_td_cache_age(sym,interval)
+            if age <= max(90.0, INTERVALS[interval]*0.8):
+                tech=local_engine(raw[:-1] if len(raw)>1 else raw)
+                direction=tech["direction"] if tech.get("confirmed") else "NEUTRO"
+                item={"symbol":sym,"direction":direction,"confidence":round(tech.get("confidence",0),1),"status":"OPORTUNIDADE TÉCNICA" if direction!="NEUTRO" else "MONITORANDO"}
             else:
-                closed = raw[:-1] if len(raw) > 1 else raw
-                tech = local_engine(closed)
-                direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
-                conf = tech["confidence"] if direction != "NEUTRO" else min(tech["confidence"], 69)
-                item = {"symbol": sym, "direction": direction, "confidence": round(conf, 1),
-                        "status": "OPORTUNIDADE TÉCNICA" if direction != "NEUTRO" else "MONITORANDO"}
+                item={"symbol":sym,"direction":"NEUTRO","confidence":0,"status":"AGUARDANDO DADOS"}
         except Exception:
-            item = {"symbol": sym, "direction": "NEUTRO", "confidence": 0, "status": "SEM DADOS"}
-        pos = by_symbol.get(sym)
-        if pos is None:
-            out.append(item)
-        else:
-            out[pos] = item
-    radar_cache[rkey] = (time.time(), out)
+            item={"symbol":sym,"direction":"NEUTRO","confidence":0,"status":"FONTE EM ESPERA"}
+        out[by.get(sym,idx)]=item
+    radar_cache[rkey]=(time.time(),out)
     return out
 
 
@@ -1321,7 +1325,7 @@ async def result(request: Request, symbol="EUR/USD", interval="1min", direction=
     return out
 
 
-HTML_PAGE = r'''<!doctype html> <html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"> <title>Mega IA Trader</title> <link rel="manifest" href="/manifest.webmanifest?v=30"> <link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=30"> <link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=30"> <meta name="theme-color" content="#07182b"> <meta name="application-name" content="Mega IA Trader"> <meta name="apple-mobile-web-app-title" content="Mega IA Trader"> <meta name="apple-mobile-web-app-capable" content="yes"> <style> body{margin:0;background:radial-gradient(circle at 50% 0,#07182b 0,#030812 42%,#02050b 100%);color:#eef5ff;font-family:Arial,sans-serif}.wrap{max-width:1150px;margin:auto;padding:18px}.brand{font-size:42px;font-weight:900;letter-spacing:1px;margin:8px 0 2px}.brand span{color:#14c8ff}.subtitle{font-size:13px;color:#91a9c8;letter-spacing:.7px} .card{background:linear-gradient(180deg,#0c1a2c,#091422);border:1px solid #164f80;border-radius:20px;padding:16px;box-shadow:0 12px 30px #0008,0 0 18px #009cff12;margin-top:12px} .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.signal{grid-column:span 2;text-align:center;min-height:270px} .big{font-size:32px;font-weight:800;margin:8px}.call{color:#45ff9b}.put{color:#ff5c7a}.neutral{color:#ffd166}.label{font-size:11px;color:#8190a8} .controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}select,button,input{background:#0d2035;color:#fff;border:1px solid #22689d;border-radius:14px;padding:12px 14px;font-size:15px}select:focus,button:focus,input:focus{outline:none;box-shadow:0 0 0 2px #00bfff55}button{cursor:pointer}input{box-sizing:border-box;width:100%;margin-top:6px}.account-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.account-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}@media(max-width:600px){.account-grid{grid-template-columns:1fr}} .ai-img{display:none;width:100%;max-width:560px;height:230px;object-fit:contain;border-radius:18px;border:1px solid #168cff66;box-shadow:0 0 35px #008cff55;margin:12px auto;animation:pulse 1.2s infinite alternate} @keyframes pulse{from{filter:brightness(.8)}to{filter:brightness(1.25);box-shadow:0 0 45px #008cff99}} .radar{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.radar div{background:#101b2b;padding:10px;border-radius:12px} .strategy{line-height:1.65}.status-analysis{color:#33baff}.tabs{display:flex;gap:8px;margin-top:12px;margin-bottom:20px;flex-wrap:wrap}.tabbtn.active{border-color:#168cff;box-shadow:0 0 15px #168cff44}.tab{display:none}.tab.active{display:block} #chartTab>.card{width:min(94vw,920px);margin:14px auto 0;box-sizing:border-box} .chartbox{position:relative;width:100%;height:520px;margin:0 auto;background:#07101c;border:1px solid #1d3049;border-radius:16px;overflow:hidden}.chartbox canvas{width:100%!important;height:100%!important;display:block}.chartmeta{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}.chartbadge{padding:7px 10px;border-radius:10px;background:#101b2b;color:#b8c7dd;font-size:12px}#chartTab{width:100%}#chartTab>.card{width:min(100%,980px);margin:12px auto 0;padding:18px;box-sizing:border-box} @media(max-width:720px){.wrap{padding:10px}#chartTab>.card{width:100%;max-width:100%;padding:10px}.chartbox{height:430px}} @media(max-width:450px){.wrap{padding:8px}#chartTab>.card{width:100%;padding:8px}.chartbox{height:400px}} .hero{display:none;position:relative;width:100%;max-width:760px;margin:26px auto 18px;border-radius:20px;overflow:hidden;border:1px solid #0bbcff;box-shadow:0 0 30px #00aaff55;background:#05111f}.hero img{display:block;width:100%;height:300px;object-fit:contain;object-position:center;background:#05111f}.entry-arrow{display:none;position:absolute;inset:0;align-items:center;justify-content:center;flex-direction:column;background:#02081488;backdrop-filter:blur(1px);font-weight:900;text-shadow:0 0 18px currentColor}.entry-arrow .arrow{font-size:110px;line-height:.8}.entry-arrow .arrow-label{font-size:28px;margin-top:8px}.entry-arrow.call{display:flex;color:#31ff87}.entry-arrow.put{display:flex;color:#ff405f}.analysisbar{text-align:center;font-size:20px;color:#22c9ff;border-color:#0bbcff}.signal{position:relative}.radar div{border:1px solid #173c5e}.radar .call{filter:drop-shadow(0 0 6px #45ff9b44)}.radar .put{filter:drop-shadow(0 0 6px #ff5c7a44)} @media(max-width:720px){.grid{grid-template-columns:1fr 1fr}.signal{grid-column:span 2}.radar{grid-template-columns:1fr 1fr}.tabs{margin-bottom:22px}.hero{margin:22px auto 16px}.hero img{height:250px}.brand{font-size:36px}.entry-arrow .arrow{font-size:90px}.entry-arrow .arrow-label{font-size:22px}} @media(max-width:450px){.grid{grid-template-columns:1fr}.signal{grid-column:span 1}.radar{grid-template-columns:1fr}.tabs{margin-bottom:24px}.hero{margin:24px auto 14px}.hero img{height:230px}} /* V21: gráfico realmente central e legível no celular */ #chartTab{width:100%;display:none;justify-content:center;align-items:flex-start} #chartTab.active{display:flex} #chartTab>.card{width:min(96vw,1100px)!important;max-width:1100px!important;margin:22px auto 0!important;padding:14px!important} .chartbox{width:100%!important;height:clamp(460px,68vh,700px)!important;margin:0 auto!important} @media(max-width:720px){ #chartTab{width:100%;margin:0 auto;padding:0;justify-content:center} #chartTab>.card{width:calc(100vw - 20px)!important;max-width:none!important;margin:18px auto 0!important;padding:10px!important;transform:none!important} .chartbox{height:58vh!important;min-height:440px!important;max-height:620px!important} .chartmeta{padding:2px 4px 6px} } @media(max-width:450px){ #chartTab>.card{width:calc(100vw - 12px)!important;padding:7px!important;margin-left:auto!important;margin-right:auto!important} .chartbox{height:56vh!important;min-height:420px!important} } /* V22: gráfico mais abaixo e visualmente centralizado */ #chartTab.active{padding-top:7vh!important;box-sizing:border-box} #chartTab.active>.card{margin-top:0!important} @media(max-width:720px){#chartTab.active{padding-top:8vh!important}} @media(max-width:450px){#chartTab.active{padding-top:9vh!important}} </style></head> <body><div class="wrap"> <div class="brand">🤖 MEGA <span>IA</span></div><div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div><div id="clock" style="font-size:22px;margin-top:4px"></div> <div class="controls"><select id="market"><option value="OPEN">🌐 Mercado Aberto</option><option value="OTC">🟣 IQ Option OTC</option></select><select id="symbol"></select><select id="interval"><option>1min</option><option>5min</option><option>15min</option><option>30min</option></select><button id="voiceBtn" onclick="voice()">🔊 Ativar voz</button><div id="otcNote" class="label" style="margin-top:6px;display:none">🟣 IQ Option OTC: verificando conexão...</div></div> <div class="tabs"><button class="tabbtn active" id="tabMain">📊 Painel</button><button class="tabbtn" id="tabChart">📈 Gráfico</button><button class="tabbtn" id="tabAccount">⚙️ Conta IQ Option</button></div> <div id="mainTab" class="tab active"> <div id="heroBox" class="hero"><img id="aiImage" src="__MEGA_IMAGE__" alt="MEGA IA analisando o mercado"><div id="entryArrow" class="entry-arrow"><div class="arrow" id="entryArrowIcon">⬆</div><div class="arrow-label" id="entryArrowLabel">CALL • COMPRAR</div></div></div> <div id="analysisText" class="card analysisbar" style="display:none">🧠 ESTOU ANALISANDO O MERCADO, AGUARDE...</div> <div class="grid"> <div class="card signal"><div class="label">SINAL ATUAL</div><div id="direction" class="big neutral">AGUARDANDO</div><div id="confidence">Confiança: --</div></div> <div class="card"><div class="label">ENTRADA</div><div id="entry" class="big">--:--:--</div><div id="countdown">--</div><div id="expiryCountdown" style="margin-top:8px;font-weight:800">⏱ EXPIRAÇÃO: --:--</div></div> <div class="card"><div class="label">STATUS IA</div><div id="status" class="big" style="font-size:18px">MONITORANDO</div><div id="risk">Risco: --</div></div></div> <div class="grid"><div class="card"><div class="label">WIN</div><div id="wins" class="big call">0</div></div><div class="card"><div class="label">LOSS</div><div id="losses" class="big put">0</div></div><div class="card"><div class="label">ASSERTIVIDADE</div><div id="accuracy" class="big">0%</div></div><div class="card"><div class="label">RESULTADO</div><div id="result" class="big">--</div></div></div> </div> <div id="chartTab" class="tab"> <div class="card"><div class="chartmeta"><b>📈 Gráfico espelhado</b><span class="chartbadge" id="chartInfo">--</span></div><div class="chartbox"><canvas id="priceChart"></canvas></div><div class="label" style="margin-top:8px">O gráfico acompanha o mesmo mercado, par e período selecionados no painel. Para OTC, os candles são solicitados à IQ Option.</div></div> </div> <div id="accountTab" class="tab"> <div class="card"> <h2 style="margin-top:0">⚙️ Conta IQ Option</h2> <div class="label">Use sua própria conta para liberar o gráfico e os candles OTC. Os dados não são gravados no GitHub ou no navegador.</div> <div class="account-grid"> <label>E-mail<input id="iqEmail" type="email" autocomplete="username" placeholder="Seu e-mail da IQ Option"></label> <label>Senha<input id="iqPassword" type="password" autocomplete="current-password" placeholder="Sua senha"></label> </div> <div class="account-actions"><button id="iqConnectBtn">🟢 Conectar</button><button id="iqLogoutBtn">🔴 Desconectar</button></div> <div id="iqAccountStatus" class="card" style="margin-top:12px">● Desconectado</div> <div class="label" style="margin-top:8px">🔒 A senha fica apenas na memória temporária do servidor durante a sessão ativa e é descartada ao desconectar ou expirar.</div> </div> </div> <div class="card"><b>Radar de oportunidades</b><div id="radar" class="radar"></div></div> <div id="licenseCard" class="card" style="display:none"><div class="label">RENOVAÇÃO</div><div id="license"></div></div> </div> <script> const syms=['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD']; const S=document.getElementById('symbol'); function fillSymbols(){const otc=market.value==='OTC';S.innerHTML='';syms.forEach(x=>S.add(new Option(otc?'🟣 '+x+' • OTC':x,x)));} fillSymbols(); let cur=null,voiceEnabled=false,lastSignalVoice='',lastAnalysis=0,five=false,entered=false,reskey=''; let robotTimer=null,arrowTimer=null;function showRobot(){const h=document.getElementById('heroBox');h.style.display='block';clearTimeout(robotTimer);robotTimer=setTimeout(()=>{if(!entryArrow.classList.contains('call')&&!entryArrow.classList.contains('put')){h.style.display='none';analysisText.style.display='none'}},10000)}function showEntryArrow(dir){showRobot();entryArrow.style.display='';entryArrow.className='entry-arrow '+(dir==='CALL'?'call':'put');entryArrowIcon.textContent=dir==='CALL'?'⬆':'⬇';entryArrowLabel.textContent=dir==='CALL'?'CALL • COMPRAR':'PUT • VENDER';clearTimeout(arrowTimer);arrowTimer=setTimeout(()=>{entryArrow.className='entry-arrow';entryArrow.style.display='';heroBox.style.display='none'},6000)} async function updateMarketNote(){const otc=market.value==='OTC';otcNote.style.display=otc?'block':'none';if(!otc)return;otcNote.textContent='🟣 IQ Option OTC: verificando conexão...';try{const x=await Promise.race([get('/otc-status'),new Promise((_,rej)=>setTimeout(()=>rej(Error('tempo limite de conexão')),16000))]);otcNote.textContent=(x.connected?'🟢 ':x.reconnecting?'🟡 ':'🔴 ')+x.message}catch(e){otcNote.textContent='🔴 IQ Option OTC: '+(e.message||'falha de conexão')}} updateMarketNote(); market.onchange=()=>{fillSymbols();updateMarketNote();sig(true);rad();if(chartTab.classList.contains('active'))loadChart()}; let megaVoices=[];function loadMegaVoices(){if(window.speechSynthesis)megaVoices=speechSynthesis.getVoices()||[]}if(window.speechSynthesis){loadMegaVoices();speechSynthesis.addEventListener?.('voiceschanged',loadMegaVoices)} function pickMalePtBRVoice(){ const all=(megaVoices.length?megaVoices:speechSynthesis.getVoices()); const br=all.filter(v=>String(v.lang||'').replace('_','-').toLowerCase()==='pt-br'); const pt=br.length?br:all.filter(v=>String(v.lang||'').toLowerCase().startsWith('pt')); // Prioriza vozes naturais/neural quando o Android/Chrome disponibilizar. const natural=/natural|neural|premium|enhanced|wavenet|google.*portugu|microsoft.*portugu/i; const male=/antonio|antônio|daniel|ricardo|felipe|paulo|carlos|thiago|bruno|marcelo|male|masculino|homem/i; const female=/maria|luciana|fernanda|camila|female|feminina|mulher/i; return pt.find(v=>natural.test(v.name||'')&&male.test(v.name||'')) ||pt.find(v=>natural.test(v.name||'')&&!female.test(v.name||'')) ||pt.find(v=>male.test(v.name||'')) ||pt.find(v=>!female.test(v.name||'')) ||pt[0]||null; } function speak(t){ if(!voiceEnabled||!window.speechSynthesis)return; speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(t); u.lang='pt-BR'; // Mais natural: velocidade próxima da fala humana e pitch sem distorção robótica. u.rate=.94;u.pitch=.90;u.volume=1; const mv=pickMalePtBRVoice();if(mv)u.voice=mv; speechSynthesis.speak(u); } function voice(){voiceEnabled=true;voiceBtn.textContent='🔊 Voz ativada';speak('Voz da Mega IA ativada.');setTimeout(()=>sig(true),650)} function ft(x){return x?new Date(x).toLocaleTimeString('pt-BR',{hour12:false}):'--:--:--'} function iqSessionToken(){try{return localStorage.getItem('mega_iq_session_token')||''}catch(_){return ''}} function authHeaders(extra={}){const h={...extra};const t=iqSessionToken();if(t)h['X-IQ-Session']=t;return h} async function get(u){const r=await fetch(u,{cache:'no-store',credentials:'include',headers:authHeaders()});let j=null;try{j=await r.json()}catch(_){j=null}if(!r.ok)throw Error((j&&j.detail)?j.detail:'HTTP '+r.status);return j} async function post(u,data={}){const r=await fetch(u,{method:'POST',credentials:'include',headers:authHeaders({'Content-Type':'application/json'}),body:JSON.stringify(data)});let j=null;try{j=await r.json()}catch(_){j=null}if(!r.ok)throw Error((j&&j.detail)?j.detail:'HTTP '+r.status);return j} let chartTimer=null; const chartCanvas=document.getElementById('priceChart'); const chartCtx=chartCanvas.getContext('2d'); function resizeChart(){const r=chartCanvas.getBoundingClientRect();const d=window.devicePixelRatio||1;chartCanvas.width=Math.max(1,r.width*d);chartCanvas.height=Math.max(1,r.height*d);chartCtx.setTransform(d,0,0,d,0,0);if(chartData.length)drawChart(chartData);} let chartData=[]; function drawChart(a){ const w=chartCanvas.clientWidth,h=chartCanvas.clientHeight;chartCtx.clearRect(0,0,w,h);if(!a.length)return; const pad={l:55,r:12,t:18,b:28},cw=w-pad.l-pad.r,ch=h-pad.t-pad.b; let lo=Math.min(...a.map(c=>Number(c.low))),hi=Math.max(...a.map(c=>Number(c.high)));const extra=(hi-lo)*.08||1;lo-=extra;hi+=extra; const px=i=>pad.l+(i/(a.length-1||1))*cw;const py=v=>pad.t+(hi-v)/(hi-lo)*ch; chartCtx.strokeStyle='#19304a';chartCtx.lineWidth=1;chartCtx.font='11px Arial';chartCtx.fillStyle='#8190a8'; for(let j=0;j<5;j++){const y=pad.t+j*ch/4;chartCtx.beginPath();chartCtx.moveTo(pad.l,y);chartCtx.lineTo(w-pad.r,y);chartCtx.stroke();const v=hi-(hi-lo)*j/4;chartCtx.fillText(v.toFixed(5),4,y+4)} const step=Math.max(2,cw/a.length*.72); a.forEach((c,i)=>{const x=px(i),o=Number(c.open),cl=Number(c.close),hh=Number(c.high),ll=Number(c.low);const up=cl>=o;chartCtx.strokeStyle=up?'#45ff9b':'#ff5c7a';chartCtx.fillStyle=up?'#45ff9b':'#ff5c7a';chartCtx.beginPath();chartCtx.moveTo(x,py(hh));chartCtx.lineTo(x,py(ll));chartCtx.stroke();const top=py(Math.max(o,cl)),bot=py(Math.min(o,cl));chartCtx.fillRect(x-step/2,top,step,Math.max(1,bot-top));if(i%Math.ceil(a.length/6)===0){chartCtx.fillStyle='#8190a8';chartCtx.fillText(new Date(c.datetime).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),x-18,h-7)}}); if(cur&&cur.direction&&cur.direction!=='NEUTRO'){const idx=a.findIndex(c=>c.datetime===cur.reference_candle);if(idx>=0){const x=px(idx),v=cur.direction==='CALL'?Number(a[idx].low):Number(a[idx].high);chartCtx.fillStyle=cur.direction==='CALL'?'#45ff9b':'#ff5c7a';chartCtx.beginPath();chartCtx.arc(x,py(v),6,0,Math.PI*2);chartCtx.fill();chartCtx.font='bold 12px Arial';chartCtx.fillText(cur.direction,x+8,py(v)-8)}} } async function loadChart(){try{const d=await get(`/candles?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&n=80`);chartData=d.candles||[];chartInfo.textContent=(d.market==='OTC'?'🟣 '+d.symbol+' • OTC':d.symbol)+' • '+d.interval;drawChart(chartData)}catch(e){chartInfo.textContent='⚠️ Dados temporariamente indisponíveis'; if(!chartData.length) drawChart([])}} function showTab(which){const main=which==='main',chart=which==='chart',account=which==='account';mainTab.classList.toggle('active',main);chartTab.classList.toggle('active',chart);accountTab.classList.toggle('active',account);tabMain.classList.toggle('active',main);tabChart.classList.toggle('active',chart);tabAccount.classList.toggle('active',account);if(chart){loadChart();setTimeout(resizeChart,50)}if(account)refreshAccountStatus()} tabMain.onclick=()=>showTab('main');tabChart.onclick=()=>showTab('chart');tabAccount.onclick=()=>showTab('account');window.addEventListener('resize',resizeChart); async function refreshAccountStatus(){try{const x=await get('/otc-status');const rr=!!x.reconnecting;iqAccountStatus.textContent=(x.connected&&!rr?'🟢 ':rr?'🟡 ':'🔴 ')+(x.connected&&!rr?('Conectado: '+(x.email_masked||'')):x.message);iqConnectBtn.disabled=!!x.connected||rr;iqLogoutBtn.disabled=!x.connected&&!rr;if(rr)setTimeout(refreshAccountStatus,2500)}catch(e){iqAccountStatus.textContent='🟡 Reconectando à IQ Option...';setTimeout(refreshAccountStatus,2500)}} iqConnectBtn.onclick=async()=>{const email=iqEmail.value.trim(),password=iqPassword.value;if(!email||!password){iqAccountStatus.textContent='🔴 Informe e-mail e senha.';return}iqAccountStatus.textContent='🟡 Conectando...';iqConnectBtn.disabled=true;try{const x=await post('/iq-login',{email,password});if(x.session_token){try{localStorage.setItem('mega_iq_session_token',x.session_token)}catch(_){}}iqPassword.value='';iqEmail.value='';iqAccountStatus.textContent='🟢 Conectado: '+(x.email_masked||'');await updateMarketNote();if(market.value==='OTC'){sig(true);if(chartTab.classList.contains('active'))loadChart()}}catch(e){iqAccountStatus.textContent='🔴 '+e.message}finally{iqConnectBtn.disabled=false;refreshAccountStatus()}}; iqLogoutBtn.onclick=async()=>{try{await post('/iq-logout',{});try{localStorage.removeItem('mega_iq_session_token')}catch(_){}iqAccountStatus.textContent='● Desconectado';otcNote.textContent='🔴 Conecte sua conta na aba Conta IQ Option.';chartData=[];drawChart([])}catch(e){iqAccountStatus.textContent='🔴 '+e.message}refreshAccountStatus()}; async function sig(announce=false){ if(announce&&voiceEnabled&&Date.now()-lastAnalysis>2500){lastAnalysis=Date.now();showRobot();analysisText.style.display='block';status.textContent='ANALISANDO O MERCADO...';speak('O Mega IA está analisando o mercado.')} try{ cur=await get(`/signal-ai?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}`); if(announce){showRobot();analysisText.style.display='block';} direction.textContent=cur.direction;direction.className='big '+(cur.direction==='CALL'?'call':cur.direction==='PUT'?'put':'neutral'); confidence.textContent='Confiança: '+cur.confidence+'%';entry.textContent=cur.direction==='NEUTRO'?'AGUARDANDO SINAL':ft(cur.entry_time);countdown.textContent=cur.direction==='NEUTRO'?'Sem entrada confirmada':'Preparando entrada';status.textContent=cur.status;risk.textContent='Risco: '+cur.risk; if(cur.direction!=='NEUTRO'){ const k=cur.symbol+'|'+cur.interval+'|'+cur.entry_time+'|'+cur.direction; if(k!==lastSignalVoice){lastSignalVoice=k;if(voiceEnabled){speak(cur.direction==='CALL'?'Análise concluída. Sinal de CALL identificado.':'Análise concluída. Sinal de PUT identificado.')}} }else if(announce&&voiceEnabled){speak('Análise concluída. Não há oportunidade segura no momento.')} fifteen=false;five=false;entered=false; }catch(e){status.textContent='ERRO DE DADOS';if(announce&&voiceEnabled)speak('Não foi possível concluir a análise. Aguarde.')} } async function perf(){try{const p=await get('/performance?market='+encodeURIComponent(market.value));wins.textContent=p.wins;losses.textContent=p.losses;accuracy.textContent=p.accuracy+'%'}catch(e){}} async function rad(){try{const a=await get('/radar?market='+encodeURIComponent(market.value)+'&interval='+encodeURIComponent(interval.value));radar.innerHTML=a.map(x=>`<div><b>${x.symbol}</b><br><span class="${x.direction==='CALL'?'call':x.direction==='PUT'?'put':'neutral'}">${x.direction}</span> • ${x.confidence}%<br><small>${x.status}</small></div>`).join('')}catch(e){}} async function lic(){try{const x=await get('/license');if(x.active){licenseCard.style.display='none';license.textContent='';return}licenseCard.style.display='block';license.innerHTML=`<b>⚠️ LICENÇA EXPIRADA</b><br>Renove o aplicativo para continuar usando.<br><br>WhatsApp: ${x.whatsapp_1} / ${x.whatsapp_2}<br>Instagram: ${x.instagram}`;}catch(e){licenseCard.style.display='none'}} async function clk(){try{const x=await get('/server-time');clock.textContent=ft(x.datetime)+' • Brasília'}catch(e){}} let fifteen=false;function cd(){const ex=document.getElementById('expiryCountdown');if(!cur||cur.direction==='NEUTRO'||!cur.entry_time){countdown.textContent='Sem entrada confirmada';if(ex)ex.textContent='⏱ EXPIRAÇÃO: --:--';return}const now=Date.now(),et=new Date(cur.entry_time).getTime(),xt=cur.expiry_time?new Date(cur.expiry_time).getTime():0;const n=Math.ceil((et-now)/1000);countdown.textContent=n>0?'Entrada em '+n+'s':'Entrada liberada';if(n>0){if(ex)ex.textContent='⏱ EXPIRAÇÃO: aguardando entrada'}else if(xt){const rem=Math.max(0,Math.ceil((xt-now)/1000)),mm=String(Math.floor(rem/60)).padStart(2,'0'),ss=String(rem%60).padStart(2,'0');if(ex)ex.textContent='⏱ EXPIRAÇÃO: '+mm+':'+ss}else if(ex)ex.textContent='⏱ EXPIRAÇÃO: --:--';if(n<=15&&n>13&&!fifteen){fifteen=true;if(voiceEnabled)speak('Atenção. Sinal confirmado de '+cur.direction+'. Entrada em 15 segundos.')}if(n<=5&&n>3&&!five){five=true;if(voiceEnabled)speak('Atenção. Entrada em 5 segundos.')}if(n<=0&&n>-2&&!entered){entered=true;showEntryArrow(cur.direction);if(voiceEnabled)speak(cur.direction==='CALL'?'Entrada liberada. Comprar agora.':'Entrada liberada. Vender agora.')}} async function resultCheck(){if(!cur||cur.direction==='NEUTRO')return;try{const x=await get(`/result?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(cur.symbol)}&interval=${cur.interval}&direction=${cur.direction}&expiry_time=${encodeURIComponent(cur.expiry_time)}`);if(x.result){result.textContent=x.result;const k=cur.symbol+'|'+cur.expiry_time;if(k!==reskey){reskey=k;if(voiceEnabled)speak('Operação finalizada. Resultado '+x.result+'.')}perf()}}catch(e){}} market.onchange=async()=>{localStorage.setItem('mega_market',market.value);fillSymbols();const savedSym=localStorage.getItem('mega_symbol');if(savedSym&&[...S.options].some(o=>o.value===savedSym))S.value=savedSym;await updateMarketNote();lastSignalVoice='';sig(true);rad();if(chartTab.classList.contains('active'))loadChart()};S.onchange=()=>{localStorage.setItem('mega_symbol',S.value);lastSignalVoice='';sig(true);rad();if(chartTab.classList.contains('active'))loadChart()};interval.onchange=()=>{localStorage.setItem('mega_interval',interval.value);lastSignalVoice='';sig(true);rad();if(chartTab.classList.contains('active'))loadChart()}; // Restaura mercado/par/período após atualizar a página, sem armazenar e-mail ou senha. try{const sm=localStorage.getItem('mega_market');if(sm==='OPEN'||sm==='OTC')market.value=sm;fillSymbols();const ss=localStorage.getItem('mega_symbol');if(ss&&[...S.options].some(o=>o.value===ss))S.value=ss;const si=localStorage.getItem('mega_interval');if(si&&[...interval.options].some(o=>o.value===si))interval.value=si}catch(_){} async function bootApp(){ await refreshAccountStatus(); await updateMarketNote(); // Dá tempo para a sessão OTC ser recuperada antes das primeiras chamadas de dados. if(market.value==='OTC') await new Promise(r=>setTimeout(r,900)); sig(false);perf();rad();lic();clk(); } bootApp(); setInterval(()=>sig(false),20000); setInterval(()=>{if(chartTab.classList.contains('active'))loadChart()},20000); setInterval(perf,20000); setInterval(rad,60000); setInterval(resultCheck,3000); setInterval(clk,1000); setInterval(cd,250); </script></body></html>'''
+HTML_PAGE = r'''<!doctype html> <html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"> <title>Mega IA Trader</title> <link rel="manifest" href="/manifest.webmanifest?v=32"> <link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=32"> <link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=32"> <meta name="theme-color" content="#07182b"> <meta name="application-name" content="Mega IA Trader"> <meta name="apple-mobile-web-app-title" content="Mega IA Trader"> <meta name="apple-mobile-web-app-capable" content="yes"> <style> body{margin:0;background:radial-gradient(circle at 50% 0,#07182b 0,#030812 42%,#02050b 100%);color:#eef5ff;font-family:Arial,sans-serif}.wrap{max-width:1150px;margin:auto;padding:18px}.brand{font-size:42px;font-weight:900;letter-spacing:1px;margin:8px 0 2px}.brand span{color:#14c8ff}.subtitle{font-size:13px;color:#91a9c8;letter-spacing:.7px} .card{background:linear-gradient(180deg,#0c1a2c,#091422);border:1px solid #164f80;border-radius:20px;padding:16px;box-shadow:0 12px 30px #0008,0 0 18px #009cff12;margin-top:12px} .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.signal{grid-column:span 2;text-align:center;min-height:270px} .big{font-size:32px;font-weight:800;margin:8px}.call{color:#45ff9b}.put{color:#ff5c7a}.neutral{color:#ffd166}.label{font-size:11px;color:#8190a8} .controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}select,button,input{background:#0d2035;color:#fff;border:1px solid #22689d;border-radius:14px;padding:12px 14px;font-size:15px}select:focus,button:focus,input:focus{outline:none;box-shadow:0 0 0 2px #00bfff55}button{cursor:pointer}input{box-sizing:border-box;width:100%;margin-top:6px}.account-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.account-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}@media(max-width:600px){.account-grid{grid-template-columns:1fr}} .ai-img{display:none;width:100%;max-width:560px;height:230px;object-fit:contain;border-radius:18px;border:1px solid #168cff66;box-shadow:0 0 35px #008cff55;margin:12px auto;animation:pulse 1.2s infinite alternate} @keyframes pulse{from{filter:brightness(.8)}to{filter:brightness(1.25);box-shadow:0 0 45px #008cff99}} .radar{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.radar div{background:#101b2b;padding:10px;border-radius:12px} .strategy{line-height:1.65}.status-analysis{color:#33baff}.tabs{display:flex;gap:8px;margin-top:12px;margin-bottom:20px;flex-wrap:wrap}.tabbtn.active{border-color:#168cff;box-shadow:0 0 15px #168cff44}.tab{display:none}.tab.active{display:block} #chartTab>.card{width:min(94vw,920px);margin:14px auto 0;box-sizing:border-box} .chartbox{position:relative;width:100%;height:520px;margin:0 auto;background:#07101c;border:1px solid #1d3049;border-radius:16px;overflow:hidden}.chartbox canvas{width:100%!important;height:100%!important;display:block}.chartmeta{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}.chartbadge{padding:7px 10px;border-radius:10px;background:#101b2b;color:#b8c7dd;font-size:12px}#chartTab{width:100%}#chartTab>.card{width:min(100%,980px);margin:12px auto 0;padding:18px;box-sizing:border-box} @media(max-width:720px){.wrap{padding:10px}#chartTab>.card{width:100%;max-width:100%;padding:10px}.chartbox{height:430px}} @media(max-width:450px){.wrap{padding:8px}#chartTab>.card{width:100%;padding:8px}.chartbox{height:400px}} .hero{display:none;position:relative;width:100%;max-width:760px;margin:26px auto 18px;border-radius:20px;overflow:hidden;border:1px solid #0bbcff;box-shadow:0 0 30px #00aaff55;background:#05111f}.hero img{display:block;width:100%;height:300px;object-fit:contain;object-position:center;background:#05111f}.entry-arrow{display:none;position:absolute;inset:0;align-items:center;justify-content:center;flex-direction:column;background:#02081488;backdrop-filter:blur(1px);font-weight:900;text-shadow:0 0 18px currentColor}.entry-arrow .arrow{font-size:110px;line-height:.8}.entry-arrow .arrow-label{font-size:28px;margin-top:8px}.entry-arrow.call{display:flex;color:#31ff87}.entry-arrow.put{display:flex;color:#ff405f}.analysisbar{text-align:center;font-size:20px;color:#22c9ff;border-color:#0bbcff}.signal{position:relative}.radar div{border:1px solid #173c5e}.radar .call{filter:drop-shadow(0 0 6px #45ff9b44)}.radar .put{filter:drop-shadow(0 0 6px #ff5c7a44)} @media(max-width:720px){.grid{grid-template-columns:1fr 1fr}.signal{grid-column:span 2}.radar{grid-template-columns:1fr 1fr}.tabs{margin-bottom:22px}.hero{margin:22px auto 16px}.hero img{height:250px}.brand{font-size:36px}.entry-arrow .arrow{font-size:90px}.entry-arrow .arrow-label{font-size:22px}} @media(max-width:450px){.grid{grid-template-columns:1fr}.signal{grid-column:span 1}.radar{grid-template-columns:1fr}.tabs{margin-bottom:24px}.hero{margin:24px auto 14px}.hero img{height:230px}} /* V21: gráfico realmente central e legível no celular */ #chartTab{width:100%;display:none;justify-content:center;align-items:flex-start} #chartTab.active{display:flex} #chartTab>.card{width:min(96vw,1100px)!important;max-width:1100px!important;margin:22px auto 0!important;padding:14px!important} .chartbox{width:100%!important;height:clamp(460px,68vh,700px)!important;margin:0 auto!important} @media(max-width:720px){ #chartTab{width:100%;margin:0 auto;padding:0;justify-content:center} #chartTab>.card{width:calc(100vw - 20px)!important;max-width:none!important;margin:18px auto 0!important;padding:10px!important;transform:none!important} .chartbox{height:58vh!important;min-height:440px!important;max-height:620px!important} .chartmeta{padding:2px 4px 6px} } @media(max-width:450px){ #chartTab>.card{width:calc(100vw - 12px)!important;padding:7px!important;margin-left:auto!important;margin-right:auto!important} .chartbox{height:56vh!important;min-height:420px!important} } /* V22: gráfico mais abaixo e visualmente centralizado */ #chartTab.active{padding-top:7vh!important;box-sizing:border-box} #chartTab.active>.card{margin-top:0!important} @media(max-width:720px){#chartTab.active{padding-top:8vh!important}} @media(max-width:450px){#chartTab.active{padding-top:9vh!important}} </style></head> <body><div class="wrap"> <div class="brand">🤖 MEGA <span>IA</span></div><div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div><div id="clock" style="font-size:22px;margin-top:4px"></div> <div class="controls"><select id="market"><option value="OPEN">🌐 Mercado Aberto</option><option value="OTC">🟣 IQ Option OTC</option></select><select id="symbol"></select><select id="interval"><option>1min</option><option>5min</option><option>15min</option><option>30min</option></select><button id="voiceBtn" onclick="voice()">🔊 Ativar voz</button><div id="otcNote" class="label" style="margin-top:6px;display:none">🟣 IQ Option OTC: verificando conexão...</div></div> <div class="tabs"><button class="tabbtn active" id="tabMain">📊 Painel</button><button class="tabbtn" id="tabChart">📈 Gráfico</button><button class="tabbtn" id="tabAccount">⚙️ Conta IQ Option</button></div> <div id="mainTab" class="tab active"> <div id="heroBox" class="hero"><img id="aiImage" src="__MEGA_IMAGE__" alt="MEGA IA analisando o mercado"><div id="entryArrow" class="entry-arrow"><div class="arrow" id="entryArrowIcon">⬆</div><div class="arrow-label" id="entryArrowLabel">CALL • COMPRAR</div></div></div> <div id="analysisText" class="card analysisbar" style="display:none">🧠 ESTOU ANALISANDO O MERCADO, AGUARDE...</div> <div class="grid"> <div class="card signal"><div class="label">SINAL ATUAL</div><div id="direction" class="big neutral">AGUARDANDO</div><div id="confidence">Confiança: --</div></div> <div class="card"><div class="label">ENTRADA</div><div id="entry" class="big">--:--:--</div><div id="countdown">--</div><div id="expiryCountdown" style="margin-top:8px;font-weight:800">⏱ EXPIRAÇÃO: --:--</div></div> <div class="card"><div class="label">STATUS IA</div><div id="status" class="big" style="font-size:18px">MONITORANDO</div><div id="risk">Risco: --</div></div></div> <div class="grid"><div class="card"><div class="label">WIN</div><div id="wins" class="big call">0</div></div><div class="card"><div class="label">LOSS</div><div id="losses" class="big put">0</div></div><div class="card"><div class="label">ASSERTIVIDADE</div><div id="accuracy" class="big">0%</div></div><div class="card"><div class="label">RESULTADO</div><div id="result" class="big">--</div></div></div> </div> <div id="chartTab" class="tab"> <div class="card"><div class="chartmeta"><b>📈 Gráfico espelhado</b><span class="chartbadge" id="chartInfo">--</span></div><div class="chartbox"><canvas id="priceChart"></canvas></div><div class="label" style="margin-top:8px">O gráfico acompanha o mesmo mercado, par e período selecionados no painel. Para OTC, os candles são solicitados à IQ Option.</div></div> </div> <div id="accountTab" class="tab"> <div class="card"> <h2 style="margin-top:0">⚙️ Conta IQ Option</h2> <div class="label">Use sua própria conta para liberar o gráfico e os candles OTC. Os dados não são gravados no GitHub ou no navegador.</div> <div class="account-grid"> <label>E-mail<input id="iqEmail" type="email" autocomplete="username" placeholder="Seu e-mail da IQ Option"></label> <label>Senha<input id="iqPassword" type="password" autocomplete="current-password" placeholder="Sua senha"></label> </div> <div class="account-actions"><button id="iqConnectBtn">🟢 Conectar</button><button id="iqLogoutBtn">🔴 Desconectar</button></div> <div id="iqAccountStatus" class="card" style="margin-top:12px">● Desconectado</div> <div class="label" style="margin-top:8px">🔒 A senha fica apenas na memória temporária do servidor durante a sessão ativa e é descartada ao desconectar ou expirar.</div> </div> </div> <div class="card"><b>Radar de oportunidades</b><div id="radar" class="radar"></div></div> <div id="licenseCard" class="card" style="display:none"><div class="label">RENOVAÇÃO</div><div id="license"></div></div> </div> <script> const syms=['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD']; const S=document.getElementById('symbol'); function fillSymbols(){const otc=market.value==='OTC';S.innerHTML='';syms.forEach(x=>S.add(new Option(otc?'🟣 '+x+' • OTC':x,x)));} fillSymbols(); let cur=null,voiceEnabled=false,lastSignalVoice='',lastAnalysis=0,five=false,entered=false,reskey=''; let sigBusy=false,chartBusy=false,radBusy=false,perfBusy=false; let robotTimer=null,arrowTimer=null;function showRobot(){const h=document.getElementById('heroBox');h.style.display='block';clearTimeout(robotTimer);robotTimer=setTimeout(()=>{if(!entryArrow.classList.contains('call')&&!entryArrow.classList.contains('put')){h.style.display='none';analysisText.style.display='none'}},10000)}function showEntryArrow(dir){showRobot();entryArrow.style.display='';entryArrow.className='entry-arrow '+(dir==='CALL'?'call':'put');entryArrowIcon.textContent=dir==='CALL'?'⬆':'⬇';entryArrowLabel.textContent=dir==='CALL'?'CALL • COMPRAR':'PUT • VENDER';clearTimeout(arrowTimer);arrowTimer=setTimeout(()=>{entryArrow.className='entry-arrow';entryArrow.style.display='';heroBox.style.display='none'},6000)} async function updateMarketNote(){const otc=market.value==='OTC';otcNote.style.display=otc?'block':'none';if(!otc)return;otcNote.textContent='🟣 IQ Option OTC: verificando conexão...';try{const x=await Promise.race([get('/otc-status'),new Promise((_,rej)=>setTimeout(()=>rej(Error('tempo limite de conexão')),16000))]);otcNote.textContent=(x.connected?'🟢 ':x.reconnecting?'🟡 ':'🔴 ')+x.message}catch(e){otcNote.textContent='🔴 IQ Option OTC: '+(e.message||'falha de conexão')}} updateMarketNote(); market.onchange=()=>{fillSymbols();updateMarketNote();sig(true);rad();if(chartTab.classList.contains('active'))loadChart()}; let megaVoices=[];function loadMegaVoices(){if(window.speechSynthesis)megaVoices=speechSynthesis.getVoices()||[]}if(window.speechSynthesis){loadMegaVoices();speechSynthesis.addEventListener?.('voiceschanged',loadMegaVoices)} function pickMalePtBRVoice(){ const all=(megaVoices.length?megaVoices:speechSynthesis.getVoices()); const br=all.filter(v=>String(v.lang||'').replace('_','-').toLowerCase()==='pt-br'); const pt=br.length?br:all.filter(v=>String(v.lang||'').toLowerCase().startsWith('pt')); // Prioriza vozes naturais/neural quando o Android/Chrome disponibilizar. const natural=/natural|neural|premium|enhanced|wavenet|google.*portugu|microsoft.*portugu/i; const male=/antonio|antônio|daniel|ricardo|felipe|paulo|carlos|thiago|bruno|marcelo|male|masculino|homem/i; const female=/maria|luciana|fernanda|camila|female|feminina|mulher/i; return pt.find(v=>natural.test(v.name||'')&&male.test(v.name||'')) ||pt.find(v=>natural.test(v.name||'')&&!female.test(v.name||'')) ||pt.find(v=>male.test(v.name||'')) ||pt.find(v=>!female.test(v.name||'')) ||pt[0]||null; } function speak(t){ if(!voiceEnabled||!window.speechSynthesis)return; speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(t); u.lang='pt-BR'; // Mais natural: velocidade próxima da fala humana e pitch sem distorção robótica. u.rate=.94;u.pitch=.90;u.volume=1; const mv=pickMalePtBRVoice();if(mv)u.voice=mv; speechSynthesis.speak(u); } function voice(){voiceEnabled=true;voiceBtn.textContent='🔊 Voz ativada';speak('Voz da Mega IA ativada.');setTimeout(()=>sig(true),650)} function ft(x){return x?new Date(x).toLocaleTimeString('pt-BR',{hour12:false}):'--:--:--'} function iqSessionToken(){try{return localStorage.getItem('mega_iq_session_token')||''}catch(_){return ''}} function authHeaders(extra={}){const h={...extra};const t=iqSessionToken();if(t)h['X-IQ-Session']=t;return h} async function get(u){const r=await fetch(u,{cache:'no-store',credentials:'include',headers:authHeaders()});let j=null;try{j=await r.json()}catch(_){j=null}if(!r.ok)throw Error((j&&j.detail)?j.detail:'HTTP '+r.status);return j} async function post(u,data={}){const r=await fetch(u,{method:'POST',credentials:'include',headers:authHeaders({'Content-Type':'application/json'}),body:JSON.stringify(data)});let j=null;try{j=await r.json()}catch(_){j=null}if(!r.ok)throw Error((j&&j.detail)?j.detail:'HTTP '+r.status);return j} let chartTimer=null; const chartCanvas=document.getElementById('priceChart'); const chartCtx=chartCanvas.getContext('2d'); function resizeChart(){const r=chartCanvas.getBoundingClientRect();const d=window.devicePixelRatio||1;chartCanvas.width=Math.max(1,r.width*d);chartCanvas.height=Math.max(1,r.height*d);chartCtx.setTransform(d,0,0,d,0,0);if(chartData.length)drawChart(chartData);} let chartData=[]; function drawChart(a){ const w=chartCanvas.clientWidth,h=chartCanvas.clientHeight;chartCtx.clearRect(0,0,w,h);if(!a.length)return; const pad={l:55,r:12,t:18,b:28},cw=w-pad.l-pad.r,ch=h-pad.t-pad.b; let lo=Math.min(...a.map(c=>Number(c.low))),hi=Math.max(...a.map(c=>Number(c.high)));const extra=(hi-lo)*.08||1;lo-=extra;hi+=extra; const px=i=>pad.l+(i/(a.length-1||1))*cw;const py=v=>pad.t+(hi-v)/(hi-lo)*ch; chartCtx.strokeStyle='#19304a';chartCtx.lineWidth=1;chartCtx.font='11px Arial';chartCtx.fillStyle='#8190a8'; for(let j=0;j<5;j++){const y=pad.t+j*ch/4;chartCtx.beginPath();chartCtx.moveTo(pad.l,y);chartCtx.lineTo(w-pad.r,y);chartCtx.stroke();const v=hi-(hi-lo)*j/4;chartCtx.fillText(v.toFixed(5),4,y+4)} const step=Math.max(2,cw/a.length*.72); a.forEach((c,i)=>{const x=px(i),o=Number(c.open),cl=Number(c.close),hh=Number(c.high),ll=Number(c.low);const up=cl>=o;chartCtx.strokeStyle=up?'#45ff9b':'#ff5c7a';chartCtx.fillStyle=up?'#45ff9b':'#ff5c7a';chartCtx.beginPath();chartCtx.moveTo(x,py(hh));chartCtx.lineTo(x,py(ll));chartCtx.stroke();const top=py(Math.max(o,cl)),bot=py(Math.min(o,cl));chartCtx.fillRect(x-step/2,top,step,Math.max(1,bot-top));if(i%Math.ceil(a.length/6)===0){chartCtx.fillStyle='#8190a8';chartCtx.fillText(new Date(c.datetime).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),x-18,h-7)}}); if(cur&&cur.direction&&cur.direction!=='NEUTRO'){const idx=a.findIndex(c=>c.datetime===cur.reference_candle);if(idx>=0){const x=px(idx),v=cur.direction==='CALL'?Number(a[idx].low):Number(a[idx].high);chartCtx.fillStyle=cur.direction==='CALL'?'#45ff9b':'#ff5c7a';chartCtx.beginPath();chartCtx.arc(x,py(v),6,0,Math.PI*2);chartCtx.fill();chartCtx.font='bold 12px Arial';chartCtx.fillText(cur.direction,x+8,py(v)-8)}} } async function loadChart(){if(chartBusy)return;chartBusy=true;try{const d=await get(`/candles?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&n=80`);if((d.candles||[]).length)chartData=d.candles||[];chartInfo.textContent=(d.ok===false?'⚠️ ':'')+(d.market==='OTC'?'🟣 '+d.symbol+' • OTC':d.symbol)+' • '+d.interval+(d.ok===false?' • '+(d.status||'INDISPONÍVEL'):'');drawChart(chartData)}catch(e){chartInfo.textContent='⚠️ Dados temporariamente indisponíveis';if(!chartData.length)drawChart([])}finally{chartBusy=false}} function showTab(which){const main=which==='main',chart=which==='chart',account=which==='account';mainTab.classList.toggle('active',main);chartTab.classList.toggle('active',chart);accountTab.classList.toggle('active',account);tabMain.classList.toggle('active',main);tabChart.classList.toggle('active',chart);tabAccount.classList.toggle('active',account);if(chart){loadChart();setTimeout(resizeChart,50)}if(account)refreshAccountStatus()} tabMain.onclick=()=>showTab('main');tabChart.onclick=()=>showTab('chart');tabAccount.onclick=()=>showTab('account');window.addEventListener('resize',resizeChart); async function refreshAccountStatus(){try{const x=await get('/otc-status');const rr=!!x.reconnecting;iqAccountStatus.textContent=(x.connected&&!rr?'🟢 ':rr?'🟡 ':'🔴 ')+(x.connected&&!rr?('Conectado: '+(x.email_masked||'')):x.message);iqConnectBtn.disabled=!!x.connected||rr;iqLogoutBtn.disabled=!x.connected&&!rr;if(rr)setTimeout(refreshAccountStatus,2500)}catch(e){iqAccountStatus.textContent='🟡 Reconectando à IQ Option...';setTimeout(refreshAccountStatus,2500)}} iqConnectBtn.onclick=async()=>{const email=iqEmail.value.trim(),password=iqPassword.value;if(!email||!password){iqAccountStatus.textContent='🔴 Informe e-mail e senha.';return}iqAccountStatus.textContent='🟡 Conectando...';iqConnectBtn.disabled=true;try{const x=await post('/iq-login',{email,password});if(x.session_token){try{localStorage.setItem('mega_iq_session_token',x.session_token)}catch(_){}}iqPassword.value='';iqEmail.value='';iqAccountStatus.textContent='🟢 Conectado: '+(x.email_masked||'');await updateMarketNote();if(market.value==='OTC'){sig(true);if(chartTab.classList.contains('active'))loadChart()}}catch(e){iqAccountStatus.textContent='🔴 '+e.message}finally{iqConnectBtn.disabled=false;refreshAccountStatus()}}; iqLogoutBtn.onclick=async()=>{try{await post('/iq-logout',{});try{localStorage.removeItem('mega_iq_session_token')}catch(_){}iqAccountStatus.textContent='● Desconectado';otcNote.textContent='🔴 Conecte sua conta na aba Conta IQ Option.';chartData=[];drawChart([])}catch(e){iqAccountStatus.textContent='🔴 '+e.message}refreshAccountStatus()}; async function sig(announce=false){ if(sigBusy)return; sigBusy=true; if(announce&&voiceEnabled&&Date.now()-lastAnalysis>2500){lastAnalysis=Date.now();showRobot();analysisText.style.display='block';status.textContent='ANALISANDO O MERCADO...';speak('O Mega IA está analisando o mercado.')} try{ cur=await get(`/signal-ai?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}`); if(announce){showRobot();analysisText.style.display='block';} direction.textContent=cur.direction||'NEUTRO';direction.className='big '+(cur.direction==='CALL'?'call':cur.direction==='PUT'?'put':'neutral'); confidence.textContent='Confiança: '+Number(cur.confidence||0).toFixed(0)+'%';entry.textContent=cur.direction==='NEUTRO'||!cur.entry_time?'AGUARDANDO SINAL':ft(cur.entry_time);countdown.textContent=cur.direction==='NEUTRO'?'Sem entrada confirmada':'Preparando entrada';status.textContent=cur.status||'MONITORANDO';risk.textContent='Risco: '+(cur.risk||'--'); if(cur.direction!=='NEUTRO'){ const k=cur.symbol+'|'+cur.interval+'|'+cur.entry_time+'|'+cur.direction; if(k!==lastSignalVoice){lastSignalVoice=k;if(voiceEnabled){speak(cur.direction==='CALL'?'Análise concluída. Sinal de CALL identificado.':'Análise concluída. Sinal de PUT identificado.')}} }else if(announce&&voiceEnabled&&cur.source_state==='READY'){speak('Análise concluída. Não há oportunidade segura no momento.')} fifteen=false;five=false;entered=false; }catch(e){status.textContent='PAINEL ATIVO • FONTE TEMPORARIAMENTE INDISPONÍVEL';direction.textContent='NEUTRO';direction.className='big neutral';entry.textContent='AGUARDANDO DADOS';countdown.textContent='Sem entrada confirmada';if(announce&&voiceEnabled)speak('A fonte de dados está temporariamente indisponível. O painel continua monitorando.')} finally{sigBusy=false} } async function perf(){if(perfBusy)return;perfBusy=true;try{const p=await get('/performance?market='+encodeURIComponent(market.value));wins.textContent=p.wins;losses.textContent=p.losses;accuracy.textContent=p.accuracy+'%'}catch(e){}finally{perfBusy=false}} async function rad(){if(radBusy)return;radBusy=true;try{const a=await get('/radar?market='+encodeURIComponent(market.value)+'&interval='+encodeURIComponent(interval.value));radar.innerHTML=a.map(x=>`<div><b>${x.symbol}</b><br><span class="${x.direction==='CALL'?'call':x.direction==='PUT'?'put':'neutral'}">${x.direction}</span> • ${x.confidence}%<br><small>${x.status}</small></div>`).join('')}catch(e){}finally{radBusy=false}} async function lic(){try{const x=await get('/license');if(x.active){licenseCard.style.display='none';license.textContent='';return}licenseCard.style.display='block';license.innerHTML=`<b>⚠️ LICENÇA EXPIRADA</b><br>Renove o aplicativo para continuar usando.<br><br>WhatsApp: ${x.whatsapp_1} / ${x.whatsapp_2}<br>Instagram: ${x.instagram}`;}catch(e){licenseCard.style.display='none'}} async function clk(){try{const x=await get('/server-time');clock.textContent=ft(x.datetime)+' • Brasília'}catch(e){}} let fifteen=false;function cd(){const ex=document.getElementById('expiryCountdown');if(!cur||cur.direction==='NEUTRO'||!cur.entry_time){countdown.textContent='Sem entrada confirmada';if(ex)ex.textContent='⏱ EXPIRAÇÃO: --:--';return}const now=Date.now(),et=new Date(cur.entry_time).getTime(),xt=cur.expiry_time?new Date(cur.expiry_time).getTime():0;const n=Math.ceil((et-now)/1000);countdown.textContent=n>0?'Entrada em '+n+'s':'Entrada liberada';if(n>0){if(ex)ex.textContent='⏱ EXPIRAÇÃO: aguardando entrada'}else if(xt){const rem=Math.max(0,Math.ceil((xt-now)/1000)),mm=String(Math.floor(rem/60)).padStart(2,'0'),ss=String(rem%60).padStart(2,'0');if(ex)ex.textContent='⏱ EXPIRAÇÃO: '+mm+':'+ss}else if(ex)ex.textContent='⏱ EXPIRAÇÃO: --:--';if(n<=15&&n>13&&!fifteen){fifteen=true;if(voiceEnabled)speak('Atenção. Sinal confirmado de '+cur.direction+'. Entrada em 15 segundos.')}if(n<=5&&n>3&&!five){five=true;if(voiceEnabled)speak('Atenção. Entrada em 5 segundos.')}if(n<=0&&n>-2&&!entered){entered=true;showEntryArrow(cur.direction);if(voiceEnabled)speak(cur.direction==='CALL'?'Entrada liberada. Comprar agora.':'Entrada liberada. Vender agora.')}} async function resultCheck(){if(!cur||cur.direction==='NEUTRO'||!cur.expiry_time||Date.now()<new Date(cur.expiry_time).getTime())return;try{const x=await get(`/result?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(cur.symbol)}&interval=${cur.interval}&direction=${cur.direction}&expiry_time=${encodeURIComponent(cur.expiry_time)}`);if(x.result){result.textContent=x.result;const k=cur.symbol+'|'+cur.expiry_time;if(k!==reskey){reskey=k;if(voiceEnabled)speak('Operação finalizada. Resultado '+x.result+'.')}perf()}}catch(e){}} market.onchange=async()=>{localStorage.setItem('mega_market',market.value);fillSymbols();const savedSym=localStorage.getItem('mega_symbol');if(savedSym&&[...S.options].some(o=>o.value===savedSym))S.value=savedSym;await updateMarketNote();lastSignalVoice='';sig(true);rad();if(chartTab.classList.contains('active'))loadChart()};S.onchange=()=>{localStorage.setItem('mega_symbol',S.value);lastSignalVoice='';sig(true);rad();if(chartTab.classList.contains('active'))loadChart()};interval.onchange=()=>{localStorage.setItem('mega_interval',interval.value);lastSignalVoice='';sig(true);rad();if(chartTab.classList.contains('active'))loadChart()}; // Restaura mercado/par/período após atualizar a página, sem armazenar e-mail ou senha. try{const sm=localStorage.getItem('mega_market');if(sm==='OPEN'||sm==='OTC')market.value=sm;fillSymbols();const ss=localStorage.getItem('mega_symbol');if(ss&&[...S.options].some(o=>o.value===ss))S.value=ss;const si=localStorage.getItem('mega_interval');if(si&&[...interval.options].some(o=>o.value===si))interval.value=si}catch(_){} async function bootApp(){ await refreshAccountStatus(); await updateMarketNote(); // Dá tempo para a sessão OTC ser recuperada antes das primeiras chamadas de dados. if(market.value==='OTC') await new Promise(r=>setTimeout(r,900)); sig(false);perf();rad();lic();clk(); } bootApp(); setInterval(()=>sig(false),35000); setInterval(()=>{if(chartTab.classList.contains('active'))loadChart()},35000); setInterval(perf,60000); setInterval(rad,90000); setInterval(resultCheck,5000); setInterval(clk,1000); setInterval(cd,250); </script></body></html>'''
 
 
 HTML_PAGE = HTML_PAGE.replace("__MEGA_IMAGE__", "/mega-ia.png")
