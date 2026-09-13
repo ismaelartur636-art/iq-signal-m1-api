@@ -4997,6 +4997,19 @@ async def performance(request: Request, interval="1min", market="OPEN"):
     }
 
 
+
+def _cached_open_candles_for_result(symbol: str, interval: str, n: int = 100):
+    """Usa o cache já carregado da Twelve Data sem gastar uma nova chamada."""
+    item = td_candle_cache.get(f"{symbol}|{interval}")
+    if not item:
+        return []
+    try:
+        values = item[1] or []
+        return values[-max(20, min(int(n), 150)):]
+    except Exception:
+        return []
+
+
 @app.get("/result")
 async def result(
     request: Request,
@@ -5044,7 +5057,31 @@ async def result(
             "next_check": iso(expiry_dt),
         }
 
-    cs = await candles(symbol, interval, 40, market, state, request=request)
+    # Para resultado OPEN, tenta primeiro o cache já existente. Isso evita
+    # consumir créditos só para fechar WIN/LOSS.
+    cs = _cached_open_candles_for_result(symbol, interval, 100) if market == "OPEN" else []
+
+    if not cs:
+        try:
+            cs = await candles(symbol, interval, 40, market, state, request=request)
+        except HTTPException as exc:
+            # Não devolve 503 ao painel. O resultado continua pendente e o
+            # navegador tenta novamente em ritmo controlado.
+            return {
+                "status": "AGUARDANDO_FONTE",
+                "stage": "ENTRADA",
+                "result": None,
+                "retry_after": 15,
+                "message": str(exc.detail)[:220],
+            }
+        except Exception as exc:
+            return {
+                "status": "AGUARDANDO_FONTE",
+                "stage": "ENTRADA",
+                "result": None,
+                "retry_after": 15,
+                "message": str(exc)[:220],
+            }
 
     def candle_near(target_dt):
         target = None
@@ -5722,6 +5759,8 @@ let pendingTrade=null;
 let pendingTradeQueue=[];
 let lastCountdownSignalKey='';
 let lastChartSignalVoice='';
+const RESULT_RETRY_MS=15000;
+const RESULT_MAX_PENDING_AGE_MS=30*60*1000;
 
 const RESULT_STATS_KEY='mega_result_stats_v33310';
 const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33310';
@@ -7205,6 +7244,21 @@ async function resultCheck(){
     return;
   }
 
+  // Evita consultar /result a cada 3 segundos quando a fonte está em limite.
+  if(Number(pendingTrade.next_result_check_at||0) > Date.now()){
+    return;
+  }
+
+  // Uma pendência muito antiga não pode bloquear para sempre as operações novas.
+  const expiryMs=new Date(pendingTrade.expiry_time).getTime();
+  if(Number.isFinite(expiryMs) && Date.now()-expiryMs > RESULT_MAX_PENDING_AGE_MS){
+    if(galeStageStatus){
+      galeStageStatus.textContent='⚠️ Resultado antigo descartado após 30 min sem dados';
+    }
+    promoteNextPendingTrade();
+    return;
+  }
+
   resultBusy=true;
 
   try{
@@ -7214,6 +7268,19 @@ async function resultCheck(){
     const x=await get(
       `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=true`
     );
+
+    if(x && !x.result && (x.status==='AGUARDANDO_FONTE' || x.status==='AGUARDANDO CANDLE')){
+      pendingTrade.next_result_check_at=Date.now()+Math.max(
+        RESULT_RETRY_MS,
+        Number(x.retry_after||15)*1000
+      );
+      pendingTrade.result_failures=Number(pendingTrade.result_failures||0)+1;
+      savePendingTrade();
+      if(galeStageStatus){
+        galeStageStatus.textContent='⏳ Resultado aguardando dados da fonte';
+      }
+      return;
+    }
 
     // A entrada original é contabilizada imediatamente após o fechamento da vela,
     // mesmo que o acompanhamento de G1/G2 ainda continue.
@@ -7275,7 +7342,12 @@ async function resultCheck(){
     }
 
   }catch(e){
-    // Mantém pendente e tenta novamente no próximo ciclo.
+    // Falha temporária: mantém pendente, mas não consulta de novo a cada 3 segundos.
+    if(pendingTrade){
+      pendingTrade.next_result_check_at=Date.now()+RESULT_RETRY_MS;
+      pendingTrade.result_failures=Number(pendingTrade.result_failures||0)+1;
+      savePendingTrade();
+    }
   }finally{
     resultBusy=false;
   }
@@ -7407,7 +7479,7 @@ setInterval(()=>{
 },240000);
 
 // Com o app ligado, acompanha o resultado das operações abertas.
-setInterval(()=>{ if(appEnabled) resultCheck(); },3000);
+setInterval(()=>{ if(appEnabled) resultCheck(); },5000);
 setInterval(clk,1000);
 setInterval(()=>{ if(appEnabled) cd(); },250);
 </script>
