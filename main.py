@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.14.1")
+app = FastAPI(title="MEGA IA", version="33.15.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2073,6 +2073,139 @@ def otc_structure_bias(cs):
             "reason":"Estrutura sem direção limpa.","strategy":"OTC Estrutura de mercado"}
 
 
+
+def adx(cs, period=21):
+    """ADX clássico (Wilder simplificado) para medir força da tendência."""
+    if len(cs) < period + 2:
+        return None
+    trs, plus_dm, minus_dm = [], [], []
+    for i in range(1, len(cs)):
+        cur, prev = cs[i], cs[i - 1]
+        up = cur["high"] - prev["high"]
+        down = prev["low"] - cur["low"]
+        plus_dm.append(up if up > down and up > 0 else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+        trs.append(max(
+            cur["high"] - cur["low"],
+            abs(cur["high"] - prev["close"]),
+            abs(cur["low"] - prev["close"]),
+        ))
+    if len(trs) < period:
+        return None
+
+    dxs = []
+    for end in range(period, len(trs) + 1):
+        tr = sum(trs[end-period:end])
+        if tr <= 1e-12:
+            continue
+        pdi = 100.0 * sum(plus_dm[end-period:end]) / tr
+        mdi = 100.0 * sum(minus_dm[end-period:end]) / tr
+        den = pdi + mdi
+        dxs.append(0.0 if den <= 1e-12 else 100.0 * abs(pdi - mdi) / den)
+    if not dxs:
+        return None
+    return sum(dxs[-period:]) / min(period, len(dxs))
+
+
+def _mega_ia_confluence_score(cs, direction, context=None):
+    """
+    Score M1/M5 de 0 a 100:
+      M5 tendência 20; EMA 3/7 15; RSI 9 15; ADX 21 10;
+      S/R local 15; padrão/rejeição 15; volume 10.
+    """
+    context = context or {}
+    if len(cs) < 25 or direction not in ("CALL", "PUT"):
+        return {"score": 0, "passed": False, "details": {}}
+
+    closes = [float(c["close"]) for c in cs]
+    e3, e7 = ema(closes, 3), ema(closes, 7)
+    r9 = rsi(closes, 9)
+    a21 = adx(cs, 21)
+    last = cs[-1]
+    details = {}
+    score = 0
+
+    # 1) Tendência M5 - 20 pontos.
+    m5 = context.get("m5") or []
+    m5_ok = False
+    if len(m5) >= 10:
+        m5c = [float(c["close"]) for c in m5]
+        m5e3, m5e7 = ema(m5c, 3), ema(m5c, 7)
+        if m5e3 is not None and m5e7 is not None:
+            m5_ok = (m5e3 > m5e7) if direction == "CALL" else (m5e3 < m5e7)
+    details["trend_m5"] = m5_ok
+    if m5_ok:
+        score += 20
+
+    # 2) EMA 3/7 M1 - 15 pontos.
+    ema_ok = False
+    if e3 is not None and e7 is not None:
+        ema_ok = (e3 > e7) if direction == "CALL" else (e3 < e7)
+    details["ema_3_7"] = ema_ok
+    if ema_ok:
+        score += 15
+
+    # 3) RSI 9 - 15 pontos. Usa reação/momentum, não apenas extremo rígido.
+    r_prev = rsi(closes[:-1], 9) if len(closes) > 10 else None
+    rsi_ok = False
+    if r9 is not None and r_prev is not None:
+        if direction == "CALL":
+            rsi_ok = (30 <= r9 <= 68 and r9 >= r_prev) or (r_prev < 30 <= r9)
+        else:
+            rsi_ok = (32 <= r9 <= 70 and r9 <= r_prev) or (r_prev > 70 >= r9)
+    details["rsi9"] = round(r9, 2) if r9 is not None else None
+    details["rsi_ok"] = rsi_ok
+    if rsi_ok:
+        score += 15
+
+    # 4) ADX 21 >= 20 - 10 pontos.
+    adx_ok = a21 is not None and a21 >= 20.0
+    details["adx21"] = round(a21, 2) if a21 is not None else None
+    details["adx_ok"] = adx_ok
+    if adx_ok:
+        score += 10
+
+    # 5) Suporte/resistência local - 15 pontos.
+    recent = cs[-20:-1] if len(cs) >= 21 else cs[:-1]
+    support = min((c["low"] for c in recent), default=last["low"])
+    resistance = max((c["high"] for c in recent), default=last["high"])
+    avg_range = sum(max(1e-12, c["high"]-c["low"]) for c in recent) / max(1, len(recent))
+    tol = max(avg_range * 0.45, 1e-12)
+    sr_ok = (last["low"] <= support + tol) if direction == "CALL" else (last["high"] >= resistance - tol)
+    details["sr_ok"] = sr_ok
+    if sr_ok:
+        score += 15
+
+    # 6) Padrão/rejeição da última vela - 15 pontos.
+    wi = wick_info(last)
+    bull = last["close"] > last["open"]
+    bear = last["close"] < last["open"]
+    reject_call = bull and wi.get("call_wick", 0) >= max(wi.get("body_ratio", 0), 0.01) * 0.7
+    reject_put = bear and wi.get("put_wick", 0) >= max(wi.get("body_ratio", 0), 0.01) * 0.7
+    # Também aceita duas velas consecutivas da direção, mas apenas como parte do score.
+    c1, c2 = cs[-2], cs[-1]
+    two_call = c1["close"] > c1["open"] and c2["close"] > c2["open"]
+    two_put = c1["close"] < c1["open"] and c2["close"] < c2["open"]
+    pattern_ok = (reject_call or two_call) if direction == "CALL" else (reject_put or two_put)
+    details["pattern_ok"] = pattern_ok
+    if pattern_ok:
+        score += 15
+
+    # 7) Volume relativo - 10 pontos.
+    vols = [float(c.get("volume", 0) or 0) for c in cs[-20:-1]]
+    vavg = sum(vols) / len(vols) if vols else 0.0
+    vlast = float(last.get("volume", 0) or 0)
+    # Algumas fontes OTC retornam volume 0; nesse caso não damos pontos nem bloqueamos sozinho.
+    volume_ok = vavg > 0 and vlast >= vavg * 0.90
+    details["volume"] = round(vlast, 2)
+    details["volume_avg"] = round(vavg, 2)
+    details["volume_ok"] = volume_ok
+    if volume_ok:
+        score += 10
+
+    return {"score": int(score), "passed": score >= 75, "details": details}
+
+
 def otc_noise_filter(cs):
     """
     Filtro de proteção contra gráfico errático:
@@ -2162,13 +2295,34 @@ def otc_engine(cs, context=None):
         # Preferência: pelo menos 2 estratégias OTC concordando.
         # Com vários detectores de padrão, exigimos pelo menos 2 confirmações.
         if len(winner) >= 2:
-            conf = min(96, avg + 3 + min(4, len(winner)-2))
+            mega_score = _mega_ia_confluence_score(cs, direction, context)
+            score = int(mega_score.get("score", 0))
+            if mega_score.get("passed"):
+                # A confiança passa a refletir tanto as estratégias quanto o score 0-100.
+                conf = min(96, max(75, avg * 0.55 + score * 0.45))
+                return {
+                    "direction": direction,
+                    "confidence": round(conf, 1),
+                    "confirmed": True,
+                    "strategy": "MEGA IA 75/100 + OTC multiestratégia",
+                    "reason": f"{len(winner)} estratégias OTC em confluência; score MEGA IA {score}/100.",
+                    "score": score,
+                    "score_min": 75,
+                    "score_details": mega_score.get("details", {}),
+                    "strategies": strategies,
+                    "engine": "OTC",
+                    "structure": structure_map,
+                    "noise_filter": noise,
+                }
             return {
-                "direction": direction,
-                "confidence": round(conf, 1),
-                "confirmed": True,
-                "strategy": "Motor OTC multiestratégia",
-                "reason": f"{len(winner)} estratégias OTC em confluência.",
+                "direction": "NEUTRO",
+                "confidence": round(min(74, max(avg, score)), 1),
+                "confirmed": False,
+                "strategy": "MEGA IA 75/100 + OTC multiestratégia",
+                "reason": f"Confluência técnica detectada, mas score {score}/100 abaixo do mínimo 75.",
+                "score": score,
+                "score_min": 75,
+                "score_details": mega_score.get("details", {}),
                 "strategies": strategies,
                 "engine": "OTC",
                 "structure": structure_map,
@@ -2964,6 +3118,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     # incluindo o mapa H1/H4. OTC usa SOMENTE o motor OTC próprio.
     h1_closed = None
     h4_closed = None
+    m5_closed = None
+
+    # Para entradas M1 em OTC, a tendência principal é confirmada no M5.
+    if market in ("IQ_OTC", "OLYMP_OTC") and interval == "1min":
+        try:
+            m5_raw = await candles(symbol, "5min", 80, market, iq_state, request=request)
+            m5_closed = m5_raw[:-1] if len(m5_raw) > 1 else m5_raw
+        except Exception:
+            m5_closed = None
 
     if market == "OPEN" and interval in ("5min", "15min"):
         try:
@@ -2983,6 +3146,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         {
             "h1": h1_closed,
             "h4": h4_closed,
+            "m5": m5_closed,
             "interval": interval,
         },
     )
@@ -3094,7 +3258,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.14.1",
+        "version": "33.15.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
