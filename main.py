@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.28.0")
+app = FastAPI(title="MEGA IA", version="33.29.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2775,6 +2775,15 @@ def iq_active_candidates(symbol: str):
     ]))
 
 
+def iq_regular_active_candidates(symbol: str):
+    """Candidatos do mercado normal da IQ Option para espelhar o gráfico."""
+    base = symbol.replace("/", "").upper()
+    return list(dict.fromkeys([
+        base,
+        symbol.replace("/", "").upper(),
+    ]))
+
+
 def iq_seconds(interval: str):
     if interval not in INTERVALS:
         raise RuntimeError("Intervalo inválido para IQ Option.")
@@ -3027,13 +3036,15 @@ def _iq_get_candles_once(client, active: str, duration: int, count: int, endtime
     )
 
 
-def iq_candles_blocking(state: Dict[str, Any], symbol: str, interval: str, n: int):
+def iq_candles_blocking(state: Dict[str, Any], symbol: str, interval: str, n: int, regular_market: bool = False):
     client = _iq_reconnect_state(state)
     duration = iq_seconds(interval)
     count = max(20, min(int(n), 150))
     errors = []
 
-    for active in iq_active_candidates(symbol):
+    candidates = iq_regular_active_candidates(symbol) if regular_market else iq_active_candidates(symbol)
+
+    for active in candidates:
         try:
             if not _iq_connected(state):
                 client = _iq_reconnect_state(state)
@@ -3081,12 +3092,12 @@ def iq_candles_blocking(state: Dict[str, Any], symbol: str, interval: str, n: in
             ):
                 _iq_close_state(state)
                 raise RuntimeError(
-                    "A conexão OTC da IQ Option caiu: " + msg[:220]
+                    "A conexão da IQ Option caiu: " + msg[:220]
                 )
 
     detail = " | ".join(errors[-3:])
     raise RuntimeError(
-        "IQ Option OTC sem candles. " + detail[:350]
+        "IQ Option sem candles. " + detail[:350]
     )
 
 
@@ -4123,6 +4134,7 @@ async def candles_endpoint(
     interval: str = "1min",
     n: int = 80,
     market: str = "OPEN",
+    mirror_iq: bool = False,
 ):
     market = (market or "OPEN").upper()
 
@@ -4130,6 +4142,61 @@ async def candles_endpoint(
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
 
     n = max(20, min(int(n), 150))
+
+    # Espelho do gráfico da IQ Option: sem sessão IQ, o gráfico fica OFFLINE.
+    if mirror_iq:
+        iq_state = _iq_session_state(request, required=False)
+        if not iq_state or not _iq_connected(iq_state):
+            return {
+                "ok": False,
+                "symbol": symbol,
+                "interval": interval,
+                "market": market,
+                "candles": [],
+                "status": "GRÁFICO OFFLINE",
+                "message": "Conecte sua conta da IQ Option para espelhar o gráfico.",
+                "mirror_iq": True,
+            }
+        try:
+            # OTC usa o fluxo OTC existente. Mercado aberto busca o ativo normal da IQ.
+            if market == "IQ_OTC":
+                values = await candles(symbol, interval, n, "IQ_OTC", iq_state, request=request)
+            else:
+                lock = iq_state.get("lock") or asyncio.Lock()
+                iq_state["lock"] = lock
+                async with lock:
+                    values = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            iq_candles_blocking,
+                            iq_state,
+                            symbol,
+                            interval,
+                            max(80, int(n)),
+                            True,
+                        ),
+                        timeout=IQ_CANDLE_TIMEOUT + 5,
+                    )
+            return {
+                "ok": True,
+                "symbol": symbol,
+                "interval": interval,
+                "market": market,
+                "candles": values[-n:],
+                "status": "IQ OPTION ESPELHADA",
+                "mirror_iq": True,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "symbol": symbol,
+                "interval": interval,
+                "market": market,
+                "candles": [],
+                "status": "GRÁFICO IQ INDISPONÍVEL",
+                "message": str(exc)[:220],
+                "mirror_iq": True,
+            }
+
     state = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
 
     try:
@@ -4856,12 +4923,37 @@ async def performance(request: Request, interval="1min", market="OPEN"):
     pending, done = _accounting_buckets(request, market)
     done = done or {}
 
-    wins = sum(1 for x in done.values() if x.get("result") == "WIN")
-    losses = sum(1 for x in done.values() if x.get("result") == "LOSS")
-    draws = sum(1 for x in done.values() if x.get("result") == "DRAW")
+    # Une resultados da contabilidade automática e do endpoint /result.
+    # A chave simplificada impede dupla contagem da mesma entrada.
+    merged_direct = {}
+    for x in done.values():
+        if x.get("result") in ("WIN", "LOSS", "DRAW"):
+            k = "|".join([
+                market, str(x.get("symbol") or ""), str(x.get("interval") or ""),
+                str(x.get("direction") or ""), str(x.get("expiry_time") or "")
+            ])
+            merged_direct[k] = x
+
+    if market == "IQ_OTC":
+        state_direct = _iq_session_state(request, required=False)
+        direct_store = state_direct.setdefault("results", {}) if state_direct else {}
+    else:
+        direct_store = results.setdefault(market, {})
+
+    for x in direct_store.values():
+        if x.get("result") in ("WIN", "LOSS", "DRAW"):
+            k = "|".join([
+                market, str(x.get("symbol") or ""), str(x.get("interval") or ""),
+                str(x.get("direction") or ""), str(x.get("expiry_time") or "")
+            ])
+            merged_direct[k] = x
+
+    wins = sum(1 for x in merged_direct.values() if x.get("result") == "WIN")
+    losses = sum(1 for x in merged_direct.values() if x.get("result") == "LOSS")
+    draws = sum(1 for x in merged_direct.values() if x.get("result") == "DRAW")
     total = wins + losses
 
-    # Gale continua vindo do fluxo antigo apenas como informação separada.
+    # Gale fica apenas como informação separada.
     if market == "IQ_OTC":
         state = _iq_session_state(request, required=False)
         gale_store = state.setdefault("results", {}) if state else {}
@@ -4982,37 +5074,42 @@ async def result(
 
     base_result = candle_result(base)
 
-    if base_result == "WIN":
-        out = {
-            "status": "FINALIZADA",
-            "stage": "ENTRADA",
-            "result": "WIN",
-            "entry_result": "WIN",
-            "candle_time": base["datetime"],
-            "entry_time": iso(entry_dt),
-            "expiry_time": expiry_time,
-            "simulated": True,
-            "direct_only": bool(direct_only),
-        }
-        store[key] = out
-        return out
+    # PLACAR PRINCIPAL: sempre fecha na vela original da entrada.
+    # G1/G2 não seguram mais WIN/LOSS nem a assertividade.
+    if base_result == "EMPATE":
+        final_direct = "DRAW"
+    else:
+        final_direct = "WIN" if base_result == "WIN" else "LOSS"
 
-    # Sinais que nasceram da bolinha de 20s são avaliados somente na próxima vela:
-    # venceu = WIN; não venceu = LOSS. Não aplica Gale automaticamente.
-    if direct_only:
-        out = {
-            "status": "FINALIZADA",
-            "stage": "ENTRADA",
-            "result": "LOSS",
-            "entry_result": "LOSS",
-            "candle_time": base["datetime"],
+    out = {
+        "status": "FINALIZADA",
+        "stage": "ENTRADA",
+        "result": final_direct,
+        "candle_time": base["datetime"],
+        "entry_time": iso(entry_dt),
+        "expiry_time": expiry_time,
+        "simulated": True,
+        "direct_only": True,
+    }
+    store[key] = out
+
+    # Mantém a contabilidade do servidor sincronizada com o /result.
+    pending_acc, done_acc = _accounting_buckets(request, market)
+    if done_acc is not None:
+        acc_item = {
+            "market": market,
+            "symbol": symbol,
+            "interval": interval,
+            "direction": direction,
             "entry_time": iso(entry_dt),
             "expiry_time": expiry_time,
-            "simulated": True,
-            "direct_only": True,
         }
-        store[key] = out
-        return out
+        acc_key = _accounting_key(acc_item)
+        done_acc[acc_key] = {**acc_item, "result": final_direct, "candle_time": base.get("datetime")}
+        if pending_acc is not None:
+            pending_acc.pop(acc_key, None)
+
+    return out
 
     # Fluxo normal do painel continua acompanhando G1/G2.
     if now() < g1_expiry_dt:
@@ -5583,8 +5680,8 @@ let pendingTradeQueue=[];
 let lastCountdownSignalKey='';
 let lastChartSignalVoice='';
 
-const RESULT_STATS_KEY='mega_result_stats_v33280';
-const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33280';
+const RESULT_STATS_KEY='mega_result_stats_v33290';
+const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33290';
 const RESULT_MARKETS=['OPEN','IQ_OTC','OLYMP_OTC'];
 
 function emptyResultBucket(){
@@ -5809,7 +5906,8 @@ function rememberPendingTrade(sig){
 
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
-    direct_only:!!sig.direct_only,
+    // Placar principal sempre fecha na vela original da entrada.
+    direct_only:true,
     market:market.value,
     symbol:sig.symbol,
     interval:sig.interval,
@@ -6355,15 +6453,25 @@ function mergeChartCandles(oldData,newData){
 }
 
 async function loadChart(){
-  // Atualizar/redesenhar o gráfico NÃO altera o estado do robô nem da voz.
+  // O gráfico da IQ Option é um espelho da sessão: sem login, fica OFFLINE.
   if(chartBusy) return;
+
+  const iqSelected=(broker && broker.value==='IQ_OPTION');
+  if(iqSelected && !brokerConnected.IQ_OPTION){
+    chartData=[];
+    chartPreSignal=null;
+    if(chartInfo) chartInfo.textContent='⚪ GRÁFICO OFFLINE • CONECTE NA IQ OPTION';
+    drawChart([]);
+    return;
+  }
 
   chartBusy=true;
 
   try{
+    const mirrorParam=iqSelected?'&mirror_iq=true':'';
     const [d,pre]=await Promise.all([
       get(
-        `/candles?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&n=80`
+        `/candles?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&n=80${mirrorParam}`
       ),
       (robotEnabled ? Promise.resolve(null) : get(
         `/chart-pre-signal?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}`
@@ -6392,9 +6500,17 @@ async function loadChart(){
       chartPreSignal=null;
     }
 
+    if(iqSelected && d.ok===false && !(d.candles||[]).length){
+      chartData=[];
+      chartPreSignal=null;
+      chartInfo.textContent='⚪ '+(d.status||'GRÁFICO OFFLINE')+' • '+(d.message||'Conecte na IQ Option');
+      drawChart([]);
+      return;
+    }
+
     chartInfo.textContent=
-      (d.ok===false?'⚠️ ':'')+
-      d.symbol+' • '+(market.value==='OPEN'?'Mercado Aberto':brokerName()+' OTC')+
+      (d.ok===false?'⚠️ ':'🟢 ')+
+      d.symbol+' • '+(iqSelected?'IQ OPTION ESPELHADA':(market.value==='OPEN'?'Mercado Aberto':brokerName()+' OTC'))+
       ' • '+d.interval+
       (d.ok===false?' • '+(d.status||'INDISPONÍVEL'):'');
 
@@ -6527,6 +6643,9 @@ iqConnectBtn.onclick=async()=>{
     iqAccountStatus.textContent='🟢 '+(d.message||'Conectada.');
     syncBroker(b);
     await updateMarketNote();
+    chartData=[];
+    chartPreSignal=null;
+    await loadChart();
     sig(true);
     rad();
   }catch(e){
@@ -6559,6 +6678,12 @@ iqLogoutBtn.onclick=async()=>{
   iqPassword.value='';
   syncBroker(b);
   iqAccountStatus.textContent='⚪ '+(b==='OLYMPTRADE'?'Olymptrade':'IQ Option')+' desconectada.';
+  if(b==='IQ_OPTION'){
+    chartData=[];
+    chartPreSignal=null;
+    if(chartInfo) chartInfo.textContent='⚪ GRÁFICO OFFLINE • CONECTE NA IQ OPTION';
+    drawChart([]);
+  }
   await updateMarketNote();
 };
 
@@ -6944,7 +7069,7 @@ async function resultCheck(){
     const t=pendingTrade;
 
     const x=await get(
-      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=${t.direct_only?'true':'false'}`
+      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=true`
     );
 
     // A entrada original é contabilizada imediatamente após o fechamento da vela,
