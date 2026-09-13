@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.22.0")
+app = FastAPI(title="MEGA IA", version="33.25.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -79,6 +79,7 @@ cache: Dict[str, Any] = {}
 # Mantém o mesmo sinal até a expiração e exige um novo setup antes de liberar outro
 # sinal na mesma direção.
 signal_release_state: Dict[str, Any] = {}
+ai_scan_state: Dict[str, Any] = {}
 oai_cache: Dict[str, Any] = {}
 results: Dict[str, Any] = {}
 radar_cache: Dict[str, Any] = {}
@@ -3257,46 +3258,91 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
 
 
 async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
-    """Modo ONLINE: a IA lê os mesmos candles do gráfico, inclusive a vela atual em formação.
-    A decisão final continua travada por ciclo para não repintar o sinal já liberado.
+    """Modo ONLINE otimizado.
+
+    O painel continua lendo o gráfico a cada ~5 s, mas a API da IA só é chamada
+    quando o candle mudou de forma relevante, nasceu um candle novo ou passou
+    um tempo máximo sem nova avaliação. Isso mantém resposta rápida sem fazer
+    uma chamada cara a cada polling.
     """
     if not OAI_KEY or not OAI_MODEL:
         return {
-            "available": False,
-            "direction": "NEUTRO",
-            "confidence": 0,
-            "confirmed": False,
-            "risk": "HIGH",
+            "available": False, "direction": "NEUTRO", "confidence": 0,
+            "confirmed": False, "risk": "HIGH",
             "reason": "OPENAI_API_KEY/OPENAI_MODEL não configurados.",
         }
 
     if not cs:
         return {
-            "available": False,
-            "direction": "NEUTRO",
-            "confidence": 0,
-            "confirmed": False,
-            "risk": "HIGH",
-            "reason": "Sem candles fechados suficientes.",
+            "available": False, "direction": "NEUTRO", "confidence": 0,
+            "confirmed": False, "risk": "HIGH",
+            "reason": "Sem candles suficientes.",
         }
 
     live = cs[-1]
-    # Reavalia a formação do gráfico em blocos de ~20 s, sem chamar a API a cada polling de 5 s.
-    scan_bucket = int(time.time() // 20)
-    key = f"AI_ONLY|{market}|{symbol}|{interval}|{live['datetime']}|{scan_bucket}"
-    if key in oai_cache and time.time() - oai_cache[key][0] < 20:
-        return oai_cache[key][1]
+    prev = cs[-2] if len(cs) > 1 else live
+    state_key = f"AI_SMART|{market}|{symbol}|{interval}"
+    st = ai_scan_state.setdefault(state_key, {})
+    now_ts = time.time()
+
+    def f(v, default=0.0):
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    o, h, l, c = (f(live.get(k)) for k in ("open", "high", "low", "close"))
+    rng = max(abs(h - l), 1e-12)
+    body = abs(c - o)
+    prev_rng = max(abs(f(prev.get("high")) - f(prev.get("low"))), 1e-12)
+    prev_close = f(prev.get("close"), c)
+    volume = f(live.get("volume"))
+
+    last_candle = st.get("candle_time")
+    last_close = f(st.get("close"), c)
+    last_volume = f(st.get("volume"), volume)
+    last_call = f(st.get("last_call"), 0.0)
+
+    new_candle = bool(last_candle and last_candle != live.get("datetime"))
+    price_move = abs(c - last_close)
+    # Mudança relevante é medida pela faixa recente, sem transformar isso em
+    # indicador de decisão. Serve apenas para decidir QUANDO pedir nova análise.
+    meaningful_price = price_move >= max(prev_rng * 0.08, rng * 0.06)
+    meaningful_body = body >= prev_rng * 0.35
+    meaningful_volume = volume > 0 and last_volume > 0 and abs(volume - last_volume) / max(last_volume, 1.0) >= 0.20
+
+    # Nunca chama a API em rajada: mínimo de 12 s. Mesmo sem grande mudança,
+    # força uma revisão em até 30 s para não deixar o gráfico sem reavaliação.
+    min_gap = 12.0
+    heartbeat = 30.0
+    due = (now_ts - last_call) >= heartbeat
+    changed = new_candle or meaningful_price or meaningful_body or meaningful_volume
+    should_call = last_call <= 0 or ((now_ts - last_call) >= min_gap and (changed or due))
+
+    st.update({
+        "candle_time": live.get("datetime"),
+        "close": c,
+        "volume": volume,
+        "last_scan": now_ts,
+    })
+
+    if not should_call and st.get("last_result"):
+        cached = dict(st["last_result"])
+        cached["smart_scan"] = True
+        cached["api_called"] = False
+        cached["next_review_seconds"] = max(0, int(min(heartbeat, max(min_gap, heartbeat - (now_ts - last_call)))))
+        return cached
 
     data = [
-        {"time": c["datetime"], "o": c["open"], "h": c["high"], "l": c["low"], "c": c["close"], "v": c.get("volume", 0)}
-        for c in cs[-60:]
+        {"time": x["datetime"], "o": x["open"], "h": x["high"], "l": x["low"], "c": x["close"], "v": x.get("volume", 0)}
+        for x in cs[-60:]
     ]
 
     prompt = f"""Você é a inteligência artificial autônoma da MEGA IA.
 Ativo: {symbol}. Timeframe: {interval}. Mercado: {market}.
 Este é o MODO IA PURA: não receba nem use sinais de RSI, MACD, Bollinger, médias, score técnico ou estratégias internas do aplicativo.
-Analise SOMENTE os candles OHLCV fornecidos, que são os mesmos dados usados para desenhar o gráfico do painel. O último candle pode estar EM FORMAÇÃO; use-o apenas como contexto atual e não trate seu fechamento como definitivo. Avalie contexto, sequência, força, rejeição, estrutura, momentum visível no preço e volume disponível.
-Não invente dados futuros e seja conservador: se não houver vantagem clara, responda NEUTRO.
+Analise SOMENTE os candles OHLCV fornecidos, os mesmos dados usados no gráfico do painel. O último candle pode estar EM FORMAÇÃO. Avalie contexto, sequência, força, rejeição, estrutura, momentum visível no preço e volume disponível.
+Não invente dados futuros. Se não houver vantagem clara, responda NEUTRO.
 Só confirme CALL ou PUT quando confidence >= {OAI_MIN:.0f} e risk não for HIGH.
 Retorne SOMENTE JSON válido:
 {{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
@@ -3329,10 +3375,8 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         confidence = clamp(float(parsed.get("confidence", 0) or 0), 0, 100)
         risk = str(parsed.get("risk", "HIGH")).upper()
         confirmed = bool(parsed.get("confirmed", False))
-
         if direction in ("CALL", "PUT") and (not confirmed or confidence < OAI_MIN or risk == "HIGH"):
-            direction = "NEUTRO"
-            confirmed = False
+            direction, confirmed = "NEUTRO", False
 
         out = {
             "available": True,
@@ -3341,18 +3385,23 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             "confirmed": confirmed and direction in ("CALL", "PUT"),
             "risk": risk if risk in ("LOW", "MEDIUM", "HIGH") else "HIGH",
             "reason": str(parsed.get("reason", ""))[:300],
+            "smart_scan": True,
+            "api_called": True,
         }
-        oai_cache[key] = (time.time(), out)
+        st["last_call"] = now_ts
+        st["last_result"] = dict(out)
         return out
     except Exception as exc:
-        return {
-            "available": False,
-            "direction": "NEUTRO",
-            "confidence": 0,
-            "confirmed": False,
-            "risk": "HIGH",
-            "reason": str(exc)[:200],
+        # Em erro de API, conserva a última leitura apenas como contexto, mas
+        # nunca reutiliza um CALL/PUT antigo como novo sinal.
+        out = {
+            "available": False, "direction": "NEUTRO", "confidence": 0,
+            "confirmed": False, "risk": "HIGH", "reason": str(exc)[:200],
+            "smart_scan": True, "api_called": True,
         }
+        st["last_call"] = now_ts
+        st["last_result"] = dict(out)
+        return out
 
 
 def next_boundary(interval):
@@ -3410,7 +3459,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         if active_expiry and now() < active_expiry:
             return active_signal
 
-    if key in cache and time.time() - cache[key][0] < 4:
+    if key in cache and time.time() - cache[key][0] < 1:
         return cache[key][1]
 
     try:
@@ -3496,7 +3545,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "entry_time": None,
             "announce_time": None,
             "expiry_time": None,
-            "status": "IA PURA • ANALISANDO O GRÁFICO",
+            "status": "IA PURA • VARREDURA 5s • ANÁLISE INTELIGENTE",
             "ai_confirmed": bool(ai.get("confirmed", False)),
             "risk": ai.get("risk", "HIGH"),
             "strategy": "IA PURA",
@@ -4924,8 +4973,9 @@ HTML_PAGE = r"""
 <style>
 body{margin:0;background:radial-gradient(circle at 50% 0,#07182b 0,#030812 42%,#02050b 100%);color:#eef5ff;font-family:Arial,sans-serif}
 .wrap{max-width:1150px;margin:auto;padding:18px}
-.brand{font-size:42px;font-weight:900;letter-spacing:1px;margin:8px 0 2px}
+.brand{display:flex;align-items:center;gap:10px;font-size:42px;font-weight:900;letter-spacing:1px;margin:8px 0 2px}
 .brand span{color:#14c8ff}
+.brand-robot{width:54px;height:54px;object-fit:contain;border-radius:14px;filter:drop-shadow(0 0 8px #14c8ff55)}
 .subtitle{font-size:13px;color:#91a9c8;letter-spacing:.7px}
 .card{background:linear-gradient(180deg,#0c1a2c,#091422);border:1px solid #164f80;border-radius:20px;padding:16px;box-shadow:0 12px 30px #0008,0 0 18px #009cff12;margin-top:12px}
 .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
@@ -4977,6 +5027,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   .radar{grid-template-columns:1fr 1fr}
   .hero img{height:250px}
   .brand{font-size:36px}
+  .brand-robot{width:48px;height:48px}
   #chartTab.active{padding-top:8vh}
   #chartTab>.card{width:calc(100vw - 20px)!important;max-width:none!important;padding:10px!important}
   .chartbox{height:58vh!important;min-height:440px!important;max-height:620px!important}
@@ -5001,7 +5052,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
 <body>
 <div class="wrap">
-  <div class="brand">🤖 MEGA <span>IA</span></div>
+  <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
