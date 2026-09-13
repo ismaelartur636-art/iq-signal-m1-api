@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
-app = FastAPI(title="MEGA IA", version="32.9.5")
+app = FastAPI(title="MEGA IA", version="32.9.6")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -684,6 +684,9 @@ def _iq_reason_requires_2fa(reason):
     ))
 
 
+iq_login_diag = {"stage": "idle", "detail": "", "updated_at": 0.0}
+
+
 def _set_iq_login_diag(stage: str, detail: str = ""):
     iq_login_diag["stage"] = stage
     iq_login_diag["detail"] = str(detail)[:240]
@@ -1256,7 +1259,7 @@ async def manifest():
 @app.get("/iq-diagnostic")
 async def iq_diagnostic():
     info = {
-        "app_version": "32.9.5",
+        "app_version": "32.9.6",
         "iq_async_library_loaded": AsyncIQOption is not None,
         "import_error": IQ_IMPORT_ERROR if AsyncIQOption is None else "",
         "active_sessions": len(iq_sessions),
@@ -1276,7 +1279,7 @@ async def iq_diagnostic():
 async def iq_network_test():
     """Testa endpoints alternativos da IQ Option sem usar e-mail nem senha."""
     result = {
-        "app_version": "32.9.5",
+        "app_version": "32.9.6",
         "http": {},
         "websocket": {},
     }
@@ -1331,7 +1334,7 @@ async def iq_network_test():
                     async with session.get(
                         url,
                         allow_redirects=False,
-                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.5"},
+                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.6"},
                     ) as resp:
                         result["http"][url] = {
                             "ok": True,
@@ -1353,7 +1356,7 @@ async def iq_network_test():
                         url,
                         timeout=10,
                         heartbeat=20,
-                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.5"},
+                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.6"},
                     )
                     result["websocket"][url] = {
                         "ok": True,
@@ -1386,7 +1389,7 @@ async def iq_port_test():
         "iqoption.com",
         "ws.iqoption.com",
     ]
-    result = {"app_version": "32.9.5", "port": 443, "hosts": {}}
+    result = {"app_version": "32.9.6", "port": 443, "hosts": {}}
 
     async def tcp_probe(host, family):
         family_name = "ipv4" if family == socket.AF_INET else "ipv6"
@@ -1478,7 +1481,7 @@ async def iq_login_diagnostic():
     if iq_login_diag.get("updated_at"):
         age = round(max(0.0, time.time() - float(iq_login_diag["updated_at"])), 1)
     return {
-        "app_version": "32.9.5",
+        "app_version": "32.9.6",
         "stage": iq_login_diag.get("stage", "idle"),
         "detail": iq_login_diag.get("detail", ""),
         "age_seconds": age,
@@ -2270,7 +2273,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 (function(){
 'use strict';
 
-var VERSION='32.9.5';
+var VERSION='32.9.6';
 var symbols=['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD'];
 var E={};
 var currentSignal=null;
