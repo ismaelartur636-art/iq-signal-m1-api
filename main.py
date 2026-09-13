@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.13.2")
+app = FastAPI(title="MEGA IA", version="33.14.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -84,6 +84,8 @@ results: Dict[str, Any] = {}
 radar_cache: Dict[str, Any] = {}
 pre_signal_cache: Dict[str, Any] = {}
 chart_pre_signal_lock: Dict[str, Dict[str, Any]] = {}
+chart_pre_signal_last_at: Dict[str, float] = {}
+CHART_SIGNAL_COOLDOWN_SECONDS = 180
 PRE_SIGNAL_TTL = 75
 PRE_SIGNAL_BATCH = 4
 
@@ -2944,7 +2946,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.13.2",
+        "version": "33.14.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -3633,11 +3635,12 @@ async def chart_pre_signal(
     market: str = "OPEN",
 ):
     """
-    Pré-sinal NÃO REPINTA:
+    SINAL DE ENTRADA NA BOLINHA, SEM REPINTAR:
     - só pode nascer nos últimos 20 segundos da vela atual;
+    - a própria bolinha é o sinal visual de CALL/PUT;
     - no primeiro CALL/PUT válido, direção/confiança/estratégia ficam TRAVADAS;
-    - a marcação permanece até a abertura da próxima vela;
-    - depois da virada da vela a trava é liberada para um novo ciclo.
+    - depois de um sinal, outro só pode ser liberado após 3 minutos;
+    - a operação indicada continua sendo avaliada na vela seguinte.
     """
     market = (market or "OPEN").upper()
 
@@ -3648,6 +3651,13 @@ async def chart_pre_signal(
     seconds_to_entry = int(max(0, (entry_dt - now()).total_seconds()))
     entry_iso = iso(entry_dt)
     lock_key = f"{market}|{symbol}|{interval}"
+
+    # Intervalo mínimo entre sinais da bolinha: 3 minutos.
+    last_signal_at = float(chart_pre_signal_last_at.get(lock_key, 0.0) or 0.0)
+    cooldown_remaining = max(
+        0,
+        int(CHART_SIGNAL_COOLDOWN_SECONDS - (time.time() - last_signal_at))
+    )
 
     # Limpa trava antiga somente quando a vela de entrada já começou.
     locked = chart_pre_signal_lock.get(lock_key)
@@ -3668,7 +3678,20 @@ async def chart_pre_signal(
             max(0, (parse_dt(out["entry_time"]) - now()).total_seconds())
         )
         out["locked"] = True
+        out["cooldown_remaining"] = cooldown_remaining
         return out
+
+    if cooldown_remaining > 0:
+        return {
+            "ok": True,
+            "active": False,
+            "locked": False,
+            "cooldown": True,
+            "cooldown_remaining": cooldown_remaining,
+            "seconds_to_entry": seconds_to_entry,
+            "entry_time": entry_iso,
+            "status": "AGUARDANDO 3 MINUTOS ENTRE SINAIS",
+        }
 
     # Antes dos 20 segundos não existe marcação.
     if seconds_to_entry > 20:
@@ -3735,11 +3758,14 @@ async def chart_pre_signal(
                 if isinstance(current_candle, dict)
                 else None
             ),
-            "status": f"{preview['direction']} • ENTRADA NA PRÓXIMA VELA",
+            "status": f"ENTRADA {preview['direction']} • SINAL NA BOLINHA",
             "signal_market": "MERCADO ABERTO" if market == "OPEN" else "OTC",
+            "cooldown_seconds": CHART_SIGNAL_COOLDOWN_SECONDS,
+            "cooldown_remaining": CHART_SIGNAL_COOLDOWN_SECONDS,
         }
 
         chart_pre_signal_lock[lock_key] = dict(payload)
+        chart_pre_signal_last_at[lock_key] = time.time()
         return payload
 
     except Exception as exc:
@@ -4603,7 +4629,7 @@ function rememberChartSignal(pre){
 
     if(voiceEnabled){
       const lado=pre.direction==='CALL'?'CALL':'PUT';
-      speak('Sinal de '+lado+' identificado no gráfico. Entrada na próxima vela.');
+      speak('Entrada '+lado+'. Sinal confirmado na bolinha.');
     }
   }
 
@@ -5033,10 +5059,10 @@ function drawChart(a){
     chartCtx.restore();
   }
 
-  // BOLINHA DE PRÉ-ENTRADA — MERCADO ABERTO E OTC:
+  // BOLINHA = SINAL DE ENTRADA — MERCADO ABERTO E OTC:
   // aparece somente nos últimos 20s da vela atual;
   // OPEN usa suas estratégias próprias e OTC usa o motor OTC;
-  // a operação indicada é sempre para a PRÓXIMA vela.
+  // depois de uma bolinha, outra só pode ser liberada após 3 minutos.
   if(chartPreSignal && chartPreSignal.active &&
      (chartPreSignal.direction==='CALL' || chartPreSignal.direction==='PUT')){
 
