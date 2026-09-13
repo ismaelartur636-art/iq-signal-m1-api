@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
-app = FastAPI(title="MEGA IA", version="32.9.9")
+app = FastAPI(title="MEGA IA", version="32.10.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -83,6 +83,10 @@ iq_sessions: Dict[str, Dict[str, Any]] = {}
 class IQLoginBody(BaseModel):
     email: str
     password: str
+
+
+class IQSSIDBody(BaseModel):
+    ssid: str
 
 
 class IQ2FABody(BaseModel):
@@ -695,6 +699,53 @@ def _set_iq_login_diag(stage: str, detail: str = ""):
 
 
 
+async def _iq_connect_with_ssid(ssid: str):
+    """Conecta direto ao WebSocket usando uma sessão IQ Option já autenticada."""
+    if AsyncIQOption is None or AsyncWebSocketClient is None:
+        raise RuntimeError("Cliente assíncrono da IQ Option não carregado no servidor.")
+
+    ssid = (ssid or "").strip()
+    if len(ssid) < 16 or len(ssid) > 4096 or any(ch.isspace() for ch in ssid):
+        raise RuntimeError("SSID inválido.")
+
+    urls = []
+    configured = os.getenv("IQ_WSS_URL", "").strip()
+    if configured:
+        urls.append(configured)
+    for url in ("wss://iqoption.com/echo/websocket", "wss://ws.iqoption.com/echo/websocket"):
+        if url not in urls:
+            urls.append(url)
+
+    errors = []
+    for wss_url in urls:
+        client = None
+        ws = None
+        try:
+            _set_iq_login_diag("ssid_websocket_open", wss_url)
+            # O AsyncIQOption serve como fachada para candles/perfil; o login HTTP é pulado.
+            client = AsyncIQOption("", "", wss_url=wss_url)
+            ws = AsyncWebSocketClient(ssid, wss_url=wss_url)
+            await asyncio.wait_for(ws.connect(auth_timeout=15), timeout=18)
+            client._ws = ws
+            _set_iq_login_diag("websocket_authenticated", "SSID autenticado no WebSocket.")
+            return client
+        except Exception as exc:
+            errors.append(f"{wss_url}: {type(exc).__name__}: {str(exc)[:100]}")
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+
+    _set_iq_login_diag("ssid_connect_failed", " | ".join(errors)[-230:])
+    raise RuntimeError("Não foi possível autenticar o SSID no WebSocket da IQ Option.")
+
+
 async def _iq_connect_official(email: str, password: str):
     """Conexão limpa usando somente a rota oficial configurada pela biblioteca.
 
@@ -1159,7 +1210,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "32.9.9",
+        "version": "32.10.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -1243,7 +1294,7 @@ async def manifest():
 @app.get("/iq-diagnostic")
 async def iq_diagnostic():
     info = {
-        "app_version": "32.9.9",
+        "app_version": "32.10.0",
         "iq_async_library_loaded": AsyncIQOption is not None,
         "import_error": IQ_IMPORT_ERROR if AsyncIQOption is None else "",
         "active_sessions": len(iq_sessions),
@@ -1263,7 +1314,7 @@ async def iq_diagnostic():
 async def iq_network_test():
     """Testa endpoints alternativos da IQ Option sem usar e-mail nem senha."""
     result = {
-        "app_version": "32.9.9",
+        "app_version": "32.10.0",
         "http": {},
         "websocket": {},
     }
@@ -1373,7 +1424,7 @@ async def iq_port_test():
         "iqoption.com",
         "ws.iqoption.com",
     ]
-    result = {"app_version": "32.9.9", "port": 443, "hosts": {}}
+    result = {"app_version": "32.10.0", "port": 443, "hosts": {}}
 
     async def tcp_probe(host, family):
         family_name = "ipv4" if family == socket.AF_INET else "ipv6"
@@ -1465,10 +1516,53 @@ async def iq_login_diagnostic():
     if iq_login_diag.get("updated_at"):
         age = round(max(0.0, time.time() - float(iq_login_diag["updated_at"])), 1)
     return {
-        "app_version": "32.9.9",
+        "app_version": "32.10.0",
         "stage": iq_login_diag.get("stage", "idle"),
         "detail": iq_login_diag.get("detail", ""),
         "age_seconds": age,
+    }
+
+
+@app.post("/iq-login-ssid")
+async def iq_login_ssid(body: IQSSIDBody, response: Response):
+    ssid = (body.ssid or "").strip()
+    if not ssid:
+        raise HTTPException(400, "Informe o SSID da sessão IQ Option.")
+    if AsyncWebSocketClient is None:
+        raise HTTPException(503, f"WebSocket IQ Option não carregado. {IQ_IMPORT_ERROR}")
+
+    token = secrets.token_urlsafe(32)
+    state = {
+        "session_id": token, "email": "", "password": "", "client": None,
+        "lock": asyncio.Lock(), "last_error": "", "last_attempt": time.time(),
+        "last_seen": time.time(), "last_connected": 0.0, "failure_count": 0,
+        "reconnect_after": 0.0, "reconnecting": False, "requires_2fa": False,
+        "generation": 0, "candle_cache": {}, "results": {}, "auth_mode": "ssid",
+    }
+
+    try:
+        async with state["lock"]:
+            client = await _iq_connect_with_ssid(ssid)
+            _iq_mark_connected(state, client)
+        if not _iq_is_connected(state):
+            raise RuntimeError("A sessão SSID não permaneceu conectada.")
+    except Exception as exc:
+        _iq_dispose_client(state)
+        raise HTTPException(401, f"Não foi possível conectar com SSID: {type(exc).__name__}: {str(exc)[:260]}")
+
+    # O SSID não é guardado no estado após autenticar; fica apenas no objeto WS em memória.
+    iq_sessions[token] = state
+    response.set_cookie(
+        IQ_SESSION_COOKIE, token, httponly=True, secure=True, samesite="lax",
+        max_age=IQ_SESSION_TTL, expires=IQ_SESSION_TTL, path="/",
+    )
+    return {
+        "connected": True,
+        "requires_2fa": False,
+        "message": "IQ Option conectada por SSID.",
+        "email_masked": "sessão SSID",
+        "session_token": token,
+        "auth_mode": "ssid",
     }
 
 
@@ -2214,10 +2308,14 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         <label id="iq2faWrap" style="display:none">Código de verificação
           <input id="iq2faCode" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="Código enviado pela IQ Option">
         </label>
+        <label>SSID da sessão (alternativa ao e-mail/senha)
+          <input id="iqSsid" type="password" autocomplete="off" placeholder="Cole o SSID somente aqui no painel">
+        </label>
       </div>
 
       <div class="account-actions">
         <button type="button" id="iqConnectBtn">🟢 Conectar</button>
+        <button type="button" id="iqSsidBtn">🔐 Conectar com SSID</button>
         <button type="button" id="iq2faBtn" style="display:none">🔐 Validar código</button>
         <button type="button" id="iqLogoutBtn">🔴 Desconectar</button>
       </div>
@@ -2237,7 +2335,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 (function(){
 'use strict';
 
-var VERSION='32.9.9';
+var VERSION='32.10.0';
 var symbols=['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD'];
 var E={};
 var currentSignal=null;
@@ -2260,7 +2358,7 @@ function timeFmt(v){
 }
 
 function bindElements(){
-  var names=['market','symbol','interval','voiceBtn','otcNote','heroBox','entryArrow','entryArrowIcon','entryArrowLabel','analysisText','mainTab','chartTab','accountTab','tabMain','tabChart','tabAccount','iqEmail','iqPassword','iq2faWrap','iq2faCode','iqConnectBtn','iq2faBtn','iqLogoutBtn','iqAccountStatus','chartInfo','direction','confidence','entry','countdown','status','risk','wins','losses','accuracy','result','radar','clock','expiryCountdown','priceChart'];
+  var names=['market','symbol','interval','voiceBtn','otcNote','heroBox','entryArrow','entryArrowIcon','entryArrowLabel','analysisText','mainTab','chartTab','accountTab','tabMain','tabChart','tabAccount','iqEmail','iqPassword','iq2faWrap','iq2faCode','iqSsid','iqConnectBtn','iqSsidBtn','iq2faBtn','iqLogoutBtn','iqAccountStatus','chartInfo','direction','confidence','entry','countdown','status','risk','wins','losses','accuracy','result','radar','clock','expiryCountdown','priceChart'];
   for(var i=0;i<names.length;i++) E[names[i]]=id(names[i]);
 }
 
@@ -2552,6 +2650,27 @@ function connectIQ(){
     if(E.iqConnectBtn)E.iqConnectBtn.disabled=false;
   });
 }
+function connectIQSSID(){
+  var ssid=E.iqSsid?E.iqSsid.value.trim():'';
+  if(!ssid){text(E.iqAccountStatus,'🔴 Cole o SSID no campo acima.');return;}
+  text(E.iqAccountStatus,'🟡 Conectando por SSID...');
+  if(E.iqSsidBtn)E.iqSsidBtn.disabled=true;
+
+  post('/iq-login-ssid',{ssid:ssid}).then(function(x){
+    if(x.session_token)safeStoreSet('mega_iq_session_token',x.session_token);
+    if(E.iqSsid)E.iqSsid.value='';
+    if(E.iqPassword)E.iqPassword.value='';
+    show2FA(false);
+    text(E.iqAccountStatus,'🟢 Conectado por SSID');
+    updateMarketNote();
+    loadSignal(true);
+  }).catch(function(e){
+    text(E.iqAccountStatus,'🔴 '+e.message);
+  }).then(function(){
+    if(E.iqSsidBtn)E.iqSsidBtn.disabled=false;
+  });
+}
+
 function submitIQ2FA(){
   var code=E.iq2faCode?E.iq2faCode.value.trim():'';
   if(!code){text(E.iqAccountStatus,'🔴 Digite o código enviado pela IQ Option.');return;}
@@ -2576,6 +2695,7 @@ function logoutIQ(){
     safeStoreDel('mega_iq_session_token');
     show2FA(false);
     if(E.iq2faCode)E.iq2faCode.value='';
+    if(E.iqSsid)E.iqSsid.value='';
     text(E.iqAccountStatus,'● Desconectado');
     updateMarketNote();
   });
@@ -2605,7 +2725,7 @@ function bindEvents(){
   if(E.market)E.market.onchange=handleMarketChange;if(E.symbol)E.symbol.onchange=handleSymbolChange;if(E.interval)E.interval.onchange=handleIntervalChange;
   if(E.voiceBtn)E.voiceBtn.onclick=function(){voice();return false;};
   if(E.tabMain)E.tabMain.onclick=function(){showTab('main');return false;};if(E.tabChart)E.tabChart.onclick=function(){showTab('chart');return false;};if(E.tabAccount)E.tabAccount.onclick=function(){showTab('account');return false;};
-  if(E.iqConnectBtn)E.iqConnectBtn.onclick=connectIQ;if(E.iq2faBtn)E.iq2faBtn.onclick=submitIQ2FA;if(E.iqLogoutBtn)E.iqLogoutBtn.onclick=logoutIQ;
+  if(E.iqConnectBtn)E.iqConnectBtn.onclick=connectIQ;if(E.iqSsidBtn)E.iqSsidBtn.onclick=connectIQSSID;if(E.iq2faBtn)E.iq2faBtn.onclick=submitIQ2FA;if(E.iqLogoutBtn)E.iqLogoutBtn.onclick=logoutIQ;
 }
 function boot(){
   bindElements();
@@ -2634,7 +2754,7 @@ HTML_PAGE = HTML_PAGE.replace("__MEGA_IMAGE__", "/mega-ia.png")
 @app.get("/version")
 async def version_info():
     return JSONResponse(
-        {"app": "MEGA IA", "version": "32.9.9", "js": "ready", "license": "disabled"},
+        {"app": "MEGA IA", "version": "32.10.0", "js": "ready", "license": "disabled"},
         headers={"Cache-Control": "no-store"},
     )
 
@@ -2647,7 +2767,7 @@ async def home():
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma": "no-cache",
             "Expires": "0",
-            "X-Mega-Panel-Version": "32.9.9",
+            "X-Mega-Panel-Version": "32.10.0",
         },
     )
 
