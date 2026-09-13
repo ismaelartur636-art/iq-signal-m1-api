@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.29.0")
+app = FastAPI(title="MEGA IA", version="33.31.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -4264,32 +4264,36 @@ async def candles_endpoint(
 
 @app.get("/signal-ai")
 async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False):
-    market = (market or "OPEN").upper()
+    requested_market = (market or "OPEN").upper()
 
-    if symbol not in SYMBOLS or interval not in INTERVALS or market not in VALID_MARKETS:
+    if symbol not in SYMBOLS or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
 
-    state = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
-
-    if market == "IQ_OTC" and not state:
-        return neutral_signal(
-            symbol,
-            interval,
-            market,
-            "LOGIN IQ OPTION NECESSÁRIO",
-            "Faça login na IQ Option pela aba Corretora para receber os candles OTC.",
-            source_state="LOGIN_REQUIRED",
-        )
+    state = _iq_session_state(request, required=False) if requested_market == "IQ_OTC" else None
+    fallback_twelve = requested_market == "IQ_OTC" and not state
+    effective_market = "OPEN" if fallback_twelve else requested_market
 
     try:
-        data = await signal(symbol, interval, market, state, request=request, ai_only=ai_only)
+        data = await signal(
+            symbol,
+            interval,
+            effective_market,
+            state if effective_market == "IQ_OTC" else None,
+            request=request,
+            ai_only=ai_only,
+        )
+        if fallback_twelve and isinstance(data, dict):
+            data["requested_market"] = requested_market
+            data["feed_source"] = "TWELVE_DATA"
+            data["feed_fallback"] = True
+            data["feed_message"] = "IQ Option desconectada: sinais usando Twelve Data (mercado aberto)."
         _remember_accounting_signal(request, data)
         return data
     except Exception as exc:
         return neutral_signal(
             symbol,
             interval,
-            market,
+            effective_market,
             "FONTE TEMPORARIAMENTE INDISPONÍVEL",
             str(exc),
             source_state="DEGRADED",
@@ -4357,18 +4361,15 @@ async def pre_signals(
     if interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Intervalo ou mercado inválido.")
 
+    requested_market = market
     iq_state = (
         _iq_session_state(request, required=False)
-        if market == "IQ_OTC"
+        if requested_market == "IQ_OTC"
         else None
     )
-
-    if market == "IQ_OTC" and not iq_state:
-        return {
-            "ok": False,
-            "message": "Faça login na IQ Option para monitorar pré-sinais OTC.",
-            "items": [],
-        }
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state
+    if fallback_twelve:
+        market = "OPEN"
 
     if market == "OLYMP_OTC":
         olymp_state = _olymp_session_state(request)
@@ -4495,6 +4496,9 @@ async def pre_signals(
         ),
         "items": items[:limit],
         "seconds_to_entry": seconds_to_entry,
+        "feed_source": "TWELVE_DATA" if fallback_twelve else market,
+        "feed_fallback": fallback_twelve,
+        "requested_market": requested_market,
     }
 
 
@@ -4519,6 +4523,12 @@ async def chart_pre_signal(
 
     if symbol not in SYMBOLS or interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
+
+    requested_market = market
+    iq_state = _iq_session_state(request, required=False) if requested_market == "IQ_OTC" else None
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state
+    if fallback_twelve:
+        market = "OPEN"
 
     entry_dt = next_boundary(interval)
     seconds_to_entry = int(max(0, (entry_dt - now()).total_seconds()))
@@ -4577,22 +4587,6 @@ async def chart_pre_signal(
             "locked": False,
             "seconds_to_entry": seconds_to_entry,
             "entry_time": entry_iso,
-        }
-
-    iq_state = (
-        _iq_session_state(request, required=False)
-        if market == "IQ_OTC"
-        else None
-    )
-
-    if market == "IQ_OTC" and not iq_state:
-        return {
-            "ok": False,
-            "active": False,
-            "locked": False,
-            "seconds_to_entry": seconds_to_entry,
-            "entry_time": entry_iso,
-            "message": "IQ Option não conectada.",
         }
 
     try:
@@ -4684,6 +4678,9 @@ async def chart_pre_signal(
             "cooldown_remaining": CHART_SIGNAL_COOLDOWN_SECONDS,
             "confirmation_count": CHART_SIGNAL_CONFIRM_READS,
             "confirmation_required": CHART_SIGNAL_CONFIRM_READS,
+            "feed_source": "TWELVE_DATA" if fallback_twelve else market,
+            "feed_fallback": fallback_twelve,
+            "requested_market": requested_market,
         }
 
         chart_pre_signal_lock[lock_key] = dict(payload)
@@ -4710,18 +4707,11 @@ async def radar(request: Request, interval="1min", market="OPEN"):
     if interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Intervalo ou mercado inválido.")
 
-    iq_state = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
-
-    if market == "IQ_OTC" and not iq_state:
-        return [
-            {
-                "symbol": s + " • IQ OTC",
-                "direction": "NEUTRO",
-                "confidence": 0,
-                "status": "LOGIN IQ NECESSÁRIO",
-            }
-            for s in SYMBOLS
-        ]
+    requested_market = market
+    iq_state = _iq_session_state(request, required=False) if requested_market == "IQ_OTC" else None
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state
+    if fallback_twelve:
+        market = "OPEN"
 
     if market == "OLYMP_OTC" and not _olymp_session_state(request) and (not OLYMPTRADE_TOKEN or OlympTradeClient is None):
         return [
@@ -4767,7 +4757,15 @@ async def radar(request: Request, interval="1min", market="OPEN"):
                 "symbol": sym + suffix,
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
-                "status": "OPORTUNIDADE TÉCNICA" if direction != "NEUTRO" else "MONITORANDO",
+                "status": (
+                    "TWELVE DATA • OPORTUNIDADE TÉCNICA" if fallback_twelve and direction != "NEUTRO"
+                    else "TWELVE DATA • MONITORANDO" if fallback_twelve
+                    else "OPORTUNIDADE TÉCNICA" if direction != "NEUTRO"
+                    else "MONITORANDO"
+                ),
+                "feed_source": "TWELVE_DATA" if fallback_twelve else market,
+                "feed_fallback": fallback_twelve,
+                "requested_market": requested_market,
             }
         else:
             item = {
@@ -5274,6 +5272,14 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .robot-mode-title{font-weight:900;font-size:13px;letter-spacing:.4px}
 .robot-mode-desc{font-size:11px;color:#9fb2ca;margin-top:3px;max-width:245px}
 #robotPowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+.app-power-card{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:14px 0 6px;padding:14px 16px;border:1px solid #227db5;border-radius:18px;background:linear-gradient(180deg,#0b1c30,#081523);box-shadow:0 0 22px #00aaff22}
+.app-power-copy{min-width:0}
+.app-power-title{font-size:14px;font-weight:900;letter-spacing:.5px}
+.app-power-desc{font-size:12px;color:#9fb2ca;margin-top:4px;line-height:1.35}
+#appPowerBtn{min-width:230px;min-height:58px;padding:16px 22px;border-radius:16px;font-size:17px;font-weight:1000;letter-spacing:.5px;box-shadow:0 8px 20px #0007;transition:transform .12s ease,box-shadow .12s ease,background .18s ease}
+#appPowerBtn:active{transform:scale(.97)}
+#appPowerBtn.app-on{background:linear-gradient(180deg,#159452,#0b6e3a);border:2px solid #35e889;color:#fff;box-shadow:0 0 18px #1ad87355,0 8px 20px #0007}
+#appPowerBtn.app-off{background:linear-gradient(180deg,#a62d36,#741b23);border:2px solid #ff6673;color:#fff;box-shadow:0 0 18px #ff405055,0 8px 20px #0007}
 
 @media(max-width:720px){
   .wrap{padding:10px}
@@ -5283,6 +5289,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   .hero img{height:250px}
   .brand{font-size:36px}
   .brand-robot{width:48px;height:48px}
+  .app-power-card{align-items:stretch;flex-direction:column}
+  #appPowerBtn{width:100%;min-width:0;min-height:62px;font-size:18px}
   #chartTab.active{padding-top:8vh}
   #chartTab>.card{width:calc(100vw - 20px)!important;max-width:none!important;padding:10px!important}
   .chartbox{height:58vh!important;min-height:440px!important;max-height:620px!important}
@@ -5310,6 +5318,14 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
+
+  <div class="app-power-card" id="appPowerCard">
+    <div class="app-power-copy">
+      <div class="app-power-title">⚡ CONTROLE PRINCIPAL</div>
+      <div class="app-power-desc" id="appPowerDesc">App ligado • sinais e análises ativos.</div>
+    </div>
+    <button id="appPowerBtn" class="app-on" type="button">🟢 DESLIGAR APP</button>
+  </div>
 
   <div class="controls">
     <select id="broker">
@@ -5588,6 +5604,12 @@ try{
   setTimeout(()=>syncBroker(savedBroker),0);
 }catch(_){}
 const interval=document.getElementById('interval');
+const appPowerBtn=document.getElementById('appPowerBtn');
+const appPowerDesc=document.getElementById('appPowerDesc');
+let appEnabled=true;
+try{
+  appEnabled=localStorage.getItem('mega_app_power')!=='OFF';
+}catch(_){}
 const robotPowerBtn=document.getElementById('robotPowerBtn');
 const robotModeDesc=document.getElementById('robotModeDesc');
 const voiceBtn=document.getElementById('voiceBtn');
@@ -5680,8 +5702,8 @@ let pendingTradeQueue=[];
 let lastCountdownSignalKey='';
 let lastChartSignalVoice='';
 
-const RESULT_STATS_KEY='mega_result_stats_v33290';
-const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33290';
+const RESULT_STATS_KEY='mega_result_stats_v33310';
+const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33310';
 const RESULT_MARKETS=['OPEN','IQ_OTC','OLYMP_OTC'];
 
 function emptyResultBucket(){
@@ -5720,6 +5742,27 @@ function normalizeResultBucket(x){
 function resultMarket(m){
   m=String(m||'OPEN').toUpperCase();
   return RESULT_MARKETS.includes(m)?m:'OPEN';
+}
+
+function activeResultMarket(){
+  // Se a IQ Option estiver selecionada, mas desconectada, os sinais vêm da Twelve Data.
+  // Portanto WIN/LOSS e performance também precisam usar o bucket OPEN.
+  const selected=resultMarket(market&&market.value);
+  if(selected==='IQ_OTC' && !(brokerConnected&&brokerConnected.IQ_OPTION)){
+    return 'OPEN';
+  }
+  return selected;
+}
+
+function signalResultMarket(sig){
+  if(sig && (sig.feed_fallback===true || String(sig.feed_source||'').toUpperCase()==='TWELVE_DATA')){
+    return 'OPEN';
+  }
+  const m=resultMarket(sig&&sig.market ? sig.market : (market&&market.value));
+  if(m==='IQ_OTC' && !(brokerConnected&&brokerConnected.IQ_OPTION)){
+    return 'OPEN';
+  }
+  return m;
 }
 
 function resultTradeKey(t){
@@ -5823,7 +5866,7 @@ function mergeServerPerformance(p,m){
 }
 
 function paintPersistentResults(){
-  const m=resultMarket(market&&market.value);
+  const m=activeResultMarket();
   const b=persistentResults[m]||emptyResultBucket();
   const totalWins=b.win_direct;
   const totalLosses=b.loss_direct;
@@ -5843,14 +5886,14 @@ function paintPersistentResults(){
 loadPersistentResults();
 
 try{
-  const savedPending=localStorage.getItem('mega_pending_trade');
+  const savedPending=localStorage.getItem('mega_pending_trade_v33310');
   if(savedPending){
-    pendingTrade=JSON.parse(savedPending);
+    pendingTrade=normalizePendingTradeMarket(JSON.parse(savedPending));
   }
   const savedQueue=localStorage.getItem(PENDING_QUEUE_KEY);
   if(savedQueue){
     const q=JSON.parse(savedQueue);
-    pendingTradeQueue=Array.isArray(q)?q.slice(0,100):[];
+    pendingTradeQueue=Array.isArray(q)?q.slice(0,100).map(normalizePendingTradeMarket):[];
   }
 }catch(e){
   pendingTrade=null;
@@ -5860,12 +5903,22 @@ try{
 function savePendingTrade(){
   try{
     if(pendingTrade){
-      localStorage.setItem('mega_pending_trade',JSON.stringify(pendingTrade));
+      localStorage.setItem('mega_pending_trade_v33310',JSON.stringify(pendingTrade));
     }else{
-      localStorage.removeItem('mega_pending_trade');
+      localStorage.removeItem('mega_pending_trade_v33310');
     }
     localStorage.setItem(PENDING_QUEUE_KEY,JSON.stringify(pendingTradeQueue.slice(0,100)));
   }catch(e){}
+}
+
+function normalizePendingTradeMarket(t){
+  if(!t || typeof t!=='object') return t;
+  // Operações novas gravam feed_fallback. Isto evita consultar a IQ ao fechar
+  // um sinal que na verdade veio da Twelve Data.
+  if(t.feed_fallback===true || String(t.feed_source||'').toUpperCase()==='TWELVE_DATA'){
+    t.market='OPEN';
+  }
+  return t;
 }
 
 function enqueuePendingTrade(t){
@@ -5908,7 +5961,9 @@ function rememberPendingTrade(sig){
     source:sig.source||'SIGNAL',
     // Placar principal sempre fecha na vela original da entrada.
     direct_only:true,
-    market:market.value,
+    market:signalResultMarket(sig),
+    feed_source:sig.feed_source||'',
+    feed_fallback:!!sig.feed_fallback,
     symbol:sig.symbol,
     interval:sig.interval,
     direction:sig.direction,
@@ -5932,8 +5987,10 @@ function rememberChartSignal(pre){
   if(pre.direction!=='CALL' && pre.direction!=='PUT') return;
   if(!pre.entry_time) return;
 
+  const chartTradeMarket=signalResultMarket(pre);
+
   const signalKey=[
-    market.value,
+    chartTradeMarket,
     S.value,
     interval.value,
     pre.direction,
@@ -5959,7 +6016,9 @@ function rememberChartSignal(pre){
   enqueuePendingTrade({
     source:'CHART_20S',
     direct_only:true,
-    market:market.value,
+    market:chartTradeMarket,
+    feed_source:pre.feed_source||'',
+    feed_fallback:!!pre.feed_fallback,
     symbol:S.value,
     interval:interval.value,
     direction:pre.direction,
@@ -6453,6 +6512,7 @@ function mergeChartCandles(oldData,newData){
 }
 
 async function loadChart(){
+  if(!appEnabled) return;
   // O gráfico da IQ Option é um espelho da sessão: sem login, fica OFFLINE.
   if(chartBusy) return;
 
@@ -6597,7 +6657,7 @@ if(broker){
     sig(true);
     rad();
     loadPreSignals();
-    if(chartTab.classList.contains('active')) loadChart();
+    if(appEnabled && chartTab.classList.contains('active')) loadChart();
   };
 }
 
@@ -6689,6 +6749,61 @@ iqLogoutBtn.onclick=async()=>{
 
 
 
+function applyAppPowerState(){
+  if(!appPowerBtn) return;
+
+  if(appEnabled){
+    appPowerBtn.textContent='🟢 DESLIGAR APP';
+    appPowerBtn.classList.remove('app-off');
+    appPowerBtn.classList.add('app-on');
+    if(appPowerDesc) appPowerDesc.textContent='App ligado • sinais, análises e atualizações ativos.';
+  }else{
+    appPowerBtn.textContent='🔴 LIGAR APP';
+    appPowerBtn.classList.remove('app-on');
+    appPowerBtn.classList.add('app-off');
+    if(appPowerDesc) appPowerDesc.textContent='App desligado • novas análises e sinais pausados.';
+    if(statusBox) statusBox.textContent='APP DESLIGADO • ANÁLISES PAUSADAS';
+    if(direction){
+      direction.textContent='DESLIGADO';
+      direction.className='big neutral';
+    }
+    if(confidence) confidence.textContent='Confiança: --';
+    if(entry) entry.textContent='--:--:--';
+    if(countdown) countdown.textContent='--';
+    if(radar) radar.innerHTML='<div>⏸ APP DESLIGADO • radar pausado</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⏸ APP DESLIGADO • pré-sinais pausados</div>';
+  }
+}
+
+async function setAppPower(enabled){
+  appEnabled=!!enabled;
+  try{ localStorage.setItem('mega_app_power', appEnabled ? 'ON' : 'OFF'); }catch(_){}
+
+  if(!appEnabled){
+    cur=null;
+    chartPreSignal=null;
+    lastCountdownSignalKey='';
+    fifteen=false;
+    five=false;
+    entered=false;
+  }
+
+  applyAppPowerState();
+
+  if(appEnabled){
+    await Promise.allSettled([sig(false), perf(), updateMarketNote()]);
+    if(!robotEnabled) await Promise.allSettled([rad(), loadPreSignals()]);
+    if(chartTab.classList.contains('active')) await loadChart();
+    if(voiceEnabled) speak('Mega IA ligado. Análises e sinais ativados.');
+  }else if(voiceEnabled){
+    speak('Mega IA desligado. Análises e sinais pausados.');
+  }
+}
+
+if(appPowerBtn){
+  appPowerBtn.onclick=()=>{ setAppPower(!appEnabled); };
+}
+
 function applyRobotPowerState(){
   if(!robotPowerBtn) return;
 
@@ -6757,6 +6872,7 @@ if(robotPowerBtn){
 }
 
 async function sig(announce=false){
+  if(!appEnabled) return;
   if(sigBusy) return;
 
   sigBusy=true;
@@ -6856,7 +6972,7 @@ async function perf(){
   perfBusy=true;
 
   try{
-    const currentMarket=resultMarket(market.value);
+    const currentMarket=activeResultMarket();
     const p=await get('/performance?market='+encodeURIComponent(currentMarket));
     mergeServerPerformance(p,currentMarket);
     paintPersistentResults();
@@ -6869,6 +6985,7 @@ async function perf(){
 }
 
 async function rad(){
+  if(!appEnabled) return;
   if(robotEnabled){
     if(radar) radar.innerHTML='<div>🧠 IA PURA ativa • radar técnico desativado</div>';
     return;
@@ -6901,6 +7018,7 @@ async function rad(){
 
 
 async function loadPreSignals(){
+  if(!appEnabled) return;
   if(robotEnabled){
     if(preSignalStatus) preSignalStatus.textContent='Modo IA pura: pré-sinais técnicos desativados.';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 Somente a IA gera sinais.</div>';
@@ -7066,7 +7184,8 @@ async function resultCheck(){
   resultBusy=true;
 
   try{
-    const t=pendingTrade;
+    const t=normalizePendingTradeMarket(pendingTrade);
+    pendingTrade=t;
 
     const x=await get(
       `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=true`
@@ -7206,6 +7325,7 @@ try{
 
 async function bootApp(){
   syncMarketFromBroker();
+  applyAppPowerState();
   applyRobotPowerState();
   applyVoiceState();
 
@@ -7229,16 +7349,16 @@ async function bootApp(){
     await new Promise(r=>setTimeout(r,700));
   }
 
-  safe('signal',()=>sig(false));
-  if(!robotEnabled){
+  if(appEnabled) safe('signal',()=>sig(false));
+  if(appEnabled && !robotEnabled){
     safe('radar',rad);
     safe('pre-signals',loadPreSignals);
   }
-  if(chartTab.classList.contains('active')){
+  if(appEnabled && chartTab.classList.contains('active')){
     safe('chart',loadChart);
   }
 
-  safe('performance',perf);
+  if(appEnabled) safe('performance',perf);
 }
 
 bootApp().catch(err=>{
@@ -7246,24 +7366,24 @@ bootApp().catch(err=>{
   statusBox.textContent='PAINEL INICIADO COM AVISO';
 });
 
-setInterval(()=>{ sig(false); },5000);
+setInterval(()=>{ if(appEnabled) sig(false); },5000);
 
 setInterval(()=>{
-  if(chartTab.classList.contains('active')) loadChart();
+  if(appEnabled && chartTab.classList.contains('active')) loadChart();
 },2000);
 
-setInterval(perf,5000);
+setInterval(()=>{ if(appEnabled) perf(); },5000);
 setInterval(()=>{
-  if(!robotEnabled) rad();
+  if(appEnabled && !robotEnabled) rad();
 },20000);
 setInterval(()=>{
-  if(!robotEnabled) loadPreSignals();
+  if(appEnabled && !robotEnabled) loadPreSignals();
 },15000);
 
-// Mesmo offline, uma operação que já estava aberta continua tendo seu resultado acompanhado.
-setInterval(resultCheck,3000);
+// Com o app ligado, acompanha o resultado das operações abertas.
+setInterval(()=>{ if(appEnabled) resultCheck(); },3000);
 setInterval(clk,1000);
-setInterval(cd,250);
+setInterval(()=>{ if(appEnabled) cd(); },250);
 </script>
 </body>
 </html>
