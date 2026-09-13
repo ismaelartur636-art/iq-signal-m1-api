@@ -13,15 +13,17 @@ import httpx
 IQ_IMPORT_ERROR = ""
 try:
     from iqoptionapi.aio import AsyncIQOption
+    from iqoptionapi.aio.ws import AsyncWebSocketClient
 except Exception as exc:
     AsyncIQOption = None
+    AsyncWebSocketClient = None
     IQ_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
-app = FastAPI(title="MEGA IA", version="32.9.3")
+app = FastAPI(title="MEGA IA", version="32.9.4")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -682,6 +684,99 @@ def _iq_reason_requires_2fa(reason):
     ))
 
 
+async def _iq_login_via_reachable_host(email: str, password: str) -> str:
+    """Login alternativo usando iqoption.com, que é alcançável pelo Render.
+
+    Não registra credenciais nem SSID. Tenta formatos legados compatíveis e
+    retorna somente o SSID em memória para autenticar o WebSocket.
+    """
+    try:
+        import aiohttp
+    except Exception as exc:
+        raise RuntimeError(f"aiohttp indisponível: {type(exc).__name__}: {exc}") from exc
+
+    login_urls = [
+        "https://iqoption.com/api/login/v2",
+        "https://iqoption.com/api/v2/login",
+    ]
+    payloads = [
+        {"identifier": email, "password": password},
+        {"email": email, "password": password},
+    ]
+
+    timeout = aiohttp.ClientTimeout(total=15, connect=8, sock_read=10)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://iqoption.com",
+        "Referer": "https://iqoption.com/",
+    }
+    errors = []
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        for url in login_urls:
+            for payload in payloads:
+                try:
+                    async with session.post(url, data=payload, allow_redirects=False) as resp:
+                        try:
+                            body = await resp.json(content_type=None)
+                        except Exception:
+                            body = None
+
+                        # Um redirecionamento para auth.iqoption.com não ajuda no Render.
+                        if 300 <= resp.status < 400:
+                            location = resp.headers.get("location", "")
+                            errors.append(f"{url}: redirecionou ({resp.status}) para {location[:90]}")
+                            continue
+
+                        if isinstance(body, dict):
+                            code = str(body.get("code", "")).lower()
+                            if code == "verify" or _iq_reason_requires_2fa(body):
+                                raise IQTwoFactorRequired("A IQ Option solicitou verificação em duas etapas.")
+
+                        ssid_cookie = resp.cookies.get("ssid")
+                        ssid = ssid_cookie.value if ssid_cookie is not None else ""
+                        if not ssid and isinstance(body, dict):
+                            data = body.get("data")
+                            if isinstance(data, dict):
+                                ssid = str(data.get("ssid", "") or "")
+                            if not ssid:
+                                ssid = str(body.get("ssid", "") or "")
+
+                        if resp.status == 200 and ssid:
+                            return ssid
+
+                        # Não expor corpo, email, senha ou token em logs/erros.
+                        errors.append(f"{url}: HTTP {resp.status}, sem SSID")
+                except IQTwoFactorRequired:
+                    raise
+                except Exception as exc:
+                    errors.append(f"{url}: {type(exc).__name__}: {str(exc)[:120]}")
+
+    detail = " | ".join(errors[-4:])
+    raise RuntimeError(f"Login alternativo não concluiu. {detail[:420]}")
+
+
+async def _iq_connect_with_fallback_login(email: str, password: str):
+    """Conecta usando login alternativo e o cliente WebSocket da biblioteca."""
+    if AsyncWebSocketClient is None:
+        raise RuntimeError("Cliente WebSocket assíncrono da IQ Option não carregado.")
+
+    ssid = await _iq_login_via_reachable_host(email, password)
+    try:
+        client = AsyncIQOption(email, password)
+        ws = AsyncWebSocketClient(ssid, wss_url="wss://iqoption.com/echo/websocket")
+        await ws.connect(auth_timeout=15.0)
+        client._ws = ws
+        return client
+    finally:
+        # SSID não é persistido nem registrado; referência local some após uso.
+        ssid = ""
+
+
 async def iq_connect_async(state, force=False):
     if AsyncIQOption is None:
         raise RuntimeError("Cliente assíncrono da IQ Option não carregado no servidor.")
@@ -707,10 +802,12 @@ async def iq_connect_async(state, force=False):
     state["reconnecting"] = True
     state["requires_2fa"] = False
 
-    client = AsyncIQOption(email, password)
-    state["client"] = client
+    client = None
+    state["client"] = None
     try:
-        await client.connect()
+        # O host auth.iqoption.com expira no Render; usa iqoption.com como rota de login.
+        client = await _iq_connect_with_fallback_login(email, password)
+        state["client"] = client
         if getattr(client, "_ws", None) is None:
             raise RuntimeError("A IQ Option não manteve o websocket conectado.")
         return _iq_mark_connected(state, client)
@@ -1146,7 +1243,7 @@ async def manifest():
 @app.get("/iq-diagnostic")
 async def iq_diagnostic():
     info = {
-        "app_version": "32.9.3",
+        "app_version": "32.9.4",
         "iq_async_library_loaded": AsyncIQOption is not None,
         "import_error": IQ_IMPORT_ERROR if AsyncIQOption is None else "",
         "active_sessions": len(iq_sessions),
@@ -1166,7 +1263,7 @@ async def iq_diagnostic():
 async def iq_network_test():
     """Testa endpoints alternativos da IQ Option sem usar e-mail nem senha."""
     result = {
-        "app_version": "32.9.3",
+        "app_version": "32.9.4",
         "http": {},
         "websocket": {},
     }
@@ -1221,7 +1318,7 @@ async def iq_network_test():
                     async with session.get(
                         url,
                         allow_redirects=False,
-                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.3"},
+                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.4"},
                     ) as resp:
                         result["http"][url] = {
                             "ok": True,
@@ -1243,7 +1340,7 @@ async def iq_network_test():
                         url,
                         timeout=10,
                         heartbeat=20,
-                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.3"},
+                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.4"},
                     )
                     result["websocket"][url] = {
                         "ok": True,
@@ -1276,7 +1373,7 @@ async def iq_port_test():
         "iqoption.com",
         "ws.iqoption.com",
     ]
-    result = {"app_version": "32.9.3", "port": 443, "hosts": {}}
+    result = {"app_version": "32.9.4", "port": 443, "hosts": {}}
 
     async def tcp_probe(host, family):
         family_name = "ipv4" if family == socket.AF_INET else "ipv6"
@@ -2146,7 +2243,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 (function(){
 'use strict';
 
-var VERSION='32.9.3';
+var VERSION='32.9.4';
 var symbols=['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD'];
 var E={};
 var currentSignal=null;
