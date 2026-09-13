@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.13.0")
+app = FastAPI(title="MEGA IA", version="33.13.2")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2944,7 +2944,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.13.0",
+        "version": "33.13.2",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -4707,6 +4707,9 @@ function pickMalePtBRVoice(){
 function speak(t){
   if(!voiceEnabled || !window.speechSynthesis) return;
 
+  // Sempre que a Mega IA falar, mostra a imagem do robô no painel.
+  showRobot();
+
   speechSynthesis.cancel();
 
   const u=new SpeechSynthesisUtterance(t);
@@ -4717,6 +4720,29 @@ function speak(t){
 
   const mv=pickMalePtBRVoice();
   if(mv) u.voice=mv;
+
+  u.onstart=()=>{
+    showRobot();
+  };
+
+  u.onend=()=>{
+    clearTimeout(robotTimer);
+    robotTimer=setTimeout(()=>{
+      if(!entryArrow.classList.contains('call') && !entryArrow.classList.contains('put')){
+        heroBox.style.display='none';
+        analysisText.style.display='none';
+      }
+    },10000);
+  };
+
+  u.onerror=()=>{
+    clearTimeout(robotTimer);
+    robotTimer=setTimeout(()=>{
+      if(!entryArrow.classList.contains('call') && !entryArrow.classList.contains('put')){
+        heroBox.style.display='none';
+      }
+    },10000);
+  };
 
   speechSynthesis.speak(u);
 }
