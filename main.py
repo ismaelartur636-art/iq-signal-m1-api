@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.4.1")
+app = FastAPI(title="MEGA IA", version="33.5.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -50,8 +50,6 @@ OAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
 OAI_MIN = float(os.getenv("OPENAI_MIN_CONFIDENCE", "70"))
 OAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "15"))
 
-IQ_EMAIL = os.getenv("IQ_EMAIL", "").strip()
-IQ_PASSWORD = os.getenv("IQ_PASSWORD", "")
 OLYMPTRADE_TOKEN = os.getenv("OLYMPTRADE_TOKEN", "").strip()
 
 LICENSE = os.getenv("LICENSE_EXPIRES", "2026-12-31")
@@ -95,15 +93,16 @@ td_backoff_reason = ""
 TD_MIN_CALL_INTERVAL = float(os.getenv("TWELVE_DATA_MIN_INTERVAL", "8.0"))
 TD_STALE_MAX_AGE = float(os.getenv("TWELVE_DATA_STALE_MAX_AGE", "900"))
 
+# IQ OPTION — implementação reconstruída do zero.
+# O login é feito somente pelo painel; não há credenciais IQ no Render.
 IQ_SESSION_COOKIE = "mega_iq_session"
 IQ_SESSION_TTL = int(os.getenv("IQ_SESSION_TTL", "43200"))
-IQ_RECONNECT_BASE_DELAY = float(os.getenv("IQ_RECONNECT_BASE_DELAY", "6"))
-IQ_RECONNECT_MAX_DELAY = float(os.getenv("IQ_RECONNECT_MAX_DELAY", "60"))
-IQ_CANDLE_TIMEOUT = float(os.getenv("IQ_CANDLE_TIMEOUT", "9"))
+IQ_CONNECT_TIMEOUT = float(os.getenv("IQ_CONNECT_TIMEOUT", "25"))
+IQ_CANDLE_TIMEOUT = float(os.getenv("IQ_CANDLE_TIMEOUT", "15"))
+IQ_CANDLE_CACHE_TTL = float(os.getenv("IQ_CANDLE_CACHE_TTL", "8"))
 iq_sessions: Dict[str, Dict[str, Any]] = {}
 
 VALID_MARKETS = ("OPEN", "IQ_OTC", "OLYMP_OTC")
-iq_env_state: Dict[str, Any] | None = None
 
 olymp_client = None
 olymp_sessions: Dict[str, Dict[str, Any]] = {}
@@ -141,16 +140,6 @@ def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 
-def _cleanup_iq_sessions():
-    now_ts = time.time()
-    expired = [k for k, v in iq_sessions.items() if now_ts - v.get("last_seen", now_ts) > IQ_SESSION_TTL]
-    for token in expired:
-        state = iq_sessions.pop(token, None)
-        if state:
-            state["password"] = ""
-            _iq_dispose_client(state)
-
-
 def _mask_email(email: str):
     if "@" not in email:
         return "***"
@@ -159,63 +148,83 @@ def _mask_email(email: str):
     return visible + "•••••@" + domain
 
 
-def _session_state(request: Request, required: bool = False):
+def _iq_connected(state: Dict[str, Any] | None) -> bool:
+    if not state:
+        return False
+    client = state.get("client")
+    if client is None:
+        return False
+    try:
+        return bool(client.check_connect())
+    except Exception:
+        return False
+
+
+def _iq_close_state(state: Dict[str, Any] | None):
+    if not state:
+        return
+
+    client = state.get("client")
+    state["client"] = None
+    state["connected"] = False
+
+    if client is None:
+        return
+
+    try:
+        api = getattr(client, "api", None)
+        close = getattr(api, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
+
+
+def _cleanup_iq_sessions():
+    now_ts = time.time()
+    expired = [
+        token
+        for token, state in iq_sessions.items()
+        if now_ts - float(state.get("last_seen", now_ts)) > IQ_SESSION_TTL
+    ]
+
+    for token in expired:
+        state = iq_sessions.pop(token, None)
+        if state:
+            state["password"] = ""
+            _iq_close_state(state)
+
+
+def _iq_session_state(request: Request, required: bool = False):
     _cleanup_iq_sessions()
-    cookie_token = request.cookies.get(IQ_SESSION_COOKIE, "")
+
     header_token = request.headers.get("X-IQ-Session", "")
+    cookie_token = request.cookies.get(IQ_SESSION_COOKIE, "")
+
     for token in (header_token, cookie_token):
         if not token:
             continue
+
         state = iq_sessions.get(token)
         if state:
-            state["last_seen"] = time.time()
             state["session_id"] = token
+            state["last_seen"] = time.time()
+            state["connected"] = _iq_connected(state)
             return state
+
     if required:
-        raise HTTPException(401, "Conecte sua conta da IQ Option na aba Conta IQ Option.")
+        raise HTTPException(
+            401,
+            "Faça login na IQ Option pela aba Corretora para usar o OTC."
+        )
+
     return None
 
 
 def _iq_state_for_request(request: Request, required: bool = False):
-    """
-    Prefer a browser session when one exists. Otherwise use a server-side
-    IQ_EMAIL/IQ_PASSWORD session configured once in Render.
-    This keeps credentials out of the panel.
-    """
-    global iq_env_state
+    # Alias interno para manter os outros módulos simples.
+    return _iq_session_state(request, required=required)
 
-    state = _session_state(request, required=False)
-    if state:
-        return state
-
-    if IQ_EMAIL and IQ_PASSWORD:
-        if iq_env_state is None:
-            iq_env_state = {
-                "session_id": "ENV_IQ",
-                "email": IQ_EMAIL,
-                "password": IQ_PASSWORD,
-                "client": None,
-                "lock": asyncio.Lock(),
-                "last_error": "",
-                "last_attempt": 0.0,
-                "last_seen": time.time(),
-                "last_connected": 0.0,
-                "failure_count": 0,
-                "reconnect_after": 0.0,
-                "reconnecting": False,
-                "generation": 0,
-                "candle_cache": {},
-                "results": {},
-            }
-        iq_env_state["last_seen"] = time.time()
-        return iq_env_state
-
-    if required:
-        raise HTTPException(
-            503,
-            "IQ Option OTC ainda não está configurada no servidor. Configure IQ_EMAIL e IQ_PASSWORD no Render."
-        )
-    return None
 
 
 def _olymp_asset(symbol: str) -> str:
@@ -1179,377 +1188,320 @@ async def candles_open(symbol, interval, n=80):
         return out[-n:]
 
 
-def iq_active_candidates(symbol):
+def iq_active_candidates(symbol: str):
     base = symbol.replace("/", "").upper()
     preferred = OTC_BASE.get(symbol, f"{base}-OTC")
-    return list(dict.fromkeys([preferred, f"{base}-OTC", f"{base}_OTC"]))
+
+    return list(dict.fromkeys([
+        preferred,
+        f"{base}-OTC",
+        f"{base}_OTC",
+        base,
+    ]))
 
 
-def iq_seconds(interval):
+def iq_seconds(interval: str):
+    if interval not in INTERVALS:
+        raise RuntimeError("Intervalo inválido para IQ Option.")
     return INTERVALS[interval]
 
 
-def _iq_is_connected(state):
-    client = state.get("client")
-    if client is None:
-        return False
-    try:
-        return bool(client.check_connect())
-    except Exception:
-        return False
+def _iq_connect_fresh(email: str, password: str):
+    """
+    Abre uma sessão nova usando somente IQ_Option.connect().
+    O watchdog impede que o servidor fique preso indefinidamente.
+    """
+    if IQ_Option is None:
+        raise RuntimeError(
+            "Biblioteca iqoptionapi não carregada no servidor."
+        )
 
+    email = (email or "").strip()
+    password = password or ""
 
-def _iq_dispose_client(state):
-    client = state.get("client")
-    state["client"] = None
-    if client is None:
-        return
-    try:
-        api = getattr(client, "api", None)
-        if api is not None:
+    if not email or not password:
+        raise RuntimeError("Informe e-mail e senha da IQ Option.")
+
+    result_box = {}
+    done = threading.Event()
+
+    def worker():
+        try:
+            client = IQ_Option(email, password)
+            result = client.connect()
+
+            reason = ""
+            accepted = False
+
+            if isinstance(result, (tuple, list)):
+                accepted = bool(result[0]) if result else False
+                reason = str(result[1] or "") if len(result) > 1 else ""
+            elif isinstance(result, bool):
+                accepted = result
+
             try:
-                api.close()
+                websocket_ok = bool(client.check_connect())
             except Exception:
-                pass
-    except Exception:
-        pass
-    time.sleep(0.15)
+                websocket_ok = False
 
+            result_box["client"] = client
+            result_box["ok"] = bool(accepted or websocket_ok)
+            result_box["reason"] = reason
 
-def _iq_mark_failure(state, message):
-    failures = int(state.get("failure_count", 0)) + 1
-    state["failure_count"] = failures
-    delay = min(IQ_RECONNECT_MAX_DELAY, IQ_RECONNECT_BASE_DELAY * (2 ** min(failures - 1, 4)))
-    state["reconnect_after"] = time.time() + delay
-    state["last_error"] = str(message)[:350]
-    _iq_dispose_client(state)
-    return delay
+        except Exception as exc:
+            result_box["error"] = str(exc)
+        finally:
+            done.set()
 
+    threading.Thread(target=worker, daemon=True).start()
 
-def _iq_mark_connected(state, client):
-    state["client"] = client
-    state["last_error"] = ""
-    state["failure_count"] = 0
-    state["reconnect_after"] = 0.0
-    state["last_seen"] = time.time()
-    state["last_connected"] = time.time()
+    if not done.wait(IQ_CONNECT_TIMEOUT):
+        raise TimeoutError(
+            f"A IQ Option não respondeu ao servidor em {int(IQ_CONNECT_TIMEOUT)} segundos."
+        )
+
+    if result_box.get("error"):
+        raise RuntimeError(result_box["error"])
+
+    client = result_box.get("client")
+    if client is None:
+        raise RuntimeError("A IQ Option não retornou uma sessão.")
+
+    if not result_box.get("ok"):
+        reason = (result_box.get("reason") or "").strip()
+
+        try:
+            api = getattr(client, "api", None)
+            close = getattr(api, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+
+        if reason:
+            raise RuntimeError(f"Login recusado pela IQ Option: {reason}")
+
+        raise RuntimeError(
+            "Login não confirmado: o websocket da IQ Option não ficou conectado."
+        )
+
     return client
 
 
-def _iq_lowlevel_connect_worker(client, result_box):
-    """
-    Conecta somente a camada HTTP/WebSocket necessária para leitura de candles.
+def _iq_reconnect_state(state: Dict[str, Any]):
+    if _iq_connected(state):
+        state["connected"] = True
+        return state["client"]
 
-    Motivo:
-    algumas versões antigas de iqoptionapi ficam presas dentro de
-    stable_api.IQ_Option.connect() esperando global_value.balance_id sem timeout.
-    Para este painel não precisamos de saldo/ordens; precisamos apenas do websocket
-    e dos candles OTC.
-    """
-    try:
-        from iqoptionapi.api import IQOptionAPI
-
-        api = IQOptionAPI("iqoption.com", client.email, client.password)
-        api.set_session(
-            headers=getattr(client, "SESSION_HEADER", {}),
-            cookies=getattr(client, "SESSION_COOKIE", {}),
-        )
-
-        client.api = api
-        check, reason = api.connect()
-
-        result_box["check"] = bool(check)
-        result_box["reason"] = reason
-
-    except Exception as exc:
-        result_box["error"] = repr(exc)
-
-
-def iq_connect_blocking(state, force=False):
-    if IQ_Option is None:
-        raise RuntimeError("Biblioteca IQ Option não carregada no servidor.")
-
-    now_ts = time.time()
-
-    if not force and _iq_is_connected(state):
-        return state.get("client")
-
-    reconnect_after = float(state.get("reconnect_after", 0.0) or 0.0)
-    if now_ts < reconnect_after:
-        wait = max(1, int(reconnect_after - now_ts + 0.999))
-        raise RuntimeError(f"IQ Option reconectando. Nova tentativa em {wait}s.")
-
-    if force:
-        _iq_dispose_client(state)
-
-    email = state.get("email", "")
-    password = state.get("password", "")
+    email = str(state.get("email") or "").strip()
+    password = str(state.get("password") or "")
 
     if not email or not password:
-        raise RuntimeError("Sessão IQ Option sem credenciais ativas. Conecte novamente.")
-
-    last_attempt = float(state.get("last_attempt", 0.0) or 0.0)
-    if now_ts - last_attempt < 2.5:
-        raise RuntimeError("IQ Option reconectando. Aguarde alguns segundos.")
-
-    state["last_attempt"] = now_ts
-    state["reconnecting"] = True
-    state["login_stage"] = "CRIANDO CLIENTE"
-
-    try:
-        client = IQ_Option(email, password)
-        state["client"] = client
-
-        # Não usamos client.connect() aqui. Em versões antigas da biblioteca,
-        # ele pode ficar preso para sempre esperando balance_id.
-        state["login_stage"] = "ABRINDO HTTP/WEBSOCKET"
-
-        result_box = {}
-        worker = threading.Thread(
-            target=_iq_lowlevel_connect_worker,
-            args=(client, result_box),
-            daemon=True,
-        )
-        worker.start()
-        worker.join(timeout=22.0)
-
-        if worker.is_alive():
-            try:
-                api = getattr(client, "api", None)
-                if api is not None:
-                    api.close()
-            except Exception:
-                pass
-
-            delay = _iq_mark_failure(
-                state,
-                "A camada HTTP/WebSocket da IQ Option não respondeu em 22 segundos."
-            )
-            raise RuntimeError(
-                f"A IQ Option não respondeu ao servidor. Nova tentativa em {int(delay)}s."
-            )
-
-        if "error" in result_box:
-            delay = _iq_mark_failure(state, result_box["error"])
-            raise RuntimeError(
-                f"Erro ao abrir conexão IQ Option. Nova tentativa em {int(delay)}s."
-            )
-
-        ok = bool(result_box.get("check"))
-        reason = result_box.get("reason")
-
-        if not ok:
-            reason_text = str(reason or "").strip()
-            low = reason_text.lower()
-
-            if reason_text == "2FA" or "2fa" in low:
-                _iq_dispose_client(state)
-                state["last_error"] = "Conta com autenticação em duas etapas (2FA)."
-                state["reconnect_after"] = 0.0
-                raise RuntimeError(
-                    "Sua conta IQ Option está pedindo 2FA. Desative temporariamente o 2FA para este login."
-                )
-
-            if "invalid_credentials" in low or "wrong credentials" in low:
-                _iq_dispose_client(state)
-                state["last_error"] = "Credenciais inválidas."
-                state["reconnect_after"] = 0.0
-                raise RuntimeError("E-mail ou senha da IQ Option estão incorretos.")
-
-            delay = _iq_mark_failure(
-                state,
-                f"Falha no login IQ Option: {reason_text or 'sem motivo retornado'}"
-            )
-            raise RuntimeError(
-                f"A IQ Option recusou a conexão: {reason_text or 'sem motivo retornado'}. "
-                f"Nova tentativa em {int(delay)}s."
-            )
-
-        state["login_stage"] = "VALIDANDO WEBSOCKET"
-
-        ready = False
-        for _ in range(24):
-            try:
-                if bool(client.check_connect()):
-                    ready = True
-                    break
-            except Exception:
-                pass
-            time.sleep(0.25)
-
-        if not ready:
-            delay = _iq_mark_failure(
-                state,
-                "Login HTTP respondeu, mas o websocket não ficou conectado."
-            )
-            raise RuntimeError(
-                f"Login aceito, mas o websocket da IQ Option não ficou ativo. "
-                f"Nova tentativa em {int(delay)}s."
-            )
-
-        state["login_stage"] = "CONECTADO"
-        return _iq_mark_connected(state, client)
-
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        delay = _iq_mark_failure(state, f"Erro ao abrir conexão IQ Option: {exc}")
         raise RuntimeError(
-            f"Falha ao conectar à IQ Option. Nova tentativa em {int(delay)}s."
+            "Sessão da IQ Option sem credenciais ativas. Faça login novamente."
         )
-    finally:
-        state["reconnecting"] = False
+
+    _iq_close_state(state)
+    client = _iq_connect_fresh(email, password)
+
+    state["client"] = client
+    state["connected"] = True
+    state["last_connected"] = time.time()
+    state["last_seen"] = time.time()
+    state["last_error"] = ""
+
+    return client
 
 
-def _iq_get_candles_once(client, active, duration, count, endtime):
+def _normalize_iq_candle(item):
+    if not isinstance(item, dict):
+        return None
+
+    raw_time = (
+        item.get("from")
+        or item.get("timestamp")
+        or item.get("time")
+        or item.get("at")
+    )
+
     try:
-        import iqoptionapi.constants as iq_constants
-    except Exception as exc:
-        raise RuntimeError(f"Constantes IQ Option indisponíveis: {exc}")
+        ts = float(raw_time)
+        if ts > 10_000_000_000:
+            ts /= 1000.0
+        candle_dt = datetime.fromtimestamp(
+            ts, tz=UTC
+        ).astimezone(BR_TZ).isoformat()
+    except Exception:
+        return None
 
-    active_id = iq_constants.ACTIVES.get(active)
-    if active_id is None:
-        raise RuntimeError(f"Ativo OTC não reconhecido pela biblioteca: {active}")
-
-    api = getattr(client, "api", None)
-    if api is None:
-        raise RuntimeError("Cliente IQ Option sem websocket ativo.")
-
-    candles_obj = getattr(api, "candles", None)
-    if candles_obj is None:
-        raise RuntimeError("Canal de candles da IQ Option não inicializado.")
-
-    candles_obj.candles_data = None
-    api.getcandles(active_id, duration, count, endtime)
-
-    deadline = time.monotonic() + IQ_CANDLE_TIMEOUT
-    while time.monotonic() < deadline:
-        data = candles_obj.candles_data
-        if data is not None:
-            return data
-        try:
-            if not client.check_connect():
-                raise RuntimeError("Websocket IQ Option desconectou durante a leitura de candles.")
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(f"Falha ao verificar websocket IQ Option: {exc}")
-        time.sleep(0.05)
-
-    raise TimeoutError(f"IQ Option não respondeu candles em {IQ_CANDLE_TIMEOUT:.0f}s.")
+    try:
+        return {
+            "datetime": candle_dt,
+            "open": float(item.get("open")),
+            "high": float(item.get("max", item.get("high"))),
+            "low": float(item.get("min", item.get("low"))),
+            "close": float(item.get("close")),
+            "volume": float(item.get("volume", 0) or 0),
+        }
+    except Exception:
+        return None
 
 
-def iq_candles_blocking(state, symbol, interval, n):
+def iq_candles_blocking(
+    state: Dict[str, Any],
+    symbol: str,
+    interval: str,
+    n: int,
+):
+    client = _iq_reconnect_state(state)
     duration = iq_seconds(interval)
-    candidates = iq_active_candidates(symbol)
-    errors = []
-    client = iq_connect_blocking(state, force=False)
+    count = max(20, min(int(n), 150))
+    last_error = ""
 
-    for name in candidates:
+    for active in iq_active_candidates(symbol):
         try:
-            if not _iq_is_connected(state):
-                raise RuntimeError("sessão desconectada antes de get_candles")
+            if not _iq_connected(state):
+                client = _iq_reconnect_state(state)
 
-            chunk = _iq_get_candles_once(client, name, duration, n, time.time())
+            raw = client.get_candles(
+                active,
+                duration,
+                count,
+                int(time.time()),
+            )
 
-            if chunk and len(chunk) >= 5:
-                out = []
-                for x in chunk:
-                    try:
-                        ts = float(x.get("from", x.get("at", 0)))
-                        dt = datetime.fromtimestamp(ts, tz=UTC).astimezone(BR_TZ).isoformat()
-                        out.append({
-                            "datetime": dt,
-                            "open": float(x["open"]),
-                            "high": float(x.get("max", x.get("high"))),
-                            "low": float(x.get("min", x.get("low"))),
-                            "close": float(x["close"]),
-                            "volume": float(x.get("volume", 0) or 0),
-                            "source": name,
-                        })
-                    except Exception:
-                        continue
+            out = []
+            for item in raw or []:
+                candle = _normalize_iq_candle(item)
+                if candle:
+                    out.append(candle)
 
-                out.sort(key=lambda z: z["datetime"])
-                if len(out) >= 5:
-                    _iq_mark_connected(state, client)
-                    return out
-
-            errors.append(f"{name}: sem candles")
+            if out:
+                out.sort(key=lambda row: row["datetime"])
+                state["connected"] = True
+                state["last_seen"] = time.time()
+                state["last_error"] = ""
+                return out[-count:]
 
         except Exception as exc:
-            msg = str(exc) or exc.__class__.__name__
-            errors.append(f"{name}: {msg}")
-            low = msg.lower()
-            if any(k in low for k in ("reconnect", "disconnect", "is_ssl", "websocket", "closed", "timeout", "timed out", "sock")):
-                delay = _iq_mark_failure(state, msg)
-                raise RuntimeError(f"Conexão OTC caiu. Reconectando em {int(delay)}s.")
+            last_error = str(exc)
+            state["last_error"] = last_error
 
-    detail = " | ".join(errors[-3:])
-    delay = _iq_mark_failure(state, f"OTC sem candles. {detail}")
-    raise RuntimeError(f"OTC sem candles. Nova tentativa em {int(delay)}s.")
+    state["connected"] = _iq_connected(state)
+
+    if not state["connected"]:
+        _iq_close_state(state)
+
+    raise RuntimeError(
+        "Não foi possível receber candles OTC da IQ Option. "
+        + (last_error[:220] if last_error else "Nenhum ativo OTC respondeu.")
+    )
 
 
-async def candles(symbol, interval, n=80, market="OPEN", iq_state=None, request: Request | None = None):
+async def candles(
+    symbol,
+    interval,
+    n=80,
+    market="OPEN",
+    iq_state=None,
+    request: Request | None = None,
+):
     market = (market or "OPEN").upper()
 
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
 
+    if symbol not in SYMBOLS or interval not in INTERVALS:
+        raise HTTPException(400, "Ativo ou intervalo inválido.")
+
     if market == "OLYMP_OTC":
-        return await candles_olymp(symbol, interval, n, request=request)
+        return await candles_olymp(
+            symbol,
+            interval,
+            n,
+            request=request,
+        )
 
     if market == "IQ_OTC":
-        if symbol not in SYMBOLS or interval not in INTERVALS:
-            raise HTTPException(400, "Ativo ou intervalo inválido.")
-        if iq_state is None:
-            raise HTTPException(
-                503,
-                "IQ Option OTC ainda não está configurada no servidor."
+        if iq_state is None and request is not None:
+            iq_state = _iq_session_state(
+                request,
+                required=False,
             )
 
-        ckey = f"{symbol}|{interval}"
+        if iq_state is None:
+            raise HTTPException(
+                401,
+                "Faça login na IQ Option pela aba Corretora para carregar o OTC."
+            )
+
+        cache_key = f"{symbol}|{interval}"
         candle_cache = iq_state.setdefault("candle_cache", {})
-        cached = candle_cache.get(ckey)
-        now_ts = time.time()
+        cached = candle_cache.get(cache_key)
 
-        if cached and now_ts - cached[0] < 20 and len(cached[1]) >= min(n, 20):
-            return cached[1][-n:]
+        if (
+            cached
+            and time.time() - cached[0] < IQ_CANDLE_CACHE_TTL
+            and len(cached[1]) >= min(int(n), 20)
+        ):
+            return cached[1][-int(n):]
 
-        reconnect_after = float(iq_state.get("reconnect_after", 0.0) or 0.0)
-        reconnecting = bool(iq_state.get("reconnecting")) or now_ts < reconnect_after
-
-        if reconnecting:
-            if cached and now_ts - cached[0] < 90:
-                return cached[1][-n:]
-            wait = max(1, int(reconnect_after-now_ts+0.999)) if reconnect_after > now_ts else 2
-            raise HTTPException(503, f"IQ Option reconectando. Aguarde {wait}s.")
+        lock = iq_state.get("lock")
+        if lock is None:
+            lock = asyncio.Lock()
+            iq_state["lock"] = lock
 
         try:
-            async with iq_state["lock"]:
-                cached = candle_cache.get(ckey)
-                if cached and time.time() - cached[0] < 20 and len(cached[1]) >= min(n, 20):
-                    return cached[1][-n:]
+            async with lock:
+                cached = candle_cache.get(cache_key)
 
-                fetch_n = max(100, min(150, int(n)))
-                out = await asyncio.wait_for(
-                    asyncio.to_thread(iq_candles_blocking, iq_state, symbol, interval, fetch_n),
-                    timeout=15,
+                if (
+                    cached
+                    and time.time() - cached[0] < IQ_CANDLE_CACHE_TTL
+                    and len(cached[1]) >= min(int(n), 20)
+                ):
+                    return cached[1][-int(n):]
+
+                data = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        iq_candles_blocking,
+                        iq_state,
+                        symbol,
+                        interval,
+                        max(80, int(n)),
+                    ),
+                    timeout=IQ_CANDLE_TIMEOUT + 5,
                 )
-                candle_cache[ckey] = (time.time(), out)
 
+                if not data:
+                    raise RuntimeError(
+                        "A IQ Option retornou zero candles."
+                    )
+
+                candle_cache[cache_key] = (
+                    time.time(),
+                    data,
+                )
+                return data[-int(n):]
+
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                504,
+                "A IQ Option demorou demais para responder aos candles OTC."
+            )
         except HTTPException:
             raise
         except Exception as exc:
-            stale = candle_cache.get(ckey)
+            # No modo IQ OTC, só aceitamos cache antigo da própria IQ.
+            stale = candle_cache.get(cache_key)
+
             if stale and time.time() - stale[0] < 90:
-                return stale[1][-n:]
-            raise HTTPException(503, f"IQ Option OTC indisponível: {str(exc)[:300]}")
+                return stale[1][-int(n):]
 
-        if not out:
-            raise HTTPException(503, "Nenhum candle OTC recebido da IQ Option.")
-
-        return out[-n:]
+            raise HTTPException(
+                503,
+                f"IQ Option OTC indisponível: {str(exc)[:260]}"
+            )
 
     return await candles_open(symbol, interval, n)
 
@@ -1649,7 +1601,7 @@ def neutral_signal(symbol, interval, market, status, reason, *, confidence=0, so
     }
 
 
-async def signal(symbol, interval, market="OPEN", iq_state=None):
+async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None):
     if symbol not in SYMBOLS or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
 
@@ -1675,22 +1627,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
     if key in cache and time.time() - cache[key][0] < 4:
         return cache[key][1]
 
-    if market == "IQ_OTC" and iq_state is not None:
-        ra = float(iq_state.get("reconnect_after", 0.0) or 0.0)
-        # Durante o backoff real, não libera entrada. Fora dele, deixa candles()
-        # tentar restaurar automaticamente o websocket da sessão preservada.
-        if iq_state.get("reconnecting") or time.time() < ra:
-            neutral = neutral_signal(
-                symbol, interval, market,
-                "IQ OPTION RECONECTANDO",
-                "A sessão OTC está sendo restaurada. Nenhuma entrada será liberada até a conexão voltar.",
-                source_state="WAITING",
-            )
-            cache[key] = (time.time(), neutral)
-            return neutral
-
     try:
-        raw = await candles(symbol, interval, 90, market, iq_state)
+        raw = await candles(symbol, interval, 90, market, iq_state, request=request)
     except HTTPException as exc:
         status = (
             "FONTE EM LIMITE"
@@ -1863,7 +1801,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.4.1",
+        "version": "33.5.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -2000,48 +1938,55 @@ async def iq_login(body: IQLoginBody, response: Response):
     password = body.password
 
     if not email or not password:
-        raise HTTPException(400, "Informe e-mail e senha da IQ Option.")
+        raise HTTPException(
+            400,
+            "Informe e-mail e senha da IQ Option."
+        )
 
     if IQ_Option is None:
-        raise HTTPException(503, "Biblioteca IQ Option não carregada. Verifique o requirements.txt.")
+        raise HTTPException(
+            503,
+            "Biblioteca iqoptionapi não carregada no servidor."
+        )
 
     token = secrets.token_urlsafe(32)
+
+    try:
+        client = await asyncio.wait_for(
+            asyncio.to_thread(
+                _iq_connect_fresh,
+                email,
+                password,
+            ),
+            timeout=IQ_CONNECT_TIMEOUT + 3,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            504,
+            "A IQ Option não respondeu ao servidor dentro do tempo limite."
+        )
+    except TimeoutError as exc:
+        raise HTTPException(504, str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            401,
+            "Não foi possível conectar à IQ Option: "
+            + str(exc)[:280]
+        )
 
     state = {
         "session_id": token,
         "email": email,
         "password": password,
-        "client": None,
+        "client": client,
         "lock": asyncio.Lock(),
-        "last_error": "",
-        "last_attempt": 0.0,
+        "connected": True,
         "last_seen": time.time(),
         "last_connected": time.time(),
-        "failure_count": 0,
-        "reconnect_after": 0.0,
-        "reconnecting": False,
-        "generation": 0,
+        "last_error": "",
         "candle_cache": {},
         "results": {},
     }
-
-    try:
-        async with state["lock"]:
-            client = await asyncio.wait_for(asyncio.to_thread(iq_connect_blocking, state), timeout=28)
-
-        if not bool(client.check_connect()):
-            raise RuntimeError("A sessão não permaneceu conectada.")
-
-    except asyncio.TimeoutError:
-        state["password"] = ""
-        raise HTTPException(
-            504,
-            "O servidor encerrou a tentativa porque a biblioteca IQ Option ficou presa no login."
-        )
-    except Exception as exc:
-        state["password"] = ""
-        raise HTTPException(401, f"Não foi possível conectar à IQ Option: {str(exc)[:250]}")
-
     iq_sessions[token] = state
 
     response.set_cookie(
@@ -2057,28 +2002,48 @@ async def iq_login(body: IQLoginBody, response: Response):
 
     return {
         "connected": True,
-        "message": "Mercado conectada.",
+        "message": "IQ Option conectada.",
         "email_masked": _mask_email(email),
         "session_token": token,
     }
 
 
 @app.post("/iq-logout")
-async def iq_logout(request: Request, response: Response):
-    header_token = request.headers.get("X-IQ-Session", "")
-    cookie_token = request.cookies.get(IQ_SESSION_COOKIE, "")
-    token = header_token if header_token in iq_sessions else cookie_token
+async def iq_logout(
+    request: Request,
+    response: Response,
+):
+    header_token = request.headers.get(
+        "X-IQ-Session",
+        "",
+    )
+    cookie_token = request.cookies.get(
+        IQ_SESSION_COOKIE,
+        "",
+    )
+
+    token = (
+        header_token
+        if header_token in iq_sessions
+        else cookie_token
+    )
+
     state = iq_sessions.pop(token, None)
 
     if state:
         state["password"] = ""
-        _iq_dispose_client(state)
         state["candle_cache"] = {}
+        _iq_close_state(state)
 
-    response.delete_cookie(IQ_SESSION_COOKIE, path="/")
+    response.delete_cookie(
+        IQ_SESSION_COOKIE,
+        path="/",
+    )
 
-    return {"connected": False, "message": "Conta IQ Option desconectada."}
-
+    return {
+        "connected": False,
+        "message": "IQ Option desconectada.",
+    }
 
 
 @app.post("/olymp-login")
@@ -2180,18 +2145,24 @@ async def otc_status(request: Request, broker: str = "IQ_OPTION"):
             "pairs": len(OTC_BASE),
         }
 
-    state = _iq_state_for_request(request, required=False)
-    configured = IQ_Option is not None and state is not None
-    connected = _iq_is_connected(state) if state else False
+    state = _iq_session_state(
+        request,
+        required=False,
+    )
+    connected = _iq_connected(state)
 
     return {
         "broker": "IQ_OPTION",
-        "configured": configured,
+        "configured": IQ_Option is not None,
         "connected": connected,
         "message": (
-            "IQ Option OTC configurada no servidor."
-            if configured
-            else "Configure IQ_EMAIL e IQ_PASSWORD no Render."
+            "IQ Option conectada pelo painel."
+            if connected
+            else (
+                "Faça login com e-mail e senha na aba Corretora."
+                if IQ_Option is not None
+                else "Biblioteca iqoptionapi não carregada no servidor."
+            )
         ),
         "pairs": len(OTC_BASE),
     }
@@ -2211,7 +2182,7 @@ async def candles_endpoint(
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
 
     n = max(20, min(int(n), 150))
-    state = _iq_state_for_request(request, required=False) if market == "IQ_OTC" else None
+    state = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
 
     try:
         if market == "IQ_OTC" and not state:
@@ -2222,10 +2193,10 @@ async def candles_endpoint(
                 "market": market,
                 "candles": [],
                 "status": "LOGIN NECESSÁRIO",
-                "message": "Configure IQ_EMAIL e IQ_PASSWORD no servidor para o OTC da IQ Option.",
+                "message": "Faça login na IQ Option pela aba Corretora para carregar o OTC real.",
             }
 
-        values = await candles(symbol, interval, n, market, state)
+        values = await candles(symbol, interval, n, market, state, request=request)
 
         return {
             "ok": True,
@@ -2283,20 +2254,20 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
     if symbol not in SYMBOLS or interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
 
-    state = _iq_state_for_request(request, required=False) if market == "IQ_OTC" else None
+    state = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
 
     if market == "IQ_OTC" and not state:
         return neutral_signal(
             symbol,
             interval,
             market,
-            "IQ OPTION OTC NÃO CONFIGURADA",
-            "Configure IQ_EMAIL e IQ_PASSWORD no Render para receber o OTC real da IQ Option.",
+            "LOGIN IQ OPTION NECESSÁRIO",
+            "Faça login na IQ Option pela aba Corretora para receber os candles OTC.",
             source_state="LOGIN_REQUIRED",
         )
 
     try:
-        return await signal(symbol, interval, market, state)
+        return await signal(symbol, interval, market, state, request=request)
     except Exception as exc:
         return neutral_signal(
             symbol,
@@ -2331,7 +2302,7 @@ async def radar(request: Request, interval="1min", market="OPEN"):
     if interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Intervalo ou mercado inválido.")
 
-    iq_state = _iq_state_for_request(request, required=False) if market == "IQ_OTC" else None
+    iq_state = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
 
     if market == "IQ_OTC" and not iq_state:
         return [
@@ -2339,7 +2310,7 @@ async def radar(request: Request, interval="1min", market="OPEN"):
                 "symbol": s + " • IQ OTC",
                 "direction": "NEUTRO",
                 "confidence": 0,
-                "status": "IQ OTC NÃO CONFIGURADA",
+                "status": "LOGIN IQ NECESSÁRIO",
             }
             for s in SYMBOLS
         ]
@@ -2424,7 +2395,7 @@ async def performance(request: Request, interval="1min", market="OPEN"):
         raise HTTPException(400, "Mercado inválido.")
 
     if market == "IQ_OTC":
-        state = _iq_state_for_request(request, required=True)
+        state = _iq_session_state(request, required=True)
         store = state.setdefault("results", {})
     else:
         # Chaveia por mercado para IQ/Olymp/Open não misturarem placar.
@@ -2457,7 +2428,7 @@ async def result(
     market=(market or "OPEN").upper()
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
-    state = _iq_state_for_request(request, required=True) if market == "IQ_OTC" else None
+    state = _iq_session_state(request, required=True) if market == "IQ_OTC" else None
     store = state.setdefault("results", {}) if market == "IQ_OTC" else results.setdefault(market, {})
     key = f"{market}|{symbol}|{interval}|{direction}|{expiry_time}"
 
@@ -2469,7 +2440,7 @@ async def result(
     if now() < expiry_dt:
         return {"status": "PENDENTE", "result": None}
 
-    cs = await candles(symbol, interval, 30, market, state)
+    cs = await candles(symbol, interval, 30, market, state, request=request)
 
     entry_dt = expiry_dt - timedelta(seconds=INTERVALS[interval])
 
