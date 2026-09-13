@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.5.2")
+app = FastAPI(title="MEGA IA", version="33.6.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -82,6 +82,9 @@ signal_release_state: Dict[str, Any] = {}
 oai_cache: Dict[str, Any] = {}
 results: Dict[str, Any] = {}
 radar_cache: Dict[str, Any] = {}
+pre_signal_cache: Dict[str, Any] = {}
+PRE_SIGNAL_TTL = 75
+PRE_SIGNAL_BATCH = 4
 
 td_sem = asyncio.Semaphore(1)
 td_candle_cache: Dict[str, Any] = {}
@@ -1918,7 +1921,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.5.2",
+        "version": "33.6.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -2412,6 +2415,188 @@ async def ai_analysis(request: Request, symbol: str = "EUR/USD", interval: str =
     return {k: data.get(k) for k in public_keys}
 
 
+def _pre_signal_from_live_candle(raw, interval: str):
+    """
+    Pré-sinal NÃO confirmado.
+    Avalia a vela atual ainda em formação como se fechasse naquele instante.
+    Serve apenas para avisar que um CALL/PUT está perto de confirmar.
+    """
+    if not raw or len(raw) < 35:
+        return None
+
+    preview = local_engine(raw, {"interval": interval})
+
+    if not preview.get("confirmed"):
+        return None
+
+    direction = preview.get("direction")
+    if direction not in ("CALL", "PUT"):
+        return None
+
+    confidence = float(preview.get("confidence", 0) or 0)
+
+    return {
+        "direction": direction,
+        "confidence": round(confidence, 1),
+        "strategy": preview.get("strategy", "Motor multiestratégia"),
+        "reason": preview.get("reason", "Condição técnica próxima de confirmar."),
+    }
+
+
+@app.get("/pre-signals")
+async def pre_signals(
+    request: Request,
+    interval: str = "1min",
+    market: str = "OPEN",
+    limit: int = 4,
+):
+    market = (market or "OPEN").upper()
+    limit = max(1, min(int(limit), 4))
+
+    if interval not in INTERVALS or market not in VALID_MARKETS:
+        raise HTTPException(400, "Intervalo ou mercado inválido.")
+
+    iq_state = (
+        _iq_session_state(request, required=False)
+        if market == "IQ_OTC"
+        else None
+    )
+
+    if market == "IQ_OTC" and not iq_state:
+        return {
+            "ok": False,
+            "message": "Faça login na IQ Option para monitorar pré-sinais OTC.",
+            "items": [],
+        }
+
+    if market == "OLYMP_OTC":
+        olymp_state = _olymp_session_state(request)
+        if (
+            not olymp_state
+            and (not OLYMPTRADE_TOKEN or OlympTradeClient is None)
+        ):
+            return {
+                "ok": False,
+                "message": "Olymptrade não conectada.",
+                "items": [],
+            }
+
+    entry_dt = next_boundary(interval)
+    seconds_to_entry = int(max(0, (entry_dt - now()).total_seconds()))
+
+    # A lista só representa "faltando até 1 minuto".
+    # Para M5/M15/M30 ela aparece apenas no último minuto da vela.
+    if seconds_to_entry > 60:
+        return {
+            "ok": True,
+            "message": f"Aguardando a janela de 1 minuto antes da próxima entrada ({seconds_to_entry}s).",
+            "items": [],
+            "seconds_to_entry": seconds_to_entry,
+        }
+
+    group_key = f"{market}|{interval}"
+    pointer_key = f"PRE_SIGNAL_INDEX|{group_key}"
+    pointer = int(cache.get(pointer_key, (0, 0))[1] or 0) % len(SYMBOLS)
+
+    batch_size = min(len(SYMBOLS), max(PRE_SIGNAL_BATCH, limit))
+    batch = [
+        SYMBOLS[(pointer + i) % len(SYMBOLS)]
+        for i in range(batch_size)
+    ]
+    cache[pointer_key] = (
+        time.time(),
+        (pointer + batch_size) % len(SYMBOLS),
+    )
+
+    # Remove candidatos vencidos.
+    now_ts = time.time()
+    stale_keys = []
+    for k, payload in pre_signal_cache.items():
+        if not k.startswith(group_key + "|"):
+            continue
+        if now_ts - float(payload.get("updated_at", 0)) > PRE_SIGNAL_TTL:
+            stale_keys.append(k)
+            continue
+        try:
+            if parse_dt(payload["entry_time"]) <= now():
+                stale_keys.append(k)
+        except Exception:
+            stale_keys.append(k)
+
+    for k in stale_keys:
+        pre_signal_cache.pop(k, None)
+
+    # Atualiza um lote por chamada para não sobrecarregar o feed OTC.
+    for symbol in batch:
+        key = f"{group_key}|{symbol}"
+        try:
+            raw = await candles(
+                symbol,
+                interval,
+                90,
+                market,
+                iq_state,
+                request=request,
+            )
+
+            preview = _pre_signal_from_live_candle(raw, interval)
+
+            if preview:
+                pre_signal_cache[key] = {
+                    "symbol": symbol,
+                    "direction": preview["direction"],
+                    "confidence": preview["confidence"],
+                    "strategy": preview["strategy"],
+                    "reason": preview["reason"],
+                    "entry_time": iso(entry_dt),
+                    "seconds_to_entry": seconds_to_entry,
+                    "updated_at": time.time(),
+                    "status": "PRÉ-SINAL • AGUARDANDO FECHAMENTO",
+                }
+            else:
+                pre_signal_cache.pop(key, None)
+
+        except Exception:
+            # Um ativo com erro não derruba os outros.
+            continue
+
+    items = []
+    for key, payload in pre_signal_cache.items():
+        if not key.startswith(group_key + "|"):
+            continue
+
+        try:
+            entry = parse_dt(payload["entry_time"])
+            remain = int(max(0, (entry - now()).total_seconds()))
+        except Exception:
+            continue
+
+        if remain > 60:
+            continue
+
+        item = dict(payload)
+        item["seconds_to_entry"] = remain
+        item.pop("updated_at", None)
+        items.append(item)
+
+    items.sort(
+        key=lambda x: (
+            -float(x.get("confidence", 0) or 0),
+            int(x.get("seconds_to_entry", 999)),
+        )
+    )
+
+    return {
+        "ok": True,
+        "message": (
+            "Pré-sinais calculados com a vela em formação. "
+            "O CALL/PUT só é confirmado no fechamento."
+        ),
+        "items": items[:limit],
+        "seconds_to_entry": seconds_to_entry,
+    }
+
+
 @app.get("/radar")
 async def radar(request: Request, interval="1min", market="OPEN"):
     market = (market or "OPEN").upper()
@@ -2834,7 +3019,27 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
   <div class="card">
     <b>Radar de oportunidades</b>
-    <div id="radar" class="radar"></div>
+    
+    <div class="card" style="margin-top:12px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+        <div>
+          <div class="label">PRÉ-SINAIS • ATÉ 1 MINUTO ANTES</div>
+          <small style="opacity:.75">Vela em formação — ainda não é entrada confirmada</small>
+        </div>
+        <select id="preSignalLimit" style="max-width:86px">
+          <option value="1">1 ativo</option>
+          <option value="2">2 ativos</option>
+          <option value="3">3 ativos</option>
+          <option value="4" selected>4 ativos</option>
+        </select>
+      </div>
+      <div id="preSignalStatus" style="margin-top:10px;font-size:12px;opacity:.8">
+        Monitorando...
+      </div>
+      <div id="preSignals" class="radar" style="margin-top:10px"></div>
+    </div>
+
+<div id="radar" class="radar"></div>
   </div>
 
   <div id="licenseCard" class="card" style="display:none">
@@ -2885,6 +3090,11 @@ function syncBroker(value){
 }
 
 try{
+  const savedLimit=Number(localStorage.getItem('mega_pre_signal_limit')||4);
+  if(preSignalLimit){
+    preSignalLimit.value=String(Math.max(1,Math.min(4,savedLimit)));
+  }
+
   const savedBroker=localStorage.getItem('mega_broker')||'IQ_OPTION';
   const savedMode=localStorage.getItem('mega_market_mode')||'OPEN';
   if(marketMode) marketMode.value=(savedMode==='OTC'?'OTC':'OPEN');
@@ -2893,6 +3103,10 @@ try{
 const interval=document.getElementById('interval');
 const voiceBtn=document.getElementById('voiceBtn');
 const otcNote=document.getElementById('otcNote');
+const preSignalLimit=document.getElementById('preSignalLimit');
+const preSignals=document.getElementById('preSignals');
+const preSignalStatus=document.getElementById('preSignalStatus');
+let preSignalBusy=false;
 const heroBox=document.getElementById('heroBox');
 const entryArrow=document.getElementById('entryArrow');
 const entryArrowIcon=document.getElementById('entryArrowIcon');
@@ -3350,6 +3564,12 @@ async function refreshAccountStatus(){
   await updateMarketNote();
 }
 
+if(preSignalLimit){
+  preSignalLimit.onchange=()=>{
+    loadPreSignals();
+  };
+}
+
 if(broker){
   broker.onchange=()=>{
     syncBroker(broker.value);
@@ -3359,6 +3579,7 @@ if(broker){
     chartData=[];
     sig(true);
     rad();
+    loadPreSignals();
     if(chartTab.classList.contains('active')) loadChart();
   };
 }
@@ -3372,6 +3593,7 @@ if(brokerAccount){
     chartData=[];
     sig(true);
     rad();
+    loadPreSignals();
     if(chartTab.classList.contains('active')) loadChart();
   };
 }
@@ -3413,6 +3635,12 @@ iqConnectBtn.onclick=async()=>{
     iqConnectBtn.disabled=false;
   }
 };
+
+if(interval){
+  interval.addEventListener('change',()=>{
+    loadPreSignals();
+  });
+}
 
 iqLogoutBtn.onclick=async()=>{
   const b=(brokerAccount&&brokerAccount.value)||broker.value||'IQ_OPTION';
@@ -3569,6 +3797,61 @@ async function rad(){
   }
 }
 
+
+async function loadPreSignals(){
+  if(preSignalBusy || !preSignals || !preSignalLimit) return;
+
+  preSignalBusy=true;
+
+  try{
+    const limit=Math.max(1,Math.min(4,Number(preSignalLimit.value||4)));
+
+    try{
+      localStorage.setItem('mega_pre_signal_limit',String(limit));
+    }catch(_){}
+
+    const d=await get(
+      '/pre-signals?market='+encodeURIComponent(market.value)+
+      '&interval='+encodeURIComponent(interval.value)+
+      '&limit='+encodeURIComponent(limit)
+    );
+
+    const items=(d&&Array.isArray(d.items))?d.items:[];
+
+    if(preSignalStatus){
+      preSignalStatus.textContent=d.message||'Monitorando pré-sinais...';
+    }
+
+    if(!items.length){
+      preSignals.innerHTML=
+        '<div style="opacity:.75">Nenhum CALL/PUT próximo de confirmar agora.</div>';
+      return;
+    }
+
+    preSignals.innerHTML=items.map(x=>{
+      const cls=x.direction==='CALL'?'call':'put';
+      const remain=Math.max(0,Number(x.seconds_to_entry||0));
+      return `
+        <div>
+          <b>${x.symbol}</b><br>
+          <span class="${cls}">PRÉ-${x.direction}</span>
+          • ${Number(x.confidence||0).toFixed(0)}%<br>
+          <b>⏳ ${remain}s para a próxima entrada</b><br>
+          <small>${x.status||'AGUARDANDO FECHAMENTO'}</small>
+        </div>
+      `;
+    }).join('');
+
+  }catch(e){
+    if(preSignalStatus){
+      preSignalStatus.textContent='Pré-sinais temporariamente indisponíveis.';
+    }
+    preSignals.innerHTML='';
+  }finally{
+    preSignalBusy=false;
+  }
+}
+
 async function lic(){
   try{
     const x=await get('/license');
@@ -3713,6 +3996,7 @@ marketMode.onchange=async()=>{
   chartData=[];
   sig(true);
   rad();
+  loadPreSignals();
   if(chartTab.classList.contains('active')) loadChart();
 };
 
@@ -3792,6 +4076,7 @@ async function bootApp(){
   safe('signal',()=>sig(false));
   safe('performance',perf);
   safe('radar',rad);
+  safe('pre-signals',loadPreSignals);
 
   if(chartTab.classList.contains('active')){
     safe('chart',loadChart);
@@ -3812,6 +4097,7 @@ setInterval(()=>{
 
 setInterval(perf,30000);
 setInterval(rad,20000);
+setInterval(loadPreSignals,15000);
 setInterval(resultCheck,3000);
 setInterval(clk,1000);
 setInterval(cd,250);
