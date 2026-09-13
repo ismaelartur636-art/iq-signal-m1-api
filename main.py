@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.10.1")
+app = FastAPI(title="MEGA IA", version="33.11.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2943,7 +2943,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.10.1",
+        "version": "33.11.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -4661,14 +4661,34 @@ function drawChart(a){
   const cw=w-pad.l-pad.r;
   const ch=h-pad.t-pad.b;
 
-  let lo=Math.min(...a.map(c=>Number(c.low)));
-  let hi=Math.max(...a.map(c=>Number(c.high)));
+  /*
+    VELA ATUAL SEMPRE NO CENTRO:
+    - a última vela recebida é considerada a vela atual/em formação;
+    - ela fica fixa exatamente no meio horizontal do gráfico;
+    - candles antigos caminham somente para a esquerda;
+    - a metade direita fica livre para o movimento futuro.
+  */
+  const currentIndex=a.length-1;
+  const centerX=pad.l+(cw/2);
+
+  // Quantidade aproximada de candles históricos visíveis na metade esquerda.
+  // Em telas pequenas mantém boa leitura sem tirar a vela atual do centro.
+  const visiblePast=Math.max(18,Math.min(36,a.length-1));
+  const candleSpacing=(cw/2)/Math.max(1,visiblePast);
+  const candleWidth=Math.max(2,Math.min(8,candleSpacing*.68));
+
+  // Escala vertical considera principalmente os candles que realmente aparecem.
+  const firstVisible=Math.max(0,currentIndex-visiblePast);
+  const visible=a.slice(firstVisible);
+
+  let lo=Math.min(...visible.map(c=>Number(c.low)));
+  let hi=Math.max(...visible.map(c=>Number(c.high)));
   const extra=(hi-lo)*.08||1;
 
   lo-=extra;
   hi+=extra;
 
-  const px=i=>pad.l+(i/(a.length-1||1))*cw;
+  const px=i=>centerX-((currentIndex-i)*candleSpacing);
   const py=v=>pad.t+(hi-v)/(hi-lo)*ch;
 
   chartCtx.strokeStyle='#19304a';
@@ -4676,6 +4696,7 @@ function drawChart(a){
   chartCtx.font='11px Arial';
   chartCtx.fillStyle='#8190a8';
 
+  // Linhas horizontais de preço
   for(let j=0;j<5;j++){
     const y=pad.t+j*ch/4;
     chartCtx.beginPath();
@@ -4687,10 +4708,31 @@ function drawChart(a){
     chartCtx.fillText(v.toFixed(5),4,y+4);
   }
 
-  const step=Math.max(2,cw/a.length*.72);
+  // Linha vertical fixa indicando onde SEMPRE fica a vela atual.
+  chartCtx.save();
+  chartCtx.strokeStyle='#6b86a8';
+  chartCtx.lineWidth=1;
+  chartCtx.setLineDash([5,5]);
+  chartCtx.beginPath();
+  chartCtx.moveTo(centerX,pad.t);
+  chartCtx.lineTo(centerX,h-pad.b);
+  chartCtx.stroke();
+  chartCtx.setLineDash([]);
 
+  chartCtx.font='bold 10px Arial';
+  chartCtx.textAlign='center';
+  chartCtx.fillStyle='#a8bbd3';
+  chartCtx.fillText('VELA ATUAL',centerX,pad.t+11);
+  chartCtx.restore();
+
+  // Desenha somente candles que cabem dentro da área visível.
   a.forEach((c,i)=>{
     const x=px(i);
+
+    if(x < pad.l-candleWidth || x > w-pad.r+candleWidth){
+      return;
+    }
+
     const o=Number(c.open);
     const cl=Number(c.close);
     const hh=Number(c.high);
@@ -4708,32 +4750,70 @@ function drawChart(a){
     const top=py(Math.max(o,cl));
     const bot=py(Math.min(o,cl));
 
-    chartCtx.fillRect(x-step/2,top,step,Math.max(1,bot-top));
+    chartCtx.fillRect(
+      x-candleWidth/2,
+      top,
+      candleWidth,
+      Math.max(1,bot-top)
+    );
 
-    if(i%Math.ceil(a.length/6)===0){
+    // Horários espaçados para não sobrepor texto.
+    const relative=currentIndex-i;
+    const labelEvery=Math.max(4,Math.round(visiblePast/5));
+
+    if(relative%labelEvery===0){
       chartCtx.fillStyle='#8190a8';
+      chartCtx.font='10px Arial';
+      chartCtx.textAlign='center';
       chartCtx.fillText(
-        new Date(c.datetime).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),
-        x-18,
+        new Date(c.datetime).toLocaleTimeString(
+          'pt-BR',
+          {hour:'2-digit',minute:'2-digit'}
+        ),
+        x,
         h-7
       );
     }
   });
 
+  // Reforça visualmente a vela atual no centro, sem mover a posição dela.
+  const current=a[currentIndex];
+  if(current){
+    const currentClose=Number(current.close);
+
+    chartCtx.save();
+    chartCtx.fillStyle='#d7e7fb';
+    chartCtx.font='bold 10px Arial';
+    chartCtx.textAlign='left';
+    chartCtx.fillText(
+      Number.isFinite(currentClose) ? currentClose.toFixed(5) : '',
+      Math.min(w-pad.r-48,centerX+7),
+      Math.max(pad.t+22,Math.min(h-pad.b-5,py(currentClose)-6))
+    );
+    chartCtx.restore();
+  }
+
+  // Marcador de CALL/PUT continua preso ao candle de referência correto.
   if(cur && cur.direction && cur.direction!=='NEUTRO' && cur.reference_candle){
     const idx=a.findIndex(c=>c.datetime===cur.reference_candle);
 
     if(idx>=0){
       const x=px(idx);
-      const v=cur.direction==='CALL'?Number(a[idx].low):Number(a[idx].high);
 
-      chartCtx.fillStyle=cur.direction==='CALL'?'#45ff9b':'#ff5c7a';
-      chartCtx.beginPath();
-      chartCtx.arc(x,py(v),6,0,Math.PI*2);
-      chartCtx.fill();
+      if(x>=pad.l && x<=w-pad.r){
+        const v=cur.direction==='CALL'
+          ? Number(a[idx].low)
+          : Number(a[idx].high);
 
-      chartCtx.font='bold 12px Arial';
-      chartCtx.fillText(cur.direction,x+8,py(v)-8);
+        chartCtx.fillStyle=cur.direction==='CALL'?'#45ff9b':'#ff5c7a';
+        chartCtx.beginPath();
+        chartCtx.arc(x,py(v),6,0,Math.PI*2);
+        chartCtx.fill();
+
+        chartCtx.font='bold 12px Arial';
+        chartCtx.textAlign='left';
+        chartCtx.fillText(cur.direction,x+8,py(v)-8);
+      }
     }
   }
 }
