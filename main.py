@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.21.0")
+app = FastAPI(title="MEGA IA", version="33.22.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -3257,7 +3257,9 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
 
 
 async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
-    """Modo ONLINE: a IA decide diretamente pelos candles, sem usar o motor técnico interno."""
+    """Modo ONLINE: a IA lê os mesmos candles do gráfico, inclusive a vela atual em formação.
+    A decisão final continua travada por ciclo para não repintar o sinal já liberado.
+    """
     if not OAI_KEY or not OAI_MODEL:
         return {
             "available": False,
@@ -3278,8 +3280,11 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
             "reason": "Sem candles fechados suficientes.",
         }
 
-    key = f"AI_ONLY|{market}|{symbol}|{interval}|{cs[-1]['datetime']}"
-    if key in oai_cache and time.time() - oai_cache[key][0] < 55:
+    live = cs[-1]
+    # Reavalia a formação do gráfico em blocos de ~20 s, sem chamar a API a cada polling de 5 s.
+    scan_bucket = int(time.time() // 20)
+    key = f"AI_ONLY|{market}|{symbol}|{interval}|{live['datetime']}|{scan_bucket}"
+    if key in oai_cache and time.time() - oai_cache[key][0] < 20:
         return oai_cache[key][1]
 
     data = [
@@ -3290,7 +3295,7 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
     prompt = f"""Você é a inteligência artificial autônoma da MEGA IA.
 Ativo: {symbol}. Timeframe: {interval}. Mercado: {market}.
 Este é o MODO IA PURA: não receba nem use sinais de RSI, MACD, Bollinger, médias, score técnico ou estratégias internas do aplicativo.
-Analise SOMENTE os candles fechados OHLCV fornecidos. Avalie contexto, sequência, força, rejeição, estrutura, momentum visível no preço e volume disponível.
+Analise SOMENTE os candles OHLCV fornecidos, que são os mesmos dados usados para desenhar o gráfico do painel. O último candle pode estar EM FORMAÇÃO; use-o apenas como contexto atual e não trate seu fechamento como definitivo. Avalie contexto, sequência, força, rejeição, estrutura, momentum visível no preço e volume disponível.
 Não invente dados futuros e seja conservador: se não houver vantagem clara, responda NEUTRO.
 Só confirme CALL ou PUT quando confidence >= {OAI_MIN:.0f} e risk não for HIGH.
 Retorne SOMENTE JSON válido:
@@ -3481,7 +3486,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             cache[key] = (time.time(), out)
             return out
 
-        ai = await openai_direct_signal(symbol, interval, closed, market)
+        ai = await openai_direct_signal(symbol, interval, raw, market)
         base = {
             "symbol": symbol,
             "interval": interval,
@@ -3491,11 +3496,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "entry_time": None,
             "announce_time": None,
             "expiry_time": None,
-            "status": "IA PURA • ANALISANDO",
+            "status": "IA PURA • ANALISANDO O GRÁFICO",
             "ai_confirmed": bool(ai.get("confirmed", False)),
             "risk": ai.get("risk", "HIGH"),
             "strategy": "IA PURA",
-            "reason": ai.get("reason") or "IA analisando somente candles fechados.",
+            "reason": ai.get("reason") or "IA analisando os mesmos candles exibidos no gráfico.",
             "non_repaint": True,
             "technical": {"disabled": True, "mode": "AI_ONLY"},
             "source_state": "READY" if ai.get("available") else "AI_UNAVAILABLE",
@@ -3509,7 +3514,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             base["entry_time"] = iso(entry)
             base["announce_time"] = iso(announce)
             base["expiry_time"] = iso(expiry)
-            base["reference_candle"] = closed[-1]["datetime"] if closed else None
+            base["reference_candle"] = raw[-1]["datetime"] if raw else None
         elif not ai.get("available"):
             base["status"] = "IA INDISPONÍVEL"
 
