@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.33.0")
+app = FastAPI(title="MEGA IA", version="33.33.1")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2652,8 +2652,11 @@ def json_extract(text):
 
 
 def _td_cache_ttl(interval: str) -> float:
+    # No M1, uma atualização por minuto é suficiente para o ciclo
+    # 4 min + confirmação 1 min. Isso reduz bastante o consumo da API
+    # sem reaproveitar a mesma leitura na confirmação do minuto seguinte.
     sec = int(INTERVALS.get(interval, 60))
-    return max(35.0, min(180.0, sec * 0.45))
+    return max(55.0, min(240.0, sec * 0.90))
 
 
 def _td_cache_age(symbol: str, interval: str) -> float:
@@ -3125,6 +3128,66 @@ async def candles(
     if symbol not in SYMBOLS or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
 
+    # MERCADO ABERTO: quando existe uma sessão IQ Option conectada,
+    # prioriza os candles do próprio broker. Além de espelhar melhor o
+    # gráfico/sinal, isso evita depender da cota da Twelve Data. Se a IQ
+    # falhar ou não estiver logada, o código cai automaticamente para
+    # Twelve Data abaixo.
+    if market == "OPEN":
+        if iq_state is None and request is not None:
+            try:
+                iq_state = _iq_session_state(request, required=False)
+            except Exception:
+                iq_state = None
+
+        if iq_state is not None:
+            cache_key = f"REGULAR|{symbol}|{interval}"
+            candle_cache = iq_state.setdefault("candle_cache", {})
+            cached = candle_cache.get(cache_key)
+
+            if (
+                cached
+                and time.time() - cached[0] < max(5.0, IQ_CANDLE_CACHE_TTL)
+                and len(cached[1]) >= min(int(n), 20)
+            ):
+                return cached[1][-int(n):]
+
+            lock = iq_state.get("lock")
+            if lock is None:
+                lock = asyncio.Lock()
+                iq_state["lock"] = lock
+
+            try:
+                async with lock:
+                    cached = candle_cache.get(cache_key)
+                    if (
+                        cached
+                        and time.time() - cached[0] < max(5.0, IQ_CANDLE_CACHE_TTL)
+                        and len(cached[1]) >= min(int(n), 20)
+                    ):
+                        return cached[1][-int(n):]
+
+                    data = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            iq_candles_blocking,
+                            iq_state,
+                            symbol,
+                            interval,
+                            max(80, int(n)),
+                            True,
+                        ),
+                        timeout=IQ_CANDLE_TIMEOUT + 5,
+                    )
+                    if data:
+                        candle_cache[cache_key] = (time.time(), data)
+                        return data[-int(n):]
+            except Exception:
+                # A sessão IQ pode estar reconectando; nesse caso não derruba
+                # o mercado aberto: usa a Twelve Data como fallback.
+                stale = candle_cache.get(cache_key)
+                if stale and time.time() - stale[0] < 90:
+                    return stale[1][-int(n):]
+
     if market == "OLYMP_OTC":
         return await candles_olymp(
             symbol,
@@ -3572,17 +3635,22 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         return out
 
     if market == "OPEN":
-        age = _td_cache_age(symbol, interval)
-        safe_age = max(75.0, INTERVALS[interval] * 0.75)
-        if age > safe_age:
-            out = neutral_signal(
-                symbol, interval, market,
-                "AGUARDANDO DADOS ATUALIZADOS",
-                "A fonte de mercado está temporariamente limitada. Nenhuma entrada será liberada com candles antigos.",
-                source_state="WAITING",
-            )
-            cache[key] = (time.time(), out)
-            return out
+        # Candles vindos da IQ Option carregam o campo ``source``. Nesse
+        # caso não devemos validar a idade do cache da Twelve Data, pois
+        # ela pode nem ter sido chamada.
+        using_iq_feed = bool(raw and isinstance(raw[-1], dict) and raw[-1].get("source"))
+        if not using_iq_feed:
+            age = _td_cache_age(symbol, interval)
+            safe_age = max(75.0, INTERVALS[interval] * 0.75)
+            if age > safe_age:
+                out = neutral_signal(
+                    symbol, interval, market,
+                    "AGUARDANDO DADOS ATUALIZADOS",
+                    "A fonte de mercado está temporariamente limitada. Nenhuma entrada será liberada com candles antigos.",
+                    source_state="WAITING",
+                )
+                cache[key] = (time.time(), out)
+                return out
 
     closed = raw[:-1] if len(raw) > 1 else raw
 
