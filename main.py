@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.5.1")
+app = FastAPI(title="MEGA IA", version="33.5.2")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -1918,7 +1918,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.5.1",
+        "version": "33.5.2",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -3102,7 +3102,14 @@ function iqSessionToken(){
 }
 
 function authHeaders(extra={}){
-  return {...extra};
+  const h={...extra};
+  try{
+    const iqSession=localStorage.getItem('mega_iq_session')||'';
+    if(iqSession){
+      h['X-IQ-Session']=iqSession;
+    }
+  }catch(_){}
+  return h;
 }
 
 
@@ -3385,6 +3392,11 @@ iqConnectBtn.onclick=async()=>{
   try{
     const url=b==='OLYMPTRADE'?'/olymp-login':'/iq-login';
     const d=await post(url,{email,password});
+    if(b==='IQ_OPTION' && d && d.session_token){
+      try{
+        localStorage.setItem('mega_iq_session',d.session_token);
+      }catch(_){}
+    }
     brokerConnected[b]=true;
     iqPassword.value='';
     iqAccountStatus.textContent='🟢 '+(d.message||'Conectada.');
@@ -3407,6 +3419,11 @@ iqLogoutBtn.onclick=async()=>{
   try{
     await post(b==='OLYMPTRADE'?'/olymp-logout':'/iq-logout',{});
   }catch(_){}
+  if(b==='IQ_OPTION'){
+    try{
+      localStorage.removeItem('mega_iq_session');
+    }catch(_){}
+  }
   brokerConnected[b]=false;
   iqPassword.value='';
   syncBroker(b);
