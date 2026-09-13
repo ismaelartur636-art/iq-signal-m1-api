@@ -4,33 +4,23 @@ import time
 import json
 import re
 import secrets
+import threading
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict
 
 import httpx
 
-IQ_IMPORT_ERROR = ""
-try:
-    from iqoptionapi.aio import AsyncIQOption
-except Exception as exc:
-    AsyncIQOption = None
-    IQ_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
-
-# Login principal: usa a API estável que já funcionava nas versões anteriores.
-# O cliente assíncrono acima é mantido somente como fallback de compatibilidade.
 try:
     from iqoptionapi.stable_api import IQ_Option
-except Exception as exc:
+except Exception:
     IQ_Option = None
-    if not IQ_IMPORT_ERROR:
-        IQ_IMPORT_ERROR = f"stable_api: {type(exc).__name__}: {exc}"
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="32.10.0")
+app = FastAPI(title="MEGA IA", version="32.7.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -46,6 +36,10 @@ OAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
 OAI_MIN = float(os.getenv("OPENAI_MIN_CONFIDENCE", "70"))
 OAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "15"))
 
+LICENSE = os.getenv("LICENSE_EXPIRES", "2026-12-31")
+WA1 = os.getenv("WHATSAPP_1", "55 84 99841-1282")
+WA2 = os.getenv("WHATSAPP_2", "55 84 99449-9442")
+IG = os.getenv("INSTAGRAM", "@Ismaelartur26")
 
 TD_URL = "https://api.twelvedata.com/time_series"
 OAI_URL = "https://api.openai.com/v1/responses"
@@ -90,49 +84,6 @@ iq_sessions: Dict[str, Dict[str, Any]] = {}
 class IQLoginBody(BaseModel):
     email: str
     password: str
-
-
-class IQ2FABody(BaseModel):
-    code: str
-
-
-class IQTwoFactorRequired(RuntimeError):
-    pass
-
-
-class StableIQOptionAdapter:
-    """Adapta IQ_Option (stable_api) à interface assíncrona usada pelo painel."""
-    def __init__(self, raw_client):
-        self._raw = raw_client
-        # O restante do código só verifica se _ws existe.
-        self._ws = self
-
-    def check_connect(self):
-        try:
-            return bool(self._raw.check_connect())
-        except Exception:
-            return False
-
-    async def get_candles(self, active, size, count, endtime, timeout=None):
-        limit = float(timeout or IQ_CANDLE_TIMEOUT)
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                self._raw.get_candles, active, int(size), int(count), int(endtime)
-            ),
-            timeout=max(3.0, limit),
-        )
-
-    def _close_blocking(self):
-        try:
-            api = getattr(self._raw, "api", None)
-            if api is not None and hasattr(api, "close"):
-                api.close()
-        except Exception:
-            pass
-
-    async def close(self):
-        await asyncio.to_thread(self._close_blocking)
-        self._ws = None
 
 
 def now():
@@ -659,7 +610,12 @@ def iq_seconds(interval):
 
 def _iq_is_connected(state):
     client = state.get("client")
-    return bool(client is not None and getattr(client, "_ws", None) is not None)
+    if client is None:
+        return False
+    try:
+        return bool(client.check_connect())
+    except Exception:
+        return False
 
 
 def _iq_dispose_client(state):
@@ -668,33 +624,25 @@ def _iq_dispose_client(state):
     if client is None:
         return
     try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(client.close())
-    except RuntimeError:
-        pass
+        api = getattr(client, "api", None)
+        if api is not None:
+            try:
+                api.close()
+            except Exception:
+                pass
     except Exception:
         pass
-
-
-async def _iq_close_client(state):
-    client = state.get("client")
-    state["client"] = None
-    if client is not None:
-        try:
-            await client.close()
-        except Exception:
-            pass
+    time.sleep(0.15)
 
 
 def _iq_mark_failure(state, message):
-    """Registra a falha sem iniciar ciclos automáticos de reconexão."""
     failures = int(state.get("failure_count", 0)) + 1
     state["failure_count"] = failures
-    state["reconnect_after"] = 0.0
-    state["reconnecting"] = False
+    delay = min(IQ_RECONNECT_MAX_DELAY, IQ_RECONNECT_BASE_DELAY * (2 ** min(failures - 1, 4)))
+    state["reconnect_after"] = time.time() + delay
     state["last_error"] = str(message)[:350]
     _iq_dispose_client(state)
-    return 0
+    return delay
 
 
 def _iq_mark_connected(state, client):
@@ -704,117 +652,44 @@ def _iq_mark_connected(state, client):
     state["reconnect_after"] = 0.0
     state["last_seen"] = time.time()
     state["last_connected"] = time.time()
-    state["requires_2fa"] = False
     return client
 
 
-def _iq_reason_text(reason):
-    if reason is None:
-        return ""
-    if isinstance(reason, (dict, list, tuple)):
-        try:
-            return json.dumps(reason, ensure_ascii=False)
-        except Exception:
-            return str(reason)
-    return str(reason)
-
-
-def _iq_reason_requires_2fa(reason):
-    t = _iq_reason_text(reason).lower()
-    return any(x in t for x in (
-        "2fa", "two-factor", "two factor", "two_factor",
-        "verification", "verify", "otp", "sms code", "auth code"
-    ))
-
-
-iq_login_diag = {"stage": "idle", "detail": "", "updated_at": 0.0}
-
-
-def _set_iq_login_diag(stage: str, detail: str = ""):
-    iq_login_diag["stage"] = stage
-    iq_login_diag["detail"] = str(detail)[:240]
-    iq_login_diag["updated_at"] = time.time()
-
-
-
-async def _iq_connect_official(email: str, password: str):
-    """Login isolado da IQ Option sem alterar painel, sinais ou estratégia.
-
-    Prioriza stable_api (mesma família usada nas versões anteriores do projeto).
-    Mantém o cliente assíncrono somente como fallback caso stable_api não esteja
-    disponível no ambiente do Render.
+def _iq_lowlevel_connect_worker(client, result_box):
     """
-    _set_iq_login_diag("official_connect_start", "Iniciando conexão IQ Option.")
+    Conecta somente a camada HTTP/WebSocket necessária para leitura de candles.
 
-    if IQ_Option is not None:
-        raw = None
-        try:
-            _set_iq_login_diag("stable_login_request", "stable_api")
-            raw = IQ_Option(email, password)
-            result = await asyncio.wait_for(asyncio.to_thread(raw.connect), timeout=25.0)
-
-            if isinstance(result, (tuple, list)):
-                ok = bool(result[0]) if result else False
-                reason = result[1] if len(result) > 1 else ""
-            else:
-                ok = bool(result)
-                reason = ""
-
-            if not ok:
-                if _iq_reason_requires_2fa(reason):
-                    raise IQTwoFactorRequired(_iq_reason_text(reason))
-                raise RuntimeError(f"Login IQ Option recusado: {_iq_reason_text(reason)[:180]}")
-
-            # Dá alguns segundos para o websocket estabilizar.
-            connected = False
-            for _ in range(20):
-                try:
-                    if bool(raw.check_connect()):
-                        connected = True
-                        break
-                except Exception:
-                    pass
-                await asyncio.sleep(0.25)
-
-            if not connected:
-                raise RuntimeError("Login aceito, mas o websocket da IQ Option não permaneceu conectado.")
-
-            client = StableIQOptionAdapter(raw)
-            _set_iq_login_diag("websocket_authenticated", "stable_api conectada.")
-            return client
-
-        except asyncio.TimeoutError as exc:
-            _set_iq_login_diag("stable_connect_timeout", "stable_api excedeu 25s")
-            raise RuntimeError("A IQ Option não respondeu ao login dentro de 25s.") from exc
-        except IQTwoFactorRequired:
-            raise
-        except Exception as exc:
-            _set_iq_login_diag("stable_connect_failed", f"{type(exc).__name__}: {str(exc)[:180]}")
-            raise
-
-    # Fallback: preserva exatamente a integração assíncrona existente.
-    if AsyncIQOption is None:
-        raise RuntimeError(f"Cliente IQ Option não carregado no servidor. {IQ_IMPORT_ERROR}")
-
-    login_url = os.getenv("IQ_LOGIN_URL", "https://auth.iqoption.com/api/v2/login").strip()
-    wss_url = os.getenv("IQ_WSS_URL", "wss://iqoption.com/echo/websocket").strip()
-    client = AsyncIQOption(email, password, login_url=login_url, wss_url=wss_url)
+    Motivo:
+    algumas versões antigas de iqoptionapi ficam presas dentro de
+    stable_api.IQ_Option.connect() esperando global_value.balance_id sem timeout.
+    Para este painel não precisamos de saldo/ordens; precisamos apenas do websocket
+    e dos candles OTC.
+    """
     try:
-        await asyncio.wait_for(client.connect(), timeout=20.0)
-        if getattr(client, "_ws", None) is None:
-            await client.close()
-            raise RuntimeError("A IQ Option não manteve o WebSocket conectado.")
-        _set_iq_login_diag("websocket_authenticated", "Cliente assíncrono conectado.")
-        return client
-    except asyncio.TimeoutError as exc:
-        raise RuntimeError("A autenticação da IQ Option não respondeu dentro de 20s.") from exc
+        from iqoptionapi.api import IQOptionAPI
+
+        api = IQOptionAPI("iqoption.com", client.email, client.password)
+        api.set_session(
+            headers=getattr(client, "SESSION_HEADER", {}),
+            cookies=getattr(client, "SESSION_COOKIE", {}),
+        )
+
+        client.api = api
+        check, reason = api.connect()
+
+        result_box["check"] = bool(check)
+        result_box["reason"] = reason
+
+    except Exception as exc:
+        result_box["error"] = repr(exc)
 
 
-async def iq_connect_async(state, force=False):
-    if IQ_Option is None and AsyncIQOption is None:
-        raise RuntimeError("Cliente da IQ Option não carregado no servidor.")
+def iq_connect_blocking(state, force=False):
+    if IQ_Option is None:
+        raise RuntimeError("Biblioteca IQ Option não carregada no servidor.")
 
     now_ts = time.time()
+
     if not force and _iq_is_connected(state):
         return state.get("client")
 
@@ -824,64 +699,178 @@ async def iq_connect_async(state, force=False):
         raise RuntimeError(f"IQ Option reconectando. Nova tentativa em {wait}s.")
 
     if force:
-        await _iq_close_client(state)
+        _iq_dispose_client(state)
 
     email = state.get("email", "")
     password = state.get("password", "")
+
     if not email or not password:
         raise RuntimeError("Sessão IQ Option sem credenciais ativas. Conecte novamente.")
 
+    last_attempt = float(state.get("last_attempt", 0.0) or 0.0)
+    if now_ts - last_attempt < 2.5:
+        raise RuntimeError("IQ Option reconectando. Aguarde alguns segundos.")
+
     state["last_attempt"] = now_ts
     state["reconnecting"] = True
-    state["requires_2fa"] = False
+    state["login_stage"] = "CRIANDO CLIENTE"
 
-    client = None
-    state["client"] = None
     try:
-        # Usa exclusivamente a conexão oficial da biblioteca; sem endpoints alternativos.
-        client = await _iq_connect_official(email, password)
+        client = IQ_Option(email, password)
         state["client"] = client
-        if getattr(client, "_ws", None) is None:
-            raise RuntimeError("A IQ Option não manteve o websocket conectado.")
-        return _iq_mark_connected(state, client)
-    except Exception as exc:
-        msg = f"{type(exc).__name__}: {exc}"
-        if _iq_reason_requires_2fa(msg):
-            state["requires_2fa"] = True
-            state["last_error"] = (
-                "A conta exige 2FA. O cliente assíncrono atual da biblioteca "
-                "ainda não implementa a etapa de verificação."
+
+        # Não usamos client.connect() aqui. Em versões antigas da biblioteca,
+        # ele pode ficar preso para sempre esperando balance_id.
+        state["login_stage"] = "ABRINDO HTTP/WEBSOCKET"
+
+        result_box = {}
+        worker = threading.Thread(
+            target=_iq_lowlevel_connect_worker,
+            args=(client, result_box),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=22.0)
+
+        if worker.is_alive():
+            try:
+                api = getattr(client, "api", None)
+                if api is not None:
+                    api.close()
+            except Exception:
+                pass
+
+            delay = _iq_mark_failure(
+                state,
+                "A camada HTTP/WebSocket da IQ Option não respondeu em 22 segundos."
             )
-            await _iq_close_client(state)
-            raise IQTwoFactorRequired(state["last_error"])
-        _iq_mark_failure(state, msg)
-        raise RuntimeError(f"Falha no login/websocket IQ Option: {msg[:260]}.")
+            raise RuntimeError(
+                f"A IQ Option não respondeu ao servidor. Nova tentativa em {int(delay)}s."
+            )
+
+        if "error" in result_box:
+            delay = _iq_mark_failure(state, result_box["error"])
+            raise RuntimeError(
+                f"Erro ao abrir conexão IQ Option. Nova tentativa em {int(delay)}s."
+            )
+
+        ok = bool(result_box.get("check"))
+        reason = result_box.get("reason")
+
+        if not ok:
+            reason_text = str(reason or "").strip()
+            low = reason_text.lower()
+
+            if reason_text == "2FA" or "2fa" in low:
+                _iq_dispose_client(state)
+                state["last_error"] = "Conta com autenticação em duas etapas (2FA)."
+                state["reconnect_after"] = 0.0
+                raise RuntimeError(
+                    "Sua conta IQ Option está pedindo 2FA. Desative temporariamente o 2FA para este login."
+                )
+
+            if "invalid_credentials" in low or "wrong credentials" in low:
+                _iq_dispose_client(state)
+                state["last_error"] = "Credenciais inválidas."
+                state["reconnect_after"] = 0.0
+                raise RuntimeError("E-mail ou senha da IQ Option estão incorretos.")
+
+            delay = _iq_mark_failure(
+                state,
+                f"Falha no login IQ Option: {reason_text or 'sem motivo retornado'}"
+            )
+            raise RuntimeError(
+                f"A IQ Option recusou a conexão: {reason_text or 'sem motivo retornado'}. "
+                f"Nova tentativa em {int(delay)}s."
+            )
+
+        state["login_stage"] = "VALIDANDO WEBSOCKET"
+
+        ready = False
+        for _ in range(24):
+            try:
+                if bool(client.check_connect()):
+                    ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.25)
+
+        if not ready:
+            delay = _iq_mark_failure(
+                state,
+                "Login HTTP respondeu, mas o websocket não ficou conectado."
+            )
+            raise RuntimeError(
+                f"Login aceito, mas o websocket da IQ Option não ficou ativo. "
+                f"Nova tentativa em {int(delay)}s."
+            )
+
+        state["login_stage"] = "CONECTADO"
+        return _iq_mark_connected(state, client)
+
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        delay = _iq_mark_failure(state, f"Erro ao abrir conexão IQ Option: {exc}")
+        raise RuntimeError(
+            f"Falha ao conectar à IQ Option. Nova tentativa em {int(delay)}s."
+        )
     finally:
         state["reconnecting"] = False
 
 
-async def iq_candles_async(state, symbol, interval, n):
+def _iq_get_candles_once(client, active, duration, count, endtime):
+    try:
+        import iqoptionapi.constants as iq_constants
+    except Exception as exc:
+        raise RuntimeError(f"Constantes IQ Option indisponíveis: {exc}")
+
+    active_id = iq_constants.ACTIVES.get(active)
+    if active_id is None:
+        raise RuntimeError(f"Ativo OTC não reconhecido pela biblioteca: {active}")
+
+    api = getattr(client, "api", None)
+    if api is None:
+        raise RuntimeError("Cliente IQ Option sem websocket ativo.")
+
+    candles_obj = getattr(api, "candles", None)
+    if candles_obj is None:
+        raise RuntimeError("Canal de candles da IQ Option não inicializado.")
+
+    candles_obj.candles_data = None
+    api.getcandles(active_id, duration, count, endtime)
+
+    deadline = time.monotonic() + IQ_CANDLE_TIMEOUT
+    while time.monotonic() < deadline:
+        data = candles_obj.candles_data
+        if data is not None:
+            return data
+        try:
+            if not client.check_connect():
+                raise RuntimeError("Websocket IQ Option desconectou durante a leitura de candles.")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Falha ao verificar websocket IQ Option: {exc}")
+        time.sleep(0.05)
+
+    raise TimeoutError(f"IQ Option não respondeu candles em {IQ_CANDLE_TIMEOUT:.0f}s.")
+
+
+def iq_candles_blocking(state, symbol, interval, n):
     duration = iq_seconds(interval)
     candidates = iq_active_candidates(symbol)
     errors = []
-
-    # Candles OTC nunca disparam reconexão automática.
-    # A conexão só é iniciada quando o usuário toca em "Conectar".
-    if not _iq_is_connected(state):
-        raise RuntimeError(
-            "IQ Option desconectada. O MEGA IA continua ativo; para OTC, conecte manualmente na aba Conta IQ Option."
-        )
-    client = state.get("client")
+    client = iq_connect_blocking(state, force=False)
 
     for name in candidates:
         try:
-            chunk = await client.get_candles(
-                active=name,
-                size=duration,
-                count=int(n),
-                endtime=int(time.time()),
-                timeout=IQ_CANDLE_TIMEOUT,
-            )
+            if not _iq_is_connected(state):
+                raise RuntimeError("sessão desconectada antes de get_candles")
+
+            chunk = _iq_get_candles_once(client, name, duration, n, time.time())
+
             if chunk and len(chunk) >= 5:
                 out = []
                 for x in chunk:
@@ -899,17 +888,25 @@ async def iq_candles_async(state, symbol, interval, n):
                         })
                     except Exception:
                         continue
+
                 out.sort(key=lambda z: z["datetime"])
                 if len(out) >= 5:
                     _iq_mark_connected(state, client)
                     return out
+
             errors.append(f"{name}: sem candles")
+
         except Exception as exc:
-            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+            msg = str(exc) or exc.__class__.__name__
+            errors.append(f"{name}: {msg}")
+            low = msg.lower()
+            if any(k in low for k in ("reconnect", "disconnect", "is_ssl", "websocket", "closed", "timeout", "timed out", "sock")):
+                delay = _iq_mark_failure(state, msg)
+                raise RuntimeError(f"Conexão OTC caiu. Reconectando em {int(delay)}s.")
 
     detail = " | ".join(errors[-3:])
-    _iq_mark_failure(state, f"OTC sem candles. {detail}")
-    raise RuntimeError(f"OTC sem candles. {detail[:220]}.")
+    delay = _iq_mark_failure(state, f"OTC sem candles. {detail}")
+    raise RuntimeError(f"OTC sem candles. Nova tentativa em {int(delay)}s.")
 
 
 async def candles(symbol, interval, n=80, market="OPEN", iq_state=None):
@@ -920,12 +917,6 @@ async def candles(symbol, interval, n=80, market="OPEN", iq_state=None):
             raise HTTPException(400, "Ativo ou intervalo inválido.")
         if iq_state is None:
             raise HTTPException(401, "Conecte sua conta da IQ Option na aba Conta IQ Option.")
-
-        if not _iq_is_connected(iq_state):
-            raise HTTPException(
-                503,
-                "IQ Option OTC desconectada. O MEGA IA continua ativo; conecte manualmente para usar candles OTC."
-            )
 
         ckey = f"{symbol}|{interval}"
         candle_cache = iq_state.setdefault("candle_cache", {})
@@ -952,8 +943,8 @@ async def candles(symbol, interval, n=80, market="OPEN", iq_state=None):
 
                 fetch_n = max(100, min(150, int(n)))
                 out = await asyncio.wait_for(
-                    iq_candles_async(iq_state, symbol, interval, fetch_n),
-                    timeout=max(15.0, IQ_CANDLE_TIMEOUT + 5.0),
+                    asyncio.to_thread(iq_candles_blocking, iq_state, symbol, interval, fetch_n),
+                    timeout=15,
                 )
                 candle_cache[ckey] = (time.time(), out)
 
@@ -1086,8 +1077,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
         if iq_state.get("reconnecting") or time.time() < ra:
             neutral = neutral_signal(
                 symbol, interval, market,
-                "IQ OPTION DESCONECTADA",
-                "A IQ Option OTC está desconectada. O MEGA IA continua ativo, mas nenhuma entrada OTC será liberada até conexão manual.",
+                "IQ OPTION RECONECTANDO",
+                "A sessão OTC está sendo restaurada. Nenhuma entrada será liberada até a conexão voltar.",
                 source_state="WAITING",
             )
             cache[key] = (time.time(), neutral)
@@ -1099,13 +1090,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
         status = (
             "FONTE EM LIMITE"
             if market == "OPEN" and exc.status_code in (429, 503)
-            else ("IQ OPTION DESCONECTADA" if market == "OTC" else "FONTE INDISPONÍVEL")
+            else ("IQ OPTION RECONECTANDO" if market == "OTC" else "FONTE INDISPONÍVEL")
         )
         out = neutral_signal(symbol, interval, market, status, exc.detail, source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
     except Exception as exc:
-        status = "IQ OPTION DESCONECTADA" if market == "OTC" else "FONTE INDISPONÍVEL"
+        status = "IQ OPTION RECONECTANDO" if market == "OTC" else "FONTE INDISPONÍVEL"
         out = neutral_signal(symbol, interval, market, status, str(exc), source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
@@ -1205,7 +1196,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "32.10.0",
+        "version": "32.7.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -1215,7 +1206,7 @@ async def health():
             "last_reason": td_backoff_reason[:120],
         },
         "iq_option": {
-            "library": bool(IQ_Option is not None or AsyncIQOption is not None),
+            "library": bool(IQ_Option is not None),
             "sessions": len(iq_sessions),
         },
         "openai": {
@@ -1228,6 +1219,26 @@ async def health():
 @app.get("/server-time")
 async def server_time():
     return {"datetime": iso(now()), "timezone": "America/Sao_Paulo"}
+
+
+@app.get("/license")
+async def license_info():
+    try:
+        exp = datetime.strptime(LICENSE, "%Y-%m-%d").date()
+        active = now().date() <= exp
+    except Exception:
+        active = False
+
+    if active:
+        return {"active": True}
+
+    return {
+        "active": False,
+        "message": "Licença expirada. Entre em contato para renovar o aplicativo.",
+        "whatsapp_1": WA1,
+        "whatsapp_2": WA2,
+        "instagram": IG,
+    }
 
 
 @app.get("/mega-ia.png")
@@ -1262,20 +1273,20 @@ async def mega_ia_icon_192():
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = {
-        "id": "/mega-ia-trader-v3290",
+        "id": "/mega-ia-trader-v34",
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v3290",
+        "start_url": "/?pwa=v34",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=3282", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=3282", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=3282", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=34", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=34", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=34", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -1285,312 +1296,73 @@ async def manifest():
     )
 
 
-
-@app.get("/iq-diagnostic")
-async def iq_diagnostic():
-    info = {
-        "app_version": "32.10.0",
-        "iq_async_library_loaded": AsyncIQOption is not None,
-        "iq_stable_library_loaded": IQ_Option is not None,
-        "import_error": IQ_IMPORT_ERROR if AsyncIQOption is None else "",
-        "active_sessions": len(iq_sessions),
-    }
-    if AsyncIQOption is not None:
-        try:
-            import iqoptionapi
-            info["iqoptionapi_module"] = getattr(iqoptionapi, "__file__", "")
-            info["iqoptionapi_version"] = getattr(iqoptionapi, "__version__", "")
-        except Exception as exc:
-            info["module_probe_error"] = f"{type(exc).__name__}: {exc}"
-    return info
-
-
-
-@app.get("/iq-network-test")
-async def iq_network_test():
-    """Testa endpoints alternativos da IQ Option sem usar e-mail nem senha."""
-    result = {
-        "app_version": "32.10.0",
-        "http": {},
-        "websocket": {},
-    }
-
-    try:
-        import aiohttp
-        import socket
-    except Exception as exc:
-        result["fatal"] = f"dependencia indisponivel: {type(exc).__name__}: {exc}"
-        return result
-
-    # DNS ajuda a separar falha de resolução de falha de rota/conexão.
-    hosts = ["auth.iqoption.com", "api.iqoption.com", "iqoption.com", "ws.iqoption.com"]
-    dns = {}
-    for host in hosts:
-        try:
-            infos = await asyncio.wait_for(
-                asyncio.to_thread(socket.getaddrinfo, host, 443, type=socket.SOCK_STREAM),
-                timeout=5,
-            )
-            ips = []
-            for info in infos:
-                ip = info[4][0]
-                if ip not in ips:
-                    ips.append(ip)
-            dns[host] = {"ok": True, "ips": ips[:6]}
-        except Exception as exc:
-            dns[host] = {
-                "ok": False,
-                "error_type": type(exc).__name__,
-                "error": str(exc)[:200],
-            }
-    result["dns"] = dns
-
-    http_urls = [
-        "https://auth.iqoption.com/api/v2/login",
-        "https://api.iqoption.com/v2/login",
-        "https://iqoption.com/",
-    ]
-    ws_urls = [
-        "wss://iqoption.com/echo/websocket",
-        "wss://ws.iqoption.com/echo/websocket",
-    ]
-
-    timeout = aiohttp.ClientTimeout(total=12, connect=8, sock_read=8)
-    connector = aiohttp.TCPConnector(family=socket.AF_UNSPEC, ttl_dns_cache=0)
-
-    try:
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            for url in http_urls:
-                try:
-                    async with session.get(
-                        url,
-                        allow_redirects=False,
-                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.6"},
-                    ) as resp:
-                        result["http"][url] = {
-                            "ok": True,
-                            "status": resp.status,
-                            "server": resp.headers.get("server", ""),
-                            "location": resp.headers.get("location", ""),
-                            "content_type": resp.headers.get("content-type", ""),
-                        }
-                except Exception as exc:
-                    result["http"][url] = {
-                        "ok": False,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc)[:300],
-                    }
-
-            for url in ws_urls:
-                try:
-                    ws = await session.ws_connect(
-                        url,
-                        timeout=10,
-                        heartbeat=20,
-                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.6"},
-                    )
-                    result["websocket"][url] = {
-                        "ok": True,
-                        "closed": bool(ws.closed),
-                        "close_code": ws.close_code,
-                    }
-                    await ws.close()
-                except Exception as exc:
-                    result["websocket"][url] = {
-                        "ok": False,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc)[:300],
-                    }
-    except Exception as exc:
-        result["fatal"] = f"{type(exc).__name__}: {str(exc)[:300]}"
-
-    return result
-
-
-@app.get("/iq-port-test")
-async def iq_port_test():
-    """Diagnóstico TCP/TLS da porta 443 da IQ Option. Não usa credenciais."""
-    import socket
-    import ssl
-    import time
-
-    hosts = [
-        "auth.iqoption.com",
-        "api.iqoption.com",
-        "iqoption.com",
-        "ws.iqoption.com",
-    ]
-    result = {"app_version": "32.10.0", "port": 443, "hosts": {}}
-
-    async def tcp_probe(host, family):
-        family_name = "ipv4" if family == socket.AF_INET else "ipv6"
-        item = {"family": family_name, "tcp": {"ok": False}, "tls": {"ok": False}}
-        try:
-            infos = await asyncio.wait_for(
-                asyncio.to_thread(socket.getaddrinfo, host, 443, family, socket.SOCK_STREAM),
-                timeout=5,
-            )
-            addresses = []
-            for info in infos:
-                ip = info[4][0]
-                if ip not in addresses:
-                    addresses.append(ip)
-            item["addresses"] = addresses[:6]
-            if not addresses:
-                item["tcp"]["error"] = "Nenhum endereço retornado."
-                return item
-
-            ip = addresses[0]
-            started = time.monotonic()
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(ip, 443, family=family),
-                    timeout=8,
-                )
-                item["tcp"] = {
-                    "ok": True,
-                    "ip": ip,
-                    "elapsed_ms": round((time.monotonic() - started) * 1000),
-                }
-                writer.close()
-                await writer.wait_closed()
-            except Exception as exc:
-                item["tcp"] = {
-                    "ok": False,
-                    "ip": ip,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc)[:200],
-                }
-                return item
-
-            ctx = ssl.create_default_context()
-            started = time.monotonic()
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        ip, 443, family=family, ssl=ctx, server_hostname=host
-                    ),
-                    timeout=10,
-                )
-                ssl_obj = writer.get_extra_info("ssl_object")
-                item["tls"] = {
-                    "ok": True,
-                    "ip": ip,
-                    "elapsed_ms": round((time.monotonic() - started) * 1000),
-                    "version": ssl_obj.version() if ssl_obj else "",
-                    "cipher": (ssl_obj.cipher()[0] if ssl_obj and ssl_obj.cipher() else ""),
-                }
-                writer.close()
-                await writer.wait_closed()
-            except Exception as exc:
-                item["tls"] = {
-                    "ok": False,
-                    "ip": ip,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc)[:200],
-                }
-        except Exception as exc:
-            item["dns_or_setup_error"] = {
-                "error_type": type(exc).__name__,
-                "error": str(exc)[:200],
-            }
-        return item
-
-    for host in hosts:
-        result["hosts"][host] = {
-            "ipv4": await tcp_probe(host, socket.AF_INET),
-            "ipv6": await tcp_probe(host, socket.AF_INET6),
-        }
-
-    return result
-
-
-@app.get("/iq-login-diagnostic")
-async def iq_login_diagnostic():
-    """Mostra somente a etapa do último login; nunca expõe credenciais."""
-    age = None
-    if iq_login_diag.get("updated_at"):
-        age = round(max(0.0, time.time() - float(iq_login_diag["updated_at"])), 1)
-    return {
-        "app_version": "32.10.0",
-        "stage": iq_login_diag.get("stage", "idle"),
-        "detail": iq_login_diag.get("detail", ""),
-        "age_seconds": age,
-    }
-
-
 @app.post("/iq-login")
 async def iq_login(body: IQLoginBody, response: Response):
     email = body.email.strip()
     password = body.password
-    print(f"[IQ LOGIN] tentativa para domínio={email.split('@')[-1] if '@' in email else 'invalido'} biblioteca_async={'OK' if AsyncIQOption is not None else 'AUSENTE'}", flush=True)
 
     if not email or not password:
         raise HTTPException(400, "Informe e-mail e senha da IQ Option.")
-    if IQ_Option is None and AsyncIQOption is None:
-        raise HTTPException(503, f"Biblioteca IQ Option não carregada no Render. {IQ_IMPORT_ERROR or 'Verifique o requirements.txt.'}")
+
+    if IQ_Option is None:
+        raise HTTPException(503, "Biblioteca IQ Option não carregada. Verifique o requirements.txt.")
 
     token = secrets.token_urlsafe(32)
+
     state = {
-        "session_id": token, "email": email, "password": password, "client": None,
-        "lock": asyncio.Lock(), "last_error": "", "last_attempt": 0.0,
-        "last_seen": time.time(), "last_connected": 0.0, "failure_count": 0,
-        "reconnect_after": 0.0, "reconnecting": False, "requires_2fa": False,
-        "generation": 0, "candle_cache": {}, "results": {},
+        "session_id": token,
+        "email": email,
+        "password": password,
+        "client": None,
+        "lock": asyncio.Lock(),
+        "last_error": "",
+        "last_attempt": 0.0,
+        "last_seen": time.time(),
+        "last_connected": time.time(),
+        "failure_count": 0,
+        "reconnect_after": 0.0,
+        "reconnecting": False,
+        "generation": 0,
+        "candle_cache": {},
+        "results": {},
     }
 
     try:
         async with state["lock"]:
-            client = await asyncio.wait_for(iq_connect_async(state), timeout=25)
-        if not _iq_is_connected(state):
-            raise RuntimeError("A sessão assíncrona não permaneceu conectada.")
+            client = await asyncio.wait_for(asyncio.to_thread(iq_connect_blocking, state), timeout=28)
 
-    except IQTwoFactorRequired:
-        print("[IQ LOGIN] 2FA solicitado pela IQ Option", flush=True)
-        iq_sessions[token] = state
-        response.set_cookie(
-            IQ_SESSION_COOKIE, token, httponly=True, secure=True, samesite="lax",
-            max_age=IQ_SESSION_TTL, expires=IQ_SESSION_TTL, path="/",
-        )
-        return {
-            "connected": False, "requires_2fa": True,
-            "message": "A IQ Option solicitou um código de verificação.",
-            "email_masked": _mask_email(email), "session_token": token,
-        }
+        if not bool(client.check_connect()):
+            raise RuntimeError("A sessão não permaneceu conectada.")
 
     except asyncio.TimeoutError:
-        print("[IQ LOGIN] timeout aguardando resposta da IQ Option", flush=True)
         state["password"] = ""
-        _iq_dispose_client(state)
-        raise HTTPException(504, "A IQ Option não respondeu ao login dentro do tempo esperado.")
-
+        raise HTTPException(
+            504,
+            "O servidor encerrou a tentativa porque a biblioteca IQ Option ficou presa no login."
+        )
     except Exception as exc:
-        print(f"[IQ LOGIN] falhou: {type(exc).__name__}: {str(exc)[:350]}", flush=True)
         state["password"] = ""
-        _iq_dispose_client(state)
-        raise HTTPException(401, f"Não foi possível conectar à IQ Option: {type(exc).__name__}: {str(exc)[:350]}")
+        raise HTTPException(401, f"Não foi possível conectar à IQ Option: {str(exc)[:250]}")
 
-    print("[IQ LOGIN] conectado com sucesso", flush=True)
     iq_sessions[token] = state
+
     response.set_cookie(
-        IQ_SESSION_COOKIE, token, httponly=True, secure=True, samesite="lax",
-        max_age=IQ_SESSION_TTL, expires=IQ_SESSION_TTL, path="/",
+        IQ_SESSION_COOKIE,
+        token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=IQ_SESSION_TTL,
+        expires=IQ_SESSION_TTL,
+        path="/",
     )
+
     return {
-        "connected": True, "requires_2fa": False,
+        "connected": True,
         "message": "IQ Option OTC conectada.",
-        "email_masked": _mask_email(email), "session_token": token,
+        "email_masked": _mask_email(email),
+        "session_token": token,
     }
-
-
-@app.post("/iq-2fa")
-async def iq_2fa(body: IQ2FABody, request: Request):
-    state = _session_state(request, required=True)
-    raise HTTPException(
-        501,
-        "A biblioteca assíncrona atual da IQ Option ainda não implementa a conclusão do 2FA. "
-        "Desative temporariamente o 2FA da conta para testar esta conexão, ou use uma integração que suporte essa etapa."
-    )
 
 
 @app.post("/iq-logout")
@@ -1602,7 +1374,7 @@ async def iq_logout(request: Request, response: Response):
 
     if state:
         state["password"] = ""
-        await _iq_close_client(state)
+        _iq_dispose_client(state)
         state["candle_cache"] = {}
 
     response.delete_cookie(IQ_SESSION_COOKIE, path="/")
@@ -1612,11 +1384,10 @@ async def iq_logout(request: Request, response: Response):
 
 @app.get("/otc-status")
 async def otc_status(request: Request):
-    if IQ_Option is None and AsyncIQOption is None:
+    if IQ_Option is None:
         return {
             "configured": False,
             "connected": False,
-            "reconnecting": False,
             "message": "Biblioteca IQ Option não foi carregada.",
         }
 
@@ -1626,31 +1397,46 @@ async def otc_status(request: Request):
         return {
             "configured": True,
             "connected": False,
-            "reconnecting": False,
-            "message": "MEGA IA ativo. IQ Option OTC desconectada.",
+            "message": "Conecte sua conta na aba Conta IQ Option.",
         }
 
     connected = _iq_is_connected(state)
+    reconnect_after = float(state.get("reconnect_after", 0) or 0)
 
-    if state.get("requires_2fa"):
-        return {
-            "configured": True,
-            "connected": False,
-            "reconnecting": False,
-            "requires_2fa": True,
-            "message": "Digite o código de verificação enviado pela IQ Option.",
-            "email_masked": _mask_email(state.get("email", "")),
-        }
+    # Se a página foi atualizada e a sessão ainda existe, recupera o websocket
+    # automaticamente quando necessário.
+    if (
+        not connected
+        and not state.get("reconnecting")
+        and time.time() >= reconnect_after
+        and state.get("email")
+        and state.get("password")
+    ):
+        try:
+            async with state["lock"]:
+                await asyncio.wait_for(
+                    asyncio.to_thread(iq_connect_blocking, state, False),
+                    timeout=18,
+                )
+            connected = _iq_is_connected(state)
+        except Exception as exc:
+            state["last_error"] = str(exc)[:250]
+
+    reconnect_after = float(state.get("reconnect_after", 0) or 0)
+    reconnecting = bool(state.get("reconnecting")) or (not connected and time.time() < reconnect_after)
 
     if connected:
         msg = "IQ Option OTC conectada."
+    elif reconnecting:
+        wait = max(1, int(reconnect_after-time.time()+0.999)) if reconnect_after > time.time() else 2
+        msg = f"Sessão preservada. Reconectando em {wait}s."
     else:
-        msg = "IQ Option OTC desconectada. Reconexão automática desativada."
+        msg = "Sessão preservada. Reconexão automática em andamento."
 
     return {
         "configured": True,
         "connected": connected,
-        "reconnecting": False,
+        "reconnecting": reconnecting,
         "message": msg,
         "email_masked": _mask_email(state.get("email", "")),
         "pairs": len(OTC_BASE),
@@ -2017,8 +1803,6 @@ async def result(
         return {"status": "AGUARDANDO CANDLE", "result": None}
 
     direction = direction.upper()
-    if direction not in ("CALL", "PUT"):
-        raise HTTPException(400, "Direção inválida.")
 
     if target["close"] == target["open"]:
         res = "EMPATE"
@@ -2048,13 +1832,10 @@ HTML_PAGE = r"""
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
-<meta http-equiv="Pragma" content="no-cache">
-<meta http-equiv="Expires" content="0">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=3280">
-<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=3282">
-<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=3282">
+<link rel="manifest" href="/manifest.webmanifest?v=34">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=34">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=34">
 <meta name="theme-color" content="#07182b">
 <meta name="application-name" content="Mega IA Trader">
 <meta name="apple-mobile-web-app-title" content="Mega IA Trader">
@@ -2139,42 +1920,28 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="controls">
-    <select id="market" onchange="handleMarketChange()">
+    <select id="market">
       <option value="OPEN">🌐 Mercado Aberto</option>
       <option value="OTC">🟣 IQ Option OTC</option>
     </select>
 
-    <select id="symbol" onchange="handleSymbolChange()">
-      <option value="EUR/USD" selected>EUR/USD</option>
-      <option value="GBP/USD">GBP/USD</option>
-      <option value="USD/JPY">USD/JPY</option>
-      <option value="AUD/USD">AUD/USD</option>
-      <option value="USD/CAD">USD/CAD</option>
-      <option value="USD/CHF">USD/CHF</option>
-      <option value="NZD/USD">NZD/USD</option>
-      <option value="EUR/JPY">EUR/JPY</option>
-      <option value="GBP/JPY">GBP/JPY</option>
-      <option value="EUR/GBP">EUR/GBP</option>
-      <option value="BTC/USD">BTC/USD</option>
-      <option value="ETH/USD">ETH/USD</option>
-      <option value="LTC/USD">LTC/USD</option>
-    </select>
+    <select id="symbol"></select>
 
-    <select id="interval" onchange="handleIntervalChange()">
+    <select id="interval">
       <option>1min</option>
       <option>5min</option>
       <option>15min</option>
       <option>30min</option>
     </select>
 
-    <button type="button" id="voiceBtn" onclick="voice();return false;">🔊 Ativar voz</button>
+    <button id="voiceBtn" onclick="voice()">🔊 Ativar voz</button>
     <div id="otcNote" class="label" style="margin-top:6px;display:none">🟣 IQ Option OTC: verificando conexão...</div>
   </div>
 
   <div class="tabs">
-    <button type="button" class="tabbtn active" id="tabMain" onclick="showTab('main');return false;">📊 Painel</button>
-    <button type="button" class="tabbtn" id="tabChart" onclick="showTab('chart');return false;">📈 Gráfico</button>
-    <button type="button" class="tabbtn" id="tabAccount" onclick="showTab('account');return false;">⚙️ Conta IQ Option</button>
+    <button class="tabbtn active" id="tabMain">📊 Painel</button>
+    <button class="tabbtn" id="tabChart">📈 Gráfico</button>
+    <button class="tabbtn" id="tabAccount">⚙️ Conta IQ Option</button>
   </div>
 
   <div id="mainTab" class="tab active">
@@ -2258,15 +2025,11 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         <label>Senha
           <input id="iqPassword" type="password" autocomplete="current-password" placeholder="Sua senha">
         </label>
-        <label id="iq2faWrap" style="display:none">Código de verificação
-          <input id="iq2faCode" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="Código enviado pela IQ Option">
-        </label>
       </div>
 
       <div class="account-actions">
-        <button type="button" id="iqConnectBtn">🟢 Conectar</button>
-        <button type="button" id="iq2faBtn" style="display:none">🔐 Validar código</button>
-        <button type="button" id="iqLogoutBtn">🔴 Desconectar</button>
+        <button id="iqConnectBtn">🟢 Conectar</button>
+        <button id="iqLogoutBtn">🔴 Desconectar</button>
       </div>
 
       <div id="iqAccountStatus" class="card" style="margin-top:12px">● Desconectado</div>
@@ -2278,398 +2041,923 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <div id="radar" class="radar"></div>
   </div>
 
+  <div id="licenseCard" class="card" style="display:none">
+    <div class="label">RENOVAÇÃO</div>
+    <div id="license"></div>
+  </div>
 </div>
 
 <script>
-(function(){
-'use strict';
+const market=document.getElementById('market');
+const interval=document.getElementById('interval');
+const voiceBtn=document.getElementById('voiceBtn');
+const otcNote=document.getElementById('otcNote');
+const heroBox=document.getElementById('heroBox');
+const entryArrow=document.getElementById('entryArrow');
+const entryArrowIcon=document.getElementById('entryArrowIcon');
+const entryArrowLabel=document.getElementById('entryArrowLabel');
+const analysisText=document.getElementById('analysisText');
+const mainTab=document.getElementById('mainTab');
+const chartTab=document.getElementById('chartTab');
+const accountTab=document.getElementById('accountTab');
+const tabMain=document.getElementById('tabMain');
+const tabChart=document.getElementById('tabChart');
+const tabAccount=document.getElementById('tabAccount');
+const iqEmail=document.getElementById('iqEmail');
+const iqPassword=document.getElementById('iqPassword');
+const iqConnectBtn=document.getElementById('iqConnectBtn');
+const iqLogoutBtn=document.getElementById('iqLogoutBtn');
+const iqAccountStatus=document.getElementById('iqAccountStatus');
+const chartInfo=document.getElementById('chartInfo');
+const direction=document.getElementById('direction');
+const confidence=document.getElementById('confidence');
+const entry=document.getElementById('entry');
+const countdown=document.getElementById('countdown');
+const statusBox=document.getElementById('status');
+const risk=document.getElementById('risk');
+const wins=document.getElementById('wins');
+const losses=document.getElementById('losses');
+const accuracy=document.getElementById('accuracy');
+const result=document.getElementById('result');
+const radar=document.getElementById('radar');
+const licenseCard=document.getElementById('licenseCard');
+const licenseBox=document.getElementById('license');
+const clock=document.getElementById('clock');
+const expiryCountdown=document.getElementById('expiryCountdown');
+const chartCanvas=document.getElementById('priceChart');
+const chartCtx=chartCanvas.getContext('2d');
 
-var VERSION='32.10.0';
-var symbols=['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD'];
-var E={};
-var currentSignal=null;
-var voiceEnabled=false;
-var signalBusy=false, radarBusy=false, perfBusy=false, chartBusy=false, resultBusy=false;
-var pendingTrade=null;
-var chartData=[];
-var lastResultKey='';
-var stats={OPEN:{wins:0,losses:0,keys:[]},OTC:{wins:0,losses:0,keys:[]}};
+const syms=[
+  'EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF',
+  'NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD'
+];
 
-function id(x){ return document.getElementById(x); }
-function text(el,v){ if(el) el.textContent=v; }
-function safeStoreGet(k){ try{return localStorage.getItem(k)||'';}catch(e){return '';} }
-function safeStoreSet(k,v){ try{localStorage.setItem(k,v);}catch(e){} }
-function safeStoreDel(k){ try{localStorage.removeItem(k);}catch(e){} }
-function encode(v){ return encodeURIComponent(v==null?'':String(v)); }
-function timeFmt(v){
-  if(!v) return '--:--:--';
-  try{return new Date(v).toLocaleTimeString('pt-BR',{hour12:false});}catch(e){return '--:--:--';}
-}
+const S=document.getElementById('symbol');
 
-function bindElements(){
-  var names=['market','symbol','interval','voiceBtn','otcNote','heroBox','entryArrow','entryArrowIcon','entryArrowLabel','analysisText','mainTab','chartTab','accountTab','tabMain','tabChart','tabAccount','iqEmail','iqPassword','iq2faWrap','iq2faCode','iqConnectBtn','iq2faBtn','iqLogoutBtn','iqAccountStatus','chartInfo','direction','confidence','entry','countdown','status','risk','wins','losses','accuracy','result','radar','clock','expiryCountdown','priceChart'];
-  for(var i=0;i<names.length;i++) E[names[i]]=id(names[i]);
-}
+let cur=null;
+let voiceEnabled=false;
+let lastSignalVoice='';
+let lastAnalysis=0;
+let fifteen=false;
+let five=false;
+let entered=false;
+let reskey='';
+let sigBusy=false;
+let chartBusy=false;
+let radBusy=false;
+let perfBusy=false;
+let robotTimer=null;
+let arrowTimer=null;
+let megaVoices=[];
+let chartData=[];
+let resultBusy=false;
+let pendingTrade=null;
 
-function request(url,options){
-  options=options||{};
-  options.cache='no-store';
-  options.credentials='include';
-  options.headers=options.headers||{};
-  var token=safeStoreGet('mega_iq_session_token');
-  if(token) options.headers['X-IQ-Session']=token;
-  return fetch(url,options).then(function(r){
-    return r.text().then(function(raw){
-      var data=null;
-      try{data=raw?JSON.parse(raw):{};}catch(e){data={};}
-      if(!r.ok){ throw new Error((data&&data.detail)||('HTTP '+r.status)); }
-      return data;
-    });
-  });
-}
-function get(url){ return request(url); }
-function post(url,data){ return request(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})}); }
-
-function loadStats(){
-  try{
-    var raw=safeStoreGet('mega_stats_3280');
-    if(!raw) raw=safeStoreGet('mega_winloss_v3271');
-    if(!raw) return;
-    var x=JSON.parse(raw);
-    ['OPEN','OTC'].forEach(function(m){
-      if(x&&x[m]){
-        stats[m].wins=Number(x[m].wins||0);
-        stats[m].losses=Number(x[m].losses||0);
-        stats[m].keys=Array.isArray(x[m].keys)?x[m].keys.slice(-500):[];
-      }
-    });
-  }catch(e){}
-}
-function saveStats(){ safeStoreSet('mega_stats_3280',JSON.stringify(stats)); }
-function paintStats(){
-  var m=(E.market&&E.market.value)||'OPEN';
-  var s=stats[m]||stats.OPEN;
-  var total=s.wins+s.losses;
-  text(E.wins,String(s.wins)); text(E.losses,String(s.losses));
-  text(E.accuracy,(total?((s.wins/total)*100).toFixed(2):'0.00')+'%');
-}
-function registerResult(t,x){
-  if(!t||!x||(x.result!=='WIN'&&x.result!=='LOSS')) return;
-  var m=(t.market||'OPEN').toUpperCase();
-  var s=stats[m]||stats.OPEN;
-  var key=[m,t.symbol,t.interval,t.direction,t.entry_time,t.expiry_time].join('|');
-  if(s.keys.indexOf(key)>=0) return;
-  s.keys.push(key); if(s.keys.length>500) s.keys=s.keys.slice(-500);
-  if(x.result==='WIN') s.wins++; else s.losses++;
-  saveStats(); paintStats();
-}
-
-function fillSymbols(){
-  if(!E.market||!E.symbol) return;
-  var old=E.symbol.value||safeStoreGet('mega_symbol')||'EUR/USD';
-  var otc=E.market.value==='OTC';
-  while(E.symbol.firstChild) E.symbol.removeChild(E.symbol.firstChild);
-  for(var i=0;i<symbols.length;i++){
-    var s=symbols[i],o=document.createElement('option');
-    o.value=s;
-    o.textContent=otc?('🟣 '+s.replace('/','')+'-OTC'):s;
-    E.symbol.appendChild(o);
+try{
+  const savedPending=localStorage.getItem('mega_pending_trade');
+  if(savedPending){
+    pendingTrade=JSON.parse(savedPending);
   }
-  E.symbol.value=old;
-  if(!E.symbol.value) E.symbol.selectedIndex=0;
+}catch(e){
+  pendingTrade=null;
 }
-function currentSymbol(){ if(!E.symbol||!E.symbol.value) fillSymbols(); return (E.symbol&&E.symbol.value)||'EUR/USD'; }
 
-function showTab(which){
-  var m=which==='main',c=which==='chart',a=which==='account';
-  if(E.mainTab) E.mainTab.classList.toggle('active',m);
-  if(E.chartTab) E.chartTab.classList.toggle('active',c);
-  if(E.accountTab) E.accountTab.classList.toggle('active',a);
-  if(E.tabMain) E.tabMain.classList.toggle('active',m);
-  if(E.tabChart) E.tabChart.classList.toggle('active',c);
-  if(E.tabAccount) E.tabAccount.classList.toggle('active',a);
-  if(c){ setTimeout(function(){ resizeChart(); loadChart(); },50); }
-  if(a) refreshAccountStatus();
-}
-window.showTab=showTab;
-
-function speak(msg){
-  if(!voiceEnabled||!window.speechSynthesis) return;
+function savePendingTrade(){
   try{
-    window.speechSynthesis.cancel();
-    var u=new SpeechSynthesisUtterance(msg); u.lang='pt-BR';u.rate=.95;u.pitch=.9;
-    window.speechSynthesis.speak(u);
+    if(pendingTrade){
+      localStorage.setItem('mega_pending_trade',JSON.stringify(pendingTrade));
+    }else{
+      localStorage.removeItem('mega_pending_trade');
+    }
   }catch(e){}
 }
-function voice(){ voiceEnabled=true;text(E.voiceBtn,'🔊 Voz ativada');speak('Voz da Mega IA ativada.');setTimeout(function(){loadSignal(true);},300); }
-window.voice=voice;
 
-function updateMarketNote(){
-  if(!E.otcNote||!E.market) return Promise.resolve();
-  if(E.market.value!=='OTC'){E.otcNote.style.display='none';return Promise.resolve();}
-  E.otcNote.style.display='block';text(E.otcNote,'🟣 IQ Option OTC: verificando conexão...');
-  return get('/otc-status').then(function(x){
-    text(E.otcNote,(x.connected?'🟢 ':x.reconnecting?'🟡 ':'🔴 ')+(x.message||''));
-  }).catch(function(e){text(E.otcNote,'🔴 IQ Option OTC: '+e.message);});
-}
+function rememberPendingTrade(sig){
+  if(!sig) return;
+  if(sig.direction!=='CALL' && sig.direction!=='PUT') return;
+  if(!sig.expiry_time || !sig.entry_time) return;
 
-function handleMarketChange(){
-  if(!E.market) return;
-  safeStoreSet('mega_market',E.market.value);fillSymbols();paintStats();updateMarketNote();
-  chartData=[];loadSignal(true);loadRadar();if(E.chartTab&&E.chartTab.classList.contains('active'))loadChart();
-}
-function handleSymbolChange(){ safeStoreSet('mega_symbol',currentSymbol());chartData=[];loadSignal(true);loadRadar();if(E.chartTab&&E.chartTab.classList.contains('active'))loadChart(); }
-function handleIntervalChange(){ if(E.interval)safeStoreSet('mega_interval',E.interval.value);chartData=[];loadSignal(true);loadRadar();if(E.chartTab&&E.chartTab.classList.contains('active'))loadChart(); }
-window.handleMarketChange=handleMarketChange;window.handleSymbolChange=handleSymbolChange;window.handleIntervalChange=handleIntervalChange;
+  // Não troca uma operação ainda aguardando resultado por outro polling do sinal.
+  if(pendingTrade && pendingTrade.expiry_time){
+    const oldExpiry=new Date(pendingTrade.expiry_time).getTime();
+    if(oldExpiry && Date.now() < oldExpiry + 120000){
+      return;
+    }
+  }
 
-function rememberPending(sig){
-  if(!sig||(sig.direction!=='CALL'&&sig.direction!=='PUT')||!sig.entry_time||!sig.expiry_time) return;
-  if(pendingTrade) return; // somente UMA operação por vez até sair WIN/LOSS
   pendingTrade={
-    market:sig.market||E.market.value,
+    market:sig.market || market.value,
     symbol:sig.symbol,
     interval:sig.interval,
     direction:sig.direction,
     entry_time:sig.entry_time,
-    expiry_time:sig.expiry_time,
-    confidence:Number(sig.confidence||0),
-    status:sig.status||'SINAL LIBERADO',
-    risk:sig.risk||'--'
+    expiry_time:sig.expiry_time
   };
-  safeStoreSet('mega_pending_trade',JSON.stringify(pendingTrade));
+
+  savePendingTrade();
 }
 
-function pendingIsLocked(){
-  return !!(pendingTrade&&pendingTrade.direction&&pendingTrade.entry_time&&pendingTrade.expiry_time);
-}
+function fillSymbols(){
+  const otc=market.value==='OTC';
+  const previous=S.value;
+  S.innerHTML='';
 
-function paintPendingTrade(){
-  if(!pendingIsLocked()) return false;
-  var expired=Date.now()>=new Date(pendingTrade.expiry_time).getTime();
-  currentSignal={
-    market:pendingTrade.market,
-    symbol:pendingTrade.symbol,
-    interval:pendingTrade.interval,
-    direction:pendingTrade.direction,
-    entry_time:pendingTrade.entry_time,
-    expiry_time:pendingTrade.expiry_time,
-    confidence:Number(pendingTrade.confidence||0),
-    status:expired?'AGUARDANDO RESULTADO':'OPERAÇÃO EM ANDAMENTO',
-    risk:pendingTrade.risk||'--'
-  };
-  var d=currentSignal.direction;
-  text(E.direction,d);
-  if(E.direction) E.direction.className='big '+(d==='CALL'?'call':'put');
-  text(E.confidence,'Confiança: '+Number(currentSignal.confidence||0).toFixed(0)+'%');
-  text(E.entry,timeFmt(currentSignal.entry_time));
-  text(E.countdown,expired?'Aguardando resultado':'Operação bloqueada até a expiração');
-  text(E.status,currentSignal.status);
-  text(E.risk,'Risco: '+(currentSignal.risk||'--'));
-  return true;
-}
+  syms.forEach(x=>{
+    S.add(new Option(otc?'🟣 '+x+' • OTC':x,x));
+  });
 
-function paintSignal(x){
-  if(pendingIsLocked()){
-    paintPendingTrade();
-    return;
+  if(previous && [...S.options].some(o=>o.value===previous)){
+    S.value=previous;
   }
-  currentSignal=x||{};
-  var d=currentSignal.direction||'NEUTRO';
-  text(E.direction,d);
-  if(E.direction) E.direction.className='big '+(d==='CALL'?'call':d==='PUT'?'put':'neutral');
-  text(E.confidence,'Confiança: '+Number(currentSignal.confidence||0).toFixed(0)+'%');
-  text(E.entry,(d==='NEUTRO'||!currentSignal.entry_time)?'AGUARDANDO SINAL':timeFmt(currentSignal.entry_time));
-  text(E.countdown,d==='NEUTRO'?'Sem entrada confirmada':'Preparando entrada');
-  text(E.status,currentSignal.status||'MONITORANDO');
-  text(E.risk,'Risco: '+(currentSignal.risk||'--'));
-  rememberPending(currentSignal);
-  if(pendingIsLocked()) paintPendingTrade();
 }
 
-function loadSignal(announce){
-  if(signalBusy||!E.market||!E.interval) return Promise.resolve();
-
-  // Enquanto existir uma operação sem resultado, não busca nem libera outro sinal.
-  if(pendingIsLocked()){
-    paintPendingTrade();
-    return Promise.resolve();
-  }
-
-  signalBusy=true;
-  if(announce){text(E.status,'ANALISANDO O MERCADO...');}
-  var u='/signal-ai?market='+encode(E.market.value)+'&symbol='+encode(currentSymbol())+'&interval='+encode(E.interval.value);
-  return get(u).then(function(x){
-    paintSignal(x);
-    if(announce&&x.direction&&x.direction!=='NEUTRO'&&pendingIsLocked()) speak('Sinal de '+x.direction+' identificado.');
-  })
-  .catch(function(e){text(E.status,'PAINEL ATIVO • FONTE TEMPORARIAMENTE INDISPONÍVEL');text(E.direction,'NEUTRO');text(E.entry,'AGUARDANDO DADOS');})
-  .then(function(){signalBusy=false;},function(){signalBusy=false;});
-}
-
-function loadPerformance(){
-  if(perfBusy||!E.market)return;perfBusy=true;
-  var m=E.market.value;
-  get('/performance?market='+encode(m)).then(function(p){
-    var s=stats[m]||stats.OPEN;s.wins=Math.max(s.wins,Number(p.wins||0));s.losses=Math.max(s.losses,Number(p.losses||0));saveStats();
-  }).catch(function(){}).then(function(){paintStats();perfBusy=false;});
-}
-function loadRadar(){
-  if(radarBusy||!E.radar||!E.market||!E.interval)return;radarBusy=true;
-  get('/radar?market='+encode(E.market.value)+'&interval='+encode(E.interval.value)).then(function(a){
-    if(!Array.isArray(a)) a=[];var h='';
-    for(var i=0;i<a.length;i++){
-      var x=a[i]||{},cls=x.direction==='CALL'?'call':x.direction==='PUT'?'put':'neutral';
-      h+='<div><b>'+String(x.symbol||'')+'</b><br><span class="'+cls+'">'+String(x.direction||'NEUTRO')+'</span> • '+Number(x.confidence||0)+'%<br><small>'+String(x.status||'')+'</small></div>';
+function showRobot(){
+  heroBox.style.display='block';
+  clearTimeout(robotTimer);
+  robotTimer=setTimeout(()=>{
+    if(!entryArrow.classList.contains('call') && !entryArrow.classList.contains('put')){
+      heroBox.style.display='none';
+      analysisText.style.display='none';
     }
-    E.radar.innerHTML=h||'<div>Monitorando oportunidades...</div>';
-  }).catch(function(){E.radar.innerHTML='<div>⚠️ Radar temporariamente indisponível</div>';}).then(function(){radarBusy=false;});
+  },10000);
 }
-function updateClock(){
-  get('/server-time').then(function(x){text(E.clock,timeFmt(x.datetime)+' • Brasília');}).catch(function(){text(E.clock,new Date().toLocaleTimeString('pt-BR',{hour12:false})+' • Brasília');});
+
+function showEntryArrow(dir){
+  showRobot();
+  entryArrow.className='entry-arrow '+(dir==='CALL'?'call':'put');
+  entryArrowIcon.textContent=dir==='CALL'?'⬆':'⬇';
+  entryArrowLabel.textContent=dir==='CALL'?'CALL • COMPRAR':'PUT • VENDER';
+
+  clearTimeout(arrowTimer);
+  arrowTimer=setTimeout(()=>{
+    entryArrow.className='entry-arrow';
+    heroBox.style.display='none';
+  },6000);
+}
+
+function loadMegaVoices(){
+  if(window.speechSynthesis){
+    megaVoices=speechSynthesis.getVoices()||[];
+  }
+}
+
+if(window.speechSynthesis){
+  loadMegaVoices();
+  if(speechSynthesis.addEventListener){
+    speechSynthesis.addEventListener('voiceschanged',loadMegaVoices);
+  }
+}
+
+function pickMalePtBRVoice(){
+  const all=(megaVoices.length?megaVoices:speechSynthesis.getVoices());
+  const br=all.filter(v=>String(v.lang||'').replace('_','-').toLowerCase()==='pt-br');
+  const pt=br.length?br:all.filter(v=>String(v.lang||'').toLowerCase().startsWith('pt'));
+  const natural=/natural|neural|premium|enhanced|wavenet|google.*portugu|microsoft.*portugu/i;
+  const male=/antonio|antônio|daniel|ricardo|felipe|paulo|carlos|thiago|bruno|marcelo|male|masculino|homem/i;
+  const female=/maria|luciana|fernanda|camila|female|feminina|mulher/i;
+
+  return pt.find(v=>natural.test(v.name||'')&&male.test(v.name||'')) ||
+         pt.find(v=>natural.test(v.name||'')&&!female.test(v.name||'')) ||
+         pt.find(v=>male.test(v.name||'')) ||
+         pt.find(v=>!female.test(v.name||'')) ||
+         pt[0] || null;
+}
+
+function speak(t){
+  if(!voiceEnabled || !window.speechSynthesis) return;
+
+  speechSynthesis.cancel();
+
+  const u=new SpeechSynthesisUtterance(t);
+  u.lang='pt-BR';
+  u.rate=.94;
+  u.pitch=.90;
+  u.volume=1;
+
+  const mv=pickMalePtBRVoice();
+  if(mv) u.voice=mv;
+
+  speechSynthesis.speak(u);
+}
+
+function voice(){
+  voiceEnabled=true;
+  voiceBtn.textContent='🔊 Voz ativada';
+  speak('Voz da Mega IA ativada.');
+  setTimeout(()=>sig(true),650);
+}
+
+function ft(x){
+  return x ? new Date(x).toLocaleTimeString('pt-BR',{hour12:false}) : '--:--:--';
+}
+
+function iqSessionToken(){
+  try{
+    return localStorage.getItem('mega_iq_session_token')||'';
+  }catch(_){
+    return '';
+  }
+}
+
+function authHeaders(extra={}){
+  const h={...extra};
+  const t=iqSessionToken();
+  if(t) h['X-IQ-Session']=t;
+  return h;
+}
+
+async function get(u){
+  const r=await fetch(u,{
+    cache:'no-store',
+    credentials:'include',
+    headers:authHeaders()
+  });
+
+  let j=null;
+
+  try{
+    j=await r.json();
+  }catch(_){
+    j=null;
+  }
+
+  if(!r.ok){
+    throw Error((j&&j.detail)?j.detail:'HTTP '+r.status);
+  }
+
+  return j;
+}
+
+async function post(u,data={}){
+  const r=await fetch(u,{
+    method:'POST',
+    credentials:'include',
+    headers:authHeaders({'Content-Type':'application/json'}),
+    body:JSON.stringify(data)
+  });
+
+  let j=null;
+
+  try{
+    j=await r.json();
+  }catch(_){
+    j=null;
+  }
+
+  if(!r.ok){
+    throw Error((j&&j.detail)?j.detail:'HTTP '+r.status);
+  }
+
+  return j;
+}
+
+async function updateMarketNote(){
+  const otc=market.value==='OTC';
+  otcNote.style.display=otc?'block':'none';
+
+  if(!otc) return;
+
+  otcNote.textContent='🟣 IQ Option OTC: verificando conexão...';
+
+  try{
+    const x=await Promise.race([
+      get('/otc-status'),
+      new Promise((_,rej)=>setTimeout(()=>rej(Error('tempo limite de conexão')),16000))
+    ]);
+
+    otcNote.textContent=(x.connected?'🟢 ':x.reconnecting?'🟡 ':'🔴 ')+x.message;
+  }catch(e){
+    otcNote.textContent='🔴 IQ Option OTC: '+(e.message||'falha de conexão');
+  }
 }
 
 function resizeChart(){
-  if(!E.priceChart)return;var ctx=E.priceChart.getContext('2d');if(!ctx)return;
-  var r=E.priceChart.getBoundingClientRect(),d=window.devicePixelRatio||1;
-  E.priceChart.width=Math.max(1,Math.floor(r.width*d));E.priceChart.height=Math.max(1,Math.floor(r.height*d));ctx.setTransform(d,0,0,d,0,0);drawChart(chartData);
+  const r=chartCanvas.getBoundingClientRect();
+  const d=window.devicePixelRatio||1;
+
+  chartCanvas.width=Math.max(1,r.width*d);
+  chartCanvas.height=Math.max(1,r.height*d);
+  chartCtx.setTransform(d,0,0,d,0,0);
+
+  if(chartData.length) drawChart(chartData);
 }
+
 function drawChart(a){
-  if(!E.priceChart)return;var ctx=E.priceChart.getContext('2d');if(!ctx)return;
-  var w=E.priceChart.clientWidth,h=E.priceChart.clientHeight;ctx.clearRect(0,0,w,h);if(!a||!a.length)return;
-  var lows=[],highs=[],i;for(i=0;i<a.length;i++){lows.push(Number(a[i].low));highs.push(Number(a[i].high));}
-  var lo=Math.min.apply(null,lows),hi=Math.max.apply(null,highs),pad=20,span=(hi-lo)||1;
-  function px(n){return pad+n/(Math.max(1,a.length-1))*(w-pad*2);}function py(v){return pad+(hi-v)/span*(h-pad*2);}
-  for(i=0;i<a.length;i++){
-    var c=a[i],x=px(i),o=Number(c.open),cl=Number(c.close),hh=Number(c.high),ll=Number(c.low),up=cl>=o;
-    ctx.strokeStyle=up?'#45ff9b':'#ff5c7a';ctx.fillStyle=ctx.strokeStyle;ctx.beginPath();ctx.moveTo(x,py(hh));ctx.lineTo(x,py(ll));ctx.stroke();
-    var y1=py(Math.max(o,cl)),y2=py(Math.min(o,cl));ctx.fillRect(x-2,y1,4,Math.max(1,y2-y1));
+  const w=chartCanvas.clientWidth;
+  const h=chartCanvas.clientHeight;
+
+  chartCtx.clearRect(0,0,w,h);
+
+  if(!a.length) return;
+
+  const pad={l:55,r:12,t:18,b:28};
+  const cw=w-pad.l-pad.r;
+  const ch=h-pad.t-pad.b;
+
+  let lo=Math.min(...a.map(c=>Number(c.low)));
+  let hi=Math.max(...a.map(c=>Number(c.high)));
+  const extra=(hi-lo)*.08||1;
+
+  lo-=extra;
+  hi+=extra;
+
+  const px=i=>pad.l+(i/(a.length-1||1))*cw;
+  const py=v=>pad.t+(hi-v)/(hi-lo)*ch;
+
+  chartCtx.strokeStyle='#19304a';
+  chartCtx.lineWidth=1;
+  chartCtx.font='11px Arial';
+  chartCtx.fillStyle='#8190a8';
+
+  for(let j=0;j<5;j++){
+    const y=pad.t+j*ch/4;
+    chartCtx.beginPath();
+    chartCtx.moveTo(pad.l,y);
+    chartCtx.lineTo(w-pad.r,y);
+    chartCtx.stroke();
+
+    const v=hi-(hi-lo)*j/4;
+    chartCtx.fillText(v.toFixed(5),4,y+4);
+  }
+
+  const step=Math.max(2,cw/a.length*.72);
+
+  a.forEach((c,i)=>{
+    const x=px(i);
+    const o=Number(c.open);
+    const cl=Number(c.close);
+    const hh=Number(c.high);
+    const ll=Number(c.low);
+    const up=cl>=o;
+
+    chartCtx.strokeStyle=up?'#45ff9b':'#ff5c7a';
+    chartCtx.fillStyle=up?'#45ff9b':'#ff5c7a';
+
+    chartCtx.beginPath();
+    chartCtx.moveTo(x,py(hh));
+    chartCtx.lineTo(x,py(ll));
+    chartCtx.stroke();
+
+    const top=py(Math.max(o,cl));
+    const bot=py(Math.min(o,cl));
+
+    chartCtx.fillRect(x-step/2,top,step,Math.max(1,bot-top));
+
+    if(i%Math.ceil(a.length/6)===0){
+      chartCtx.fillStyle='#8190a8';
+      chartCtx.fillText(
+        new Date(c.datetime).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),
+        x-18,
+        h-7
+      );
+    }
+  });
+
+  if(cur && cur.direction && cur.direction!=='NEUTRO' && cur.reference_candle){
+    const idx=a.findIndex(c=>c.datetime===cur.reference_candle);
+
+    if(idx>=0){
+      const x=px(idx);
+      const v=cur.direction==='CALL'?Number(a[idx].low):Number(a[idx].high);
+
+      chartCtx.fillStyle=cur.direction==='CALL'?'#45ff9b':'#ff5c7a';
+      chartCtx.beginPath();
+      chartCtx.arc(x,py(v),6,0,Math.PI*2);
+      chartCtx.fill();
+
+      chartCtx.font='bold 12px Arial';
+      chartCtx.fillText(cur.direction,x+8,py(v)-8);
+    }
   }
 }
-function loadChart(){
-  if(chartBusy||!E.market||!E.interval)return;chartBusy=true;
-  var u='/candles?market='+encode(E.market.value)+'&symbol='+encode(currentSymbol())+'&interval='+encode(E.interval.value)+'&n=80';
-  get(u).then(function(d){
-    if(d&&Array.isArray(d.candles)&&d.candles.length)chartData=d.candles;
-    text(E.chartInfo,(d.market==='OTC'?'🟣 '+String(d.symbol||'')+' • OTC':String(d.symbol||''))+' • '+String(d.interval||''));resizeChart();
-  }).catch(function(){text(E.chartInfo,'⚠️ Dados temporariamente indisponíveis');}).then(function(){chartBusy=false;});
+
+async function loadChart(){
+  if(chartBusy) return;
+
+  chartBusy=true;
+
+  try{
+    const d=await get(
+      `/candles?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&n=80`
+    );
+
+    if((d.candles||[]).length){
+      chartData=d.candles||[];
+    }
+
+    chartInfo.textContent=
+      (d.ok===false?'⚠️ ':'')+
+      (d.market==='OTC'?'🟣 '+d.symbol+' • OTC':d.symbol)+
+      ' • '+d.interval+
+      (d.ok===false?' • '+(d.status||'INDISPONÍVEL'):'');
+
+    drawChart(chartData);
+
+  }catch(e){
+    chartInfo.textContent='⚠️ Dados temporariamente indisponíveis';
+    if(!chartData.length) drawChart([]);
+  }finally{
+    chartBusy=false;
+  }
 }
 
-function show2FA(show){
-  if(E.iq2faWrap)E.iq2faWrap.style.display=show?'block':'none';
-  if(E.iq2faBtn)E.iq2faBtn.style.display=show?'inline-flex':'none';
+function showTab(which){
+  const main=which==='main';
+  const chart=which==='chart';
+  const account=which==='account';
+
+  mainTab.classList.toggle('active',main);
+  chartTab.classList.toggle('active',chart);
+  accountTab.classList.toggle('active',account);
+
+  tabMain.classList.toggle('active',main);
+  tabChart.classList.toggle('active',chart);
+  tabAccount.classList.toggle('active',account);
+
+  if(chart){
+    loadChart();
+    setTimeout(resizeChart,50);
+  }
+
+  if(account){
+    refreshAccountStatus();
+  }
 }
-function refreshAccountStatus(){
-  return get('/otc-status').then(function(x){
-    if(x.requires_2fa){
-      show2FA(true);
-      text(E.iqAccountStatus,'🟡 Digite o código de verificação enviado pela IQ Option.');
-      if(E.iqConnectBtn)E.iqConnectBtn.disabled=true;
-      if(E.iqLogoutBtn)E.iqLogoutBtn.disabled=false;
+
+tabMain.onclick=()=>showTab('main');
+tabChart.onclick=()=>showTab('chart');
+tabAccount.onclick=()=>showTab('account');
+
+window.addEventListener('resize',resizeChart);
+
+async function refreshAccountStatus(){
+  try{
+    const x=await get('/otc-status');
+    const rr=!!x.reconnecting;
+
+    iqAccountStatus.textContent=
+      (x.connected&&!rr?'🟢 ':rr?'🟡 ':'🔴 ')+
+      (x.connected&&!rr?('Conectado: '+(x.email_masked||'')):x.message);
+
+    iqConnectBtn.disabled=!!x.connected||rr;
+    iqLogoutBtn.disabled=!x.connected&&!rr;
+
+    if(rr) setTimeout(refreshAccountStatus,2500);
+
+  }catch(e){
+    iqAccountStatus.textContent='🟡 Reconectando à IQ Option...';
+    setTimeout(refreshAccountStatus,2500);
+  }
+}
+
+iqConnectBtn.onclick=async()=>{
+  const email=iqEmail.value.trim();
+  const password=iqPassword.value;
+
+  if(!email||!password){
+    iqAccountStatus.textContent='🔴 Informe e-mail e senha.';
+    return;
+  }
+
+  iqAccountStatus.textContent='🟡 Conectando...';
+  iqConnectBtn.disabled=true;
+
+  try{
+    const x=await post('/iq-login',{email,password});
+
+    if(x.session_token){
+      try{
+        localStorage.setItem('mega_iq_session_token',x.session_token);
+      }catch(_){}
+    }
+
+    iqPassword.value='';
+    iqEmail.value='';
+    iqAccountStatus.textContent='🟢 Conectado: '+(x.email_masked||'');
+
+    await updateMarketNote();
+
+    if(market.value==='OTC'){
+      sig(true);
+      rad();
+      if(chartTab.classList.contains('active')) loadChart();
+    }
+
+  }catch(e){
+    iqAccountStatus.textContent='🔴 '+e.message;
+  }finally{
+    iqConnectBtn.disabled=false;
+    refreshAccountStatus();
+  }
+};
+
+iqLogoutBtn.onclick=async()=>{
+  try{
+    await post('/iq-logout',{});
+
+    try{
+      localStorage.removeItem('mega_iq_session_token');
+    }catch(_){}
+
+    iqAccountStatus.textContent='● Desconectado';
+    otcNote.textContent='🔴 Conecte sua conta na aba Conta IQ Option.';
+    chartData=[];
+    drawChart([]);
+
+  }catch(e){
+    iqAccountStatus.textContent='🔴 '+e.message;
+  }
+
+  refreshAccountStatus();
+};
+
+async function sig(announce=false){
+  if(sigBusy) return;
+
+  sigBusy=true;
+
+  if(announce && voiceEnabled && Date.now()-lastAnalysis>2500){
+    lastAnalysis=Date.now();
+    showRobot();
+    analysisText.style.display='block';
+    statusBox.textContent='ANALISANDO O MERCADO...';
+    speak('O Mega IA está analisando o mercado.');
+  }
+
+  try{
+    cur=await get(
+      `/signal-ai?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}`
+    );
+
+    if(announce){
+      showRobot();
+      analysisText.style.display='block';
+    }
+
+    direction.textContent=cur.direction||'NEUTRO';
+    direction.className='big '+(
+      cur.direction==='CALL'?'call':
+      cur.direction==='PUT'?'put':
+      'neutral'
+    );
+
+    confidence.textContent='Confiança: '+Number(cur.confidence||0).toFixed(0)+'%';
+
+    entry.textContent=
+      cur.direction==='NEUTRO'||!cur.entry_time
+      ? 'AGUARDANDO SINAL'
+      : ft(cur.entry_time);
+
+    countdown.textContent=
+      cur.direction==='NEUTRO'
+      ? 'Sem entrada confirmada'
+      : 'Preparando entrada';
+
+    statusBox.textContent=cur.status||'MONITORANDO';
+    risk.textContent='Risco: '+(cur.risk||'--');
+
+    rememberPendingTrade(cur);
+
+    if(cur.direction!=='NEUTRO'){
+      const k=cur.symbol+'|'+cur.interval+'|'+cur.entry_time+'|'+cur.direction;
+
+      if(k!==lastSignalVoice){
+        lastSignalVoice=k;
+
+        if(voiceEnabled){
+          speak(
+            cur.direction==='CALL'
+            ? 'Análise concluída. Sinal de CALL identificado.'
+            : 'Análise concluída. Sinal de PUT identificado.'
+          );
+        }
+      }
+
+    }else if(announce && voiceEnabled && cur.source_state==='READY'){
+      speak('Análise concluída. Não há oportunidade segura no momento.');
+    }
+
+    fifteen=false;
+    five=false;
+    entered=false;
+
+  }catch(e){
+    statusBox.textContent='PAINEL ATIVO • FONTE TEMPORARIAMENTE INDISPONÍVEL';
+    direction.textContent='NEUTRO';
+    direction.className='big neutral';
+    entry.textContent='AGUARDANDO DADOS';
+    countdown.textContent='Sem entrada confirmada';
+
+    if(announce&&voiceEnabled){
+      speak('A fonte de dados está temporariamente indisponível. O painel continua monitorando.');
+    }
+
+  }finally{
+    sigBusy=false;
+  }
+}
+
+async function perf(){
+  if(perfBusy) return;
+
+  perfBusy=true;
+
+  try{
+    const p=await get('/performance?market='+encodeURIComponent(market.value));
+    wins.textContent=p.wins;
+    losses.textContent=p.losses;
+    accuracy.textContent=p.accuracy+'%';
+  }catch(e){
+  }finally{
+    perfBusy=false;
+  }
+}
+
+async function rad(){
+  if(radBusy) return;
+
+  radBusy=true;
+
+  try{
+    const a=await get(
+      '/radar?market='+encodeURIComponent(market.value)+
+      '&interval='+encodeURIComponent(interval.value)
+    );
+
+    radar.innerHTML=a.map(x=>`
+      <div>
+        <b>${x.symbol}</b><br>
+        <span class="${x.direction==='CALL'?'call':x.direction==='PUT'?'put':'neutral'}">${x.direction}</span>
+        • ${x.confidence}%<br>
+        <small>${x.status}</small>
+      </div>
+    `).join('');
+
+  }catch(e){
+    radar.innerHTML='<div>⚠️ Radar temporariamente indisponível</div>';
+  }finally{
+    radBusy=false;
+  }
+}
+
+async function lic(){
+  try{
+    const x=await get('/license');
+
+    if(x.active){
+      licenseCard.style.display='none';
+      licenseBox.textContent='';
       return;
     }
-    show2FA(false);
-    var rr=!!x.reconnecting;
-    text(E.iqAccountStatus,(x.connected&&!rr?'🟢 ':rr?'🟡 ':'🔴 ')+(x.connected&&!rr?('Conectado: '+(x.email_masked||'')):(x.message||'Desconectado')));
-    if(E.iqConnectBtn)E.iqConnectBtn.disabled=!!x.connected||rr;
-    if(E.iqLogoutBtn)E.iqLogoutBtn.disabled=!x.connected&&!rr;
-  }).catch(function(){text(E.iqAccountStatus,'🟡 Verificando conexão...');});
-}
-function connectIQ(){
-  var email=E.iqEmail?E.iqEmail.value.trim():'',password=E.iqPassword?E.iqPassword.value:'';
-  if(!email||!password){text(E.iqAccountStatus,'🔴 Informe e-mail e senha.');return;}
-  show2FA(false);
-  text(E.iqAccountStatus,'🟡 Conectando à IQ Option...');
-  if(E.iqConnectBtn)E.iqConnectBtn.disabled=true;
 
-  post('/iq-login',{email:email,password:password}).then(function(x){
-    if(x.session_token)safeStoreSet('mega_iq_session_token',x.session_token);
-    if(x.requires_2fa){
-      show2FA(true);
-      text(E.iqAccountStatus,'🟡 A IQ Option pediu um código de verificação. Digite o código recebido.');
-      if(E.iqPassword)E.iqPassword.value='';
-      return;
+    licenseCard.style.display='block';
+    licenseBox.innerHTML=
+      `<b>⚠️ LICENÇA EXPIRADA</b><br>
+       Renove o aplicativo para continuar usando.<br><br>
+       WhatsApp: ${x.whatsapp_1} / ${x.whatsapp_2}<br>
+       Instagram: ${x.instagram}`;
+
+  }catch(e){
+    licenseCard.style.display='none';
+  }
+}
+
+async function clk(){
+  try{
+    const x=await get('/server-time');
+    clock.textContent=ft(x.datetime)+' • Brasília';
+  }catch(e){
+    const local=new Date();
+    clock.textContent=local.toLocaleTimeString('pt-BR',{hour12:false})+' • Brasília';
+  }
+}
+
+function cd(){
+  if(!cur || cur.direction==='NEUTRO' || !cur.entry_time){
+    countdown.textContent='Sem entrada confirmada';
+    expiryCountdown.textContent='⏱ EXPIRAÇÃO: --:--';
+    return;
+  }
+
+  const nowMs=Date.now();
+  const et=new Date(cur.entry_time).getTime();
+  const xt=cur.expiry_time?new Date(cur.expiry_time).getTime():0;
+  const n=Math.ceil((et-nowMs)/1000);
+
+  countdown.textContent=n>0?'Entrada em '+n+'s':'Entrada liberada';
+
+  if(n>0){
+    expiryCountdown.textContent='⏱ EXPIRAÇÃO: aguardando entrada';
+  }else if(xt){
+    const rem=Math.max(0,Math.ceil((xt-nowMs)/1000));
+    const mm=String(Math.floor(rem/60)).padStart(2,'0');
+    const ss=String(rem%60).padStart(2,'0');
+    expiryCountdown.textContent='⏱ EXPIRAÇÃO: '+mm+':'+ss;
+  }else{
+    expiryCountdown.textContent='⏱ EXPIRAÇÃO: --:--';
+  }
+
+  if(n<=15 && n>13 && !fifteen){
+    fifteen=true;
+    if(voiceEnabled){
+      speak('Atenção. Sinal confirmado de '+cur.direction+'. Entrada em 15 segundos.');
     }
-    if(E.iqPassword)E.iqPassword.value='';
-    text(E.iqAccountStatus,'🟢 Conectado: '+(x.email_masked||''));
-    updateMarketNote();
-    loadSignal(true);
-  }).catch(function(e){
-    text(E.iqAccountStatus,'🔴 '+e.message);
-  }).then(function(){
-    if(E.iqConnectBtn)E.iqConnectBtn.disabled=false;
-  });
-}
-function submitIQ2FA(){
-  var code=E.iq2faCode?E.iq2faCode.value.trim():'';
-  if(!code){text(E.iqAccountStatus,'🔴 Digite o código enviado pela IQ Option.');return;}
-  text(E.iqAccountStatus,'🟡 Validando código...');
-  if(E.iq2faBtn)E.iq2faBtn.disabled=true;
+  }
 
-  post('/iq-2fa',{code:code}).then(function(x){
-    if(x.session_token)safeStoreSet('mega_iq_session_token',x.session_token);
-    if(E.iq2faCode)E.iq2faCode.value='';
-    show2FA(false);
-    text(E.iqAccountStatus,'🟢 Conectado: '+(x.email_masked||''));
-    updateMarketNote();
-    loadSignal(true);
-  }).catch(function(e){
-    text(E.iqAccountStatus,'🔴 '+e.message);
-  }).then(function(){
-    if(E.iq2faBtn)E.iq2faBtn.disabled=false;
-  });
-}
-function logoutIQ(){
-  post('/iq-logout',{}).catch(function(){}).then(function(){
-    safeStoreDel('mega_iq_session_token');
-    show2FA(false);
-    if(E.iq2faCode)E.iq2faCode.value='';
-    text(E.iqAccountStatus,'● Desconectado');
-    updateMarketNote();
-  });
+  if(n<=5 && n>3 && !five){
+    five=true;
+    if(voiceEnabled){
+      speak('Atenção. Entrada em 5 segundos.');
+    }
+  }
+
+  if(n<=0 && n>-2 && !entered){
+    entered=true;
+    showEntryArrow(cur.direction);
+
+    if(voiceEnabled){
+      speak(
+        cur.direction==='CALL'
+        ? 'Entrada liberada. Comprar agora.'
+        : 'Entrada liberada. Vender agora.'
+      );
+    }
+  }
 }
 
-function checkResult(){
-  if(resultBusy)return;if(!pendingTrade){try{var p=safeStoreGet('mega_pending_trade');if(p)pendingTrade=JSON.parse(p);}catch(e){}}
-  if(!pendingTrade||!pendingTrade.expiry_time||Date.now()<new Date(pendingTrade.expiry_time).getTime())return;
-  resultBusy=true;var t=pendingTrade;
-  var u='/result?market='+encode(t.market)+'&symbol='+encode(t.symbol)+'&interval='+encode(t.interval)+'&direction='+encode(t.direction)+'&expiry_time='+encode(t.expiry_time);
-  get(u).then(function(x){if(x&&x.result){text(E.result,x.result);registerResult(t,x);var k=t.symbol+'|'+t.direction+'|'+t.expiry_time;if(k!==lastResultKey){lastResultKey=k;speak('Operação finalizada. Resultado '+x.result+'.');}pendingTrade=null;safeStoreDel('mega_pending_trade');currentSignal={};loadPerformance();setTimeout(function(){loadSignal(false);},500);}})
-  .catch(function(){}).then(function(){resultBusy=false;});
-}
-function countdown(){
-  var c=currentSignal;if(!c||c.direction==='NEUTRO'||!c.entry_time){text(E.countdown,'Sem entrada confirmada');text(E.expiryCountdown,'⏱ EXPIRAÇÃO: --:--');return;}
-  var n=Math.ceil((new Date(c.entry_time).getTime()-Date.now())/1000),xt=c.expiry_time?new Date(c.expiry_time).getTime():0;
-  text(E.countdown,n>0?'Entrada em '+n+'s':'Entrada liberada');
-  if(n>0)text(E.expiryCountdown,'⏱ EXPIRAÇÃO: aguardando entrada');else if(xt){var rem=Math.max(0,Math.ceil((xt-Date.now())/1000));text(E.expiryCountdown,'⏱ EXPIRAÇÃO: '+String(Math.floor(rem/60)).padStart(2,'0')+':'+String(rem%60).padStart(2,'0'));}
+async function resultCheck(){
+  if(resultBusy) return;
+
+  if(!pendingTrade){
+    rememberPendingTrade(cur);
+  }
+
+  if(
+    !pendingTrade ||
+    !pendingTrade.expiry_time ||
+    Date.now() < new Date(pendingTrade.expiry_time).getTime()
+  ){
+    return;
+  }
+
+  resultBusy=true;
+
+  try{
+    const t=pendingTrade;
+
+    const x=await get(
+      `/result?market=${encodeURIComponent(t.market || market.value)}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}`
+    );
+
+    if(x.result){
+      result.textContent=x.result;
+
+      const k=t.symbol+'|'+t.direction+'|'+t.expiry_time;
+
+      if(k!==reskey){
+        reskey=k;
+
+        if(voiceEnabled){
+          speak('Operação finalizada. Resultado '+x.result+'.');
+        }
+      }
+
+      await perf();
+
+      // Só remove depois que o servidor realmente devolveu o resultado.
+      pendingTrade=null;
+      savePendingTrade();
+    }
+
+  }catch(e){
+    // Mantém pendente e tenta novamente no próximo ciclo.
+  }finally{
+    resultBusy=false;
+  }
 }
 
-function restoreSelections(){
-  var m=safeStoreGet('mega_market');if(m==='OPEN'||m==='OTC')E.market.value=m;
-  fillSymbols();var s=safeStoreGet('mega_symbol');if(s&&symbols.indexOf(s)>=0)E.symbol.value=s;
-  var it=safeStoreGet('mega_interval');if(it&&['1min','5min','15min','30min'].indexOf(it)>=0)E.interval.value=it;
-}
-function bindEvents(){
-  if(E.market)E.market.onchange=handleMarketChange;if(E.symbol)E.symbol.onchange=handleSymbolChange;if(E.interval)E.interval.onchange=handleIntervalChange;
-  if(E.voiceBtn)E.voiceBtn.onclick=function(){voice();return false;};
-  if(E.tabMain)E.tabMain.onclick=function(){showTab('main');return false;};if(E.tabChart)E.tabChart.onclick=function(){showTab('chart');return false;};if(E.tabAccount)E.tabAccount.onclick=function(){showTab('account');return false;};
-  if(E.iqConnectBtn)E.iqConnectBtn.onclick=connectIQ;if(E.iq2faBtn)E.iq2faBtn.onclick=submitIQ2FA;if(E.iqLogoutBtn)E.iqLogoutBtn.onclick=logoutIQ;
-}
-function boot(){
-  bindElements();
-  if(!E.market||!E.symbol||!E.interval){document.documentElement.setAttribute('data-mega-js','missing-elements');return;}
-  loadStats();restoreSelections();bindEvents();paintStats();showTab('main');
-  try{var p=safeStoreGet('mega_pending_trade');if(p)pendingTrade=JSON.parse(p);}catch(e){}
-  document.documentElement.setAttribute('data-mega-js','ready');document.documentElement.setAttribute('data-mega-version',VERSION);
-  text(E.status,'MONITORANDO');
-  if(pendingIsLocked()) paintPendingTrade();
-  updateMarketNote();refreshAccountStatus();updateClock();loadSignal(false);loadPerformance();loadRadar();
-  setInterval(function(){loadSignal(false);},5000);setInterval(updateClock,1000);setInterval(loadRadar,20000);setInterval(loadPerformance,30000);setInterval(checkResult,3000);setInterval(countdown,250);setInterval(function(){if(E.chartTab&&E.chartTab.classList.contains('active'))loadChart();},15000);
+market.onchange=async()=>{
+  try{localStorage.setItem('mega_market',market.value)}catch(_){}
+
+  fillSymbols();
+
+  try{
+    const savedSym=localStorage.getItem('mega_symbol');
+    if(savedSym && [...S.options].some(o=>o.value===savedSym)){
+      S.value=savedSym;
+    }
+  }catch(_){}
+
+  await updateMarketNote();
+
+  lastSignalVoice='';
+  chartData=[];
+
+  sig(true);
+  rad();
+
+  if(chartTab.classList.contains('active')){
+    loadChart();
+  }
+};
+
+S.onchange=()=>{
+  try{localStorage.setItem('mega_symbol',S.value)}catch(_){}
+
+  lastSignalVoice='';
+  chartData=[];
+
+  sig(true);
+  rad();
+
+  if(chartTab.classList.contains('active')){
+    loadChart();
+  }
+};
+
+interval.onchange=()=>{
+  try{localStorage.setItem('mega_interval',interval.value)}catch(_){}
+
+  lastSignalVoice='';
+  chartData=[];
+
+  sig(true);
+  rad();
+
+  if(chartTab.classList.contains('active')){
+    loadChart();
+  }
+};
+
+try{
+  const sm=localStorage.getItem('mega_market');
+  if(sm==='OPEN'||sm==='OTC'){
+    market.value=sm;
+  }
+
+  fillSymbols();
+
+  const ss=localStorage.getItem('mega_symbol');
+  if(ss && [...S.options].some(o=>o.value===ss)){
+    S.value=ss;
+  }
+
+  const si=localStorage.getItem('mega_interval');
+  if(si && [...interval.options].some(o=>o.value===si)){
+    interval.value=si;
+  }
+
+}catch(_){
+  fillSymbols();
 }
 
-window.addEventListener('error',function(ev){try{console.error('[MEGA IA]',ev.message||ev.error);document.documentElement.setAttribute('data-mega-js','error');text(id('status'),'ERRO DE INTERFACE • RECARREGUE A PÁGINA');}catch(e){}});
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot);else boot();
-})();
+async function bootApp(){
+  const safe=(name,fn)=>
+    Promise.resolve()
+      .then(fn)
+      .catch(err=>{
+        console.error('[MEGA IA] '+name,err);
 
+        if(name==='signal'){
+          statusBox.textContent='MONITORANDO • DADOS TEMPORARIAMENTE INDISPONÍVEIS';
+        }
+      });
+
+  safe('clock',clk);
+  safe('license',lic);
+  safe('account',refreshAccountStatus);
+  safe('market-status',updateMarketNote);
+
+  if(market.value==='OTC'){
+    await new Promise(r=>setTimeout(r,700));
+  }
+
+  safe('signal',()=>sig(false));
+  safe('performance',perf);
+  safe('radar',rad);
+
+  if(chartTab.classList.contains('active')){
+    safe('chart',loadChart);
+  }
+}
+
+bootApp().catch(err=>{
+  console.error('[MEGA IA] boot',err);
+  statusBox.textContent='PAINEL INICIADO COM AVISO';
+});
+
+setInterval(()=>sig(false),5000);
+setInterval(()=>{
+  if(chartTab.classList.contains('active')){
+    loadChart();
+  }
+},15000);
+
+setInterval(perf,30000);
+setInterval(rad,20000);
+setInterval(resultCheck,3000);
+setInterval(clk,1000);
+setInterval(cd,250);
 </script>
 </body>
 </html>
@@ -2678,25 +2966,9 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 HTML_PAGE = HTML_PAGE.replace("__MEGA_IMAGE__", "/mega-ia.png")
 
 
-@app.get("/version")
-async def version_info():
-    return JSONResponse(
-        {"app": "MEGA IA", "version": "32.10.0", "js": "ready", "license": "disabled"},
-        headers={"Cache-Control": "no-store"},
-    )
-
-
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def home():
-    return HTMLResponse(
-        HTML_PAGE,
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Expires": "0",
-            "X-Mega-Panel-Version": "32.10.0",
-        },
-    )
+    return HTMLResponse(HTML_PAGE)
 
 
 if __name__ == "__main__":
