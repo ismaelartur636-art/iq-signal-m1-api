@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
-app = FastAPI(title="MEGA IA", version="32.9.4")
+app = FastAPI(title="MEGA IA", version="32.9.5")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -684,6 +684,12 @@ def _iq_reason_requires_2fa(reason):
     ))
 
 
+def _set_iq_login_diag(stage: str, detail: str = ""):
+    iq_login_diag["stage"] = stage
+    iq_login_diag["detail"] = str(detail)[:240]
+    iq_login_diag["updated_at"] = time.time()
+
+
 async def _iq_login_via_reachable_host(email: str, password: str) -> str:
     """Login alternativo usando iqoption.com, que é alcançável pelo Render.
 
@@ -695,6 +701,7 @@ async def _iq_login_via_reachable_host(email: str, password: str) -> str:
     except Exception as exc:
         raise RuntimeError(f"aiohttp indisponível: {type(exc).__name__}: {exc}") from exc
 
+    _set_iq_login_diag("login_start", "Preparando autenticação HTTP.")
     login_urls = [
         "https://iqoption.com/api/login/v2",
         "https://iqoption.com/api/v2/login",
@@ -720,7 +727,9 @@ async def _iq_login_via_reachable_host(email: str, password: str) -> str:
         for url in login_urls:
             for payload in payloads:
                 try:
+                    _set_iq_login_diag("http_login_request", url)
                     async with session.post(url, data=payload, allow_redirects=False) as resp:
+                        _set_iq_login_diag("http_login_response", f"{url} -> HTTP {resp.status}")
                         try:
                             body = await resp.json(content_type=None)
                         except Exception:
@@ -747,6 +756,7 @@ async def _iq_login_via_reachable_host(email: str, password: str) -> str:
                                 ssid = str(body.get("ssid", "") or "")
 
                         if resp.status == 200 and ssid:
+                            _set_iq_login_diag("ssid_received", "SSID recebido; iniciando WebSocket.")
                             return ssid
 
                         # Não expor corpo, email, senha ou token em logs/erros.
@@ -757,6 +767,7 @@ async def _iq_login_via_reachable_host(email: str, password: str) -> str:
                     errors.append(f"{url}: {type(exc).__name__}: {str(exc)[:120]}")
 
     detail = " | ".join(errors[-4:])
+    _set_iq_login_diag("http_login_failed", detail)
     raise RuntimeError(f"Login alternativo não concluiu. {detail[:420]}")
 
 
@@ -768,8 +779,10 @@ async def _iq_connect_with_fallback_login(email: str, password: str):
     ssid = await _iq_login_via_reachable_host(email, password)
     try:
         client = AsyncIQOption(email, password)
+        _set_iq_login_diag("websocket_open", "Abrindo WebSocket e aguardando autenticação.")
         ws = AsyncWebSocketClient(ssid, wss_url="wss://iqoption.com/echo/websocket")
         await ws.connect(auth_timeout=15.0)
+        _set_iq_login_diag("websocket_authenticated", "WebSocket autenticado.")
         client._ws = ws
         return client
     finally:
@@ -1243,7 +1256,7 @@ async def manifest():
 @app.get("/iq-diagnostic")
 async def iq_diagnostic():
     info = {
-        "app_version": "32.9.4",
+        "app_version": "32.9.5",
         "iq_async_library_loaded": AsyncIQOption is not None,
         "import_error": IQ_IMPORT_ERROR if AsyncIQOption is None else "",
         "active_sessions": len(iq_sessions),
@@ -1263,7 +1276,7 @@ async def iq_diagnostic():
 async def iq_network_test():
     """Testa endpoints alternativos da IQ Option sem usar e-mail nem senha."""
     result = {
-        "app_version": "32.9.4",
+        "app_version": "32.9.5",
         "http": {},
         "websocket": {},
     }
@@ -1318,7 +1331,7 @@ async def iq_network_test():
                     async with session.get(
                         url,
                         allow_redirects=False,
-                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.4"},
+                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.5"},
                     ) as resp:
                         result["http"][url] = {
                             "ok": True,
@@ -1340,7 +1353,7 @@ async def iq_network_test():
                         url,
                         timeout=10,
                         heartbeat=20,
-                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.4"},
+                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.5"},
                     )
                     result["websocket"][url] = {
                         "ok": True,
@@ -1373,7 +1386,7 @@ async def iq_port_test():
         "iqoption.com",
         "ws.iqoption.com",
     ]
-    result = {"app_version": "32.9.4", "port": 443, "hosts": {}}
+    result = {"app_version": "32.9.5", "port": 443, "hosts": {}}
 
     async def tcp_probe(host, family):
         family_name = "ipv4" if family == socket.AF_INET else "ipv6"
@@ -1456,6 +1469,20 @@ async def iq_port_test():
         }
 
     return result
+
+
+@app.get("/iq-login-diagnostic")
+async def iq_login_diagnostic():
+    """Mostra somente a etapa do último login; nunca expõe credenciais ou SSID."""
+    age = None
+    if iq_login_diag.get("updated_at"):
+        age = round(max(0.0, time.time() - float(iq_login_diag["updated_at"])), 1)
+    return {
+        "app_version": "32.9.5",
+        "stage": iq_login_diag.get("stage", "idle"),
+        "detail": iq_login_diag.get("detail", ""),
+        "age_seconds": age,
+    }
 
 
 @app.post("/iq-login")
@@ -2243,7 +2270,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 (function(){
 'use strict';
 
-var VERSION='32.9.4';
+var VERSION='32.9.5';
 var symbols=['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD'];
 var E={};
 var currentSignal=null;
