@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
-app = FastAPI(title="MEGA IA", version="32.9.0")
+app = FastAPI(title="MEGA IA", version="32.9.1")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -843,7 +843,15 @@ async def openai_confirm(symbol, interval, cs, analysis):
         for c in cs[-40:]
     ]
 
-    prompt = f"""Você é o módulo de confirmação da MEGA IA. Ativo {symbol}, timeframe {interval}. Use SOMENTE candles fechados. Não invente dados futuros. Estratégias internas: reversão, tendência, momentum, price action e breakout com filtro de volatilidade. Análise técnica preliminar: {json.dumps(analysis, ensure_ascii=False)} Retorne SOMENTE JSON: {{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"reason":"curto","risk":"LOW|MEDIUM|HIGH"}} Candles: {json.dumps(data, ensure_ascii=False)}"""
+    prompt = f"""Você é o módulo de confirmação da MEGA IA.
+Ativo {symbol}, timeframe {interval}.
+Use SOMENTE candles fechados.
+Não invente dados futuros.
+Estratégias internas: reversão, tendência, momentum, price action e breakout com filtro de volatilidade.
+Análise técnica preliminar: {json.dumps(analysis, ensure_ascii=False)}
+Retorne SOMENTE JSON:
+{{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
+Candles: {json.dumps(data, ensure_ascii=False)}"""
 
     try:
         async with httpx.AsyncClient(timeout=OAI_TIMEOUT) as client:
@@ -1138,7 +1146,7 @@ async def manifest():
 @app.get("/iq-diagnostic")
 async def iq_diagnostic():
     info = {
-        "app_version": "32.9.0",
+        "app_version": "32.9.1",
         "iq_async_library_loaded": AsyncIQOption is not None,
         "import_error": IQ_IMPORT_ERROR if AsyncIQOption is None else "",
         "active_sessions": len(iq_sessions),
@@ -1151,6 +1159,74 @@ async def iq_diagnostic():
         except Exception as exc:
             info["module_probe_error"] = f"{type(exc).__name__}: {exc}"
     return info
+
+
+
+@app.get("/iq-network-test")
+async def iq_network_test():
+    """Testa somente conectividade Render -> IQ Option. Não usa e-mail nem senha."""
+    result = {
+        "app_version": "32.9.1",
+        "http_auth": {"ok": False},
+        "websocket": {"ok": False},
+    }
+
+    try:
+        import aiohttp
+    except Exception as exc:
+        result["fatal"] = f"aiohttp indisponível: {type(exc).__name__}: {exc}"
+        return result
+
+    # 1) Teste HTTPS: qualquer resposta HTTP prova que o host respondeu.
+    auth_url = "https://auth.iqoption.com/api/v2/login"
+    try:
+        timeout = aiohttp.ClientTimeout(total=12, connect=8, sock_read=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                async with session.get(
+                    auth_url,
+                    allow_redirects=False,
+                    headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test"},
+                ) as resp:
+                    result["http_auth"] = {
+                        "ok": True,
+                        "status": resp.status,
+                        "server": resp.headers.get("server", ""),
+                        "content_type": resp.headers.get("content-type", ""),
+                    }
+            except Exception as exc:
+                result["http_auth"] = {
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:300],
+                }
+
+            # 2) Teste WebSocket sem autenticação, só abertura do canal.
+            ws_url = "wss://iqoption.com/echo/websocket"
+            try:
+                ws = await session.ws_connect(
+                    ws_url,
+                    timeout=10,
+                    heartbeat=20,
+                    headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test"},
+                )
+                result["websocket"] = {
+                    "ok": True,
+                    "closed": bool(ws.closed),
+                    "close_code": ws.close_code,
+                }
+                await ws.close()
+            except Exception as exc:
+                result["websocket"] = {
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:300],
+                }
+
+    except Exception as exc:
+        result["fatal"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+
+    return result
 
 
 @app.post("/iq-login")
@@ -1312,7 +1388,13 @@ async def otc_status(request: Request):
 
 
 @app.get("/candles")
-async def candles_endpoint( request: Request, symbol: str = "EUR/USD", interval: str = "1min", n: int = 80, market: str = "OPEN", ):
+async def candles_endpoint(
+    request: Request,
+    symbol: str = "EUR/USD",
+    interval: str = "1min",
+    n: int = 80,
+    market: str = "OPEN",
+):
     market = (market or "OPEN").upper()
 
     if symbol not in SYMBOLS or interval not in INTERVALS or market not in ("OPEN", "OTC"):
@@ -1618,7 +1700,14 @@ async def performance(request: Request, interval="1min", market="OPEN"):
 
 
 @app.get("/result")
-async def result( request: Request, symbol="EUR/USD", interval="1min", direction="CALL", expiry_time="", market="OPEN", ):
+async def result(
+    request: Request,
+    symbol="EUR/USD",
+    interval="1min",
+    direction="CALL",
+    expiry_time="",
+    market="OPEN",
+):
     if not expiry_time:
         raise HTTPException(400, "expiry_time é obrigatório.")
 
@@ -1683,7 +1772,582 @@ async def result( request: Request, symbol="EUR/USD", interval="1min", direction
     return out
 
 
-HTML_PAGE = r""" <!doctype html> <html lang="pt-BR"> <head> <meta charset="utf-8"> <meta name="viewport" content="width=device-width,initial-scale=1"> <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"> <meta http-equiv="Pragma" content="no-cache"> <meta http-equiv="Expires" content="0"> <title>Mega IA Trader</title> <link rel="manifest" href="/manifest.webmanifest?v=3280"> <link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=3282"> <link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=3282"> <meta name="theme-color" content="#07182b"> <meta name="application-name" content="Mega IA Trader"> <meta name="apple-mobile-web-app-title" content="Mega IA Trader"> <meta name="apple-mobile-web-app-capable" content="yes"> <style> body{margin:0;background:radial-gradient(circle at 50% 0,#07182b 0,#030812 42%,#02050b 100%);color:#eef5ff;font-family:Arial,sans-serif} .wrap{max-width:1150px;margin:auto;padding:18px} .brand{font-size:42px;font-weight:900;letter-spacing:1px;margin:8px 0 2px} .brand span{color:#14c8ff} .subtitle{font-size:13px;color:#91a9c8;letter-spacing:.7px} .card{background:linear-gradient(180deg,#0c1a2c,#091422);border:1px solid #164f80;border-radius:20px;padding:16px;box-shadow:0 12px 30px #0008,0 0 18px #009cff12;margin-top:12px} .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px} .signal{grid-column:span 2;text-align:center;min-height:270px;position:relative} .big{font-size:32px;font-weight:800;margin:8px} .call{color:#45ff9b} .put{color:#ff5c7a} .neutral{color:#ffd166} .label{font-size:11px;color:#8190a8} .controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px} select,button,input{background:#0d2035;color:#fff;border:1px solid #22689d;border-radius:14px;padding:12px 14px;font-size:15px} select:focus,button:focus,input:focus{outline:none;box-shadow:0 0 0 2px #00bfff55} button{cursor:pointer} input{box-sizing:border-box;width:100%;margin-top:6px} .account-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px} .account-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px} .radar{display:grid;grid-template-columns:repeat(3,1fr);gap:8px} .radar div{background:#101b2b;padding:10px;border-radius:12px;border:1px solid #173c5e} .tabs{display:flex;gap:8px;margin-top:12px;margin-bottom:20px;flex-wrap:wrap} .tabbtn.active{border-color:#168cff;box-shadow:0 0 15px #168cff44} .tab{display:none} .tab.active{display:block} #chartTab{width:100%;display:none;justify-content:center;align-items:flex-start} #chartTab.active{display:flex;padding-top:7vh;box-sizing:border-box} #chartTab>.card{width:min(96vw,1100px)!important;max-width:1100px!important;margin:0 auto!important;padding:14px!important;box-sizing:border-box} .chartbox{position:relative;width:100%!important;height:clamp(460px,68vh,700px)!important;margin:0 auto!important;background:#07101c;border:1px solid #1d3049;border-radius:16px;overflow:hidden} .chartbox canvas{width:100%!important;height:100%!important;display:block} .chartmeta{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px} .chartbadge{padding:7px 10px;border-radius:10px;background:#101b2b;color:#b8c7dd;font-size:12px} .hero{display:none;position:relative;width:100%;max-width:760px;margin:26px auto 18px;border-radius:20px;overflow:hidden;border:1px solid #0bbcff;box-shadow:0 0 30px #00aaff55;background:#05111f} .hero img{display:block;width:100%;height:300px;object-fit:contain;object-position:center;background:#05111f} .entry-arrow{display:none;position:absolute;inset:0;align-items:center;justify-content:center;flex-direction:column;background:#02081488;backdrop-filter:blur(1px);font-weight:900;text-shadow:0 0 18px currentColor} .entry-arrow .arrow{font-size:110px;line-height:.8} .entry-arrow .arrow-label{font-size:28px;margin-top:8px} .entry-arrow.call{display:flex;color:#31ff87} .entry-arrow.put{display:flex;color:#ff405f} .analysisbar{text-align:center;font-size:20px;color:#22c9ff;border-color:#0bbcff} @media(max-width:720px){ .wrap{padding:10px} .grid{grid-template-columns:1fr 1fr} .signal{grid-column:span 2} .radar{grid-template-columns:1fr 1fr} .hero img{height:250px} .brand{font-size:36px} #chartTab.active{padding-top:8vh} #chartTab>.card{width:calc(100vw - 20px)!important;max-width:none!important;padding:10px!important} .chartbox{height:58vh!important;min-height:440px!important;max-height:620px!important} } @media(max-width:600px){ .account-grid{grid-template-columns:1fr} } @media(max-width:450px){ .wrap{padding:8px} .grid{grid-template-columns:1fr} .signal{grid-column:span 1} .radar{grid-template-columns:1fr} .hero img{height:230px} #chartTab.active{padding-top:9vh} #chartTab>.card{width:calc(100vw - 12px)!important;padding:7px!important} .chartbox{height:56vh!important;min-height:420px!important} } </style> </head> <body> <div class="wrap"> <div class="brand">🤖 MEGA <span>IA</span></div> <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div> <div id="clock" style="font-size:22px;margin-top:4px"></div> <div class="controls"> <select id="market" onchange="handleMarketChange()"> <option value="OPEN">🌐 Mercado Aberto</option> <option value="OTC">🟣 IQ Option OTC</option> </select> <select id="symbol" onchange="handleSymbolChange()"> <option value="EUR/USD" selected>EUR/USD</option> <option value="GBP/USD">GBP/USD</option> <option value="USD/JPY">USD/JPY</option> <option value="AUD/USD">AUD/USD</option> <option value="USD/CAD">USD/CAD</option> <option value="USD/CHF">USD/CHF</option> <option value="NZD/USD">NZD/USD</option> <option value="EUR/JPY">EUR/JPY</option> <option value="GBP/JPY">GBP/JPY</option> <option value="EUR/GBP">EUR/GBP</option> <option value="BTC/USD">BTC/USD</option> <option value="ETH/USD">ETH/USD</option> <option value="LTC/USD">LTC/USD</option> </select> <select id="interval" onchange="handleIntervalChange()"> <option>1min</option> <option>5min</option> <option>15min</option> <option>30min</option> </select> <button type="button" id="voiceBtn" onclick="voice();return false;">🔊 Ativar voz</button> <div id="otcNote" class="label" style="margin-top:6px;display:none">🟣 IQ Option OTC: verificando conexão...</div> </div> <div class="tabs"> <button type="button" class="tabbtn active" id="tabMain" onclick="showTab('main');return false;">📊 Painel</button> <button type="button" class="tabbtn" id="tabChart" onclick="showTab('chart');return false;">📈 Gráfico</button> <button type="button" class="tabbtn" id="tabAccount" onclick="showTab('account');return false;">⚙️ Conta IQ Option</button> </div> <div id="mainTab" class="tab active"> <div id="heroBox" class="hero"> <img id="aiImage" src="__MEGA_IMAGE__" alt="MEGA IA analisando o mercado"> <div id="entryArrow" class="entry-arrow"> <div class="arrow" id="entryArrowIcon">⬆</div> <div class="arrow-label" id="entryArrowLabel">CALL • COMPRAR</div> </div> </div> <div id="analysisText" class="card analysisbar" style="display:none"> 🧠 ESTOU ANALISANDO O MERCADO, AGUARDE... </div> <div class="grid"> <div class="card signal"> <div class="label">SINAL ATUAL</div> <div id="direction" class="big neutral">AGUARDANDO</div> <div id="confidence">Confiança: --</div> </div> <div class="card"> <div class="label">ENTRADA</div> <div id="entry" class="big">--:--:--</div> <div id="countdown">--</div> <div id="expiryCountdown" style="margin-top:8px;font-weight:800">⏱ EXPIRAÇÃO: --:--</div> </div> <div class="card"> <div class="label">STATUS IA</div> <div id="status" class="big" style="font-size:18px">MONITORANDO</div> <div id="risk">Risco: --</div> </div> </div> <div class="grid"> <div class="card"> <div class="label">WIN</div> <div id="wins" class="big call">0</div> </div> <div class="card"> <div class="label">LOSS</div> <div id="losses" class="big put">0</div> </div> <div class="card"> <div class="label">ASSERTIVIDADE</div> <div id="accuracy" class="big">0%</div> </div> <div class="card"> <div class="label">RESULTADO</div> <div id="result" class="big">--</div> </div> </div> </div> <div id="chartTab" class="tab"> <div class="card"> <div class="chartmeta"> <b>📈 Gráfico espelhado</b> <span class="chartbadge" id="chartInfo">--</span> </div> <div class="chartbox"><canvas id="priceChart"></canvas></div> <div class="label" style="margin-top:8px"> O gráfico acompanha o mesmo mercado, par e período selecionados no painel. </div> </div> </div> <div id="accountTab" class="tab"> <div class="card"> <h2 style="margin-top:0">⚙️ Conta IQ Option</h2> <div class="label"> Use sua própria conta para liberar o gráfico e os candles OTC. </div> <div class="account-grid"> <label>E-mail <input id="iqEmail" type="email" autocomplete="username" placeholder="Seu e-mail da IQ Option"> </label> <label>Senha <input id="iqPassword" type="password" autocomplete="current-password" placeholder="Sua senha"> </label> <label id="iq2faWrap" style="display:none">Código de verificação <input id="iq2faCode" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="Código enviado pela IQ Option"> </label> </div> <div class="account-actions"> <button type="button" id="iqConnectBtn">🟢 Conectar</button> <button type="button" id="iq2faBtn" style="display:none">🔐 Validar código</button> <button type="button" id="iqLogoutBtn">🔴 Desconectar</button> </div> <div id="iqAccountStatus" class="card" style="margin-top:12px">● Desconectado</div> </div> </div> <div class="card"> <b>Radar de oportunidades</b> <div id="radar" class="radar"></div> </div> </div> <script> (function(){ 'use strict'; var VERSION='32.9.0'; var symbols=['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD']; var E={}; var currentSignal=null; var voiceEnabled=false; var signalBusy=false, radarBusy=false, perfBusy=false, chartBusy=false, resultBusy=false; var pendingTrade=null; var chartData=[]; var lastResultKey=''; var stats={OPEN:{wins:0,losses:0,keys:[]},OTC:{wins:0,losses:0,keys:[]}}; function id(x){ return document.getElementById(x); } function text(el,v){ if(el) el.textContent=v; } function safeStoreGet(k){ try{return localStorage.getItem(k)||'';}catch(e){return '';} } function safeStoreSet(k,v){ try{localStorage.setItem(k,v);}catch(e){} } function safeStoreDel(k){ try{localStorage.removeItem(k);}catch(e){} } function encode(v){ return encodeURIComponent(v==null?'':String(v)); } function timeFmt(v){ if(!v) return '--:--:--'; try{return new Date(v).toLocaleTimeString('pt-BR',{hour12:false});}catch(e){return '--:--:--';} } function bindElements(){ var names=['market','symbol','interval','voiceBtn','otcNote','heroBox','entryArrow','entryArrowIcon','entryArrowLabel','analysisText','mainTab','chartTab','accountTab','tabMain','tabChart','tabAccount','iqEmail','iqPassword','iq2faWrap','iq2faCode','iqConnectBtn','iq2faBtn','iqLogoutBtn','iqAccountStatus','chartInfo','direction','confidence','entry','countdown','status','risk','wins','losses','accuracy','result','radar','clock','expiryCountdown','priceChart']; for(var i=0;i<names.length;i++) E[names[i]]=id(names[i]); } function request(url,options){ options=options||{}; options.cache='no-store'; options.credentials='include'; options.headers=options.headers||{}; var token=safeStoreGet('mega_iq_session_token'); if(token) options.headers['X-IQ-Session']=token; return fetch(url,options).then(function(r){ return r.text().then(function(raw){ var data=null; try{data=raw?JSON.parse(raw):{};}catch(e){data={};} if(!r.ok){ throw new Error((data&&data.detail)||('HTTP '+r.status)); } return data; }); }); } function get(url){ return request(url); } function post(url,data){ return request(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})}); } function loadStats(){ try{ var raw=safeStoreGet('mega_stats_3280'); if(!raw) raw=safeStoreGet('mega_winloss_v3271'); if(!raw) return; var x=JSON.parse(raw); ['OPEN','OTC'].forEach(function(m){ if(x&&x[m]){ stats[m].wins=Number(x[m].wins||0); stats[m].losses=Number(x[m].losses||0); stats[m].keys=Array.isArray(x[m].keys)?x[m].keys.slice(-500):[]; } }); }catch(e){} } function saveStats(){ safeStoreSet('mega_stats_3280',JSON.stringify(stats)); } function paintStats(){ var m=(E.market&&E.market.value)||'OPEN'; var s=stats[m]||stats.OPEN; var total=s.wins+s.losses; text(E.wins,String(s.wins)); text(E.losses,String(s.losses)); text(E.accuracy,(total?((s.wins/total)*100).toFixed(2):'0.00')+'%'); } function registerResult(t,x){ if(!t||!x||(x.result!=='WIN'&&x.result!=='LOSS')) return; var m=(t.market||'OPEN').toUpperCase(); var s=stats[m]||stats.OPEN; var key=[m,t.symbol,t.interval,t.direction,t.entry_time,t.expiry_time].join('|'); if(s.keys.indexOf(key)>=0) return; s.keys.push(key); if(s.keys.length>500) s.keys=s.keys.slice(-500); if(x.result==='WIN') s.wins++; else s.losses++; saveStats(); paintStats(); } function fillSymbols(){ if(!E.market||!E.symbol) return; var old=E.symbol.value||safeStoreGet('mega_symbol')||'EUR/USD'; var otc=E.market.value==='OTC'; while(E.symbol.firstChild) E.symbol.removeChild(E.symbol.firstChild); for(var i=0;i<symbols.length;i++){ var s=symbols[i],o=document.createElement('option'); o.value=s; o.textContent=otc?('🟣 '+s.replace('/','')+'-OTC'):s; E.symbol.appendChild(o); } E.symbol.value=old; if(!E.symbol.value) E.symbol.selectedIndex=0; } function currentSymbol(){ if(!E.symbol||!E.symbol.value) fillSymbols(); return (E.symbol&&E.symbol.value)||'EUR/USD'; } function showTab(which){ var m=which==='main',c=which==='chart',a=which==='account'; if(E.mainTab) E.mainTab.classList.toggle('active',m); if(E.chartTab) E.chartTab.classList.toggle('active',c); if(E.accountTab) E.accountTab.classList.toggle('active',a); if(E.tabMain) E.tabMain.classList.toggle('active',m); if(E.tabChart) E.tabChart.classList.toggle('active',c); if(E.tabAccount) E.tabAccount.classList.toggle('active',a); if(c){ setTimeout(function(){ resizeChart(); loadChart(); },50); } if(a) refreshAccountStatus(); } window.showTab=showTab; function speak(msg){ if(!voiceEnabled||!window.speechSynthesis) return; try{ window.speechSynthesis.cancel(); var u=new SpeechSynthesisUtterance(msg); u.lang='pt-BR';u.rate=.95;u.pitch=.9; window.speechSynthesis.speak(u); }catch(e){} } function voice(){ voiceEnabled=true;text(E.voiceBtn,'🔊 Voz ativada');speak('Voz da Mega IA ativada.');setTimeout(function(){loadSignal(true);},300); } window.voice=voice; function updateMarketNote(){ if(!E.otcNote||!E.market) return Promise.resolve(); if(E.market.value!=='OTC'){E.otcNote.style.display='none';return Promise.resolve();} E.otcNote.style.display='block';text(E.otcNote,'🟣 IQ Option OTC: verificando conexão...'); return get('/otc-status').then(function(x){ text(E.otcNote,(x.connected?'🟢 ':x.reconnecting?'🟡 ':'🔴 ')+(x.message||'')); }).catch(function(e){text(E.otcNote,'🔴 IQ Option OTC: '+e.message);}); } function handleMarketChange(){ if(!E.market) return; safeStoreSet('mega_market',E.market.value);fillSymbols();paintStats();updateMarketNote(); chartData=[];loadSignal(true);loadRadar();if(E.chartTab&&E.chartTab.classList.contains('active'))loadChart(); } function handleSymbolChange(){ safeStoreSet('mega_symbol',currentSymbol());chartData=[];loadSignal(true);loadRadar();if(E.chartTab&&E.chartTab.classList.contains('active'))loadChart(); } function handleIntervalChange(){ if(E.interval)safeStoreSet('mega_interval',E.interval.value);chartData=[];loadSignal(true);loadRadar();if(E.chartTab&&E.chartTab.classList.contains('active'))loadChart(); } window.handleMarketChange=handleMarketChange;window.handleSymbolChange=handleSymbolChange;window.handleIntervalChange=handleIntervalChange; function rememberPending(sig){ if(!sig||(sig.direction!=='CALL'&&sig.direction!=='PUT')||!sig.entry_time||!sig.expiry_time) return; if(pendingTrade&&pendingTrade.expiry_time&&Date.now()<new Date(pendingTrade.expiry_time).getTime()+120000) return; pendingTrade={market:sig.market||E.market.value,symbol:sig.symbol,interval:sig.interval,direction:sig.direction,entry_time:sig.entry_time,expiry_time:sig.expiry_time}; safeStoreSet('mega_pending_trade',JSON.stringify(pendingTrade)); } function paintSignal(x){ currentSignal=x||{}; var d=currentSignal.direction||'NEUTRO'; text(E.direction,d); if(E.direction) E.direction.className='big '+(d==='CALL'?'call':d==='PUT'?'put':'neutral'); text(E.confidence,'Confiança: '+Number(currentSignal.confidence||0).toFixed(0)+'%'); text(E.entry,(d==='NEUTRO'||!currentSignal.entry_time)?'AGUARDANDO SINAL':timeFmt(currentSignal.entry_time)); text(E.countdown,d==='NEUTRO'?'Sem entrada confirmada':'Preparando entrada'); text(E.status,currentSignal.status||'MONITORANDO'); text(E.risk,'Risco: '+(currentSignal.risk||'--')); rememberPending(currentSignal); } function loadSignal(announce){ if(signalBusy||!E.market||!E.interval) return Promise.resolve(); signalBusy=true; if(announce){text(E.status,'ANALISANDO O MERCADO...');} var u='/signal-ai?market='+encode(E.market.value)+'&symbol='+encode(currentSymbol())+'&interval='+encode(E.interval.value); return get(u).then(function(x){paintSignal(x);if(announce&&x.direction&&x.direction!=='NEUTRO')speak('Sinal de '+x.direction+' identificado.');}) .catch(function(e){text(E.status,'PAINEL ATIVO • FONTE TEMPORARIAMENTE INDISPONÍVEL');text(E.direction,'NEUTRO');text(E.entry,'AGUARDANDO DADOS');}) .then(function(){signalBusy=false;},function(){signalBusy=false;}); } function loadPerformance(){ if(perfBusy||!E.market)return;perfBusy=true; var m=E.market.value; get('/performance?market='+encode(m)).then(function(p){ var s=stats[m]||stats.OPEN;s.wins=Math.max(s.wins,Number(p.wins||0));s.losses=Math.max(s.losses,Number(p.losses||0));saveStats(); }).catch(function(){}).then(function(){paintStats();perfBusy=false;}); } function loadRadar(){ if(radarBusy||!E.radar||!E.market||!E.interval)return;radarBusy=true; get('/radar?market='+encode(E.market.value)+'&interval='+encode(E.interval.value)).then(function(a){ if(!Array.isArray(a)) a=[];var h=''; for(var i=0;i<a.length;i++){ var x=a[i]||{},cls=x.direction==='CALL'?'call':x.direction==='PUT'?'put':'neutral'; h+='<div><b>'+String(x.symbol||'')+'</b><br><span class="'+cls+'">'+String(x.direction||'NEUTRO')+'</span> • '+Number(x.confidence||0)+'%<br><small>'+String(x.status||'')+'</small></div>'; } E.radar.innerHTML=h||'<div>Monitorando oportunidades...</div>'; }).catch(function(){E.radar.innerHTML='<div>⚠️ Radar temporariamente indisponível</div>';}).then(function(){radarBusy=false;}); } function updateClock(){ get('/server-time').then(function(x){text(E.clock,timeFmt(x.datetime)+' • Brasília');}).catch(function(){text(E.clock,new Date().toLocaleTimeString('pt-BR',{hour12:false})+' • Brasília');}); } function resizeChart(){ if(!E.priceChart)return;var ctx=E.priceChart.getContext('2d');if(!ctx)return; var r=E.priceChart.getBoundingClientRect(),d=window.devicePixelRatio||1; E.priceChart.width=Math.max(1,Math.floor(r.width*d));E.priceChart.height=Math.max(1,Math.floor(r.height*d));ctx.setTransform(d,0,0,d,0,0);drawChart(chartData); } function drawChart(a){ if(!E.priceChart)return;var ctx=E.priceChart.getContext('2d');if(!ctx)return; var w=E.priceChart.clientWidth,h=E.priceChart.clientHeight;ctx.clearRect(0,0,w,h);if(!a||!a.length)return; var lows=[],highs=[],i;for(i=0;i<a.length;i++){lows.push(Number(a[i].low));highs.push(Number(a[i].high));} var lo=Math.min.apply(null,lows),hi=Math.max.apply(null,highs),pad=20,span=(hi-lo)||1; function px(n){return pad+n/(Math.max(1,a.length-1))*(w-pad*2);}function py(v){return pad+(hi-v)/span*(h-pad*2);} for(i=0;i<a.length;i++){ var c=a[i],x=px(i),o=Number(c.open),cl=Number(c.close),hh=Number(c.high),ll=Number(c.low),up=cl>=o; ctx.strokeStyle=up?'#45ff9b':'#ff5c7a';ctx.fillStyle=ctx.strokeStyle;ctx.beginPath();ctx.moveTo(x,py(hh));ctx.lineTo(x,py(ll));ctx.stroke(); var y1=py(Math.max(o,cl)),y2=py(Math.min(o,cl));ctx.fillRect(x-2,y1,4,Math.max(1,y2-y1)); } } function loadChart(){ if(chartBusy||!E.market||!E.interval)return;chartBusy=true; var u='/candles?market='+encode(E.market.value)+'&symbol='+encode(currentSymbol())+'&interval='+encode(E.interval.value)+'&n=80'; get(u).then(function(d){ if(d&&Array.isArray(d.candles)&&d.candles.length)chartData=d.candles; text(E.chartInfo,(d.market==='OTC'?'🟣 '+String(d.symbol||'')+' • OTC':String(d.symbol||''))+' • '+String(d.interval||''));resizeChart(); }).catch(function(){text(E.chartInfo,'⚠️ Dados temporariamente indisponíveis');}).then(function(){chartBusy=false;}); } function show2FA(show){ if(E.iq2faWrap)E.iq2faWrap.style.display=show?'block':'none'; if(E.iq2faBtn)E.iq2faBtn.style.display=show?'inline-flex':'none'; } function refreshAccountStatus(){ return get('/otc-status').then(function(x){ if(x.requires_2fa){ show2FA(true); text(E.iqAccountStatus,'🟡 Digite o código de verificação enviado pela IQ Option.'); if(E.iqConnectBtn)E.iqConnectBtn.disabled=true; if(E.iqLogoutBtn)E.iqLogoutBtn.disabled=false; return; } show2FA(false); var rr=!!x.reconnecting; text(E.iqAccountStatus,(x.connected&&!rr?'🟢 ':rr?'🟡 ':'🔴 ')+(x.connected&&!rr?('Conectado: '+(x.email_masked||'')):(x.message||'Desconectado'))); if(E.iqConnectBtn)E.iqConnectBtn.disabled=!!x.connected||rr; if(E.iqLogoutBtn)E.iqLogoutBtn.disabled=!x.connected&&!rr; }).catch(function(){text(E.iqAccountStatus,'🟡 Verificando conexão...');}); } function connectIQ(){ var email=E.iqEmail?E.iqEmail.value.trim():'',password=E.iqPassword?E.iqPassword.value:''; if(!email||!password){text(E.iqAccountStatus,'🔴 Informe e-mail e senha.');return;} show2FA(false); text(E.iqAccountStatus,'🟡 Conectando à IQ Option...'); if(E.iqConnectBtn)E.iqConnectBtn.disabled=true; post('/iq-login',{email:email,password:password}).then(function(x){ if(x.session_token)safeStoreSet('mega_iq_session_token',x.session_token); if(x.requires_2fa){ show2FA(true); text(E.iqAccountStatus,'🟡 A IQ Option pediu um código de verificação. Digite o código recebido.'); if(E.iqPassword)E.iqPassword.value=''; return; } if(E.iqPassword)E.iqPassword.value=''; text(E.iqAccountStatus,'🟢 Conectado: '+(x.email_masked||'')); updateMarketNote(); loadSignal(true); }).catch(function(e){ text(E.iqAccountStatus,'🔴 '+e.message); }).then(function(){ if(E.iqConnectBtn)E.iqConnectBtn.disabled=false; }); } function submitIQ2FA(){ var code=E.iq2faCode?E.iq2faCode.value.trim():''; if(!code){text(E.iqAccountStatus,'🔴 Digite o código enviado pela IQ Option.');return;} text(E.iqAccountStatus,'🟡 Validando código...'); if(E.iq2faBtn)E.iq2faBtn.disabled=true; post('/iq-2fa',{code:code}).then(function(x){ if(x.session_token)safeStoreSet('mega_iq_session_token',x.session_token); if(E.iq2faCode)E.iq2faCode.value=''; show2FA(false); text(E.iqAccountStatus,'🟢 Conectado: '+(x.email_masked||'')); updateMarketNote(); loadSignal(true); }).catch(function(e){ text(E.iqAccountStatus,'🔴 '+e.message); }).then(function(){ if(E.iq2faBtn)E.iq2faBtn.disabled=false; }); } function logoutIQ(){ post('/iq-logout',{}).catch(function(){}).then(function(){ safeStoreDel('mega_iq_session_token'); show2FA(false); if(E.iq2faCode)E.iq2faCode.value=''; text(E.iqAccountStatus,'● Desconectado'); updateMarketNote(); }); } function checkResult(){ if(resultBusy)return;if(!pendingTrade){try{var p=safeStoreGet('mega_pending_trade');if(p)pendingTrade=JSON.parse(p);}catch(e){}} if(!pendingTrade||!pendingTrade.expiry_time||Date.now()<new Date(pendingTrade.expiry_time).getTime())return; resultBusy=true;var t=pendingTrade; var u='/result?market='+encode(t.market)+'&symbol='+encode(t.symbol)+'&interval='+encode(t.interval)+'&direction='+encode(t.direction)+'&expiry_time='+encode(t.expiry_time); get(u).then(function(x){if(x&&x.result){text(E.result,x.result);registerResult(t,x);var k=t.symbol+'|'+t.direction+'|'+t.expiry_time;if(k!==lastResultKey){lastResultKey=k;speak('Operação finalizada. Resultado '+x.result+'.');}pendingTrade=null;safeStoreDel('mega_pending_trade');loadPerformance();}}) .catch(function(){}).then(function(){resultBusy=false;}); } function countdown(){ var c=currentSignal;if(!c||c.direction==='NEUTRO'||!c.entry_time){text(E.countdown,'Sem entrada confirmada');text(E.expiryCountdown,'⏱ EXPIRAÇÃO: --:--');return;} var n=Math.ceil((new Date(c.entry_time).getTime()-Date.now())/1000),xt=c.expiry_time?new Date(c.expiry_time).getTime():0; text(E.countdown,n>0?'Entrada em '+n+'s':'Entrada liberada'); if(n>0)text(E.expiryCountdown,'⏱ EXPIRAÇÃO: aguardando entrada');else if(xt){var rem=Math.max(0,Math.ceil((xt-Date.now())/1000));text(E.expiryCountdown,'⏱ EXPIRAÇÃO: '+String(Math.floor(rem/60)).padStart(2,'0')+':'+String(rem%60).padStart(2,'0'));} } function restoreSelections(){ var m=safeStoreGet('mega_market');if(m==='OPEN'||m==='OTC')E.market.value=m; fillSymbols();var s=safeStoreGet('mega_symbol');if(s&&symbols.indexOf(s)>=0)E.symbol.value=s; var it=safeStoreGet('mega_interval');if(it&&['1min','5min','15min','30min'].indexOf(it)>=0)E.interval.value=it; } function bindEvents(){ if(E.market)E.market.onchange=handleMarketChange;if(E.symbol)E.symbol.onchange=handleSymbolChange;if(E.interval)E.interval.onchange=handleIntervalChange; if(E.voiceBtn)E.voiceBtn.onclick=function(){voice();return false;}; if(E.tabMain)E.tabMain.onclick=function(){showTab('main');return false;};if(E.tabChart)E.tabChart.onclick=function(){showTab('chart');return false;};if(E.tabAccount)E.tabAccount.onclick=function(){showTab('account');return false;}; if(E.iqConnectBtn)E.iqConnectBtn.onclick=connectIQ;if(E.iq2faBtn)E.iq2faBtn.onclick=submitIQ2FA;if(E.iqLogoutBtn)E.iqLogoutBtn.onclick=logoutIQ; } function boot(){ bindElements(); if(!E.market||!E.symbol||!E.interval){document.documentElement.setAttribute('data-mega-js','missing-elements');return;} loadStats();restoreSelections();bindEvents();paintStats();showTab('main'); try{var p=safeStoreGet('mega_pending_trade');if(p)pendingTrade=JSON.parse(p);}catch(e){} document.documentElement.setAttribute('data-mega-js','ready');document.documentElement.setAttribute('data-mega-version',VERSION); text(E.status,'MONITORANDO'); updateMarketNote();refreshAccountStatus();updateClock();loadSignal(false);loadPerformance();loadRadar(); setInterval(function(){loadSignal(false);},5000);setInterval(updateClock,1000);setInterval(loadRadar,20000);setInterval(loadPerformance,30000);setInterval(checkResult,3000);setInterval(countdown,250);setInterval(function(){if(E.chartTab&&E.chartTab.classList.contains('active'))loadChart();},15000); } window.addEventListener('error',function(ev){try{console.error('[MEGA IA]',ev.message||ev.error);document.documentElement.setAttribute('data-mega-js','error');text(id('status'),'ERRO DE INTERFACE • RECARREGUE A PÁGINA');}catch(e){}}); if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot);else boot(); })(); </script> </body> </html> """
+HTML_PAGE = r"""
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>Mega IA Trader</title>
+<link rel="manifest" href="/manifest.webmanifest?v=3280">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=3282">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=3282">
+<meta name="theme-color" content="#07182b">
+<meta name="application-name" content="Mega IA Trader">
+<meta name="apple-mobile-web-app-title" content="Mega IA Trader">
+<meta name="apple-mobile-web-app-capable" content="yes">
+
+<style>
+body{margin:0;background:radial-gradient(circle at 50% 0,#07182b 0,#030812 42%,#02050b 100%);color:#eef5ff;font-family:Arial,sans-serif}
+.wrap{max-width:1150px;margin:auto;padding:18px}
+.brand{font-size:42px;font-weight:900;letter-spacing:1px;margin:8px 0 2px}
+.brand span{color:#14c8ff}
+.subtitle{font-size:13px;color:#91a9c8;letter-spacing:.7px}
+.card{background:linear-gradient(180deg,#0c1a2c,#091422);border:1px solid #164f80;border-radius:20px;padding:16px;box-shadow:0 12px 30px #0008,0 0 18px #009cff12;margin-top:12px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.signal{grid-column:span 2;text-align:center;min-height:270px;position:relative}
+.big{font-size:32px;font-weight:800;margin:8px}
+.call{color:#45ff9b}
+.put{color:#ff5c7a}
+.neutral{color:#ffd166}
+.label{font-size:11px;color:#8190a8}
+.controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+select,button,input{background:#0d2035;color:#fff;border:1px solid #22689d;border-radius:14px;padding:12px 14px;font-size:15px}
+select:focus,button:focus,input:focus{outline:none;box-shadow:0 0 0 2px #00bfff55}
+button{cursor:pointer}
+input{box-sizing:border-box;width:100%;margin-top:6px}
+.account-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.account-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.radar{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.radar div{background:#101b2b;padding:10px;border-radius:12px;border:1px solid #173c5e}
+.tabs{display:flex;gap:8px;margin-top:12px;margin-bottom:20px;flex-wrap:wrap}
+.tabbtn.active{border-color:#168cff;box-shadow:0 0 15px #168cff44}
+.tab{display:none}
+.tab.active{display:block}
+#chartTab{width:100%;display:none;justify-content:center;align-items:flex-start}
+#chartTab.active{display:flex;padding-top:7vh;box-sizing:border-box}
+#chartTab>.card{width:min(96vw,1100px)!important;max-width:1100px!important;margin:0 auto!important;padding:14px!important;box-sizing:border-box}
+.chartbox{position:relative;width:100%!important;height:clamp(460px,68vh,700px)!important;margin:0 auto!important;background:#07101c;border:1px solid #1d3049;border-radius:16px;overflow:hidden}
+.chartbox canvas{width:100%!important;height:100%!important;display:block}
+.chartmeta{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.chartbadge{padding:7px 10px;border-radius:10px;background:#101b2b;color:#b8c7dd;font-size:12px}
+.hero{display:none;position:relative;width:100%;max-width:760px;margin:26px auto 18px;border-radius:20px;overflow:hidden;border:1px solid #0bbcff;box-shadow:0 0 30px #00aaff55;background:#05111f}
+.hero img{display:block;width:100%;height:300px;object-fit:contain;object-position:center;background:#05111f}
+.entry-arrow{display:none;position:absolute;inset:0;align-items:center;justify-content:center;flex-direction:column;background:#02081488;backdrop-filter:blur(1px);font-weight:900;text-shadow:0 0 18px currentColor}
+.entry-arrow .arrow{font-size:110px;line-height:.8}
+.entry-arrow .arrow-label{font-size:28px;margin-top:8px}
+.entry-arrow.call{display:flex;color:#31ff87}
+.entry-arrow.put{display:flex;color:#ff405f}
+.analysisbar{text-align:center;font-size:20px;color:#22c9ff;border-color:#0bbcff}
+
+@media(max-width:720px){
+  .wrap{padding:10px}
+  .grid{grid-template-columns:1fr 1fr}
+  .signal{grid-column:span 2}
+  .radar{grid-template-columns:1fr 1fr}
+  .hero img{height:250px}
+  .brand{font-size:36px}
+  #chartTab.active{padding-top:8vh}
+  #chartTab>.card{width:calc(100vw - 20px)!important;max-width:none!important;padding:10px!important}
+  .chartbox{height:58vh!important;min-height:440px!important;max-height:620px!important}
+}
+
+@media(max-width:600px){
+  .account-grid{grid-template-columns:1fr}
+}
+
+@media(max-width:450px){
+  .wrap{padding:8px}
+  .grid{grid-template-columns:1fr}
+  .signal{grid-column:span 1}
+  .radar{grid-template-columns:1fr}
+  .hero img{height:230px}
+  #chartTab.active{padding-top:9vh}
+  #chartTab>.card{width:calc(100vw - 12px)!important;padding:7px!important}
+  .chartbox{height:56vh!important;min-height:420px!important}
+}
+</style>
+</head>
+
+<body>
+<div class="wrap">
+  <div class="brand">🤖 MEGA <span>IA</span></div>
+  <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
+  <div id="clock" style="font-size:22px;margin-top:4px"></div>
+
+  <div class="controls">
+    <select id="market" onchange="handleMarketChange()">
+      <option value="OPEN">🌐 Mercado Aberto</option>
+      <option value="OTC">🟣 IQ Option OTC</option>
+    </select>
+
+    <select id="symbol" onchange="handleSymbolChange()">
+      <option value="EUR/USD" selected>EUR/USD</option>
+      <option value="GBP/USD">GBP/USD</option>
+      <option value="USD/JPY">USD/JPY</option>
+      <option value="AUD/USD">AUD/USD</option>
+      <option value="USD/CAD">USD/CAD</option>
+      <option value="USD/CHF">USD/CHF</option>
+      <option value="NZD/USD">NZD/USD</option>
+      <option value="EUR/JPY">EUR/JPY</option>
+      <option value="GBP/JPY">GBP/JPY</option>
+      <option value="EUR/GBP">EUR/GBP</option>
+      <option value="BTC/USD">BTC/USD</option>
+      <option value="ETH/USD">ETH/USD</option>
+      <option value="LTC/USD">LTC/USD</option>
+    </select>
+
+    <select id="interval" onchange="handleIntervalChange()">
+      <option>1min</option>
+      <option>5min</option>
+      <option>15min</option>
+      <option>30min</option>
+    </select>
+
+    <button type="button" id="voiceBtn" onclick="voice();return false;">🔊 Ativar voz</button>
+    <div id="otcNote" class="label" style="margin-top:6px;display:none">🟣 IQ Option OTC: verificando conexão...</div>
+  </div>
+
+  <div class="tabs">
+    <button type="button" class="tabbtn active" id="tabMain" onclick="showTab('main');return false;">📊 Painel</button>
+    <button type="button" class="tabbtn" id="tabChart" onclick="showTab('chart');return false;">📈 Gráfico</button>
+    <button type="button" class="tabbtn" id="tabAccount" onclick="showTab('account');return false;">⚙️ Conta IQ Option</button>
+  </div>
+
+  <div id="mainTab" class="tab active">
+    <div id="heroBox" class="hero">
+      <img id="aiImage" src="__MEGA_IMAGE__" alt="MEGA IA analisando o mercado">
+      <div id="entryArrow" class="entry-arrow">
+        <div class="arrow" id="entryArrowIcon">⬆</div>
+        <div class="arrow-label" id="entryArrowLabel">CALL • COMPRAR</div>
+      </div>
+    </div>
+
+    <div id="analysisText" class="card analysisbar" style="display:none">
+      🧠 ESTOU ANALISANDO O MERCADO, AGUARDE...
+    </div>
+
+    <div class="grid">
+      <div class="card signal">
+        <div class="label">SINAL ATUAL</div>
+        <div id="direction" class="big neutral">AGUARDANDO</div>
+        <div id="confidence">Confiança: --</div>
+      </div>
+
+      <div class="card">
+        <div class="label">ENTRADA</div>
+        <div id="entry" class="big">--:--:--</div>
+        <div id="countdown">--</div>
+        <div id="expiryCountdown" style="margin-top:8px;font-weight:800">⏱ EXPIRAÇÃO: --:--</div>
+      </div>
+
+      <div class="card">
+        <div class="label">STATUS IA</div>
+        <div id="status" class="big" style="font-size:18px">MONITORANDO</div>
+        <div id="risk">Risco: --</div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">WIN</div>
+        <div id="wins" class="big call">0</div>
+      </div>
+      <div class="card">
+        <div class="label">LOSS</div>
+        <div id="losses" class="big put">0</div>
+      </div>
+      <div class="card">
+        <div class="label">ASSERTIVIDADE</div>
+        <div id="accuracy" class="big">0%</div>
+      </div>
+      <div class="card">
+        <div class="label">RESULTADO</div>
+        <div id="result" class="big">--</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="chartTab" class="tab">
+    <div class="card">
+      <div class="chartmeta">
+        <b>📈 Gráfico espelhado</b>
+        <span class="chartbadge" id="chartInfo">--</span>
+      </div>
+      <div class="chartbox"><canvas id="priceChart"></canvas></div>
+      <div class="label" style="margin-top:8px">
+        O gráfico acompanha o mesmo mercado, par e período selecionados no painel.
+      </div>
+    </div>
+  </div>
+
+  <div id="accountTab" class="tab">
+    <div class="card">
+      <h2 style="margin-top:0">⚙️ Conta IQ Option</h2>
+      <div class="label">
+        Use sua própria conta para liberar o gráfico e os candles OTC.
+      </div>
+
+      <div class="account-grid">
+        <label>E-mail
+          <input id="iqEmail" type="email" autocomplete="username" placeholder="Seu e-mail da IQ Option">
+        </label>
+        <label>Senha
+          <input id="iqPassword" type="password" autocomplete="current-password" placeholder="Sua senha">
+        </label>
+        <label id="iq2faWrap" style="display:none">Código de verificação
+          <input id="iq2faCode" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="Código enviado pela IQ Option">
+        </label>
+      </div>
+
+      <div class="account-actions">
+        <button type="button" id="iqConnectBtn">🟢 Conectar</button>
+        <button type="button" id="iq2faBtn" style="display:none">🔐 Validar código</button>
+        <button type="button" id="iqLogoutBtn">🔴 Desconectar</button>
+      </div>
+
+      <div id="iqAccountStatus" class="card" style="margin-top:12px">● Desconectado</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <b>Radar de oportunidades</b>
+    <div id="radar" class="radar"></div>
+  </div>
+
+</div>
+
+<script>
+(function(){
+'use strict';
+
+var VERSION='32.9.1';
+var symbols=['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD'];
+var E={};
+var currentSignal=null;
+var voiceEnabled=false;
+var signalBusy=false, radarBusy=false, perfBusy=false, chartBusy=false, resultBusy=false;
+var pendingTrade=null;
+var chartData=[];
+var lastResultKey='';
+var stats={OPEN:{wins:0,losses:0,keys:[]},OTC:{wins:0,losses:0,keys:[]}};
+
+function id(x){ return document.getElementById(x); }
+function text(el,v){ if(el) el.textContent=v; }
+function safeStoreGet(k){ try{return localStorage.getItem(k)||'';}catch(e){return '';} }
+function safeStoreSet(k,v){ try{localStorage.setItem(k,v);}catch(e){} }
+function safeStoreDel(k){ try{localStorage.removeItem(k);}catch(e){} }
+function encode(v){ return encodeURIComponent(v==null?'':String(v)); }
+function timeFmt(v){
+  if(!v) return '--:--:--';
+  try{return new Date(v).toLocaleTimeString('pt-BR',{hour12:false});}catch(e){return '--:--:--';}
+}
+
+function bindElements(){
+  var names=['market','symbol','interval','voiceBtn','otcNote','heroBox','entryArrow','entryArrowIcon','entryArrowLabel','analysisText','mainTab','chartTab','accountTab','tabMain','tabChart','tabAccount','iqEmail','iqPassword','iq2faWrap','iq2faCode','iqConnectBtn','iq2faBtn','iqLogoutBtn','iqAccountStatus','chartInfo','direction','confidence','entry','countdown','status','risk','wins','losses','accuracy','result','radar','clock','expiryCountdown','priceChart'];
+  for(var i=0;i<names.length;i++) E[names[i]]=id(names[i]);
+}
+
+function request(url,options){
+  options=options||{};
+  options.cache='no-store';
+  options.credentials='include';
+  options.headers=options.headers||{};
+  var token=safeStoreGet('mega_iq_session_token');
+  if(token) options.headers['X-IQ-Session']=token;
+  return fetch(url,options).then(function(r){
+    return r.text().then(function(raw){
+      var data=null;
+      try{data=raw?JSON.parse(raw):{};}catch(e){data={};}
+      if(!r.ok){ throw new Error((data&&data.detail)||('HTTP '+r.status)); }
+      return data;
+    });
+  });
+}
+function get(url){ return request(url); }
+function post(url,data){ return request(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})}); }
+
+function loadStats(){
+  try{
+    var raw=safeStoreGet('mega_stats_3280');
+    if(!raw) raw=safeStoreGet('mega_winloss_v3271');
+    if(!raw) return;
+    var x=JSON.parse(raw);
+    ['OPEN','OTC'].forEach(function(m){
+      if(x&&x[m]){
+        stats[m].wins=Number(x[m].wins||0);
+        stats[m].losses=Number(x[m].losses||0);
+        stats[m].keys=Array.isArray(x[m].keys)?x[m].keys.slice(-500):[];
+      }
+    });
+  }catch(e){}
+}
+function saveStats(){ safeStoreSet('mega_stats_3280',JSON.stringify(stats)); }
+function paintStats(){
+  var m=(E.market&&E.market.value)||'OPEN';
+  var s=stats[m]||stats.OPEN;
+  var total=s.wins+s.losses;
+  text(E.wins,String(s.wins)); text(E.losses,String(s.losses));
+  text(E.accuracy,(total?((s.wins/total)*100).toFixed(2):'0.00')+'%');
+}
+function registerResult(t,x){
+  if(!t||!x||(x.result!=='WIN'&&x.result!=='LOSS')) return;
+  var m=(t.market||'OPEN').toUpperCase();
+  var s=stats[m]||stats.OPEN;
+  var key=[m,t.symbol,t.interval,t.direction,t.entry_time,t.expiry_time].join('|');
+  if(s.keys.indexOf(key)>=0) return;
+  s.keys.push(key); if(s.keys.length>500) s.keys=s.keys.slice(-500);
+  if(x.result==='WIN') s.wins++; else s.losses++;
+  saveStats(); paintStats();
+}
+
+function fillSymbols(){
+  if(!E.market||!E.symbol) return;
+  var old=E.symbol.value||safeStoreGet('mega_symbol')||'EUR/USD';
+  var otc=E.market.value==='OTC';
+  while(E.symbol.firstChild) E.symbol.removeChild(E.symbol.firstChild);
+  for(var i=0;i<symbols.length;i++){
+    var s=symbols[i],o=document.createElement('option');
+    o.value=s;
+    o.textContent=otc?('🟣 '+s.replace('/','')+'-OTC'):s;
+    E.symbol.appendChild(o);
+  }
+  E.symbol.value=old;
+  if(!E.symbol.value) E.symbol.selectedIndex=0;
+}
+function currentSymbol(){ if(!E.symbol||!E.symbol.value) fillSymbols(); return (E.symbol&&E.symbol.value)||'EUR/USD'; }
+
+function showTab(which){
+  var m=which==='main',c=which==='chart',a=which==='account';
+  if(E.mainTab) E.mainTab.classList.toggle('active',m);
+  if(E.chartTab) E.chartTab.classList.toggle('active',c);
+  if(E.accountTab) E.accountTab.classList.toggle('active',a);
+  if(E.tabMain) E.tabMain.classList.toggle('active',m);
+  if(E.tabChart) E.tabChart.classList.toggle('active',c);
+  if(E.tabAccount) E.tabAccount.classList.toggle('active',a);
+  if(c){ setTimeout(function(){ resizeChart(); loadChart(); },50); }
+  if(a) refreshAccountStatus();
+}
+window.showTab=showTab;
+
+function speak(msg){
+  if(!voiceEnabled||!window.speechSynthesis) return;
+  try{
+    window.speechSynthesis.cancel();
+    var u=new SpeechSynthesisUtterance(msg); u.lang='pt-BR';u.rate=.95;u.pitch=.9;
+    window.speechSynthesis.speak(u);
+  }catch(e){}
+}
+function voice(){ voiceEnabled=true;text(E.voiceBtn,'🔊 Voz ativada');speak('Voz da Mega IA ativada.');setTimeout(function(){loadSignal(true);},300); }
+window.voice=voice;
+
+function updateMarketNote(){
+  if(!E.otcNote||!E.market) return Promise.resolve();
+  if(E.market.value!=='OTC'){E.otcNote.style.display='none';return Promise.resolve();}
+  E.otcNote.style.display='block';text(E.otcNote,'🟣 IQ Option OTC: verificando conexão...');
+  return get('/otc-status').then(function(x){
+    text(E.otcNote,(x.connected?'🟢 ':x.reconnecting?'🟡 ':'🔴 ')+(x.message||''));
+  }).catch(function(e){text(E.otcNote,'🔴 IQ Option OTC: '+e.message);});
+}
+
+function handleMarketChange(){
+  if(!E.market) return;
+  safeStoreSet('mega_market',E.market.value);fillSymbols();paintStats();updateMarketNote();
+  chartData=[];loadSignal(true);loadRadar();if(E.chartTab&&E.chartTab.classList.contains('active'))loadChart();
+}
+function handleSymbolChange(){ safeStoreSet('mega_symbol',currentSymbol());chartData=[];loadSignal(true);loadRadar();if(E.chartTab&&E.chartTab.classList.contains('active'))loadChart(); }
+function handleIntervalChange(){ if(E.interval)safeStoreSet('mega_interval',E.interval.value);chartData=[];loadSignal(true);loadRadar();if(E.chartTab&&E.chartTab.classList.contains('active'))loadChart(); }
+window.handleMarketChange=handleMarketChange;window.handleSymbolChange=handleSymbolChange;window.handleIntervalChange=handleIntervalChange;
+
+function rememberPending(sig){
+  if(!sig||(sig.direction!=='CALL'&&sig.direction!=='PUT')||!sig.entry_time||!sig.expiry_time) return;
+  if(pendingTrade&&pendingTrade.expiry_time&&Date.now()<new Date(pendingTrade.expiry_time).getTime()+120000) return;
+  pendingTrade={market:sig.market||E.market.value,symbol:sig.symbol,interval:sig.interval,direction:sig.direction,entry_time:sig.entry_time,expiry_time:sig.expiry_time};
+  safeStoreSet('mega_pending_trade',JSON.stringify(pendingTrade));
+}
+
+function paintSignal(x){
+  currentSignal=x||{};
+  var d=currentSignal.direction||'NEUTRO';
+  text(E.direction,d);
+  if(E.direction) E.direction.className='big '+(d==='CALL'?'call':d==='PUT'?'put':'neutral');
+  text(E.confidence,'Confiança: '+Number(currentSignal.confidence||0).toFixed(0)+'%');
+  text(E.entry,(d==='NEUTRO'||!currentSignal.entry_time)?'AGUARDANDO SINAL':timeFmt(currentSignal.entry_time));
+  text(E.countdown,d==='NEUTRO'?'Sem entrada confirmada':'Preparando entrada');
+  text(E.status,currentSignal.status||'MONITORANDO');
+  text(E.risk,'Risco: '+(currentSignal.risk||'--'));
+  rememberPending(currentSignal);
+}
+function loadSignal(announce){
+  if(signalBusy||!E.market||!E.interval) return Promise.resolve();
+  signalBusy=true;
+  if(announce){text(E.status,'ANALISANDO O MERCADO...');}
+  var u='/signal-ai?market='+encode(E.market.value)+'&symbol='+encode(currentSymbol())+'&interval='+encode(E.interval.value);
+  return get(u).then(function(x){paintSignal(x);if(announce&&x.direction&&x.direction!=='NEUTRO')speak('Sinal de '+x.direction+' identificado.');})
+  .catch(function(e){text(E.status,'PAINEL ATIVO • FONTE TEMPORARIAMENTE INDISPONÍVEL');text(E.direction,'NEUTRO');text(E.entry,'AGUARDANDO DADOS');})
+  .then(function(){signalBusy=false;},function(){signalBusy=false;});
+}
+
+function loadPerformance(){
+  if(perfBusy||!E.market)return;perfBusy=true;
+  var m=E.market.value;
+  get('/performance?market='+encode(m)).then(function(p){
+    var s=stats[m]||stats.OPEN;s.wins=Math.max(s.wins,Number(p.wins||0));s.losses=Math.max(s.losses,Number(p.losses||0));saveStats();
+  }).catch(function(){}).then(function(){paintStats();perfBusy=false;});
+}
+function loadRadar(){
+  if(radarBusy||!E.radar||!E.market||!E.interval)return;radarBusy=true;
+  get('/radar?market='+encode(E.market.value)+'&interval='+encode(E.interval.value)).then(function(a){
+    if(!Array.isArray(a)) a=[];var h='';
+    for(var i=0;i<a.length;i++){
+      var x=a[i]||{},cls=x.direction==='CALL'?'call':x.direction==='PUT'?'put':'neutral';
+      h+='<div><b>'+String(x.symbol||'')+'</b><br><span class="'+cls+'">'+String(x.direction||'NEUTRO')+'</span> • '+Number(x.confidence||0)+'%<br><small>'+String(x.status||'')+'</small></div>';
+    }
+    E.radar.innerHTML=h||'<div>Monitorando oportunidades...</div>';
+  }).catch(function(){E.radar.innerHTML='<div>⚠️ Radar temporariamente indisponível</div>';}).then(function(){radarBusy=false;});
+}
+function updateClock(){
+  get('/server-time').then(function(x){text(E.clock,timeFmt(x.datetime)+' • Brasília');}).catch(function(){text(E.clock,new Date().toLocaleTimeString('pt-BR',{hour12:false})+' • Brasília');});
+}
+
+function resizeChart(){
+  if(!E.priceChart)return;var ctx=E.priceChart.getContext('2d');if(!ctx)return;
+  var r=E.priceChart.getBoundingClientRect(),d=window.devicePixelRatio||1;
+  E.priceChart.width=Math.max(1,Math.floor(r.width*d));E.priceChart.height=Math.max(1,Math.floor(r.height*d));ctx.setTransform(d,0,0,d,0,0);drawChart(chartData);
+}
+function drawChart(a){
+  if(!E.priceChart)return;var ctx=E.priceChart.getContext('2d');if(!ctx)return;
+  var w=E.priceChart.clientWidth,h=E.priceChart.clientHeight;ctx.clearRect(0,0,w,h);if(!a||!a.length)return;
+  var lows=[],highs=[],i;for(i=0;i<a.length;i++){lows.push(Number(a[i].low));highs.push(Number(a[i].high));}
+  var lo=Math.min.apply(null,lows),hi=Math.max.apply(null,highs),pad=20,span=(hi-lo)||1;
+  function px(n){return pad+n/(Math.max(1,a.length-1))*(w-pad*2);}function py(v){return pad+(hi-v)/span*(h-pad*2);}
+  for(i=0;i<a.length;i++){
+    var c=a[i],x=px(i),o=Number(c.open),cl=Number(c.close),hh=Number(c.high),ll=Number(c.low),up=cl>=o;
+    ctx.strokeStyle=up?'#45ff9b':'#ff5c7a';ctx.fillStyle=ctx.strokeStyle;ctx.beginPath();ctx.moveTo(x,py(hh));ctx.lineTo(x,py(ll));ctx.stroke();
+    var y1=py(Math.max(o,cl)),y2=py(Math.min(o,cl));ctx.fillRect(x-2,y1,4,Math.max(1,y2-y1));
+  }
+}
+function loadChart(){
+  if(chartBusy||!E.market||!E.interval)return;chartBusy=true;
+  var u='/candles?market='+encode(E.market.value)+'&symbol='+encode(currentSymbol())+'&interval='+encode(E.interval.value)+'&n=80';
+  get(u).then(function(d){
+    if(d&&Array.isArray(d.candles)&&d.candles.length)chartData=d.candles;
+    text(E.chartInfo,(d.market==='OTC'?'🟣 '+String(d.symbol||'')+' • OTC':String(d.symbol||''))+' • '+String(d.interval||''));resizeChart();
+  }).catch(function(){text(E.chartInfo,'⚠️ Dados temporariamente indisponíveis');}).then(function(){chartBusy=false;});
+}
+
+function show2FA(show){
+  if(E.iq2faWrap)E.iq2faWrap.style.display=show?'block':'none';
+  if(E.iq2faBtn)E.iq2faBtn.style.display=show?'inline-flex':'none';
+}
+function refreshAccountStatus(){
+  return get('/otc-status').then(function(x){
+    if(x.requires_2fa){
+      show2FA(true);
+      text(E.iqAccountStatus,'🟡 Digite o código de verificação enviado pela IQ Option.');
+      if(E.iqConnectBtn)E.iqConnectBtn.disabled=true;
+      if(E.iqLogoutBtn)E.iqLogoutBtn.disabled=false;
+      return;
+    }
+    show2FA(false);
+    var rr=!!x.reconnecting;
+    text(E.iqAccountStatus,(x.connected&&!rr?'🟢 ':rr?'🟡 ':'🔴 ')+(x.connected&&!rr?('Conectado: '+(x.email_masked||'')):(x.message||'Desconectado')));
+    if(E.iqConnectBtn)E.iqConnectBtn.disabled=!!x.connected||rr;
+    if(E.iqLogoutBtn)E.iqLogoutBtn.disabled=!x.connected&&!rr;
+  }).catch(function(){text(E.iqAccountStatus,'🟡 Verificando conexão...');});
+}
+function connectIQ(){
+  var email=E.iqEmail?E.iqEmail.value.trim():'',password=E.iqPassword?E.iqPassword.value:'';
+  if(!email||!password){text(E.iqAccountStatus,'🔴 Informe e-mail e senha.');return;}
+  show2FA(false);
+  text(E.iqAccountStatus,'🟡 Conectando à IQ Option...');
+  if(E.iqConnectBtn)E.iqConnectBtn.disabled=true;
+
+  post('/iq-login',{email:email,password:password}).then(function(x){
+    if(x.session_token)safeStoreSet('mega_iq_session_token',x.session_token);
+    if(x.requires_2fa){
+      show2FA(true);
+      text(E.iqAccountStatus,'🟡 A IQ Option pediu um código de verificação. Digite o código recebido.');
+      if(E.iqPassword)E.iqPassword.value='';
+      return;
+    }
+    if(E.iqPassword)E.iqPassword.value='';
+    text(E.iqAccountStatus,'🟢 Conectado: '+(x.email_masked||''));
+    updateMarketNote();
+    loadSignal(true);
+  }).catch(function(e){
+    text(E.iqAccountStatus,'🔴 '+e.message);
+  }).then(function(){
+    if(E.iqConnectBtn)E.iqConnectBtn.disabled=false;
+  });
+}
+function submitIQ2FA(){
+  var code=E.iq2faCode?E.iq2faCode.value.trim():'';
+  if(!code){text(E.iqAccountStatus,'🔴 Digite o código enviado pela IQ Option.');return;}
+  text(E.iqAccountStatus,'🟡 Validando código...');
+  if(E.iq2faBtn)E.iq2faBtn.disabled=true;
+
+  post('/iq-2fa',{code:code}).then(function(x){
+    if(x.session_token)safeStoreSet('mega_iq_session_token',x.session_token);
+    if(E.iq2faCode)E.iq2faCode.value='';
+    show2FA(false);
+    text(E.iqAccountStatus,'🟢 Conectado: '+(x.email_masked||''));
+    updateMarketNote();
+    loadSignal(true);
+  }).catch(function(e){
+    text(E.iqAccountStatus,'🔴 '+e.message);
+  }).then(function(){
+    if(E.iq2faBtn)E.iq2faBtn.disabled=false;
+  });
+}
+function logoutIQ(){
+  post('/iq-logout',{}).catch(function(){}).then(function(){
+    safeStoreDel('mega_iq_session_token');
+    show2FA(false);
+    if(E.iq2faCode)E.iq2faCode.value='';
+    text(E.iqAccountStatus,'● Desconectado');
+    updateMarketNote();
+  });
+}
+
+function checkResult(){
+  if(resultBusy)return;if(!pendingTrade){try{var p=safeStoreGet('mega_pending_trade');if(p)pendingTrade=JSON.parse(p);}catch(e){}}
+  if(!pendingTrade||!pendingTrade.expiry_time||Date.now()<new Date(pendingTrade.expiry_time).getTime())return;
+  resultBusy=true;var t=pendingTrade;
+  var u='/result?market='+encode(t.market)+'&symbol='+encode(t.symbol)+'&interval='+encode(t.interval)+'&direction='+encode(t.direction)+'&expiry_time='+encode(t.expiry_time);
+  get(u).then(function(x){if(x&&x.result){text(E.result,x.result);registerResult(t,x);var k=t.symbol+'|'+t.direction+'|'+t.expiry_time;if(k!==lastResultKey){lastResultKey=k;speak('Operação finalizada. Resultado '+x.result+'.');}pendingTrade=null;safeStoreDel('mega_pending_trade');loadPerformance();}})
+  .catch(function(){}).then(function(){resultBusy=false;});
+}
+function countdown(){
+  var c=currentSignal;if(!c||c.direction==='NEUTRO'||!c.entry_time){text(E.countdown,'Sem entrada confirmada');text(E.expiryCountdown,'⏱ EXPIRAÇÃO: --:--');return;}
+  var n=Math.ceil((new Date(c.entry_time).getTime()-Date.now())/1000),xt=c.expiry_time?new Date(c.expiry_time).getTime():0;
+  text(E.countdown,n>0?'Entrada em '+n+'s':'Entrada liberada');
+  if(n>0)text(E.expiryCountdown,'⏱ EXPIRAÇÃO: aguardando entrada');else if(xt){var rem=Math.max(0,Math.ceil((xt-Date.now())/1000));text(E.expiryCountdown,'⏱ EXPIRAÇÃO: '+String(Math.floor(rem/60)).padStart(2,'0')+':'+String(rem%60).padStart(2,'0'));}
+}
+
+function restoreSelections(){
+  var m=safeStoreGet('mega_market');if(m==='OPEN'||m==='OTC')E.market.value=m;
+  fillSymbols();var s=safeStoreGet('mega_symbol');if(s&&symbols.indexOf(s)>=0)E.symbol.value=s;
+  var it=safeStoreGet('mega_interval');if(it&&['1min','5min','15min','30min'].indexOf(it)>=0)E.interval.value=it;
+}
+function bindEvents(){
+  if(E.market)E.market.onchange=handleMarketChange;if(E.symbol)E.symbol.onchange=handleSymbolChange;if(E.interval)E.interval.onchange=handleIntervalChange;
+  if(E.voiceBtn)E.voiceBtn.onclick=function(){voice();return false;};
+  if(E.tabMain)E.tabMain.onclick=function(){showTab('main');return false;};if(E.tabChart)E.tabChart.onclick=function(){showTab('chart');return false;};if(E.tabAccount)E.tabAccount.onclick=function(){showTab('account');return false;};
+  if(E.iqConnectBtn)E.iqConnectBtn.onclick=connectIQ;if(E.iq2faBtn)E.iq2faBtn.onclick=submitIQ2FA;if(E.iqLogoutBtn)E.iqLogoutBtn.onclick=logoutIQ;
+}
+function boot(){
+  bindElements();
+  if(!E.market||!E.symbol||!E.interval){document.documentElement.setAttribute('data-mega-js','missing-elements');return;}
+  loadStats();restoreSelections();bindEvents();paintStats();showTab('main');
+  try{var p=safeStoreGet('mega_pending_trade');if(p)pendingTrade=JSON.parse(p);}catch(e){}
+  document.documentElement.setAttribute('data-mega-js','ready');document.documentElement.setAttribute('data-mega-version',VERSION);
+  text(E.status,'MONITORANDO');
+  updateMarketNote();refreshAccountStatus();updateClock();loadSignal(false);loadPerformance();loadRadar();
+  setInterval(function(){loadSignal(false);},5000);setInterval(updateClock,1000);setInterval(loadRadar,20000);setInterval(loadPerformance,30000);setInterval(checkResult,3000);setInterval(countdown,250);setInterval(function(){if(E.chartTab&&E.chartTab.classList.contains('active'))loadChart();},15000);
+}
+
+window.addEventListener('error',function(ev){try{console.error('[MEGA IA]',ev.message||ev.error);document.documentElement.setAttribute('data-mega-js','error');text(id('status'),'ERRO DE INTERFACE • RECARREGUE A PÁGINA');}catch(e){}});
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot);else boot();
+})();
+
+</script>
+</body>
+</html>
+"""
 
 HTML_PAGE = HTML_PAGE.replace("__MEGA_IMAGE__", "/mega-ia.png")
 
