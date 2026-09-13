@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.20.0")
+app = FastAPI(title="MEGA IA", version="33.21.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -3450,8 +3450,37 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     closed = raw[:-1] if len(raw) > 1 else raw
 
-    # MODO ONLINE / IA PURA: ignora completamente o motor de estratégias e indicadores internos.
+    # MODO ONLINE / IA PURA: analisa continuamente, mas libera no máximo 1 sinal a cada 5 minutos.
     if ai_only:
+        release_state = signal_release_state.setdefault(release_key, {})
+        ai_cycle_seconds = 300
+        last_ai_signal_ts = float(release_state.get("last_ai_signal_ts", 0.0) or 0.0)
+        ai_cycle_remaining = max(0, int(ai_cycle_seconds - (time.time() - last_ai_signal_ts))) if last_ai_signal_ts else 0
+
+        # Mesmo durante o bloqueio, o front continua consultando a cada 5s.
+        # Não chama a IA novamente até abrir o próximo ciclo, evitando sinais duplicados e custo desnecessário.
+        if ai_cycle_remaining > 0:
+            active_signal = release_state.get("active_signal")
+            if active_signal and active_signal.get("expiry_time"):
+                try:
+                    if now() < parse_dt(active_signal["expiry_time"]):
+                        held = dict(active_signal)
+                        held["ai_cycle_remaining"] = ai_cycle_remaining
+                        held["ai_cycle_seconds"] = ai_cycle_seconds
+                        return held
+                except Exception:
+                    pass
+            out = neutral_signal(
+                symbol, interval, market,
+                "IA PURA • NOVO CICLO EM %02d:%02d" % divmod(ai_cycle_remaining, 60),
+                "A IA já liberou um sinal neste ciclo e continua aguardando a próxima janela de 5 minutos.",
+                source_state="READY",
+            )
+            out.update({"strategy":"IA PURA", "mode":"AI_ONLY", "technical":{"disabled":True,"mode":"AI_ONLY"},
+                        "ai_cycle_remaining":ai_cycle_remaining, "ai_cycle_seconds":ai_cycle_seconds})
+            cache[key] = (time.time(), out)
+            return out
+
         ai = await openai_direct_signal(symbol, interval, closed, market)
         base = {
             "symbol": symbol,
@@ -3484,7 +3513,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif not ai.get("available"):
             base["status"] = "IA INDISPONÍVEL"
 
-        release_state = signal_release_state.setdefault(release_key, {})
+        base["ai_cycle_remaining"] = 0
+        base["ai_cycle_seconds"] = ai_cycle_seconds
         active_signal = release_state.get("active_signal")
         if active_signal and active_signal.get("expiry_time"):
             try:
@@ -3506,6 +3536,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 release_state["locked_direction"] = base["direction"]
                 release_state["locked_strategy"] = "IA PURA"
                 release_state["active_signal"] = dict(base)
+                release_state["last_ai_signal_ts"] = time.time()
         else:
             release_state["locked_direction"] = None
             release_state["locked_strategy"] = None
