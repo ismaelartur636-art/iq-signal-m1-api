@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.32.0")
+app = FastAPI(title="MEGA IA", version="33.33.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -3911,7 +3911,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.32.0",
+        "version": "33.33.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -4499,12 +4499,16 @@ def _pre_signal_from_live_candle(raw, interval: str, market: str = "OPEN", symbo
     }
 
 
+# Cursor da fila econômica do radar OPEN/Twelve Data.
+_td_radar_cursor = 0
+
 @app.get("/pre-signals")
 async def pre_signals(
     request: Request,
     interval: str = "1min",
     market: str = "OPEN",
     limit: int = 4,
+    selected_symbol: str | None = None,
 ):
     market = (market or "OPEN").upper()
     limit = max(1, min(int(limit), 4))
@@ -4612,6 +4616,33 @@ async def pre_signals(
         except Exception:
             # Um ativo com erro não derruba os outros.
             continue
+
+    global _td_radar_cursor
+
+    # No mercado OPEN/Twelve Data, não varremos todos os ativos de uma vez.
+    # O ativo selecionado é prioritário e mais um ativo avança pela fila.
+    radar_symbols = list(SYMBOLS)
+    if market == "OPEN":
+        preferred = selected_symbol if selected_symbol in SYMBOLS else None
+        ordered = ([preferred] if preferred else []) + [
+            x for x in radar_symbols if x != preferred
+        ]
+        queued = []
+        if ordered:
+            idx = _td_radar_cursor % len(ordered)
+            candidate = ordered[idx]
+            if candidate != preferred:
+                queued.append(candidate)
+            else:
+                for off in range(1, len(ordered)):
+                    candidate = ordered[(idx + off) % len(ordered)]
+                    if candidate != preferred:
+                        queued.append(candidate)
+                        break
+            _td_radar_cursor = (_td_radar_cursor + 1) % max(1, len(ordered))
+
+        radar_symbols = ([preferred] if preferred else []) + queued
+        radar_symbols = list(dict.fromkeys(x for x in radar_symbols if x))
 
     items = []
     for key, payload in pre_signal_cache.items():
@@ -5677,7 +5708,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <div class="card" style="margin-top:12px">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
         <div>
-          <div class="label">PRÉ-SINAIS • ATÉ 1 MINUTO ANTES</div>
+          <div class="label">CICLO • ANÁLISE 4 MIN + CONFIRMAÇÃO 1 MIN</div>
           <small style="opacity:.75">Vela em formação — ainda não é entrada confirmada</small>
         </div>
         <select id="preSignalLimit" style="max-width:86px">
