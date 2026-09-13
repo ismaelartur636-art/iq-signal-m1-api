@@ -16,11 +16,19 @@ try:
 except Exception:
     IQ_Option = None
 
+try:
+    from olymptrade_ws import OlympTradeClient
+except Exception:
+    try:
+        from olymptrade_ws.main import OlympTradeClient
+    except Exception:
+        OlympTradeClient = None
+
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.3.1")
+app = FastAPI(title="MEGA IA", version="33.4.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -35,6 +43,10 @@ OAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
 OAI_MIN = float(os.getenv("OPENAI_MIN_CONFIDENCE", "70"))
 OAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "15"))
+
+IQ_EMAIL = os.getenv("IQ_EMAIL", "").strip()
+IQ_PASSWORD = os.getenv("IQ_PASSWORD", "")
+OLYMPTRADE_TOKEN = os.getenv("OLYMPTRADE_TOKEN", "").strip()
 
 LICENSE = os.getenv("LICENSE_EXPIRES", "2026-12-31")
 WA1 = os.getenv("WHATSAPP_1", "55 84 99841-1282")
@@ -83,6 +95,14 @@ IQ_RECONNECT_BASE_DELAY = float(os.getenv("IQ_RECONNECT_BASE_DELAY", "6"))
 IQ_RECONNECT_MAX_DELAY = float(os.getenv("IQ_RECONNECT_MAX_DELAY", "60"))
 IQ_CANDLE_TIMEOUT = float(os.getenv("IQ_CANDLE_TIMEOUT", "9"))
 iq_sessions: Dict[str, Dict[str, Any]] = {}
+
+VALID_MARKETS = ("OPEN", "IQ_OTC", "OLYMP_OTC")
+iq_env_state: Dict[str, Any] | None = None
+
+olymp_client = None
+olymp_lock = asyncio.Lock()
+olymp_candle_cache: Dict[str, Any] = {}
+OLYMP_CANDLE_TTL = float(os.getenv("OLYMP_CANDLE_TTL", "15"))
 
 
 class IQLoginBody(BaseModel):
@@ -140,6 +160,175 @@ def _session_state(request: Request, required: bool = False):
     if required:
         raise HTTPException(401, "Conecte sua conta da IQ Option na aba Conta IQ Option.")
     return None
+
+
+def _iq_state_for_request(request: Request, required: bool = False):
+    """
+    Prefer a browser session when one exists. Otherwise use a server-side
+    IQ_EMAIL/IQ_PASSWORD session configured once in Render.
+    This keeps credentials out of the panel.
+    """
+    global iq_env_state
+
+    state = _session_state(request, required=False)
+    if state:
+        return state
+
+    if IQ_EMAIL and IQ_PASSWORD:
+        if iq_env_state is None:
+            iq_env_state = {
+                "session_id": "ENV_IQ",
+                "email": IQ_EMAIL,
+                "password": IQ_PASSWORD,
+                "client": None,
+                "lock": asyncio.Lock(),
+                "last_error": "",
+                "last_attempt": 0.0,
+                "last_seen": time.time(),
+                "last_connected": 0.0,
+                "failure_count": 0,
+                "reconnect_after": 0.0,
+                "reconnecting": False,
+                "generation": 0,
+                "candle_cache": {},
+                "results": {},
+            }
+        iq_env_state["last_seen"] = time.time()
+        return iq_env_state
+
+    if required:
+        raise HTTPException(
+            503,
+            "IQ Option OTC ainda não está configurada no servidor. Configure IQ_EMAIL e IQ_PASSWORD no Render."
+        )
+    return None
+
+
+def _olymp_asset(symbol: str) -> str:
+    # OlympTrade examples use pair symbols without slash.
+    # OTC naming may vary by instrument; try standard OTC aliases in order.
+    return symbol.replace("/", "").replace(" ", "")
+
+
+def _normalize_olymp_candle(item):
+    if hasattr(item, "__dict__") and not isinstance(item, dict):
+        item = vars(item)
+    if not isinstance(item, dict):
+        return None
+
+    ts = (
+        item.get("time")
+        or item.get("timestamp")
+        or item.get("from")
+        or item.get("datetime")
+    )
+    try:
+        if isinstance(ts, (int, float)):
+            # tolerate ms timestamps
+            if ts > 10_000_000_000:
+                ts = ts / 1000.0
+            dt = datetime.fromtimestamp(float(ts), tz=UTC).astimezone(BR_TZ).isoformat()
+        else:
+            dt = str(ts)
+    except Exception:
+        dt = str(ts or "")
+
+    try:
+        return {
+            "datetime": dt,
+            "open": float(item.get("open", item.get("o"))),
+            "high": float(item.get("high", item.get("h"))),
+            "low": float(item.get("low", item.get("l"))),
+            "close": float(item.get("close", item.get("c"))),
+            "volume": float(item.get("volume", item.get("v", 0)) or 0),
+        }
+    except Exception:
+        return None
+
+
+async def _get_olymp_client():
+    global olymp_client
+
+    if not OLYMPTRADE_TOKEN:
+        raise HTTPException(
+            503,
+            "Olymptrade OTC ainda não está configurada no servidor. Configure OLYMPTRADE_TOKEN no Render."
+        )
+    if OlympTradeClient is None:
+        raise HTTPException(
+            503,
+            "Biblioteca olymptrade_ws não carregada. Adicione a biblioteca ao requirements.txt."
+        )
+
+    async with olymp_lock:
+        if olymp_client is None:
+            try:
+                olymp_client = OlympTradeClient(access_token=OLYMPTRADE_TOKEN)
+                start = getattr(olymp_client, "start", None)
+                if start:
+                    result = start()
+                    if asyncio.iscoroutine(result):
+                        await asyncio.wait_for(result, timeout=15)
+            except Exception as exc:
+                olymp_client = None
+                raise HTTPException(503, f"Falha ao conectar à Olymptrade: {str(exc)[:220]}")
+        return olymp_client
+
+
+async def candles_olymp(symbol: str, interval: str, n: int = 80):
+    if symbol not in SYMBOLS or interval not in INTERVALS:
+        raise HTTPException(400, "Ativo ou intervalo inválido.")
+
+    key = f"{symbol}|{interval}"
+    cached = olymp_candle_cache.get(key)
+    if cached and time.time() - cached[0] < OLYMP_CANDLE_TTL and len(cached[1]) >= min(n, 20):
+        return cached[1][-n:]
+
+    client = await _get_olymp_client()
+    period = INTERVALS[interval]
+    asset_base = _olymp_asset(symbol)
+    candidates = [
+        asset_base + "_OTC",
+        asset_base + "_otc",
+        asset_base + "-OTC",
+        asset_base,
+    ]
+
+    last_error = ""
+    for asset in candidates:
+        try:
+            market_api = getattr(client, "market", None)
+            if market_api is None:
+                raise RuntimeError("Módulo market não encontrado no cliente Olymptrade.")
+
+            getter = getattr(market_api, "get_candles", None)
+            if getter is None:
+                raise RuntimeError("Método market.get_candles não encontrado.")
+
+            data = getter(asset, size=period, count=max(100, min(150, int(n))))
+            if asyncio.iscoroutine(data):
+                data = await asyncio.wait_for(data, timeout=15)
+
+            out = []
+            for item in data or []:
+                c = _normalize_olymp_candle(item)
+                if c:
+                    out.append(c)
+
+            if len(out) >= min(n, 20):
+                out.sort(key=lambda x: x["datetime"])
+                olymp_candle_cache[key] = (time.time(), out)
+                return out[-n:]
+        except Exception as exc:
+            last_error = str(exc)
+
+    if cached and time.time() - cached[0] < 90:
+        return cached[1][-n:]
+
+    raise HTTPException(
+        503,
+        "Olymptrade OTC sem candles. " + (last_error[:180] if last_error else "Ativo OTC não disponível.")
+    )
 
 
 def ema(values, period):
@@ -1249,11 +1438,20 @@ def iq_candles_blocking(state, symbol, interval, n):
 async def candles(symbol, interval, n=80, market="OPEN", iq_state=None):
     market = (market or "OPEN").upper()
 
-    if market == "OTC":
+    if market not in VALID_MARKETS:
+        raise HTTPException(400, "Mercado inválido.")
+
+    if market == "OLYMP_OTC":
+        return await candles_olymp(symbol, interval, n)
+
+    if market == "IQ_OTC":
         if symbol not in SYMBOLS or interval not in INTERVALS:
             raise HTTPException(400, "Ativo ou intervalo inválido.")
         if iq_state is None:
-            raise HTTPException(401, "Conecte sua conta da IQ Option na aba Conta IQ Option.")
+            raise HTTPException(
+                503,
+                "IQ Option OTC ainda não está configurada no servidor."
+            )
 
         ckey = f"{symbol}|{interval}"
         candle_cache = iq_state.setdefault("candle_cache", {})
@@ -1291,7 +1489,7 @@ async def candles(symbol, interval, n=80, market="OPEN", iq_state=None):
             stale = candle_cache.get(ckey)
             if stale and time.time() - stale[0] < 90:
                 return stale[1][-n:]
-            raise HTTPException(503, f"Mercado indisponível: {str(exc)[:300]}")
+            raise HTTPException(503, f"IQ Option OTC indisponível: {str(exc)[:300]}")
 
         if not out:
             raise HTTPException(503, "Nenhum candle OTC recebido da IQ Option.")
@@ -1401,7 +1599,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
         raise HTTPException(400, "Ativo ou intervalo inválido.")
 
     market = (market or "OPEN").upper()
-    session_part = iq_state.get("session_id", "") if (market == "OTC" and iq_state) else "PUBLIC"
+    session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}"
 
     release_key = f"{market}|{symbol}|{interval}"
@@ -1422,7 +1620,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
     if key in cache and time.time() - cache[key][0] < 4:
         return cache[key][1]
 
-    if market == "OTC" and iq_state is not None:
+    if market == "IQ_OTC" and iq_state is not None:
         ra = float(iq_state.get("reconnect_after", 0.0) or 0.0)
         # Durante o backoff real, não libera entrada. Fora dele, deixa candles()
         # tentar restaurar automaticamente o websocket da sessão preservada.
@@ -1442,13 +1640,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
         status = (
             "FONTE EM LIMITE"
             if market == "OPEN" and exc.status_code in (429, 503)
-            else ("IQ OPTION RECONECTANDO" if market == "OTC" else "FONTE INDISPONÍVEL")
+            else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else ("OLYMPTRADE INDISPONÍVEL" if market == "OLYMP_OTC" else "FONTE INDISPONÍVEL"))
         )
         out = neutral_signal(symbol, interval, market, status, exc.detail, source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
     except Exception as exc:
-        status = "IQ OPTION RECONECTANDO" if market == "OTC" else "FONTE INDISPONÍVEL"
+        status = "IQ OPTION RECONECTANDO" if market == "IQ_OTC" else ("OLYMPTRADE INDISPONÍVEL" if market == "OLYMP_OTC" else "FONTE INDISPONÍVEL")
         out = neutral_signal(symbol, interval, market, status, str(exc), source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
@@ -1610,7 +1808,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.3.1",
+        "version": "33.4.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -1797,62 +1995,36 @@ async def iq_logout(request: Request, response: Response):
 
 
 @app.get("/otc-status")
-async def otc_status(request: Request):
-    if IQ_Option is None:
+async def otc_status(request: Request, broker: str = "IQ_OPTION"):
+    broker = (broker or "IQ_OPTION").upper()
+
+    if broker == "OLYMPTRADE":
+        configured = bool(OLYMPTRADE_TOKEN) and OlympTradeClient is not None
         return {
-            "configured": False,
-            "connected": False,
-            "message": "Biblioteca IQ Option não foi carregada.",
+            "broker": "OLYMPTRADE",
+            "configured": configured,
+            "connected": bool(olymp_client) if configured else False,
+            "message": (
+                "Olymptrade OTC configurada no servidor."
+                if configured
+                else "Configure OLYMPTRADE_TOKEN e a biblioteca olymptrade_ws no Render."
+            ),
+            "pairs": len(OTC_BASE),
         }
 
-    state = _session_state(request, required=False)
-
-    if not state:
-        return {
-            "configured": True,
-            "connected": False,
-            "message": "Conecte sua conta na aba Conta IQ Option.",
-        }
-
-    connected = _iq_is_connected(state)
-    reconnect_after = float(state.get("reconnect_after", 0) or 0)
-
-    # Se a página foi atualizada e a sessão ainda existe, recupera o websocket
-    # automaticamente quando necessário.
-    if (
-        not connected
-        and not state.get("reconnecting")
-        and time.time() >= reconnect_after
-        and state.get("email")
-        and state.get("password")
-    ):
-        try:
-            async with state["lock"]:
-                await asyncio.wait_for(
-                    asyncio.to_thread(iq_connect_blocking, state, False),
-                    timeout=18,
-                )
-            connected = _iq_is_connected(state)
-        except Exception as exc:
-            state["last_error"] = str(exc)[:250]
-
-    reconnect_after = float(state.get("reconnect_after", 0) or 0)
-    reconnecting = bool(state.get("reconnecting")) or (not connected and time.time() < reconnect_after)
-
-    if connected:
-        msg = "Mercado conectada."
-    elif reconnecting:
-        wait = max(1, int(reconnect_after-time.time()+0.999)) if reconnect_after > time.time() else 2
-        msg = f"Sessão preservada. Reconectando em {wait}s."
-    else:
-        msg = "Sessão preservada. Reconexão automática em andamento."
+    state = _iq_state_for_request(request, required=False)
+    configured = IQ_Option is not None and state is not None
+    connected = _iq_is_connected(state) if state else False
 
     return {
-        "configured": True,
+        "broker": "IQ_OPTION",
+        "configured": configured,
         "connected": connected,
-        "reconnecting": reconnecting,
-        "message": msg,
-        "email_masked": _mask_email(state.get("email", "")),
+        "message": (
+            "IQ Option OTC configurada no servidor."
+            if configured
+            else "Configure IQ_EMAIL e IQ_PASSWORD no Render."
+        ),
         "pairs": len(OTC_BASE),
     }
 
@@ -1867,14 +2039,14 @@ async def candles_endpoint(
 ):
     market = (market or "OPEN").upper()
 
-    if symbol not in SYMBOLS or interval not in INTERVALS or market not in ("OPEN", "OTC"):
+    if symbol not in SYMBOLS or interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
 
     n = max(20, min(int(n), 150))
-    state = _session_state(request, required=False)
+    state = _iq_state_for_request(request, required=False) if market == "IQ_OTC" else None
 
     try:
-        if market == "OTC" and not state:
+        if market == "IQ_OTC" and not state:
             return {
                 "ok": False,
                 "symbol": symbol,
@@ -1882,7 +2054,7 @@ async def candles_endpoint(
                 "market": market,
                 "candles": [],
                 "status": "LOGIN NECESSÁRIO",
-                "message": "Conecte sua conta IQ Option.",
+                "message": "Configure IQ_EMAIL e IQ_PASSWORD no servidor para o OTC da IQ Option.",
             }
 
         values = await candles(symbol, interval, n, market, state)
@@ -1904,8 +2076,12 @@ async def candles_endpoint(
             if item:
                 stale = item[1][-n:]
 
-        elif state:
+        elif market == "IQ_OTC" and state:
             item = state.setdefault("candle_cache", {}).get(f"{symbol}|{interval}")
+            if item:
+                stale = item[1][-n:]
+        elif market == "OLYMP_OTC":
+            item = olymp_candle_cache.get(f"{symbol}|{interval}")
             if item:
                 stale = item[1][-n:]
 
@@ -1936,18 +2112,18 @@ async def candles_endpoint(
 async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN"):
     market = (market or "OPEN").upper()
 
-    if symbol not in SYMBOLS or interval not in INTERVALS or market not in ("OPEN", "OTC"):
+    if symbol not in SYMBOLS or interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
 
-    state = _session_state(request, required=False)
+    state = _iq_state_for_request(request, required=False) if market == "IQ_OTC" else None
 
-    if market == "OTC" and not state:
+    if market == "IQ_OTC" and not state:
         return neutral_signal(
             symbol,
             interval,
             market,
-            "LOGIN IQ OPTION NECESSÁRIO",
-            "Conecte sua conta IQ Option para receber candles OTC.",
+            "IQ OPTION OTC NÃO CONFIGURADA",
+            "Configure IQ_EMAIL e IQ_PASSWORD no Render para receber o OTC real da IQ Option.",
             source_state="LOGIN_REQUIRED",
         )
 
@@ -1984,119 +2160,40 @@ async def ai_analysis(request: Request, symbol: str = "EUR/USD", interval: str =
 async def radar(request: Request, interval="1min", market="OPEN"):
     market = (market or "OPEN").upper()
 
-    if interval not in INTERVALS or market not in ("OPEN", "OTC"):
-        raise HTTPException(400, "Intervalo inválido.")
+    if interval not in INTERVALS or market not in VALID_MARKETS:
+        raise HTTPException(400, "Intervalo ou mercado inválido.")
 
-    if market == "OTC":
-        state = _session_state(request, required=False)
+    iq_state = _iq_state_for_request(request, required=False) if market == "IQ_OTC" else None
 
-        if not state:
-            return [
-                {
-                    "symbol": s + " • OTC",
-                    "direction": "NEUTRO",
-                    "confidence": 0,
-                    "status": "LOGIN IQ OPTION",
-                }
-                for s in SYMBOLS
-            ]
+    if market == "IQ_OTC" and not iq_state:
+        return [
+            {
+                "symbol": s + " • IQ OTC",
+                "direction": "NEUTRO",
+                "confidence": 0,
+                "status": "IQ OTC NÃO CONFIGURADA",
+            }
+            for s in SYMBOLS
+        ]
 
-        cc = state.setdefault("candle_cache", {})
+    if market == "OLYMP_OTC" and (not OLYMPTRADE_TOKEN or OlympTradeClient is None):
+        return [
+            {
+                "symbol": s + " • OLYMP OTC",
+                "direction": "NEUTRO",
+                "confidence": 0,
+                "status": "OLYMP OTC NÃO CONFIGURADA",
+            }
+            for s in SYMBOLS
+        ]
 
-        # V32.2:
-        # O radar antigo apenas LIA o cache. Por isso somente o par selecionado
-        # tinha dados e todos os outros ficavam eternamente em "AGUARDANDO DADOS".
-        # Agora cada chamada do radar aquece 1 par OTC por vez, em sequência,
-        # reutilizando o mesmo lock da sessão para não criar chamadas websocket
-        # simultâneas na IQ Option.
-        idx_key = f"radar_index|{interval}"
-        idx = int(state.get(idx_key, 0) or 0) % len(SYMBOLS)
-
-        # Prioriza um par que ainda não possui cache recente.
-        chosen_idx = idx
-        for offset in range(len(SYMBOLS)):
-            test_idx = (idx + offset) % len(SYMBOLS)
-            sym_test = SYMBOLS[test_idx]
-            item = cc.get(f"{sym_test}|{interval}")
-            if not item or time.time() - item[0] > 75:
-                chosen_idx = test_idx
-                break
-
-        chosen = SYMBOLS[chosen_idx]
-        state[idx_key] = (chosen_idx + 1) % len(SYMBOLS)
-
-        # Evita rajadas se houver duas abas abertas ou chamadas muito próximas.
-        radar_next = float(state.get("radar_next_fetch", 0.0) or 0.0)
-        if time.time() >= radar_next:
-            state["radar_next_fetch"] = time.time() + 12.0
-            try:
-                await candles(chosen, interval, 90, "OTC", state)
-            except Exception as exc:
-                state["radar_last_error"] = str(exc)[:180]
-
-        out = []
-
-        for sym in SYMBOLS:
-            item = cc.get(f"{sym}|{interval}")
-
-            if not item:
-                out.append({
-                    "symbol": sym + " • OTC",
-                    "direction": "NEUTRO",
-                    "confidence": 0,
-                    "status": "CARREGANDO DADOS",
-                })
-                continue
-
-            age = time.time() - item[0]
-
-            if age > 180:
-                out.append({
-                    "symbol": sym + " • OTC",
-                    "direction": "NEUTRO",
-                    "confidence": 0,
-                    "status": "ATUALIZANDO DADOS",
-                })
-                continue
-
-            try:
-                raw = item[1]
-
-                if len(raw) < 25:
-                    out.append({
-                        "symbol": sym + " • OTC",
-                        "direction": "NEUTRO",
-                        "confidence": 0,
-                        "status": "POUCOS CANDLES",
-                    })
-                    continue
-
-                tech = local_engine(raw[:-1] if len(raw) > 1 else raw)
-                direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
-
-                out.append({
-                    "symbol": sym + " • OTC",
-                    "direction": direction,
-                    "confidence": round(float(tech.get("confidence", 0) or 0), 1),
-                    "status": "OPORTUNIDADE TÉCNICA" if direction != "NEUTRO" else "MONITORANDO",
-                })
-
-            except Exception:
-                out.append({
-                    "symbol": sym + " • OTC",
-                    "direction": "NEUTRO",
-                    "confidence": 0,
-                    "status": "SEM DADOS",
-                })
-
-        return out
-
-    rkey = f"OPEN|{interval}"
+    rkey = f"{market}|{interval}"
     previous = radar_cache.get(rkey)
+    suffix = "" if market == "OPEN" else (" • IQ OTC" if market == "IQ_OTC" else " • OLYMP OTC")
 
     out = list(previous[1]) if previous else [
         {
-            "symbol": sym,
+            "symbol": sym + suffix,
             "direction": "NEUTRO",
             "confidence": 0,
             "status": "AGUARDANDO LEITURA",
@@ -2104,44 +2201,48 @@ async def radar(request: Request, interval="1min", market="OPEN"):
         for sym in SYMBOLS
     ]
 
-    if time.time() >= td_backoff_until:
-        idx_key = f"OPEN_RADAR_INDEX|{interval}"
-        idx = int(cache.get(idx_key, (0, 0))[1] or 0) % len(SYMBOLS)
-        sym = SYMBOLS[idx]
-        cache[idx_key] = (time.time(), (idx + 1) % len(SYMBOLS))
-        by = {x["symbol"]: i for i, x in enumerate(out)}
+    # Aquece apenas um par por ciclo para não sobrecarregar os feeds.
+    idx_key = f"RADAR_INDEX|{market}|{interval}"
+    idx = int(cache.get(idx_key, (0, 0))[1] or 0) % len(SYMBOLS)
+    sym = SYMBOLS[idx]
+    cache[idx_key] = (time.time(), (idx + 1) % len(SYMBOLS))
 
-        try:
-            raw = await candles(sym, interval, 90, "OPEN", None)
-            age = _td_cache_age(sym, interval)
-
-            if age <= max(90.0, INTERVALS[interval] * 0.8):
-                tech = local_engine(raw[:-1] if len(raw) > 1 else raw)
-                direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
-
-                item = {
-                    "symbol": sym,
-                    "direction": direction,
-                    "confidence": round(float(tech.get("confidence", 0) or 0), 1),
-                    "status": "OPORTUNIDADE TÉCNICA" if direction != "NEUTRO" else "MONITORANDO",
-                }
-            else:
-                item = {
-                    "symbol": sym,
-                    "direction": "NEUTRO",
-                    "confidence": 0,
-                    "status": "AGUARDANDO DADOS",
-                }
-
-        except Exception:
+    try:
+        raw = await candles(sym, interval, 90, market, iq_state)
+        if len(raw) >= 25:
+            tech = local_engine(raw[:-1] if len(raw) > 1 else raw, {"interval": interval})
+            direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
             item = {
-                "symbol": sym,
+                "symbol": sym + suffix,
+                "direction": direction,
+                "confidence": round(float(tech.get("confidence", 0) or 0), 1),
+                "status": "OPORTUNIDADE TÉCNICA" if direction != "NEUTRO" else "MONITORANDO",
+            }
+        else:
+            item = {
+                "symbol": sym + suffix,
                 "direction": "NEUTRO",
                 "confidence": 0,
-                "status": "FONTE EM ESPERA",
+                "status": "POUCOS CANDLES",
             }
+    except Exception:
+        item = {
+            "symbol": sym + suffix,
+            "direction": "NEUTRO",
+            "confidence": 0,
+            "status": "FONTE EM ESPERA",
+        }
 
-        out[by.get(sym, idx)] = item
+    # replace same symbol slot
+    base_symbol = sym + suffix
+    replaced = False
+    for i, old in enumerate(out):
+        if old.get("symbol") == base_symbol:
+            out[i] = item
+            replaced = True
+            break
+    if not replaced:
+        out.append(item)
 
     radar_cache[rkey] = (time.time(), out)
     return out
@@ -2151,11 +2252,15 @@ async def radar(request: Request, interval="1min", market="OPEN"):
 async def performance(request: Request, interval="1min", market="OPEN"):
     market=(market or "OPEN").upper()
 
-    if market == "OTC":
-        state = _session_state(request, required=True)
+    if market not in VALID_MARKETS:
+        raise HTTPException(400, "Mercado inválido.")
+
+    if market == "IQ_OTC":
+        state = _iq_state_for_request(request, required=True)
         store = state.setdefault("results", {})
     else:
-        store = results
+        # Chaveia por mercado para IQ/Olymp/Open não misturarem placar.
+        store = results.setdefault(market, {})
 
     wins = sum(1 for x in store.values() if x.get("result") == "WIN")
     losses = sum(1 for x in store.values() if x.get("result") == "LOSS")
@@ -2182,8 +2287,10 @@ async def result(
         raise HTTPException(400, "expiry_time é obrigatório.")
 
     market=(market or "OPEN").upper()
-    state = _session_state(request, required=(market == "OTC"))
-    store = state.setdefault("results", {}) if market == "OTC" else results
+    if market not in VALID_MARKETS:
+        raise HTTPException(400, "Mercado inválido.")
+    state = _iq_state_for_request(request, required=True) if market == "IQ_OTC" else None
+    store = state.setdefault("results", {}) if market == "IQ_OTC" else results.setdefault(market, {})
     key = f"{market}|{symbol}|{interval}|{direction}|{expiry_time}"
 
     if key in store:
@@ -2339,6 +2446,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <option value="OLYMPTRADE">🏦 Olymptrade</option>
     </select>
 
+    <select id="marketMode">
+      <option value="OPEN">🌐 Mercado Aberto</option>
+      <option value="OTC">🟣 OTC da corretora</option>
+    </select>
     <input id="market" type="hidden" value="OPEN">
 
     <select id="symbol"></select>
@@ -2438,13 +2549,13 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </select>
 
       <div id="iqAccountStatus" class="card" style="margin-top:12px">
-        🟢 Sem login. Os sinais usam dados externos de mercado.
+        🟢 Sem login no painel. O OTC usa a conexão real configurada no servidor.
       </div>
 
       <div class="label" style="margin-top:10px;line-height:1.5">
-        IQ Option e Olymptrade são usadas somente como local de execução da entrada.
-        Os candles desta versão vêm da fonte externa do MEGA IA.
-        Não são candles OTC próprios das corretoras.
+        Mercado Aberto usa a fonte externa do MEGA IA.
+        No modo OTC, IQ Option e Olymptrade usam fontes separadas.
+        As credenciais/tokens ficam somente nas variáveis seguras do servidor.
       </div>
 
       <input id="iqEmail" type="hidden">
@@ -2467,6 +2578,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
 <script>
 const market=document.getElementById('market');
+const marketMode=document.getElementById('marketMode');
 const broker=document.getElementById('broker');
 const brokerAccount=document.getElementById('brokerAccount');
 
@@ -2476,19 +2588,34 @@ function brokerName(){
   return 'IQ Option';
 }
 
+function syncMarketFromBroker(){
+  if(!market || !marketMode) return;
+  if(marketMode.value==='OPEN'){
+    market.value='OPEN';
+  }else{
+    market.value=(broker && broker.value==='OLYMPTRADE') ? 'OLYMP_OTC' : 'IQ_OTC';
+  }
+  try{localStorage.setItem('mega_market_mode',marketMode.value)}catch(_){}
+}
+
 function syncBroker(value){
   const v=['IQ_OPTION','OLYMPTRADE'].includes(value) ? value : 'IQ_OPTION';
   if(broker) broker.value=v;
   if(brokerAccount) brokerAccount.value=v;
   try{localStorage.setItem('mega_broker',v)}catch(_){}
+  syncMarketFromBroker();
+
   if(typeof iqAccountStatus!=='undefined' && iqAccountStatus){
     const name=v==='OLYMPTRADE'?'Olymptrade':'IQ Option';
-    iqAccountStatus.textContent='🟢 '+name+' selecionada • sem login';
+    const mode=marketMode && marketMode.value==='OTC' ? 'OTC REAL' : 'MERCADO ABERTO';
+    iqAccountStatus.textContent='🟢 '+name+' selecionada • '+mode;
   }
 }
 
 try{
   const savedBroker=localStorage.getItem('mega_broker')||'IQ_OPTION';
+  const savedMode=localStorage.getItem('mega_market_mode')||'OPEN';
+  if(marketMode) marketMode.value=(savedMode==='OTC'?'OTC':'OPEN');
   setTimeout(()=>syncBroker(savedBroker),0);
 }catch(_){}
 const interval=document.getElementById('interval');
@@ -2589,7 +2716,7 @@ function rememberPendingTrade(sig){
   }
 
   pendingTrade={
-    market:'OPEN',
+    market:market.value,
     symbol:sig.symbol,
     interval:sig.interval,
     direction:sig.direction,
@@ -2604,8 +2731,12 @@ function fillSymbols(){
   const previous=S.value;
   S.innerHTML='';
 
+  const suffix=(marketMode && marketMode.value==='OTC')
+    ? (broker && broker.value==='OLYMPTRADE' ? ' • OLYMP OTC' : ' • IQ OTC')
+    : '';
+
   syms.forEach(x=>{
-    S.add(new Option(x,x));
+    S.add(new Option(x+suffix,x));
   });
 
   if(previous && [...S.options].some(o=>o.value===previous)){
@@ -2748,8 +2879,23 @@ async function post(u,data={}){
 }
 
 async function updateMarketNote(){
-  otcNote.style.display='none';
-  if(market) market.value='OPEN';
+  syncMarketFromBroker();
+  if(!otcNote) return;
+
+  if(marketMode.value!=='OTC'){
+    otcNote.style.display='none';
+    return;
+  }
+
+  otcNote.style.display='block';
+  otcNote.textContent='🟣 Verificando '+brokerName()+' OTC...';
+
+  try{
+    const d=await get('/otc-status?broker='+encodeURIComponent(broker.value));
+    otcNote.textContent=(d.configured?'🟢 ':'🟠 ')+brokerName()+' OTC • '+(d.message||'');
+  }catch(e){
+    otcNote.textContent='🔴 '+brokerName()+' OTC indisponível';
+  }
 }
 
 
@@ -2869,7 +3015,7 @@ async function loadChart(){
 
     chartInfo.textContent=
       (d.ok===false?'⚠️ ':'')+
-      d.symbol+' • '+brokerName()+
+      d.symbol+' • '+(market.value==='OPEN'?'Mercado Aberto':brokerName()+' OTC')+
       ' • '+d.interval+
       (d.ok===false?' • '+(d.status||'INDISPONÍVEL'):'');
 
@@ -2913,13 +3059,17 @@ tabAccount.onclick=()=>showTab('account');
 window.addEventListener('resize',resizeChart);
 
 async function refreshAccountStatus(){
-  if(market) market.value='OPEN';
   syncBroker((broker&&broker.value)||'IQ_OPTION');
+  await updateMarketNote();
 }
 
 if(broker){
   broker.onchange=()=>{
     syncBroker(broker.value);
+    fillSymbols();
+    updateMarketNote();
+    lastSignalVoice='';
+    chartData=[];
     sig(true);
     rad();
     if(chartTab.classList.contains('active')) loadChart();
@@ -2929,6 +3079,10 @@ if(broker){
 if(brokerAccount){
   brokerAccount.onchange=()=>{
     syncBroker(brokerAccount.value);
+    fillSymbols();
+    updateMarketNote();
+    lastSignalVoice='';
+    chartData=[];
     sig(true);
     rad();
     if(chartTab.classList.contains('active')) loadChart();
@@ -3182,7 +3336,7 @@ async function resultCheck(){
     const t=pendingTrade;
 
     const x=await get(
-      `/result?market=${encodeURIComponent('OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}`
+      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}`
     );
 
     if(x.result){
@@ -3212,8 +3366,15 @@ async function resultCheck(){
   }
 }
 
-market.onchange=async()=>{
-  market.value='OPEN';
+marketMode.onchange=async()=>{
+  syncMarketFromBroker();
+  fillSymbols();
+  updateMarketNote();
+  lastSignalVoice='';
+  chartData=[];
+  sig(true);
+  rad();
+  if(chartTab.classList.contains('active')) loadChart();
 };
 
 
@@ -3246,11 +3407,11 @@ interval.onchange=()=>{
 };
 
 try{
-  const sm=localStorage.getItem('mega_market');
+  const sm=localStorage.getItem('mega_market_mode');
   if(sm==='OPEN'||sm==='OTC'){
-    market.value=sm;
+    marketMode.value=sm;
   }
-
+  syncMarketFromBroker();
   fillSymbols();
 
   const ss=localStorage.getItem('mega_symbol');
@@ -3268,7 +3429,7 @@ try{
 }
 
 async function bootApp(){
-  market.value='OPEN';
+  syncMarketFromBroker();
   const safe=(name,fn)=>
     Promise.resolve()
       .then(fn)
@@ -3285,7 +3446,7 @@ async function bootApp(){
   safe('account',refreshAccountStatus);
   safe('market-status',updateMarketNote);
 
-  if(market.value==='OTC'){
+  if(market.value!=='OPEN'){
     await new Promise(r=>setTimeout(r,700));
   }
 
