@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.25.0")
+app = FastAPI(title="MEGA IA", version="33.26.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -5187,6 +5187,11 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         </div>
 
         <div class="card">
+          <div class="label">LOSS DIRETO</div>
+          <div id="lossDirect" class="big put">0</div>
+        </div>
+
+        <div class="card">
           <div class="label">LOSS G2</div>
           <div id="lossG2" class="big put">0</div>
         </div>
@@ -5199,9 +5204,9 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
 
       <div class="label" style="margin-top:10px;line-height:1.5">
-        Se a entrada inicial perder, o painel acompanha a vela seguinte como G1.
-        Se G1 perder, acompanha a próxima como G2. O painel apenas mostra o resultado;
-        não executa Martingale automaticamente.
+        WIN DIRETO e LOSS DIRETO são registrados quando a operação termina sem Gale.
+        Quando o fluxo normal acompanha G1/G2, WIN G1, WIN G2 e LOSS G2 também entram no placar.
+        Cada operação é contabilizada uma única vez e o histórico fica salvo neste aparelho.
       </div>
     </div>
   </div>
@@ -5353,6 +5358,7 @@ const tabResults=document.getElementById('tabResults');
 const winDirect=document.getElementById('winDirect');
 const winG1=document.getElementById('winG1');
 const winG2=document.getElementById('winG2');
+const lossDirect=document.getElementById('lossDirect');
 const lossG2=document.getElementById('lossG2');
 const galeLastResult=document.getElementById('galeLastResult');
 const galeStageStatus=document.getElementById('galeStageStatus');
@@ -5415,16 +5421,158 @@ let chartData=[];
 let chartPreSignal=null;
 let resultBusy=false;
 let pendingTrade=null;
+let pendingTradeQueue=[];
 let lastCountdownSignalKey='';
 let lastChartSignalVoice='';
+
+const RESULT_STATS_KEY='mega_result_stats_v33260';
+const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33260';
+const RESULT_MARKETS=['OPEN','IQ_OTC','OLYMP_OTC'];
+
+function emptyResultBucket(){
+  return {
+    win_direct:0,
+    win_g1:0,
+    win_g2:0,
+    loss_direct:0,
+    loss_g2:0,
+    processed_keys:[]
+  };
+}
+
+let persistentResults={
+  OPEN:emptyResultBucket(),
+  IQ_OTC:emptyResultBucket(),
+  OLYMP_OTC:emptyResultBucket()
+};
+
+function normalizeResultBucket(x){
+  const b=emptyResultBucket();
+  if(!x || typeof x!=='object') return b;
+  b.win_direct=Math.max(0,Number(x.win_direct||0));
+  b.win_g1=Math.max(0,Number(x.win_g1||0));
+  b.win_g2=Math.max(0,Number(x.win_g2||0));
+  b.loss_direct=Math.max(0,Number(x.loss_direct||0));
+  b.loss_g2=Math.max(0,Number(x.loss_g2||0));
+  b.processed_keys=Array.isArray(x.processed_keys)?x.processed_keys.slice(-1500):[];
+  return b;
+}
+
+function resultMarket(m){
+  m=String(m||'OPEN').toUpperCase();
+  return RESULT_MARKETS.includes(m)?m:'OPEN';
+}
+
+function resultTradeKey(t){
+  if(!t) return '';
+  return [
+    resultMarket(t.market),
+    t.symbol||'',
+    t.interval||'',
+    t.direction||'',
+    t.entry_time||'',
+    t.expiry_time||''
+  ].join('|');
+}
+
+function loadPersistentResults(){
+  try{
+    const raw=localStorage.getItem(RESULT_STATS_KEY);
+    if(!raw) return;
+    const data=JSON.parse(raw)||{};
+    RESULT_MARKETS.forEach(m=>{
+      persistentResults[m]=normalizeResultBucket(data[m]);
+    });
+  }catch(_){ }
+}
+
+function savePersistentResults(){
+  try{
+    localStorage.setItem(RESULT_STATS_KEY,JSON.stringify(persistentResults));
+  }catch(_){ }
+}
+
+function isResultAlreadyCounted(t){
+  const key=resultTradeKey(t);
+  if(!key) return false;
+  const b=persistentResults[resultMarket(t.market)]||emptyResultBucket();
+  return b.processed_keys.includes(key);
+}
+
+function registerPersistentResult(t,x){
+  if(!t || !x) return false;
+  const r=String(x.result||'').toUpperCase();
+  if(!['WIN','WIN G1','WIN G2','LOSS','LOSS G2'].includes(r)) return false;
+
+  const m=resultMarket(t.market);
+  const b=persistentResults[m]||emptyResultBucket();
+  persistentResults[m]=b;
+  const key=resultTradeKey(t);
+  if(!key || b.processed_keys.includes(key)) return false;
+
+  b.processed_keys.push(key);
+  if(b.processed_keys.length>1500) b.processed_keys=b.processed_keys.slice(-1500);
+
+  if(r==='WIN') b.win_direct++;
+  else if(r==='WIN G1') b.win_g1++;
+  else if(r==='WIN G2') b.win_g2++;
+  else if(r==='LOSS') b.loss_direct++;
+  else if(r==='LOSS G2') b.loss_g2++;
+
+  savePersistentResults();
+  paintPersistentResults();
+  return true;
+}
+
+function mergeServerPerformance(p,m){
+  if(!p) return;
+  m=resultMarket(m);
+  const b=persistentResults[m]||emptyResultBucket();
+  persistentResults[m]=b;
+
+  // O servidor funciona como uma segunda fonte. Usamos o maior valor por categoria
+  // para recuperar histórico sem somar duas vezes a mesma operação.
+  b.win_direct=Math.max(b.win_direct,Number(p.win_direct||0));
+  b.win_g1=Math.max(b.win_g1,Number(p.win_g1||0));
+  b.win_g2=Math.max(b.win_g2,Number(p.win_g2||0));
+  b.loss_direct=Math.max(b.loss_direct,Number(p.loss_direct||0));
+  b.loss_g2=Math.max(b.loss_g2,Number(p.loss_g2||0));
+  savePersistentResults();
+}
+
+function paintPersistentResults(){
+  const m=resultMarket(market&&market.value);
+  const b=persistentResults[m]||emptyResultBucket();
+  const totalWins=b.win_direct+b.win_g1+b.win_g2;
+  const totalLosses=b.loss_direct+b.loss_g2;
+  const total=totalWins+totalLosses;
+  const acc=total?((totalWins/total)*100):0;
+
+  if(wins) wins.textContent=String(totalWins);
+  if(losses) losses.textContent=String(totalLosses);
+  if(accuracy) accuracy.textContent=acc.toFixed(2)+'%';
+  if(winDirect) winDirect.textContent=String(b.win_direct);
+  if(winG1) winG1.textContent=String(b.win_g1);
+  if(winG2) winG2.textContent=String(b.win_g2);
+  if(lossDirect) lossDirect.textContent=String(b.loss_direct);
+  if(lossG2) lossG2.textContent=String(b.loss_g2);
+}
+
+loadPersistentResults();
 
 try{
   const savedPending=localStorage.getItem('mega_pending_trade');
   if(savedPending){
     pendingTrade=JSON.parse(savedPending);
   }
+  const savedQueue=localStorage.getItem(PENDING_QUEUE_KEY);
+  if(savedQueue){
+    const q=JSON.parse(savedQueue);
+    pendingTradeQueue=Array.isArray(q)?q.slice(0,100):[];
+  }
 }catch(e){
   pendingTrade=null;
+  pendingTradeQueue=[];
 }
 
 function savePendingTrade(){
@@ -5434,7 +5582,39 @@ function savePendingTrade(){
     }else{
       localStorage.removeItem('mega_pending_trade');
     }
+    localStorage.setItem(PENDING_QUEUE_KEY,JSON.stringify(pendingTradeQueue.slice(0,100)));
   }catch(e){}
+}
+
+function enqueuePendingTrade(t){
+  if(!t || !t.expiry_time || !t.entry_time) return;
+  if(t.direction!=='CALL' && t.direction!=='PUT') return;
+  if(isResultAlreadyCounted(t)) return;
+
+  const key=resultTradeKey(t);
+  if(pendingTrade && resultTradeKey(pendingTrade)===key) return;
+  if(pendingTradeQueue.some(x=>resultTradeKey(x)===key)) return;
+
+  if(!pendingTrade){
+    pendingTrade=t;
+  }else{
+    pendingTradeQueue.push(t);
+    pendingTradeQueue.sort((a,b)=>new Date(a.expiry_time).getTime()-new Date(b.expiry_time).getTime());
+    if(pendingTradeQueue.length>100) pendingTradeQueue=pendingTradeQueue.slice(0,100);
+  }
+  savePendingTrade();
+}
+
+function promoteNextPendingTrade(){
+  pendingTrade=null;
+  while(pendingTradeQueue.length){
+    const next=pendingTradeQueue.shift();
+    if(next && !isResultAlreadyCounted(next)){
+      pendingTrade=next;
+      break;
+    }
+  }
+  savePendingTrade();
 }
 
 function rememberPendingTrade(sig){
@@ -5442,26 +5622,17 @@ function rememberPendingTrade(sig){
   if(sig.direction!=='CALL' && sig.direction!=='PUT') return;
   if(!sig.expiry_time || !sig.entry_time) return;
 
-  // Não troca uma operação ainda aguardando resultado por outro polling do sinal.
-  if(pendingTrade && pendingTrade.expiry_time){
-    const oldExpiry=new Date(pendingTrade.expiry_time).getTime();
-    if(oldExpiry && Date.now() < oldExpiry + 120000){
-      return;
-    }
-  }
-
-  pendingTrade={
+  enqueuePendingTrade({
+    source:sig.source||'SIGNAL',
+    direct_only:!!sig.direct_only,
     market:market.value,
     symbol:sig.symbol,
     interval:sig.interval,
     direction:sig.direction,
     entry_time:sig.entry_time,
     expiry_time:sig.expiry_time
-  };
-
-  savePendingTrade();
+  });
 }
-
 
 function intervalSecondsValue(v){
   const map={
@@ -5502,15 +5673,7 @@ function rememberChartSignal(pre){
   const expiryMs=entryMs+(intervalSecondsValue(interval.value)*1000);
   const expiryIso=new Date(expiryMs).toISOString();
 
-  // Não sobrescreve uma operação ainda aguardando resultado.
-  if(pendingTrade && pendingTrade.expiry_time){
-    const oldExpiry=new Date(pendingTrade.expiry_time).getTime();
-    if(oldExpiry && Date.now()<oldExpiry+5000){
-      return;
-    }
-  }
-
-  pendingTrade={
+  enqueuePendingTrade({
     source:'CHART_20S',
     direct_only:true,
     market:market.value,
@@ -5519,9 +5682,7 @@ function rememberChartSignal(pre){
     direction:pre.direction,
     entry_time:pre.entry_time,
     expiry_time:expiryIso
-  };
-
-  savePendingTrade();
+  });
 }
 
 function fillSymbols(){
@@ -6385,16 +6546,13 @@ async function perf(){
   perfBusy=true;
 
   try{
-    const p=await get('/performance?market='+encodeURIComponent(market.value));
-    wins.textContent=p.wins;
-    losses.textContent=p.losses;
-    accuracy.textContent=p.accuracy+'%';
-
-    if(winDirect) winDirect.textContent=p.win_direct||0;
-    if(winG1) winG1.textContent=p.win_g1||0;
-    if(winG2) winG2.textContent=p.win_g2||0;
-    if(lossG2) lossG2.textContent=p.loss_g2||0;
+    const currentMarket=resultMarket(market.value);
+    const p=await get('/performance?market='+encodeURIComponent(currentMarket));
+    mergeServerPerformance(p,currentMarket);
+    paintPersistentResults();
   }catch(e){
+    // Mesmo se a API estiver temporariamente indisponível, mantém o placar salvo.
+    paintPersistentResults();
   }finally{
     perfBusy=false;
   }
@@ -6579,6 +6737,10 @@ function cd(){
 async function resultCheck(){
   if(resultBusy) return;
 
+  if(!pendingTrade && pendingTradeQueue.length){
+    promoteNextPendingTrade();
+  }
+
   if(!pendingTrade){
     rememberPendingTrade(cur);
   }
@@ -6647,11 +6809,12 @@ async function resultCheck(){
         }
       }
 
+      // Registra exatamente uma vez antes de atualizar o painel.
+      registerPersistentResult(t,x);
       await perf();
 
-      // Só remove depois do resultado final: WIN, WIN G1, WIN G2 ou LOSS G2.
-      pendingTrade=null;
-      savePendingTrade();
+      // Finalizada: passa para a próxima operação que estiver aguardando resultado.
+      promoteNextPendingTrade();
     }
 
   }catch(e){
