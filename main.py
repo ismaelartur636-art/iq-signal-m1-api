@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.3.0")
+app = FastAPI(title="MEGA IA", version="33.3.1")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -59,6 +59,10 @@ OTC_BASE = {
 }
 
 cache: Dict[str, Any] = {}
+# Controle anti-repetição de sinais.
+# Mantém o mesmo sinal até a expiração e exige um novo setup antes de liberar outro
+# sinal na mesma direção.
+signal_release_state: Dict[str, Any] = {}
 oai_cache: Dict[str, Any] = {}
 results: Dict[str, Any] = {}
 radar_cache: Dict[str, Any] = {}
@@ -1400,6 +1404,21 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
     session_part = iq_state.get("session_id", "") if (market == "OTC" and iq_state) else "PUBLIC"
     key = f"{session_part}|{market}|{symbol}|{interval}"
 
+    release_key = f"{market}|{symbol}|{interval}"
+    release_state = signal_release_state.get(release_key) or {}
+
+    active_signal = release_state.get("active_signal")
+    if active_signal and active_signal.get("expiry_time"):
+        try:
+            active_expiry = parse_dt(active_signal["expiry_time"])
+        except Exception:
+            active_expiry = None
+
+        # Enquanto a operação ainda está ativa, devolve exatamente o MESMO sinal.
+        # Isso impede que cada polling gere um novo horário de entrada.
+        if active_expiry and now() < active_expiry:
+            return active_signal
+
     if key in cache and time.time() - cache[key][0] < 4:
         return cache[key][1]
 
@@ -1484,6 +1503,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
         },
     )
 
+    # Se a condição anterior deixou de existir, libera o gate para um novo setup.
+    release_state = signal_release_state.setdefault(release_key, {})
+    if not analysis.get("confirmed") or analysis.get("direction") not in ("CALL", "PUT"):
+        release_state["locked_direction"] = None
+        release_state["locked_strategy"] = None
+        release_state["active_signal"] = None
+
     base = {
         "symbol": symbol,
         "interval": interval,
@@ -1536,13 +1562,44 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
             )
 
     if base["direction"] in ("CALL", "PUT"):
-        announce, entry, expiry = entry_window(interval)
-        base["entry_time"] = iso(entry)
-        base["announce_time"] = iso(announce)
-        base["expiry_time"] = iso(expiry)
-        base["reference_candle"] = closed[-1]["datetime"] if closed else None
+        release_state = signal_release_state.setdefault(release_key, {})
+        locked_direction = release_state.get("locked_direction")
+        locked_strategy = release_state.get("locked_strategy")
+
+        # O mesmo setup não pode liberar uma nova entrada minuto após minuto.
+        # Para voltar a liberar na mesma direção, o setup precisa primeiro desaparecer
+        # (ficar NEUTRO) e depois se formar novamente.
+        if (
+            locked_direction == base["direction"]
+            and locked_strategy == base.get("strategy")
+        ):
+            base.update(
+                direction="NEUTRO",
+                entry_time=None,
+                announce_time=None,
+                expiry_time=None,
+                status="AGUARDANDO NOVO SETUP",
+                reason="O sinal anterior já foi utilizado. Aguardando a condição desaparecer e se formar novamente.",
+                risk="HIGH",
+            )
+        else:
+            announce, entry, expiry = entry_window(interval)
+            base["entry_time"] = iso(entry)
+            base["announce_time"] = iso(announce)
+            base["expiry_time"] = iso(expiry)
+            base["reference_candle"] = closed[-1]["datetime"] if closed else None
+
+            release_state["locked_direction"] = base["direction"]
+            release_state["locked_strategy"] = base.get("strategy")
+            release_state["active_signal"] = dict(base)
 
     base["source_state"] = "READY"
+
+    # Atualiza a cópia ativa já com source_state.
+    if base["direction"] in ("CALL", "PUT"):
+        release_state = signal_release_state.setdefault(release_key, {})
+        release_state["active_signal"] = dict(base)
+
     cache[key] = (time.time(), base)
     return base
 
@@ -1553,7 +1610,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.3.0",
+        "version": "33.3.1",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -2497,6 +2554,7 @@ let megaVoices=[];
 let chartData=[];
 let resultBusy=false;
 let pendingTrade=null;
+let lastCountdownSignalKey='';
 
 try{
   const savedPending=localStorage.getItem('mega_pending_trade');
@@ -2947,9 +3005,17 @@ async function sig(announce=false){
       speak('Análise concluída. Não há oportunidade segura no momento.');
     }
 
-    fifteen=false;
-    five=false;
-    entered=false;
+    const countdownSignalKey =
+      cur && cur.direction!=='NEUTRO' && cur.entry_time
+      ? [cur.symbol,cur.interval,cur.direction,cur.entry_time].join('|')
+      : '';
+
+    if(countdownSignalKey !== lastCountdownSignalKey){
+      lastCountdownSignalKey=countdownSignalKey;
+      fifteen=false;
+      five=false;
+      entered=false;
+    }
 
   }catch(e){
     statusBox.textContent='PAINEL ATIVO • FONTE TEMPORARIAMENTE INDISPONÍVEL';
