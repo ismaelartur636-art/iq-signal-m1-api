@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.27.0")
+app = FastAPI(title="MEGA IA", version="33.28.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -82,6 +82,10 @@ signal_release_state: Dict[str, Any] = {}
 ai_scan_state: Dict[str, Any] = {}
 oai_cache: Dict[str, Any] = {}
 results: Dict[str, Any] = {}
+# Contabilidade principal independente do fluxo de Gale.
+# Cada sinal confirmado entra aqui e é avaliado na vela original.
+accounting_pending: Dict[str, Dict[str, Any]] = {}
+accounting_results: Dict[str, Dict[str, Any]] = {}
 radar_cache: Dict[str, Any] = {}
 pre_signal_cache: Dict[str, Any] = {}
 chart_pre_signal_lock: Dict[str, Dict[str, Any]] = {}
@@ -4211,7 +4215,9 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         )
 
     try:
-        return await signal(symbol, interval, market, state, request=request, ai_only=ai_only)
+        data = await signal(symbol, interval, market, state, request=request, ai_only=ai_only)
+        _remember_accounting_signal(request, data)
+        return data
     except Exception as exc:
         return neutral_signal(
             symbol,
@@ -4596,6 +4602,10 @@ async def chart_pre_signal(
             "reason": preview["reason"],
             "seconds_to_entry": seconds_to_entry,
             "entry_time": entry_iso,
+            "expiry_time": iso(entry_dt + timedelta(seconds=INTERVALS[interval])),
+            "market": market,
+            "symbol": symbol,
+            "interval": interval,
             "reference_candle": (
                 current_candle.get("datetime")
                 if isinstance(current_candle, dict)
@@ -4612,6 +4622,7 @@ async def chart_pre_signal(
         chart_pre_signal_lock[lock_key] = dict(payload)
         chart_pre_signal_candidate.pop(lock_key, None)
         chart_pre_signal_last_at[lock_key] = time.time()
+        _remember_accounting_signal(request, payload)
         return payload
 
     except Exception as exc:
@@ -4721,6 +4732,119 @@ async def radar(request: Request, interval="1min", market="OPEN"):
     return out
 
 
+
+def _accounting_key(payload: Dict[str, Any]) -> str:
+    return "|".join([
+        str(payload.get("market") or "OPEN").upper(),
+        str(payload.get("symbol") or ""),
+        str(payload.get("interval") or ""),
+        str(payload.get("direction") or "").upper(),
+        str(payload.get("entry_time") or ""),
+        str(payload.get("expiry_time") or ""),
+    ])
+
+
+def _accounting_buckets(request: Request, market: str):
+    market = (market or "OPEN").upper()
+    if market == "IQ_OTC":
+        state = _iq_session_state(request, required=False)
+        if state is None:
+            return None, None
+        return (
+            state.setdefault("accounting_pending", {}),
+            state.setdefault("accounting_results", {}),
+        )
+    return (
+        accounting_pending.setdefault(market, {}),
+        accounting_results.setdefault(market, {}),
+    )
+
+
+def _remember_accounting_signal(request: Request, payload: Dict[str, Any]):
+    """Registra uma entrada confirmada no servidor, independente do navegador."""
+    if not isinstance(payload, dict):
+        return
+    direction = str(payload.get("direction") or "").upper()
+    if direction not in ("CALL", "PUT"):
+        return
+    if not payload.get("entry_time") or not payload.get("expiry_time"):
+        return
+    market = str(payload.get("market") or "OPEN").upper()
+    pending, done = _accounting_buckets(request, market)
+    if pending is None or done is None:
+        return
+    item = {
+        "market": market,
+        "symbol": payload.get("symbol"),
+        "interval": payload.get("interval"),
+        "direction": direction,
+        "entry_time": payload.get("entry_time"),
+        "expiry_time": payload.get("expiry_time"),
+        "source": payload.get("source") or payload.get("strategy") or "SIGNAL",
+    }
+    key = _accounting_key(item)
+    if key and key not in done and key not in pending:
+        pending[key] = item
+
+
+async def _settle_accounting_pending(request: Request, market: str):
+    """Fecha sinais expirados pelo candle da entrada original e grava WIN/LOSS uma vez."""
+    market = (market or "OPEN").upper()
+    pending, done = _accounting_buckets(request, market)
+    if pending is None or done is None or not pending:
+        return
+
+    iq_state = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
+    for key, t in list(pending.items())[:30]:
+        try:
+            expiry_dt = parse_dt(t["expiry_time"])
+            # Pequena folga para não ler o candle ainda em formação/cache antigo.
+            if now() < expiry_dt + timedelta(seconds=2):
+                continue
+            symbol = t["symbol"]
+            interval = t["interval"]
+            direction = str(t["direction"]).upper()
+            entry_dt = parse_dt(t["entry_time"])
+            cs = await candles(symbol, interval, 50, market, iq_state, request=request)
+
+            target = None
+            best_delta = None
+            for c in cs:
+                try:
+                    cdt = parse_dt(c["datetime"])
+                except Exception:
+                    continue
+                delta = abs((cdt - entry_dt).total_seconds())
+                if best_delta is None or delta < best_delta:
+                    best_delta = delta
+                    target = c
+
+            if not target or best_delta is None or best_delta > INTERVALS[interval] * 0.75:
+                continue
+
+            op = float(target["open"])
+            cl = float(target["close"])
+            if cl == op:
+                # Empate não vira WIN nem LOSS; marca como DRAW para não duplicar.
+                result_value = "DRAW"
+            else:
+                won = ((direction == "CALL" and cl > op) or (direction == "PUT" and cl < op))
+                result_value = "WIN" if won else "LOSS"
+
+            done[key] = {
+                **t,
+                "result": result_value,
+                "candle_time": target.get("datetime"),
+                "open": op,
+                "close": cl,
+                "settled_at": iso(now()),
+            }
+            pending.pop(key, None)
+        except Exception:
+            # Mantém pendente para tentar novamente no próximo ciclo.
+            continue
+
+
 @app.get("/performance")
 async def performance(request: Request, interval="1min", market="OPEN"):
     market=(market or "OPEN").upper()
@@ -4728,40 +4852,36 @@ async def performance(request: Request, interval="1min", market="OPEN"):
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
 
-    if market == "IQ_OTC":
-        state = _iq_session_state(request, required=True)
-        store = state.setdefault("results", {})
-    else:
-        # Chaveia por mercado para IQ/Olymp/Open não misturarem placar.
-        store = results.setdefault(market, {})
+    await _settle_accounting_pending(request, market)
+    pending, done = _accounting_buckets(request, market)
+    done = done or {}
 
-    # O placar principal mede SEMPRE a entrada original (1 vela).
-    # Gale fica separado e não transforma uma entrada perdida em WIN no placar principal.
-    win_direct = sum(
-        1 for x in store.values()
-        if (x.get("entry_result") or x.get("result")) == "WIN"
-    )
-    loss_direct = sum(
-        1 for x in store.values()
-        if (x.get("entry_result") or x.get("result")) == "LOSS"
-    )
-    win_g1 = sum(1 for x in store.values() if x.get("result") == "WIN G1")
-    win_g2 = sum(1 for x in store.values() if x.get("result") == "WIN G2")
-    loss_g2 = sum(1 for x in store.values() if x.get("result") == "LOSS G2")
-
-    wins = win_direct
-    losses = loss_direct
+    wins = sum(1 for x in done.values() if x.get("result") == "WIN")
+    losses = sum(1 for x in done.values() if x.get("result") == "LOSS")
+    draws = sum(1 for x in done.values() if x.get("result") == "DRAW")
     total = wins + losses
+
+    # Gale continua vindo do fluxo antigo apenas como informação separada.
+    if market == "IQ_OTC":
+        state = _iq_session_state(request, required=False)
+        gale_store = state.setdefault("results", {}) if state else {}
+    else:
+        gale_store = results.setdefault(market, {})
+    win_g1 = sum(1 for x in gale_store.values() if x.get("result") == "WIN G1")
+    win_g2 = sum(1 for x in gale_store.values() if x.get("result") == "WIN G2")
+    loss_g2 = sum(1 for x in gale_store.values() if x.get("result") == "LOSS G2")
 
     return {
         "wins": wins,
         "losses": losses,
         "total": total,
         "accuracy": round(wins / total * 100, 2) if total else 0,
-        "win_direct": win_direct,
+        "win_direct": wins,
+        "loss_direct": losses,
+        "draws": draws,
+        "pending": len(pending or {}),
         "win_g1": win_g1,
         "win_g2": win_g2,
-        "loss_direct": loss_direct,
         "loss_g2": loss_g2,
     }
 
@@ -5463,8 +5583,8 @@ let pendingTradeQueue=[];
 let lastCountdownSignalKey='';
 let lastChartSignalVoice='';
 
-const RESULT_STATS_KEY='mega_result_stats_v33260';
-const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33260';
+const RESULT_STATS_KEY='mega_result_stats_v33280';
+const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33280';
 const RESULT_MARKETS=['OPEN','IQ_OTC','OLYMP_OTC'];
 
 function emptyResultBucket(){
@@ -5595,10 +5715,12 @@ function mergeServerPerformance(p,m){
 
   // O servidor funciona como uma segunda fonte. Usamos o maior valor por categoria
   // para recuperar histórico sem somar duas vezes a mesma operação.
-  b.win_direct=Math.max(b.win_direct,Number(p.win_direct||0));
+  // O servidor é a fonte principal para WIN/LOSS da entrada original.
+  b.win_direct=Math.max(0,Number(p.win_direct||p.wins||0));
+  b.loss_direct=Math.max(0,Number(p.loss_direct||p.losses||0));
+  // Gales continuam apenas como estatística separada.
   b.win_g1=Math.max(b.win_g1,Number(p.win_g1||0));
   b.win_g2=Math.max(b.win_g2,Number(p.win_g2||0));
-  b.loss_direct=Math.max(b.loss_direct,Number(p.loss_direct||0));
   b.loss_g2=Math.max(b.loss_g2,Number(p.loss_g2||0));
   savePersistentResults();
 }
@@ -5606,8 +5728,8 @@ function mergeServerPerformance(p,m){
 function paintPersistentResults(){
   const m=resultMarket(market&&market.value);
   const b=persistentResults[m]||emptyResultBucket();
-  const totalWins=b.win_direct+b.win_g1+b.win_g2;
-  const totalLosses=b.loss_direct+b.loss_g2;
+  const totalWins=b.win_direct;
+  const totalLosses=b.loss_direct;
   const total=totalWins+totalLosses;
   const acc=total?((totalWins/total)*100):0;
 
@@ -7005,7 +7127,7 @@ setInterval(()=>{
   if(chartTab.classList.contains('active')) loadChart();
 },2000);
 
-setInterval(perf,30000);
+setInterval(perf,5000);
 setInterval(()=>{
   if(!robotEnabled) rad();
 },20000);
