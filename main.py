@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
-app = FastAPI(title="MEGA IA", version="32.9.8")
+app = FastAPI(title="MEGA IA", version="32.9.9")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -1159,7 +1159,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "32.8.0",
+        "version": "32.9.9",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -1243,7 +1243,7 @@ async def manifest():
 @app.get("/iq-diagnostic")
 async def iq_diagnostic():
     info = {
-        "app_version": "32.9.8",
+        "app_version": "32.9.9",
         "iq_async_library_loaded": AsyncIQOption is not None,
         "import_error": IQ_IMPORT_ERROR if AsyncIQOption is None else "",
         "active_sessions": len(iq_sessions),
@@ -1263,7 +1263,7 @@ async def iq_diagnostic():
 async def iq_network_test():
     """Testa endpoints alternativos da IQ Option sem usar e-mail nem senha."""
     result = {
-        "app_version": "32.9.8",
+        "app_version": "32.9.9",
         "http": {},
         "websocket": {},
     }
@@ -1373,7 +1373,7 @@ async def iq_port_test():
         "iqoption.com",
         "ws.iqoption.com",
     ]
-    result = {"app_version": "32.9.8", "port": 443, "hosts": {}}
+    result = {"app_version": "32.9.9", "port": 443, "hosts": {}}
 
     async def tcp_probe(host, family):
         family_name = "ipv4" if family == socket.AF_INET else "ipv6"
@@ -1465,7 +1465,7 @@ async def iq_login_diagnostic():
     if iq_login_diag.get("updated_at"):
         age = round(max(0.0, time.time() - float(iq_login_diag["updated_at"])), 1)
     return {
-        "app_version": "32.9.8",
+        "app_version": "32.9.9",
         "stage": iq_login_diag.get("stage", "idle"),
         "detail": iq_login_diag.get("detail", ""),
         "age_seconds": age,
@@ -2237,7 +2237,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 (function(){
 'use strict';
 
-var VERSION='32.9.6';
+var VERSION='32.9.9';
 var symbols=['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD'];
 var E={};
 var currentSignal=null;
@@ -2377,12 +2377,55 @@ window.handleMarketChange=handleMarketChange;window.handleSymbolChange=handleSym
 
 function rememberPending(sig){
   if(!sig||(sig.direction!=='CALL'&&sig.direction!=='PUT')||!sig.entry_time||!sig.expiry_time) return;
-  if(pendingTrade&&pendingTrade.expiry_time&&Date.now()<new Date(pendingTrade.expiry_time).getTime()+120000) return;
-  pendingTrade={market:sig.market||E.market.value,symbol:sig.symbol,interval:sig.interval,direction:sig.direction,entry_time:sig.entry_time,expiry_time:sig.expiry_time};
+  if(pendingTrade) return; // somente UMA operação por vez até sair WIN/LOSS
+  pendingTrade={
+    market:sig.market||E.market.value,
+    symbol:sig.symbol,
+    interval:sig.interval,
+    direction:sig.direction,
+    entry_time:sig.entry_time,
+    expiry_time:sig.expiry_time,
+    confidence:Number(sig.confidence||0),
+    status:sig.status||'SINAL LIBERADO',
+    risk:sig.risk||'--'
+  };
   safeStoreSet('mega_pending_trade',JSON.stringify(pendingTrade));
 }
 
+function pendingIsLocked(){
+  return !!(pendingTrade&&pendingTrade.direction&&pendingTrade.entry_time&&pendingTrade.expiry_time);
+}
+
+function paintPendingTrade(){
+  if(!pendingIsLocked()) return false;
+  var expired=Date.now()>=new Date(pendingTrade.expiry_time).getTime();
+  currentSignal={
+    market:pendingTrade.market,
+    symbol:pendingTrade.symbol,
+    interval:pendingTrade.interval,
+    direction:pendingTrade.direction,
+    entry_time:pendingTrade.entry_time,
+    expiry_time:pendingTrade.expiry_time,
+    confidence:Number(pendingTrade.confidence||0),
+    status:expired?'AGUARDANDO RESULTADO':'OPERAÇÃO EM ANDAMENTO',
+    risk:pendingTrade.risk||'--'
+  };
+  var d=currentSignal.direction;
+  text(E.direction,d);
+  if(E.direction) E.direction.className='big '+(d==='CALL'?'call':'put');
+  text(E.confidence,'Confiança: '+Number(currentSignal.confidence||0).toFixed(0)+'%');
+  text(E.entry,timeFmt(currentSignal.entry_time));
+  text(E.countdown,expired?'Aguardando resultado':'Operação bloqueada até a expiração');
+  text(E.status,currentSignal.status);
+  text(E.risk,'Risco: '+(currentSignal.risk||'--'));
+  return true;
+}
+
 function paintSignal(x){
+  if(pendingIsLocked()){
+    paintPendingTrade();
+    return;
+  }
   currentSignal=x||{};
   var d=currentSignal.direction||'NEUTRO';
   text(E.direction,d);
@@ -2393,13 +2436,25 @@ function paintSignal(x){
   text(E.status,currentSignal.status||'MONITORANDO');
   text(E.risk,'Risco: '+(currentSignal.risk||'--'));
   rememberPending(currentSignal);
+  if(pendingIsLocked()) paintPendingTrade();
 }
+
 function loadSignal(announce){
   if(signalBusy||!E.market||!E.interval) return Promise.resolve();
+
+  // Enquanto existir uma operação sem resultado, não busca nem libera outro sinal.
+  if(pendingIsLocked()){
+    paintPendingTrade();
+    return Promise.resolve();
+  }
+
   signalBusy=true;
   if(announce){text(E.status,'ANALISANDO O MERCADO...');}
   var u='/signal-ai?market='+encode(E.market.value)+'&symbol='+encode(currentSymbol())+'&interval='+encode(E.interval.value);
-  return get(u).then(function(x){paintSignal(x);if(announce&&x.direction&&x.direction!=='NEUTRO')speak('Sinal de '+x.direction+' identificado.');})
+  return get(u).then(function(x){
+    paintSignal(x);
+    if(announce&&x.direction&&x.direction!=='NEUTRO'&&pendingIsLocked()) speak('Sinal de '+x.direction+' identificado.');
+  })
   .catch(function(e){text(E.status,'PAINEL ATIVO • FONTE TEMPORARIAMENTE INDISPONÍVEL');text(E.direction,'NEUTRO');text(E.entry,'AGUARDANDO DADOS');})
   .then(function(){signalBusy=false;},function(){signalBusy=false;});
 }
@@ -2531,7 +2586,7 @@ function checkResult(){
   if(!pendingTrade||!pendingTrade.expiry_time||Date.now()<new Date(pendingTrade.expiry_time).getTime())return;
   resultBusy=true;var t=pendingTrade;
   var u='/result?market='+encode(t.market)+'&symbol='+encode(t.symbol)+'&interval='+encode(t.interval)+'&direction='+encode(t.direction)+'&expiry_time='+encode(t.expiry_time);
-  get(u).then(function(x){if(x&&x.result){text(E.result,x.result);registerResult(t,x);var k=t.symbol+'|'+t.direction+'|'+t.expiry_time;if(k!==lastResultKey){lastResultKey=k;speak('Operação finalizada. Resultado '+x.result+'.');}pendingTrade=null;safeStoreDel('mega_pending_trade');loadPerformance();}})
+  get(u).then(function(x){if(x&&x.result){text(E.result,x.result);registerResult(t,x);var k=t.symbol+'|'+t.direction+'|'+t.expiry_time;if(k!==lastResultKey){lastResultKey=k;speak('Operação finalizada. Resultado '+x.result+'.');}pendingTrade=null;safeStoreDel('mega_pending_trade');currentSignal={};loadPerformance();setTimeout(function(){loadSignal(false);},500);}})
   .catch(function(){}).then(function(){resultBusy=false;});
 }
 function countdown(){
@@ -2559,6 +2614,7 @@ function boot(){
   try{var p=safeStoreGet('mega_pending_trade');if(p)pendingTrade=JSON.parse(p);}catch(e){}
   document.documentElement.setAttribute('data-mega-js','ready');document.documentElement.setAttribute('data-mega-version',VERSION);
   text(E.status,'MONITORANDO');
+  if(pendingIsLocked()) paintPendingTrade();
   updateMarketNote();refreshAccountStatus();updateClock();loadSignal(false);loadPerformance();loadRadar();
   setInterval(function(){loadSignal(false);},5000);setInterval(updateClock,1000);setInterval(loadRadar,20000);setInterval(loadPerformance,30000);setInterval(checkResult,3000);setInterval(countdown,250);setInterval(function(){if(E.chartTab&&E.chartTab.classList.contains('active'))loadChart();},15000);
 }
@@ -2578,7 +2634,7 @@ HTML_PAGE = HTML_PAGE.replace("__MEGA_IMAGE__", "/mega-ia.png")
 @app.get("/version")
 async def version_info():
     return JSONResponse(
-        {"app": "MEGA IA", "version": "32.8.0", "js": "ready", "license": "disabled"},
+        {"app": "MEGA IA", "version": "32.9.9", "js": "ready", "license": "disabled"},
         headers={"Cache-Control": "no-store"},
     )
 
@@ -2591,7 +2647,7 @@ async def home():
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma": "no-cache",
             "Expires": "0",
-            "X-Mega-Panel-Version": "32.8.0",
+            "X-Mega-Panel-Version": "32.9.9",
         },
     )
 
