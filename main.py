@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.12.1")
+app = FastAPI(title="MEGA IA", version="33.13.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -83,6 +83,7 @@ oai_cache: Dict[str, Any] = {}
 results: Dict[str, Any] = {}
 radar_cache: Dict[str, Any] = {}
 pre_signal_cache: Dict[str, Any] = {}
+chart_pre_signal_lock: Dict[str, Dict[str, Any]] = {}
 PRE_SIGNAL_TTL = 75
 PRE_SIGNAL_BATCH = 4
 
@@ -2943,7 +2944,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.12.1",
+        "version": "33.13.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -3632,10 +3633,11 @@ async def chart_pre_signal(
     market: str = "OPEN",
 ):
     """
-    Marcador visual do gráfico para MERCADO ABERTO e OTC:
-    só aparece nos últimos 20 segundos da vela atual.
-    OPEN usa o motor de mercado aberto; IQ_OTC/OLYMP_OTC usam o motor OTC.
-    CALL/PUT indicado aqui é sempre para entrada na PRÓXIMA vela.
+    Pré-sinal NÃO REPINTA:
+    - só pode nascer nos últimos 20 segundos da vela atual;
+    - no primeiro CALL/PUT válido, direção/confiança/estratégia ficam TRAVADAS;
+    - a marcação permanece até a abertura da próxima vela;
+    - depois da virada da vela a trava é liberada para um novo ciclo.
     """
     market = (market or "OPEN").upper()
 
@@ -3644,14 +3646,38 @@ async def chart_pre_signal(
 
     entry_dt = next_boundary(interval)
     seconds_to_entry = int(max(0, (entry_dt - now()).total_seconds()))
+    entry_iso = iso(entry_dt)
+    lock_key = f"{market}|{symbol}|{interval}"
 
-    # Fora da janela de 20 segundos, a bolinha não aparece.
+    # Limpa trava antiga somente quando a vela de entrada já começou.
+    locked = chart_pre_signal_lock.get(lock_key)
+    if locked:
+        try:
+            locked_entry = parse_dt(locked["entry_time"])
+            if now() >= locked_entry:
+                chart_pre_signal_lock.pop(lock_key, None)
+                locked = None
+        except Exception:
+            chart_pre_signal_lock.pop(lock_key, None)
+            locked = None
+
+    # Se já apareceu uma bolinha neste ciclo, NÃO recalcula a direção.
+    if locked:
+        out = dict(locked)
+        out["seconds_to_entry"] = int(
+            max(0, (parse_dt(out["entry_time"]) - now()).total_seconds())
+        )
+        out["locked"] = True
+        return out
+
+    # Antes dos 20 segundos não existe marcação.
     if seconds_to_entry > 20:
         return {
             "ok": True,
             "active": False,
+            "locked": False,
             "seconds_to_entry": seconds_to_entry,
-            "entry_time": iso(entry_dt),
+            "entry_time": entry_iso,
         }
 
     iq_state = (
@@ -3664,8 +3690,9 @@ async def chart_pre_signal(
         return {
             "ok": False,
             "active": False,
+            "locked": False,
             "seconds_to_entry": seconds_to_entry,
-            "entry_time": iso(entry_dt),
+            "entry_time": entry_iso,
             "message": "IQ Option não conectada.",
         }
 
@@ -3685,21 +3712,24 @@ async def chart_pre_signal(
             return {
                 "ok": True,
                 "active": False,
+                "locked": False,
                 "seconds_to_entry": seconds_to_entry,
-                "entry_time": iso(entry_dt),
+                "entry_time": entry_iso,
             }
 
         current_candle = raw[-1] if raw else None
 
-        return {
+        # PRIMEIRO sinal válido dentro da janela: trava até a próxima vela.
+        payload = {
             "ok": True,
             "active": True,
+            "locked": True,
             "direction": preview["direction"],
             "confidence": preview["confidence"],
             "strategy": preview["strategy"],
             "reason": preview["reason"],
             "seconds_to_entry": seconds_to_entry,
-            "entry_time": iso(entry_dt),
+            "entry_time": entry_iso,
             "reference_candle": (
                 current_candle.get("datetime")
                 if isinstance(current_candle, dict)
@@ -3709,12 +3739,17 @@ async def chart_pre_signal(
             "signal_market": "MERCADO ABERTO" if market == "OPEN" else "OTC",
         }
 
+        chart_pre_signal_lock[lock_key] = dict(payload)
+        return payload
+
     except Exception as exc:
+        # Erro temporário não inventa nem troca sinal.
         return {
             "ok": False,
             "active": False,
+            "locked": False,
             "seconds_to_entry": seconds_to_entry,
-            "entry_time": iso(entry_dt),
+            "entry_time": entry_iso,
             "message": str(exc)[:220],
         }
 
@@ -3831,10 +3866,11 @@ async def performance(request: Request, interval="1min", market="OPEN"):
     win_direct = sum(1 for x in store.values() if x.get("result") == "WIN")
     win_g1 = sum(1 for x in store.values() if x.get("result") == "WIN G1")
     win_g2 = sum(1 for x in store.values() if x.get("result") == "WIN G2")
+    loss_direct = sum(1 for x in store.values() if x.get("result") == "LOSS")
     loss_g2 = sum(1 for x in store.values() if x.get("result") == "LOSS G2")
 
     wins = win_direct + win_g1 + win_g2
-    losses = loss_g2
+    losses = loss_direct + loss_g2
     total = wins + losses
 
     return {
@@ -3845,6 +3881,7 @@ async def performance(request: Request, interval="1min", market="OPEN"):
         "win_direct": win_direct,
         "win_g1": win_g1,
         "win_g2": win_g2,
+        "loss_direct": loss_direct,
         "loss_g2": loss_g2,
     }
 
@@ -3857,6 +3894,7 @@ async def result(
     direction="CALL",
     expiry_time="",
     market="OPEN",
+    direct_only: bool = False,
 ):
     if not expiry_time:
         raise HTTPException(400, "expiry_time é obrigatório.")
@@ -3953,11 +3991,28 @@ async def result(
             "entry_time": iso(entry_dt),
             "expiry_time": expiry_time,
             "simulated": True,
+            "direct_only": bool(direct_only),
         }
         store[key] = out
         return out
 
-    # EMPATE não avança gale; espera o próximo fechamento e trata como G1.
+    # Sinais que nasceram da bolinha de 20s são avaliados somente na próxima vela:
+    # venceu = WIN; não venceu = LOSS. Não aplica Gale automaticamente.
+    if direct_only:
+        out = {
+            "status": "FINALIZADA",
+            "stage": "ENTRADA",
+            "result": "LOSS",
+            "candle_time": base["datetime"],
+            "entry_time": iso(entry_dt),
+            "expiry_time": expiry_time,
+            "simulated": True,
+            "direct_only": True,
+        }
+        store[key] = out
+        return out
+
+    # Fluxo normal do painel continua acompanhando G1/G2.
     if now() < g1_expiry_dt:
         return {
             "status": "AGUARDANDO G1",
@@ -4472,6 +4527,7 @@ let chartPreSignal=null;
 let resultBusy=false;
 let pendingTrade=null;
 let lastCountdownSignalKey='';
+let lastChartSignalVoice='';
 
 try{
   const savedPending=localStorage.getItem('mega_pending_trade');
@@ -4512,6 +4568,68 @@ function rememberPendingTrade(sig){
     direction:sig.direction,
     entry_time:sig.entry_time,
     expiry_time:sig.expiry_time
+  };
+
+  savePendingTrade();
+}
+
+
+function intervalSecondsValue(v){
+  const map={
+    '1min':60,
+    '5min':300,
+    '15min':900,
+    '30min':1800
+  };
+  return map[v]||60;
+}
+
+function rememberChartSignal(pre){
+  if(!pre || !pre.active) return;
+  if(pre.direction!=='CALL' && pre.direction!=='PUT') return;
+  if(!pre.entry_time) return;
+
+  const signalKey=[
+    market.value,
+    S.value,
+    interval.value,
+    pre.direction,
+    pre.entry_time
+  ].join('|');
+
+  // A voz fala uma única vez no instante em que a bolinha nasce.
+  if(signalKey!==lastChartSignalVoice){
+    lastChartSignalVoice=signalKey;
+
+    if(voiceEnabled){
+      const lado=pre.direction==='CALL'?'CALL':'PUT';
+      speak('Sinal de '+lado+' identificado no gráfico. Entrada na próxima vela.');
+    }
+  }
+
+  const entryMs=new Date(pre.entry_time).getTime();
+  if(!entryMs) return;
+
+  const expiryMs=entryMs+(intervalSecondsValue(interval.value)*1000);
+  const expiryIso=new Date(expiryMs).toISOString();
+
+  // Não sobrescreve uma operação ainda aguardando resultado.
+  if(pendingTrade && pendingTrade.expiry_time){
+    const oldExpiry=new Date(pendingTrade.expiry_time).getTime();
+    if(oldExpiry && Date.now()<oldExpiry+5000){
+      return;
+    }
+  }
+
+  pendingTrade={
+    source:'CHART_20S',
+    direct_only:true,
+    market:market.value,
+    symbol:S.value,
+    interval:interval.value,
+    direction:pre.direction,
+    entry_time:pre.entry_time,
+    expiry_time:expiryIso
   };
 
   savePendingTrade();
@@ -4918,13 +5036,6 @@ function drawChart(a){
     chartCtx.fillStyle=dir==='CALL'?'#45ff9b':'#ff5c7a';
     chartCtx.fillText(dir,x+10,py(v)-9);
 
-    chartCtx.font='bold 10px Arial';
-    chartCtx.fillStyle='#d7e7fb';
-    chartCtx.fillText(
-      'PRÓXIMA VELA • '+Math.max(0,Number(chartPreSignal.seconds_to_entry||0))+'s',
-      x+10,
-      py(v)+7
-    );
     chartCtx.restore();
 
   }else if(cur && cur.direction && cur.direction!=='NEUTRO' && cur.reference_candle){
@@ -5008,7 +5119,23 @@ async function loadChart(){
       chartData=mergeChartCandles(chartData,d.candles||[]);
     }
 
-    chartPreSignal=(pre && pre.active) ? pre : null;
+    if(pre && pre.active){
+      chartPreSignal=pre;
+      rememberChartSignal(pre);
+    }else if(chartPreSignal && chartPreSignal.active && chartPreSignal.entry_time){
+      // Não deixa polling/latência apagar ou trocar a bolinha antes da próxima vela.
+      const entryMs=new Date(chartPreSignal.entry_time).getTime();
+      if(!entryMs || Date.now()>=entryMs){
+        chartPreSignal=null;
+      }else{
+        chartPreSignal.seconds_to_entry=Math.max(
+          0,
+          Math.ceil((entryMs-Date.now())/1000)
+        );
+      }
+    }else{
+      chartPreSignal=null;
+    }
 
     chartInfo.textContent=
       (d.ok===false?'⚠️ ':'')+
@@ -5019,7 +5146,12 @@ async function loadChart(){
     drawChart(chartData);
 
   }catch(e){
-    chartPreSignal=null;
+    if(chartPreSignal && chartPreSignal.entry_time){
+      const entryMs=new Date(chartPreSignal.entry_time).getTime();
+      if(!entryMs || Date.now()>=entryMs){
+        chartPreSignal=null;
+      }
+    }
     chartInfo.textContent='⚠️ Dados temporariamente indisponíveis';
     if(!chartData.length) drawChart([]);
   }finally{
@@ -5088,7 +5220,8 @@ if(broker){
     fillSymbols();
     updateMarketNote();
     lastSignalVoice='';
-    chartData=[];
+    lastChartSignalVoice='';
+  chartData=[];
     chartPreSignal=null;
     sig(true);
     rad();
@@ -5103,7 +5236,8 @@ if(brokerAccount){
     fillSymbols();
     await refreshAccountStatus();
     lastSignalVoice='';
-    chartData=[];
+    lastChartSignalVoice='';
+  chartData=[];
     chartPreSignal=null;
     sig(true);
     rad();
@@ -5229,7 +5363,8 @@ async function setRobotPower(enabled){
 
   if(robotEnabled){
     lastSignalVoice='';
-    chartData=[];
+    lastChartSignalVoice='';
+  chartData=[];
     await Promise.allSettled([
       sig(true),
       rad(),
@@ -5573,7 +5708,7 @@ async function resultCheck(){
     const t=pendingTrade;
 
     const x=await get(
-      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}`
+      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=${t.direct_only?'true':'false'}`
     );
 
     if(galeStageStatus){
@@ -5600,7 +5735,8 @@ async function resultCheck(){
 
       if(galeStageStatus){
         galeStageStatus.textContent=
-          x.result==='WIN' ? '✅ Venceu na entrada inicial' :
+          x.result==='WIN' ? '✅ Venceu na entrada' :
+          x.result==='LOSS' ? '❌ Loss na entrada' :
           x.result==='WIN G1' ? '✅ Venceu no Gale 1' :
           x.result==='WIN G2' ? '✅ Venceu no Gale 2' :
           '❌ Não venceu até o Gale 2';
@@ -5612,7 +5748,13 @@ async function resultCheck(){
         reskey=k;
 
         if(voiceEnabled){
-          speak('Operação finalizada. Resultado '+x.result+'.');
+          if(x.result==='WIN'){
+            speak('Resultado da entrada: WIN.');
+          }else if(x.result==='LOSS'){
+            speak('Resultado da entrada: LOSS.');
+          }else{
+            speak('Operação finalizada. Resultado '+x.result+'.');
+          }
         }
       }
 
@@ -5635,6 +5777,7 @@ marketMode.onchange=async()=>{
   fillSymbols();
   updateMarketNote();
   lastSignalVoice='';
+  lastChartSignalVoice='';
   chartData=[];
   sig(true);
   rad();
@@ -5647,6 +5790,7 @@ S.onchange=()=>{
   try{localStorage.setItem('mega_symbol',S.value)}catch(_){}
 
   lastSignalVoice='';
+  lastChartSignalVoice='';
   chartData=[];
 
   sig(true);
@@ -5661,6 +5805,7 @@ interval.onchange=()=>{
   try{localStorage.setItem('mega_interval',interval.value)}catch(_){}
 
   lastSignalVoice='';
+  lastChartSignalVoice='';
   chartData=[];
 
   sig(true);
