@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.16.0")
+app = FastAPI(title="MEGA IA", version="33.18.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -582,37 +582,6 @@ def bollinger_stochastic(cs):
             "bollinger": bb}
 
 
-def ema_rsi_strategy(cs):
-    if len(cs) < 35:
-        return {"direction": "NEUTRO", "confidence": 0, "confirmed": False,
-                "reason": "Poucos candles fechados.", "strategy": "EMA 9/21 + RSI 7"}
-
-    closes = [c["close"] for c in cs]
-    e9_now, e21_now = ema(closes, 9), ema(closes, 21)
-    e9_prev, e21_prev = ema(closes[:-1], 9), ema(closes[:-1], 21)
-    r_now = rsi(closes, 7)
-    r_prev = rsi(closes[:-1], 7)
-    if None in (e9_now, e21_now, e9_prev, e21_prev, r_now, r_prev):
-        return {"direction": "NEUTRO", "confidence": 0, "confirmed": False,
-                "reason": "Indicadores insuficientes.", "strategy": "EMA 9/21 + RSI 7"}
-
-    cross_up = e9_prev <= e21_prev and e9_now > e21_now
-    cross_down = e9_prev >= e21_prev and e9_now < e21_now
-    call_ok = cross_up and r_now > 50 and r_now > r_prev and r_now < 70
-    put_ok = cross_down and r_now < 50 and r_now < r_prev and r_now > 30
-
-    if call_ok:
-        return {"direction": "CALL", "confidence": 82, "confirmed": True,
-                "reason": "EMA 9 cruzou acima da EMA 21; RSI 7 acima de 50 e subindo, abaixo de 70.",
-                "strategy": "EMA 9/21 + RSI 7", "ema9": e9_now, "ema21": e21_now, "rsi7": r_now}
-    if put_ok:
-        return {"direction": "PUT", "confidence": 82, "confirmed": True,
-                "reason": "EMA 9 cruzou abaixo da EMA 21; RSI 7 abaixo de 50 e caindo, acima de 30.",
-                "strategy": "EMA 9/21 + RSI 7", "ema9": e9_now, "ema21": e21_now, "rsi7": r_now}
-
-    return {"direction": "NEUTRO", "confidence": 50, "confirmed": False,
-            "reason": "Não houve cruzamento EMA 9/21 com confirmação completa do RSI 7.",
-            "strategy": "EMA 9/21 + RSI 7", "ema9": e9_now, "ema21": e21_now, "rsi7": r_now}
 
 
 def ema_series(values, period):
@@ -635,76 +604,10 @@ def atr(cs, period=14):
     return sum(trs[-period:]) / period if len(trs) >= period else None
 
 
-def macd_strategy(cs):
-    if len(cs) < 50:
-        return {"direction":"NEUTRO","confidence":0,"confirmed":False,"reason":"Poucos candles.","strategy":"MACD momentum"}
-    closes=[c["close"] for c in cs]
-    fast=ema_series(closes,12)
-    slow=ema_series(closes,26)
-    if len(fast)<10 or len(slow)<3:
-        return {"direction":"NEUTRO","confidence":0,"confirmed":False,"reason":"MACD insuficiente.","strategy":"MACD momentum"}
-    m=[]
-    common=min(len(fast),len(slow))
-    for i in range(1, common+1):
-        m.append(fast[-i]-slow[-i])
-    m=list(reversed(m))
-    sig=ema_series(m,9)
-    if len(sig)<2 or len(m)<2:
-        return {"direction":"NEUTRO","confidence":0,"confirmed":False,"reason":"MACD sem sinal.","strategy":"MACD momentum"}
-    line_now,line_prev=m[-1],m[-2]
-    sig_now,sig_prev=sig[-1],sig[-2]
-    e50=ema(closes,50)
-    r=rsi(closes,14)
-    up=line_prev<=sig_prev and line_now>sig_now and closes[-1]>e50 and r and 52<r<72
-    dn=line_prev>=sig_prev and line_now<sig_now and closes[-1]<e50 and r and 28<r<48
-    if up:
-        return {"direction":"CALL","confidence":80,"confirmed":True,"reason":"MACD cruzou para cima com tendência e RSI favoráveis.","strategy":"MACD momentum"}
-    if dn:
-        return {"direction":"PUT","confidence":80,"confirmed":True,"reason":"MACD cruzou para baixo com tendência e RSI favoráveis.","strategy":"MACD momentum"}
-    return {"direction":"NEUTRO","confidence":48,"confirmed":False,"reason":"MACD sem confirmação completa.","strategy":"MACD momentum"}
 
 
-def price_action_strategy(cs):
-    if len(cs) < 30:
-        return {"direction":"NEUTRO","confidence":0,"confirmed":False,"reason":"Poucos candles.","strategy":"Price action"}
-    closes=[c["close"] for c in cs]
-    e21=ema(closes,21)
-    e50=ema(closes,50) if len(closes)>=50 else ema(closes,21)
-    a,b=cs[-2],cs[-1]
-    bull_engulf=b["close"]>b["open"] and a["close"]<a["open"] and b["open"]<=a["close"] and b["close"]>=a["open"]
-    bear_engulf=b["close"]<b["open"] and a["close"]>a["open"] and b["open"]>=a["close"] and b["close"]<=a["open"]
-    wi=wick_info(b)
-    pin_call=wi["call_wick"]>=0.55 and wi["body_ratio"]<=0.35
-    pin_put=wi["put_wick"]>=0.55 and wi["body_ratio"]<=0.35
-    trend_up=e21 is not None and e50 is not None and e21>=e50
-    trend_dn=e21 is not None and e50 is not None and e21<=e50
-    if (bull_engulf or pin_call) and trend_up:
-        return {"direction":"CALL","confidence":78 if bull_engulf else 74,"confirmed":True,"reason":"Rejeição/engolfo comprador alinhado à tendência.","strategy":"Price action"}
-    if (bear_engulf or pin_put) and trend_dn:
-        return {"direction":"PUT","confidence":78 if bear_engulf else 74,"confirmed":True,"reason":"Rejeição/engolfo vendedor alinhado à tendência.","strategy":"Price action"}
-    return {"direction":"NEUTRO","confidence":45,"confirmed":False,"reason":"Padrão de preço sem alinhamento.","strategy":"Price action"}
 
 
-def volatility_breakout_strategy(cs):
-    if len(cs) < 35:
-        return {"direction":"NEUTRO","confidence":0,"confirmed":False,"reason":"Poucos candles.","strategy":"Breakout ATR"}
-    closes=[c["close"] for c in cs]
-    a=atr(cs,14)
-    if not a:
-        return {"direction":"NEUTRO","confidence":0,"confirmed":False,"reason":"ATR insuficiente.","strategy":"Breakout ATR"}
-    last=cs[-1]
-    prev=cs[-11:-1]
-    hi=max(c["high"] for c in prev)
-    lo=min(c["low"] for c in prev)
-    body=abs(last["close"]-last["open"])
-    e20=ema(closes,20)
-    call=last["close"]>hi and body>=0.45*a and last["close"]>e20
-    put=last["close"]<lo and body>=0.45*a and last["close"]<e20
-    if call:
-        return {"direction":"CALL","confidence":79,"confirmed":True,"reason":"Rompimento de máxima recente com expansão de volatilidade.","strategy":"Breakout ATR"}
-    if put:
-        return {"direction":"PUT","confidence":79,"confirmed":True,"reason":"Rompimento de mínima recente com expansão de volatilidade.","strategy":"Breakout ATR"}
-    return {"direction":"NEUTRO","confidence":44,"confirmed":False,"reason":"Sem breakout válido.","strategy":"Breakout ATR"}
 
 
 
@@ -2521,9 +2424,132 @@ def strategy_engine_for_market(cs, market="OPEN", context=None):
         return otc_engine(cs, context)
     return local_engine(cs, context)
 
+def open_confluence_ema_rsi_structure(cs):
+    """
+    Estratégia exclusiva de MERCADO ABERTO.
+    Confluência: EMA 9/21/50, RSI 7/14, força/rejeição da vela,
+    rompimento de estrutura (12 velas) e Bollinger 20/2.
+
+    Pontuação máxima por direção: 79.
+    Libera confirmação somente com >= 50 pontos e vantagem >= 15 pontos.
+    """
+    if len(cs) < 55:
+        return {
+            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+            "reason": "Poucos candles fechados para a confluência 9/21/50.",
+            "strategy": "OPEN Confluência EMA 9/21/50 + RSI 7/14",
+        }
+
+    closes = [float(c["close"]) for c in cs]
+    highs = [float(c["high"]) for c in cs]
+    lows = [float(c["low"]) for c in cs]
+    last = cs[-1]
+
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+    e50 = ema(closes, 50)
+    r7 = rsi(closes, 7)
+    r14 = rsi(closes, 14)
+    bb = bollinger(closes, 20, 2.0)
+
+    if None in (e9, e21, e50, r7, r14) or not bb:
+        return {
+            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+            "reason": "Indicadores insuficientes para a confluência de mercado aberto.",
+            "strategy": "OPEN Confluência EMA 9/21/50 + RSI 7/14",
+        }
+
+    scores = {"CALL": 0.0, "PUT": 0.0}
+    reasons = {"CALL": [], "PUT": []}
+
+    def add(direction, weight, text):
+        scores[direction] += float(weight)
+        reasons[direction].append(text)
+
+    # 1) Tendência - 22 pontos
+    if e9 > e21 > e50 and closes[-1] > e9:
+        add("CALL", 22, "tendência de alta pelas EMA 9/21/50")
+    elif e9 < e21 < e50 and closes[-1] < e9:
+        add("PUT", 22, "tendência de baixa pelas EMA 9/21/50")
+
+    # 2) RSI - 14 pontos
+    if r7 >= 55 and r14 >= 52 and r7 < 78:
+        add("CALL", 14, "momentum comprador confirmado pelo RSI 7/14")
+    elif r7 <= 45 and r14 <= 48 and r7 > 22:
+        add("PUT", 14, "momentum vendedor confirmado pelo RSI 7/14")
+
+    # 3) Price action / força da vela - 12 pontos
+    body = abs(float(last["close"]) - float(last["open"]))
+    rng = max(float(last["high"]) - float(last["low"]), 1e-12)
+    upper_wick = float(last["high"]) - max(float(last["open"]), float(last["close"]))
+    lower_wick = min(float(last["open"]), float(last["close"])) - float(last["low"])
+
+    if last["close"] > last["open"] and body / rng >= 0.55:
+        add("CALL", 12, "vela de força compradora")
+    elif last["close"] < last["open"] and body / rng >= 0.55:
+        add("PUT", 12, "vela de força vendedora")
+
+    # 4) Rejeição - 10 pontos
+    if lower_wick / rng >= 0.45 and last["close"] > last["open"]:
+        add("CALL", 10, "rejeição de preços baixos")
+    elif upper_wick / rng >= 0.45 and last["close"] < last["open"]:
+        add("PUT", 10, "rejeição de preços altos")
+
+    # 5) Estrutura - 14 pontos (12 velas anteriores)
+    lookback = min(12, len(cs) - 2)
+    recent_high = max(highs[-lookback - 1:-1])
+    recent_low = min(lows[-lookback - 1:-1])
+    if float(last["close"]) > recent_high:
+        add("CALL", 14, "rompimento da máxima recente")
+    elif float(last["close"]) < recent_low:
+        add("PUT", 14, "rompimento da mínima recente")
+
+    # 6) Bollinger 20/2 - 7 pontos; usada como confluência, não como gatilho isolado.
+    if closes[-1] > bb["middle"] and closes[-1] < bb["upper"]:
+        add("CALL", 7, "preço acima da média das Bollinger")
+    elif closes[-1] < bb["middle"] and closes[-1] > bb["lower"]:
+        add("PUT", 7, "preço abaixo da média das Bollinger")
+
+    direction = "CALL" if scores["CALL"] > scores["PUT"] else "PUT"
+    other = "PUT" if direction == "CALL" else "CALL"
+    best = scores[direction]
+    advantage = best - scores[other]
+    confirmed = best >= 50 and advantage >= 15
+
+    if confirmed:
+        # Converte 50..79 pontos para ~78..96% sem prometer probabilidade real.
+        confidence = clamp(78 + (best - 50) * (18 / 29), 78, 96)
+        reason = "; ".join(reasons[direction])
+        return {
+            "direction": direction, "confidence": round(confidence, 1), "confirmed": True,
+            "reason": reason,
+            "strategy": "OPEN Confluência EMA 9/21/50 + RSI 7/14",
+            "score": round(best, 1), "score_call": round(scores["CALL"], 1),
+            "score_put": round(scores["PUT"], 1), "score_advantage": round(advantage, 1),
+            "ema9": e9, "ema21": e21, "ema50": e50,
+            "rsi7": round(r7, 2), "rsi14": round(r14, 2), "bollinger": bb,
+        }
+
+    best_score = max(scores.values())
+    return {
+        "direction": "NEUTRO",
+        "confidence": round(clamp(35 + best_score * 0.6, 35, 69), 1),
+        "confirmed": False,
+        "reason": (
+            f"Confluência OPEN insuficiente: CALL {scores['CALL']:.0f}/79, "
+            f"PUT {scores['PUT']:.0f}/79; exige mínimo 50 e vantagem de 15 pontos."
+        ),
+        "strategy": "OPEN Confluência EMA 9/21/50 + RSI 7/14",
+        "score_call": round(scores["CALL"], 1), "score_put": round(scores["PUT"], 1),
+        "ema9": e9, "ema21": e21, "ema50": e50,
+        "rsi7": round(r7, 2), "rsi14": round(r14, 2), "bollinger": bb,
+    }
+
+
 def local_engine(cs, context=None):
     context = context or {}
     strategies = [
+        open_confluence_ema_rsi_structure(cs),
         htf_sr_rsi_macd_strategy(
             cs,
             context.get("h1"),
@@ -2531,10 +2557,6 @@ def local_engine(cs, context=None):
             context.get("interval", "5min"),
         ),
         bollinger_stochastic(cs),
-        ema_rsi_strategy(cs),
-        macd_strategy(cs),
-        price_action_strategy(cs),
-        volatility_breakout_strategy(cs),
     ]
     confirmed=[x for x in strategies if x.get("confirmed") and x.get("direction") in ("CALL","PUT")]
     calls=[x for x in confirmed if x["direction"]=="CALL"]
