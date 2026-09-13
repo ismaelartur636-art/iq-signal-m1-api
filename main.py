@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
-app = FastAPI(title="MEGA IA", version="32.9.6")
+app = FastAPI(title="MEGA IA", version="32.9.7")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -693,104 +693,74 @@ def _set_iq_login_diag(stage: str, detail: str = ""):
     iq_login_diag["updated_at"] = time.time()
 
 
-async def _iq_login_via_reachable_host(email: str, password: str) -> str:
-    """Login alternativo usando iqoption.com, que é alcançável pelo Render.
 
-    Não registra credenciais nem SSID. Tenta formatos legados compatíveis e
-    retorna somente o SSID em memória para autenticar o WebSocket.
+async def _iq_connect_official(email: str, password: str):
+    """Conexão limpa usando somente a rota oficial configurada pela biblioteca.
+
+    Remove as tentativas em endpoints alternativos que estavam causando
+    timeout confuso. Permite sobrescrever URLs por variáveis de ambiente
+    sem alterar o código.
     """
+    if AsyncIQOption is None:
+        raise RuntimeError("Cliente assíncrono da IQ Option não carregado no servidor.")
+
+    login_url = os.getenv(
+        "IQ_LOGIN_URL",
+        "https://auth.iqoption.com/api/v2/login",
+    ).strip()
+    wss_url = os.getenv(
+        "IQ_WSS_URL",
+        "wss://iqoption.com/echo/websocket",
+    ).strip()
+
+    _set_iq_login_diag("official_connect_start", "Iniciando conexão oficial da IQ Option.")
+
     try:
-        import aiohttp
-    except Exception as exc:
-        raise RuntimeError(f"aiohttp indisponível: {type(exc).__name__}: {exc}") from exc
+        client = AsyncIQOption(
+            email,
+            password,
+            login_url=login_url,
+            wss_url=wss_url,
+        )
 
-    _set_iq_login_diag("login_start", "Preparando autenticação HTTP.")
-    login_urls = [
-        "https://iqoption.com/api/login/v2",
-        "https://iqoption.com/api/v2/login",
-    ]
-    payloads = [
-        {"identifier": email, "password": password},
-        {"email": email, "password": password},
-    ]
+        _set_iq_login_diag("official_login_request", login_url)
 
-    timeout = aiohttp.ClientTimeout(total=15, connect=8, sock_read=10)
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://iqoption.com",
-        "Referer": "https://iqoption.com/",
-    }
-    errors = []
+        # O cliente da biblioteca faz login HTTP e depois autentica o WebSocket.
+        await asyncio.wait_for(client.connect(), timeout=20.0)
 
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        for url in login_urls:
-            for payload in payloads:
-                try:
-                    _set_iq_login_diag("http_login_request", url)
-                    async with session.post(url, data=payload, allow_redirects=False) as resp:
-                        _set_iq_login_diag("http_login_response", f"{url} -> HTTP {resp.status}")
-                        try:
-                            body = await resp.json(content_type=None)
-                        except Exception:
-                            body = None
+        if getattr(client, "_ws", None) is None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            _set_iq_login_diag(
+                "official_connect_failed",
+                "A biblioteca terminou sem manter o WebSocket conectado.",
+            )
+            raise RuntimeError("A IQ Option não manteve o WebSocket conectado.")
 
-                        # Um redirecionamento para auth.iqoption.com não ajuda no Render.
-                        if 300 <= resp.status < 400:
-                            location = resp.headers.get("location", "")
-                            errors.append(f"{url}: redirecionou ({resp.status}) para {location[:90]}")
-                            continue
-
-                        if isinstance(body, dict):
-                            code = str(body.get("code", "")).lower()
-                            if code == "verify" or _iq_reason_requires_2fa(body):
-                                raise IQTwoFactorRequired("A IQ Option solicitou verificação em duas etapas.")
-
-                        ssid_cookie = resp.cookies.get("ssid")
-                        ssid = ssid_cookie.value if ssid_cookie is not None else ""
-                        if not ssid and isinstance(body, dict):
-                            data = body.get("data")
-                            if isinstance(data, dict):
-                                ssid = str(data.get("ssid", "") or "")
-                            if not ssid:
-                                ssid = str(body.get("ssid", "") or "")
-
-                        if resp.status == 200 and ssid:
-                            _set_iq_login_diag("ssid_received", "SSID recebido; iniciando WebSocket.")
-                            return ssid
-
-                        # Não expor corpo, email, senha ou token em logs/erros.
-                        errors.append(f"{url}: HTTP {resp.status}, sem SSID")
-                except IQTwoFactorRequired:
-                    raise
-                except Exception as exc:
-                    errors.append(f"{url}: {type(exc).__name__}: {str(exc)[:120]}")
-
-    detail = " | ".join(errors[-4:])
-    _set_iq_login_diag("http_login_failed", detail)
-    raise RuntimeError(f"Login alternativo não concluiu. {detail[:420]}")
-
-
-async def _iq_connect_with_fallback_login(email: str, password: str):
-    """Conecta usando login alternativo e o cliente WebSocket da biblioteca."""
-    if AsyncWebSocketClient is None:
-        raise RuntimeError("Cliente WebSocket assíncrono da IQ Option não carregado.")
-
-    ssid = await _iq_login_via_reachable_host(email, password)
-    try:
-        client = AsyncIQOption(email, password)
-        _set_iq_login_diag("websocket_open", "Abrindo WebSocket e aguardando autenticação.")
-        ws = AsyncWebSocketClient(ssid, wss_url="wss://iqoption.com/echo/websocket")
-        await ws.connect(auth_timeout=15.0)
-        _set_iq_login_diag("websocket_authenticated", "WebSocket autenticado.")
-        client._ws = ws
+        _set_iq_login_diag(
+            "websocket_authenticated",
+            "Login HTTP e WebSocket concluídos pela biblioteca oficial configurada.",
+        )
         return client
-    finally:
-        # SSID não é persistido nem registrado; referência local some após uso.
-        ssid = ""
+
+    except asyncio.TimeoutError as exc:
+        _set_iq_login_diag(
+            "official_connect_timeout",
+            f"Timeout ao acessar {login_url}",
+        )
+        raise RuntimeError(
+            "A autenticação oficial da IQ Option não respondeu dentro de 20s."
+        ) from exc
+    except IQTwoFactorRequired:
+        raise
+    except Exception as exc:
+        _set_iq_login_diag(
+            "official_connect_failed",
+            f"{type(exc).__name__}: {str(exc)[:180]}",
+        )
+        raise
 
 
 async def iq_connect_async(state, force=False):
@@ -821,8 +791,8 @@ async def iq_connect_async(state, force=False):
     client = None
     state["client"] = None
     try:
-        # O host auth.iqoption.com expira no Render; usa iqoption.com como rota de login.
-        client = await _iq_connect_with_fallback_login(email, password)
+        # Usa exclusivamente a conexão oficial da biblioteca; sem endpoints alternativos.
+        client = await _iq_connect_official(email, password)
         state["client"] = client
         if getattr(client, "_ws", None) is None:
             raise RuntimeError("A IQ Option não manteve o websocket conectado.")
@@ -1259,7 +1229,7 @@ async def manifest():
 @app.get("/iq-diagnostic")
 async def iq_diagnostic():
     info = {
-        "app_version": "32.9.6",
+        "app_version": "32.9.7",
         "iq_async_library_loaded": AsyncIQOption is not None,
         "import_error": IQ_IMPORT_ERROR if AsyncIQOption is None else "",
         "active_sessions": len(iq_sessions),
@@ -1279,7 +1249,7 @@ async def iq_diagnostic():
 async def iq_network_test():
     """Testa endpoints alternativos da IQ Option sem usar e-mail nem senha."""
     result = {
-        "app_version": "32.9.6",
+        "app_version": "32.9.7",
         "http": {},
         "websocket": {},
     }
@@ -1389,7 +1359,7 @@ async def iq_port_test():
         "iqoption.com",
         "ws.iqoption.com",
     ]
-    result = {"app_version": "32.9.6", "port": 443, "hosts": {}}
+    result = {"app_version": "32.9.7", "port": 443, "hosts": {}}
 
     async def tcp_probe(host, family):
         family_name = "ipv4" if family == socket.AF_INET else "ipv6"
@@ -1481,7 +1451,7 @@ async def iq_login_diagnostic():
     if iq_login_diag.get("updated_at"):
         age = round(max(0.0, time.time() - float(iq_login_diag["updated_at"])), 1)
     return {
-        "app_version": "32.9.6",
+        "app_version": "32.9.7",
         "stage": iq_login_diag.get("stage", "idle"),
         "detail": iq_login_diag.get("detail", ""),
         "age_seconds": age,
@@ -1510,7 +1480,7 @@ async def iq_login(body: IQLoginBody, response: Response):
 
     try:
         async with state["lock"]:
-            client = await asyncio.wait_for(iq_connect_async(state), timeout=22)
+            client = await asyncio.wait_for(iq_connect_async(state), timeout=25)
         if not _iq_is_connected(state):
             raise RuntimeError("A sessão assíncrona não permaneceu conectada.")
 
