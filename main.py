@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.15.0")
+app = FastAPI(title="MEGA IA", version="33.16.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2206,6 +2206,146 @@ def _mega_ia_confluence_score(cs, direction, context=None):
     return {"score": int(score), "passed": score >= 75, "details": details}
 
 
+
+def _otc_pattern_feature(cs, end_idx):
+    """Cria uma assinatura normalizada do comportamento recente até end_idx."""
+    if end_idx < 12 or end_idx >= len(cs):
+        return None
+
+    start = max(0, end_idx - 13)
+    recent = cs[start:end_idx + 1]
+    ranges = [max(1e-12, float(c["high"]) - float(c["low"])) for c in recent]
+    avg_range = sum(ranges) / max(1, len(ranges))
+    if avg_range <= 1e-12:
+        return None
+
+    feats = []
+    for c in cs[end_idx - 2:end_idx + 1]:
+        o, h, l, cl = map(float, (c["open"], c["high"], c["low"], c["close"]))
+        rg = max(1e-12, h - l)
+        body = cl - o
+        upper = h - max(o, cl)
+        lower = min(o, cl) - l
+        feats.extend([
+            max(-1.5, min(1.5, body / rg)),
+            max(0.0, min(1.5, upper / rg)),
+            max(0.0, min(1.5, lower / rg)),
+            max(0.0, min(3.0, rg / avg_range)),
+        ])
+
+    closes = [float(c["close"]) for c in cs[:end_idx + 1]]
+    e3 = ema(closes, 3)
+    e7 = ema(closes, 7)
+    r9 = rsi(closes, 9)
+    if e3 is None or e7 is None or r9 is None:
+        return None
+
+    feats.append(max(-3.0, min(3.0, (e3 - e7) / avg_range)))
+    feats.append(max(-1.0, min(1.0, (r9 - 50.0) / 50.0)))
+    return feats
+
+
+def otc_pattern_detector(cs, context=None):
+    """
+    Detector estatístico de padrões OTC.
+
+    Compara a assinatura das 3 velas mais recentes com situações anteriores
+    do MESMO fluxo de candles e mede o que aconteceu na vela seguinte.
+    Não lê algoritmo interno da corretora e não promete prever o futuro.
+    """
+    context = context or {}
+    min_history = 55
+    min_matches = 8
+    max_neighbors = 20
+    similarity_floor = 0.66
+
+    if len(cs) < min_history:
+        return {
+            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+            "reason": f"Detector OTC aguardando histórico suficiente ({len(cs)}/{min_history} candles).",
+            "strategy": "Detector de Padrões OTC",
+            "pattern_samples": 0, "pattern_probability": 0,
+        }
+
+    target = _otc_pattern_feature(cs, len(cs) - 1)
+    if not target:
+        return {
+            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+            "reason": "Não foi possível montar a assinatura do padrão atual.",
+            "strategy": "Detector de Padrões OTC",
+            "pattern_samples": 0, "pattern_probability": 0,
+        }
+
+    candidates = []
+    # end_idx precisa deixar uma vela posterior para medir o resultado.
+    for end_idx in range(14, len(cs) - 2):
+        feat = _otc_pattern_feature(cs, end_idx)
+        if not feat or len(feat) != len(target):
+            continue
+        dist = (sum((a - b) ** 2 for a, b in zip(target, feat)) / len(target)) ** 0.5
+        similarity = 1.0 / (1.0 + dist)
+        if similarity < similarity_floor:
+            continue
+
+        nxt = cs[end_idx + 1]
+        if float(nxt["close"]) > float(nxt["open"]):
+            outcome = "CALL"
+        elif float(nxt["close"]) < float(nxt["open"]):
+            outcome = "PUT"
+        else:
+            continue
+        candidates.append((similarity, outcome))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    neighbors = candidates[:max_neighbors]
+    if len(neighbors) < min_matches:
+        return {
+            "direction": "NEUTRO", "confidence": 45, "confirmed": False,
+            "reason": f"Só {len(neighbors)} padrões suficientemente parecidos; mínimo {min_matches}.",
+            "strategy": "Detector de Padrões OTC",
+            "pattern_samples": len(neighbors), "pattern_probability": 0,
+        }
+
+    call_w = sum(sim for sim, out in neighbors if out == "CALL")
+    put_w = sum(sim for sim, out in neighbors if out == "PUT")
+    total = call_w + put_w
+    if total <= 1e-12:
+        return {
+            "direction": "NEUTRO", "confidence": 45, "confirmed": False,
+            "reason": "Amostras históricas sem peso estatístico suficiente.",
+            "strategy": "Detector de Padrões OTC",
+            "pattern_samples": len(neighbors), "pattern_probability": 0,
+        }
+
+    p_call = call_w / total
+    p_put = put_w / total
+    direction = "CALL" if p_call > p_put else "PUT"
+    prob = max(p_call, p_put)
+    avg_similarity = sum(sim for sim, _ in neighbors) / len(neighbors)
+
+    # Confirma apenas com vantagem clara; a confluência geral ainda exige score >=75.
+    confirmed = prob >= 0.66 and avg_similarity >= 0.69
+    conf = max(50.0, min(90.0, prob * 100.0 * 0.75 + avg_similarity * 100.0 * 0.25))
+
+    symbol = context.get("symbol") or "ativo OTC"
+    return {
+        "direction": direction if confirmed else "NEUTRO",
+        "confidence": round(conf if confirmed else min(conf, 64.0), 1),
+        "confirmed": confirmed,
+        "reason": (
+            f"{len(neighbors)} padrões parecidos em {symbol}: estimativa empírica "
+            f"{direction} {prob*100:.1f}% (similaridade média {avg_similarity*100:.1f}%)."
+            if confirmed else
+            f"Padrões históricos sem vantagem clara: CALL {p_call*100:.1f}% / PUT {p_put*100:.1f}%."
+        ),
+        "strategy": "Detector de Padrões OTC",
+        "pattern_samples": len(neighbors),
+        "pattern_probability": round(prob * 100.0, 1),
+        "call_probability": round(p_call * 100.0, 1),
+        "put_probability": round(p_put * 100.0, 1),
+        "avg_similarity": round(avg_similarity * 100.0, 1),
+    }
+
 def otc_noise_filter(cs):
     """
     Filtro de proteção contra gráfico errático:
@@ -2238,7 +2378,12 @@ def otc_engine(cs, context=None):
     noise = otc_noise_filter(cs)
     structure_map = otc_market_structure_map(cs)
 
+    pattern_detector = otc_pattern_detector(cs, context)
+
     strategies = [
+        # Detector estatístico do comportamento do próprio ativo OTC
+        pattern_detector,
+
         # Estratégias técnicas OTC
         otc_bb_rsi_rejection(cs),
         otc_stochastic_reversal(cs),
@@ -2273,6 +2418,7 @@ def otc_engine(cs, context=None):
             "confirmed": False,
             "strategy": "Motor OTC multiestratégia",
             "reason": noise.get("reason", "Filtro de ruído bloqueou a entrada."),
+            "pattern_detector": pattern_detector,
             "strategies": strategies,
             "engine": "OTC",
             "structure": structure_map,
@@ -2290,6 +2436,26 @@ def otc_engine(cs, context=None):
 
     if winner:
         direction = winner[0]["direction"]
+
+        # Se o detector histórico estiver forte na direção oposta, não liberamos entrada.
+        if (
+            pattern_detector.get("confirmed")
+            and pattern_detector.get("direction") in ("CALL", "PUT")
+            and pattern_detector.get("direction") != direction
+            and float(pattern_detector.get("confidence", 0) or 0) >= 72
+        ):
+            return {
+                "direction": "NEUTRO",
+                "confidence": 68,
+                "confirmed": False,
+                "strategy": "MEGA IA + Detector de Padrões OTC",
+                "reason": "Conflito entre confluência técnica e padrão histórico; entrada bloqueada.",
+                "pattern_detector": pattern_detector,
+                "strategies": strategies,
+                "engine": "OTC",
+                "structure": structure_map,
+                "noise_filter": noise,
+            }
         avg = sum(float(x.get("confidence", 0)) for x in winner) / len(winner)
 
         # Preferência: pelo menos 2 estratégias OTC concordando.
@@ -2309,6 +2475,7 @@ def otc_engine(cs, context=None):
                     "score": score,
                     "score_min": 75,
                     "score_details": mega_score.get("details", {}),
+                    "pattern_detector": pattern_detector,
                     "strategies": strategies,
                     "engine": "OTC",
                     "structure": structure_map,
@@ -2323,6 +2490,7 @@ def otc_engine(cs, context=None):
                 "score": score,
                 "score_min": 75,
                 "score_details": mega_score.get("details", {}),
+                "pattern_detector": pattern_detector,
                 "strategies": strategies,
                 "engine": "OTC",
                 "structure": structure_map,
@@ -2339,6 +2507,7 @@ def otc_engine(cs, context=None):
         "confirmed": False,
         "strategy": "Motor OTC multiestratégia",
         "reason": "Sem confluência suficiente nas estratégias OTC.",
+        "pattern_detector": pattern_detector,
         "strategies": strategies,
         "engine": "OTC",
         "structure": structure_map,
@@ -3073,7 +3242,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         return cache[key][1]
 
     try:
-        raw = await candles(symbol, interval, 90, market, iq_state, request=request)
+        raw = await candles(symbol, interval, 150, market, iq_state, request=request)
     except HTTPException as exc:
         status = (
             "FONTE EM LIMITE"
@@ -3148,6 +3317,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "h4": h4_closed,
             "m5": m5_closed,
             "interval": interval,
+            "symbol": symbol,
+            "market": market,
         },
     )
 
@@ -3752,7 +3923,7 @@ async def ai_analysis(request: Request, symbol: str = "EUR/USD", interval: str =
     return {k: data.get(k) for k in public_keys}
 
 
-def _pre_signal_from_live_candle(raw, interval: str, market: str = "OPEN"):
+def _pre_signal_from_live_candle(raw, interval: str, market: str = "OPEN", symbol: str | None = None):
     """
     Pré-sinal NÃO confirmado.
     Avalia a vela atual ainda em formação como se fechasse naquele instante.
@@ -3764,7 +3935,7 @@ def _pre_signal_from_live_candle(raw, interval: str, market: str = "OPEN"):
     preview = strategy_engine_for_market(
         raw,
         market,
-        {"interval": interval},
+        {"interval": interval, "symbol": symbol, "market": market},
     )
 
     if not preview.get("confirmed"):
@@ -3880,7 +4051,7 @@ async def pre_signals(
                 request=request,
             )
 
-            preview = _pre_signal_from_live_candle(raw, interval, market)
+            preview = _pre_signal_from_live_candle(raw, interval, market, symbol)
 
             if preview:
                 pre_signal_cache[key] = {
@@ -4039,7 +4210,7 @@ async def chart_pre_signal(
         raw = await candles(
             symbol,
             interval,
-            90,
+            150,
             market,
             iq_state,
             request=request,
