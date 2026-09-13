@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="32.7.0")
+app = FastAPI(title="MEGA IA", version="33.3.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -44,7 +44,7 @@ IG = os.getenv("INSTAGRAM", "@Ismaelartur26")
 TD_URL = "https://api.twelvedata.com/time_series"
 OAI_URL = "https://api.openai.com/v1/responses"
 
-INTERVALS = {"1min": 60, "5min": 300, "15min": 900, "30min": 1800}
+INTERVALS = {"1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1h": 3600, "4h": 14400}
 SYMBOLS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF",
     "NZD/USD", "EUR/JPY", "GBP/JPY", "EUR/GBP", "BTC/USD", "ETH/USD", "LTC/USD"
@@ -441,8 +441,341 @@ def volatility_breakout_strategy(cs):
     return {"direction":"NEUTRO","confidence":44,"confirmed":False,"reason":"Sem breakout válido.","strategy":"Breakout ATR"}
 
 
-def local_engine(cs):
+
+def _macd_snapshot(closes, fast_period=12, slow_period=26, signal_period=9):
+    """Retorna MACD, sinal, histograma e cruzamentos recentes."""
+    if len(closes) < slow_period + signal_period + 4:
+        return None
+
+    fast = ema_series(closes, fast_period)
+    slow = ema_series(closes, slow_period)
+    if not fast or not slow:
+        return None
+
+    # Alinha as séries pelo final, suficiente para leitura dos pontos mais recentes.
+    common = min(len(fast), len(slow))
+    macd_line = [fast[-common + i] - slow[-common + i] for i in range(common)]
+    signal_line = ema_series(macd_line, signal_period)
+    if len(signal_line) < 3:
+        return None
+
+    macd_aligned = macd_line[-len(signal_line):]
+    hist = [m - s for m, s in zip(macd_aligned, signal_line)]
+    if len(hist) < 3:
+        return None
+
+    m_prev, m_now = macd_aligned[-2], macd_aligned[-1]
+    s_prev, s_now = signal_line[-2], signal_line[-1]
+    h_prev2, h_prev, h_now = hist[-3], hist[-2], hist[-1]
+
+    return {
+        "macd": m_now,
+        "signal": s_now,
+        "hist": h_now,
+        "hist_prev": h_prev,
+        "cross_up": m_prev <= s_prev and m_now > s_now,
+        "cross_down": m_prev >= s_prev and m_now < s_now,
+        "hist_improving_up": h_now > h_prev and h_prev >= h_prev2,
+        "hist_improving_down": h_now < h_prev and h_prev <= h_prev2,
+        # Aproximação de "barras caminhando para zero".
+        "hist_toward_zero_up": h_prev < 0 and h_now > h_prev,
+        "hist_toward_zero_down": h_prev > 0 and h_now < h_prev,
+    }
+
+
+def _rsi_series(values, period=14):
+    out = []
+    for i in range(period + 1, len(values) + 1):
+        out.append(rsi(values[:i], period))
+    return out
+
+
+def _rsi_divergence(cs, lookback=18, period=14):
+    """
+    Detecta divergência simples nos dois extremos recentes:
+    bullish: preço faz fundo menor e RSI fundo maior;
+    bearish: preço faz topo maior e RSI topo menor.
+    """
+    if len(cs) < max(lookback + period + 2, 35):
+        return {"bullish": False, "bearish": False}
+
+    sample = cs[-(lookback + period + 3):]
+    closes = [c["close"] for c in sample]
+    rs = _rsi_series(closes, period)
+    if len(rs) < lookback:
+        return {"bullish": False, "bearish": False}
+
+    # Mapeia RSI de volta aos candles finais.
+    offset = len(sample) - len(rs)
+    lows = []
+    highs = []
+    for i in range(2, len(sample) - 2):
+        if sample[i]["low"] <= sample[i-1]["low"] and sample[i]["low"] <= sample[i+1]["low"]:
+            ri = i - offset
+            if 0 <= ri < len(rs) and rs[ri] is not None:
+                lows.append((i, sample[i]["low"], rs[ri]))
+        if sample[i]["high"] >= sample[i-1]["high"] and sample[i]["high"] >= sample[i+1]["high"]:
+            ri = i - offset
+            if 0 <= ri < len(rs) and rs[ri] is not None:
+                highs.append((i, sample[i]["high"], rs[ri]))
+
+    bullish = False
+    bearish = False
+
+    if len(lows) >= 2:
+        a, b = lows[-2], lows[-1]
+        bullish = b[1] < a[1] and b[2] > a[2]
+
+    if len(highs) >= 2:
+        a, b = highs[-2], highs[-1]
+        bearish = b[1] > a[1] and b[2] < a[2]
+
+    return {"bullish": bullish, "bearish": bearish}
+
+
+def _cluster_levels(points, tolerance):
+    """Agrupa níveis próximos e exige pelo menos dois toques."""
+    if not points:
+        return []
+
+    points = sorted(float(x) for x in points)
+    clusters = []
+
+    for p in points:
+        placed = False
+        for c in clusters:
+            center = sum(c) / len(c)
+            if abs(p - center) <= tolerance:
+                c.append(p)
+                placed = True
+                break
+        if not placed:
+            clusters.append([p])
+
+    levels = []
+    for c in clusters:
+        if len(c) >= 2:
+            levels.append({
+                "price": sum(c) / len(c),
+                "touches": len(c),
+            })
+    return levels
+
+
+def _support_resistance_levels(cs, timeframe_name):
+    """
+    Marca zonas por pivôs H1/H4 e só aceita níveis com 2+ toques,
+    conforme a estratégia enviada.
+    """
+    if not cs or len(cs) < 25:
+        return {"supports": [], "resistances": [], "tolerance": 0.0}
+
+    recent = cs[-100:]
+    a = atr(recent, 14)
+    price = recent[-1]["close"]
+    base_tol = (a * 0.28) if a else abs(price) * 0.0007
+    if timeframe_name == "4h":
+        base_tol *= 1.15
+    tolerance = max(base_tol, abs(price) * 0.00025)
+
+    lows, highs = [], []
+    for i in range(2, len(recent) - 2):
+        c = recent[i]
+        if c["low"] <= min(recent[i-1]["low"], recent[i-2]["low"], recent[i+1]["low"], recent[i+2]["low"]):
+            lows.append(c["low"])
+        if c["high"] >= max(recent[i-1]["high"], recent[i-2]["high"], recent[i+1]["high"], recent[i+2]["high"]):
+            highs.append(c["high"])
+
+    supports = _cluster_levels(lows, tolerance)
+    resistances = _cluster_levels(highs, tolerance)
+
+    return {
+        "supports": supports,
+        "resistances": resistances,
+        "tolerance": tolerance,
+    }
+
+
+def htf_sr_rsi_macd_strategy(cs, h1=None, h4=None, interval="5min"):
+    """
+    Estratégia:
+    - zonas de suporte/resistência em H1/H4;
+    - gatilho em M5/M15;
+    - RSI 14 (30/70);
+    - MACD 12,26,9;
+    - rejeita candle de força/elefantíase;
+    - divergência de RSI aumenta a confiança.
+    """
+    strategy_name = "S/R H1-H4 + RSI 14 + MACD 12/26/9"
+
+    if interval not in ("5min", "15min"):
+        return {
+            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+            "reason": "Estratégia H1/H4 ativa somente nos gatilhos M5 e M15.",
+            "strategy": strategy_name,
+        }
+
+    if len(cs) < 55 or not h1 or not h4 or len(h1) < 25 or len(h4) < 25:
+        return {
+            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+            "reason": "Aguardando candles H1/H4 suficientes.",
+            "strategy": strategy_name,
+        }
+
+    closes = [c["close"] for c in cs]
+    last = cs[-1]
+    price = last["close"]
+
+    r_now = rsi(closes, 14)
+    macd = _macd_snapshot(closes, 12, 26, 9)
+    a = atr(cs, 14)
+
+    if r_now is None or not macd or not a:
+        return {
+            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+            "reason": "RSI/MACD/ATR ainda sem dados suficientes.",
+            "strategy": strategy_name,
+        }
+
+    h1_levels = _support_resistance_levels(h1, "1h")
+    h4_levels = _support_resistance_levels(h4, "4h")
+
+    supports = [
+        ("H1", x["price"], x["touches"], h1_levels["tolerance"]) for x in h1_levels["supports"]
+    ] + [
+        ("H4", x["price"], x["touches"], h4_levels["tolerance"]) for x in h4_levels["supports"]
+    ]
+    resistances = [
+        ("H1", x["price"], x["touches"], h1_levels["tolerance"]) for x in h1_levels["resistances"]
+    ] + [
+        ("H4", x["price"], x["touches"], h4_levels["tolerance"]) for x in h4_levels["resistances"]
+    ]
+
+    nearest_support = min(
+        (x for x in supports if x[1] <= price + x[3]),
+        key=lambda x: abs(price - x[1]),
+        default=None,
+    )
+    nearest_resistance = min(
+        (x for x in resistances if x[1] >= price - x[3]),
+        key=lambda x: abs(price - x[1]),
+        default=None,
+    )
+
+    touch_support = bool(nearest_support and abs(price - nearest_support[1]) <= max(nearest_support[3], a * 0.35))
+    touch_resistance = bool(nearest_resistance and abs(price - nearest_resistance[1]) <= max(nearest_resistance[3], a * 0.35))
+
+    wi = wick_info(last)
+    body = abs(last["close"] - last["open"])
+    elephant = body >= 1.6 * a and wi["body_ratio"] >= 0.68
+
+    div = _rsi_divergence(cs, 18, 14)
+
+    # "Abaixo de 30 ou muito próximo": usamos 32/68 como margem pequena.
+    rsi_call = r_now <= 32
+    rsi_put = r_now >= 68
+
+    macd_call = macd["cross_up"] and (macd["hist_toward_zero_up"] or macd["hist_improving_up"])
+    macd_put = macd["cross_down"] and (macd["hist_toward_zero_down"] or macd["hist_improving_down"])
+
+    if elephant:
+        return {
+            "direction": "NEUTRO", "confidence": 25, "confirmed": False,
+            "reason": "Filtro de segurança: candle de força/elefantíase detectado na zona.",
+            "strategy": strategy_name,
+            "rsi14": round(r_now, 2),
+            "elephant_candle": True,
+        }
+
+    if touch_support and rsi_call and macd_call:
+        tf, level, touches, _ = nearest_support
+        conf = 84
+        if tf == "H4":
+            conf += 4
+        if div["bullish"]:
+            conf += 5
+        if wi["call_wick"] >= 0.35:
+            conf += 3
+        return {
+            "direction": "CALL",
+            "confidence": round(clamp(conf, 80, 97), 1),
+            "confirmed": True,
+            "reason": (
+                f"Preço em suporte {tf} ({touches} toques); RSI 14 em {r_now:.1f}; "
+                "MACD cruzou para cima com histograma reagindo em direção ao zero"
+                + ("; divergência altista de RSI" if div["bullish"] else "")
+                + "."
+            ),
+            "strategy": strategy_name,
+            "rsi14": round(r_now, 2),
+            "level": round(level, 8),
+            "level_timeframe": tf,
+            "level_touches": touches,
+            "rsi_divergence": "BULLISH" if div["bullish"] else "NONE",
+            "elephant_candle": False,
+        }
+
+    if touch_resistance and rsi_put and macd_put:
+        tf, level, touches, _ = nearest_resistance
+        conf = 84
+        if tf == "H4":
+            conf += 4
+        if div["bearish"]:
+            conf += 5
+        if wi["put_wick"] >= 0.35:
+            conf += 3
+        return {
+            "direction": "PUT",
+            "confidence": round(clamp(conf, 80, 97), 1),
+            "confirmed": True,
+            "reason": (
+                f"Preço em resistência {tf} ({touches} toques); RSI 14 em {r_now:.1f}; "
+                "MACD cruzou para baixo com histograma reagindo em direção ao zero"
+                + ("; divergência baixista de RSI" if div["bearish"] else "")
+                + "."
+            ),
+            "strategy": strategy_name,
+            "rsi14": round(r_now, 2),
+            "level": round(level, 8),
+            "level_timeframe": tf,
+            "level_touches": touches,
+            "rsi_divergence": "BEARISH" if div["bearish"] else "NONE",
+            "elephant_candle": False,
+        }
+
+    reasons = []
+    if not touch_support and not touch_resistance:
+        reasons.append("preço fora das zonas H1/H4")
+    if touch_support and not rsi_call:
+        reasons.append(f"RSI {r_now:.1f} não está em sobrevenda")
+    if touch_resistance and not rsi_put:
+        reasons.append(f"RSI {r_now:.1f} não está em sobrecompra")
+    if (touch_support and rsi_call and not macd_call) or (touch_resistance and rsi_put and not macd_put):
+        reasons.append("MACD ainda não confirmou o cruzamento")
+
+    return {
+        "direction": "NEUTRO",
+        "confidence": 55 if (touch_support or touch_resistance) else 35,
+        "confirmed": False,
+        "reason": "; ".join(reasons) if reasons else "Sem confluência completa H1/H4 + RSI + MACD.",
+        "strategy": strategy_name,
+        "rsi14": round(r_now, 2),
+        "elephant_candle": False,
+        "rsi_divergence": (
+            "BULLISH" if div["bullish"] else "BEARISH" if div["bearish"] else "NONE"
+        ),
+    }
+
+
+def local_engine(cs, context=None):
+    context = context or {}
     strategies = [
+        htf_sr_rsi_macd_strategy(
+            cs,
+            context.get("h1"),
+            context.get("h4"),
+            context.get("interval", "5min"),
+        ),
         bollinger_stochastic(cs),
         ema_rsi_strategy(cs),
         macd_strategy(cs),
@@ -954,7 +1287,7 @@ async def candles(symbol, interval, n=80, market="OPEN", iq_state=None):
             stale = candle_cache.get(ckey)
             if stale and time.time() - stale[0] < 90:
                 return stale[1][-n:]
-            raise HTTPException(503, f"IQ Option OTC indisponível: {str(exc)[:300]}")
+            raise HTTPException(503, f"Mercado indisponível: {str(exc)[:300]}")
 
         if not out:
             raise HTTPException(503, "Nenhum candle OTC recebido da IQ Option.")
@@ -1125,7 +1458,31 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
             return out
 
     closed = raw[:-1] if len(raw) > 1 else raw
-    analysis = local_engine(closed)
+
+    # Estratégia multi-timeframe: H1/H4 servem somente como mapa de zonas.
+    # Se a fonte superior falhar, as outras estratégias continuam funcionando.
+    h1_closed = None
+    h4_closed = None
+    if interval in ("5min", "15min"):
+        try:
+            h1_raw, h4_raw = await asyncio.gather(
+                candles(symbol, "1h", 100, market, iq_state),
+                candles(symbol, "4h", 100, market, iq_state),
+            )
+            h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
+            h4_closed = h4_raw[:-1] if len(h4_raw) > 1 else h4_raw
+        except Exception:
+            h1_closed = None
+            h4_closed = None
+
+    analysis = local_engine(
+        closed,
+        {
+            "h1": h1_closed,
+            "h4": h4_closed,
+            "interval": interval,
+        },
+    )
 
     base = {
         "symbol": symbol,
@@ -1196,7 +1553,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "32.7.0",
+        "version": "33.3.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -1359,7 +1716,7 @@ async def iq_login(body: IQLoginBody, response: Response):
 
     return {
         "connected": True,
-        "message": "IQ Option OTC conectada.",
+        "message": "Mercado conectada.",
         "email_masked": _mask_email(email),
         "session_token": token,
     }
@@ -1426,7 +1783,7 @@ async def otc_status(request: Request):
     reconnecting = bool(state.get("reconnecting")) or (not connected and time.time() < reconnect_after)
 
     if connected:
-        msg = "IQ Option OTC conectada."
+        msg = "Mercado conectada."
     elif reconnecting:
         wait = max(1, int(reconnect_after-time.time()+0.999)) if reconnect_after > time.time() else 2
         msg = f"Sessão preservada. Reconectando em {wait}s."
@@ -1920,10 +2277,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="controls">
-    <select id="market">
-      <option value="OPEN">🌐 Mercado Aberto</option>
-      <option value="OTC">🟣 IQ Option OTC</option>
+    <select id="broker">
+      <option value="IQ_OPTION">🏦 IQ Option</option>
+      <option value="OLYMPTRADE">🏦 Olymptrade</option>
     </select>
+
+    <input id="market" type="hidden" value="OPEN">
 
     <select id="symbol"></select>
 
@@ -1935,13 +2294,13 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </select>
 
     <button id="voiceBtn" onclick="voice()">🔊 Ativar voz</button>
-    <div id="otcNote" class="label" style="margin-top:6px;display:none">🟣 IQ Option OTC: verificando conexão...</div>
+    <div id="otcNote" class="label" style="display:none"></div>
   </div>
 
   <div class="tabs">
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
     <button class="tabbtn" id="tabChart">📈 Gráfico</button>
-    <button class="tabbtn" id="tabAccount">⚙️ Conta IQ Option</button>
+    <button class="tabbtn" id="tabAccount">🏦 Corretora</button>
   </div>
 
   <div id="mainTab" class="tab active">
@@ -2013,26 +2372,28 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
   <div id="accountTab" class="tab">
     <div class="card">
-      <h2 style="margin-top:0">⚙️ Conta IQ Option</h2>
-      <div class="label">
-        Use sua própria conta para liberar o gráfico e os candles OTC.
+      <h2 style="margin-top:0">🏦 Corretora</h2>
+      <div class="label">ESCOLHA ONDE VOCÊ VAI EXECUTAR A ENTRADA</div>
+
+      <select id="brokerAccount" style="width:100%;margin-top:10px">
+        <option value="IQ_OPTION">IQ Option</option>
+        <option value="OLYMPTRADE">Olymptrade</option>
+      </select>
+
+      <div id="iqAccountStatus" class="card" style="margin-top:12px">
+        🟢 Sem login. Os sinais usam dados externos de mercado.
       </div>
 
-      <div class="account-grid">
-        <label>E-mail
-          <input id="iqEmail" type="email" autocomplete="username" placeholder="Seu e-mail da IQ Option">
-        </label>
-        <label>Senha
-          <input id="iqPassword" type="password" autocomplete="current-password" placeholder="Sua senha">
-        </label>
+      <div class="label" style="margin-top:10px;line-height:1.5">
+        IQ Option e Olymptrade são usadas somente como local de execução da entrada.
+        Os candles desta versão vêm da fonte externa do MEGA IA.
+        Não são candles OTC próprios das corretoras.
       </div>
 
-      <div class="account-actions">
-        <button id="iqConnectBtn">🟢 Conectar</button>
-        <button id="iqLogoutBtn">🔴 Desconectar</button>
-      </div>
-
-      <div id="iqAccountStatus" class="card" style="margin-top:12px">● Desconectado</div>
+      <input id="iqEmail" type="hidden">
+      <input id="iqPassword" type="hidden">
+      <button id="iqConnectBtn" style="display:none"></button>
+      <button id="iqLogoutBtn" style="display:none"></button>
     </div>
   </div>
 
@@ -2049,6 +2410,30 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
 <script>
 const market=document.getElementById('market');
+const broker=document.getElementById('broker');
+const brokerAccount=document.getElementById('brokerAccount');
+
+function brokerName(){
+  const v=broker ? broker.value : 'IQ_OPTION';
+  if(v==='OLYMPTRADE') return 'Olymptrade';
+  return 'IQ Option';
+}
+
+function syncBroker(value){
+  const v=['IQ_OPTION','OLYMPTRADE'].includes(value) ? value : 'IQ_OPTION';
+  if(broker) broker.value=v;
+  if(brokerAccount) brokerAccount.value=v;
+  try{localStorage.setItem('mega_broker',v)}catch(_){}
+  if(typeof iqAccountStatus!=='undefined' && iqAccountStatus){
+    const name=v==='OLYMPTRADE'?'Olymptrade':'IQ Option';
+    iqAccountStatus.textContent='🟢 '+name+' selecionada • sem login';
+  }
+}
+
+try{
+  const savedBroker=localStorage.getItem('mega_broker')||'IQ_OPTION';
+  setTimeout(()=>syncBroker(savedBroker),0);
+}catch(_){}
 const interval=document.getElementById('interval');
 const voiceBtn=document.getElementById('voiceBtn');
 const otcNote=document.getElementById('otcNote');
@@ -2146,7 +2531,7 @@ function rememberPendingTrade(sig){
   }
 
   pendingTrade={
-    market:sig.market || market.value,
+    market:'OPEN',
     symbol:sig.symbol,
     interval:sig.interval,
     direction:sig.direction,
@@ -2158,12 +2543,11 @@ function rememberPendingTrade(sig){
 }
 
 function fillSymbols(){
-  const otc=market.value==='OTC';
   const previous=S.value;
   S.innerHTML='';
 
   syms.forEach(x=>{
-    S.add(new Option(otc?'🟣 '+x+' • OTC':x,x));
+    S.add(new Option(x,x));
   });
 
   if(previous && [...S.options].some(o=>o.value===previous)){
@@ -2252,19 +2636,13 @@ function ft(x){
 }
 
 function iqSessionToken(){
-  try{
-    return localStorage.getItem('mega_iq_session_token')||'';
-  }catch(_){
-    return '';
-  }
+  return '';
 }
 
 function authHeaders(extra={}){
-  const h={...extra};
-  const t=iqSessionToken();
-  if(t) h['X-IQ-Session']=t;
-  return h;
+  return {...extra};
 }
+
 
 async function get(u){
   const r=await fetch(u,{
@@ -2312,24 +2690,10 @@ async function post(u,data={}){
 }
 
 async function updateMarketNote(){
-  const otc=market.value==='OTC';
-  otcNote.style.display=otc?'block':'none';
-
-  if(!otc) return;
-
-  otcNote.textContent='🟣 IQ Option OTC: verificando conexão...';
-
-  try{
-    const x=await Promise.race([
-      get('/otc-status'),
-      new Promise((_,rej)=>setTimeout(()=>rej(Error('tempo limite de conexão')),16000))
-    ]);
-
-    otcNote.textContent=(x.connected?'🟢 ':x.reconnecting?'🟡 ':'🔴 ')+x.message;
-  }catch(e){
-    otcNote.textContent='🔴 IQ Option OTC: '+(e.message||'falha de conexão');
-  }
+  otcNote.style.display='none';
+  if(market) market.value='OPEN';
 }
+
 
 function resizeChart(){
   const r=chartCanvas.getBoundingClientRect();
@@ -2447,7 +2811,7 @@ async function loadChart(){
 
     chartInfo.textContent=
       (d.ok===false?'⚠️ ':'')+
-      (d.market==='OTC'?'🟣 '+d.symbol+' • OTC':d.symbol)+
+      d.symbol+' • '+brokerName()+
       ' • '+d.interval+
       (d.ok===false?' • '+(d.status||'INDISPONÍVEL'):'');
 
@@ -2491,85 +2855,31 @@ tabAccount.onclick=()=>showTab('account');
 window.addEventListener('resize',resizeChart);
 
 async function refreshAccountStatus(){
-  try{
-    const x=await get('/otc-status');
-    const rr=!!x.reconnecting;
-
-    iqAccountStatus.textContent=
-      (x.connected&&!rr?'🟢 ':rr?'🟡 ':'🔴 ')+
-      (x.connected&&!rr?('Conectado: '+(x.email_masked||'')):x.message);
-
-    iqConnectBtn.disabled=!!x.connected||rr;
-    iqLogoutBtn.disabled=!x.connected&&!rr;
-
-    if(rr) setTimeout(refreshAccountStatus,2500);
-
-  }catch(e){
-    iqAccountStatus.textContent='🟡 Reconectando à IQ Option...';
-    setTimeout(refreshAccountStatus,2500);
-  }
+  if(market) market.value='OPEN';
+  syncBroker((broker&&broker.value)||'IQ_OPTION');
 }
 
-iqConnectBtn.onclick=async()=>{
-  const email=iqEmail.value.trim();
-  const password=iqPassword.value;
+if(broker){
+  broker.onchange=()=>{
+    syncBroker(broker.value);
+    sig(true);
+    rad();
+    if(chartTab.classList.contains('active')) loadChart();
+  };
+}
 
-  if(!email||!password){
-    iqAccountStatus.textContent='🔴 Informe e-mail e senha.';
-    return;
-  }
+if(brokerAccount){
+  brokerAccount.onchange=()=>{
+    syncBroker(brokerAccount.value);
+    sig(true);
+    rad();
+    if(chartTab.classList.contains('active')) loadChart();
+  };
+}
 
-  iqAccountStatus.textContent='🟡 Conectando...';
-  iqConnectBtn.disabled=true;
+iqConnectBtn.onclick=()=>{};
+iqLogoutBtn.onclick=()=>{};
 
-  try{
-    const x=await post('/iq-login',{email,password});
-
-    if(x.session_token){
-      try{
-        localStorage.setItem('mega_iq_session_token',x.session_token);
-      }catch(_){}
-    }
-
-    iqPassword.value='';
-    iqEmail.value='';
-    iqAccountStatus.textContent='🟢 Conectado: '+(x.email_masked||'');
-
-    await updateMarketNote();
-
-    if(market.value==='OTC'){
-      sig(true);
-      rad();
-      if(chartTab.classList.contains('active')) loadChart();
-    }
-
-  }catch(e){
-    iqAccountStatus.textContent='🔴 '+e.message;
-  }finally{
-    iqConnectBtn.disabled=false;
-    refreshAccountStatus();
-  }
-};
-
-iqLogoutBtn.onclick=async()=>{
-  try{
-    await post('/iq-logout',{});
-
-    try{
-      localStorage.removeItem('mega_iq_session_token');
-    }catch(_){}
-
-    iqAccountStatus.textContent='● Desconectado';
-    otcNote.textContent='🔴 Conecte sua conta na aba Conta IQ Option.';
-    chartData=[];
-    drawChart([]);
-
-  }catch(e){
-    iqAccountStatus.textContent='🔴 '+e.message;
-  }
-
-  refreshAccountStatus();
-};
 
 async function sig(announce=false){
   if(sigBusy) return;
@@ -2806,7 +3116,7 @@ async function resultCheck(){
     const t=pendingTrade;
 
     const x=await get(
-      `/result?market=${encodeURIComponent(t.market || market.value)}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}`
+      `/result?market=${encodeURIComponent('OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}`
     );
 
     if(x.result){
@@ -2837,29 +3147,9 @@ async function resultCheck(){
 }
 
 market.onchange=async()=>{
-  try{localStorage.setItem('mega_market',market.value)}catch(_){}
-
-  fillSymbols();
-
-  try{
-    const savedSym=localStorage.getItem('mega_symbol');
-    if(savedSym && [...S.options].some(o=>o.value===savedSym)){
-      S.value=savedSym;
-    }
-  }catch(_){}
-
-  await updateMarketNote();
-
-  lastSignalVoice='';
-  chartData=[];
-
-  sig(true);
-  rad();
-
-  if(chartTab.classList.contains('active')){
-    loadChart();
-  }
+  market.value='OPEN';
 };
+
 
 S.onchange=()=>{
   try{localStorage.setItem('mega_symbol',S.value)}catch(_){}
@@ -2912,6 +3202,7 @@ try{
 }
 
 async function bootApp(){
+  market.value='OPEN';
   const safe=(name,fn)=>
     Promise.resolve()
       .then(fn)
