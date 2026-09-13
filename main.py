@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.11.0")
+app = FastAPI(title="MEGA IA", version="33.11.1")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -102,7 +102,7 @@ IQ_SESSION_COOKIE = "mega_iq_session"
 IQ_SESSION_TTL = int(os.getenv("IQ_SESSION_TTL", "43200"))
 IQ_CONNECT_TIMEOUT = float(os.getenv("IQ_CONNECT_TIMEOUT", "25"))
 IQ_CANDLE_TIMEOUT = float(os.getenv("IQ_CANDLE_TIMEOUT", "15"))
-IQ_CANDLE_CACHE_TTL = float(os.getenv("IQ_CANDLE_CACHE_TTL", "8"))
+IQ_CANDLE_CACHE_TTL = float(os.getenv("IQ_CANDLE_CACHE_TTL", "3"))
 iq_sessions: Dict[str, Dict[str, Any]] = {}
 
 VALID_MARKETS = ("OPEN", "IQ_OTC", "OLYMP_OTC")
@@ -2943,7 +2943,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.11.0",
+        "version": "33.11.1",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -4818,6 +4818,38 @@ function drawChart(a){
   }
 }
 
+function candleTimeKey(c){
+  if(!c) return '';
+  return String(c.datetime || c.time || c.timestamp || '');
+}
+
+function mergeChartCandles(oldData,newData){
+  const map=new Map();
+
+  (oldData||[]).forEach(c=>{
+    const k=candleTimeKey(c);
+    if(k) map.set(k,c);
+  });
+
+  (newData||[]).forEach(c=>{
+    const k=candleTimeKey(c);
+    if(!k) return;
+
+    // O candle mais novo substitui a versão anterior do mesmo horário,
+    // fazendo a vela em formação crescer/diminuir sem "pular".
+    map.set(k,{...(map.get(k)||{}),...c});
+  });
+
+  const merged=[...map.values()].sort((a,b)=>{
+    const ta=new Date(candleTimeKey(a)).getTime();
+    const tb=new Date(candleTimeKey(b)).getTime();
+    return ta-tb;
+  });
+
+  // Mantém histórico suficiente, sem deixar o navegador pesado.
+  return merged.slice(-120);
+}
+
 async function loadChart(){
   // Atualizar/redesenhar o gráfico NÃO altera o estado do robô nem da voz.
   if(!robotEnabled){
@@ -4834,7 +4866,7 @@ async function loadChart(){
     );
 
     if((d.candles||[]).length){
-      chartData=d.candles||[];
+      chartData=mergeChartCandles(chartData,d.candles||[]);
     }
 
     chartInfo.textContent=
@@ -5568,7 +5600,7 @@ setInterval(()=>{
   if(robotEnabled && chartTab.classList.contains('active')){
     loadChart();
   }
-},15000);
+},4000);
 
 setInterval(perf,30000);
 setInterval(()=>{
