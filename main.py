@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.31.0")
+app = FastAPI(title="MEGA IA", version="33.32.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -96,6 +96,14 @@ CHART_SIGNAL_CONFIRM_READS = 3
 CHART_SIGNAL_CONFIRM_MAX_GAP = 6
 PRE_SIGNAL_TTL = 75
 PRE_SIGNAL_BATCH = 4
+
+# Ciclo econômico de análise para reduzir chamadas ao feed:
+# 1) faz uma análise completa a cada 4 minutos;
+# 2) se houver setup, guarda um pré-sinal;
+# 3) 60 segundos depois faz uma segunda leitura e só então libera CALL/PUT.
+ANALYSIS_CYCLE_SECONDS = 240
+ANALYSIS_CONFIRM_SECONDS = 60
+analysis_cycle_state: Dict[str, Dict[str, Any]] = {}
 
 td_sem = asyncio.Semaphore(1)
 td_candle_cache: Dict[str, Any] = {}
@@ -3477,6 +3485,65 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     if key in cache and time.time() - cache[key][0] < 1:
         return cache[key][1]
 
+    # Modo técnico: análise pesada só a cada 4 minutos.
+    # Quando existe um candidato, esperamos 60s e fazemos uma segunda leitura
+    # antes de liberar qualquer CALL/PUT. O modo IA pura mantém seu ciclo próprio.
+    cycle_state = None
+    cycle_candidate = None
+    cycle_confirming_due = False
+    cycle_key = f"{market}|{symbol}|{interval}"
+    if not ai_only:
+        cycle_state = analysis_cycle_state.setdefault(cycle_key, {})
+        cycle_candidate = cycle_state.get("candidate")
+        now_ts = time.time()
+
+        if cycle_candidate:
+            confirm_at = float(cycle_candidate.get("confirm_at", 0) or 0)
+            if confirm_at > now_ts:
+                remaining = max(1, int(confirm_at - now_ts + 0.999))
+                cand_dir = str(cycle_candidate.get("direction") or "NEUTRO")
+                cand_conf = float(cycle_candidate.get("confidence", 0) or 0)
+                out = neutral_signal(
+                    symbol, interval, market,
+                    f"PRÉ-SINAL {cand_dir} • CONFIRMAÇÃO EM {remaining}s",
+                    "A primeira análise encontrou uma oportunidade. O robô está esperando 1 minuto para confirmar força e direção antes de liberar a entrada.",
+                    source_state="READY",
+                )
+                out.update({
+                    "confidence": round(cand_conf, 1),
+                    "strategy": cycle_candidate.get("strategy", "Motor multiestratégia"),
+                    "reason": cycle_candidate.get("reason", "Oportunidade em confirmação."),
+                    "pre_signal": True,
+                    "pre_signal_direction": cand_dir,
+                    "pre_signal_confidence": round(cand_conf, 1),
+                    "cycle_phase": "CONFIRMING",
+                    "confirmation_in": remaining,
+                    "analysis_cycle_seconds": ANALYSIS_CYCLE_SECONDS,
+                    "confirmation_seconds": ANALYSIS_CONFIRM_SECONDS,
+                })
+                cache[key] = (time.time(), out)
+                return out
+            cycle_confirming_due = True
+        else:
+            next_scan_at = float(cycle_state.get("next_scan_at", 0) or 0)
+            if next_scan_at > now_ts:
+                remaining = max(1, int(next_scan_at - now_ts + 0.999))
+                mm, ss = divmod(remaining, 60)
+                out = neutral_signal(
+                    symbol, interval, market,
+                    f"PRÓXIMA ANÁLISE EM {mm:02d}:{ss:02d}",
+                    "O robô aguarda o próximo ciclo de 4 minutos para fazer uma nova análise completa.",
+                    source_state="READY",
+                )
+                out.update({
+                    "cycle_phase": "WAITING_SCAN",
+                    "next_analysis_in": remaining,
+                    "analysis_cycle_seconds": ANALYSIS_CYCLE_SECONDS,
+                    "confirmation_seconds": ANALYSIS_CONFIRM_SECONDS,
+                })
+                cache[key] = (time.time(), out)
+                return out
+
     try:
         raw = await candles(symbol, interval, 150, market, iq_state, request=request)
     except HTTPException as exc:
@@ -3653,6 +3720,76 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         },
     )
 
+    # Novo fluxo de 2 etapas no modo técnico.
+    if not ai_only and cycle_state is not None:
+        analysis_ok = bool(analysis.get("confirmed")) and analysis.get("direction") in ("CALL", "PUT")
+
+        # Primeira leitura do ciclo: nunca libera entrada imediatamente.
+        # Um setup bom vira pré-sinal e precisa sobreviver por mais 60 segundos.
+        if not cycle_confirming_due:
+            if analysis_ok:
+                confirm_at = time.time() + ANALYSIS_CONFIRM_SECONDS
+                cycle_state["candidate"] = {
+                    "direction": analysis.get("direction"),
+                    "confidence": float(analysis.get("confidence", 0) or 0),
+                    "strategy": analysis.get("strategy", "Motor multiestratégia"),
+                    "reason": analysis.get("reason", "Setup técnico encontrado."),
+                    "created_at": time.time(),
+                    "confirm_at": confirm_at,
+                }
+                cycle_state["next_scan_at"] = 0.0
+                out = neutral_signal(
+                    symbol, interval, market,
+                    f"PRÉ-SINAL {analysis.get('direction')} • CONFIRMANDO 1 MINUTO",
+                    "A oportunidade passou na primeira análise. Nenhuma entrada foi liberada ainda; o robô fará uma segunda leitura em 60 segundos.",
+                    source_state="READY",
+                )
+                out.update({
+                    "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
+                    "strategy": analysis.get("strategy"),
+                    "reason": analysis.get("reason"),
+                    "technical": analysis,
+                    "pre_signal": True,
+                    "pre_signal_direction": analysis.get("direction"),
+                    "pre_signal_confidence": round(float(analysis.get("confidence", 0) or 0), 1),
+                    "cycle_phase": "CONFIRMING",
+                    "confirmation_in": ANALYSIS_CONFIRM_SECONDS,
+                    "analysis_cycle_seconds": ANALYSIS_CYCLE_SECONDS,
+                    "confirmation_seconds": ANALYSIS_CONFIRM_SECONDS,
+                })
+                cache[key] = (time.time(), out)
+                return out
+            else:
+                cycle_state["candidate"] = None
+                cycle_state["next_scan_at"] = time.time() + ANALYSIS_CYCLE_SECONDS
+
+        # Segunda leitura: só passa adiante se a direção continuar a mesma
+        # e o motor técnico continuar confirmando o setup.
+        else:
+            expected_direction = str((cycle_candidate or {}).get("direction") or "")
+            if not analysis_ok or analysis.get("direction") != expected_direction:
+                cycle_state["candidate"] = None
+                cycle_state["next_scan_at"] = time.time() + ANALYSIS_CYCLE_SECONDS
+                out = neutral_signal(
+                    symbol, interval, market,
+                    "PRÉ-SINAL CANCELADO",
+                    "A segunda leitura de 1 minuto não confirmou a mesma direção. Nenhuma entrada foi liberada.",
+                    source_state="READY",
+                )
+                out.update({
+                    "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
+                    "strategy": analysis.get("strategy"),
+                    "reason": analysis.get("reason"),
+                    "technical": analysis,
+                    "pre_signal": False,
+                    "cycle_phase": "CANCELLED",
+                    "next_analysis_in": ANALYSIS_CYCLE_SECONDS,
+                    "analysis_cycle_seconds": ANALYSIS_CYCLE_SECONDS,
+                    "confirmation_seconds": ANALYSIS_CONFIRM_SECONDS,
+                })
+                cache[key] = (time.time(), out)
+                return out
+
     # Se a condição anterior deixou de existir, libera o gate para um novo setup.
     release_state = signal_release_state.setdefault(release_key, {})
     if not analysis.get("confirmed") or analysis.get("direction") not in ("CALL", "PUT"):
@@ -3745,6 +3882,20 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     base["source_state"] = "READY"
 
+    # Final da segunda leitura: independentemente de liberar ou rejeitar o sinal,
+    # encerra este candidato e agenda uma nova análise completa para daqui a 4 minutos.
+    if not ai_only and cycle_state is not None:
+        if cycle_confirming_due:
+            cycle_state["candidate"] = None
+            cycle_state["next_scan_at"] = time.time() + ANALYSIS_CYCLE_SECONDS
+            base["cycle_phase"] = "SIGNAL_RELEASED" if base["direction"] in ("CALL", "PUT") else "CONFIRMATION_REJECTED"
+            base["next_analysis_in"] = ANALYSIS_CYCLE_SECONDS
+        else:
+            base["cycle_phase"] = "WAITING_SCAN"
+            base["next_analysis_in"] = max(0, int(float(cycle_state.get("next_scan_at", 0) or 0) - time.time()))
+        base["analysis_cycle_seconds"] = ANALYSIS_CYCLE_SECONDS
+        base["confirmation_seconds"] = ANALYSIS_CONFIRM_SECONDS
+
     # Atualiza a cópia ativa já com source_state.
     if base["direction"] in ("CALL", "PUT"):
         release_state = signal_release_state.setdefault(release_key, {})
@@ -3760,7 +3911,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.20.0",
+        "version": "33.32.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -7373,12 +7524,13 @@ setInterval(()=>{
 },2000);
 
 setInterval(()=>{ if(appEnabled) perf(); },5000);
+// Radar e pré-sinais seguem o mesmo ciclo econômico de 4 minutos.
 setInterval(()=>{
   if(appEnabled && !robotEnabled) rad();
-},20000);
+},240000);
 setInterval(()=>{
   if(appEnabled && !robotEnabled) loadPreSignals();
-},15000);
+},240000);
 
 // Com o app ligado, acompanha o resultado das operações abertas.
 setInterval(()=>{ if(appEnabled) resultCheck(); },3000);
