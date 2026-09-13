@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.14.0")
+app = FastAPI(title="MEGA IA", version="33.14.1")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -85,7 +85,10 @@ radar_cache: Dict[str, Any] = {}
 pre_signal_cache: Dict[str, Any] = {}
 chart_pre_signal_lock: Dict[str, Dict[str, Any]] = {}
 chart_pre_signal_last_at: Dict[str, float] = {}
+chart_pre_signal_candidate: Dict[str, Dict[str, Any]] = {}
 CHART_SIGNAL_COOLDOWN_SECONDS = 180
+CHART_SIGNAL_CONFIRM_READS = 3
+CHART_SIGNAL_CONFIRM_MAX_GAP = 6
 PRE_SIGNAL_TTL = 75
 PRE_SIGNAL_BATCH = 4
 
@@ -1160,6 +1163,150 @@ def otc_ema_pullback(cs):
             "reason":"Sem pullback alinhado à tendência curta.","strategy":"OTC EMA pullback"}
 
 
+
+def otc_two_candle_color_continuation(cs):
+    """
+    Estratégia OTC de continuação por cor:
+    - 2 velas verdes consecutivas -> procura CALL na 3ª vela;
+    - 2 velas vermelhas consecutivas -> procura PUT na 3ª vela.
+
+    A cor sozinha NÃO libera a entrada. O padrão precisa passar por filtros de
+    corpo/range, EMA 9/21, RSI 7 e continuidade do fechamento. Depois disso,
+    o motor OTC ainda exige confluência com pelo menos outra estratégia.
+    """
+    if len(cs) < 35:
+        return {
+            "direction": "NEUTRO",
+            "confidence": 0,
+            "confirmed": False,
+            "reason": "Poucos candles para validar o padrão de 2 cores.",
+            "strategy": "OTC 2 velas mesma cor",
+        }
+
+    c1 = cs[-2]
+    c2 = cs[-1]
+
+    def _metrics(c):
+        op = float(c["open"])
+        cl = float(c["close"])
+        hi = float(c["high"])
+        lo = float(c["low"])
+        rng = max(1e-12, hi - lo)
+        body = abs(cl - op)
+        return {
+            "green": cl > op,
+            "red": cl < op,
+            "body_ratio": body / rng,
+            "range": rng,
+        }
+
+    m1 = _metrics(c1)
+    m2 = _metrics(c2)
+
+    recent = cs[-12:-2]
+    avg_range = (
+        sum(max(1e-12, float(c["high"]) - float(c["low"])) for c in recent)
+        / max(1, len(recent))
+    )
+
+    # Evita doji, velas muito fracas ou explosões anormais.
+    body_ok = m1["body_ratio"] >= 0.45 and m2["body_ratio"] >= 0.45
+    range_ok = (
+        0.45 * avg_range <= m1["range"] <= 1.90 * avg_range
+        and 0.45 * avg_range <= m2["range"] <= 1.90 * avg_range
+    )
+
+    closes = [float(c["close"]) for c in cs]
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+    r = rsi(closes, 7)
+
+    if e9 is None or e21 is None or r is None:
+        return {
+            "direction": "NEUTRO",
+            "confidence": 0,
+            "confirmed": False,
+            "reason": "Indicadores insuficientes para validar o padrão de 2 cores.",
+            "strategy": "OTC 2 velas mesma cor",
+        }
+
+    two_green = m1["green"] and m2["green"]
+    two_red = m1["red"] and m2["red"]
+
+    # A segunda vela precisa mostrar continuação real do movimento.
+    green_progress = float(c2["close"]) > float(c1["close"])
+    red_progress = float(c2["close"]) < float(c1["close"])
+
+    trend_call = e9 > e21 and float(c2["close"]) >= e9
+    trend_put = e9 < e21 and float(c2["close"]) <= e9
+
+    # Evita seguir movimento já excessivamente esticado.
+    rsi_call_ok = 50 <= r <= 72
+    rsi_put_ok = 28 <= r <= 50
+
+    call = (
+        two_green
+        and body_ok
+        and range_ok
+        and green_progress
+        and trend_call
+        and rsi_call_ok
+    )
+
+    put = (
+        two_red
+        and body_ok
+        and range_ok
+        and red_progress
+        and trend_put
+        and rsi_put_ok
+    )
+
+    if call:
+        return {
+            "direction": "CALL",
+            "confidence": 84,
+            "confirmed": True,
+            "reason": (
+                "Duas velas verdes consecutivas com corpos firmes, "
+                "continuidade, EMA 9/21 e RSI favoráveis à compra."
+            ),
+            "strategy": "OTC 2 velas mesma cor",
+        }
+
+    if put:
+        return {
+            "direction": "PUT",
+            "confidence": 84,
+            "confirmed": True,
+            "reason": (
+                "Duas velas vermelhas consecutivas com corpos firmes, "
+                "continuidade, EMA 9/21 e RSI favoráveis à venda."
+            ),
+            "strategy": "OTC 2 velas mesma cor",
+        }
+
+    if two_green or two_red:
+        return {
+            "direction": "NEUTRO",
+            "confidence": 58,
+            "confirmed": False,
+            "reason": (
+                "Duas velas da mesma cor foram encontradas, mas a análise "
+                "de tendência, força, RSI ou qualidade das velas não confirmou."
+            ),
+            "strategy": "OTC 2 velas mesma cor",
+        }
+
+    return {
+        "direction": "NEUTRO",
+        "confidence": 45,
+        "confirmed": False,
+        "reason": "Sem sequência válida de duas velas da mesma cor.",
+        "strategy": "OTC 2 velas mesma cor",
+    }
+
+
 def otc_exhaustion_reversal(cs):
     """Exaustão OTC: sequência de velas + rejeição no extremo."""
     if len(cs) < 12:
@@ -1963,6 +2110,7 @@ def otc_engine(cs, context=None):
         otc_bb_rsi_rejection(cs),
         otc_stochastic_reversal(cs),
         otc_ema_pullback(cs),
+        otc_two_candle_color_continuation(cs),
         otc_exhaustion_reversal(cs),
         otc_local_sr_rejection(cs),
         otc_micro_macd(cs),
@@ -2946,7 +3094,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.14.0",
+        "version": "33.14.1",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -3637,8 +3785,9 @@ async def chart_pre_signal(
     """
     SINAL DE ENTRADA NA BOLINHA, SEM REPINTAR:
     - só pode nascer nos últimos 20 segundos da vela atual;
-    - a própria bolinha é o sinal visual de CALL/PUT;
-    - no primeiro CALL/PUT válido, direção/confiança/estratégia ficam TRAVADAS;
+    - exige 3 leituras consecutivas na mesma direção antes de liberar a bolinha;
+    - se a direção mudar ou o setup desaparecer, a contagem reinicia;
+    - depois que a bolinha aparece, direção/confiança/estratégia ficam TRAVADAS;
     - depois de um sinal, outro só pode ser liberado após 3 minutos;
     - a operação indicada continua sendo avaliada na vela seguinte.
     """
@@ -3666,6 +3815,7 @@ async def chart_pre_signal(
             locked_entry = parse_dt(locked["entry_time"])
             if now() >= locked_entry:
                 chart_pre_signal_lock.pop(lock_key, None)
+                chart_pre_signal_candidate.pop(lock_key, None)
                 locked = None
         except Exception:
             chart_pre_signal_lock.pop(lock_key, None)
@@ -3682,6 +3832,7 @@ async def chart_pre_signal(
         return out
 
     if cooldown_remaining > 0:
+        chart_pre_signal_candidate.pop(lock_key, None)
         return {
             "ok": True,
             "active": False,
@@ -3695,6 +3846,7 @@ async def chart_pre_signal(
 
     # Antes dos 20 segundos não existe marcação.
     if seconds_to_entry > 20:
+        chart_pre_signal_candidate.pop(lock_key, None)
         return {
             "ok": True,
             "active": False,
@@ -3732,17 +3884,57 @@ async def chart_pre_signal(
         preview = _pre_signal_from_live_candle(raw, interval, market)
 
         if not preview:
+            # Setup desapareceu: perde a sequência e precisa confirmar 3 vezes novamente.
+            chart_pre_signal_candidate.pop(lock_key, None)
             return {
                 "ok": True,
                 "active": False,
                 "locked": False,
+                "confirming": False,
+                "confirmation_count": 0,
+                "confirmation_required": CHART_SIGNAL_CONFIRM_READS,
                 "seconds_to_entry": seconds_to_entry,
                 "entry_time": entry_iso,
             }
 
         current_candle = raw[-1] if raw else None
 
-        # PRIMEIRO sinal válido dentro da janela: trava até a próxima vela.
+        # CONFIRMAÇÃO DE ESTABILIDADE:
+        # a mesma direção precisa aparecer em 3 leituras consecutivas.
+        now_ts = time.time()
+        direction = preview["direction"]
+        candidate = chart_pre_signal_candidate.get(lock_key)
+
+        same_sequence = bool(
+            candidate
+            and candidate.get("entry_time") == entry_iso
+            and candidate.get("direction") == direction
+            and (now_ts - float(candidate.get("last_seen", 0.0) or 0.0)) <= CHART_SIGNAL_CONFIRM_MAX_GAP
+        )
+
+        confirmation_count = int(candidate.get("count", 0)) + 1 if same_sequence else 1
+        chart_pre_signal_candidate[lock_key] = {
+            "entry_time": entry_iso,
+            "direction": direction,
+            "count": confirmation_count,
+            "last_seen": now_ts,
+        }
+
+        if confirmation_count < CHART_SIGNAL_CONFIRM_READS:
+            return {
+                "ok": True,
+                "active": False,
+                "locked": False,
+                "confirming": True,
+                "direction": direction,
+                "confirmation_count": confirmation_count,
+                "confirmation_required": CHART_SIGNAL_CONFIRM_READS,
+                "seconds_to_entry": seconds_to_entry,
+                "entry_time": entry_iso,
+                "status": f"CONFIRMANDO {direction} • {confirmation_count}/{CHART_SIGNAL_CONFIRM_READS}",
+            }
+
+        # Terceira leitura consecutiva confirmou o setup: agora trava a bolinha.
         payload = {
             "ok": True,
             "active": True,
@@ -3762,9 +3954,12 @@ async def chart_pre_signal(
             "signal_market": "MERCADO ABERTO" if market == "OPEN" else "OTC",
             "cooldown_seconds": CHART_SIGNAL_COOLDOWN_SECONDS,
             "cooldown_remaining": CHART_SIGNAL_COOLDOWN_SECONDS,
+            "confirmation_count": CHART_SIGNAL_CONFIRM_READS,
+            "confirmation_required": CHART_SIGNAL_CONFIRM_READS,
         }
 
         chart_pre_signal_lock[lock_key] = dict(payload)
+        chart_pre_signal_candidate.pop(lock_key, None)
         chart_pre_signal_last_at[lock_key] = time.time()
         return payload
 
@@ -4629,7 +4824,7 @@ function rememberChartSignal(pre){
 
     if(voiceEnabled){
       const lado=pre.direction==='CALL'?'CALL':'PUT';
-      speak('Entrada '+lado+'. Sinal confirmado na bolinha.');
+      speak('Entrada '+lado+'. Sinal confirmado após três leituras consecutivas.');
     }
   }
 
@@ -5060,8 +5255,8 @@ function drawChart(a){
   }
 
   // BOLINHA = SINAL DE ENTRADA — MERCADO ABERTO E OTC:
-  // aparece somente nos últimos 20s da vela atual;
-  // OPEN usa suas estratégias próprias e OTC usa o motor OTC;
+  // aparece somente após 3 leituras consecutivas na mesma direção;
+  // a confirmação ocorre dentro dos últimos 20s da vela atual;
   // depois de uma bolinha, outra só pode ser liberada após 3 minutos.
   if(chartPreSignal && chartPreSignal.active &&
      (chartPreSignal.direction==='CALL' || chartPreSignal.direction==='PUT')){
