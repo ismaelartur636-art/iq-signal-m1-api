@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
-app = FastAPI(title="MEGA IA", version="32.9.1")
+app = FastAPI(title="MEGA IA", version="32.9.2")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -1146,7 +1146,7 @@ async def manifest():
 @app.get("/iq-diagnostic")
 async def iq_diagnostic():
     info = {
-        "app_version": "32.9.1",
+        "app_version": "32.9.2",
         "iq_async_library_loaded": AsyncIQOption is not None,
         "import_error": IQ_IMPORT_ERROR if AsyncIQOption is None else "",
         "active_sessions": len(iq_sessions),
@@ -1164,65 +1164,99 @@ async def iq_diagnostic():
 
 @app.get("/iq-network-test")
 async def iq_network_test():
-    """Testa somente conectividade Render -> IQ Option. Não usa e-mail nem senha."""
+    """Testa endpoints alternativos da IQ Option sem usar e-mail nem senha."""
     result = {
-        "app_version": "32.9.1",
-        "http_auth": {"ok": False},
-        "websocket": {"ok": False},
+        "app_version": "32.9.2",
+        "http": {},
+        "websocket": {},
     }
 
     try:
         import aiohttp
+        import socket
     except Exception as exc:
-        result["fatal"] = f"aiohttp indisponível: {type(exc).__name__}: {exc}"
+        result["fatal"] = f"dependencia indisponivel: {type(exc).__name__}: {exc}"
         return result
 
-    # 1) Teste HTTPS: qualquer resposta HTTP prova que o host respondeu.
-    auth_url = "https://auth.iqoption.com/api/v2/login"
+    # DNS ajuda a separar falha de resolução de falha de rota/conexão.
+    hosts = ["auth.iqoption.com", "api.iqoption.com", "iqoption.com", "ws.iqoption.com"]
+    dns = {}
+    for host in hosts:
+        try:
+            infos = await asyncio.wait_for(
+                asyncio.to_thread(socket.getaddrinfo, host, 443, type=socket.SOCK_STREAM),
+                timeout=5,
+            )
+            ips = []
+            for info in infos:
+                ip = info[4][0]
+                if ip not in ips:
+                    ips.append(ip)
+            dns[host] = {"ok": True, "ips": ips[:6]}
+        except Exception as exc:
+            dns[host] = {
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:200],
+            }
+    result["dns"] = dns
+
+    http_urls = [
+        "https://auth.iqoption.com/api/v2/login",
+        "https://api.iqoption.com/v2/login",
+        "https://iqoption.com/",
+    ]
+    ws_urls = [
+        "wss://iqoption.com/echo/websocket",
+        "wss://ws.iqoption.com/echo/websocket",
+    ]
+
+    timeout = aiohttp.ClientTimeout(total=12, connect=8, sock_read=8)
+    connector = aiohttp.TCPConnector(family=socket.AF_UNSPEC, ttl_dns_cache=0)
+
     try:
-        timeout = aiohttp.ClientTimeout(total=12, connect=8, sock_read=8)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            try:
-                async with session.get(
-                    auth_url,
-                    allow_redirects=False,
-                    headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test"},
-                ) as resp:
-                    result["http_auth"] = {
-                        "ok": True,
-                        "status": resp.status,
-                        "server": resp.headers.get("server", ""),
-                        "content_type": resp.headers.get("content-type", ""),
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            for url in http_urls:
+                try:
+                    async with session.get(
+                        url,
+                        allow_redirects=False,
+                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.2"},
+                    ) as resp:
+                        result["http"][url] = {
+                            "ok": True,
+                            "status": resp.status,
+                            "server": resp.headers.get("server", ""),
+                            "location": resp.headers.get("location", ""),
+                            "content_type": resp.headers.get("content-type", ""),
+                        }
+                except Exception as exc:
+                    result["http"][url] = {
+                        "ok": False,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:300],
                     }
-            except Exception as exc:
-                result["http_auth"] = {
-                    "ok": False,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc)[:300],
-                }
 
-            # 2) Teste WebSocket sem autenticação, só abertura do canal.
-            ws_url = "wss://iqoption.com/echo/websocket"
-            try:
-                ws = await session.ws_connect(
-                    ws_url,
-                    timeout=10,
-                    heartbeat=20,
-                    headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test"},
-                )
-                result["websocket"] = {
-                    "ok": True,
-                    "closed": bool(ws.closed),
-                    "close_code": ws.close_code,
-                }
-                await ws.close()
-            except Exception as exc:
-                result["websocket"] = {
-                    "ok": False,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc)[:300],
-                }
-
+            for url in ws_urls:
+                try:
+                    ws = await session.ws_connect(
+                        url,
+                        timeout=10,
+                        heartbeat=20,
+                        headers={"User-Agent": "Mozilla/5.0 MEGA-IA-Network-Test/32.9.2"},
+                    )
+                    result["websocket"][url] = {
+                        "ok": True,
+                        "closed": bool(ws.closed),
+                        "close_code": ws.close_code,
+                    }
+                    await ws.close()
+                except Exception as exc:
+                    result["websocket"][url] = {
+                        "ok": False,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:300],
+                    }
     except Exception as exc:
         result["fatal"] = f"{type(exc).__name__}: {str(exc)[:300]}"
 
@@ -2014,7 +2048,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 (function(){
 'use strict';
 
-var VERSION='32.9.1';
+var VERSION='32.9.2';
 var symbols=['EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD'];
 var E={};
 var currentSignal=null;
