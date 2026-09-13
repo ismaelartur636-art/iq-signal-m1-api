@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.11.1")
+app = FastAPI(title="MEGA IA", version="33.12.1")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2943,7 +2943,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.11.1",
+        "version": "33.12.1",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -3622,6 +3622,101 @@ async def pre_signals(
         "seconds_to_entry": seconds_to_entry,
     }
 
+
+
+@app.get("/chart-pre-signal")
+async def chart_pre_signal(
+    request: Request,
+    symbol: str = "EUR/USD",
+    interval: str = "1min",
+    market: str = "OPEN",
+):
+    """
+    Marcador visual do gráfico para MERCADO ABERTO e OTC:
+    só aparece nos últimos 20 segundos da vela atual.
+    OPEN usa o motor de mercado aberto; IQ_OTC/OLYMP_OTC usam o motor OTC.
+    CALL/PUT indicado aqui é sempre para entrada na PRÓXIMA vela.
+    """
+    market = (market or "OPEN").upper()
+
+    if symbol not in SYMBOLS or interval not in INTERVALS or market not in VALID_MARKETS:
+        raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
+
+    entry_dt = next_boundary(interval)
+    seconds_to_entry = int(max(0, (entry_dt - now()).total_seconds()))
+
+    # Fora da janela de 20 segundos, a bolinha não aparece.
+    if seconds_to_entry > 20:
+        return {
+            "ok": True,
+            "active": False,
+            "seconds_to_entry": seconds_to_entry,
+            "entry_time": iso(entry_dt),
+        }
+
+    iq_state = (
+        _iq_session_state(request, required=False)
+        if market == "IQ_OTC"
+        else None
+    )
+
+    if market == "IQ_OTC" and not iq_state:
+        return {
+            "ok": False,
+            "active": False,
+            "seconds_to_entry": seconds_to_entry,
+            "entry_time": iso(entry_dt),
+            "message": "IQ Option não conectada.",
+        }
+
+    try:
+        raw = await candles(
+            symbol,
+            interval,
+            90,
+            market,
+            iq_state,
+            request=request,
+        )
+
+        preview = _pre_signal_from_live_candle(raw, interval, market)
+
+        if not preview:
+            return {
+                "ok": True,
+                "active": False,
+                "seconds_to_entry": seconds_to_entry,
+                "entry_time": iso(entry_dt),
+            }
+
+        current_candle = raw[-1] if raw else None
+
+        return {
+            "ok": True,
+            "active": True,
+            "direction": preview["direction"],
+            "confidence": preview["confidence"],
+            "strategy": preview["strategy"],
+            "reason": preview["reason"],
+            "seconds_to_entry": seconds_to_entry,
+            "entry_time": iso(entry_dt),
+            "reference_candle": (
+                current_candle.get("datetime")
+                if isinstance(current_candle, dict)
+                else None
+            ),
+            "status": f"{preview['direction']} • ENTRADA NA PRÓXIMA VELA",
+            "signal_market": "MERCADO ABERTO" if market == "OPEN" else "OTC",
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "active": False,
+            "seconds_to_entry": seconds_to_entry,
+            "entry_time": iso(entry_dt),
+            "message": str(exc)[:220],
+        }
 
 @app.get("/radar")
 async def radar(request: Request, interval="1min", market="OPEN"):
@@ -4373,6 +4468,7 @@ let robotTimer=null;
 let arrowTimer=null;
 let megaVoices=[];
 let chartData=[];
+let chartPreSignal=null;
 let resultBusy=false;
 let pendingTrade=null;
 let lastCountdownSignalKey='';
@@ -4793,8 +4889,46 @@ function drawChart(a){
     chartCtx.restore();
   }
 
-  // Marcador de CALL/PUT continua preso ao candle de referência correto.
-  if(cur && cur.direction && cur.direction!=='NEUTRO' && cur.reference_candle){
+  // BOLINHA DE PRÉ-ENTRADA — MERCADO ABERTO E OTC:
+  // aparece somente nos últimos 20s da vela atual;
+  // OPEN usa suas estratégias próprias e OTC usa o motor OTC;
+  // a operação indicada é sempre para a PRÓXIMA vela.
+  if(chartPreSignal && chartPreSignal.active &&
+     (chartPreSignal.direction==='CALL' || chartPreSignal.direction==='PUT')){
+
+    const idx=currentIndex;
+    const x=px(idx);
+    const dir=chartPreSignal.direction;
+    const v=dir==='CALL'
+      ? Number(a[idx].low)
+      : Number(a[idx].high);
+
+    chartCtx.save();
+    chartCtx.fillStyle=dir==='CALL'?'#45ff9b':'#ff5c7a';
+    chartCtx.strokeStyle='#07111f';
+    chartCtx.lineWidth=2;
+
+    chartCtx.beginPath();
+    chartCtx.arc(x,py(v),7,0,Math.PI*2);
+    chartCtx.fill();
+    chartCtx.stroke();
+
+    chartCtx.font='bold 12px Arial';
+    chartCtx.textAlign='left';
+    chartCtx.fillStyle=dir==='CALL'?'#45ff9b':'#ff5c7a';
+    chartCtx.fillText(dir,x+10,py(v)-9);
+
+    chartCtx.font='bold 10px Arial';
+    chartCtx.fillStyle='#d7e7fb';
+    chartCtx.fillText(
+      'PRÓXIMA VELA • '+Math.max(0,Number(chartPreSignal.seconds_to_entry||0))+'s',
+      x+10,
+      py(v)+7
+    );
+    chartCtx.restore();
+
+  }else if(cur && cur.direction && cur.direction!=='NEUTRO' && cur.reference_candle){
+    // Mantém o marcador do sinal confirmado quando não há pré-sinal de 20s.
     const idx=a.findIndex(c=>c.datetime===cur.reference_candle);
 
     if(idx>=0){
@@ -4861,13 +4995,20 @@ async function loadChart(){
   chartBusy=true;
 
   try{
-    const d=await get(
-      `/candles?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&n=80`
-    );
+    const [d,pre]=await Promise.all([
+      get(
+        `/candles?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&n=80`
+      ),
+      get(
+        `/chart-pre-signal?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}`
+      ).catch(()=>null)
+    ]);
 
     if((d.candles||[]).length){
       chartData=mergeChartCandles(chartData,d.candles||[]);
     }
+
+    chartPreSignal=(pre && pre.active) ? pre : null;
 
     chartInfo.textContent=
       (d.ok===false?'⚠️ ':'')+
@@ -4878,6 +5019,7 @@ async function loadChart(){
     drawChart(chartData);
 
   }catch(e){
+    chartPreSignal=null;
     chartInfo.textContent='⚠️ Dados temporariamente indisponíveis';
     if(!chartData.length) drawChart([]);
   }finally{
@@ -4947,6 +5089,7 @@ if(broker){
     updateMarketNote();
     lastSignalVoice='';
     chartData=[];
+    chartPreSignal=null;
     sig(true);
     rad();
     loadPreSignals();
@@ -4961,6 +5104,7 @@ if(brokerAccount){
     await refreshAccountStatus();
     lastSignalVoice='';
     chartData=[];
+    chartPreSignal=null;
     sig(true);
     rad();
     loadPreSignals();
@@ -5600,7 +5744,7 @@ setInterval(()=>{
   if(robotEnabled && chartTab.classList.contains('active')){
     loadChart();
   }
-},4000);
+},2000);
 
 setInterval(perf,30000);
 setInterval(()=>{
