@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.6.1")
+app = FastAPI(title="MEGA IA", version="33.10.1")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -1027,6 +1027,1026 @@ def htf_sr_rsi_macd_strategy(cs, h1=None, h4=None, interval="5min"):
     }
 
 
+
+def otc_bb_rsi_rejection(cs):
+    """Reversão OTC: Banda de Bollinger + RSI + rejeição por pavio."""
+    if len(cs) < 35:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC BB + RSI + rejeição"}
+
+    closes = [c["close"] for c in cs]
+    bb = bollinger(closes, 20, 2)
+    r = rsi(closes, 7)
+    if not bb or r is None:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Indicadores insuficientes.","strategy":"OTC BB + RSI + rejeição"}
+
+    last = cs[-1]
+    prev = cs[-2]
+    wi = wick_info(last)
+
+    call = (
+        (last["low"] <= bb["lower"] or prev["low"] <= bb["lower"])
+        and last["close"] > bb["lower"]
+        and r <= 34
+        and wi["call_wick"] >= 0.42
+        and last["close"] >= last["open"]
+    )
+    put = (
+        (last["high"] >= bb["upper"] or prev["high"] >= bb["upper"])
+        and last["close"] < bb["upper"]
+        and r >= 66
+        and wi["put_wick"] >= 0.42
+        and last["close"] <= last["open"]
+    )
+
+    if call:
+        return {"direction":"CALL","confidence":84,"confirmed":True,
+                "reason":"Rejeição da banda inferior com RSI baixo e pavio comprador.",
+                "strategy":"OTC BB + RSI + rejeição"}
+    if put:
+        return {"direction":"PUT","confidence":84,"confirmed":True,
+                "reason":"Rejeição da banda superior com RSI alto e pavio vendedor.",
+                "strategy":"OTC BB + RSI + rejeição"}
+
+    return {"direction":"NEUTRO","confidence":52,"confirmed":False,
+            "reason":"Sem rejeição completa nas bandas.","strategy":"OTC BB + RSI + rejeição"}
+
+
+def otc_stochastic_reversal(cs):
+    """Reversão curta OTC com Estocástico e confirmação da vela."""
+    if len(cs) < 35:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC Estocástico reversão"}
+
+    st = stochastic(cs, 14, 3, 3)
+    if not st:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Estocástico insuficiente.","strategy":"OTC Estocástico reversão"}
+
+    last = cs[-1]
+    wi = wick_info(last)
+
+    call = (
+        st["k"] <= 24 and st["d"] <= 26 and st["cross_up"]
+        and last["close"] > last["open"]
+        and wi["call_wick"] >= 0.25
+    )
+    put = (
+        st["k"] >= 76 and st["d"] >= 74 and st["cross_down"]
+        and last["close"] < last["open"]
+        and wi["put_wick"] >= 0.25
+    )
+
+    if call:
+        return {"direction":"CALL","confidence":82,"confirmed":True,
+                "reason":"Estocástico saiu da sobrevenda com vela compradora.",
+                "strategy":"OTC Estocástico reversão"}
+    if put:
+        return {"direction":"PUT","confidence":82,"confirmed":True,
+                "reason":"Estocástico saiu da sobrecompra com vela vendedora.",
+                "strategy":"OTC Estocástico reversão"}
+
+    return {"direction":"NEUTRO","confidence":49,"confirmed":False,
+            "reason":"Estocástico sem reversão confirmada.","strategy":"OTC Estocástico reversão"}
+
+
+def otc_ema_pullback(cs):
+    """Continuação OTC após pullback curto em EMA 9/21."""
+    if len(cs) < 35:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC EMA pullback"}
+
+    closes = [c["close"] for c in cs]
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+    r = rsi(closes, 7)
+    if None in (e9, e21, r):
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Indicadores insuficientes.","strategy":"OTC EMA pullback"}
+
+    last = cs[-1]
+    prev = cs[-2]
+    spread = abs(e9 - e21)
+    avg_range = sum(max(1e-12, c["high"]-c["low"]) for c in cs[-10:]) / 10.0
+    near_fast = abs(prev["close"] - e9) <= max(avg_range * .45, spread * 1.2)
+
+    call = (
+        e9 > e21 and near_fast
+        and last["close"] > last["open"]
+        and last["close"] > e9
+        and 52 <= r <= 69
+    )
+    put = (
+        e9 < e21 and near_fast
+        and last["close"] < last["open"]
+        and last["close"] < e9
+        and 31 <= r <= 48
+    )
+
+    if call:
+        return {"direction":"CALL","confidence":81,"confirmed":True,
+                "reason":"Pullback curto na EMA 9 dentro de tendência compradora.",
+                "strategy":"OTC EMA pullback"}
+    if put:
+        return {"direction":"PUT","confidence":81,"confirmed":True,
+                "reason":"Pullback curto na EMA 9 dentro de tendência vendedora.",
+                "strategy":"OTC EMA pullback"}
+
+    return {"direction":"NEUTRO","confidence":48,"confirmed":False,
+            "reason":"Sem pullback alinhado à tendência curta.","strategy":"OTC EMA pullback"}
+
+
+def otc_exhaustion_reversal(cs):
+    """Exaustão OTC: sequência de velas + rejeição no extremo."""
+    if len(cs) < 12:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC exaustão 3 velas"}
+
+    seq = cs[-4:-1]
+    last = cs[-1]
+    wi = wick_info(last)
+    closes = [c["close"] for c in cs]
+    r = rsi(closes, 7)
+
+    three_down = all(c["close"] < c["open"] for c in seq)
+    three_up = all(c["close"] > c["open"] for c in seq)
+
+    call = (
+        three_down and last["close"] > last["open"]
+        and wi["call_wick"] >= 0.38
+        and r is not None and r <= 38
+    )
+    put = (
+        three_up and last["close"] < last["open"]
+        and wi["put_wick"] >= 0.38
+        and r is not None and r >= 62
+    )
+
+    if call:
+        return {"direction":"CALL","confidence":80,"confirmed":True,
+                "reason":"Sequência vendedora mostrou exaustão e rejeição compradora.",
+                "strategy":"OTC exaustão 3 velas"}
+    if put:
+        return {"direction":"PUT","confidence":80,"confirmed":True,
+                "reason":"Sequência compradora mostrou exaustão e rejeição vendedora.",
+                "strategy":"OTC exaustão 3 velas"}
+
+    return {"direction":"NEUTRO","confidence":46,"confirmed":False,
+            "reason":"Sem exaustão confirmada.","strategy":"OTC exaustão 3 velas"}
+
+
+def otc_local_sr_rejection(cs):
+    """Suporte/resistência local OTC usando extremos recentes e rejeição."""
+    if len(cs) < 30:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC suporte/resistência local"}
+
+    recent = cs[-21:-1]
+    last = cs[-1]
+    support = min(c["low"] for c in recent)
+    resistance = max(c["high"] for c in recent)
+    span = max(1e-12, resistance - support)
+    tolerance = span * 0.08
+    wi = wick_info(last)
+
+    call = (
+        last["low"] <= support + tolerance
+        and last["close"] > last["open"]
+        and wi["call_wick"] >= 0.40
+        and last["close"] > support
+    )
+    put = (
+        last["high"] >= resistance - tolerance
+        and last["close"] < last["open"]
+        and wi["put_wick"] >= 0.40
+        and last["close"] < resistance
+    )
+
+    if call:
+        return {"direction":"CALL","confidence":83,"confirmed":True,
+                "reason":"Rejeição compradora em suporte local recente.",
+                "strategy":"OTC suporte/resistência local"}
+    if put:
+        return {"direction":"PUT","confidence":83,"confirmed":True,
+                "reason":"Rejeição vendedora em resistência local recente.",
+                "strategy":"OTC suporte/resistência local"}
+
+    return {"direction":"NEUTRO","confidence":50,"confirmed":False,
+            "reason":"Preço fora de zona local de rejeição.","strategy":"OTC suporte/resistência local"}
+
+
+def otc_micro_macd(cs):
+    """Momentum curto OTC com MACD 6/13/5 e filtro RSI."""
+    if len(cs) < 35:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC MACD curto 6/13/5"}
+
+    closes = [c["close"] for c in cs]
+    snap = _macd_snapshot(closes, 6, 13, 5)
+    r = rsi(closes, 7)
+    if not snap or r is None:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"MACD curto insuficiente.","strategy":"OTC MACD curto 6/13/5"}
+
+    call = snap.get("cross_up") and snap.get("hist", 0) > 0 and 50 < r < 70
+    put = snap.get("cross_down") and snap.get("hist", 0) < 0 and 30 < r < 50
+
+    if call:
+        return {"direction":"CALL","confidence":80,"confirmed":True,
+                "reason":"MACD curto cruzou para cima com RSI favorável.",
+                "strategy":"OTC MACD curto 6/13/5"}
+    if put:
+        return {"direction":"PUT","confidence":80,"confirmed":True,
+                "reason":"MACD curto cruzou para baixo com RSI favorável.",
+                "strategy":"OTC MACD curto 6/13/5"}
+
+    return {"direction":"NEUTRO","confidence":47,"confirmed":False,
+            "reason":"MACD curto sem confirmação.","strategy":"OTC MACD curto 6/13/5"}
+
+
+
+def _otc_candle_context(cs):
+    """Contexto curto para validar padrões de vela OTC."""
+    if len(cs) < 25:
+        return None
+
+    recent = cs[-21:-1]
+    support = min(c["low"] for c in recent)
+    resistance = max(c["high"] for c in recent)
+    span = max(1e-12, resistance - support)
+    tolerance = span * 0.10
+
+    closes = [c["close"] for c in cs]
+    r7 = rsi(closes, 7)
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+
+    return {
+        "support": support,
+        "resistance": resistance,
+        "tolerance": tolerance,
+        "rsi7": r7,
+        "ema9": e9,
+        "ema21": e21,
+    }
+
+
+def otc_candle_engulfing(cs):
+    """Engolfo de alta/baixa com contexto de extremo local."""
+    if len(cs) < 25:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC Engolfo"}
+
+    ctx = _otc_candle_context(cs)
+    if not ctx:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Contexto insuficiente.","strategy":"OTC Engolfo"}
+
+    a, b = cs[-2], cs[-1]
+    a_body = abs(a["close"] - a["open"])
+    b_body = abs(b["close"] - b["open"])
+
+    bull = (
+        a["close"] < a["open"]
+        and b["close"] > b["open"]
+        and b["open"] <= a["close"]
+        and b["close"] >= a["open"]
+        and b_body >= a_body * 1.05
+        and b["low"] <= ctx["support"] + ctx["tolerance"]
+        and ctx["rsi7"] is not None
+        and ctx["rsi7"] <= 44
+    )
+
+    bear = (
+        a["close"] > a["open"]
+        and b["close"] < b["open"]
+        and b["open"] >= a["close"]
+        and b["close"] <= a["open"]
+        and b_body >= a_body * 1.05
+        and b["high"] >= ctx["resistance"] - ctx["tolerance"]
+        and ctx["rsi7"] is not None
+        and ctx["rsi7"] >= 56
+    )
+
+    if bull:
+        return {"direction":"CALL","confidence":86,"confirmed":True,
+                "reason":"Engolfo comprador em região de suporte local com RSI favorável.",
+                "strategy":"OTC Engolfo"}
+    if bear:
+        return {"direction":"PUT","confidence":86,"confirmed":True,
+                "reason":"Engolfo vendedor em região de resistência local com RSI favorável.",
+                "strategy":"OTC Engolfo"}
+
+    return {"direction":"NEUTRO","confidence":50,"confirmed":False,
+            "reason":"Engolfo sem contexto suficiente.","strategy":"OTC Engolfo"}
+
+
+def otc_candle_hammer_star(cs):
+    """Martelo e Shooting Star com pavio dominante e zona local."""
+    if len(cs) < 25:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC Martelo/Shooting Star"}
+
+    ctx = _otc_candle_context(cs)
+    last = cs[-1]
+    wi = wick_info(last)
+    body = max(abs(last["close"] - last["open"]), 1e-12)
+    lower = min(last["open"], last["close"]) - last["low"]
+    upper = last["high"] - max(last["open"], last["close"])
+
+    hammer = (
+        lower >= body * 2.0
+        and upper <= body * 0.8
+        and wi["body_ratio"] <= 0.42
+        and last["low"] <= ctx["support"] + ctx["tolerance"]
+        and ctx["rsi7"] is not None
+        and ctx["rsi7"] <= 42
+    )
+
+    shooting = (
+        upper >= body * 2.0
+        and lower <= body * 0.8
+        and wi["body_ratio"] <= 0.42
+        and last["high"] >= ctx["resistance"] - ctx["tolerance"]
+        and ctx["rsi7"] is not None
+        and ctx["rsi7"] >= 58
+    )
+
+    if hammer:
+        return {"direction":"CALL","confidence":85,"confirmed":True,
+                "reason":"Martelo com forte rejeição em suporte local.",
+                "strategy":"OTC Martelo/Shooting Star"}
+    if shooting:
+        return {"direction":"PUT","confidence":85,"confirmed":True,
+                "reason":"Shooting Star com forte rejeição em resistência local.",
+                "strategy":"OTC Martelo/Shooting Star"}
+
+    return {"direction":"NEUTRO","confidence":49,"confirmed":False,
+            "reason":"Sem Martelo/Shooting Star validado no contexto.",
+            "strategy":"OTC Martelo/Shooting Star"}
+
+
+def otc_candle_tweezer(cs):
+    """Tweezer Bottom/Top em dois candles próximos do mesmo extremo."""
+    if len(cs) < 25:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC Tweezer"}
+
+    ctx = _otc_candle_context(cs)
+    a, b = cs[-2], cs[-1]
+    local_range = sum(max(1e-12, c["high"] - c["low"]) for c in cs[-10:]) / 10.0
+    tol = local_range * 0.16
+
+    bottom = (
+        abs(a["low"] - b["low"]) <= tol
+        and a["close"] < a["open"]
+        and b["close"] > b["open"]
+        and min(a["low"], b["low"]) <= ctx["support"] + ctx["tolerance"]
+        and ctx["rsi7"] is not None
+        and ctx["rsi7"] <= 45
+    )
+
+    top = (
+        abs(a["high"] - b["high"]) <= tol
+        and a["close"] > a["open"]
+        and b["close"] < b["open"]
+        and max(a["high"], b["high"]) >= ctx["resistance"] - ctx["tolerance"]
+        and ctx["rsi7"] is not None
+        and ctx["rsi7"] >= 55
+    )
+
+    if bottom:
+        return {"direction":"CALL","confidence":83,"confirmed":True,
+                "reason":"Tweezer Bottom em suporte local.",
+                "strategy":"OTC Tweezer"}
+    if top:
+        return {"direction":"PUT","confidence":83,"confirmed":True,
+                "reason":"Tweezer Top em resistência local.",
+                "strategy":"OTC Tweezer"}
+
+    return {"direction":"NEUTRO","confidence":47,"confirmed":False,
+            "reason":"Sem Tweezer confirmado.","strategy":"OTC Tweezer"}
+
+
+def otc_candle_morning_evening_star(cs):
+    """Morning Star e Evening Star adaptados ao fluxo OTC."""
+    if len(cs) < 26:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC Morning/Evening Star"}
+
+    ctx = _otc_candle_context(cs)
+    a, b, c = cs[-3], cs[-2], cs[-1]
+
+    a_body = abs(a["close"] - a["open"])
+    b_body = abs(b["close"] - b["open"])
+    c_body = abs(c["close"] - c["open"])
+
+    mid_a = (a["open"] + a["close"]) / 2.0
+
+    morning = (
+        a["close"] < a["open"]
+        and a_body > 0
+        and b_body <= a_body * 0.55
+        and c["close"] > c["open"]
+        and c_body >= a_body * 0.55
+        and c["close"] > mid_a
+        and min(a["low"], b["low"], c["low"]) <= ctx["support"] + ctx["tolerance"]
+        and ctx["rsi7"] is not None
+        and ctx["rsi7"] <= 46
+    )
+
+    evening = (
+        a["close"] > a["open"]
+        and a_body > 0
+        and b_body <= a_body * 0.55
+        and c["close"] < c["open"]
+        and c_body >= a_body * 0.55
+        and c["close"] < mid_a
+        and max(a["high"], b["high"], c["high"]) >= ctx["resistance"] - ctx["tolerance"]
+        and ctx["rsi7"] is not None
+        and ctx["rsi7"] >= 54
+    )
+
+    if morning:
+        return {"direction":"CALL","confidence":87,"confirmed":True,
+                "reason":"Morning Star em zona de suporte com reversão confirmada.",
+                "strategy":"OTC Morning/Evening Star"}
+    if evening:
+        return {"direction":"PUT","confidence":87,"confirmed":True,
+                "reason":"Evening Star em zona de resistência com reversão confirmada.",
+                "strategy":"OTC Morning/Evening Star"}
+
+    return {"direction":"NEUTRO","confidence":51,"confirmed":False,
+            "reason":"Sem Morning/Evening Star confirmado.",
+            "strategy":"OTC Morning/Evening Star"}
+
+
+def otc_candle_pinbar(cs):
+    """Pin Bar de rejeição com filtro de posição e RSI."""
+    if len(cs) < 25:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC Pin Bar"}
+
+    ctx = _otc_candle_context(cs)
+    last = cs[-1]
+    wi = wick_info(last)
+
+    bull = (
+        wi["call_wick"] >= 0.58
+        and wi["body_ratio"] <= 0.32
+        and last["low"] <= ctx["support"] + ctx["tolerance"]
+        and ctx["rsi7"] is not None
+        and ctx["rsi7"] <= 43
+    )
+
+    bear = (
+        wi["put_wick"] >= 0.58
+        and wi["body_ratio"] <= 0.32
+        and last["high"] >= ctx["resistance"] - ctx["tolerance"]
+        and ctx["rsi7"] is not None
+        and ctx["rsi7"] >= 57
+    )
+
+    if bull:
+        return {"direction":"CALL","confidence":84,"confirmed":True,
+                "reason":"Pin Bar comprador rejeitando suporte local.",
+                "strategy":"OTC Pin Bar"}
+    if bear:
+        return {"direction":"PUT","confidence":84,"confirmed":True,
+                "reason":"Pin Bar vendedor rejeitando resistência local.",
+                "strategy":"OTC Pin Bar"}
+
+    return {"direction":"NEUTRO","confidence":48,"confirmed":False,
+            "reason":"Pin Bar sem contexto de reversão.","strategy":"OTC Pin Bar"}
+
+
+def otc_candle_inside_breakout(cs):
+    """Inside Bar + rompimento da máxima/mínima da barra-mãe."""
+    if len(cs) < 26:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC Inside Bar rompimento"}
+
+    mother, inside, last = cs[-3], cs[-2], cs[-1]
+    closes = [c["close"] for c in cs]
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+
+    is_inside = (
+        inside["high"] < mother["high"]
+        and inside["low"] > mother["low"]
+    )
+
+    call = (
+        is_inside
+        and last["close"] > mother["high"]
+        and last["close"] > last["open"]
+        and e9 is not None and e21 is not None
+        and e9 >= e21
+    )
+
+    put = (
+        is_inside
+        and last["close"] < mother["low"]
+        and last["close"] < last["open"]
+        and e9 is not None and e21 is not None
+        and e9 <= e21
+    )
+
+    if call:
+        return {"direction":"CALL","confidence":81,"confirmed":True,
+                "reason":"Inside Bar rompeu para cima alinhado à tendência curta.",
+                "strategy":"OTC Inside Bar rompimento"}
+    if put:
+        return {"direction":"PUT","confidence":81,"confirmed":True,
+                "reason":"Inside Bar rompeu para baixo alinhado à tendência curta.",
+                "strategy":"OTC Inside Bar rompimento"}
+
+    return {"direction":"NEUTRO","confidence":46,"confirmed":False,
+            "reason":"Inside Bar sem rompimento válido.",
+            "strategy":"OTC Inside Bar rompimento"}
+
+
+def otc_candle_doji_reversal(cs):
+    """Doji de indecisão seguido de confirmação direcional."""
+    if len(cs) < 26:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC Doji reversão"}
+
+    ctx = _otc_candle_context(cs)
+    doji, confirm = cs[-2], cs[-1]
+    doji_wi = wick_info(doji)
+
+    is_doji = doji_wi["body_ratio"] <= 0.12
+
+    call = (
+        is_doji
+        and doji["low"] <= ctx["support"] + ctx["tolerance"]
+        and confirm["close"] > confirm["open"]
+        and confirm["close"] > doji["high"]
+        and ctx["rsi7"] is not None
+        and ctx["rsi7"] <= 48
+    )
+
+    put = (
+        is_doji
+        and doji["high"] >= ctx["resistance"] - ctx["tolerance"]
+        and confirm["close"] < confirm["open"]
+        and confirm["close"] < doji["low"]
+        and ctx["rsi7"] is not None
+        and ctx["rsi7"] >= 52
+    )
+
+    if call:
+        return {"direction":"CALL","confidence":82,"confirmed":True,
+                "reason":"Doji em suporte seguido de confirmação compradora.",
+                "strategy":"OTC Doji reversão"}
+    if put:
+        return {"direction":"PUT","confidence":82,"confirmed":True,
+                "reason":"Doji em resistência seguido de confirmação vendedora.",
+                "strategy":"OTC Doji reversão"}
+
+    return {"direction":"NEUTRO","confidence":45,"confirmed":False,
+            "reason":"Doji sem confirmação direcional.",
+            "strategy":"OTC Doji reversão"}
+
+
+def _otc_swing_points(cs, left=2, right=2):
+    """Detecta pivôs locais simples sem usar candles futuros além da janela disponível."""
+    highs, lows = [], []
+    n = len(cs)
+
+    for i in range(left, n - right):
+        h = cs[i]["high"]
+        l = cs[i]["low"]
+
+        if all(h >= cs[j]["high"] for j in range(i-left, i+right+1) if j != i):
+            highs.append({"index": i, "price": h, "time": cs[i].get("datetime")})
+
+        if all(l <= cs[j]["low"] for j in range(i-left, i+right+1) if j != i):
+            lows.append({"index": i, "price": l, "time": cs[i].get("datetime")})
+
+    return highs, lows
+
+
+def _otc_cluster_zones(points, tolerance):
+    """Agrupa pivôs próximos e mede quantas vezes a região foi respeitada."""
+    zones = []
+
+    for p in points:
+        price = float(p["price"])
+        matched = None
+
+        for z in zones:
+            if abs(price - z["price"]) <= tolerance:
+                matched = z
+                break
+
+        if matched is None:
+            zones.append({
+                "price": price,
+                "touches": 1,
+                "last_index": p["index"],
+            })
+        else:
+            t = matched["touches"]
+            matched["price"] = (matched["price"] * t + price) / (t + 1)
+            matched["touches"] = t + 1
+            matched["last_index"] = max(matched["last_index"], p["index"])
+
+    zones.sort(key=lambda z: (z["touches"], z["last_index"]), reverse=True)
+    return zones
+
+
+def otc_market_structure_map(cs):
+    """
+    Mapeia estrutura OTC: suportes, resistências, regiões fortes e tendência curta.
+    Isso é leitura de preço; não presume manipulação real da corretora.
+    """
+    if len(cs) < 35:
+        return None
+
+    sample = cs[-80:] if len(cs) > 80 else cs
+    ranges = [max(1e-12, c["high"] - c["low"]) for c in sample[-20:]]
+    avg_range = sum(ranges) / len(ranges)
+    tolerance = avg_range * 0.45
+
+    highs, lows = _otc_swing_points(sample, 2, 2)
+    rz = _otc_cluster_zones(highs, tolerance)
+    sz = _otc_cluster_zones(lows, tolerance)
+
+    current = float(sample[-1]["close"])
+    supports = [z for z in sz if z["price"] <= current + tolerance]
+    resistances = [z for z in rz if z["price"] >= current - tolerance]
+
+    nearest_support = max(supports, key=lambda z: z["price"], default=None)
+    nearest_resistance = min(resistances, key=lambda z: z["price"], default=None)
+
+    closes = [c["close"] for c in sample]
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+
+    if e9 is not None and e21 is not None and e9 > e21:
+        trend = "UP"
+    elif e9 is not None and e21 is not None and e9 < e21:
+        trend = "DOWN"
+    else:
+        trend = "FLAT"
+
+    return {
+        "avg_range": avg_range,
+        "tolerance": tolerance,
+        "nearest_support": nearest_support,
+        "nearest_resistance": nearest_resistance,
+        "strong_supports": [z for z in supports if z["touches"] >= 2][:3],
+        "strong_resistances": [z for z in resistances if z["touches"] >= 2][:3],
+        "trend": trend,
+        "ema9": e9,
+        "ema21": e21,
+    }
+
+
+def otc_strong_zone_rejection(cs):
+    """Entrada por rejeição em região forte tocada pelo menos duas vezes."""
+    smap = otc_market_structure_map(cs)
+    if not smap:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Estrutura insuficiente.","strategy":"OTC Região forte"}
+
+    last = cs[-1]
+    wi = wick_info(last)
+    tol = smap["tolerance"]
+    sup = smap["nearest_support"]
+    res = smap["nearest_resistance"]
+
+    call = (
+        sup is not None
+        and sup["touches"] >= 2
+        and last["low"] <= sup["price"] + tol
+        and last["close"] > sup["price"]
+        and wi["call_wick"] >= 0.38
+        and last["close"] >= last["open"]
+    )
+
+    put = (
+        res is not None
+        and res["touches"] >= 2
+        and last["high"] >= res["price"] - tol
+        and last["close"] < res["price"]
+        and wi["put_wick"] >= 0.38
+        and last["close"] <= last["open"]
+    )
+
+    if call:
+        return {"direction":"CALL","confidence":86,"confirmed":True,
+                "reason":f"Rejeição em suporte forte com {sup['touches']} toques.",
+                "strategy":"OTC Região forte"}
+    if put:
+        return {"direction":"PUT","confidence":86,"confirmed":True,
+                "reason":f"Rejeição em resistência forte com {res['touches']} toques.",
+                "strategy":"OTC Região forte"}
+
+    return {"direction":"NEUTRO","confidence":52,"confirmed":False,
+            "reason":"Sem rejeição válida em região forte.","strategy":"OTC Região forte"}
+
+
+def otc_liquidity_sweep(cs):
+    """
+    Detecta sweep/falso rompimento de máxima ou mínima recente.
+    É um proxy técnico de caça de liquidez; não afirma manipulação real do gráfico.
+    """
+    if len(cs) < 25:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC Sweep de liquidez"}
+
+    last = cs[-1]
+    prev = cs[-13:-1]
+    recent_high = max(c["high"] for c in prev)
+    recent_low = min(c["low"] for c in prev)
+    wi = wick_info(last)
+
+    bull_sweep = (
+        last["low"] < recent_low
+        and last["close"] > recent_low
+        and last["close"] > last["open"]
+        and wi["call_wick"] >= 0.42
+    )
+
+    bear_sweep = (
+        last["high"] > recent_high
+        and last["close"] < recent_high
+        and last["close"] < last["open"]
+        and wi["put_wick"] >= 0.42
+    )
+
+    if bull_sweep:
+        return {"direction":"CALL","confidence":88,"confirmed":True,
+                "reason":"Varreu mínima recente e fechou novamente acima: possível sweep de liquidez.",
+                "strategy":"OTC Sweep de liquidez"}
+    if bear_sweep:
+        return {"direction":"PUT","confidence":88,"confirmed":True,
+                "reason":"Varreu máxima recente e fechou novamente abaixo: possível sweep de liquidez.",
+                "strategy":"OTC Sweep de liquidez"}
+
+    return {"direction":"NEUTRO","confidence":50,"confirmed":False,
+            "reason":"Sem falso rompimento/sweep confirmado.","strategy":"OTC Sweep de liquidez"}
+
+
+def otc_break_retest(cs):
+    """Rompimento de região recente seguido de reteste e rejeição."""
+    if len(cs) < 30:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC Rompimento + reteste"}
+
+    last = cs[-1]
+    prev = cs[-2]
+    base = cs[-16:-2]
+
+    hi = max(c["high"] for c in base)
+    lo = min(c["low"] for c in base)
+
+    avg_range = sum(max(1e-12, c["high"]-c["low"]) for c in cs[-12:]) / 12.0
+    tol = avg_range * 0.30
+    wi = wick_info(last)
+
+    call = (
+        prev["close"] > hi
+        and last["low"] <= hi + tol
+        and last["close"] > hi
+        and last["close"] > last["open"]
+        and wi["call_wick"] >= 0.20
+    )
+
+    put = (
+        prev["close"] < lo
+        and last["high"] >= lo - tol
+        and last["close"] < lo
+        and last["close"] < last["open"]
+        and wi["put_wick"] >= 0.20
+    )
+
+    if call:
+        return {"direction":"CALL","confidence":84,"confirmed":True,
+                "reason":"Rompimento de resistência com reteste comprador.",
+                "strategy":"OTC Rompimento + reteste"}
+    if put:
+        return {"direction":"PUT","confidence":84,"confirmed":True,
+                "reason":"Rompimento de suporte com reteste vendedor.",
+                "strategy":"OTC Rompimento + reteste"}
+
+    return {"direction":"NEUTRO","confidence":48,"confirmed":False,
+            "reason":"Sem rompimento e reteste confirmados.","strategy":"OTC Rompimento + reteste"}
+
+
+def otc_displacement_reversal(cs):
+    """Detecta candle de deslocamento forte chegando em região extrema, seguido de rejeição."""
+    if len(cs) < 30:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC Deslocamento + rejeição"}
+
+    smap = otc_market_structure_map(cs)
+    if not smap:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Estrutura insuficiente.","strategy":"OTC Deslocamento + rejeição"}
+
+    impulse = cs[-2]
+    last = cs[-1]
+    impulse_range = max(1e-12, impulse["high"] - impulse["low"])
+    impulse_body = abs(impulse["close"] - impulse["open"])
+    strong = impulse_body >= smap["avg_range"] * 0.9 and impulse_body / impulse_range >= 0.65
+
+    sup = smap["nearest_support"]
+    res = smap["nearest_resistance"]
+    tol = smap["tolerance"]
+    wi = wick_info(last)
+
+    call = (
+        strong
+        and impulse["close"] < impulse["open"]
+        and sup is not None
+        and impulse["low"] <= sup["price"] + tol
+        and last["close"] > last["open"]
+        and wi["call_wick"] >= 0.30
+    )
+
+    put = (
+        strong
+        and impulse["close"] > impulse["open"]
+        and res is not None
+        and impulse["high"] >= res["price"] - tol
+        and last["close"] < last["open"]
+        and wi["put_wick"] >= 0.30
+    )
+
+    if call:
+        return {"direction":"CALL","confidence":83,"confirmed":True,
+                "reason":"Deslocamento vendedor forte encontrou suporte e sofreu rejeição.",
+                "strategy":"OTC Deslocamento + rejeição"}
+    if put:
+        return {"direction":"PUT","confidence":83,"confirmed":True,
+                "reason":"Deslocamento comprador forte encontrou resistência e sofreu rejeição.",
+                "strategy":"OTC Deslocamento + rejeição"}
+
+    return {"direction":"NEUTRO","confidence":47,"confirmed":False,
+            "reason":"Sem deslocamento extremo com rejeição.","strategy":"OTC Deslocamento + rejeição"}
+
+
+def otc_structure_bias(cs):
+    """Leitura de sequência de pivôs: HH/HL ou LH/LL."""
+    if len(cs) < 35:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,
+                "reason":"Poucos candles.","strategy":"OTC Estrutura de mercado"}
+
+    highs, lows = _otc_swing_points(cs[-60:], 2, 2)
+
+    if len(highs) < 2 or len(lows) < 2:
+        return {"direction":"NEUTRO","confidence":45,"confirmed":False,
+                "reason":"Poucos pivôs confiáveis.","strategy":"OTC Estrutura de mercado"}
+
+    h1, h2 = highs[-2], highs[-1]
+    l1, l2 = lows[-2], lows[-1]
+    last = cs[-1]
+
+    up = h2["price"] > h1["price"] and l2["price"] > l1["price"] and last["close"] > last["open"]
+    down = h2["price"] < h1["price"] and l2["price"] < l1["price"] and last["close"] < last["open"]
+
+    if up:
+        return {"direction":"CALL","confidence":80,"confirmed":True,
+                "reason":"Estrutura com máxima e mínima ascendentes (HH/HL).",
+                "strategy":"OTC Estrutura de mercado"}
+    if down:
+        return {"direction":"PUT","confidence":80,"confirmed":True,
+                "reason":"Estrutura com máxima e mínima descendentes (LH/LL).",
+                "strategy":"OTC Estrutura de mercado"}
+
+    return {"direction":"NEUTRO","confidence":46,"confirmed":False,
+            "reason":"Estrutura sem direção limpa.","strategy":"OTC Estrutura de mercado"}
+
+
+def otc_noise_filter(cs):
+    """
+    Filtro de proteção contra gráfico errático:
+    evita entrada quando a última vela é anormalmente grande ou quando há alternância excessiva.
+    """
+    if len(cs) < 20:
+        return {"blocked": True, "reason": "Poucos candles para filtro de ruído."}
+
+    recent = cs[-12:]
+    ranges = [max(1e-12, c["high"] - c["low"]) for c in recent[:-1]]
+    avg_range = sum(ranges) / len(ranges)
+    last_range = max(1e-12, recent[-1]["high"] - recent[-1]["low"])
+
+    colors = [1 if c["close"] > c["open"] else -1 if c["close"] < c["open"] else 0 for c in recent[-8:]]
+    flips = sum(1 for a, b in zip(colors, colors[1:]) if a and b and a != b)
+
+    if last_range > avg_range * 2.8:
+        return {"blocked": True, "reason": "Vela anormalmente grande; aguardando normalização."}
+
+    if flips >= 6:
+        return {"blocked": True, "reason": "Mercado muito alternado/ruidoso no curto prazo."}
+
+    return {"blocked": False, "reason": "Fluxo aceitável."}
+
+def otc_engine(cs, context=None):
+    """
+    Motor EXCLUSIVO para OTC.
+    Observa padrões, estrutura, regiões fortes e falsos rompimentos.
+    """
+    noise = otc_noise_filter(cs)
+    structure_map = otc_market_structure_map(cs)
+
+    strategies = [
+        # Estratégias técnicas OTC
+        otc_bb_rsi_rejection(cs),
+        otc_stochastic_reversal(cs),
+        otc_ema_pullback(cs),
+        otc_exhaustion_reversal(cs),
+        otc_local_sr_rejection(cs),
+        otc_micro_macd(cs),
+
+        # Estratégias exclusivas de padrões de vela OTC
+        otc_candle_engulfing(cs),
+        otc_candle_hammer_star(cs),
+        otc_candle_tweezer(cs),
+        otc_candle_morning_evening_star(cs),
+        otc_candle_pinbar(cs),
+        otc_candle_inside_breakout(cs),
+        otc_candle_doji_reversal(cs),
+
+        # Leitura estrutural do gráfico OTC
+        otc_strong_zone_rejection(cs),
+        otc_liquidity_sweep(cs),
+        otc_break_retest(cs),
+        otc_displacement_reversal(cs),
+        otc_structure_bias(cs),
+    ]
+
+    if noise.get("blocked"):
+        best = max((float(x.get("confidence", 0)) for x in strategies), default=0)
+        return {
+            "direction": "NEUTRO",
+            "confidence": round(min(best, 65), 1),
+            "confirmed": False,
+            "strategy": "Motor OTC multiestratégia",
+            "reason": noise.get("reason", "Filtro de ruído bloqueou a entrada."),
+            "strategies": strategies,
+            "engine": "OTC",
+            "structure": structure_map,
+            "noise_filter": noise,
+        }
+
+    confirmed = [
+        x for x in strategies
+        if x.get("confirmed") and x.get("direction") in ("CALL", "PUT")
+    ]
+    calls = [x for x in confirmed if x["direction"] == "CALL"]
+    puts = [x for x in confirmed if x["direction"] == "PUT"]
+
+    winner = calls if len(calls) > len(puts) else puts if len(puts) > len(calls) else []
+
+    if winner:
+        direction = winner[0]["direction"]
+        avg = sum(float(x.get("confidence", 0)) for x in winner) / len(winner)
+
+        # Preferência: pelo menos 2 estratégias OTC concordando.
+        # Com vários detectores de padrão, exigimos pelo menos 2 confirmações.
+        if len(winner) >= 2:
+            conf = min(96, avg + 3 + min(4, len(winner)-2))
+            return {
+                "direction": direction,
+                "confidence": round(conf, 1),
+                "confirmed": True,
+                "strategy": "Motor OTC multiestratégia",
+                "reason": f"{len(winner)} estratégias OTC em confluência.",
+                "strategies": strategies,
+                "engine": "OTC",
+                "structure": structure_map,
+                "noise_filter": noise,
+            }
+
+        # Um único padrão/indicador não libera sinal OTC.
+        # O motor aguarda outra confirmação independente.
+
+    best = max((float(x.get("confidence", 0)) for x in strategies), default=0)
+    return {
+        "direction": "NEUTRO",
+        "confidence": round(min(best, 69), 1),
+        "confirmed": False,
+        "strategy": "Motor OTC multiestratégia",
+        "reason": "Sem confluência suficiente nas estratégias OTC.",
+        "strategies": strategies,
+        "engine": "OTC",
+        "structure": structure_map,
+        "noise_filter": noise,
+    }
+
+
+def strategy_engine_for_market(cs, market="OPEN", context=None):
+    market = (market or "OPEN").upper()
+    if market in ("IQ_OTC", "OLYMP_OTC"):
+        return otc_engine(cs, context)
+    return local_engine(cs, context)
+
 def local_engine(cs, context=None):
     context = context or {}
     strategies = [
@@ -1789,11 +2809,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     closed = raw[:-1] if len(raw) > 1 else raw
 
-    # Estratégia multi-timeframe: H1/H4 servem somente como mapa de zonas.
-    # Se a fonte superior falhar, as outras estratégias continuam funcionando.
+    # Mercado aberto mantém as estratégias/indicadores já existentes,
+    # incluindo o mapa H1/H4. OTC usa SOMENTE o motor OTC próprio.
     h1_closed = None
     h4_closed = None
-    if interval in ("5min", "15min"):
+
+    if market == "OPEN" and interval in ("5min", "15min"):
         try:
             h1_raw, h4_raw = await asyncio.gather(
                 candles(symbol, "1h", 100, market, iq_state, request=request),
@@ -1805,8 +2826,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             h1_closed = None
             h4_closed = None
 
-    analysis = local_engine(
+    analysis = strategy_engine_for_market(
         closed,
+        market,
         {
             "h1": h1_closed,
             "h4": h4_closed,
@@ -1830,7 +2852,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         "entry_time": None,
         "announce_time": None,
         "expiry_time": None,
-        "status": "MONITORANDO",
+        "status": "MONITORANDO OTC" if market in ("IQ_OTC", "OLYMP_OTC") else "MONITORANDO MERCADO ABERTO",
         "ai_confirmed": False,
         "risk": "HIGH",
         "strategy": analysis["strategy"],
@@ -1921,7 +2943,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.6.1",
+        "version": "33.10.1",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -2415,7 +3437,7 @@ async def ai_analysis(request: Request, symbol: str = "EUR/USD", interval: str =
     return {k: data.get(k) for k in public_keys}
 
 
-def _pre_signal_from_live_candle(raw, interval: str):
+def _pre_signal_from_live_candle(raw, interval: str, market: str = "OPEN"):
     """
     Pré-sinal NÃO confirmado.
     Avalia a vela atual ainda em formação como se fechasse naquele instante.
@@ -2424,7 +3446,11 @@ def _pre_signal_from_live_candle(raw, interval: str):
     if not raw or len(raw) < 35:
         return None
 
-    preview = local_engine(raw, {"interval": interval})
+    preview = strategy_engine_for_market(
+        raw,
+        market,
+        {"interval": interval},
+    )
 
     if not preview.get("confirmed"):
         return None
@@ -2539,7 +3565,7 @@ async def pre_signals(
                 request=request,
             )
 
-            preview = _pre_signal_from_live_candle(raw, interval)
+            preview = _pre_signal_from_live_candle(raw, interval, market)
 
             if preview:
                 pre_signal_cache[key] = {
@@ -2651,7 +3677,11 @@ async def radar(request: Request, interval="1min", market="OPEN"):
     try:
         raw = await candles(sym, interval, 90, market, iq_state, request=request)
         if len(raw) >= 25:
-            tech = local_engine(raw[:-1] if len(raw) > 1 else raw, {"interval": interval})
+            tech = strategy_engine_for_market(
+                raw[:-1] if len(raw) > 1 else raw,
+                market,
+                {"interval": interval},
+            )
             direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
             item = {
                 "symbol": sym + suffix,
@@ -3017,7 +4047,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <option>30min</option>
     </select>
 
-    <button id="voiceBtn" onclick="voice()">🔊 Ativar voz</button>
+    <button id="robotPowerBtn" type="button" style="font-weight:900">🟢 ONLINE</button>
+    <button id="voiceBtn" type="button" onclick="voice()" style="font-weight:900">🔇 VOZ OFFLINE</button>
     <div id="otcNote" class="label" style="display:none"></div>
   </div>
 
@@ -3259,7 +4290,12 @@ try{
   setTimeout(()=>syncBroker(savedBroker),0);
 }catch(_){}
 const interval=document.getElementById('interval');
+const robotPowerBtn=document.getElementById('robotPowerBtn');
 const voiceBtn=document.getElementById('voiceBtn');
+let robotEnabled=true;
+try{
+  robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
+}catch(_){}
 const otcNote=document.getElementById('otcNote');
 const preSignalLimit=document.getElementById('preSignalLimit');
 const preSignals=document.getElementById('preSignals');
@@ -3318,6 +4354,11 @@ const S=document.getElementById('symbol');
 
 let cur=null;
 let voiceEnabled=false;
+try{
+  voiceEnabled=localStorage.getItem('mega_voice_power')==='ONLINE';
+}catch(_){
+  voiceEnabled=false;
+}
 let lastSignalVoice='';
 let lastAnalysis=0;
 let fifteen=false;
@@ -3466,11 +4507,48 @@ function speak(t){
   speechSynthesis.speak(u);
 }
 
+function applyVoiceState(){
+  if(!voiceBtn) return;
+
+  if(voiceEnabled){
+    voiceBtn.textContent='🔊 VOZ ONLINE';
+    voiceBtn.style.background='#0b7a3d';
+    voiceBtn.style.color='#fff';
+    voiceBtn.style.borderColor='#16c56b';
+  }else{
+    voiceBtn.textContent='🔇 VOZ OFFLINE';
+    voiceBtn.style.background='#7d1d1d';
+    voiceBtn.style.color='#fff';
+    voiceBtn.style.borderColor='#ff5252';
+
+    if(window.speechSynthesis){
+      speechSynthesis.cancel();
+    }
+  }
+}
+
 function voice(){
-  voiceEnabled=true;
-  voiceBtn.textContent='🔊 Voz ativada';
-  speak('Voz da Mega IA ativada.');
-  setTimeout(()=>sig(true),650);
+  const wasEnabled=voiceEnabled;
+  voiceEnabled=!voiceEnabled;
+
+  try{
+    localStorage.setItem(
+      'mega_voice_power',
+      voiceEnabled ? 'ONLINE' : 'OFFLINE'
+    );
+  }catch(_){}
+
+  applyVoiceState();
+
+  if(voiceEnabled){
+    // Fala somente quando o usuário liga manualmente a voz.
+    speak('Voz da Mega IA online.');
+    if(robotEnabled){
+      setTimeout(()=>sig(true),650);
+    }
+  }else if(wasEnabled && window.speechSynthesis){
+    speechSynthesis.cancel();
+  }
 }
 
 function ft(x){
@@ -3560,6 +4638,7 @@ async function updateMarketNote(){
 
 
 function resizeChart(){
+  // Apenas redimensiona/redesenha; não liga nem desliga robô ou voz.
   const r=chartCanvas.getBoundingClientRect();
   const d=window.devicePixelRatio||1;
 
@@ -3660,6 +4739,11 @@ function drawChart(a){
 }
 
 async function loadChart(){
+  // Atualizar/redesenhar o gráfico NÃO altera o estado do robô nem da voz.
+  if(!robotEnabled){
+    chartInfo.textContent='🔴 ROBÔ OFFLINE • gráfico pausado';
+    return;
+  }
   if(chartBusy) return;
 
   chartBusy=true;
@@ -3834,7 +4918,94 @@ iqLogoutBtn.onclick=async()=>{
 };
 
 
+
+function applyRobotPowerState(){
+  if(!robotPowerBtn) return;
+
+  if(robotEnabled){
+    robotPowerBtn.textContent='🟢 ONLINE';
+    robotPowerBtn.style.background='#0b7a3d';
+    robotPowerBtn.style.color='#fff';
+    robotPowerBtn.style.borderColor='#16c56b';
+
+    if(statusBox && (!cur || cur.direction==='NEUTRO')){
+      statusBox.textContent='ROBÔ ONLINE • MONITORANDO';
+    }
+  }else{
+    robotPowerBtn.textContent='🔴 OFFLINE';
+    robotPowerBtn.style.background='#7d1d1d';
+    robotPowerBtn.style.color='#fff';
+    robotPowerBtn.style.borderColor='#ff5252';
+
+    if(direction){
+      direction.textContent='OFFLINE';
+      direction.className='big neutral';
+    }
+    if(confidence) confidence.textContent='Confiança: --';
+    if(entry) entry.textContent='ROBÔ DESLIGADO';
+    if(countdown) countdown.textContent='Monitoramento pausado';
+    if(expiryCountdown) expiryCountdown.textContent='⏱ EXPIRAÇÃO: --:--';
+    if(statusBox) statusBox.textContent='ROBÔ OFFLINE • ANÁLISE PAUSADA';
+    if(risk) risk.textContent='Risco: --';
+    if(preSignalStatus) preSignalStatus.textContent='Pré-sinais pausados enquanto o robô está offline.';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">Robô offline.</div>';
+    if(radar) radar.innerHTML='<div>🔴 Monitoramento pausado</div>';
+
+    cur=null;
+    lastCountdownSignalKey='';
+    fifteen=false;
+    five=false;
+    entered=false;
+  }
+}
+
+async function setRobotPower(enabled){
+  robotEnabled=!!enabled;
+
+  try{
+    localStorage.setItem(
+      'mega_robot_power',
+      robotEnabled ? 'ONLINE' : 'OFFLINE'
+    );
+  }catch(_){}
+
+  applyRobotPowerState();
+
+  if(robotEnabled){
+    lastSignalVoice='';
+    chartData=[];
+    await Promise.allSettled([
+      sig(true),
+      rad(),
+      loadPreSignals(),
+      perf(),
+    ]);
+
+    if(chartTab.classList.contains('active')){
+      loadChart();
+    }
+
+    if(voiceEnabled){
+      speak('Robô online. Monitoramento ativado.');
+    }
+  }else{
+    if(voiceEnabled){
+      speak('Robô offline. Monitoramento pausado.');
+    }
+  }
+}
+
+if(robotPowerBtn){
+  robotPowerBtn.onclick=()=>{
+    setRobotPower(!robotEnabled);
+  };
+}
+
 async function sig(announce=false){
+  if(!robotEnabled){
+    applyRobotPowerState();
+    return;
+  }
   if(sigBusy) return;
 
   sigBusy=true;
@@ -3950,6 +5121,10 @@ async function perf(){
 }
 
 async function rad(){
+  if(!robotEnabled){
+    if(radar) radar.innerHTML='<div>🔴 Monitoramento pausado</div>';
+    return;
+  }
   if(radBusy) return;
 
   radBusy=true;
@@ -3978,6 +5153,11 @@ async function rad(){
 
 
 async function loadPreSignals(){
+  if(!robotEnabled){
+    if(preSignalStatus) preSignalStatus.textContent='Pré-sinais pausados enquanto o robô está offline.';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">Robô offline.</div>';
+    return;
+  }
   if(preSignalBusy || !preSignals || !preSignalLimit) return;
 
   preSignalBusy=true;
@@ -4259,6 +5439,9 @@ try{
 
 async function bootApp(){
   syncMarketFromBroker();
+  applyRobotPowerState();
+  applyVoiceState();
+
   const safe=(name,fn)=>
     Promise.resolve()
       .then(fn)
@@ -4279,14 +5462,17 @@ async function bootApp(){
     await new Promise(r=>setTimeout(r,700));
   }
 
-  safe('signal',()=>sig(false));
-  safe('performance',perf);
-  safe('radar',rad);
-  safe('pre-signals',loadPreSignals);
+  if(robotEnabled){
+    safe('signal',()=>sig(false));
+    safe('radar',rad);
+    safe('pre-signals',loadPreSignals);
 
-  if(chartTab.classList.contains('active')){
-    safe('chart',loadChart);
+    if(chartTab.classList.contains('active')){
+      safe('chart',loadChart);
+    }
   }
+
+  safe('performance',perf);
 }
 
 bootApp().catch(err=>{
@@ -4294,16 +5480,25 @@ bootApp().catch(err=>{
   statusBox.textContent='PAINEL INICIADO COM AVISO';
 });
 
-setInterval(()=>sig(false),5000);
 setInterval(()=>{
-  if(chartTab.classList.contains('active')){
+  if(robotEnabled) sig(false);
+},5000);
+
+setInterval(()=>{
+  if(robotEnabled && chartTab.classList.contains('active')){
     loadChart();
   }
 },15000);
 
 setInterval(perf,30000);
-setInterval(rad,20000);
-setInterval(loadPreSignals,15000);
+setInterval(()=>{
+  if(robotEnabled) rad();
+},20000);
+setInterval(()=>{
+  if(robotEnabled) loadPreSignals();
+},15000);
+
+// Mesmo offline, uma operação que já estava aberta continua tendo seu resultado acompanhado.
 setInterval(resultCheck,3000);
 setInterval(clk,1000);
 setInterval(cd,250);
