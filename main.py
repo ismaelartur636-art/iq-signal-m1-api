@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.26.0")
+app = FastAPI(title="MEGA IA", version="33.27.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -4735,14 +4735,22 @@ async def performance(request: Request, interval="1min", market="OPEN"):
         # Chaveia por mercado para IQ/Olymp/Open não misturarem placar.
         store = results.setdefault(market, {})
 
-    win_direct = sum(1 for x in store.values() if x.get("result") == "WIN")
+    # O placar principal mede SEMPRE a entrada original (1 vela).
+    # Gale fica separado e não transforma uma entrada perdida em WIN no placar principal.
+    win_direct = sum(
+        1 for x in store.values()
+        if (x.get("entry_result") or x.get("result")) == "WIN"
+    )
+    loss_direct = sum(
+        1 for x in store.values()
+        if (x.get("entry_result") or x.get("result")) == "LOSS"
+    )
     win_g1 = sum(1 for x in store.values() if x.get("result") == "WIN G1")
     win_g2 = sum(1 for x in store.values() if x.get("result") == "WIN G2")
-    loss_direct = sum(1 for x in store.values() if x.get("result") == "LOSS")
     loss_g2 = sum(1 for x in store.values() if x.get("result") == "LOSS G2")
 
-    wins = win_direct + win_g1 + win_g2
-    losses = loss_direct + loss_g2
+    wins = win_direct
+    losses = loss_direct
     total = wins + losses
 
     return {
@@ -4784,7 +4792,7 @@ async def result(
     store = state.setdefault("results", {}) if market == "IQ_OTC" else results.setdefault(market, {})
     key = f"{market}|{symbol}|{interval}|{direction}|{expiry_time}"
 
-    if key in store:
+    if key in store and store[key].get("status") == "FINALIZADA":
         return store[key]
 
     expiry_dt = parse_dt(expiry_time)
@@ -4859,6 +4867,7 @@ async def result(
             "status": "FINALIZADA",
             "stage": "ENTRADA",
             "result": "WIN",
+            "entry_result": "WIN",
             "candle_time": base["datetime"],
             "entry_time": iso(entry_dt),
             "expiry_time": expiry_time,
@@ -4875,6 +4884,7 @@ async def result(
             "status": "FINALIZADA",
             "stage": "ENTRADA",
             "result": "LOSS",
+            "entry_result": "LOSS",
             "candle_time": base["datetime"],
             "entry_time": iso(entry_dt),
             "expiry_time": expiry_time,
@@ -4886,23 +4896,34 @@ async def result(
 
     # Fluxo normal do painel continua acompanhando G1/G2.
     if now() < g1_expiry_dt:
-        return {
+        out = {
             "status": "AGUARDANDO G1",
             "stage": "G1",
             "result": None,
+            "entry_result": base_result,
             "previous": base_result,
             "next_check": iso(g1_expiry_dt),
             "g1_entry_time": iso(g1_entry_dt),
             "g1_expiry_time": iso(g1_expiry_dt),
+            "entry_time": iso(entry_dt),
+            "expiry_time": expiry_time,
         }
+        # Salva a entrada original imediatamente para o WIN/LOSS principal.
+        store[key] = out
+        return out
 
     g1 = candle_near(g1_entry_dt)
     if not g1:
-        return {
+        out = {
             "status": "AGUARDANDO CANDLE G1",
             "stage": "G1",
             "result": None,
+            "entry_result": base_result,
+            "entry_time": iso(entry_dt),
+            "expiry_time": expiry_time,
         }
+        store[key] = out
+        return out
 
     g1_result = candle_result(g1)
 
@@ -4911,6 +4932,8 @@ async def result(
             "status": "FINALIZADA",
             "stage": "G1",
             "result": "WIN G1",
+            "entry_result": base_result,
+            "g1_result": "WIN",
             "candle_time": g1["datetime"],
             "entry_time": iso(entry_dt),
             "expiry_time": iso(g1_expiry_dt),
@@ -4920,23 +4943,35 @@ async def result(
         return out
 
     if now() < g2_expiry_dt:
-        return {
+        out = {
             "status": "AGUARDANDO G2",
             "stage": "G2",
             "result": None,
+            "entry_result": base_result,
+            "g1_result": g1_result,
             "previous": g1_result,
             "next_check": iso(g2_expiry_dt),
             "g2_entry_time": iso(g2_entry_dt),
             "g2_expiry_time": iso(g2_expiry_dt),
+            "entry_time": iso(entry_dt),
+            "expiry_time": expiry_time,
         }
+        store[key] = out
+        return out
 
     g2 = candle_near(g2_entry_dt)
     if not g2:
-        return {
+        out = {
             "status": "AGUARDANDO CANDLE G2",
             "stage": "G2",
             "result": None,
+            "entry_result": base_result,
+            "g1_result": g1_result,
+            "entry_time": iso(entry_dt),
+            "expiry_time": expiry_time,
         }
+        store[key] = out
+        return out
 
     g2_result = candle_result(g2)
     final_result = "WIN G2" if g2_result == "WIN" else "LOSS G2"
@@ -4945,6 +4980,9 @@ async def result(
         "status": "FINALIZADA",
         "stage": "G2",
         "result": final_result,
+        "entry_result": base_result,
+        "g1_result": g1_result,
+        "g2_result": g2_result,
         "candle_time": g2["datetime"],
         "entry_time": iso(entry_dt),
         "expiry_time": iso(g2_expiry_dt),
@@ -5436,7 +5474,9 @@ function emptyResultBucket(){
     win_g2:0,
     loss_direct:0,
     loss_g2:0,
-    processed_keys:[]
+    processed_keys:[],
+    entry_keys:[],
+    gale_keys:[]
   };
 }
 
@@ -5455,6 +5495,8 @@ function normalizeResultBucket(x){
   b.loss_direct=Math.max(0,Number(x.loss_direct||0));
   b.loss_g2=Math.max(0,Number(x.loss_g2||0));
   b.processed_keys=Array.isArray(x.processed_keys)?x.processed_keys.slice(-1500):[];
+  b.entry_keys=Array.isArray(x.entry_keys)?x.entry_keys.slice(-1500):[];
+  b.gale_keys=Array.isArray(x.gale_keys)?x.gale_keys.slice(-1500):[];
   return b;
 }
 
@@ -5501,27 +5543,48 @@ function isResultAlreadyCounted(t){
 
 function registerPersistentResult(t,x){
   if(!t || !x) return false;
-  const r=String(x.result||'').toUpperCase();
-  if(!['WIN','WIN G1','WIN G2','LOSS','LOSS G2'].includes(r)) return false;
-
   const m=resultMarket(t.market);
   const b=persistentResults[m]||emptyResultBucket();
   persistentResults[m]=b;
   const key=resultTradeKey(t);
-  if(!key || b.processed_keys.includes(key)) return false;
+  if(!key) return false;
 
-  b.processed_keys.push(key);
-  if(b.processed_keys.length>1500) b.processed_keys=b.processed_keys.slice(-1500);
+  let changed=false;
+  const entryResult=String(x.entry_result||((x.result==='WIN'||x.result==='LOSS')?x.result:'')).toUpperCase();
+  const entryKey=key+'|ENTRY';
 
-  if(r==='WIN') b.win_direct++;
-  else if(r==='WIN G1') b.win_g1++;
-  else if(r==='WIN G2') b.win_g2++;
-  else if(r==='LOSS') b.loss_direct++;
-  else if(r==='LOSS G2') b.loss_g2++;
+  // WIN/LOSS principal: contabiliza assim que a PRIMEIRA vela fecha.
+  if((entryResult==='WIN'||entryResult==='LOSS') && !b.entry_keys.includes(entryKey)){
+    b.entry_keys.push(entryKey);
+    if(b.entry_keys.length>1500) b.entry_keys=b.entry_keys.slice(-1500);
+    if(entryResult==='WIN') b.win_direct++;
+    else b.loss_direct++;
+    changed=true;
+  }
 
-  savePersistentResults();
-  paintPersistentResults();
-  return true;
+  // Gale é apenas estatística separada e nunca altera o placar principal.
+  const r=String(x.result||'').toUpperCase();
+  const galeKey=key+'|FINAL';
+  if(['WIN G1','WIN G2','LOSS G2'].includes(r) && !b.gale_keys.includes(galeKey)){
+    b.gale_keys.push(galeKey);
+    if(b.gale_keys.length>1500) b.gale_keys=b.gale_keys.slice(-1500);
+    if(r==='WIN G1') b.win_g1++;
+    else if(r==='WIN G2') b.win_g2++;
+    else b.loss_g2++;
+    changed=true;
+  }
+
+  if(r && ['WIN','LOSS','WIN G1','WIN G2','LOSS G2'].includes(r) && !b.processed_keys.includes(key)){
+    b.processed_keys.push(key);
+    if(b.processed_keys.length>1500) b.processed_keys=b.processed_keys.slice(-1500);
+    changed=true;
+  }
+
+  if(changed){
+    savePersistentResults();
+    paintPersistentResults();
+  }
+  return changed;
 }
 
 function mergeServerPerformance(p,m){
@@ -6762,6 +6825,11 @@ async function resultCheck(){
       `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=${t.direct_only?'true':'false'}`
     );
 
+    // A entrada original é contabilizada imediatamente após o fechamento da vela,
+    // mesmo que o acompanhamento de G1/G2 ainda continue.
+    const accountingChanged=registerPersistentResult(t,x);
+    if(accountingChanged) await perf();
+
     if(galeStageStatus){
       const stage=x.stage||'ENTRADA';
 
@@ -6809,8 +6877,7 @@ async function resultCheck(){
         }
       }
 
-      // Registra exatamente uma vez antes de atualizar o painel.
-      registerPersistentResult(t,x);
+      // Atualiza também os dados do servidor após o resultado final.
       await perf();
 
       // Finalizada: passa para a próxima operação que estiver aguardando resultado.
