@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.6.0")
+app = FastAPI(title="MEGA IA", version="33.6.1")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -1921,7 +1921,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.6.0",
+        "version": "33.6.1",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -2703,8 +2703,13 @@ async def performance(request: Request, interval="1min", market="OPEN"):
         # Chaveia por mercado para IQ/Olymp/Open não misturarem placar.
         store = results.setdefault(market, {})
 
-    wins = sum(1 for x in store.values() if x.get("result") == "WIN")
-    losses = sum(1 for x in store.values() if x.get("result") == "LOSS")
+    win_direct = sum(1 for x in store.values() if x.get("result") == "WIN")
+    win_g1 = sum(1 for x in store.values() if x.get("result") == "WIN G1")
+    win_g2 = sum(1 for x in store.values() if x.get("result") == "WIN G2")
+    loss_g2 = sum(1 for x in store.values() if x.get("result") == "LOSS G2")
+
+    wins = win_direct + win_g1 + win_g2
+    losses = loss_g2
     total = wins + losses
 
     return {
@@ -2712,6 +2717,10 @@ async def performance(request: Request, interval="1min", market="OPEN"):
         "losses": losses,
         "total": total,
         "accuracy": round(wins / total * 100, 2) if total else 0,
+        "win_direct": win_direct,
+        "win_g1": win_g1,
+        "win_g2": win_g2,
+        "loss_g2": loss_g2,
     }
 
 
@@ -2727,9 +2736,15 @@ async def result(
     if not expiry_time:
         raise HTTPException(400, "expiry_time é obrigatório.")
 
-    market=(market or "OPEN").upper()
+    market = (market or "OPEN").upper()
+    direction = (direction or "CALL").upper()
+
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
+
+    if direction not in ("CALL", "PUT"):
+        raise HTTPException(400, "Direção inválida.")
+
     state = _iq_session_state(request, required=True) if market == "IQ_OTC" else None
     store = state.setdefault("results", {}) if market == "IQ_OTC" else results.setdefault(market, {})
     key = f"{market}|{symbol}|{interval}|{direction}|{expiry_time}"
@@ -2738,49 +2753,149 @@ async def result(
         return store[key]
 
     expiry_dt = parse_dt(expiry_time)
+    step = timedelta(seconds=INTERVALS[interval])
+
+    # Entrada original começa uma vela antes do expiry_time.
+    entry_dt = expiry_dt - step
+    g1_entry_dt = expiry_dt
+    g1_expiry_dt = expiry_dt + step
+    g2_entry_dt = g1_expiry_dt
+    g2_expiry_dt = g1_expiry_dt + step
 
     if now() < expiry_dt:
-        return {"status": "PENDENTE", "result": None}
+        return {
+            "status": "PENDENTE",
+            "stage": "ENTRADA",
+            "result": None,
+            "next_check": iso(expiry_dt),
+        }
 
-    cs = await candles(symbol, interval, 30, market, state, request=request)
+    cs = await candles(symbol, interval, 40, market, state, request=request)
 
-    entry_dt = expiry_dt - timedelta(seconds=INTERVALS[interval])
+    def candle_near(target_dt):
+        target = None
+        best_delta = None
 
-    target = None
-    best_delta = None
+        for c in cs:
+            try:
+                cdt = parse_dt(c["datetime"])
+            except Exception:
+                continue
 
-    for c in cs:
-        try:
-            cdt = parse_dt(c["datetime"])
-        except Exception:
-            continue
+            delta = abs((cdt - target_dt).total_seconds())
 
-        delta = abs((cdt - entry_dt).total_seconds())
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                target = c
 
-        if best_delta is None or delta < best_delta:
-            best_delta = delta
-            target = c
+        if (
+            not target
+            or best_delta is None
+            or best_delta > INTERVALS[interval] * 0.75
+        ):
+            return None
 
-    if not target or (best_delta is not None and best_delta > INTERVALS[interval] * 0.75):
-        return {"status": "AGUARDANDO CANDLE", "result": None}
+        return target
 
-    direction = direction.upper()
+    def candle_result(candle):
+        if candle["close"] == candle["open"]:
+            return "EMPATE"
 
-    if target["close"] == target["open"]:
-        res = "EMPATE"
-    else:
-        res = "WIN" if (
-            (direction == "CALL" and target["close"] > target["open"])
+        won = (
+            (direction == "CALL" and candle["close"] > candle["open"])
             or
-            (direction == "PUT" and target["close"] < target["open"])
-        ) else "LOSS"
+            (direction == "PUT" and candle["close"] < candle["open"])
+        )
+        return "WIN" if won else "LOSS"
+
+    # Entrada inicial.
+    base = candle_near(entry_dt)
+    if not base:
+        return {
+            "status": "AGUARDANDO CANDLE",
+            "stage": "ENTRADA",
+            "result": None,
+        }
+
+    base_result = candle_result(base)
+
+    if base_result == "WIN":
+        out = {
+            "status": "FINALIZADA",
+            "stage": "ENTRADA",
+            "result": "WIN",
+            "candle_time": base["datetime"],
+            "entry_time": iso(entry_dt),
+            "expiry_time": expiry_time,
+            "simulated": True,
+        }
+        store[key] = out
+        return out
+
+    # EMPATE não avança gale; espera o próximo fechamento e trata como G1.
+    if now() < g1_expiry_dt:
+        return {
+            "status": "AGUARDANDO G1",
+            "stage": "G1",
+            "result": None,
+            "previous": base_result,
+            "next_check": iso(g1_expiry_dt),
+            "g1_entry_time": iso(g1_entry_dt),
+            "g1_expiry_time": iso(g1_expiry_dt),
+        }
+
+    g1 = candle_near(g1_entry_dt)
+    if not g1:
+        return {
+            "status": "AGUARDANDO CANDLE G1",
+            "stage": "G1",
+            "result": None,
+        }
+
+    g1_result = candle_result(g1)
+
+    if g1_result == "WIN":
+        out = {
+            "status": "FINALIZADA",
+            "stage": "G1",
+            "result": "WIN G1",
+            "candle_time": g1["datetime"],
+            "entry_time": iso(entry_dt),
+            "expiry_time": iso(g1_expiry_dt),
+            "simulated": True,
+        }
+        store[key] = out
+        return out
+
+    if now() < g2_expiry_dt:
+        return {
+            "status": "AGUARDANDO G2",
+            "stage": "G2",
+            "result": None,
+            "previous": g1_result,
+            "next_check": iso(g2_expiry_dt),
+            "g2_entry_time": iso(g2_entry_dt),
+            "g2_expiry_time": iso(g2_expiry_dt),
+        }
+
+    g2 = candle_near(g2_entry_dt)
+    if not g2:
+        return {
+            "status": "AGUARDANDO CANDLE G2",
+            "stage": "G2",
+            "result": None,
+        }
+
+    g2_result = candle_result(g2)
+    final_result = "WIN G2" if g2_result == "WIN" else "LOSS G2"
 
     out = {
         "status": "FINALIZADA",
-        "result": res,
-        "candle_time": target["datetime"],
+        "stage": "G2",
+        "result": final_result,
+        "candle_time": g2["datetime"],
         "entry_time": iso(entry_dt),
-        "expiry_time": expiry_time,
+        "expiry_time": iso(g2_expiry_dt),
         "simulated": True,
     }
 
@@ -2909,6 +3024,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="tabs">
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
     <button class="tabbtn" id="tabChart">📈 Gráfico</button>
+    <button class="tabbtn" id="tabResults">🎯 Resultados</button>
     <button class="tabbtn" id="tabAccount">🏦 Corretora</button>
   </div>
 
@@ -2975,6 +3091,48 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="chartbox"><canvas id="priceChart"></canvas></div>
       <div class="label" style="margin-top:8px">
         O gráfico acompanha o mesmo mercado, par e período selecionados no painel.
+      </div>
+    </div>
+  </div>
+
+
+  <div id="resultsTab" class="tab">
+    <div class="card">
+      <h2 style="margin-top:0">🎯 Resultados até Gale 2</h2>
+      <div class="label">ACOMPANHAMENTO DA ENTRADA • G1 • G2</div>
+
+      <div class="grid" style="margin-top:12px">
+        <div class="card">
+          <div class="label">WIN DIRETO</div>
+          <div id="winDirect" class="big call">0</div>
+        </div>
+
+        <div class="card">
+          <div class="label">WIN G1</div>
+          <div id="winG1" class="big call">0</div>
+        </div>
+
+        <div class="card">
+          <div class="label">WIN G2</div>
+          <div id="winG2" class="big call">0</div>
+        </div>
+
+        <div class="card">
+          <div class="label">LOSS G2</div>
+          <div id="lossG2" class="big put">0</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <div class="label">ÚLTIMO RESULTADO</div>
+        <div id="galeLastResult" class="big">--</div>
+        <div id="galeStageStatus" style="margin-top:8px">Aguardando operação.</div>
+      </div>
+
+      <div class="label" style="margin-top:10px;line-height:1.5">
+        Se a entrada inicial perder, o painel acompanha a vela seguinte como G1.
+        Se G1 perder, acompanha a próxima como G2. O painel apenas mostra o resultado;
+        não executa Martingale automaticamente.
       </div>
     </div>
   </div>
@@ -3115,6 +3273,14 @@ const analysisText=document.getElementById('analysisText');
 const mainTab=document.getElementById('mainTab');
 const chartTab=document.getElementById('chartTab');
 const accountTab=document.getElementById('accountTab');
+const resultsTab=document.getElementById('resultsTab');
+const tabResults=document.getElementById('tabResults');
+const winDirect=document.getElementById('winDirect');
+const winG1=document.getElementById('winG1');
+const winG2=document.getElementById('winG2');
+const lossG2=document.getElementById('lossG2');
+const galeLastResult=document.getElementById('galeLastResult');
+const galeStageStatus=document.getElementById('galeStageStatus');
 const tabMain=document.getElementById('tabMain');
 const tabChart=document.getElementById('tabChart');
 const tabAccount=document.getElementById('tabAccount');
@@ -3526,19 +3692,26 @@ async function loadChart(){
 function showTab(which){
   const main=which==='main';
   const chart=which==='chart';
+  const results=which==='results';
   const account=which==='account';
 
   mainTab.classList.toggle('active',main);
   chartTab.classList.toggle('active',chart);
+  resultsTab.classList.toggle('active',results);
   accountTab.classList.toggle('active',account);
 
   tabMain.classList.toggle('active',main);
   tabChart.classList.toggle('active',chart);
+  tabResults.classList.toggle('active',results);
   tabAccount.classList.toggle('active',account);
 
   if(chart){
     loadChart();
     setTimeout(resizeChart,50);
+  }
+
+  if(results){
+    perf();
   }
 
   if(account){
@@ -3548,6 +3721,7 @@ function showTab(which){
 
 tabMain.onclick=()=>showTab('main');
 tabChart.onclick=()=>showTab('chart');
+tabResults.onclick=()=>showTab('results');
 tabAccount.onclick=()=>showTab('account');
 
 window.addEventListener('resize',resizeChart);
@@ -3764,6 +3938,11 @@ async function perf(){
     wins.textContent=p.wins;
     losses.textContent=p.losses;
     accuracy.textContent=p.accuracy+'%';
+
+    if(winDirect) winDirect.textContent=p.win_direct||0;
+    if(winG1) winG1.textContent=p.win_g1||0;
+    if(winG2) winG2.textContent=p.win_g2||0;
+    if(lossG2) lossG2.textContent=p.loss_g2||0;
   }catch(e){
   }finally{
     perfBusy=false;
@@ -3961,8 +4140,35 @@ async function resultCheck(){
       `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}`
     );
 
+    if(galeStageStatus){
+      const stage=x.stage||'ENTRADA';
+
+      if(!x.result){
+        if(stage==='G1'){
+          galeStageStatus.textContent='⏳ Entrada inicial não venceu • aguardando resultado do G1';
+        }else if(stage==='G2'){
+          galeStageStatus.textContent='⏳ G1 não venceu • aguardando resultado do G2';
+        }else{
+          galeStageStatus.textContent='⏳ Aguardando resultado da entrada inicial';
+        }
+      }
+    }
+
     if(x.result){
       result.textContent=x.result;
+
+      if(galeLastResult){
+        galeLastResult.textContent=x.result;
+        galeLastResult.className='big '+(String(x.result).startsWith('WIN')?'call':'put');
+      }
+
+      if(galeStageStatus){
+        galeStageStatus.textContent=
+          x.result==='WIN' ? '✅ Venceu na entrada inicial' :
+          x.result==='WIN G1' ? '✅ Venceu no Gale 1' :
+          x.result==='WIN G2' ? '✅ Venceu no Gale 2' :
+          '❌ Não venceu até o Gale 2';
+      }
 
       const k=t.symbol+'|'+t.direction+'|'+t.expiry_time;
 
@@ -3976,7 +4182,7 @@ async function resultCheck(){
 
       await perf();
 
-      // Só remove depois que o servidor realmente devolveu o resultado.
+      // Só remove depois do resultado final: WIN, WIN G1, WIN G2 ou LOSS G2.
       pendingTrade=null;
       savePendingTrade();
     }
