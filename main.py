@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
-app = FastAPI(title="MEGA IA", version="32.9.7")
+app = FastAPI(title="MEGA IA", version="32.9.8")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -645,13 +645,14 @@ async def _iq_close_client(state):
 
 
 def _iq_mark_failure(state, message):
+    """Registra a falha sem iniciar ciclos automáticos de reconexão."""
     failures = int(state.get("failure_count", 0)) + 1
     state["failure_count"] = failures
-    delay = min(IQ_RECONNECT_MAX_DELAY, IQ_RECONNECT_BASE_DELAY * (2 ** min(failures - 1, 4)))
-    state["reconnect_after"] = time.time() + delay
+    state["reconnect_after"] = 0.0
+    state["reconnecting"] = False
     state["last_error"] = str(message)[:350]
     _iq_dispose_client(state)
-    return delay
+    return 0
 
 
 def _iq_mark_connected(state, client):
@@ -807,8 +808,8 @@ async def iq_connect_async(state, force=False):
             )
             await _iq_close_client(state)
             raise IQTwoFactorRequired(state["last_error"])
-        delay = _iq_mark_failure(state, msg)
-        raise RuntimeError(f"Falha no login/websocket IQ Option: {msg[:260]}. Nova tentativa em {int(delay)}s.")
+        _iq_mark_failure(state, msg)
+        raise RuntimeError(f"Falha no login/websocket IQ Option: {msg[:260]}.")
     finally:
         state["reconnecting"] = False
 
@@ -817,7 +818,14 @@ async def iq_candles_async(state, symbol, interval, n):
     duration = iq_seconds(interval)
     candidates = iq_active_candidates(symbol)
     errors = []
-    client = await iq_connect_async(state, force=False)
+
+    # Candles OTC nunca disparam reconexão automática.
+    # A conexão só é iniciada quando o usuário toca em "Conectar".
+    if not _iq_is_connected(state):
+        raise RuntimeError(
+            "IQ Option desconectada. O MEGA IA continua ativo; para OTC, conecte manualmente na aba Conta IQ Option."
+        )
+    client = state.get("client")
 
     for name in candidates:
         try:
@@ -854,8 +862,8 @@ async def iq_candles_async(state, symbol, interval, n):
             errors.append(f"{name}: {type(exc).__name__}: {exc}")
 
     detail = " | ".join(errors[-3:])
-    delay = _iq_mark_failure(state, f"OTC sem candles. {detail}")
-    raise RuntimeError(f"OTC sem candles. {detail[:220]}. Nova tentativa em {int(delay)}s.")
+    _iq_mark_failure(state, f"OTC sem candles. {detail}")
+    raise RuntimeError(f"OTC sem candles. {detail[:220]}.")
 
 
 async def candles(symbol, interval, n=80, market="OPEN", iq_state=None):
@@ -866,6 +874,12 @@ async def candles(symbol, interval, n=80, market="OPEN", iq_state=None):
             raise HTTPException(400, "Ativo ou intervalo inválido.")
         if iq_state is None:
             raise HTTPException(401, "Conecte sua conta da IQ Option na aba Conta IQ Option.")
+
+        if not _iq_is_connected(iq_state):
+            raise HTTPException(
+                503,
+                "IQ Option OTC desconectada. O MEGA IA continua ativo; conecte manualmente para usar candles OTC."
+            )
 
         ckey = f"{symbol}|{interval}"
         candle_cache = iq_state.setdefault("candle_cache", {})
@@ -1026,8 +1040,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
         if iq_state.get("reconnecting") or time.time() < ra:
             neutral = neutral_signal(
                 symbol, interval, market,
-                "IQ OPTION RECONECTANDO",
-                "A sessão OTC está sendo restaurada. Nenhuma entrada será liberada até a conexão voltar.",
+                "IQ OPTION DESCONECTADA",
+                "A IQ Option OTC está desconectada. O MEGA IA continua ativo, mas nenhuma entrada OTC será liberada até conexão manual.",
                 source_state="WAITING",
             )
             cache[key] = (time.time(), neutral)
@@ -1039,13 +1053,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None):
         status = (
             "FONTE EM LIMITE"
             if market == "OPEN" and exc.status_code in (429, 503)
-            else ("IQ OPTION RECONECTANDO" if market == "OTC" else "FONTE INDISPONÍVEL")
+            else ("IQ OPTION DESCONECTADA" if market == "OTC" else "FONTE INDISPONÍVEL")
         )
         out = neutral_signal(symbol, interval, market, status, exc.detail, source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
     except Exception as exc:
-        status = "IQ OPTION RECONECTANDO" if market == "OTC" else "FONTE INDISPONÍVEL"
+        status = "IQ OPTION DESCONECTADA" if market == "OTC" else "FONTE INDISPONÍVEL"
         out = neutral_signal(symbol, interval, market, status, str(exc), source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
@@ -1229,7 +1243,7 @@ async def manifest():
 @app.get("/iq-diagnostic")
 async def iq_diagnostic():
     info = {
-        "app_version": "32.9.7",
+        "app_version": "32.9.8",
         "iq_async_library_loaded": AsyncIQOption is not None,
         "import_error": IQ_IMPORT_ERROR if AsyncIQOption is None else "",
         "active_sessions": len(iq_sessions),
@@ -1249,7 +1263,7 @@ async def iq_diagnostic():
 async def iq_network_test():
     """Testa endpoints alternativos da IQ Option sem usar e-mail nem senha."""
     result = {
-        "app_version": "32.9.7",
+        "app_version": "32.9.8",
         "http": {},
         "websocket": {},
     }
@@ -1359,7 +1373,7 @@ async def iq_port_test():
         "iqoption.com",
         "ws.iqoption.com",
     ]
-    result = {"app_version": "32.9.7", "port": 443, "hosts": {}}
+    result = {"app_version": "32.9.8", "port": 443, "hosts": {}}
 
     async def tcp_probe(host, family):
         family_name = "ipv4" if family == socket.AF_INET else "ipv6"
@@ -1451,7 +1465,7 @@ async def iq_login_diagnostic():
     if iq_login_diag.get("updated_at"):
         age = round(max(0.0, time.time() - float(iq_login_diag["updated_at"])), 1)
     return {
-        "app_version": "32.9.7",
+        "app_version": "32.9.8",
         "stage": iq_login_diag.get("stage", "idle"),
         "detail": iq_login_diag.get("detail", ""),
         "age_seconds": age,
@@ -1555,6 +1569,7 @@ async def otc_status(request: Request):
         return {
             "configured": False,
             "connected": False,
+            "reconnecting": False,
             "message": "Biblioteca IQ Option não foi carregada.",
         }
 
@@ -1564,52 +1579,31 @@ async def otc_status(request: Request):
         return {
             "configured": True,
             "connected": False,
-            "message": "Conecte sua conta na aba Conta IQ Option.",
+            "reconnecting": False,
+            "message": "MEGA IA ativo. IQ Option OTC desconectada.",
         }
 
     connected = _iq_is_connected(state)
+
     if state.get("requires_2fa"):
         return {
             "configured": True,
             "connected": False,
+            "reconnecting": False,
             "requires_2fa": True,
             "message": "Digite o código de verificação enviado pela IQ Option.",
             "email_masked": _mask_email(state.get("email", "")),
         }
 
-    reconnect_after = float(state.get("reconnect_after", 0) or 0)
-
-    # Se a página foi atualizada e a sessão ainda existe, recupera o websocket
-    # automaticamente quando necessário.
-    if (
-        not connected
-        and not state.get("reconnecting")
-        and time.time() >= reconnect_after
-        and state.get("email")
-        and state.get("password")
-    ):
-        try:
-            async with state["lock"]:
-                await asyncio.wait_for(iq_connect_async(state, False), timeout=18)
-            connected = _iq_is_connected(state)
-        except Exception as exc:
-            state["last_error"] = str(exc)[:250]
-
-    reconnect_after = float(state.get("reconnect_after", 0) or 0)
-    reconnecting = bool(state.get("reconnecting")) or (not connected and time.time() < reconnect_after)
-
     if connected:
         msg = "IQ Option OTC conectada."
-    elif reconnecting:
-        wait = max(1, int(reconnect_after-time.time()+0.999)) if reconnect_after > time.time() else 2
-        msg = f"Sessão preservada. Reconectando em {wait}s."
     else:
-        msg = "Sessão preservada. Reconexão automática em andamento."
+        msg = "IQ Option OTC desconectada. Reconexão automática desativada."
 
     return {
         "configured": True,
         "connected": connected,
-        "reconnecting": reconnecting,
+        "reconnecting": False,
         "message": msg,
         "email_masked": _mask_email(state.get("email", "")),
         "pairs": len(OTC_BASE),
