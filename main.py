@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.46.0")
-print("[MEGA IA] versão 33.46.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.47.0")
+print("[MEGA IA] versão 33.47.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -5806,6 +5806,7 @@ const preSignalLimit=document.getElementById('preSignalLimit');
 const preSignals=document.getElementById('preSignals');
 const preSignalStatus=document.getElementById('preSignalStatus');
 let preSignalBusy=false;
+let iqLoginInProgress=false; // pausa temporariamente as consultas durante o login da IQ Option
 const heroBox=document.getElementById('heroBox');
 const entryArrow=document.getElementById('entryArrow');
 const entryArrowIcon=document.getElementById('entryArrowIcon');
@@ -6867,7 +6868,7 @@ if(broker){
     sig(true);
     rad();
     loadPreSignals();
-    if(appEnabled && chartTab.classList.contains('active')) loadChart();
+    if(appEnabled && !iqLoginInProgress && chartTab.classList.contains('active')) loadChart();
   };
 }
 
@@ -6903,6 +6904,7 @@ window.megaConnectIQ=async function(event){
   }
 
   if(iqConnectBtn) iqConnectBtn.disabled=true;
+  iqLoginInProgress=(b==='IQ_OPTION');
   if(iqAccountStatus) iqAccountStatus.textContent='🟡 Enviando login para '+(b==='OLYMPTRADE'?'Olymptrade':'IQ Option')+'...';
 
   try{
@@ -6947,6 +6949,7 @@ window.megaConnectIQ=async function(event){
     if(iqConnectBtn) iqConnectBtn.style.display='block';
     if(iqLogoutBtn) iqLogoutBtn.style.display='none';
   }finally{
+    iqLoginInProgress=false;
     if(iqConnectBtn) iqConnectBtn.disabled=false;
   }
   return false;
@@ -7342,6 +7345,11 @@ async function lic(){
 }
 
 async function clk(){
+  if(iqLoginInProgress){
+    const local=new Date();
+    clock.textContent=local.toLocaleTimeString('pt-BR',{hour12:false})+' • Brasília';
+    return;
+  }
   try{
     const x=await get('/server-time');
     clock.textContent=ft(x.datetime)+' • Brasília';
@@ -7646,24 +7654,24 @@ bootApp().catch(err=>{
   statusBox.textContent='PAINEL INICIADO COM AVISO';
 });
 
-setInterval(()=>{ if(appEnabled) sig(false); },5000);
+setInterval(()=>{ if(appEnabled && !iqLoginInProgress) sig(false); },5000);
 
 setInterval(()=>{
-  if(appEnabled && chartTab.classList.contains('active')) loadChart();
+  if(appEnabled && !iqLoginInProgress && chartTab.classList.contains('active')) loadChart();
 },2000);
 
-setInterval(()=>{ if(appEnabled) perf(); },5000);
+setInterval(()=>{ if(appEnabled && !iqLoginInProgress) perf(); },5000);
 // Radar completo atualizado a cada 1 minuto.
 setInterval(()=>{
-  if(appEnabled && !robotEnabled) rad();
+  if(appEnabled && !iqLoginInProgress && !robotEnabled) rad();
 },60000);
 // Pré-análise atualizada a cada 1 minuto; a confirmação continua usando a janela final de 1 minuto.
 setInterval(()=>{
-  if(appEnabled && !robotEnabled) loadPreSignals();
+  if(appEnabled && !iqLoginInProgress && !robotEnabled) loadPreSignals();
 },60000);
 
 // Com o app ligado, acompanha o resultado das operações abertas.
-setInterval(()=>{ if(appEnabled) resultCheck(); },5000);
+setInterval(()=>{ if(appEnabled && !iqLoginInProgress) resultCheck(); },5000);
 setInterval(clk,1000);
 setInterval(()=>{ if(appEnabled) cd(); },250);
 </script>
