@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.34.0")
+app = FastAPI(title="MEGA IA", version="33.35.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -3810,9 +3810,9 @@ async def manifest():
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=34", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=34", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=34", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=35", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=35", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=35", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -3857,7 +3857,7 @@ def _olymp_login_blocking(email: str, password: str):
 async def iq_login(body: IQLoginBody, response: Response):
     email = body.email.strip()
     password = body.password
-    print(f"[IQ LOGIN] tentativa recebida dominio={email.split('@')[-1] if '@' in email else 'invalido'}", flush=True)
+    print(f"[IQ LOGIN] POST recebido dominio={email.split('@')[-1] if '@' in email else 'invalido'}", flush=True)
 
     if not email or not password:
         raise HTTPException(
@@ -5239,9 +5239,9 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=34">
-<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=34">
-<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=34">
+<link rel="manifest" href="/manifest.webmanifest?v=35">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=35">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=35">
 <meta name="theme-color" content="#07182b">
 <meta name="application-name" content="Mega IA Trader">
 <meta name="apple-mobile-web-app-title" content="Mega IA Trader">
@@ -5534,7 +5534,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
                style="width:100%;box-sizing:border-box;margin-top:6px">
       </div>
 
-      <button id="iqConnectBtn" style="width:100%;margin-top:12px">🔐 CONECTAR</button>
+      <button id="iqConnectBtn" type="button" style="width:100%;margin-top:12px">🔐 CONECTAR</button>
       <button id="iqLogoutBtn" style="width:100%;margin-top:8px;display:none">🚪 DESCONECTAR</button>
 
       <div class="label" style="margin-top:10px;line-height:1.5">
@@ -6703,49 +6703,74 @@ if(brokerAccount){
   };
 }
 
-iqConnectBtn.onclick=async()=>{
-  const b=(brokerAccount&&brokerAccount.value)||broker.value||'IQ_OPTION';
+window.megaConnectIQ=async function(event){
+  if(event){
+    try{ event.preventDefault(); }catch(_){}
+    try{ event.stopPropagation(); }catch(_){}
+  }
+
+  const b=(brokerAccount&&brokerAccount.value)||((broker&&broker.value)||'IQ_OPTION');
   const email=(iqEmail&&iqEmail.value||'').trim();
   const password=(iqPassword&&iqPassword.value||'');
 
   if(!email || !password){
-    iqAccountStatus.textContent='🟠 Informe e-mail e senha.';
-    return;
+    if(iqAccountStatus) iqAccountStatus.textContent='🟠 Informe e-mail e senha.';
+    return false;
   }
 
-  iqConnectBtn.disabled=true;
-  iqAccountStatus.textContent='🟡 Conectando '+(b==='OLYMPTRADE'?'Olymptrade':'IQ Option')+'...';
+  if(iqConnectBtn) iqConnectBtn.disabled=true;
+  if(iqAccountStatus) iqAccountStatus.textContent='🟡 Enviando login para '+(b==='OLYMPTRADE'?'Olymptrade':'IQ Option')+'...';
 
   try{
     if(b==='IQ_OPTION'){
       try{ localStorage.removeItem('mega_iq_session'); }catch(_){}
     }
+
     const url=b==='OLYMPTRADE'?'/olymp-login':'/iq-login';
-    const d=await post(url,{email,password});
-    if(b==='IQ_OPTION' && d && d.session_token){
-      try{
-        localStorage.setItem('mega_iq_session',d.session_token);
-      }catch(_){}
+    const r=await fetch(url,{
+      method:'POST',
+      credentials:'include',
+      cache:'no-store',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email:email,password:password})
+    });
+
+    let d=null;
+    try{ d=await r.json(); }catch(_){}
+
+    if(!r.ok){
+      throw new Error((d&&d.detail)?d.detail:('HTTP '+r.status));
     }
+
+    if(b==='IQ_OPTION' && d && d.session_token){
+      try{ localStorage.setItem('mega_iq_session',d.session_token); }catch(_){}
+    }
+
     brokerConnected[b]=true;
-    iqPassword.value='';
-    iqAccountStatus.textContent='🟢 '+(d.message||'Conectada.');
-    syncBroker(b);
-    await updateMarketNote();
+    if(iqPassword) iqPassword.value='';
+    if(iqAccountStatus) iqAccountStatus.textContent='🟢 '+((d&&d.message)||'Conectada.');
+
+    try{ syncBroker(b); }catch(_){}
+    try{ await updateMarketNote(); }catch(_){}
     chartData=[];
     chartPreSignal=null;
-    await loadChart();
-    sig(true);
-    rad();
+    try{ if(chartTab && chartTab.classList.contains('active')) await loadChart(); }catch(_){}
+    try{ sig(true); }catch(_){}
+    try{ rad(); }catch(_){}
   }catch(e){
     brokerConnected[b]=false;
-    iqAccountStatus.textContent='🔴 '+String(e.message||e);
-    iqConnectBtn.style.display='block';
-    iqLogoutBtn.style.display='none';
+    if(iqAccountStatus) iqAccountStatus.textContent='🔴 '+String((e&&e.message)||e);
+    if(iqConnectBtn) iqConnectBtn.style.display='block';
+    if(iqLogoutBtn) iqLogoutBtn.style.display='none';
   }finally{
-    iqConnectBtn.disabled=false;
+    if(iqConnectBtn) iqConnectBtn.disabled=false;
   }
+  return false;
 };
+
+if(iqConnectBtn){
+  iqConnectBtn.addEventListener('click',window.megaConnectIQ);
+}
 
 if(interval){
   interval.addEventListener('change',()=>{
