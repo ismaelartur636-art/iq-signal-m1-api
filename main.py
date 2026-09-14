@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.52.0")
-print("[MEGA IA] versão 33.52.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.53.0")
+print("[MEGA IA] versão 33.53.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -48,6 +48,8 @@ UTC = timezone.utc
 TD_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 OAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 OAI_MIN = float(os.getenv("OPENAI_MIN_CONFIDENCE", "70"))
 OAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "15"))
 
@@ -60,6 +62,7 @@ IG = os.getenv("INSTAGRAM", "@Ismaelartur26")
 
 TD_URL = "https://api.twelvedata.com/time_series"
 OAI_URL = "https://api.openai.com/v1/responses"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 INTERVALS = {"1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1h": 3600, "4h": 14400}
 SYMBOLS = [
@@ -3415,9 +3418,30 @@ async def candles(
     return await candles_open(symbol, interval, n)
 
 
+async def _gemini_json(prompt):
+    """Executa o motor Gemini e devolve o JSON produzido pelo modelo."""
+    if not GEMINI_KEY:
+        raise RuntimeError("GEMINI_API_KEY não configurada.")
+    url = GEMINI_URL.format(model=GEMINI_MODEL)
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.15},
+    }
+    async with httpx.AsyncClient(timeout=OAI_TIMEOUT) as client:
+        response = await client.post(url, params={"key": GEMINI_KEY}, json=body)
+        response.raise_for_status()
+        payload = response.json()
+    parts = (((payload.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+    text = "".join(str(x.get("text", "")) for x in parts if isinstance(x, dict))
+    parsed = json_extract(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("Resposta inválida da IA Gemini.")
+    return parsed
+
+
 async def openai_confirm(symbol, interval, cs, analysis):
-    if not OAI_KEY or not OAI_MODEL:
-        return {"available": False, "reason": "OPENAI_API_KEY/OPENAI_MODEL não configurados."}
+    if not GEMINI_KEY:
+        return {"available": False, "reason": "GEMINI_API_KEY não configurada."}
 
     key = f"{symbol}|{interval}|{cs[-1]['datetime']}"
     if key in oai_cache and time.time() - oai_cache[key][0] < 55:
@@ -3439,25 +3463,7 @@ Retorne SOMENTE JSON:
 Candles: {json.dumps(data, ensure_ascii=False)}"""
 
     try:
-        async with httpx.AsyncClient(timeout=OAI_TIMEOUT) as client:
-            response = await client.post(
-                OAI_URL,
-                headers={"Authorization": f"Bearer {OAI_KEY}", "Content-Type": "application/json"},
-                json={"model": OAI_MODEL, "input": prompt},
-            )
-            response.raise_for_status()
-            payload = response.json()
-
-        text = payload.get("output_text", "")
-        if not text:
-            for item in payload.get("output", []):
-                for content in item.get("content", []):
-                    if content.get("type") in ("output_text", "text"):
-                        text += content.get("text", "")
-
-        p = json_extract(text)
-        if not isinstance(p, dict):
-            raise ValueError("Resposta inválida da IA.")
+        p = await _gemini_json(prompt)
 
         out = {
             "available": True,
@@ -3486,11 +3492,11 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
     um tempo máximo sem nova avaliação. Isso mantém resposta rápida sem fazer
     uma chamada cara a cada polling.
     """
-    if not OAI_KEY or not OAI_MODEL:
+    if not GEMINI_KEY:
         return {
             "available": False, "direction": "NEUTRO", "confidence": 0,
             "confirmed": False, "risk": "HIGH",
-            "reason": "OPENAI_API_KEY/OPENAI_MODEL não configurados.",
+            "reason": "GEMINI_API_KEY não configurada.",
         }
 
     if not cs:
@@ -3570,25 +3576,7 @@ Retorne SOMENTE JSON válido:
 Candles: {json.dumps(data, ensure_ascii=False)}"""
 
     try:
-        async with httpx.AsyncClient(timeout=OAI_TIMEOUT) as client:
-            response = await client.post(
-                OAI_URL,
-                headers={"Authorization": f"Bearer {OAI_KEY}", "Content-Type": "application/json"},
-                json={"model": OAI_MODEL, "input": prompt},
-            )
-            response.raise_for_status()
-            payload = response.json()
-
-        text = payload.get("output_text", "")
-        if not text:
-            for item in payload.get("output", []):
-                for content in item.get("content", []):
-                    if content.get("type") in ("output_text", "text"):
-                        text += content.get("text", "")
-
-        parsed = json_extract(text)
-        if not isinstance(parsed, dict):
-            raise ValueError("Resposta inválida da IA.")
+        parsed = await _gemini_json(prompt)
 
         direction = str(parsed.get("direction", "NEUTRO")).upper()
         if direction not in ("CALL", "PUT", "NEUTRO"):
@@ -3769,7 +3757,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "status": "IA PURA • VARREDURA 5s • ANÁLISE INTELIGENTE",
             "ai_confirmed": bool(ai.get("confirmed", False)),
             "risk": ai.get("risk", "HIGH"),
-            "strategy": "IA PURA",
+            "strategy": "IA GEMINI",
+            "ai_provider": "GEMINI",
             "reason": ai.get("reason") or "IA analisando os mesmos candles exibidos no gráfico.",
             "non_repaint": True,
             "technical": {"disabled": True, "mode": "AI_ONLY"},
@@ -3779,7 +3768,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
         if ai.get("available") and ai.get("confirmed") and ai.get("direction") in ("CALL", "PUT"):
             base["direction"] = ai["direction"]
-            base["status"] = "SINAL DA IA LIBERADO"
+            base["status"] = "SINAL IA GEMINI LIBERADO"
             announce, entry, expiry = entry_window(interval)
             base["entry_time"] = iso(entry)
             base["announce_time"] = iso(announce)
