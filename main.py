@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.58.0")
-print("[MEGA IA] versão 33.58.0 • RSI CROSS MULTI-TIMEFRAME carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.59.0")
+print("[MEGA IA] versão 33.59.0 • RSI CROSS MULTI-TIMEFRAME + RESET RESULTADOS carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -4251,7 +4251,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.35.0",
+        "version": "33.59.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -5488,6 +5488,27 @@ async def performance(request: Request, interval="1min", market="OPEN"):
     }
 
 
+@app.post("/performance/reset")
+async def reset_performance(request: Request, market="OPEN"):
+    """Zera resultados e entradas pendentes do mercado selecionado."""
+    market = (market or "OPEN").upper()
+    if market not in VALID_MARKETS:
+        raise HTTPException(400, "Mercado inválido.")
+
+    if market == "IQ_OTC":
+        state = _iq_session_state(request, required=False)
+        if state is not None:
+            state.setdefault("accounting_pending", {}).clear()
+            state.setdefault("accounting_results", {}).clear()
+            state.setdefault("results", {}).clear()
+    else:
+        accounting_pending.setdefault(market, {}).clear()
+        accounting_results.setdefault(market, {}).clear()
+        results.setdefault(market, {}).clear()
+
+    return {"ok": True, "market": market, "message": "Resultados zerados com sucesso."}
+
+
 
 def _cached_open_candles_for_result(symbol: str, interval: str, n: int = 100):
     """Usa o cache já carregado da Twelve Data sem gastar uma nova chamada."""
@@ -6151,6 +6172,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         </div>
       </div>
 
+      <div style="margin-top:14px">
+        <button id="resetResultsBtn" type="button" style="width:100%;font-weight:900;border-color:#ff5252">🗑️ ZERAR RESULTADOS</button>
+      </div>
+
       <div class="card" style="margin-top:12px">
         <div class="label">ÚLTIMO RESULTADO</div>
         <div id="galeLastResult" class="big">--</div>
@@ -6331,6 +6356,7 @@ const winG1=document.getElementById('winG1');
 const winG2=document.getElementById('winG2');
 const lossDirect=document.getElementById('lossDirect');
 const lossG2=document.getElementById('lossG2');
+const resetResultsBtn=document.getElementById('resetResultsBtn');
 const galeLastResult=document.getElementById('galeLastResult');
 const galeStageStatus=document.getElementById('galeStageStatus');
 const tabMain=document.getElementById('tabMain');
@@ -6587,6 +6613,43 @@ function paintPersistentResults(){
   if(lossDirect) lossDirect.textContent=String(b.loss_direct);
   if(lossG2) lossG2.textContent=String(b.loss_g2);
 }
+
+async function resetResultsNow(){
+  const m=activeResultMarket();
+  const ok=confirm('Zerar todos os resultados de '+m+'? Esta ação não pode ser desfeita.');
+  if(!ok) return;
+
+  try{
+    if(resetResultsBtn){
+      resetResultsBtn.disabled=true;
+      resetResultsBtn.textContent='⏳ ZERANDO...';
+    }
+    const r=await fetch('/performance/reset?market='+encodeURIComponent(m),{method:'POST',cache:'no-store'});
+    const data=await r.json().catch(()=>({}));
+    if(!r.ok || data.ok===false) throw new Error(data.detail||data.message||'Falha ao zerar resultados');
+
+    persistentResults[m]=emptyResultBucket();
+    pendingTrade=(pendingTrade && resultMarket(pendingTrade.market)===m)?null:pendingTrade;
+    pendingTradeQueue=(pendingTradeQueue||[]).filter(t=>resultMarket(t.market)!==m);
+    try{
+      localStorage.removeItem('mega_pending_trade_v33450');
+      localStorage.setItem(PENDING_QUEUE_KEY,JSON.stringify(pendingTradeQueue));
+    }catch(_){}
+    savePersistentResults();
+    paintPersistentResults();
+    if(typeof resultEl!=='undefined' && resultEl) resultEl.textContent='--';
+    alert('Resultados zerados com sucesso.');
+  }catch(e){
+    alert('Não foi possível zerar: '+(e?.message||e));
+  }finally{
+    if(resetResultsBtn){
+      resetResultsBtn.disabled=false;
+      resetResultsBtn.textContent='🗑️ ZERAR RESULTADOS';
+    }
+  }
+}
+
+if(resetResultsBtn) resetResultsBtn.onclick=resetResultsNow;
 
 loadPersistentResults();
 
