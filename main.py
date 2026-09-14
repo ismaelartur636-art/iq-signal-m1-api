@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.47.0")
-print("[MEGA IA] versão 33.47.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.48.0")
+print("[MEGA IA] versão 33.48.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2885,8 +2885,38 @@ def _iq_lowlevel_connect_worker(client, result_box):
         result_box["error"] = repr(exc)
 
 
+def _iq_network_probe():
+    """Diagnóstico leve da rota Render -> IQ Option, sem usar credenciais."""
+    import socket
+    host = "iqoption.com"
+    out = {"dns_ok": False, "tcp443_ok": False, "dns_ms": None, "tcp_ms": None, "ip": ""}
+    try:
+        t0 = time.monotonic()
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        out["dns_ms"] = round((time.monotonic() - t0) * 1000)
+        out["dns_ok"] = bool(infos)
+        if infos:
+            out["ip"] = str(infos[0][4][0])
+    except Exception as exc:
+        out["dns_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+        return out
+
+    try:
+        t0 = time.monotonic()
+        sock = socket.create_connection((host, 443), timeout=6.0)
+        out["tcp_ms"] = round((time.monotonic() - t0) * 1000)
+        out["tcp443_ok"] = True
+        try:
+            sock.close()
+        except Exception:
+            pass
+    except Exception as exc:
+        out["tcp_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+    return out
+
+
 def _iq_connect_fresh(email: str, password: str):
-    """Login IQ Option com construtor e conexão protegidos por timeout real."""
+    """Login IQ Option com diagnóstico por etapas e timeout real."""
     if IQ_Option is None:
         raise RuntimeError("Biblioteca iqoptionapi não carregada no servidor.")
 
@@ -2895,14 +2925,40 @@ def _iq_connect_fresh(email: str, password: str):
     if not email or not password:
         raise RuntimeError("Informe e-mail e senha da IQ Option.")
 
-    stable_box = {}
+    # 1) Verifica primeiro se o Render consegue resolver o domínio e abrir TCP 443.
+    probe = _iq_network_probe()
+    print(
+        "[IQ DIAG] rede "
+        f"dns={'OK' if probe.get('dns_ok') else 'FALHA'} "
+        f"dns_ms={probe.get('dns_ms')} "
+        f"tcp443={'OK' if probe.get('tcp443_ok') else 'FALHA'} "
+        f"tcp_ms={probe.get('tcp_ms')} "
+        f"ip={probe.get('ip') or '-'}",
+        flush=True,
+    )
+    if probe.get("dns_error"):
+        print(f"[IQ DIAG] DNS erro={probe['dns_error']}", flush=True)
+    if probe.get("tcp_error"):
+        print(f"[IQ DIAG] TCP443 erro={probe['tcp_error']}", flush=True)
+    if not probe.get("dns_ok") or not probe.get("tcp443_ok"):
+        raise RuntimeError("O servidor Render não conseguiu alcançar iqoption.com pela porta 443.")
+
+    stable_box = {"stage": "aguardando", "started": time.monotonic()}
 
     def stable_worker():
         try:
+            stable_box["stage"] = "construtor_IQ_Option"
+            stable_box["stage_at"] = time.monotonic()
             client = IQ_Option(email, password)
             stable_box["client"] = client
+            stable_box["constructor_ms"] = round((time.monotonic() - stable_box["stage_at"]) * 1000)
+            stable_box["stage"] = "connect_HTTP_WebSocket"
+            stable_box["stage_at"] = time.monotonic()
             stable_box["result"] = client.connect()
+            stable_box["connect_ms"] = round((time.monotonic() - stable_box["stage_at"]) * 1000)
+            stable_box["stage"] = "connect_retorno"
         except Exception as exc:
+            stable_box["stage"] = "excecao"
             stable_box["error"] = exc
 
     print("[IQ LOGIN] iniciando stable_api", flush=True)
@@ -2911,6 +2967,13 @@ def _iq_connect_fresh(email: str, password: str):
     th.join(32.0)
 
     if not th.is_alive():
+        elapsed_ms = round((time.monotonic() - stable_box["started"]) * 1000)
+        print(
+            f"[IQ DIAG] stable terminou etapa={stable_box.get('stage')} "
+            f"total_ms={elapsed_ms} construtor_ms={stable_box.get('constructor_ms')} "
+            f"connect_ms={stable_box.get('connect_ms')}",
+            flush=True,
+        )
         if "error" in stable_box:
             exc = stable_box["error"]
             print(f"[IQ LOGIN] stable_api erro={type(exc).__name__}: {str(exc)[:180]}", flush=True)
@@ -2923,13 +2986,20 @@ def _iq_connect_fresh(email: str, password: str):
             else:
                 ok = bool(result)
                 reason = ""
+            print(
+                f"[IQ DIAG] stable connect retornou ok={ok} reason={reason[:120] or '-'}",
+                flush=True,
+            )
             if ok and client is not None:
                 try:
-                    if bool(client.check_connect()):
+                    stable_box["stage"] = "check_connect_WebSocket"
+                    connected = bool(client.check_connect())
+                    print(f"[IQ DIAG] check_connect={connected}", flush=True)
+                    if connected:
                         print("[IQ LOGIN] stable_api conectado", flush=True)
                         return client
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"[IQ DIAG] check_connect erro={type(exc).__name__}: {str(exc)[:160]}", flush=True)
             low = reason.lower()
             if "2fa" in low or "verify" in low:
                 raise RuntimeError("A IQ Option está exigindo autenticação em duas etapas (2FA).")
@@ -2937,29 +3007,54 @@ def _iq_connect_fresh(email: str, password: str):
                 raise RuntimeError("E-mail ou senha da IQ Option estão incorretos.")
             print(f"[IQ LOGIN] stable_api sem conexão; fallback. motivo={reason[:120]}", flush=True)
     else:
+        elapsed_ms = round((time.monotonic() - stable_box["started"]) * 1000)
+        stage = stable_box.get("stage") or "desconhecida"
+        stage_age_ms = None
+        if stable_box.get("stage_at"):
+            stage_age_ms = round((time.monotonic() - stable_box["stage_at"]) * 1000)
+        print(
+            f"[IQ DIAG] TIMEOUT stable etapa={stage} total_ms={elapsed_ms} etapa_ms={stage_age_ms} "
+            f"construtor_ms={stable_box.get('constructor_ms')}",
+            flush=True,
+        )
         print("[IQ LOGIN] stable_api excedeu 32s; cancelando sem abrir conexão concorrente", flush=True)
+        if stage == "construtor_IQ_Option":
+            detail = "travou ao criar o cliente IQ_Option antes de iniciar o login."
+        elif stage == "connect_HTTP_WebSocket":
+            detail = "travou dentro de client.connect(), na etapa de autenticação/sessão/WebSocket da iqoptionapi."
+        else:
+            detail = f"travou na etapa {stage}."
         raise TimeoutError(
-            "A IQ Option não respondeu ao servidor dentro de 32 segundos. "
-            "A tentativa foi encerrada sem iniciar uma segunda conexão simultânea."
+            "A IQ Option não respondeu ao servidor dentro de 32 segundos; " + detail
         )
 
-    fallback_box = {}
+    fallback_box = {"stage": "aguardando", "started": time.monotonic()}
 
     def fallback_worker():
         try:
+            fallback_box["stage"] = "construtor_IQ_Option"
+            fallback_box["stage_at"] = time.monotonic()
             client = IQ_Option(email, password)
+            fallback_box["constructor_ms"] = round((time.monotonic() - fallback_box["stage_at"]) * 1000)
             from iqoptionapi.api import IQOptionAPI
+            fallback_box["stage"] = "criar_IQOptionAPI"
             api = IQOptionAPI("iqoption.com", email, password)
+            fallback_box["stage"] = "set_session"
             api.set_session(
                 headers=getattr(client, "SESSION_HEADER", {}),
                 cookies=getattr(client, "SESSION_COOKIE", {}),
             )
             client.api = api
+            fallback_box["stage"] = "api_connect_HTTP_WebSocket"
+            fallback_box["stage_at"] = time.monotonic()
             check, reason = api.connect()
+            fallback_box["connect_ms"] = round((time.monotonic() - fallback_box["stage_at"]) * 1000)
+            fallback_box["stage"] = "api_connect_retorno"
             fallback_box["client"] = client
             fallback_box["ok"] = bool(check)
             fallback_box["reason"] = str(reason or "")
         except Exception as exc:
+            fallback_box["stage"] = "excecao"
             fallback_box["error"] = exc
 
     print("[IQ LOGIN] iniciando fallback low-level", flush=True)
@@ -2968,20 +3063,38 @@ def _iq_connect_fresh(email: str, password: str):
     ft.join(20.0)
 
     if ft.is_alive():
+        stage = fallback_box.get("stage") or "desconhecida"
+        stage_age_ms = None
+        if fallback_box.get("stage_at"):
+            stage_age_ms = round((time.monotonic() - fallback_box["stage_at"]) * 1000)
+        print(
+            f"[IQ DIAG] TIMEOUT fallback etapa={stage} etapa_ms={stage_age_ms} "
+            f"construtor_ms={fallback_box.get('constructor_ms')}",
+            flush=True,
+        )
         print("[IQ LOGIN] fallback excedeu 20s", flush=True)
         raise TimeoutError(
-            "A biblioteca da IQ Option ficou travada no servidor. "
-            "O login foi cancelado pelo limite de segurança."
+            f"A biblioteca da IQ Option ficou travada no fallback na etapa {stage}."
         )
 
     if "error" in fallback_box:
         exc = fallback_box["error"]
+        print(
+            f"[IQ DIAG] fallback exceção etapa={fallback_box.get('stage')} "
+            f"erro={type(exc).__name__}: {str(exc)[:180]}",
+            flush=True,
+        )
         print(f"[IQ LOGIN] fallback erro={type(exc).__name__}: {str(exc)[:180]}", flush=True)
         raise RuntimeError(f"Fallback IQ Option falhou: {str(exc)[:240]}")
 
     ok = bool(fallback_box.get("ok"))
     reason = str(fallback_box.get("reason") or "")
     client = fallback_box.get("client")
+    print(
+        f"[IQ DIAG] fallback terminou etapa={fallback_box.get('stage')} ok={ok} "
+        f"connect_ms={fallback_box.get('connect_ms')} reason={reason[:120] or '-'}",
+        flush=True,
+    )
 
     if not ok or client is None:
         low = reason.lower()
@@ -2992,9 +3105,12 @@ def _iq_connect_fresh(email: str, password: str):
         raise RuntimeError("A IQ Option recusou a conexão" + (f": {reason}" if reason else "."))
 
     try:
+        fallback_box["stage"] = "check_connect_WebSocket"
         connected = bool(client.check_connect())
-    except Exception:
+        print(f"[IQ DIAG] fallback check_connect={connected}", flush=True)
+    except Exception as exc:
         connected = False
+        print(f"[IQ DIAG] fallback check_connect erro={type(exc).__name__}: {str(exc)[:160]}", flush=True)
 
     if not connected:
         raise RuntimeError("A IQ Option abriu a sessão, mas o WebSocket não permaneceu conectado.")
