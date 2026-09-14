@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.38.0")
+app = FastAPI(title="MEGA IA", version="33.39.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -148,6 +148,70 @@ def iso(d: datetime):
 def parse_dt(value: str):
     d = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return (d if d.tzinfo else d.replace(tzinfo=UTC)).astimezone(BR_TZ)
+
+
+
+def _candle_time_candidates(value: str):
+    """
+    Twelve Data pode entregar datetime sem offset.
+    Para fechar WIN/LOSS, aceita tanto UTC quanto horário de Brasília
+    e escolhe a interpretação mais próxima da entrada.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+
+    out = []
+    try:
+        d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return out
+
+    if d.tzinfo is not None:
+        return [d.astimezone(BR_TZ)]
+
+    # Interpretação 1: datetime recebido já está em Brasília.
+    try:
+        out.append(d.replace(tzinfo=BR_TZ))
+    except Exception:
+        pass
+
+    # Interpretação 2: datetime recebido está em UTC.
+    try:
+        out.append(d.replace(tzinfo=UTC).astimezone(BR_TZ))
+    except Exception:
+        pass
+
+    # Remove duplicatas.
+    unique = []
+    seen = set()
+    for item in out:
+        key = item.isoformat()
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def _nearest_candle_for_time(candles_list, target_dt, interval_seconds):
+    target = None
+    best_delta = None
+    best_dt = None
+
+    for c in candles_list or []:
+        for cdt in _candle_time_candidates(c.get("datetime")):
+            delta = abs((cdt - target_dt).total_seconds())
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                target = c
+                best_dt = cdt
+
+    # Um candle do timeframe deve ficar muito próximo do horário esperado.
+    tolerance = max(45.0, float(interval_seconds) * 0.80)
+    if target is None or best_delta is None or best_delta > tolerance:
+        return None, best_delta, best_dt
+
+    return target, best_delta, best_dt
 
 
 def clamp(x, lo, hi):
@@ -2821,7 +2885,13 @@ def _iq_lowlevel_connect_worker(client, result_box):
 
 
 def _iq_connect_fresh(email: str, password: str):
-    """Conecta pela stable_api, usando o mesmo fluxo que já funcionou no Render."""
+    """
+    Login IQ Option resistente ao travamento da stable_api no Render.
+
+    1) tenta IQ_Option.connect() normalmente;
+    2) se o connect ficar preso, usa a camada IQOptionAPI já existente
+       como fallback, sem esperar indefinidamente pelo balance_id.
+    """
     if IQ_Option is None:
         raise RuntimeError("Biblioteca iqoptionapi não carregada no servidor.")
 
@@ -2830,56 +2900,95 @@ def _iq_connect_fresh(email: str, password: str):
     if not email or not password:
         raise RuntimeError("Informe e-mail e senha da IQ Option.")
 
-    client = IQ_Option(email, password)
+    def _check_ready(client, seconds=5.0):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                if bool(client.check_connect()):
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.25)
+        return False
 
-    try:
-        result = client.connect()
-    except Exception as exc:
-        raise RuntimeError(f"Falha ao abrir login IQ Option: {type(exc).__name__}: {str(exc)[:220]}") from exc
+    # 1) Stable API com limite real de tempo.
+    stable_client = IQ_Option(email, password)
+    stable_box = {}
 
-    if isinstance(result, (tuple, list)):
-        ok = bool(result[0]) if result else False
-        reason = str(result[1] if len(result) > 1 else "")
+    def _stable_worker():
+        try:
+            stable_box["result"] = stable_client.connect()
+        except Exception as exc:
+            stable_box["error"] = exc
+
+    th = threading.Thread(target=_stable_worker, daemon=True)
+    th.start()
+    th.join(timeout=18.0)
+
+    if not th.is_alive():
+        if "error" in stable_box:
+            raise RuntimeError(
+                f"Falha no login IQ Option: {type(stable_box['error']).__name__}: "
+                f"{str(stable_box['error'])[:220]}"
+            )
+
+        result = stable_box.get("result")
+        if isinstance(result, (tuple, list)):
+            ok = bool(result[0]) if result else False
+            reason = str(result[1] if len(result) > 1 else "")
+        else:
+            ok = bool(result)
+            reason = ""
+
+        if ok and _check_ready(stable_client, 5.0):
+            return stable_client
+
+        low = reason.lower()
+        if "2fa" in low or "verify" in low:
+            raise RuntimeError("A IQ Option está exigindo autenticação em duas etapas (2FA).")
+        if "invalid_credentials" in low or "wrong credentials" in low or "invalid credentials" in low:
+            raise RuntimeError("E-mail ou senha da IQ Option estão incorretos.")
+
+        # Se respondeu, mas websocket não estabilizou, ainda tentamos o fallback.
+        print(
+            f"[IQ LOGIN] stable_api não estabilizou; fallback low-level. motivo={reason[:120]}",
+            flush=True,
+        )
     else:
-        ok = bool(result)
-        reason = ""
+        print("[IQ LOGIN] stable_api travou por 18s; ativando fallback low-level", flush=True)
+
+    # 2) Fallback low-level da própria iqoptionapi.
+    low_client = IQ_Option(email, password)
+    result_box = {}
+    low_thread = threading.Thread(
+        target=_iq_lowlevel_connect_worker,
+        args=(low_client, result_box),
+        daemon=True,
+    )
+    low_thread.start()
+    low_thread.join(timeout=15.0)
+
+    if low_thread.is_alive():
+        raise TimeoutError("A IQ Option não respondeu nem pelo fallback dentro do tempo limite.")
+
+    if result_box.get("error"):
+        raise RuntimeError(f"Fallback IQ Option falhou: {str(result_box['error'])[:240]}")
+
+    ok = bool(result_box.get("ok"))
+    reason = str(result_box.get("reason") or "")
 
     if not ok:
         low = reason.lower()
         if "2fa" in low or "verify" in low:
             raise RuntimeError("A IQ Option está exigindo autenticação em duas etapas (2FA).")
-        if (
-            "invalid_credentials" in low
-            or "wrong credentials" in low
-            or "invalid credentials" in low
-        ):
+        if "invalid_credentials" in low or "wrong credentials" in low or "invalid credentials" in low:
             raise RuntimeError("E-mail ou senha da IQ Option estão incorretos.")
         raise RuntimeError("A IQ Option recusou a conexão" + (f": {reason}" if reason else "."))
 
-    # O connect pode retornar antes do websocket estabilizar.
-    ready = False
-    for _ in range(24):
-        try:
-            if bool(client.check_connect()):
-                ready = True
-                break
-        except Exception:
-            pass
-        time.sleep(0.25)
+    if not _check_ready(low_client, 6.0):
+        raise RuntimeError("A conexão abriu, mas o websocket da IQ Option não permaneceu conectado.")
 
-    if not ready:
-        try:
-            client.close()
-        except Exception:
-            try:
-                api = getattr(client, "api", None)
-                if api is not None and callable(getattr(api, "close", None)):
-                    api.close()
-            except Exception:
-                pass
-        raise RuntimeError("Login aceito, mas o websocket da IQ Option não permaneceu conectado.")
-
-    return client
+    return low_client
 
 def _iq_reconnect_state(state: Dict[str, Any]):
     if _iq_connected(state):
@@ -3810,9 +3919,9 @@ async def manifest():
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=38", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=38", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=38", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=39", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=39", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=39", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -3876,10 +3985,10 @@ async def iq_login(body: IQLoginBody, response: Response):
     client = None
     last_exc = None
 
-    # A IQ Option pode falhar temporariamente no primeiro handshake.
-    # Fazemos uma segunda tentativa automática apenas para falhas transitórias.
-    for attempt in range(2):
-        print(f"[IQ LOGIN] stable_api tentativa={attempt+1}/2", flush=True)
+    # _iq_connect_fresh já possui stable_api + fallback interno.
+    # Uma única tentativa evita deixar duas conexões presas no Render.
+    for attempt in range(1):
+        print("[IQ LOGIN] conexão robusta stable_api + fallback", flush=True)
         try:
             client = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -3887,7 +3996,7 @@ async def iq_login(body: IQLoginBody, response: Response):
                     email,
                     password,
                 ),
-                timeout=max(IQ_CONNECT_TIMEOUT + 5, 30),
+                timeout=45,
             )
             if client is not None:
                 break
@@ -3901,7 +4010,7 @@ async def iq_login(body: IQLoginBody, response: Response):
                 or "2fa" in low
                 or "duas etapas" in low
             )
-            if fatal or attempt >= 1:
+            if fatal or attempt >= 0:
                 break
             await asyncio.sleep(1.5)
 
@@ -4860,19 +4969,11 @@ async def _settle_accounting_pending(request: Request, market: str):
             entry_dt = parse_dt(t["entry_time"])
             cs = await candles(symbol, interval, 50, market, iq_state, request=request)
 
-            target = None
-            best_delta = None
-            for c in cs:
-                try:
-                    cdt = parse_dt(c["datetime"])
-                except Exception:
-                    continue
-                delta = abs((cdt - entry_dt).total_seconds())
-                if best_delta is None or delta < best_delta:
-                    best_delta = delta
-                    target = c
+            target, best_delta, matched_dt = _nearest_candle_for_time(
+                cs, entry_dt, INTERVALS[interval]
+            )
 
-            if not target or best_delta is None or best_delta > INTERVALS[interval] * 0.75:
+            if not target:
                 continue
 
             op = float(target["open"])
@@ -5051,28 +5152,9 @@ async def result(
             }
 
     def candle_near(target_dt):
-        target = None
-        best_delta = None
-
-        for c in cs:
-            try:
-                cdt = parse_dt(c["datetime"])
-            except Exception:
-                continue
-
-            delta = abs((cdt - target_dt).total_seconds())
-
-            if best_delta is None or delta < best_delta:
-                best_delta = delta
-                target = c
-
-        if (
-            not target
-            or best_delta is None
-            or best_delta > INTERVALS[interval] * 0.75
-        ):
-            return None
-
+        target, best_delta, matched_dt = _nearest_candle_for_time(
+            cs, target_dt, INTERVALS[interval]
+        )
         return target
 
     def candle_result(candle):
@@ -5105,6 +5187,10 @@ async def result(
             base = None
 
     if not base:
+        print(
+            f"[RESULTADO] aguardando candle {symbol} {interval} {direction} entrada={iso(entry_dt)}",
+            flush=True,
+        )
         return {
             "status": "AGUARDANDO CANDLE",
             "stage": "ENTRADA",
@@ -5132,6 +5218,11 @@ async def result(
         "direct_only": True,
     }
     store[key] = out
+    print(
+        f"[RESULTADO] {symbol} {interval} {direction} -> {final_direct} "
+        f"entrada={iso(entry_dt)} candle={base.get('datetime')}",
+        flush=True,
+    )
 
     # Mantém a contabilidade do servidor sincronizada com o /result.
     pending_acc, done_acc = _accounting_buckets(request, market)
@@ -5257,9 +5348,9 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=38">
-<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=38">
-<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=38">
+<link rel="manifest" href="/manifest.webmanifest?v=39">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=39">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=39">
 <meta name="theme-color" content="#07182b">
 <meta name="application-name" content="Mega IA Trader">
 <meta name="apple-mobile-web-app-title" content="Mega IA Trader">
