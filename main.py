@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.57.0")
-print("[MEGA IA] versão 33.57.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.58.0")
+print("[MEGA IA] versão 33.58.0 • RSI CROSS MULTI-TIMEFRAME carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2093,58 +2093,6 @@ def adx(cs, period=21):
     return sum(dxs[-period:]) / min(period, len(dxs))
 
 
-
-def _adx_di_snapshot(cs, period=21):
-    """ADX/+DI/-DI compatível com a regra do indicador MQL4 ISMAEL TRADER."""
-    if len(cs) < period + 2:
-        return None
-    trs, plus_dm, minus_dm = [], [], []
-    for i in range(1, len(cs)):
-        cur, prev = cs[i], cs[i-1]
-        up = float(cur["high"]) - float(prev["high"])
-        down = float(prev["low"]) - float(cur["low"])
-        plus_dm.append(up if up > down and up > 0 else 0.0)
-        minus_dm.append(down if down > up and down > 0 else 0.0)
-        trs.append(max(float(cur["high"])-float(cur["low"]), abs(float(cur["high"])-float(prev["close"])), abs(float(cur["low"])-float(prev["close"]))))
-    if len(trs) < period:
-        return None
-    tr = sum(trs[-period:])
-    if tr <= 1e-12:
-        return None
-    pdi = 100.0 * sum(plus_dm[-period:]) / tr
-    mdi = 100.0 * sum(minus_dm[-period:]) / tr
-    a = adx(cs, period)
-    if a is None:
-        return None
-    return {"adx": a, "plus_di": pdi, "minus_di": mdi}
-
-
-def ismael_trader_ema_rsi_adx(cs):
-    """Conversão do MQL4: EMA 3/7 + RSI 9 (30/70) + ADX 21 mínimo 20."""
-    name = "ISMAEL TRADER • EMA 3/7 + RSI 9 + ADX 21"
-    if len(cs) < 45:
-        return {"direction":"NEUTRO","confidence":0,"confirmed":False,"reason":"Aguardando candles suficientes.","strategy":name}
-    closes=[float(c["close"]) for c in cs]
-    ef, es = ema(closes,3), ema(closes,7)
-    efp, esp = ema(closes[:-1],3), ema(closes[:-1],7)
-    r = rsi(closes,9)
-    snap = _adx_di_snapshot(cs,21)
-    if None in (ef,es,efp,esp,r) or not snap:
-        return {"direction":"NEUTRO","confidence":0,"confirmed":False,"reason":"EMA/RSI/ADX ainda sem dados suficientes.","strategy":name}
-    a,pdi,mdi=snap["adx"],snap["plus_di"],snap["minus_di"]
-    cross_up=ef>es and efp<=esp
-    cross_down=ef<es and efp>=esp
-    trend_up=ef>es and pdi>mdi
-    trend_down=ef<es and mdi>pdi
-    call=(cross_up or trend_up) and r<=30.0 and a>=20.0
-    put=(cross_down or trend_down) and r>=70.0 and a>=20.0
-    details={"ema3":round(ef,8),"ema7":round(es,8),"rsi9":round(r,2),"adx21":round(a,2),"plus_di":round(pdi,2),"minus_di":round(mdi,2)}
-    if call:
-        return {"direction":"CALL","confidence":85.0,"confirmed":True,"reason":f"EMA 3/7 compradora; RSI 9={r:.1f} <= 30; ADX 21={a:.1f} >= 20; +DI={pdi:.1f} e -DI={mdi:.1f}.","strategy":name,**details}
-    if put:
-        return {"direction":"PUT","confidence":85.0,"confirmed":True,"reason":f"EMA 3/7 vendedora; RSI 9={r:.1f} >= 70; ADX 21={a:.1f} >= 20; +DI={pdi:.1f} e -DI={mdi:.1f}.","strategy":name,**details}
-    return {"direction":"NEUTRO","confidence":50.0,"confirmed":False,"reason":f"Sem condição completa. RSI 9={r:.1f}, ADX 21={a:.1f}.","strategy":name,**details}
-
 def _mega_ia_confluence_score(cs, direction, context=None):
     """
     Score M1/M5 de 0 a 100:
@@ -2551,6 +2499,54 @@ def otc_engine(cs, context=None):
         "structure": structure_map,
         "noise_filter": noise,
     }
+
+
+def primary_rsi_cross_strategy(cs, period=14, timeframe="15min"):
+    """
+    Conversão do indicador rsier1m2.mq4 para o timeframe selecionado no app.
+
+    Regra original preservada:
+      CALL -> RSI anterior <= 30 e RSI atual >= 30
+      PUT  -> RSI anterior >= 70 e RSI atual <= 70
+
+    RSI 14 roda em M1, M5, M15 ou M30 conforme a seleção do painel.
+    Somente candles fechados entram no cálculo para evitar repaint.
+    """
+    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
+    name = f"RSI CROSS {tf_label} • rsier1m2"
+    if len(cs) < period + 2:
+        return {
+            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+            "strategy": name,
+            "reason": f"Aguardando pelo menos {period + 2} candles {tf_label} fechados.",
+            "rsi_period": period, "rsi_timeframe": timeframe,
+        }
+
+    closes = [float(c["close"]) for c in cs]
+    rsi_before = rsi(closes[:-1], period)
+    rsi_now = rsi(closes, period)
+
+    if rsi_before is None or rsi_now is None:
+        return {
+            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+            "strategy": name, "reason": "RSI ainda insuficiente.",
+            "rsi_period": period, "rsi_timeframe": timeframe,
+        }
+
+    base = {
+        "strategy": name, "rsi_period": period, "rsi_timeframe": timeframe,
+        "rsi_before": round(float(rsi_before), 2), "rsi_now": round(float(rsi_now), 2),
+        "legacy_disabled": True, "source": "rsier1m2.mq4",
+    }
+
+    if rsi_now >= 30.0 and rsi_before <= 30.0:
+        return {**base, "direction": "CALL", "confidence": 100, "confirmed": True,
+                "reason": f"RSI 14 {tf_label} cruzou 30 para cima ({rsi_before:.2f} → {rsi_now:.2f})."}
+    if rsi_before >= 70.0 and rsi_now <= 70.0:
+        return {**base, "direction": "PUT", "confidence": 100, "confirmed": True,
+                "reason": f"RSI 14 {tf_label} cruzou 70 para baixo ({rsi_before:.2f} → {rsi_now:.2f})."}
+    return {**base, "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+            "reason": f"Sem cruzamento agora. RSI 14 {tf_label}: {rsi_before:.2f} → {rsi_now:.2f}."}
 
 
 def strategy_engine_for_market(cs, market="OPEN", context=None):
@@ -3895,73 +3891,89 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     closed = raw[:-1] if len(raw) > 1 else raw
 
-    # 33.57.0 — teste isolado do indicador convertido de MQL4.
-    # ONLINE e OFFLINE usam EXATAMENTE o mesmo indicador; nenhuma IA ou estratégia antiga participa.
-    # OTC continua reservado ao segundo indicador solicitado pelo usuário.
-    if NEW_PRIMARY_INDICATOR_ENABLED and market == "OPEN":
-        analysis = ismael_trader_ema_rsi_adx(closed)
-        base = neutral_signal(symbol, interval, market, "INDICADOR ISMAEL • ANALISANDO", analysis.get("reason", ""), source_state="READY")
-        base.update({
-            "strategy": analysis.get("strategy"),
-            "mode": "PRIMARY_INDICATOR_ONLY",
-            "technical": analysis,
-            "ai_provider": "DISABLED",
-            "ai_confirmed": False,
-            "legacy_ai_disabled": True,
-            "legacy_indicators_disabled": True,
-            "robot_switch": "ONLINE" if ai_only else "OFFLINE",
+    # 33.58.0: ONLINE usa SOMENTE o indicador rsier1m2 no timeframe selecionado.
+    # Todas as IAs e todos os indicadores/estratégias antigos permanecem no arquivo,
+    # mas não participam desta bancada de teste.
+    if ai_only and NEW_PRIMARY_INDICATOR_ENABLED:
+        if market != "OPEN":
+            out = neutral_signal(
+                symbol, interval, market,
+                "ONLINE • RSI PRINCIPAL • SOMENTE MERCADO ABERTO",
+                "O indicador principal rsier1m2 está reservado ao mercado aberto. OTC aguardará o segundo indicador.",
+                source_state="READY",
+            )
+            out.update({
+                "strategy": f"RSI CROSS { {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval) } • rsier1m2",
+                "mode": "PRIMARY_RSI_TEST",
+                "ai_provider": "DISABLED",
+                "technical": {"legacy_disabled": True, "rsi_period": 14, "rsi_timeframe": interval},
+                "legacy_ai_disabled": True,
+                "legacy_indicators_disabled": True,
+            })
+            cache[key] = (time.time(), out)
+            return out
+
+        try:
+            # RSI 14 acompanha o timeframe selecionado no painel: M1/M5/M15/M30.
+            rsi_raw = await candles(symbol, interval, 80, market, iq_state, request=request)
+            rsi_closed = rsi_raw[:-1] if len(rsi_raw) > 1 else rsi_raw
+            analysis = primary_rsi_cross_strategy(rsi_closed, 14, interval)
+        except Exception as exc:
+            out = neutral_signal(
+                symbol, interval, market,
+                "ONLINE • RSI PRINCIPAL • AGUARDANDO DADOS",
+                f"Não foi possível calcular o RSI no timeframe {interval} agora: {str(exc)[:180]}",
+                source_state="WAITING",
+            )
+            out.update({"strategy": f"RSI CROSS { {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval) } • rsier1m2", "mode": "PRIMARY_RSI_TEST"})
+            cache[key] = (time.time(), out)
+            return out
+
+        release_state = signal_release_state.setdefault(release_key, {})
+        base = {
+            "symbol": symbol, "interval": interval, "market": market,
+            "direction": "NEUTRO",
             "confidence": analysis.get("confidence", 0),
-        })
-        if analysis.get("confirmed") and analysis.get("direction") in ("CALL", "PUT"):
-            announce, entry, expiry = entry_window(interval)
-            base.update(direction=analysis["direction"], confidence=analysis.get("confidence",85),
-                        entry_time=iso(entry), announce_time=iso(announce), expiry_time=iso(expiry),
-                        status="SINAL ISMAEL TRADER LIBERADO", risk="MEDIUM",
-                        reason=analysis.get("reason", ""), reference_candle=closed[-1].get("datetime") if closed else None)
-            release_state = signal_release_state.setdefault(release_key, {})
-            locked = release_state.get("locked_direction")
-            if locked == base["direction"]:
-                base.update(direction="NEUTRO", entry_time=None, announce_time=None, expiry_time=None,
-                            status="INDICADOR ISMAEL • AGUARDANDO NOVO SETUP",
-                            reason="O setup anterior já foi utilizado; aguardando uma nova condição do indicador.")
-            else:
-                release_state["locked_direction"] = base["direction"]
-                release_state["active_signal"] = dict(base)
-        else:
-            release_state = signal_release_state.setdefault(release_key, {})
-            release_state["locked_direction"] = None
-            release_state["active_signal"] = None
-        cache[key]=(time.time(),base)
-        return base
-
-    if market in ("IQ_OTC", "OLYMP_OTC") and not NEW_OTC_INDICATOR_ENABLED:
-        out = neutral_signal(symbol, interval, market, "OTC • AGUARDANDO SEGUNDO INDICADOR",
-                             "O indicador principal está isolado no Mercado Aberto. OTC permanece reservado ao segundo indicador.", source_state="READY")
-        out.update({"strategy":"SEGUNDO INDICADOR OTC • AGUARDANDO", "mode":"OTC_INDICATOR_WAITING",
-                    "legacy_ai_disabled":True,"legacy_indicators_disabled":True})
-        cache[key]=(time.time(),out)
-        return out
-
-    # BANCADA 33.56.0: o botão ONLINE/OFFLINE permanece disponível para receber
-    # o primeiro novo indicador, mas nenhuma IA antiga é executada.
-    if ai_only and not LEGACY_AI_ENABLED and not NEW_PRIMARY_INDICATOR_ENABLED:
-        out = neutral_signal(
-            symbol, interval, market,
-            "ONLINE • AGUARDANDO NOVO INDICADOR",
-            "Todas as IAs anteriores estão desativadas, sem exclusão do código. Aguardando o novo indicador principal.",
-            source_state="READY",
-        )
-        out.update({
-            "strategy": "NOVO INDICADOR PRINCIPAL • AGUARDANDO INSTALAÇÃO",
-            "mode": "NEW_INDICATOR_TEST",
-            "ai_provider": "DISABLED",
-            "ai_confirmed": False,
-            "technical": {"disabled": True, "legacy_preserved": True},
+            "entry_time": None, "announce_time": None, "expiry_time": None,
+            "status": f"ONLINE • RSI CROSS {interval} MONITORANDO",
+            "ai_confirmed": False, "ai_provider": "DISABLED",
+            "risk": "HIGH",
+            "strategy": analysis.get("strategy", f"RSI CROSS {interval} • rsier1m2"),
+            "reason": analysis.get("reason", "Sem cruzamento RSI."),
+            "non_repaint": True,
+            "technical": analysis,
+            "source_state": "READY",
+            "mode": "PRIMARY_RSI_TEST",
             "legacy_ai_disabled": True,
             "legacy_indicators_disabled": True,
-        })
-        cache[key] = (time.time(), out)
-        return out
+        }
+
+        if analysis.get("confirmed") and analysis.get("direction") in ("CALL", "PUT"):
+            direction_now = analysis["direction"]
+            # Só libera uma vez por candle do timeframe selecionado; evita duplicar sinal no polling.
+            reference_candle = rsi_closed[-1].get("datetime") if rsi_closed else None
+            signal_fingerprint = f"{direction_now}|{reference_candle}"
+            if release_state.get("primary_rsi_fingerprint") != signal_fingerprint:
+                announce, entry, expiry = entry_window(interval)
+                base.update({
+                    "direction": direction_now,
+                    "status": "SINAL RSI LIBERADO",
+                    "risk": "MEDIUM",
+                    "entry_time": iso(entry),
+                    "announce_time": iso(announce),
+                    "expiry_time": iso(expiry),
+                    "reference_candle": reference_candle,
+                })
+                release_state["primary_rsi_fingerprint"] = signal_fingerprint
+                release_state["active_signal"] = dict(base)
+            else:
+                base["status"] = "ONLINE • RSI • SINAL JÁ UTILIZADO"
+                base["reason"] = f"Este cruzamento RSI {interval} já foi liberado; aguardando um novo cruzamento."
+        else:
+            release_state["active_signal"] = None
+
+        cache[key] = (time.time(), base)
+        return base
 
     # MODO ONLINE / IA PURA: código antigo PRESERVADO, porém desligado pelas flags acima.
     if ai_only:
@@ -4076,7 +4088,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     # BANCADA 33.56.0: no modo OFFLINE, os indicadores/estratégias anteriores
     # também permanecem preservados no arquivo, porém sem gerar sinais.
-    if not LEGACY_INDICATORS_ENABLED and not NEW_PRIMARY_INDICATOR_ENABLED and not NEW_OTC_INDICATOR_ENABLED:
+    if not LEGACY_INDICATORS_ENABLED:
         out = neutral_signal(
             symbol, interval, market,
             "OFFLINE • AGUARDANDO NOVOS INDICADORES",
@@ -6294,7 +6306,7 @@ try{
 const robotPowerBtn=document.getElementById('robotPowerBtn');
 const robotModeDesc=document.getElementById('robotModeDesc');
 const voiceBtn=document.getElementById('voiceBtn');
-let robotEnabled=true; // true = ONLINE / IA PURA; false = OFFLINE / MODO NORMAL
+let robotEnabled=true; // true = ONLINE / RSI rsier1m2; false = OFFLINE / robô pausado
 try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
 }catch(_){}
@@ -7572,21 +7584,21 @@ function applyRobotPowerState(){
     robotPowerBtn.style.background='#0b7a3d';
     robotPowerBtn.style.color='#fff';
     robotPowerBtn.style.borderColor='#16c56b';
-    if(robotModeDesc) robotModeDesc.textContent='ONLINE: indicadores internos desligados • somente IA.';
+    if(robotModeDesc) robotModeDesc.textContent='ONLINE: RSI 14 ativo no timeframe selecionado (M1/M5/M15/M30).';
     if(statusBox && (!cur || cur.direction==='NEUTRO')){
-      statusBox.textContent='MODO ONLINE • IA PURA MONITORANDO';
+      statusBox.textContent='MODO ONLINE • RSI 14 MONITORANDO O TIMEFRAME SELECIONADO';
     }
-    if(preSignalStatus) preSignalStatus.textContent='Modo IA pura: pré-sinais técnicos desativados.';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 ONLINE: somente a IA gera sinais.</div>';
-    if(radar) radar.innerHTML='<div>🧠 IA PURA ativa • indicadores internos desligados</div>';
+    if(preSignalStatus) preSignalStatus.textContent='Modo RSI: pré-sinais dos indicadores antigos desativados.';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📈 ONLINE: somente o RSI 14 gera sinais no timeframe selecionado.</div>';
+    if(radar) radar.innerHTML='<div>📈 RSI 14 M1/M5/M15/M30 ativo • demais indicadores desligados</div>';
   }else{
     robotPowerBtn.textContent='🔴 OFFLINE';
     robotPowerBtn.style.background='#7d1d1d';
     robotPowerBtn.style.color='#fff';
     robotPowerBtn.style.borderColor='#ff5252';
-    if(robotModeDesc) robotModeDesc.textContent='OFFLINE: modo normal • estratégias e indicadores internos ativos.';
+    if(robotModeDesc) robotModeDesc.textContent='OFFLINE: robô de sinais pausado • indicadores antigos continuam desativados.';
     if(statusBox && (!cur || cur.direction==='NEUTRO')){
-      statusBox.textContent='MODO NORMAL • INDICADORES ATIVOS';
+      statusBox.textContent='OFFLINE • SINAIS PAUSADOS';
     }
   }
 }
@@ -7613,17 +7625,18 @@ async function setRobotPower(enabled){
 
   await Promise.allSettled([sig(true), perf()]);
 
-  // Radar e pré-sinais pertencem ao motor técnico e só funcionam no modo normal.
+  // Nesta bancada, OFFLINE pausa o robô; radar e pré-sinais antigos ficam desligados.
   if(!robotEnabled){
-    await Promise.allSettled([rad(), loadPreSignals()]);
+    if(radar) radar.innerHTML='<div>⛔ OFFLINE • radar desativado nesta bancada</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ OFFLINE • pré-sinais desativados</div>';
   }
 
   if(chartTab.classList.contains('active')) loadChart();
 
   if(voiceEnabled){
     speak(robotEnabled
-      ? 'Modo online. Somente a inteligência artificial está gerando os sinais.'
-      : 'Modo offline. Estratégias e indicadores internos voltaram ao normal.');
+      ? 'Modo online. Somente o indicador RSI 14 do timeframe selecionado está gerando os sinais.'
+      : 'Modo offline. O robô de sinais está pausado e os indicadores antigos continuam desativados.');
   }
 }
 
@@ -7745,96 +7758,14 @@ async function perf(){
 }
 
 async function rad(){
-  if(!appEnabled) return;
-  if(robotEnabled){
-    if(radar) radar.innerHTML='<div>🧠 IA PURA ativa • radar técnico desativado</div>';
-    return;
-  }
-  if(radBusy) return;
-
-  radBusy=true;
-
-  try{
-    const a=await get(
-      '/radar?market='+encodeURIComponent(market.value)+
-      '&interval='+encodeURIComponent(interval.value)
-    );
-
-    radar.innerHTML=a.map(x=>`
-      <div>
-        <b>${x.symbol}</b><br>
-        <span class="${x.direction==='CALL'?'call':x.direction==='PUT'?'put':'neutral'}">${x.direction}</span>
-        • ${x.confidence}%<br>
-        <small>${x.status}</small>
-      </div>
-    `).join('');
-
-  }catch(e){
-    radar.innerHTML='<div>⚠️ Radar temporariamente indisponível</div>';
-  }finally{
-    radBusy=false;
-  }
+  if(radar) radar.innerHTML='<div>⛔ Radar técnico desativado durante o teste do RSI rsier1m2</div>';
+  return;
 }
 
-
 async function loadPreSignals(){
-  if(!appEnabled) return;
-  if(robotEnabled){
-    if(preSignalStatus) preSignalStatus.textContent='Modo IA pura: pré-sinais técnicos desativados.';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 Somente a IA gera sinais.</div>';
-    return;
-  }
-  if(preSignalBusy || !preSignals || !preSignalLimit) return;
-
-  preSignalBusy=true;
-
-  try{
-    const limit=Math.max(1,Math.min(4,Number(preSignalLimit.value||4)));
-
-    try{
-      localStorage.setItem('mega_pre_signal_limit',String(limit));
-    }catch(_){}
-
-    const d=await get(
-      '/pre-signals?market='+encodeURIComponent(market.value)+
-      '&interval='+encodeURIComponent(interval.value)+
-      '&limit='+encodeURIComponent(limit)
-    );
-
-    const items=(d&&Array.isArray(d.items))?d.items:[];
-
-    if(preSignalStatus){
-      preSignalStatus.textContent=d.message||'Monitorando pré-sinais...';
-    }
-
-    if(!items.length){
-      preSignals.innerHTML=
-        '<div style="opacity:.75">Nenhum CALL/PUT próximo de confirmar agora.</div>';
-      return;
-    }
-
-    preSignals.innerHTML=items.map(x=>{
-      const cls=x.direction==='CALL'?'call':'put';
-      const remain=Math.max(0,Number(x.seconds_to_entry||0));
-      return `
-        <div>
-          <b>${x.symbol}</b><br>
-          <span class="${cls}">PRÉ-${x.direction}</span>
-          • ${Number(x.confidence||0).toFixed(0)}%<br>
-          <b>⏳ ${remain}s para a próxima entrada</b><br>
-          <small>${x.status||'AGUARDANDO FECHAMENTO'}</small>
-        </div>
-      `;
-    }).join('');
-
-  }catch(e){
-    if(preSignalStatus){
-      preSignalStatus.textContent='Pré-sinais temporariamente indisponíveis.';
-    }
-    preSignals.innerHTML='';
-  }finally{
-    preSignalBusy=false;
-  }
+  if(preSignalStatus) preSignalStatus.textContent='Pré-sinais antigos desativados durante o teste do RSI.';
+  if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📈 Teste isolado: somente RSI 14 no timeframe selecionado.</div>';
+  return;
 }
 
 async function lic(){
