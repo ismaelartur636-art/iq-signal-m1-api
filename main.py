@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.45.0")
-print("[MEGA IA] versão 33.45.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.46.0")
+print("[MEGA IA] versão 33.46.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2908,7 +2908,7 @@ def _iq_connect_fresh(email: str, password: str):
     print("[IQ LOGIN] iniciando stable_api", flush=True)
     th = threading.Thread(target=stable_worker, daemon=True)
     th.start()
-    th.join(18.0)
+    th.join(32.0)
 
     if not th.is_alive():
         if "error" in stable_box:
@@ -2937,7 +2937,11 @@ def _iq_connect_fresh(email: str, password: str):
                 raise RuntimeError("E-mail ou senha da IQ Option estão incorretos.")
             print(f"[IQ LOGIN] stable_api sem conexão; fallback. motivo={reason[:120]}", flush=True)
     else:
-        print("[IQ LOGIN] stable_api excedeu 18s; iniciando fallback", flush=True)
+        print("[IQ LOGIN] stable_api excedeu 32s; cancelando sem abrir conexão concorrente", flush=True)
+        raise TimeoutError(
+            "A IQ Option não respondeu ao servidor dentro de 32 segundos. "
+            "A tentativa foi encerrada sem iniciar uma segunda conexão simultânea."
+        )
 
     fallback_box = {}
 
@@ -2961,10 +2965,10 @@ def _iq_connect_fresh(email: str, password: str):
     print("[IQ LOGIN] iniciando fallback low-level", flush=True)
     ft = threading.Thread(target=fallback_worker, daemon=True)
     ft.start()
-    ft.join(15.0)
+    ft.join(20.0)
 
     if ft.is_alive():
-        print("[IQ LOGIN] fallback excedeu 15s", flush=True)
+        print("[IQ LOGIN] fallback excedeu 20s", flush=True)
         raise TimeoutError(
             "A biblioteca da IQ Option ficou travada no servidor. "
             "O login foi cancelado pelo limite de segurança."
@@ -4004,7 +4008,7 @@ async def iq_login(body: IQLoginBody, response: Response):
                     email,
                     password,
                 ),
-                timeout=40,
+                timeout=58,
             )
             if client is not None:
                 break
