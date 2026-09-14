@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.51.0")
-print("[MEGA IA] versão 33.51.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.52.0")
+print("[MEGA IA] versão 33.52.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -3786,7 +3786,20 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             base["expiry_time"] = iso(expiry)
             base["reference_candle"] = raw[-1]["datetime"] if raw else None
         elif not ai.get("available"):
-            base["status"] = "IA INDISPONÍVEL"
+            ai_reason = str(ai.get("reason") or "Erro não identificado da IA.")
+            low_reason = ai_reason.lower()
+            if "não configurados" in low_reason or "api_key" in low_reason or "api key" in low_reason:
+                base["status"] = "IA INDISPONÍVEL • CONFIGURAÇÃO AUSENTE"
+            elif "timeout" in low_reason or "timed out" in low_reason or "tempo" in low_reason:
+                base["status"] = "IA INDISPONÍVEL • TIMEOUT"
+            elif "401" in low_reason or "unauthorized" in low_reason or "authentication" in low_reason:
+                base["status"] = "IA INDISPONÍVEL • CHAVE INVÁLIDA"
+            elif "429" in low_reason or "rate limit" in low_reason or "quota" in low_reason:
+                base["status"] = "IA INDISPONÍVEL • LIMITE DA API"
+            else:
+                base["status"] = "IA INDISPONÍVEL • ERRO DA API"
+            base["reason"] = ai_reason[:300]
+            print(f"[IA STATUS] {symbol} {interval} {base['status']} | {ai_reason[:220]}", flush=True)
 
         base["ai_cycle_remaining"] = 0
         base["ai_cycle_seconds"] = ai_cycle_seconds
