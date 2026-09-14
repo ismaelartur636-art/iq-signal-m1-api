@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.42.0")
-print("[MEGA IA] versão 33.42.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.43.0")
+print("[MEGA IA] versão 33.43.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -5667,7 +5667,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <div class="card" style="margin-top:12px">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
         <div>
-          <div class="label">ANÁLISE 4 MIN • CONFIRMAÇÃO NO ÚLTIMO MINUTO</div>
+          <div class="label">ANÁLISE 1 MIN • CONFIRMAÇÃO NO ÚLTIMO MINUTO</div>
           <small style="opacity:.75">Vela em formação — ainda não é entrada confirmada</small>
         </div>
         <select id="preSignalLimit" style="max-width:86px">
@@ -7607,14 +7607,14 @@ setInterval(()=>{
 },2000);
 
 setInterval(()=>{ if(appEnabled) perf(); },5000);
-// Radar completo em ciclo econômico de 4 minutos.
+// Radar completo atualizado a cada 1 minuto.
 setInterval(()=>{
   if(appEnabled && !robotEnabled) rad();
-},240000);
-// Pré-análise em ciclo de 4 minutos; a confirmação continua usando a janela final de 1 minuto.
+},60000);
+// Pré-análise atualizada a cada 1 minuto; a confirmação continua usando a janela final de 1 minuto.
 setInterval(()=>{
   if(appEnabled && !robotEnabled) loadPreSignals();
-},240000);
+},60000);
 
 // Com o app ligado, acompanha o resultado das operações abertas.
 setInterval(()=>{ if(appEnabled) resultCheck(); },5000);
