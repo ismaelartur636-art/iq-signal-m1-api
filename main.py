@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.41.0")
-print("[MEGA IA] versão 33.41.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.42.0")
+print("[MEGA IA] versão 33.42.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2886,13 +2886,7 @@ def _iq_lowlevel_connect_worker(client, result_box):
 
 
 def _iq_connect_fresh(email: str, password: str):
-    """
-    Login IQ Option resistente ao travamento da stable_api no Render.
-
-    1) tenta IQ_Option.connect() normalmente;
-    2) se o connect ficar preso, usa a camada IQOptionAPI já existente
-       como fallback, sem esperar indefinidamente pelo balance_id.
-    """
+    """Login IQ Option com construtor e conexão protegidos por timeout real."""
     if IQ_Option is None:
         raise RuntimeError("Biblioteca iqoptionapi não carregada no servidor.")
 
@@ -2901,84 +2895,91 @@ def _iq_connect_fresh(email: str, password: str):
     if not email or not password:
         raise RuntimeError("Informe e-mail e senha da IQ Option.")
 
-    def _check_ready(client, seconds=5.0):
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            try:
-                if bool(client.check_connect()):
-                    return True
-            except Exception:
-                pass
-            time.sleep(0.25)
-        return False
-
-    # 1) Stable API com limite real de tempo.
-    stable_client = IQ_Option(email, password)
     stable_box = {}
 
-    def _stable_worker():
+    def stable_worker():
         try:
-            stable_box["result"] = stable_client.connect()
+            client = IQ_Option(email, password)
+            stable_box["client"] = client
+            stable_box["result"] = client.connect()
         except Exception as exc:
             stable_box["error"] = exc
 
-    th = threading.Thread(target=_stable_worker, daemon=True)
+    print("[IQ LOGIN] iniciando stable_api", flush=True)
+    th = threading.Thread(target=stable_worker, daemon=True)
     th.start()
-    th.join(timeout=18.0)
+    th.join(18.0)
 
     if not th.is_alive():
         if "error" in stable_box:
-            raise RuntimeError(
-                f"Falha no login IQ Option: {type(stable_box['error']).__name__}: "
-                f"{str(stable_box['error'])[:220]}"
-            )
-
-        result = stable_box.get("result")
-        if isinstance(result, (tuple, list)):
-            ok = bool(result[0]) if result else False
-            reason = str(result[1] if len(result) > 1 else "")
+            exc = stable_box["error"]
+            print(f"[IQ LOGIN] stable_api erro={type(exc).__name__}: {str(exc)[:180]}", flush=True)
         else:
-            ok = bool(result)
-            reason = ""
-
-        if ok and _check_ready(stable_client, 5.0):
-            return stable_client
-
-        low = reason.lower()
-        if "2fa" in low or "verify" in low:
-            raise RuntimeError("A IQ Option está exigindo autenticação em duas etapas (2FA).")
-        if "invalid_credentials" in low or "wrong credentials" in low or "invalid credentials" in low:
-            raise RuntimeError("E-mail ou senha da IQ Option estão incorretos.")
-
-        # Se respondeu, mas websocket não estabilizou, ainda tentamos o fallback.
-        print(
-            f"[IQ LOGIN] stable_api não estabilizou; fallback low-level. motivo={reason[:120]}",
-            flush=True,
-        )
+            client = stable_box.get("client")
+            result = stable_box.get("result")
+            if isinstance(result, (tuple, list)):
+                ok = bool(result[0]) if result else False
+                reason = str(result[1] if len(result) > 1 else "")
+            else:
+                ok = bool(result)
+                reason = ""
+            if ok and client is not None:
+                try:
+                    if bool(client.check_connect()):
+                        print("[IQ LOGIN] stable_api conectado", flush=True)
+                        return client
+                except Exception:
+                    pass
+            low = reason.lower()
+            if "2fa" in low or "verify" in low:
+                raise RuntimeError("A IQ Option está exigindo autenticação em duas etapas (2FA).")
+            if "invalid_credentials" in low or "wrong credentials" in low or "invalid credentials" in low:
+                raise RuntimeError("E-mail ou senha da IQ Option estão incorretos.")
+            print(f"[IQ LOGIN] stable_api sem conexão; fallback. motivo={reason[:120]}", flush=True)
     else:
-        print("[IQ LOGIN] stable_api travou por 18s; ativando fallback low-level", flush=True)
+        print("[IQ LOGIN] stable_api excedeu 18s; iniciando fallback", flush=True)
 
-    # 2) Fallback low-level da própria iqoptionapi.
-    low_client = IQ_Option(email, password)
-    result_box = {}
-    low_thread = threading.Thread(
-        target=_iq_lowlevel_connect_worker,
-        args=(low_client, result_box),
-        daemon=True,
-    )
-    low_thread.start()
-    low_thread.join(timeout=15.0)
+    fallback_box = {}
 
-    if low_thread.is_alive():
-        raise TimeoutError("A IQ Option não respondeu nem pelo fallback dentro do tempo limite.")
+    def fallback_worker():
+        try:
+            client = IQ_Option(email, password)
+            from iqoptionapi.api import IQOptionAPI
+            api = IQOptionAPI("iqoption.com", email, password)
+            api.set_session(
+                headers=getattr(client, "SESSION_HEADER", {}),
+                cookies=getattr(client, "SESSION_COOKIE", {}),
+            )
+            client.api = api
+            check, reason = api.connect()
+            fallback_box["client"] = client
+            fallback_box["ok"] = bool(check)
+            fallback_box["reason"] = str(reason or "")
+        except Exception as exc:
+            fallback_box["error"] = exc
 
-    if result_box.get("error"):
-        raise RuntimeError(f"Fallback IQ Option falhou: {str(result_box['error'])[:240]}")
+    print("[IQ LOGIN] iniciando fallback low-level", flush=True)
+    ft = threading.Thread(target=fallback_worker, daemon=True)
+    ft.start()
+    ft.join(15.0)
 
-    ok = bool(result_box.get("ok"))
-    reason = str(result_box.get("reason") or "")
+    if ft.is_alive():
+        print("[IQ LOGIN] fallback excedeu 15s", flush=True)
+        raise TimeoutError(
+            "A biblioteca da IQ Option ficou travada no servidor. "
+            "O login foi cancelado pelo limite de segurança."
+        )
 
-    if not ok:
+    if "error" in fallback_box:
+        exc = fallback_box["error"]
+        print(f"[IQ LOGIN] fallback erro={type(exc).__name__}: {str(exc)[:180]}", flush=True)
+        raise RuntimeError(f"Fallback IQ Option falhou: {str(exc)[:240]}")
+
+    ok = bool(fallback_box.get("ok"))
+    reason = str(fallback_box.get("reason") or "")
+    client = fallback_box.get("client")
+
+    if not ok or client is None:
         low = reason.lower()
         if "2fa" in low or "verify" in low:
             raise RuntimeError("A IQ Option está exigindo autenticação em duas etapas (2FA).")
@@ -2986,10 +2987,16 @@ def _iq_connect_fresh(email: str, password: str):
             raise RuntimeError("E-mail ou senha da IQ Option estão incorretos.")
         raise RuntimeError("A IQ Option recusou a conexão" + (f": {reason}" if reason else "."))
 
-    if not _check_ready(low_client, 6.0):
-        raise RuntimeError("A conexão abriu, mas o websocket da IQ Option não permaneceu conectado.")
+    try:
+        connected = bool(client.check_connect())
+    except Exception:
+        connected = False
 
-    return low_client
+    if not connected:
+        raise RuntimeError("A IQ Option abriu a sessão, mas o WebSocket não permaneceu conectado.")
+
+    print("[IQ LOGIN] fallback conectado", flush=True)
+    return client
 
 def _iq_reconnect_state(state: Dict[str, Any]):
     if _iq_connected(state):
@@ -3997,7 +4004,7 @@ async def iq_login(body: IQLoginBody, response: Response):
                     email,
                     password,
                 ),
-                timeout=45,
+                timeout=40,
             )
             if client is not None:
                 break
