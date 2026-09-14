@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "33.67.0"
-PWA_VERSION = "v45"
+APP_VERSION = "33.68.0"
+PWA_VERSION = "v46"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • OLYMP TRADE POR TOKEN + WEBSOCKET carregada", flush=True)
@@ -121,8 +121,9 @@ td_rate_lock = asyncio.Lock()
 td_last_call_at = 0.0
 td_backoff_until = 0.0
 td_backoff_reason = ""
-TD_MIN_CALL_INTERVAL = float(os.getenv("TWELVE_DATA_MIN_INTERVAL", "8.0"))
+TD_MIN_CALL_INTERVAL = float(os.getenv("TWELVE_DATA_MIN_INTERVAL", "15.0"))
 TD_STALE_MAX_AGE = float(os.getenv("TWELVE_DATA_STALE_MAX_AGE", "900"))
+TD_LIMIT_BACKOFF = float(os.getenv("TWELVE_DATA_LIMIT_BACKOFF", "900"))
 
 # IQ OPTION — implementação reconstruída do zero.
 # O login é feito somente pelo painel; não há credenciais IQ no Render.
@@ -2787,7 +2788,10 @@ def json_extract(text):
 
 def _td_cache_ttl(interval: str) -> float:
     sec = int(INTERVALS.get(interval, 60))
-    return max(75.0, min(300.0, sec * 0.45))
+    # Modo econômico para a cota gratuita da Twelve Data. O painel pode
+    # consultar seus endpoints frequentemente, mas somente este cache decide
+    # quando uma chamada externa será realmente feita.
+    return max(180.0, min(900.0, sec * 1.0))
 
 
 def _td_cache_age(symbol: str, interval: str) -> float:
@@ -2851,14 +2855,14 @@ async def candles_open(symbol, interval, n=80):
         if response.status_code == 429:
             retry_header = response.headers.get("Retry-After", "")
             try:
-                retry_after = max(30.0, float(retry_header)) if retry_header else 60.0
+                retry_after = max(TD_LIMIT_BACKOFF, float(retry_header)) if retry_header else TD_LIMIT_BACKOFF
             except Exception:
-                retry_after = 60.0
+                retry_after = TD_LIMIT_BACKOFF
             td_backoff_until = time.time() + retry_after
             td_backoff_reason = "HTTP 429"
             if cached and time.time() - cached[0] <= TD_STALE_MAX_AGE:
                 return cached[1][-n:]
-            raise HTTPException(503, f"Limite da Twelve Data atingido. Aguarde cerca de {int(retry_after)}s.")
+            raise HTTPException(503, f"Limite da Twelve Data atingido. Aguarde cerca de {int(retry_after // 60)} minutos.")
 
         try:
             response.raise_for_status()
@@ -2872,11 +2876,11 @@ async def candles_open(symbol, interval, n=80):
             msg = str(data.get("message", "Erro Twelve Data."))
             code = str(data.get("code", ""))
             if "429" in code or "limit" in msg.lower() or "credit" in msg.lower():
-                td_backoff_until = time.time() + 60.0
+                td_backoff_until = time.time() + TD_LIMIT_BACKOFF
                 td_backoff_reason = msg[:160]
                 if cached and time.time() - cached[0] <= TD_STALE_MAX_AGE:
                     return cached[1][-n:]
-                raise HTTPException(503, "Limite temporário da Twelve Data. Aguarde 60s.")
+                raise HTTPException(503, f"Limite temporário da Twelve Data. Aguarde cerca de {int(TD_LIMIT_BACKOFF // 60)} minutos.")
             if cached and time.time() - cached[0] <= TD_STALE_MAX_AGE:
                 return cached[1][-n:]
             raise HTTPException(502, msg[:220])
@@ -4414,11 +4418,11 @@ async def mega_ia_icon_192():
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = {
-        "id": "/mega-ia-trader-v45",
+        "id": "/mega-ia-trader-v46",
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v45",
+        "start_url": "/?pwa=v46",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
@@ -5371,7 +5375,7 @@ async def radar(request: Request, interval="1min", market="OPEN"):
     previous = radar_cache.get(rkey)
     # Proteção do feed: várias telas/clientes reaproveitam o mesmo snapshot do Radar.
     # Isso impede que cada atualização visual dispare uma nova consulta de candles.
-    if previous and (time.time() - float(previous[0])) < 25.0:
+    if previous and (time.time() - float(previous[0])) < 540.0:
         return list(previous[1])
     suffix = "" if market == "OPEN" else (" • IQ OTC" if market == "IQ_OTC" else " • OLYMP OTC")
 
@@ -6297,12 +6301,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 </div>
 
 <script>
-// MEGA IA build 33.67.0 — força o PWA antigo a abrir a versão atual.
+// MEGA IA build 33.68.0 — força o PWA antigo a abrir a versão atual.
 (function(){
   try{
     const u=new URL(window.location.href);
-    if(u.searchParams.get('pwa')!=='v45'){
-      u.searchParams.set('pwa','v45');
+    if(u.searchParams.get('pwa')!=='v46'){
+      u.searchParams.set('pwa','v46');
       window.history.replaceState({},'',u.pathname+u.search+u.hash);
     }
   }catch(_){}
@@ -7597,7 +7601,7 @@ window.megaConnectIQ=async function(event){
         method:'POST',
         credentials:'include',
         cache:'no-store',
-        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'33.67.0'},
+        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'33.68.0'},
         body:JSON.stringify(b==='OLYMPTRADE'?{token:email}:{email:email,password:password}),
         signal:controller.signal
       });
@@ -8317,7 +8321,7 @@ setInterval(()=>{ if(appEnabled && !iqLoginInProgress) perf(); },5000);
 // Intervalo conservador para evitar consumir o limite da fonte de dados.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress) rad();
-},30000);
+},600000);
 // Pré-análise atualizada a cada 1 minuto; a confirmação continua usando a janela final de 1 minuto.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress && !robotEnabled) loadPreSignals();
