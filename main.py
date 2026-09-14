@@ -2821,79 +2821,44 @@ def _iq_lowlevel_connect_worker(client, result_box):
 
 
 def _iq_connect_fresh(email: str, password: str):
-    """
-    Conexão IQ Option voltada para leitura de candles OTC.
-    Não chama stable_api.connect(), porque essa função pode ficar
-    presa aguardando balance_id em versões antigas da biblioteca.
-    """
+    """Conecta pela stable_api, usando o mesmo fluxo que já funcionou no Render."""
     if IQ_Option is None:
-        raise RuntimeError(
-            "Biblioteca iqoptionapi não carregada no servidor."
-        )
+        raise RuntimeError("Biblioteca iqoptionapi não carregada no servidor.")
 
     email = (email or "").strip()
     password = password or ""
-
     if not email or not password:
         raise RuntimeError("Informe e-mail e senha da IQ Option.")
 
     client = IQ_Option(email, password)
-    result_box = {}
 
-    worker = threading.Thread(
-        target=_iq_lowlevel_connect_worker,
-        args=(client, result_box),
-        daemon=True,
-    )
-    worker.start()
-    worker.join(timeout=IQ_CONNECT_TIMEOUT)
+    try:
+        result = client.connect()
+    except Exception as exc:
+        raise RuntimeError(f"Falha ao abrir login IQ Option: {type(exc).__name__}: {str(exc)[:220]}") from exc
 
-    if worker.is_alive():
-        try:
-            api = getattr(client, "api", None)
-            if api is not None:
-                close = getattr(api, "close", None)
-                if callable(close):
-                    close()
-        except Exception:
-            pass
+    if isinstance(result, (tuple, list)):
+        ok = bool(result[0]) if result else False
+        reason = str(result[1] if len(result) > 1 else "")
+    else:
+        ok = bool(result)
+        reason = ""
 
-        raise TimeoutError(
-            f"A camada HTTP/WebSocket da IQ Option não respondeu em "
-            f"{int(IQ_CONNECT_TIMEOUT)} segundos."
-        )
-
-    if "error" in result_box:
-        raise RuntimeError(
-            "Erro interno ao abrir a conexão IQ Option: "
-            + result_box["error"][:260]
-        )
-
-    if not result_box.get("ok"):
-        reason = (result_box.get("reason") or "").strip()
+    if not ok:
         low = reason.lower()
-
-        if reason == "2FA" or "2fa" in low:
-            raise RuntimeError(
-                "A IQ Option está exigindo autenticação em duas etapas (2FA)."
-            )
-
+        if "2fa" in low or "verify" in low:
+            raise RuntimeError("A IQ Option está exigindo autenticação em duas etapas (2FA).")
         if (
             "invalid_credentials" in low
             or "wrong credentials" in low
             or "invalid credentials" in low
         ):
-            raise RuntimeError(
-                "E-mail ou senha da IQ Option estão incorretos."
-            )
+            raise RuntimeError("E-mail ou senha da IQ Option estão incorretos.")
+        raise RuntimeError("A IQ Option recusou a conexão" + (f": {reason}" if reason else "."))
 
-        raise RuntimeError(
-            "A IQ Option recusou a conexão"
-            + (f": {reason}" if reason else ".")
-        )
-
+    # O connect pode retornar antes do websocket estabilizar.
     ready = False
-    for _ in range(32):
+    for _ in range(24):
         try:
             if bool(client.check_connect()):
                 ready = True
@@ -2904,20 +2869,17 @@ def _iq_connect_fresh(email: str, password: str):
 
     if not ready:
         try:
-            api = getattr(client, "api", None)
-            if api is not None:
-                close = getattr(api, "close", None)
-                if callable(close):
-                    close()
+            client.close()
         except Exception:
-            pass
-
-        raise RuntimeError(
-            "O login HTTP respondeu, mas o websocket da IQ Option não ficou ativo."
-        )
+            try:
+                api = getattr(client, "api", None)
+                if api is not None and callable(getattr(api, "close", None)):
+                    api.close()
+            except Exception:
+                pass
+        raise RuntimeError("Login aceito, mas o websocket da IQ Option não permaneceu conectado.")
 
     return client
-
 
 def _iq_reconnect_state(state: Dict[str, Any]):
     if _iq_connected(state):
@@ -3760,7 +3722,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.34.0",
+        "version": "33.35.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -3895,6 +3857,7 @@ def _olymp_login_blocking(email: str, password: str):
 async def iq_login(body: IQLoginBody, response: Response):
     email = body.email.strip()
     password = body.password
+    print(f"[IQ LOGIN] tentativa recebida dominio={email.split('@')[-1] if '@' in email else 'invalido'}", flush=True)
 
     if not email or not password:
         raise HTTPException(
@@ -3923,7 +3886,7 @@ async def iq_login(body: IQLoginBody, response: Response):
                     email,
                     password,
                 ),
-                timeout=IQ_CONNECT_TIMEOUT + 5,
+                timeout=max(IQ_CONNECT_TIMEOUT + 5, 30),
             )
             if client is not None:
                 break
@@ -3943,6 +3906,7 @@ async def iq_login(body: IQLoginBody, response: Response):
 
     if client is None:
         exc = last_exc or RuntimeError("Falha desconhecida ao conectar.")
+        print(f"[IQ LOGIN] falhou: {type(exc).__name__}: {str(exc)[:260]}", flush=True)
         if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
             raise HTTPException(
                 504,
@@ -3953,6 +3917,8 @@ async def iq_login(body: IQLoginBody, response: Response):
             "Não foi possível conectar à IQ Option: "
             + str(exc)[:280]
         )
+
+    print("[IQ LOGIN] conectado com sucesso", flush=True)
 
     state = {
         "session_id": token,
