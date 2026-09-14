@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.36.0")
+app = FastAPI(title="MEGA IA", version="33.38.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -3810,9 +3810,9 @@ async def manifest():
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=36", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=36", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=36", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=38", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=38", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=38", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -3879,6 +3879,7 @@ async def iq_login(body: IQLoginBody, response: Response):
     # A IQ Option pode falhar temporariamente no primeiro handshake.
     # Fazemos uma segunda tentativa automática apenas para falhas transitórias.
     for attempt in range(2):
+        print(f"[IQ LOGIN] stable_api tentativa={attempt+1}/2", flush=True)
         try:
             client = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -5087,11 +5088,28 @@ async def result(
 
     # Entrada inicial.
     base = candle_near(entry_dt)
+    if not base and market == "OPEN":
+        # O cache pode estar preenchido, mas não conter mais a vela da entrada.
+        # Força uma leitura maior uma única vez para conseguir fechar WIN/LOSS.
+        try:
+            cache_key = f"{symbol}|{interval}"
+            cached_item = td_candle_cache.pop(cache_key, None)
+            try:
+                cs = await candles(symbol, interval, 120, market, state, request=request)
+            finally:
+                # Se a consulta falhar e havia cache anterior, não o perde.
+                if cache_key not in td_candle_cache and cached_item is not None:
+                    td_candle_cache[cache_key] = cached_item
+            base = candle_near(entry_dt)
+        except Exception:
+            base = None
+
     if not base:
         return {
             "status": "AGUARDANDO CANDLE",
             "stage": "ENTRADA",
             "result": None,
+            "retry_after": 15,
         }
 
     base_result = candle_result(base)
@@ -5239,9 +5257,9 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=36">
-<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=36">
-<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=36">
+<link rel="manifest" href="/manifest.webmanifest?v=38">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=38">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=38">
 <meta name="theme-color" content="#07182b">
 <meta name="application-name" content="Mega IA Trader">
 <meta name="apple-mobile-web-app-title" content="Mega IA Trader">
@@ -5534,7 +5552,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
                style="width:100%;box-sizing:border-box;margin-top:6px">
       </div>
 
-      <button id="iqConnectBtn" type="button" onclick="return window.megaConnectIQ ? window.megaConnectIQ(event) : false;" style="width:100%;margin-top:12px">🔐 CONECTAR</button>
+      <button id="iqConnectBtn" type="button" style="width:100%;margin-top:12px">🔐 CONECTAR</button>
       <button id="iqLogoutBtn" style="width:100%;margin-top:8px;display:none">🚪 DESCONECTAR</button>
 
       <div class="label" style="margin-top:10px;line-height:1.5">
@@ -5576,12 +5594,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 </div>
 
 <script>
-// MEGA IA build 33.36.0 — força o PWA antigo a abrir a versão atual.
+// MEGA IA build 33.38.0 — força o PWA antigo a abrir a versão atual.
 (function(){
   try{
     const u=new URL(window.location.href);
-    if(u.searchParams.get('pwa')!=='v36'){
-      u.searchParams.set('pwa','v36');
+    if(u.searchParams.get('pwa')!=='v38'){
+      u.searchParams.set('pwa','v38');
       window.history.replaceState({},'',u.pathname+u.search+u.hash);
     }
   }catch(_){}
@@ -5889,11 +5907,12 @@ function mergeServerPerformance(p,m){
   const b=persistentResults[m]||emptyResultBucket();
   persistentResults[m]=b;
 
-  // O servidor funciona como uma segunda fonte. Usamos o maior valor por categoria
-  // para recuperar histórico sem somar duas vezes a mesma operação.
-  // O servidor é a fonte principal para WIN/LOSS da entrada original.
-  b.win_direct=Math.max(0,Number(p.win_direct||p.wins||0));
-  b.loss_direct=Math.max(0,Number(p.loss_direct||p.losses||0));
+  // O servidor funciona como segunda fonte. Uma resposta zerada/atrasada
+  // NUNCA pode apagar um WIN/LOSS que o navegador acabou de confirmar.
+  const serverWins=Math.max(0,Number(p.win_direct||p.wins||0));
+  const serverLosses=Math.max(0,Number(p.loss_direct||p.losses||0));
+  b.win_direct=Math.max(Number(b.win_direct||0),serverWins);
+  b.loss_direct=Math.max(Number(b.loss_direct||0),serverLosses);
   // Gales continuam apenas como estatística separada.
   b.win_g1=Math.max(b.win_g1,Number(p.win_g1||0));
   b.win_g2=Math.max(b.win_g2,Number(p.win_g2||0));
@@ -6778,6 +6797,14 @@ window.megaConnectIQ=async function(event){
   return false;
 };
 
+
+if(iqConnectBtn){
+  // Fallback para Android/PWA: garante que o toque sempre chegue ao /iq-login.
+  iqConnectBtn.addEventListener('click',function(ev){
+    if(window.megaConnectIQ) window.megaConnectIQ(ev);
+  });
+}
+
 if(interval){
   interval.addEventListener('change',()=>{
     loadPreSignals();
@@ -7266,7 +7293,7 @@ async function resultCheck(){
       `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=true`
     );
 
-    if(x && !x.result && (x.status==='AGUARDANDO_FONTE' || x.status==='AGUARDANDO CANDLE')){
+    if(x && !x.result && (x.status==='AGUARDANDO_FONTE' || String(x.status||'').startsWith('AGUARDANDO'))){
       pendingTrade.next_result_check_at=Date.now()+Math.max(
         RESULT_RETRY_MS,
         Number(x.retry_after||15)*1000
@@ -7282,7 +7309,12 @@ async function resultCheck(){
     // A entrada original é contabilizada imediatamente após o fechamento da vela,
     // mesmo que o acompanhamento de G1/G2 ainda continue.
     const accountingChanged=registerPersistentResult(t,x);
-    if(accountingChanged) await perf();
+    if(accountingChanged){
+      // Atualiza WIN/LOSS na tela imediatamente.
+      paintPersistentResults();
+      // Sincroniza depois, sem permitir que o servidor zere o placar local.
+      await perf();
+    }
 
     if(galeStageStatus){
       const stage=x.stage||'ENTRADA';
