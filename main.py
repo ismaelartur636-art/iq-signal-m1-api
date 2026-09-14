@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.59.0")
-print("[MEGA IA] versão 33.59.0 • RSI CROSS MULTI-TIMEFRAME + RESET RESULTADOS carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.60.0")
+print("[MEGA IA] versão 33.60.0 • MODO ROBO LIMPO + RESET RESULTADOS carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2513,7 +2513,7 @@ def primary_rsi_cross_strategy(cs, period=14, timeframe="15min"):
     Somente candles fechados entram no cálculo para evitar repaint.
     """
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"RSI CROSS {tf_label} • rsier1m2"
+    name = f"ROBÔ PRINCIPAL {tf_label}"
     if len(cs) < period + 2:
         return {
             "direction": "NEUTRO", "confidence": 0, "confirmed": False,
@@ -2529,7 +2529,7 @@ def primary_rsi_cross_strategy(cs, period=14, timeframe="15min"):
     if rsi_before is None or rsi_now is None:
         return {
             "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "strategy": name, "reason": "RSI ainda insuficiente.",
+            "strategy": name, "reason": "Dados ainda insuficientes para confirmar entrada.",
             "rsi_period": period, "rsi_timeframe": timeframe,
         }
 
@@ -2541,12 +2541,12 @@ def primary_rsi_cross_strategy(cs, period=14, timeframe="15min"):
 
     if rsi_now >= 30.0 and rsi_before <= 30.0:
         return {**base, "direction": "CALL", "confidence": 100, "confirmed": True,
-                "reason": f"RSI 14 {tf_label} cruzou 30 para cima ({rsi_before:.2f} → {rsi_now:.2f})."}
+                "reason": f"Confirmação de compra detectada em {tf_label}."}
     if rsi_before >= 70.0 and rsi_now <= 70.0:
         return {**base, "direction": "PUT", "confidence": 100, "confirmed": True,
-                "reason": f"RSI 14 {tf_label} cruzou 70 para baixo ({rsi_before:.2f} → {rsi_now:.2f})."}
+                "reason": f"Confirmação de venda detectada em {tf_label}."}
     return {**base, "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "reason": f"Sem cruzamento agora. RSI 14 {tf_label}: {rsi_before:.2f} → {rsi_now:.2f}."}
+            "reason": f"Sem confirmação de entrada agora em {tf_label}."}
 
 
 def strategy_engine_for_market(cs, market="OPEN", context=None):
@@ -3898,12 +3898,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         if market != "OPEN":
             out = neutral_signal(
                 symbol, interval, market,
-                "ONLINE • RSI PRINCIPAL • SOMENTE MERCADO ABERTO",
-                "O indicador principal rsier1m2 está reservado ao mercado aberto. OTC aguardará o segundo indicador.",
+                "ONLINE • ROBÔ PRINCIPAL • SOMENTE MERCADO ABERTO",
+                "O robô principal está reservado ao mercado aberto. OTC aguardará o segundo módulo.",
                 source_state="READY",
             )
             out.update({
-                "strategy": f"RSI CROSS { {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval) } • rsier1m2",
+                "strategy": f"ROBÔ PRINCIPAL { {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval) }",
                 "mode": "PRIMARY_RSI_TEST",
                 "ai_provider": "DISABLED",
                 "technical": {"legacy_disabled": True, "rsi_period": 14, "rsi_timeframe": interval},
@@ -3921,11 +3921,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         except Exception as exc:
             out = neutral_signal(
                 symbol, interval, market,
-                "ONLINE • RSI PRINCIPAL • AGUARDANDO DADOS",
-                f"Não foi possível calcular o RSI no timeframe {interval} agora: {str(exc)[:180]}",
+                "ONLINE • ROBÔ PRINCIPAL • AGUARDANDO DADOS",
+                f"Não foi possível concluir a análise no timeframe {interval} agora: {str(exc)[:180]}",
                 source_state="WAITING",
             )
-            out.update({"strategy": f"RSI CROSS { {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval) } • rsier1m2", "mode": "PRIMARY_RSI_TEST"})
+            out.update({"strategy": f"ROBÔ PRINCIPAL { {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval) }", "mode": "PRIMARY_RSI_TEST"})
             cache[key] = (time.time(), out)
             return out
 
@@ -3935,11 +3935,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "direction": "NEUTRO",
             "confidence": analysis.get("confidence", 0),
             "entry_time": None, "announce_time": None, "expiry_time": None,
-            "status": f"ONLINE • RSI CROSS {interval} MONITORANDO",
+            "status": f"ONLINE • ROBÔ {interval} MONITORANDO",
             "ai_confirmed": False, "ai_provider": "DISABLED",
             "risk": "HIGH",
-            "strategy": analysis.get("strategy", f"RSI CROSS {interval} • rsier1m2"),
-            "reason": analysis.get("reason", "Sem cruzamento RSI."),
+            "strategy": analysis.get("strategy", f"ROBÔ PRINCIPAL {interval}"),
+            "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
             "technical": analysis,
             "source_state": "READY",
@@ -3957,7 +3957,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 announce, entry, expiry = entry_window(interval)
                 base.update({
                     "direction": direction_now,
-                    "status": "SINAL RSI LIBERADO",
+                    "status": "SINAL LIBERADO",
                     "risk": "MEDIUM",
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -3967,8 +3967,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 release_state["primary_rsi_fingerprint"] = signal_fingerprint
                 release_state["active_signal"] = dict(base)
             else:
-                base["status"] = "ONLINE • RSI • SINAL JÁ UTILIZADO"
-                base["reason"] = f"Este cruzamento RSI {interval} já foi liberado; aguardando um novo cruzamento."
+                base["status"] = "ONLINE • SINAL JÁ UTILIZADO"
+                base["reason"] = f"Este sinal {interval} já foi liberado; aguardando uma nova oportunidade."
         else:
             release_state["active_signal"] = None
 
@@ -4251,7 +4251,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.59.0",
+        "version": "33.60.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -6331,7 +6331,7 @@ try{
 const robotPowerBtn=document.getElementById('robotPowerBtn');
 const robotModeDesc=document.getElementById('robotModeDesc');
 const voiceBtn=document.getElementById('voiceBtn');
-let robotEnabled=true; // true = ONLINE / RSI rsier1m2; false = OFFLINE / robô pausado
+let robotEnabled=true; // true = ONLINE / robô principal; false = OFFLINE / robô pausado
 try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
 }catch(_){}
@@ -7647,13 +7647,13 @@ function applyRobotPowerState(){
     robotPowerBtn.style.background='#0b7a3d';
     robotPowerBtn.style.color='#fff';
     robotPowerBtn.style.borderColor='#16c56b';
-    if(robotModeDesc) robotModeDesc.textContent='ONLINE: RSI 14 ativo no timeframe selecionado (M1/M5/M15/M30).';
+    if(robotModeDesc) robotModeDesc.textContent='ONLINE: robô ativo no timeframe selecionado (M1/M5/M15/M30).';
     if(statusBox && (!cur || cur.direction==='NEUTRO')){
-      statusBox.textContent='MODO ONLINE • RSI 14 MONITORANDO O TIMEFRAME SELECIONADO';
+      statusBox.textContent='MODO ONLINE • ROBÔ MONITORANDO O TIMEFRAME SELECIONADO';
     }
-    if(preSignalStatus) preSignalStatus.textContent='Modo RSI: pré-sinais dos indicadores antigos desativados.';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📈 ONLINE: somente o RSI 14 gera sinais no timeframe selecionado.</div>';
-    if(radar) radar.innerHTML='<div>📈 RSI 14 M1/M5/M15/M30 ativo • demais indicadores desligados</div>';
+    if(preSignalStatus) preSignalStatus.textContent='Pré-sinais antigos desativados durante o teste.';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 ONLINE: robô principal analisando o timeframe selecionado.</div>';
+    if(radar) radar.innerHTML='<div>🤖 Robô ativo em M1/M5/M15/M30 • módulos antigos desligados</div>';
   }else{
     robotPowerBtn.textContent='🔴 OFFLINE';
     robotPowerBtn.style.background='#7d1d1d';
@@ -7698,7 +7698,7 @@ async function setRobotPower(enabled){
 
   if(voiceEnabled){
     speak(robotEnabled
-      ? 'Modo online. Somente o indicador RSI 14 do timeframe selecionado está gerando os sinais.'
+      ? 'Modo online. Somente o robô principal do timeframe selecionado está gerando os sinais.'
       : 'Modo offline. O robô de sinais está pausado e os indicadores antigos continuam desativados.');
   }
 }
@@ -7821,13 +7821,13 @@ async function perf(){
 }
 
 async function rad(){
-  if(radar) radar.innerHTML='<div>⛔ Radar técnico desativado durante o teste do RSI rsier1m2</div>';
+  if(radar) radar.innerHTML='<div>⛔ Radar técnico desativado durante o teste do robô principal</div>';
   return;
 }
 
 async function loadPreSignals(){
-  if(preSignalStatus) preSignalStatus.textContent='Pré-sinais antigos desativados durante o teste do RSI.';
-  if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📈 Teste isolado: somente RSI 14 no timeframe selecionado.</div>';
+  if(preSignalStatus) preSignalStatus.textContent='Pré-sinais antigos desativados durante o teste atual.';
+  if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 Teste isolado: somente o robô principal no timeframe selecionado.</div>';
   return;
 }
 
