@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.43.0")
-print("[MEGA IA] versão 33.43.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.44.0")
+print("[MEGA IA] versão 33.44.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -3916,20 +3916,20 @@ async def mega_ia_icon_192():
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = {
-        "id": "/mega-ia-trader-v41",
+        "id": "/mega-ia-trader-v44",
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v41",
+        "start_url": "/?pwa=v44",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=41", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=41", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=41", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=44", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=44", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=44", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -5194,6 +5194,32 @@ async def result(
         except Exception:
             base = None
 
+    if not base and market == "IQ_OTC" and state is not None:
+        # No OTC da IQ, o cache curto pode conter apenas candles muito recentes.
+        # Remove somente o cache deste ativo/timeframe e força histórico maior
+        # para localizar exatamente a vela da entrada e fechar WIN/LOSS.
+        try:
+            cache_key = f"{symbol}|{interval}"
+            iq_cache = state.setdefault("candle_cache", {})
+            old_iq_cache = iq_cache.pop(cache_key, None)
+            try:
+                cs = await candles(symbol, interval, 150, "IQ_OTC", state, request=request)
+            finally:
+                if cache_key not in iq_cache and old_iq_cache is not None:
+                    iq_cache[cache_key] = old_iq_cache
+            base = candle_near(entry_dt)
+            if base:
+                print(
+                    f"[RESULTADO] candle IQ_OTC recuperado {symbol} {interval} entrada={iso(entry_dt)}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"[RESULTADO] falha ao recuperar histórico IQ_OTC {symbol} {interval}: {str(exc)[:180]}",
+                flush=True,
+            )
+            base = None
+
     if not base:
         print(
             f"[RESULTADO] aguardando candle {symbol} {interval} {direction} entrada={iso(entry_dt)}",
@@ -5356,9 +5382,9 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=39">
-<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=41">
-<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=41">
+<link rel="manifest" href="/manifest.webmanifest?v=44">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=44">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=44">
 <meta name="theme-color" content="#07182b">
 <meta name="application-name" content="Mega IA Trader">
 <meta name="apple-mobile-web-app-title" content="Mega IA Trader">
@@ -5898,13 +5924,11 @@ function resultMarket(m){
 }
 
 function activeResultMarket(){
-  // Se a IQ Option estiver selecionada, mas desconectada, os sinais vêm da Twelve Data.
-  // Portanto WIN/LOSS e performance também precisam usar o bucket OPEN.
-  const selected=resultMarket(market&&market.value);
-  if(selected==='IQ_OTC' && !(brokerConnected&&brokerConnected.IQ_OPTION)){
-    return 'OPEN';
-  }
-  return selected;
+  // O placar deve acompanhar o mercado VISÍVEL no seletor.
+  // Assim, ao operar IQ OTC, /performance e o painel usam IQ_OTC.
+  // Sinais que realmente vierem do fallback Twelve Data continuam sendo
+  // registrados em OPEN por signalResultMarket().
+  return resultMarket(market&&market.value);
 }
 
 function signalResultMarket(sig){
