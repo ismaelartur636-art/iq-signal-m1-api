@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.50.0")
-print("[MEGA IA] versão 33.50.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.51.0")
+print("[MEGA IA] versão 33.51.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -5659,6 +5659,26 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 #appPowerBtn.app-on{background:linear-gradient(180deg,#159452,#0b6e3a);border:2px solid #35e889;color:#fff;box-shadow:0 0 18px #1ad87355,0 8px 20px #0007}
 #appPowerBtn.app-off{background:linear-gradient(180deg,#a62d36,#741b23);border:2px solid #ff6673;color:#fff;box-shadow:0 0 18px #ff405055,0 8px 20px #0007}
 
+/* MEGA IA 33.51.0 — placar e cronograma com leitura forte */
+.score-card{position:relative;text-align:center;overflow:hidden;min-height:118px;display:flex;flex-direction:column;justify-content:center;align-items:center}
+.score-card .label{font-size:16px!important;font-weight:1000;letter-spacing:.8px;color:#f4f8ff!important;text-shadow:0 0 10px currentColor}
+.score-card .big{font-size:44px!important;line-height:1;font-weight:1000;margin-top:12px;text-shadow:0 0 16px currentColor}
+.score-win{border-color:#20e979;box-shadow:inset 0 0 22px #18d66a18,0 0 18px #18d66a30}
+.score-win .label,.score-win .big{color:#42ff9b!important}
+.score-loss{border-color:#ff405f;box-shadow:inset 0 0 22px #ff405f18,0 0 18px #ff405f30}
+.score-loss .label,.score-loss .big{color:#ff5572!important}
+.score-accuracy{border-color:#18a8ff;box-shadow:inset 0 0 22px #18a8ff18,0 0 18px #18a8ff30}
+.score-accuracy .label,.score-accuracy .big{color:#43c8ff!important}
+.score-result{border-color:#b34cff;box-shadow:inset 0 0 22px #a53cff18,0 0 18px #a53cff30}
+.score-result .label,.score-result .big{color:#d277ff!important}
+.schedule-card{text-align:center;border-color:#198fff;box-shadow:inset 0 0 24px #168cff15,0 0 18px #168cff22}
+.schedule-card .label{font-size:17px!important;font-weight:1000;color:#4fd2ff!important;letter-spacing:.8px;text-shadow:0 0 10px #18a8ff}
+.schedule-card #entry{font-size:38px!important;color:#ffd43b!important;text-shadow:0 0 15px #ffd43b66}
+.schedule-card #countdown{font-size:16px;font-weight:900;color:#f4f8ff;margin-top:6px}
+.schedule-card #expiryCountdown{font-size:18px!important;color:#ff5872!important;text-shadow:0 0 10px #ff405f66}
+@media(max-width:720px){.score-card{min-height:105px}.score-card .label{font-size:15px!important}.score-card .big{font-size:38px!important}.schedule-card #entry{font-size:34px!important}}
+@media(max-width:450px){.score-card{min-height:100px}.score-card .label{font-size:14px!important}.score-card .big{font-size:34px!important}.schedule-card .label{font-size:15px!important}.schedule-card #entry{font-size:31px!important}.schedule-card #expiryCountdown{font-size:16px!important}}
+
 @media(max-width:720px){
   .wrap{padding:10px}
   .grid{grid-template-columns:1fr 1fr}
@@ -5766,8 +5786,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         <div id="confidence">Confiança: --</div>
       </div>
 
-      <div class="card">
-        <div class="label">ENTRADA</div>
+      <div class="card schedule-card">
+        <div class="label">⏱ CRONOGRAMA • ENTRADA</div>
         <div id="entry" class="big">--:--:--</div>
         <div id="countdown">--</div>
         <div id="expiryCountdown" style="margin-top:8px;font-weight:800">⏱ EXPIRAÇÃO: --:--</div>
@@ -5781,20 +5801,20 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </div>
 
     <div class="grid">
-      <div class="card">
-        <div class="label">WIN</div>
+      <div class="card score-card score-win">
+        <div class="label">🏆 WIN</div>
         <div id="wins" class="big call">0</div>
       </div>
-      <div class="card">
-        <div class="label">LOSS</div>
+      <div class="card score-card score-loss">
+        <div class="label">✖ LOSS</div>
         <div id="losses" class="big put">0</div>
       </div>
-      <div class="card">
-        <div class="label">ASSERTIVIDADE</div>
+      <div class="card score-card score-accuracy">
+        <div class="label">🎯 ASSERTIVIDADE</div>
         <div id="accuracy" class="big">0%</div>
       </div>
-      <div class="card">
-        <div class="label">RESULTADO</div>
+      <div class="card score-card score-result">
+        <div class="label">★ RESULTADO</div>
         <div id="result" class="big">--</div>
       </div>
     </div>
