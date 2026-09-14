@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.44.0")
-print("[MEGA IA] versão 33.44.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.45.0")
+print("[MEGA IA] versão 33.45.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -4387,11 +4387,14 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             request=request,
             ai_only=ai_only,
         )
-        if fallback_twelve and isinstance(data, dict):
+        if isinstance(data, dict):
+            # Sempre informa ao frontend qual mercado foi pedido e qual fonte
+            # realmente gerou o sinal. Isto evita fechar um sinal IQ_OTC como OPEN.
             data["requested_market"] = requested_market
-            data["feed_source"] = "TWELVE_DATA"
-            data["feed_fallback"] = True
-            data["feed_message"] = "IQ Option desconectada: sinais usando Twelve Data (mercado aberto)."
+            data["feed_source"] = "TWELVE_DATA" if fallback_twelve else effective_market
+            data["feed_fallback"] = bool(fallback_twelve)
+            if fallback_twelve:
+                data["feed_message"] = "IQ Option desconectada: sinais usando Twelve Data (mercado aberto)."
         _remember_accounting_signal(request, data)
         return data
     except Exception as exc:
@@ -5882,7 +5885,7 @@ const RESULT_RETRY_MS=15000;
 const RESULT_MAX_PENDING_AGE_MS=30*60*1000;
 
 const RESULT_STATS_KEY='mega_result_stats_v33310';
-const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33410';
+const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33450';
 const RESULT_MARKETS=['OPEN','IQ_OTC','OLYMP_OTC'];
 
 function emptyResultBucket(){
@@ -5935,7 +5938,13 @@ function signalResultMarket(sig){
   if(sig && (sig.feed_fallback===true || String(sig.feed_source||'').toUpperCase()==='TWELVE_DATA')){
     return 'OPEN';
   }
-  const m=resultMarket(sig&&sig.market ? sig.market : (market&&market.value));
+  // Prioriza o mercado originalmente solicitado. Em IQ_OTC conectado,
+  // o resultado deve ser fechado com candles da própria IQ Option.
+  const requested=resultMarket(sig&&sig.requested_market ? sig.requested_market : (market&&market.value));
+  if(requested==='IQ_OTC' && brokerConnected&&brokerConnected.IQ_OPTION){
+    return 'IQ_OTC';
+  }
+  const m=resultMarket(sig&&sig.market ? sig.market : requested);
   if(m==='IQ_OTC' && !(brokerConnected&&brokerConnected.IQ_OPTION)){
     return 'OPEN';
   }
@@ -6070,11 +6079,13 @@ try{
     'mega_pending_trade_queue_v33310',
     'mega_pending_trade_v33400',
     'mega_pending_trade_queue_v33400'
+    ,'mega_pending_trade_v33410'
+    ,'mega_pending_trade_queue_v33410'
   ].forEach(k=>{ try{ localStorage.removeItem(k); }catch(_){} });
 }catch(_){}
 
 try{
-  const savedPending=localStorage.getItem('mega_pending_trade_v33410');
+  const savedPending=localStorage.getItem('mega_pending_trade_v33450');
   if(savedPending){
     pendingTrade=normalizePendingTradeMarket(JSON.parse(savedPending));
   }
@@ -6091,9 +6102,9 @@ try{
 function savePendingTrade(){
   try{
     if(pendingTrade){
-      localStorage.setItem('mega_pending_trade_v33410',JSON.stringify(pendingTrade));
+      localStorage.setItem('mega_pending_trade_v33450',JSON.stringify(pendingTrade));
     }else{
-      localStorage.removeItem('mega_pending_trade_v33410');
+      localStorage.removeItem('mega_pending_trade_v33450');
     }
     localStorage.setItem(PENDING_QUEUE_KEY,JSON.stringify(pendingTradeQueue.slice(0,100)));
   }catch(e){}
@@ -6101,10 +6112,16 @@ function savePendingTrade(){
 
 function normalizePendingTradeMarket(t){
   if(!t || typeof t!=='object') return t;
-  // Operações novas gravam feed_fallback. Isto evita consultar a IQ ao fechar
-  // um sinal que na verdade veio da Twelve Data.
+  // Fallback real da Twelve Data sempre fecha em OPEN.
   if(t.feed_fallback===true || String(t.feed_source||'').toUpperCase()==='TWELVE_DATA'){
     t.market='OPEN';
+    return t;
+  }
+  // Se a operação nasceu no IQ_OTC e a sessão continua conectada,
+  // nunca deixa uma pendência antiga/sem metadata cair em OPEN.
+  const requested=resultMarket(t.requested_market || t.market || (market&&market.value));
+  if(requested==='IQ_OTC' && brokerConnected&&brokerConnected.IQ_OPTION){
+    t.market='IQ_OTC';
   }
   return t;
 }
@@ -6150,6 +6167,7 @@ function rememberPendingTrade(sig){
     // Placar principal sempre fecha na vela original da entrada.
     direct_only:true,
     market:signalResultMarket(sig),
+    requested_market:sig.requested_market || (market&&market.value) || 'OPEN',
     feed_source:sig.feed_source||'',
     feed_fallback:!!sig.feed_fallback,
     symbol:sig.symbol,
