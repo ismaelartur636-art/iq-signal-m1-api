@@ -34,8 +34,11 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.66.0")
-print("[MEGA IA] versão 33.66.0 • OLYMP TRADE POR TOKEN + WEBSOCKET carregada", flush=True)
+APP_VERSION = "33.67.0"
+PWA_VERSION = "v45"
+
+app = FastAPI(title="MEGA IA", version=APP_VERSION)
+print(f"[MEGA IA] versão {APP_VERSION} • OLYMP TRADE POR TOKEN + WEBSOCKET carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -4329,7 +4332,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.63.0",
+        "version": APP_VERSION,
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -4342,9 +4345,14 @@ async def health():
             "library": bool(IQ_Option is not None),
             "sessions": len(iq_sessions),
         },
-        "openai": {
-            "configured": bool(OAI_KEY and OAI_MODEL),
-            "model": OAI_MODEL or None,
+        "gemini": {
+            "configured": bool(GEMINI_KEY),
+            "model": _gemini_selected_model or GEMINI_MODEL or None,
+        },
+        "olymp_trade": {
+            "library": bool(OlympTradeClient is not None),
+            "sessions": len(olymp_sessions),
+            "server_token": bool(OLYMPTRADE_TOKEN),
         },
     }
 
@@ -4406,20 +4414,20 @@ async def mega_ia_icon_192():
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = {
-        "id": "/mega-ia-trader-v44",
+        "id": "/mega-ia-trader-v45",
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v44",
+        "start_url": "/?pwa=v45",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=44", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=44", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=44", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=45", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=45", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=45", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -4468,7 +4476,7 @@ async def iq_login_ready():
         "ok": True,
         "stage": "BACKEND_OK",
         "iqoptionapi_loaded": IQ_Option is not None,
-        "version": "33.66.0",
+        "version": APP_VERSION,
     }
 
 
@@ -4620,7 +4628,7 @@ async def olymp_login_ready():
         "stage": "BACKEND_OK",
         "olymp_ws_loaded": OlympTradeClient is not None,
         "auth_mode": "ACCESS_TOKEN",
-        "version": "33.66.0",
+        "version": APP_VERSION,
     }
 
 
@@ -4712,7 +4720,7 @@ async def otc_status(request: Request, broker: str = "IQ_OPTION"):
                 else (
                     "Olymptrade OTC configurada por token no servidor."
                     if token_configured
-                    else "Faça login com e-mail e senha no painel."
+                    else "Cole o token de acesso na aba Corretora."
                 )
             ),
             "pairs": len(OTC_BASE),
@@ -5755,11 +5763,6 @@ async def result(
 
     # Entrada original começa uma vela antes do expiry_time.
     entry_dt = expiry_dt - step
-    g1_entry_dt = expiry_dt
-    g1_expiry_dt = expiry_dt + step
-    g2_entry_dt = g1_expiry_dt
-    g2_expiry_dt = g1_expiry_dt + step
-
     if now() < expiry_dt:
         return {
             "status": "PENDENTE",
@@ -5920,104 +5923,6 @@ async def result(
 
     return out
 
-    # Fluxo normal do painel continua acompanhando G1/G2.
-    if now() < g1_expiry_dt:
-        out = {
-            "status": "AGUARDANDO G1",
-            "stage": "G1",
-            "result": None,
-            "entry_result": base_result,
-            "previous": base_result,
-            "next_check": iso(g1_expiry_dt),
-            "g1_entry_time": iso(g1_entry_dt),
-            "g1_expiry_time": iso(g1_expiry_dt),
-            "entry_time": iso(entry_dt),
-            "expiry_time": expiry_time,
-        }
-        # Salva a entrada original imediatamente para o WIN/LOSS principal.
-        store[key] = out
-        return out
-
-    g1 = candle_near(g1_entry_dt)
-    if not g1:
-        out = {
-            "status": "AGUARDANDO CANDLE G1",
-            "stage": "G1",
-            "result": None,
-            "entry_result": base_result,
-            "entry_time": iso(entry_dt),
-            "expiry_time": expiry_time,
-        }
-        store[key] = out
-        return out
-
-    g1_result = candle_result(g1)
-
-    if g1_result == "WIN":
-        out = {
-            "status": "FINALIZADA",
-            "stage": "G1",
-            "result": "WIN G1",
-            "entry_result": base_result,
-            "g1_result": "WIN",
-            "candle_time": g1["datetime"],
-            "entry_time": iso(entry_dt),
-            "expiry_time": iso(g1_expiry_dt),
-            "simulated": True,
-        }
-        store[key] = out
-        return out
-
-    if now() < g2_expiry_dt:
-        out = {
-            "status": "AGUARDANDO G2",
-            "stage": "G2",
-            "result": None,
-            "entry_result": base_result,
-            "g1_result": g1_result,
-            "previous": g1_result,
-            "next_check": iso(g2_expiry_dt),
-            "g2_entry_time": iso(g2_entry_dt),
-            "g2_expiry_time": iso(g2_expiry_dt),
-            "entry_time": iso(entry_dt),
-            "expiry_time": expiry_time,
-        }
-        store[key] = out
-        return out
-
-    g2 = candle_near(g2_entry_dt)
-    if not g2:
-        out = {
-            "status": "AGUARDANDO CANDLE G2",
-            "stage": "G2",
-            "result": None,
-            "entry_result": base_result,
-            "g1_result": g1_result,
-            "entry_time": iso(entry_dt),
-            "expiry_time": expiry_time,
-        }
-        store[key] = out
-        return out
-
-    g2_result = candle_result(g2)
-    final_result = "WIN G2" if g2_result == "WIN" else "LOSS G2"
-
-    out = {
-        "status": "FINALIZADA",
-        "stage": "G2",
-        "result": final_result,
-        "entry_result": base_result,
-        "g1_result": g1_result,
-        "g2_result": g2_result,
-        "candle_time": g2["datetime"],
-        "entry_time": iso(entry_dt),
-        "expiry_time": iso(g2_expiry_dt),
-        "simulated": True,
-    }
-
-    store[key] = out
-    return out
-
 
 HTML_PAGE = r"""
 <!doctype html>
@@ -6026,9 +5931,9 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=44">
-<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=44">
-<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=44">
+<link rel="manifest" href="/manifest.webmanifest?v=45">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=45">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=45">
 <meta name="theme-color" content="#07182b">
 <meta name="application-name" content="Mega IA Trader">
 <meta name="apple-mobile-web-app-title" content="Mega IA Trader">
@@ -6392,12 +6297,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 </div>
 
 <script>
-// MEGA IA build 33.38.0 — força o PWA antigo a abrir a versão atual.
+// MEGA IA build 33.67.0 — força o PWA antigo a abrir a versão atual.
 (function(){
   try{
     const u=new URL(window.location.href);
-    if(u.searchParams.get('pwa')!=='v38'){
-      u.searchParams.set('pwa','v38');
+    if(u.searchParams.get('pwa')!=='v45'){
+      u.searchParams.set('pwa','v45');
       window.history.replaceState({},'',u.pathname+u.search+u.hash);
     }
   }catch(_){}
@@ -6439,21 +6344,10 @@ function syncBroker(value){
     if(iqLogoutBtn) iqLogoutBtn.style.display=connected?'block':'none';
     if(iqConnectBtn) iqConnectBtn.style.display=connected?'none':'block';
     if(iqPassword) iqPassword.value='';
-    if(b==='OLYMPTRADE' && iqEmail) iqEmail.value='';
+    if(v==='OLYMPTRADE' && iqEmail) iqEmail.value='';
   }
 }
 
-try{
-  const savedLimit=Number(localStorage.getItem('mega_pre_signal_limit')||4);
-  if(preSignalLimit){
-    preSignalLimit.value=String(Math.max(1,Math.min(4,savedLimit)));
-  }
-
-  const savedBroker=localStorage.getItem('mega_broker')||'IQ_OPTION';
-  const savedMode=localStorage.getItem('mega_market_mode')||'OPEN';
-  if(marketMode) marketMode.value=(savedMode==='OTC'?'OTC':'OPEN');
-  setTimeout(()=>syncBroker(savedBroker),0);
-}catch(_){}
 const interval=document.getElementById('interval');
 const appPowerBtn=document.getElementById('appPowerBtn');
 const appPowerDesc=document.getElementById('appPowerDesc');
@@ -6522,6 +6416,18 @@ const clock=document.getElementById('clock');
 const expiryCountdown=document.getElementById('expiryCountdown');
 const chartCanvas=document.getElementById('priceChart');
 const chartCtx=chartCanvas.getContext('2d');
+
+// Restaura preferências somente depois que todos os elementos/estados existem.
+try{
+  const savedLimit=Number(localStorage.getItem('mega_pre_signal_limit')||4);
+  if(preSignalLimit){
+    preSignalLimit.value=String(Math.max(1,Math.min(4,savedLimit)));
+  }
+  const savedBroker=localStorage.getItem('mega_broker')||'IQ_OPTION';
+  const savedMode=localStorage.getItem('mega_market_mode')||'OPEN';
+  if(marketMode) marketMode.value=(savedMode==='OTC'?'OTC':'OPEN');
+  setTimeout(()=>syncBroker(savedBroker),0);
+}catch(_){}
 
 const syms=[
   'EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF',
@@ -7119,6 +7025,10 @@ function authHeaders(extra={}){
     if(iqSession){
       h['X-IQ-Session']=iqSession;
     }
+    const olympSession=localStorage.getItem('mega_olymp_session')||'';
+    if(olympSession){
+      h['X-OLYMP-Session']=olympSession;
+    }
   }catch(_){}
   return h;
 }
@@ -7687,7 +7597,7 @@ window.megaConnectIQ=async function(event){
         method:'POST',
         credentials:'include',
         cache:'no-store',
-        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'33.66.0'},
+        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'33.67.0'},
         body:JSON.stringify(b==='OLYMPTRADE'?{token:email}:{email:email,password:password}),
         signal:controller.signal
       });
@@ -8433,7 +8343,7 @@ async def home():
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma": "no-cache",
             "Expires": "0",
-            "X-Mega-IA-Build": "33.36.0",
+            "X-Mega-IA-Build": APP_VERSION,
         },
     )
 
