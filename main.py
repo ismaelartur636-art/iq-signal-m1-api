@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.49.0")
-print("[MEGA IA] versão 33.49.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.50.0")
+print("[MEGA IA] versão 33.50.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2941,7 +2941,14 @@ def _iq_connect_fresh(email: str, password: str):
     if probe.get("tcp_error"):
         print(f"[IQ DIAG] TCP443 erro={probe['tcp_error']}", flush=True)
     if not probe.get("dns_ok") or not probe.get("tcp443_ok"):
-        raise RuntimeError("O servidor Render não conseguiu alcançar iqoption.com pela porta 443.")
+        # O teste TCP é apenas diagnóstico. Em algumas rotas/clouds ele pode
+        # falhar momentaneamente mesmo quando a própria biblioteca consegue
+        # negociar a sessão logo depois. Por isso não bloqueamos o login aqui:
+        # deixamos o IQ_Option.connect() fazer a tentativa real.
+        print(
+            "[IQ DIAG] aviso: probe 443 falhou; continuando com a tentativa real da iqoptionapi",
+            flush=True,
+        )
 
     stable_box = {"stage": "aguardando", "started": time.monotonic()}
 
@@ -5209,6 +5216,78 @@ def _cached_open_candles_for_result(symbol: str, interval: str, n: int = 100):
         return []
 
 
+async def _fetch_open_result_window(symbol: str, interval: str, target_dt: datetime):
+    """Busca uma janela pequena exatamente ao redor da entrada na Twelve Data.
+
+    É usada somente quando o cache/histórico recente não contém a vela necessária
+    para fechar WIN/LOSS. Isso evita deixar uma operação presa em
+    "AGUARDANDO CANDLE" por causa de cache curto ou sessão de mercado.
+    """
+    global td_last_call_at, td_backoff_until, td_backoff_reason
+    if not TD_KEY:
+        return []
+    try:
+        seconds = int(INTERVALS.get(interval, 60))
+        start_dt = (target_dt - timedelta(seconds=seconds * 2)).astimezone(BR_TZ)
+        end_dt = (target_dt + timedelta(seconds=seconds * 3)).astimezone(BR_TZ)
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "start_date": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_date": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "timezone": "America/Sao_Paulo",
+            "outputsize": 12,
+            "apikey": TD_KEY,
+            "format": "JSON",
+        }
+
+        # Respeita o mesmo limitador global usado pelo restante da Twelve Data.
+        async with td_rate_lock:
+            delay = TD_MIN_CALL_INTERVAL - (time.time() - td_last_call_at)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            async with td_sem:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    response = await client.get(TD_URL, params=params)
+                td_last_call_at = time.time()
+
+        if response.status_code == 429:
+            td_backoff_until = time.time() + 60.0
+            td_backoff_reason = "HTTP 429 em resultado"
+            return []
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") == "error":
+            return []
+
+        out = []
+        for x in reversed(data.get("values", [])):
+            try:
+                out.append({
+                    "datetime": x["datetime"],
+                    "open": float(x["open"]),
+                    "high": float(x["high"]),
+                    "low": float(x["low"]),
+                    "close": float(x["close"]),
+                    "volume": float(x.get("volume", 0) or 0),
+                })
+            except Exception:
+                pass
+        if out:
+            print(
+                f"[RESULTADO] janela exata Twelve Data recuperada {symbol} {interval} "
+                f"entrada={iso(target_dt)} candles={len(out)}",
+                flush=True,
+            )
+        return out
+    except Exception as exc:
+        print(
+            f"[RESULTADO] falha janela exata Twelve Data {symbol} {interval}: {str(exc)[:180]}",
+            flush=True,
+        )
+        return []
+
+
 @app.get("/result")
 async def result(
     request: Request,
@@ -5316,6 +5395,15 @@ async def result(
             base = candle_near(entry_dt)
         except Exception:
             base = None
+
+        # Se o histórico recente ainda não trouxe o horário da entrada,
+        # consulta uma janela exata ao redor da operação. É a última tentativa
+        # antes de devolver AGUARDANDO CANDLE.
+        if not base:
+            exact_cs = await _fetch_open_result_window(symbol, interval, entry_dt)
+            if exact_cs:
+                cs = exact_cs
+                base = candle_near(entry_dt)
 
     if not base and market == "IQ_OTC" and state is not None:
         # No OTC da IQ, o cache curto pode conter apenas candles muito recentes.
@@ -6048,11 +6136,15 @@ function resultMarket(m){
 }
 
 function activeResultMarket(){
-  // O placar deve acompanhar o mercado VISÍVEL no seletor.
-  // Assim, ao operar IQ OTC, /performance e o painel usam IQ_OTC.
-  // Sinais que realmente vierem do fallback Twelve Data continuam sendo
-  // registrados em OPEN por signalResultMarket().
-  return resultMarket(market&&market.value);
+  // Quando IQ OTC está selecionado mas a corretora está desconectada,
+  // os sinais são calculados pelo fallback real da Twelve Data (OPEN).
+  // O placar precisa seguir a FONTE REAL do sinal; caso contrário /result
+  // fecha em OPEN enquanto /performance consulta IQ_OTC e WIN/LOSS parece zerado.
+  const selected=resultMarket(market&&market.value);
+  if(selected==='IQ_OTC' && !(brokerConnected&&brokerConnected.IQ_OPTION)){
+    return 'OPEN';
+  }
+  return selected;
 }
 
 function signalResultMarket(sig){
