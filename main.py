@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.65.0")
-print("[MEGA IA] versão 33.65.0 • OLYMP TRADE COMO FONTE + DIAGNOSTICO carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.66.0")
+print("[MEGA IA] versão 33.66.0 • OLYMP TRADE POR TOKEN + WEBSOCKET carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -146,9 +146,8 @@ class IQLoginBody(BaseModel):
     password: str
 
 
-class OlympLoginBody(BaseModel):
-    email: str
-    password: str
+class OlympTokenBody(BaseModel):
+    token: str
 
 
 def now():
@@ -372,7 +371,7 @@ async def _get_olymp_client(request: Request | None = None):
     if not OLYMPTRADE_TOKEN:
         raise HTTPException(
             503,
-            "Olymptrade OTC não está conectada. Faça login com e-mail e senha no painel "
+            "Olymp Trade não está conectada. Cole o token de acesso no painel "
             "ou configure OLYMPTRADE_TOKEN no servidor."
         )
     if OlympTradeClient is None:
@@ -4438,26 +4437,27 @@ def _olymp_session_state(request: Request):
     return state
 
 
-def _olymp_login_blocking(email: str, password: str):
-    if OlympTradeLoginClient is None:
+async def _olymp_connect_token(access_token: str):
+    """Cria uma sessão Olymp Trade usando somente o token de acesso.
+
+    A senha da corretora nunca é enviada ao MEGA IA. O token fica apenas na
+    memória do servidor durante a sessão e é descartado no logout/restart.
+    """
+    if OlympTradeClient is None:
         raise RuntimeError(
-            "O conector Olymptrade por e-mail/senha não está instalado no servidor "
-            "(módulo olymptradeapi)."
+            "O conector WebSocket olymptrade_ws não está carregado no servidor."
         )
 
-    client = OlympTradeLoginClient(email, password)
-    result = client.connect()
+    token = str(access_token or "").strip()
+    if len(token) < 20:
+        raise RuntimeError("Token Olymp Trade inválido ou muito curto.")
 
-    if isinstance(result, (list, tuple)):
-        ok = bool(result[0]) if result else False
-        reason = str(result[1]) if len(result) > 1 else ""
-    else:
-        ok = bool(result)
-        reason = ""
-
-    if not ok:
-        raise RuntimeError(reason or "A Olymptrade recusou o login.")
-
+    client = OlympTradeClient(access_token=token)
+    start = getattr(client, "start", None) or getattr(client, "connect", None)
+    if start:
+        result = start()
+        if asyncio.iscoroutine(result):
+            await asyncio.wait_for(result, timeout=20)
     return client
 
 
@@ -4468,7 +4468,7 @@ async def iq_login_ready():
         "ok": True,
         "stage": "BACKEND_OK",
         "iqoptionapi_loaded": IQ_Option is not None,
-        "version": "33.65.0",
+        "version": "33.66.0",
     }
 
 
@@ -4614,49 +4614,39 @@ async def iq_logout(
 
 @app.get("/olymp-login-ready")
 async def olymp_login_ready():
-    print("[OLYMP LOGIN] preflight recebido do painel", flush=True)
+    print("[OLYMP TOKEN] preflight recebido do painel", flush=True)
     return {
         "ok": True,
         "stage": "BACKEND_OK",
-        "olymp_email_login_loaded": OlympTradeLoginClient is not None,
         "olymp_ws_loaded": OlympTradeClient is not None,
-        "version": "33.65.0",
+        "auth_mode": "ACCESS_TOKEN",
+        "version": "33.66.0",
     }
 
 
 @app.post("/olymp-login")
-async def olymp_login(body: OlympLoginBody, response: Response):
-    email = body.email.strip()
-    password = body.password
-    print(f"[OLYMP LOGIN] POST recebido dominio={email.split('@')[-1] if '@' in email else 'invalido'}", flush=True)
+async def olymp_login(body: OlympTokenBody, response: Response):
+    access_token = str(body.token or "").strip()
+    print(f"[OLYMP TOKEN] POST recebido tamanho={len(access_token)}", flush=True)
 
-    if not email or not password:
-        raise HTTPException(400, "Informe e-mail e senha da Olymptrade.")
+    if not access_token:
+        raise HTTPException(400, "Informe o token de acesso da Olymp Trade.")
 
-    token = secrets.token_urlsafe(32)
-
+    session_id = secrets.token_urlsafe(32)
     try:
-        print("[OLYMP LOGIN] iniciando conector", flush=True)
-        client = await asyncio.wait_for(
-            asyncio.to_thread(_olymp_login_blocking, email, password),
-            timeout=40,
-        )
+        print("[OLYMP TOKEN] iniciando WebSocket", flush=True)
+        client = await asyncio.wait_for(_olymp_connect_token(access_token), timeout=25)
     except asyncio.TimeoutError:
-        print("[OLYMP LOGIN] timeout no conector", flush=True)
-        raise HTTPException(504, "A Olymptrade não respondeu ao servidor dentro do tempo limite.")
+        print("[OLYMP TOKEN] timeout no WebSocket", flush=True)
+        raise HTTPException(504, "A Olymp Trade não respondeu ao WebSocket dentro do tempo limite.")
     except Exception as exc:
-        print(f"[OLYMP LOGIN] falhou: {type(exc).__name__}: {str(exc)[:260]}", flush=True)
-        raise HTTPException(
-            401,
-            "Não foi possível conectar à Olymptrade por e-mail/senha: " + str(exc)[:300]
-        )
-    print("[OLYMP LOGIN] conectado com sucesso", flush=True)
+        print(f"[OLYMP TOKEN] falhou: {type(exc).__name__}: {str(exc)[:260]}", flush=True)
+        raise HTTPException(401, "Não foi possível conectar à Olymp Trade com esse token: " + str(exc)[:280])
 
-    olymp_sessions[token] = {
-        "session_id": token,
-        "email": email,
-        "password": password,
+    olymp_sessions[session_id] = {
+        "session_id": session_id,
         "client": client,
+        "auth_mode": "ACCESS_TOKEN",
         "last_seen": time.time(),
         "candle_cache": {},
         "results": {},
@@ -4664,7 +4654,7 @@ async def olymp_login(body: OlympLoginBody, response: Response):
 
     response.set_cookie(
         OLYMP_SESSION_COOKIE,
-        token,
+        session_id,
         httponly=True,
         secure=True,
         samesite="lax",
@@ -4673,11 +4663,12 @@ async def olymp_login(body: OlympLoginBody, response: Response):
         path="/",
     )
 
+    print("[OLYMP TOKEN] conectado com sucesso", flush=True)
     return {
         "connected": True,
-        "message": "Olymptrade conectada.",
-        "email_masked": _mask_email(email),
-        "session_token": token,
+        "message": "Olymp Trade conectada por token.",
+        "session_token": session_id,
+        "auth_mode": "ACCESS_TOKEN",
     }
 
 
@@ -4690,7 +4681,6 @@ async def olymp_logout(request: Request, response: Response):
     state = olymp_sessions.pop(token, None)
 
     if state:
-        state["password"] = ""
         client = state.get("client")
         try:
             close = getattr(client, "close", None) or getattr(client, "disconnect", None)
@@ -6347,13 +6337,13 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
 
       <div style="margin-top:12px">
-        <div class="label">E-MAIL DA CORRETORA</div>
+        <div id="accountUserLabel" class="label">E-MAIL DA CORRETORA</div>
         <input id="iqEmail" type="email" autocomplete="username"
                placeholder="seuemail@exemplo.com"
                style="width:100%;box-sizing:border-box;margin-top:6px">
       </div>
 
-      <div style="margin-top:10px">
+      <div id="accountPasswordWrap" style="margin-top:10px">
         <div class="label">SENHA</div>
         <input id="iqPassword" type="password" autocomplete="current-password"
                placeholder="Sua senha"
@@ -6363,7 +6353,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <button id="iqConnectBtn" type="button" onclick="return window.megaConnectIQ(event)" style="width:100%;margin-top:12px">🔐 CONECTAR</button>
       <button id="iqLogoutBtn" style="width:100%;margin-top:8px;display:none">🚪 DESCONECTAR</button>
 
-      <div class="label" style="margin-top:10px;line-height:1.5">
+      <div id="accountAuthHelp" class="label" style="margin-top:10px;line-height:1.5">
         O e-mail e a senha são usados apenas para abrir a sessão da corretora.
         A senha não é salva no navegador.
       </div>
@@ -6449,6 +6439,7 @@ function syncBroker(value){
     if(iqLogoutBtn) iqLogoutBtn.style.display=connected?'block':'none';
     if(iqConnectBtn) iqConnectBtn.style.display=connected?'none':'block';
     if(iqPassword) iqPassword.value='';
+    if(b==='OLYMPTRADE' && iqEmail) iqEmail.value='';
   }
 }
 
@@ -6505,6 +6496,9 @@ const tabMain=document.getElementById('tabMain');
 const tabChart=document.getElementById('tabChart');
 const tabAccount=document.getElementById('tabAccount');
 const iqEmail=document.getElementById('iqEmail');
+const accountUserLabel=document.getElementById('accountUserLabel');
+const accountPasswordWrap=document.getElementById('accountPasswordWrap');
+const accountAuthHelp=document.getElementById('accountAuthHelp');
 const iqPassword=document.getElementById('iqPassword');
 const iqConnectBtn=document.getElementById('iqConnectBtn');
 const iqLogoutBtn=document.getElementById('iqLogoutBtn');
@@ -7614,8 +7608,24 @@ if(broker){
   };
 }
 
+function syncAccountAuthFields(){
+  const b=(brokerAccount&&brokerAccount.value)||'IQ_OPTION';
+  const olymp=b==='OLYMPTRADE';
+  if(accountUserLabel) accountUserLabel.textContent=olymp?'TOKEN DE ACESSO OLYMP TRADE':'E-MAIL DA CORRETORA';
+  if(iqEmail){
+    iqEmail.type=olymp?'password':'email';
+    iqEmail.placeholder=olymp?'Cole aqui o token da sua sessão Olymp Trade':'seuemail@exemplo.com';
+    iqEmail.autocomplete=olymp?'off':'username';
+  }
+  if(accountPasswordWrap) accountPasswordWrap.style.display=olymp?'none':'block';
+  if(accountAuthHelp) accountAuthHelp.textContent=olymp
+    ?'Use somente o token de acesso da sua sessão Olymp Trade. Sua senha da corretora não é enviada ao MEGA IA e o token não é salvo no navegador.'
+    :'O e-mail e a senha são usados apenas para abrir a sessão da corretora. A senha não é salva no navegador.';
+}
+
 if(brokerAccount){
   brokerAccount.onchange=async()=>{
+    syncAccountAuthFields();
     syncBroker(brokerAccount.value);
     fillSymbols();
     await refreshAccountStatus();
@@ -7630,6 +7640,8 @@ if(brokerAccount){
   };
 }
 
+syncAccountAuthFields();
+
 window.megaConnectIQ=async function(event){
   if(event){
     try{ event.preventDefault(); }catch(_){}
@@ -7639,15 +7651,16 @@ window.megaConnectIQ=async function(event){
   const b=(brokerAccount&&brokerAccount.value)||((broker&&broker.value)||'IQ_OPTION');
   const email=(iqEmail&&iqEmail.value||'').trim();
   const password=(iqPassword&&iqPassword.value||'');
+  const olymp=b==='OLYMPTRADE';
 
-  if(!email || !password){
-    if(iqAccountStatus) iqAccountStatus.textContent='🟠 Informe e-mail e senha.';
+  if((olymp && !email) || (!olymp && (!email || !password))){
+    if(iqAccountStatus) iqAccountStatus.textContent=olymp?'🟠 Informe o token de acesso da Olymp Trade.':'🟠 Informe e-mail e senha.';
     return false;
   }
 
   if(iqConnectBtn) iqConnectBtn.disabled=true;
   iqLoginInProgress=(b==='IQ_OPTION');
-  if(iqAccountStatus) iqAccountStatus.textContent='🟡 Enviando login para '+(b==='OLYMPTRADE'?'Olymptrade':'IQ Option')+'...';
+  if(iqAccountStatus) iqAccountStatus.textContent=b==='OLYMPTRADE'?'🟡 Preparando conexão por token com Olymp Trade...':'🟡 Enviando login para IQ Option...';
 
   try{
     if(b==='IQ_OPTION'){
@@ -7663,8 +7676,8 @@ window.megaConnectIQ=async function(event){
     let rd=null; try{ rd=await ready.json(); }catch(_){}
     if(!ready.ok || !rd || !rd.ok) throw new Error('O painel não conseguiu confirmar o servidor de login.');
     if(b==='IQ_OPTION' && !rd.iqoptionapi_loaded) throw new Error('A biblioteca iqoptionapi não está carregada no servidor.');
-    if(b==='OLYMPTRADE' && !rd.olymp_email_login_loaded) throw new Error('O conector de login da Olymptrade não está carregado no servidor.');
-    if(iqAccountStatus) iqAccountStatus.textContent='🟡 Etapa 2/3: enviando login para '+(b==='OLYMPTRADE'?'Olymptrade':'IQ Option')+'...';
+    if(b==='OLYMPTRADE' && !rd.olymp_ws_loaded) throw new Error('O conector WebSocket da Olymp Trade não está carregado no servidor.');
+    if(iqAccountStatus) iqAccountStatus.textContent=b==='OLYMPTRADE'?'🟡 Etapa 2/3: abrindo WebSocket Olymp Trade...':'🟡 Etapa 2/3: enviando login para IQ Option...';
 
     const controller=new AbortController();
     const loginTimer=setTimeout(()=>controller.abort(),65000);
@@ -7674,8 +7687,8 @@ window.megaConnectIQ=async function(event){
         method:'POST',
         credentials:'include',
         cache:'no-store',
-        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'33.65.0'},
-        body:JSON.stringify({email:email,password:password}),
+        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'33.66.0'},
+        body:JSON.stringify(b==='OLYMPTRADE'?{token:email}:{email:email,password:password}),
         signal:controller.signal
       });
     }catch(fetchErr){
@@ -7699,6 +7712,7 @@ window.megaConnectIQ=async function(event){
 
     brokerConnected[b]=true;
     if(iqPassword) iqPassword.value='';
+    if(b==='OLYMPTRADE' && iqEmail) iqEmail.value='';
     if(iqAccountStatus) iqAccountStatus.textContent='🟢 '+((d&&d.message)||'Conectada.');
 
     try{ syncBroker(b); }catch(_){}
