@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.53.0")
-print("[MEGA IA] versão 33.53.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.54.0")
+print("[MEGA IA] versão 33.54.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -49,7 +49,8 @@ TD_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 OAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
+GEMINI_MODEL_FALLBACKS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.0-flash"]
 OAI_MIN = float(os.getenv("OPENAI_MIN_CONFIDENCE", "70"))
 OAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "15"))
 
@@ -3418,17 +3419,62 @@ async def candles(
     return await candles_open(symbol, interval, n)
 
 
+_gemini_selected_model = None
+_gemini_model_checked_at = 0.0
+
+async def _gemini_pick_model(client):
+    """Escolhe um modelo generateContent realmente disponível para esta chave/projeto."""
+    global _gemini_selected_model, _gemini_model_checked_at
+    if _gemini_selected_model and time.time() - _gemini_model_checked_at < 3600:
+        return _gemini_selected_model
+
+    headers = {"x-goog-api-key": GEMINI_KEY}
+    response = await client.get("https://generativelanguage.googleapis.com/v1beta/models", headers=headers)
+    response.raise_for_status()
+    models = response.json().get("models") or []
+    available = []
+    for item in models:
+        methods = item.get("supportedGenerationMethods") or item.get("supportedActions") or []
+        if "generateContent" not in methods:
+            continue
+        name = str(item.get("name", "")).replace("models/", "", 1)
+        if name:
+            available.append(name)
+
+    preferred = ([GEMINI_MODEL] if GEMINI_MODEL else []) + GEMINI_MODEL_FALLBACKS
+    for name in preferred:
+        if name and name in available:
+            _gemini_selected_model = name
+            break
+    if not _gemini_selected_model:
+        flash = [m for m in available if "flash" in m.lower() and "image" not in m.lower()]
+        _gemini_selected_model = flash[0] if flash else (available[0] if available else None)
+    if not _gemini_selected_model:
+        raise RuntimeError("Nenhum modelo Gemini com generateContent disponível para este projeto.")
+    _gemini_model_checked_at = time.time()
+    print(f"[IA GEMINI] modelo disponível selecionado: {_gemini_selected_model}", flush=True)
+    return _gemini_selected_model
+
 async def _gemini_json(prompt):
-    """Executa o motor Gemini e devolve o JSON produzido pelo modelo."""
+    """Executa o Gemini sem colocar a chave na URL/log e devolve JSON."""
+    global _gemini_selected_model, _gemini_model_checked_at
     if not GEMINI_KEY:
         raise RuntimeError("GEMINI_API_KEY não configurada.")
-    url = GEMINI_URL.format(model=GEMINI_MODEL)
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.15},
     }
+    headers = {"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=OAI_TIMEOUT) as client:
-        response = await client.post(url, params={"key": GEMINI_KEY}, json=body)
+        model = await _gemini_pick_model(client)
+        url = GEMINI_URL.format(model=model)
+        response = await client.post(url, headers=headers, json=body)
+        if response.status_code == 404:
+            _gemini_selected_model = None
+            _gemini_model_checked_at = 0.0
+            model = await _gemini_pick_model(client)
+            url = GEMINI_URL.format(model=model)
+            response = await client.post(url, headers=headers, json=body)
         response.raise_for_status()
         payload = response.json()
     parts = (((payload.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
