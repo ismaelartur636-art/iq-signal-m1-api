@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.48.0")
-print("[MEGA IA] versão 33.48.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.49.0")
+print("[MEGA IA] versão 33.49.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -5715,12 +5715,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div id="chartTab" class="tab">
     <div class="card">
       <div class="chartmeta">
-        <b>📈 Gráfico espelhado</b>
+        <b>📈 Gráfico em tempo real</b>
         <span class="chartbadge" id="chartInfo">--</span>
       </div>
       <div class="chartbox"><canvas id="priceChart"></canvas></div>
       <div class="label" style="margin-top:8px">
-        O gráfico acompanha o mesmo mercado, par e período selecionados no painel.
+        O gráfico acompanha o mercado, par e período selecionados e atualiza automaticamente com a vela atual.
       </div>
     </div>
   </div>
@@ -6840,14 +6840,21 @@ function mergeChartCandles(oldData,newData){
 
 async function loadChart(){
   if(!appEnabled) return;
-  // O gráfico da IQ Option é um espelho da sessão: sem login, fica OFFLINE.
   if(chartBusy) return;
 
   const iqSelected=(broker && broker.value==='IQ_OPTION');
-  if(iqSelected && !brokerConnected.IQ_OPTION){
+  const openMode=(marketMode && marketMode.value==='OPEN');
+  const iqConnected=!!brokerConnected.IQ_OPTION;
+
+  // Regras do gráfico:
+  // 1) IQ Option + Mercado Aberto + conectada = candles reais do mercado aberto da IQ Option.
+  // 2) IQ Option + OTC + conectada = candles reais OTC da IQ Option.
+  // 3) Mercado Aberto sem sessão IQ = gráfico atual da Twelve Data, para o gráfico não ficar vazio.
+  // 4) OTC sem sessão IQ continua offline, pois OTC precisa da própria corretora.
+  if(iqSelected && !openMode && !iqConnected){
     chartData=[];
     chartPreSignal=null;
-    if(chartInfo) chartInfo.textContent='⚪ GRÁFICO OFFLINE • CONECTE NA IQ OPTION';
+    if(chartInfo) chartInfo.textContent='⚪ OTC IQ OPTION OFFLINE • CONECTE NA IQ OPTION';
     drawChart([]);
     return;
   }
@@ -6855,10 +6862,12 @@ async function loadChart(){
   chartBusy=true;
 
   try{
-    const mirrorParam=iqSelected?'&mirror_iq=true':'';
+    const useIqMirror=iqSelected && iqConnected;
+    const chartMarket=(iqSelected && openMode && !iqConnected) ? 'OPEN' : market.value;
+    const mirrorParam=useIqMirror?'&mirror_iq=true':'';
     const [d,pre]=await Promise.all([
       get(
-        `/candles?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&n=80${mirrorParam}`
+        `/candles?market=${encodeURIComponent(chartMarket)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&n=80${mirrorParam}`
       ),
       (robotEnabled ? Promise.resolve(null) : get(
         `/chart-pre-signal?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}`
@@ -6887,7 +6896,7 @@ async function loadChart(){
       chartPreSignal=null;
     }
 
-    if(iqSelected && d.ok===false && !(d.candles||[]).length){
+    if(useIqMirror && d.ok===false && !(d.candles||[]).length){
       chartData=[];
       chartPreSignal=null;
       chartInfo.textContent='⚪ '+(d.status||'GRÁFICO OFFLINE')+' • '+(d.message||'Conecte na IQ Option');
@@ -6895,9 +6904,14 @@ async function loadChart(){
       return;
     }
 
+    let chartSourceLabel='MERCADO ABERTO • TWELVE DATA';
+    if(useIqMirror && openMode) chartSourceLabel='IQ OPTION • MERCADO ABERTO';
+    else if(useIqMirror && !openMode) chartSourceLabel='IQ OPTION • OTC';
+    else if(!openMode) chartSourceLabel=brokerName()+' • OTC';
+
     chartInfo.textContent=
       (d.ok===false?'⚠️ ':'🟢 ')+
-      d.symbol+' • '+(iqSelected?'IQ OPTION ESPELHADA':(market.value==='OPEN'?'Mercado Aberto':brokerName()+' OTC'))+
+      d.symbol+' • '+chartSourceLabel+
       ' • '+d.interval+
       (d.ok===false?' • '+(d.status||'INDISPONÍVEL'):'');
 
