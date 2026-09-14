@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.61.0")
-print("[MEGA IA] versão 33.61.0 • MODO ROBO LIMPO + RESET RESULTADOS carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.62.0")
+print("[MEGA IA] versão 33.62.0 • MODO ROBO LIMPO + RESET RESULTADOS carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -2784,7 +2784,7 @@ def json_extract(text):
 
 def _td_cache_ttl(interval: str) -> float:
     sec = int(INTERVALS.get(interval, 60))
-    return max(35.0, min(180.0, sec * 0.45))
+    return max(75.0, min(300.0, sec * 0.45))
 
 
 def _td_cache_age(symbol: str, interval: str) -> float:
@@ -4251,7 +4251,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.61.0",
+        "version": "33.62.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -5246,6 +5246,10 @@ async def radar(request: Request, interval="1min", market="OPEN"):
 
     rkey = f"{market}|{interval}"
     previous = radar_cache.get(rkey)
+    # Proteção do feed: várias telas/clientes reaproveitam o mesmo snapshot do Radar.
+    # Isso impede que cada atualização visual dispare uma nova consulta de candles.
+    if previous and (time.time() - float(previous[0])) < 25.0:
+        return list(previous[1])
     suffix = "" if market == "OPEN" else (" • IQ OTC" if market == "IQ_OTC" else " • OLYMP OTC")
 
     out = list(previous[1]) if previous else [
@@ -8234,10 +8238,11 @@ setInterval(()=>{
 },2000);
 
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) perf(); },5000);
-// Radar completo atualizado a cada 1 minuto.
+// Radar usa o mesmo cache de candles do robô e gira um ativo por ciclo.
+// Intervalo conservador para evitar consumir o limite da fonte de dados.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress) rad();
-},20000);
+},30000);
 // Pré-análise atualizada a cada 1 minuto; a confirmação continua usando a janela final de 1 minuto.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress && !robotEnabled) loadPreSignals();
