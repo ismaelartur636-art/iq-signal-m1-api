@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.54.0")
-print("[MEGA IA] versão 33.54.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.55.0")
+print("[MEGA IA] versão 33.55.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -50,7 +50,7 @@ OAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
-GEMINI_MODEL_FALLBACKS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.0-flash"]
+GEMINI_MODEL_FALLBACKS = []
 OAI_MIN = float(os.getenv("OPENAI_MIN_CONFIDENCE", "70"))
 OAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "15"))
 
@@ -3421,15 +3421,22 @@ async def candles(
 
 _gemini_selected_model = None
 _gemini_model_checked_at = 0.0
+_gemini_models_cache = []
+_gemini_models_checked_at = 0.0
+_gemini_model_cooldown = {}
 
-async def _gemini_pick_model(client):
-    """Escolhe um modelo generateContent realmente disponível para esta chave/projeto."""
-    global _gemini_selected_model, _gemini_model_checked_at
-    if _gemini_selected_model and time.time() - _gemini_model_checked_at < 3600:
-        return _gemini_selected_model
+async def _gemini_list_models(client, force=False):
+    """Lista modelos generateContent disponíveis sem expor a chave."""
+    global _gemini_models_cache, _gemini_models_checked_at
+    if (not force and _gemini_models_cache and
+            time.time() - _gemini_models_checked_at < 3600):
+        return list(_gemini_models_cache)
 
     headers = {"x-goog-api-key": GEMINI_KEY}
-    response = await client.get("https://generativelanguage.googleapis.com/v1beta/models", headers=headers)
+    response = await client.get(
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        headers=headers,
+    )
     response.raise_for_status()
     models = response.json().get("models") or []
     available = []
@@ -3437,52 +3444,107 @@ async def _gemini_pick_model(client):
         methods = item.get("supportedGenerationMethods") or item.get("supportedActions") or []
         if "generateContent" not in methods:
             continue
-        name = str(item.get("name", "")).replace("models/", "", 1)
-        if name:
-            available.append(name)
+        name = str(item.get("name", "")).replace("models/", "", 1).strip()
+        if not name:
+            continue
+        low = name.lower()
+        # Evita variantes inadequadas para análise textual normal.
+        if any(x in low for x in ("embedding", "image", "tts", "live", "vision")):
+            continue
+        available.append(name)
 
-    preferred = ([GEMINI_MODEL] if GEMINI_MODEL else []) + GEMINI_MODEL_FALLBACKS
-    for name in preferred:
-        if name and name in available:
-            _gemini_selected_model = name
-            break
-    if not _gemini_selected_model:
-        flash = [m for m in available if "flash" in m.lower() and "image" not in m.lower()]
-        _gemini_selected_model = flash[0] if flash else (available[0] if available else None)
-    if not _gemini_selected_model:
+    # Mantém ordem da API, mas prioriza o modelo configurado e variantes Flash.
+    ordered = []
+    if GEMINI_MODEL and GEMINI_MODEL in available:
+        ordered.append(GEMINI_MODEL)
+    ordered.extend([m for m in available if "flash" in m.lower() and m not in ordered])
+    ordered.extend([m for m in available if m not in ordered])
+    _gemini_models_cache = ordered
+    _gemini_models_checked_at = time.time()
+    return list(ordered)
+
+async def _gemini_pick_model(client, force=False, exclude=None):
+    """Escolhe um modelo disponível, ignorando os que estão em cooldown por 503."""
+    global _gemini_selected_model, _gemini_model_checked_at
+    exclude = set(exclude or [])
+    now_ts = time.time()
+
+    if (not force and _gemini_selected_model and
+            _gemini_selected_model not in exclude and
+            _gemini_model_cooldown.get(_gemini_selected_model, 0) <= now_ts and
+            now_ts - _gemini_model_checked_at < 3600):
+        return _gemini_selected_model
+
+    available = await _gemini_list_models(client, force=force)
+    candidates = [m for m in available if m not in exclude and _gemini_model_cooldown.get(m, 0) <= now_ts]
+    if not candidates:
+        # Se todos estiverem em cooldown, permita nova tentativa no que expira primeiro.
+        candidates = [m for m in available if m not in exclude]
+    if not candidates:
         raise RuntimeError("Nenhum modelo Gemini com generateContent disponível para este projeto.")
-    _gemini_model_checked_at = time.time()
-    print(f"[IA GEMINI] modelo disponível selecionado: {_gemini_selected_model}", flush=True)
+
+    _gemini_selected_model = candidates[0]
+    _gemini_model_checked_at = now_ts
+    print(f"[IA GEMINI] modelo selecionado: {_gemini_selected_model}", flush=True)
     return _gemini_selected_model
 
 async def _gemini_json(prompt):
-    """Executa o Gemini sem colocar a chave na URL/log e devolve JSON."""
+    """Executa Gemini; em 503/404 troca automaticamente de modelo sem expor a chave."""
     global _gemini_selected_model, _gemini_model_checked_at
     if not GEMINI_KEY:
         raise RuntimeError("GEMINI_API_KEY não configurada.")
+
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.15},
     }
     headers = {"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"}
+    tried = []
+    last_error = None
+
     async with httpx.AsyncClient(timeout=OAI_TIMEOUT) as client:
-        model = await _gemini_pick_model(client)
-        url = GEMINI_URL.format(model=model)
-        response = await client.post(url, headers=headers, json=body)
-        if response.status_code == 404:
-            _gemini_selected_model = None
-            _gemini_model_checked_at = 0.0
-            model = await _gemini_pick_model(client)
+        available = await _gemini_list_models(client)
+        max_models = min(4, max(1, len(available)))
+
+        for attempt in range(max_models):
+            model = await _gemini_pick_model(client, force=(attempt > 0), exclude=tried)
+            tried.append(model)
             url = GEMINI_URL.format(model=model)
-            response = await client.post(url, headers=headers, json=body)
-        response.raise_for_status()
-        payload = response.json()
-    parts = (((payload.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
-    text = "".join(str(x.get("text", "")) for x in parts if isinstance(x, dict))
-    parsed = json_extract(text)
-    if not isinstance(parsed, dict):
-        raise ValueError("Resposta inválida da IA Gemini.")
-    return parsed
+            try:
+                response = await client.post(url, headers=headers, json=body)
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                last_error = exc
+                raise
+
+            if response.status_code in (404, 503):
+                last_error = RuntimeError(f"Gemini HTTP {response.status_code} no modelo {model}")
+                # 404: modelo incompatível/retirado. 503: indisponível/sobrecarregado.
+                cooldown = 3600 if response.status_code == 404 else 300
+                _gemini_model_cooldown[model] = time.time() + cooldown
+                _gemini_selected_model = None
+                _gemini_model_checked_at = 0.0
+                print(f"[IA GEMINI] modelo {model} retornou {response.status_code}; tentando outro modelo", flush=True)
+                if attempt + 1 < max_models:
+                    await asyncio.sleep(0.8 * (attempt + 1))
+                    continue
+
+            # 429 não deve disparar várias chamadas em outros modelos; respeita limite/quota.
+            response.raise_for_status()
+            payload = response.json()
+            parts = (((payload.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+            text = "".join(str(x.get("text", "")) for x in parts if isinstance(x, dict))
+            parsed = json_extract(text)
+            if not isinstance(parsed, dict):
+                raise ValueError("Resposta inválida da IA Gemini.")
+            _gemini_selected_model = model
+            _gemini_model_checked_at = time.time()
+            return parsed
+
+    if last_error:
+        if "503" in str(last_error):
+            raise RuntimeError("Gemini temporariamente indisponível (503) nos modelos testados.")
+        raise last_error
+    raise RuntimeError("Falha ao obter resposta da IA Gemini.")
 
 
 async def openai_confirm(symbol, interval, cs, analysis):
@@ -3831,6 +3893,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 base["status"] = "IA INDISPONÍVEL • CHAVE INVÁLIDA"
             elif "429" in low_reason or "rate limit" in low_reason or "quota" in low_reason:
                 base["status"] = "IA INDISPONÍVEL • LIMITE DA API"
+            elif "503" in low_reason or "service unavailable" in low_reason or "temporariamente indisponível" in low_reason:
+                base["status"] = "IA GEMINI • SERVIÇO TEMPORARIAMENTE INDISPONÍVEL"
             else:
                 base["status"] = "IA INDISPONÍVEL • ERRO DA API"
             base["reason"] = ai_reason[:300]
