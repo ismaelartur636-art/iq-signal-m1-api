@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.60.0")
-print("[MEGA IA] versão 33.60.0 • MODO ROBO LIMPO + RESET RESULTADOS carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.61.0")
+print("[MEGA IA] versão 33.61.0 • MODO ROBO LIMPO + RESET RESULTADOS carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -4251,7 +4251,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.60.0",
+        "version": "33.61.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -5251,9 +5251,11 @@ async def radar(request: Request, interval="1min", market="OPEN"):
     out = list(previous[1]) if previous else [
         {
             "symbol": sym + suffix,
+            "base_symbol": sym,
             "direction": "NEUTRO",
             "confidence": 0,
             "status": "AGUARDANDO LEITURA",
+            "clickable": False,
         }
         for sym in SYMBOLS
     ]
@@ -5267,22 +5269,24 @@ async def radar(request: Request, interval="1min", market="OPEN"):
     try:
         raw = await candles(sym, interval, 90, market, iq_state, request=request)
         if len(raw) >= 25:
-            tech = strategy_engine_for_market(
-                raw[:-1] if len(raw) > 1 else raw,
-                market,
-                {"interval": interval},
-            )
-            direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
+            closed = raw[:-1] if len(raw) > 1 else raw
+            if market == "OPEN":
+                tech = primary_rsi_cross_strategy(closed, 14, interval)
+                direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
+                status_text = "OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else "MONITORANDO"
+            else:
+                tech = {"direction": "NEUTRO", "confidence": 0, "confirmed": False}
+                direction = "NEUTRO"
+                status_text = "AGUARDANDO MÓDULO OTC"
             item = {
                 "symbol": sym + suffix,
+                "base_symbol": sym,
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    "TWELVE DATA • OPORTUNIDADE TÉCNICA" if fallback_twelve and direction != "NEUTRO"
-                    else "TWELVE DATA • MONITORANDO" if fallback_twelve
-                    else "OPORTUNIDADE TÉCNICA" if direction != "NEUTRO"
-                    else "MONITORANDO"
+                    ("TWELVE DATA • " + status_text) if fallback_twelve else status_text
                 ),
+                "clickable": direction in ("CALL", "PUT"),
                 "feed_source": "TWELVE_DATA" if fallback_twelve else market,
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
@@ -5290,16 +5294,20 @@ async def radar(request: Request, interval="1min", market="OPEN"):
         else:
             item = {
                 "symbol": sym + suffix,
+                "base_symbol": sym,
                 "direction": "NEUTRO",
                 "confidence": 0,
                 "status": "POUCOS CANDLES",
+                "clickable": False,
             }
     except Exception:
         item = {
             "symbol": sym + suffix,
+            "base_symbol": sym,
             "direction": "NEUTRO",
             "confidence": 0,
             "status": "FONTE EM ESPERA",
+            "clickable": False,
         }
 
     # replace same symbol slot
@@ -5931,6 +5939,11 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .account-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
 .radar{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
 .radar div{background:#101b2b;padding:10px;border-radius:12px;border:1px solid #173c5e}
+.radar .radar-opportunity{cursor:pointer;border-width:2px;box-shadow:0 0 0 1px rgba(255,255,255,.03) inset;transition:transform .12s ease,filter .12s ease}
+.radar .radar-opportunity:active{transform:scale(.98)}
+.radar .radar-opportunity small{display:block;margin-top:6px;opacity:.78}
+.radar .radar-call{border-color:#16c56b}
+.radar .radar-put{border-color:#ff5252}
 .tabs{display:flex;gap:8px;margin-top:12px;margin-bottom:20px;flex-wrap:wrap}
 .tabbtn.active{border-color:#168cff;box-shadow:0 0 15px #168cff44}
 .tab{display:none}
@@ -7627,7 +7640,8 @@ async function setAppPower(enabled){
 
   if(appEnabled){
     await Promise.allSettled([sig(false), perf(), updateMarketNote()]);
-    if(!robotEnabled) await Promise.allSettled([rad(), loadPreSignals()]);
+    await Promise.allSettled([rad()]);
+    if(!robotEnabled) await Promise.allSettled([loadPreSignals()]);
     if(chartTab.classList.contains('active')) await loadChart();
     if(voiceEnabled) speak('Mega IA ligado. Análises e sinais ativados.');
   }else if(voiceEnabled){
@@ -7653,7 +7667,8 @@ function applyRobotPowerState(){
     }
     if(preSignalStatus) preSignalStatus.textContent='Pré-sinais antigos desativados durante o teste.';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 ONLINE: robô principal analisando o timeframe selecionado.</div>';
-    if(radar) radar.innerHTML='<div>🤖 Robô ativo em M1/M5/M15/M30 • módulos antigos desligados</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar ativo • procurando oportunidades</div>';
+    rad();
   }else{
     robotPowerBtn.textContent='🔴 OFFLINE';
     robotPowerBtn.style.background='#7d1d1d';
@@ -7690,7 +7705,8 @@ async function setRobotPower(enabled){
 
   // Nesta bancada, OFFLINE pausa o robô; radar e pré-sinais antigos ficam desligados.
   if(!robotEnabled){
-    if(radar) radar.innerHTML='<div>⛔ OFFLINE • radar desativado nesta bancada</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar ativo • robô principal offline</div>';
+    rad();
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ OFFLINE • pré-sinais desativados</div>';
   }
 
@@ -7820,9 +7836,55 @@ async function perf(){
   }
 }
 
+function radarBaseSymbol(item){
+  if(item && item.base_symbol) return String(item.base_symbol);
+  return String((item&&item.symbol)||'').split(' • ')[0].trim();
+}
+
+function radarCard(item){
+  const dir=String(item.direction||'NEUTRO').toUpperCase();
+  const sym=radarBaseSymbol(item);
+  const conf=Math.round(Number(item.confidence||0));
+  const status=String(item.status||'MONITORANDO');
+  const opportunity=(dir==='CALL'||dir==='PUT');
+  const cls=opportunity ? ('radar-opportunity '+(dir==='CALL'?'radar-call':'radar-put')) : '';
+  const icon=dir==='CALL'?'🟢':dir==='PUT'?'🔴':'⚪';
+  const hint=opportunity?'<small>Toque para abrir este ativo</small>':'';
+  return `<div class="${cls}" data-radar-symbol="${sym}" data-radar-opportunity="${opportunity?'1':'0'}">
+    <b>${icon} ${sym}</b><br>
+    <span>${dir==='NEUTRO'?'AGUARDANDO':dir}</span>
+    ${opportunity?` • ${conf}%`:''}<br>
+    <small>${status}</small>${hint}
+  </div>`;
+}
+
 async function rad(){
-  if(radar) radar.innerHTML='<div>⛔ Radar técnico desativado durante o teste do robô principal</div>';
-  return;
+  if(!appEnabled || !radar) return;
+  try{
+    const items=await get(`/radar?market=${encodeURIComponent(market.value)}&interval=${encodeURIComponent(interval.value)}`);
+    const list=Array.isArray(items)?items:[];
+    if(!list.length){
+      radar.innerHTML='<div>📡 Radar ativo • aguardando leitura</div>';
+      return;
+    }
+    radar.innerHTML=list.map(radarCard).join('');
+    radar.querySelectorAll('[data-radar-opportunity="1"]').forEach(card=>{
+      card.onclick=async()=>{
+        const sym=card.getAttribute('data-radar-symbol');
+        if(!sym) return;
+        if(S){
+          const exists=[...S.options].some(o=>o.value===sym);
+          if(exists) S.value=sym;
+        }
+        if(mainTab && typeof mainTab.click==='function') mainTab.click();
+        if(statusBox) statusBox.textContent='ATIVO SELECIONADO PELO RADAR • CONFIRMANDO OPORTUNIDADE';
+        await sig(true);
+        window.scrollTo({top:0,behavior:'smooth'});
+      };
+    });
+  }catch(e){
+    radar.innerHTML='<div>📡 Radar ativo • fonte temporariamente indisponível</div>';
+  }
 }
 
 async function loadPreSignals(){
@@ -8147,8 +8209,10 @@ async function bootApp(){
   }
 
   if(appEnabled) safe('signal',()=>sig(false));
-  if(appEnabled && !robotEnabled){
+  if(appEnabled){
     safe('radar',rad);
+  }
+  if(appEnabled && !robotEnabled){
     safe('pre-signals',loadPreSignals);
   }
   if(appEnabled && chartTab.classList.contains('active')){
@@ -8172,8 +8236,8 @@ setInterval(()=>{
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) perf(); },5000);
 // Radar completo atualizado a cada 1 minuto.
 setInterval(()=>{
-  if(appEnabled && !iqLoginInProgress && !robotEnabled) rad();
-},60000);
+  if(appEnabled && !iqLoginInProgress) rad();
+},20000);
 // Pré-análise atualizada a cada 1 minuto; a confirmação continua usando a janela final de 1 minuto.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress && !robotEnabled) loadPreSignals();
