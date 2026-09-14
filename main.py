@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.64.0")
-print("[MEGA IA] versão 33.64.0 • MODO ROBO LIMPO + RESET RESULTADOS carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.65.0")
+print("[MEGA IA] versão 33.65.0 • OLYMP TRADE COMO FONTE + DIAGNOSTICO carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -396,11 +396,12 @@ async def _get_olymp_client(request: Request | None = None):
         return olymp_client
 
 
-async def candles_olymp(symbol: str, interval: str, n: int = 80, request: Request | None = None):
+async def candles_olymp(symbol: str, interval: str, n: int = 80, request: Request | None = None, otc: bool = True):
     if symbol not in SYMBOLS or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
 
-    key = f"{symbol}|{interval}"
+    mode_key = "OTC" if otc else "OPEN"
+    key = f"{mode_key}|{symbol}|{interval}"
     cached = olymp_candle_cache.get(key)
     if cached and time.time() - cached[0] < OLYMP_CANDLE_TTL and len(cached[1]) >= min(n, 20):
         return cached[1][-n:]
@@ -408,12 +409,12 @@ async def candles_olymp(symbol: str, interval: str, n: int = 80, request: Reques
     client = await _get_olymp_client(request)
     period = INTERVALS[interval]
     asset_base = _olymp_asset(symbol)
-    candidates = [
+    otc_candidates = [
         asset_base + "_OTC",
         asset_base + "_otc",
         asset_base + "-OTC",
-        asset_base,
     ]
+    candidates = (otc_candidates + [asset_base]) if otc else ([asset_base] + otc_candidates)
 
     # Cliente por e-mail/senha.
     if hasattr(client, "get_candle"):
@@ -446,7 +447,7 @@ async def candles_olymp(symbol: str, interval: str, n: int = 80, request: Reques
 
         raise HTTPException(
             503,
-            "Olymptrade OTC sem candles pelo login. "
+            "Olymptrade sem candles pelo login. "
             + (last_error[:180] if last_error else "Ativo OTC não disponível.")
         )
 
@@ -483,7 +484,7 @@ async def candles_olymp(symbol: str, interval: str, n: int = 80, request: Reques
 
     raise HTTPException(
         503,
-        "Olymptrade OTC sem candles. " + (last_error[:180] if last_error else "Ativo OTC não disponível.")
+        "Olymptrade sem candles. " + (last_error[:180] if last_error else "Ativo não disponível.")
     )
 
 
@@ -3403,16 +3404,33 @@ async def candles(
             interval,
             n,
             request=request,
+            otc=True,
         )
 
     # Fonte principal no mercado aberto: IQ Option quando houver sessão conectada.
     # Twelve Data fica apenas como fallback. O gráfico visual não é necessário
     # para o robô calcular sinais; basta a sessão fornecer candles.
     if market == "OPEN":
+        selected_broker = "IQ_OPTION"
+        if request is not None:
+            selected_broker = str(request.query_params.get("broker", "IQ_OPTION") or "IQ_OPTION").upper()
+
+        # Quando Olymptrade estiver selecionada e conectada, os candles dela
+        # têm prioridade também no Mercado Aberto. Se a sessão não estiver
+        # disponível, o fluxo continua para IQ/Twelve sem travar o robô.
+        if selected_broker == "OLYMPTRADE" and request is not None:
+            olymp_state = _olymp_session_state(request)
+            if olymp_state and olymp_state.get("client") is not None:
+                try:
+                    return await candles_olymp(symbol, interval, n, request=request, otc=False)
+                except Exception as exc:
+                    print(f"[OLYMP CANDLES] mercado aberto indisponível {symbol} {interval}: {type(exc).__name__}: {str(exc)[:180]}", flush=True)
+
         if iq_state is None and request is not None:
             iq_state = _iq_session_state(request, required=False)
 
-        if iq_state is not None and _iq_connected(iq_state):
+        # Só usa IQ como fonte aberta quando ela for a corretora selecionada.
+        if selected_broker != "OLYMPTRADE" and iq_state is not None and _iq_connected(iq_state):
             cache_key = f"OPEN|{symbol}|{interval}"
             candle_cache = iq_state.setdefault("candle_cache", {})
             cached = candle_cache.get(cache_key)
@@ -4450,7 +4468,7 @@ async def iq_login_ready():
         "ok": True,
         "stage": "BACKEND_OK",
         "iqoptionapi_loaded": IQ_Option is not None,
-        "version": "33.64.0",
+        "version": "33.65.0",
     }
 
 
@@ -4594,10 +4612,23 @@ async def iq_logout(
     }
 
 
+@app.get("/olymp-login-ready")
+async def olymp_login_ready():
+    print("[OLYMP LOGIN] preflight recebido do painel", flush=True)
+    return {
+        "ok": True,
+        "stage": "BACKEND_OK",
+        "olymp_email_login_loaded": OlympTradeLoginClient is not None,
+        "olymp_ws_loaded": OlympTradeClient is not None,
+        "version": "33.65.0",
+    }
+
+
 @app.post("/olymp-login")
 async def olymp_login(body: OlympLoginBody, response: Response):
     email = body.email.strip()
     password = body.password
+    print(f"[OLYMP LOGIN] POST recebido dominio={email.split('@')[-1] if '@' in email else 'invalido'}", flush=True)
 
     if not email or not password:
         raise HTTPException(400, "Informe e-mail e senha da Olymptrade.")
@@ -4605,17 +4636,21 @@ async def olymp_login(body: OlympLoginBody, response: Response):
     token = secrets.token_urlsafe(32)
 
     try:
+        print("[OLYMP LOGIN] iniciando conector", flush=True)
         client = await asyncio.wait_for(
             asyncio.to_thread(_olymp_login_blocking, email, password),
-            timeout=30,
+            timeout=40,
         )
     except asyncio.TimeoutError:
-        raise HTTPException(504, "A tentativa de login da Olymptrade excedeu o tempo limite.")
+        print("[OLYMP LOGIN] timeout no conector", flush=True)
+        raise HTTPException(504, "A Olymptrade não respondeu ao servidor dentro do tempo limite.")
     except Exception as exc:
+        print(f"[OLYMP LOGIN] falhou: {type(exc).__name__}: {str(exc)[:260]}", flush=True)
         raise HTTPException(
             401,
             "Não foi possível conectar à Olymptrade por e-mail/senha: " + str(exc)[:300]
         )
+    print("[OLYMP LOGIN] conectado com sucesso", flush=True)
 
     olymp_sessions[token] = {
         "session_id": token,
@@ -4824,7 +4859,7 @@ async def candles_endpoint(
             if item:
                 stale = item[1][-n:]
         elif market == "OLYMP_OTC":
-            item = olymp_candle_cache.get(f"{symbol}|{interval}")
+            item = olymp_candle_cache.get(f"OTC|{symbol}|{interval}")
             if item:
                 stale = item[1][-n:]
 
@@ -4876,10 +4911,22 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             # realmente gerou o sinal. Isto evita fechar um sinal IQ_OTC como OPEN.
             data["requested_market"] = requested_market
             if requested_market == "OPEN":
-                data["feed_source"] = "IQ_OPTION" if (state and _iq_connected(state)) else "TWELVE_DATA"
-                data["feed_fallback"] = not bool(state and _iq_connected(state))
-                if data["feed_fallback"]:
-                    data["feed_message"] = "IQ Option desconectada: usando a fonte reserva."
+                selected_broker = str(request.query_params.get("broker", "IQ_OPTION") or "IQ_OPTION").upper()
+                olymp_state = _olymp_session_state(request) if selected_broker == "OLYMPTRADE" else None
+                if selected_broker == "OLYMPTRADE" and olymp_state and olymp_state.get("client") is not None:
+                    data["feed_source"] = "OLYMPTRADE"
+                    data["feed_fallback"] = False
+                elif selected_broker != "OLYMPTRADE" and state and _iq_connected(state):
+                    data["feed_source"] = "IQ_OPTION"
+                    data["feed_fallback"] = False
+                else:
+                    data["feed_source"] = "TWELVE_DATA"
+                    data["feed_fallback"] = True
+                    data["feed_message"] = (
+                        "Olymptrade desconectada: usando a fonte reserva."
+                        if selected_broker == "OLYMPTRADE"
+                        else "IQ Option desconectada: usando a fonte reserva."
+                    )
             else:
                 data["feed_source"] = "TWELVE_DATA" if fallback_twelve else effective_market
                 data["feed_fallback"] = bool(fallback_twelve)
@@ -7397,9 +7444,12 @@ async function loadChart(){
   if(!appEnabled) return;
   if(chartBusy) return;
 
-  const iqSelected=(broker && broker.value==='IQ_OPTION');
+  const selectedBroker=(broker&&broker.value)||'IQ_OPTION';
+  const iqSelected=selectedBroker==='IQ_OPTION';
+  const olympSelected=selectedBroker==='OLYMPTRADE';
   const openMode=(marketMode && marketMode.value==='OPEN');
   const iqConnected=!!brokerConnected.IQ_OPTION;
+  const olympConnected=!!brokerConnected.OLYMPTRADE;
 
   // Regras do gráfico:
   // 1) IQ Option + Mercado Aberto + conectada = candles reais do mercado aberto da IQ Option.
@@ -7413,6 +7463,13 @@ async function loadChart(){
     drawChart([]);
     return;
   }
+  if(olympSelected && !openMode && !olympConnected){
+    chartData=[];
+    chartPreSignal=null;
+    if(chartInfo) chartInfo.textContent='⚪ OTC OLYMPTRADE OFFLINE • CONECTE NA OLYMPTRADE';
+    drawChart([]);
+    return;
+  }
 
   chartBusy=true;
 
@@ -7422,10 +7479,10 @@ async function loadChart(){
     const mirrorParam=useIqMirror?'&mirror_iq=true':'';
     const [d,pre]=await Promise.all([
       get(
-        `/candles?market=${encodeURIComponent(chartMarket)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&n=80${mirrorParam}`
+        `/candles?market=${encodeURIComponent(chartMarket)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&n=80${mirrorParam}`
       ),
       (robotEnabled ? Promise.resolve(null) : get(
-        `/chart-pre-signal?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}`
+        `/chart-pre-signal?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}`
       ).catch(()=>null))
     ]);
 
@@ -7599,17 +7656,15 @@ window.megaConnectIQ=async function(event){
 
     const url=b==='OLYMPTRADE'?'/olymp-login':'/iq-login';
 
-    // Diagnóstico Android/PWA: primeiro confirma que o toque chegou ao backend.
-    if(b==='IQ_OPTION'){
-      if(iqAccountStatus) iqAccountStatus.textContent='🟡 Etapa 1/3: verificando servidor...';
-      const ready=await fetch('/iq-login-ready?t='+Date.now(),{
-        method:'GET', credentials:'include', cache:'no-store'
-      });
-      let rd=null; try{ rd=await ready.json(); }catch(_){}
-      if(!ready.ok || !rd || !rd.ok) throw new Error('O painel não conseguiu confirmar o servidor de login.');
-      if(!rd.iqoptionapi_loaded) throw new Error('A biblioteca iqoptionapi não está carregada no servidor.');
-      if(iqAccountStatus) iqAccountStatus.textContent='🟡 Etapa 2/3: enviando login para IQ Option...';
-    }
+    // Diagnóstico Android/PWA: confirma o backend antes de enviar credenciais.
+    if(iqAccountStatus) iqAccountStatus.textContent='🟡 Etapa 1/3: verificando servidor...';
+    const readyUrl=(b==='OLYMPTRADE'?'/olymp-login-ready':'/iq-login-ready')+'?t='+Date.now();
+    const ready=await fetch(readyUrl,{method:'GET',credentials:'include',cache:'no-store'});
+    let rd=null; try{ rd=await ready.json(); }catch(_){}
+    if(!ready.ok || !rd || !rd.ok) throw new Error('O painel não conseguiu confirmar o servidor de login.');
+    if(b==='IQ_OPTION' && !rd.iqoptionapi_loaded) throw new Error('A biblioteca iqoptionapi não está carregada no servidor.');
+    if(b==='OLYMPTRADE' && !rd.olymp_email_login_loaded) throw new Error('O conector de login da Olymptrade não está carregado no servidor.');
+    if(iqAccountStatus) iqAccountStatus.textContent='🟡 Etapa 2/3: enviando login para '+(b==='OLYMPTRADE'?'Olymptrade':'IQ Option')+'...';
 
     const controller=new AbortController();
     const loginTimer=setTimeout(()=>controller.abort(),65000);
@@ -7619,15 +7674,15 @@ window.megaConnectIQ=async function(event){
         method:'POST',
         credentials:'include',
         cache:'no-store',
-        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'33.64.0'},
+        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'33.65.0'},
         body:JSON.stringify({email:email,password:password}),
         signal:controller.signal
       });
     }catch(fetchErr){
-      if(fetchErr && fetchErr.name==='AbortError') throw new Error('O servidor recebeu a tentativa, mas a conexão da IQ Option excedeu 65 segundos.');
+      if(fetchErr && fetchErr.name==='AbortError') throw new Error('O servidor recebeu a tentativa, mas a conexão da corretora excedeu 65 segundos.');
       throw fetchErr;
     }finally{ clearTimeout(loginTimer); }
-    if(b==='IQ_OPTION' && iqAccountStatus) iqAccountStatus.textContent='🟡 Etapa 3/3: validando sessão...';
+    if(iqAccountStatus) iqAccountStatus.textContent='🟡 Etapa 3/3: validando sessão...';
 
     let d=null;
     try{ d=await r.json(); }catch(_){}
@@ -7636,8 +7691,10 @@ window.megaConnectIQ=async function(event){
       throw new Error((d&&d.detail)?d.detail:('HTTP '+r.status));
     }
 
-    if(b==='IQ_OPTION' && d && d.session_token){
-      try{ localStorage.setItem('mega_iq_session',d.session_token); }catch(_){}
+    if(d && d.session_token){
+      try{
+        localStorage.setItem(b==='OLYMPTRADE'?'mega_olymp_session':'mega_iq_session',d.session_token);
+      }catch(_){}
     }
 
     brokerConnected[b]=true;
@@ -7677,11 +7734,9 @@ iqLogoutBtn.onclick=async()=>{
   try{
     await post(b==='OLYMPTRADE'?'/olymp-logout':'/iq-logout',{});
   }catch(_){}
-  if(b==='IQ_OPTION'){
-    try{
-      localStorage.removeItem('mega_iq_session');
-    }catch(_){}
-  }
+  try{
+    localStorage.removeItem(b==='OLYMPTRADE'?'mega_olymp_session':'mega_iq_session');
+  }catch(_){}
   brokerConnected[b]=false;
   iqPassword.value='';
   syncBroker(b);
@@ -7839,7 +7894,7 @@ async function sig(announce=false){
 
   try{
     cur=await get(
-      `/signal-ai?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=${robotEnabled?'true':'false'}`
+      `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=${robotEnabled?'true':'false'}`
     );
 
     if(announce){
@@ -7961,7 +8016,7 @@ function radarCard(item){
 async function rad(){
   if(!appEnabled || !radar) return;
   try{
-    const items=await get(`/radar?market=${encodeURIComponent(market.value)}&interval=${encodeURIComponent(interval.value)}`);
+    const items=await get(`/radar?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}`);
     const list=Array.isArray(items)?items:[];
     if(!list.length){
       radar.innerHTML='<div>📡 Radar ativo • aguardando leitura</div>';
