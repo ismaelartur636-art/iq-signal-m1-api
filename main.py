@@ -34,7 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.39.0")
+app = FastAPI(title="MEGA IA", version="33.41.0")
+print("[MEGA IA] versão 33.41.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -3908,20 +3909,20 @@ async def mega_ia_icon_192():
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = {
-        "id": "/mega-ia-trader-v36",
+        "id": "/mega-ia-trader-v41",
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v36",
+        "start_url": "/?pwa=v41",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=39", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=39", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=39", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=41", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=41", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=41", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -5349,8 +5350,8 @@ HTML_PAGE = r"""
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
 <link rel="manifest" href="/manifest.webmanifest?v=39">
-<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=39">
-<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=39">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=41">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=41">
 <meta name="theme-color" content="#07182b">
 <meta name="application-name" content="Mega IA Trader">
 <meta name="apple-mobile-web-app-title" content="Mega IA Trader">
@@ -5848,7 +5849,7 @@ const RESULT_RETRY_MS=15000;
 const RESULT_MAX_PENDING_AGE_MS=30*60*1000;
 
 const RESULT_STATS_KEY='mega_result_stats_v33310';
-const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33310';
+const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33410';
 const RESULT_MARKETS=['OPEN','IQ_OTC','OLYMP_OTC'];
 
 function emptyResultBucket(){
@@ -6032,7 +6033,17 @@ function paintPersistentResults(){
 loadPersistentResults();
 
 try{
-  const savedPending=localStorage.getItem('mega_pending_trade_v33310');
+  // Remove filas antigas que ficaram presas em versões anteriores.
+  [
+    'mega_pending_trade_v33310',
+    'mega_pending_trade_queue_v33310',
+    'mega_pending_trade_v33400',
+    'mega_pending_trade_queue_v33400'
+  ].forEach(k=>{ try{ localStorage.removeItem(k); }catch(_){} });
+}catch(_){}
+
+try{
+  const savedPending=localStorage.getItem('mega_pending_trade_v33410');
   if(savedPending){
     pendingTrade=normalizePendingTradeMarket(JSON.parse(savedPending));
   }
@@ -6049,9 +6060,9 @@ try{
 function savePendingTrade(){
   try{
     if(pendingTrade){
-      localStorage.setItem('mega_pending_trade_v33310',JSON.stringify(pendingTrade));
+      localStorage.setItem('mega_pending_trade_v33410',JSON.stringify(pendingTrade));
     }else{
-      localStorage.removeItem('mega_pending_trade_v33310');
+      localStorage.removeItem('mega_pending_trade_v33410');
     }
     localStorage.setItem(PENDING_QUEUE_KEY,JSON.stringify(pendingTradeQueue.slice(0,100)));
   }catch(e){}
