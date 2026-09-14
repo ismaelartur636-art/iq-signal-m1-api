@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.55.0")
-print("[MEGA IA] versão 33.55.0 carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.57.0")
+print("[MEGA IA] versão 33.57.0 carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -64,6 +64,15 @@ IG = os.getenv("INSTAGRAM", "@Ismaelartur26")
 TD_URL = "https://api.twelvedata.com/time_series"
 OAI_URL = "https://api.openai.com/v1/responses"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+# 33.56.0 — bancada de testes de novos indicadores.
+# Mantemos TODAS as IAs, estratégias e indicadores antigos no arquivo, mas
+# eles ficam desligados do motor de sinais até os dois novos indicadores
+# serem instalados e testados.
+LEGACY_AI_ENABLED = False
+LEGACY_INDICATORS_ENABLED = False
+NEW_PRIMARY_INDICATOR_ENABLED = True
+NEW_OTC_INDICATOR_ENABLED = False
 
 INTERVALS = {"1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1h": 3600, "4h": 14400}
 SYMBOLS = [
@@ -2084,6 +2093,58 @@ def adx(cs, period=21):
     return sum(dxs[-period:]) / min(period, len(dxs))
 
 
+
+def _adx_di_snapshot(cs, period=21):
+    """ADX/+DI/-DI compatível com a regra do indicador MQL4 ISMAEL TRADER."""
+    if len(cs) < period + 2:
+        return None
+    trs, plus_dm, minus_dm = [], [], []
+    for i in range(1, len(cs)):
+        cur, prev = cs[i], cs[i-1]
+        up = float(cur["high"]) - float(prev["high"])
+        down = float(prev["low"]) - float(cur["low"])
+        plus_dm.append(up if up > down and up > 0 else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+        trs.append(max(float(cur["high"])-float(cur["low"]), abs(float(cur["high"])-float(prev["close"])), abs(float(cur["low"])-float(prev["close"]))))
+    if len(trs) < period:
+        return None
+    tr = sum(trs[-period:])
+    if tr <= 1e-12:
+        return None
+    pdi = 100.0 * sum(plus_dm[-period:]) / tr
+    mdi = 100.0 * sum(minus_dm[-period:]) / tr
+    a = adx(cs, period)
+    if a is None:
+        return None
+    return {"adx": a, "plus_di": pdi, "minus_di": mdi}
+
+
+def ismael_trader_ema_rsi_adx(cs):
+    """Conversão do MQL4: EMA 3/7 + RSI 9 (30/70) + ADX 21 mínimo 20."""
+    name = "ISMAEL TRADER • EMA 3/7 + RSI 9 + ADX 21"
+    if len(cs) < 45:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,"reason":"Aguardando candles suficientes.","strategy":name}
+    closes=[float(c["close"]) for c in cs]
+    ef, es = ema(closes,3), ema(closes,7)
+    efp, esp = ema(closes[:-1],3), ema(closes[:-1],7)
+    r = rsi(closes,9)
+    snap = _adx_di_snapshot(cs,21)
+    if None in (ef,es,efp,esp,r) or not snap:
+        return {"direction":"NEUTRO","confidence":0,"confirmed":False,"reason":"EMA/RSI/ADX ainda sem dados suficientes.","strategy":name}
+    a,pdi,mdi=snap["adx"],snap["plus_di"],snap["minus_di"]
+    cross_up=ef>es and efp<=esp
+    cross_down=ef<es and efp>=esp
+    trend_up=ef>es and pdi>mdi
+    trend_down=ef<es and mdi>pdi
+    call=(cross_up or trend_up) and r<=30.0 and a>=20.0
+    put=(cross_down or trend_down) and r>=70.0 and a>=20.0
+    details={"ema3":round(ef,8),"ema7":round(es,8),"rsi9":round(r,2),"adx21":round(a,2),"plus_di":round(pdi,2),"minus_di":round(mdi,2)}
+    if call:
+        return {"direction":"CALL","confidence":85.0,"confirmed":True,"reason":f"EMA 3/7 compradora; RSI 9={r:.1f} <= 30; ADX 21={a:.1f} >= 20; +DI={pdi:.1f} e -DI={mdi:.1f}.","strategy":name,**details}
+    if put:
+        return {"direction":"PUT","confidence":85.0,"confirmed":True,"reason":f"EMA 3/7 vendedora; RSI 9={r:.1f} >= 70; ADX 21={a:.1f} >= 20; +DI={pdi:.1f} e -DI={mdi:.1f}.","strategy":name,**details}
+    return {"direction":"NEUTRO","confidence":50.0,"confirmed":False,"reason":f"Sem condição completa. RSI 9={r:.1f}, ADX 21={a:.1f}.","strategy":name,**details}
+
 def _mega_ia_confluence_score(cs, direction, context=None):
     """
     Score M1/M5 de 0 a 100:
@@ -2493,6 +2554,19 @@ def otc_engine(cs, context=None):
 
 
 def strategy_engine_for_market(cs, market="OPEN", context=None):
+    # As estratégias/indicadores anteriores continuam preservados abaixo e nas
+    # funções existentes, porém não participam mais das decisões enquanto a
+    # bancada 33.56.0 estiver ativa.
+    if not LEGACY_INDICATORS_ENABLED:
+        return {
+            "direction": "NEUTRO",
+            "confidence": 0,
+            "confirmed": False,
+            "strategy": "BANCADA DE TESTE",
+            "reason": "Indicadores e estratégias anteriores desativados temporariamente para testar os novos indicadores.",
+            "legacy_disabled": True,
+        }
+
     market = (market or "OPEN").upper()
     if market in ("IQ_OTC", "OLYMP_OTC"):
         return otc_engine(cs, context)
@@ -3821,7 +3895,75 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     closed = raw[:-1] if len(raw) > 1 else raw
 
-    # MODO ONLINE / IA PURA: analisa continuamente, mas libera no máximo 1 sinal a cada 5 minutos.
+    # 33.57.0 — teste isolado do indicador convertido de MQL4.
+    # ONLINE e OFFLINE usam EXATAMENTE o mesmo indicador; nenhuma IA ou estratégia antiga participa.
+    # OTC continua reservado ao segundo indicador solicitado pelo usuário.
+    if NEW_PRIMARY_INDICATOR_ENABLED and market == "OPEN":
+        analysis = ismael_trader_ema_rsi_adx(closed)
+        base = neutral_signal(symbol, interval, market, "INDICADOR ISMAEL • ANALISANDO", analysis.get("reason", ""), source_state="READY")
+        base.update({
+            "strategy": analysis.get("strategy"),
+            "mode": "PRIMARY_INDICATOR_ONLY",
+            "technical": analysis,
+            "ai_provider": "DISABLED",
+            "ai_confirmed": False,
+            "legacy_ai_disabled": True,
+            "legacy_indicators_disabled": True,
+            "robot_switch": "ONLINE" if ai_only else "OFFLINE",
+            "confidence": analysis.get("confidence", 0),
+        })
+        if analysis.get("confirmed") and analysis.get("direction") in ("CALL", "PUT"):
+            announce, entry, expiry = entry_window(interval)
+            base.update(direction=analysis["direction"], confidence=analysis.get("confidence",85),
+                        entry_time=iso(entry), announce_time=iso(announce), expiry_time=iso(expiry),
+                        status="SINAL ISMAEL TRADER LIBERADO", risk="MEDIUM",
+                        reason=analysis.get("reason", ""), reference_candle=closed[-1].get("datetime") if closed else None)
+            release_state = signal_release_state.setdefault(release_key, {})
+            locked = release_state.get("locked_direction")
+            if locked == base["direction"]:
+                base.update(direction="NEUTRO", entry_time=None, announce_time=None, expiry_time=None,
+                            status="INDICADOR ISMAEL • AGUARDANDO NOVO SETUP",
+                            reason="O setup anterior já foi utilizado; aguardando uma nova condição do indicador.")
+            else:
+                release_state["locked_direction"] = base["direction"]
+                release_state["active_signal"] = dict(base)
+        else:
+            release_state = signal_release_state.setdefault(release_key, {})
+            release_state["locked_direction"] = None
+            release_state["active_signal"] = None
+        cache[key]=(time.time(),base)
+        return base
+
+    if market in ("IQ_OTC", "OLYMP_OTC") and not NEW_OTC_INDICATOR_ENABLED:
+        out = neutral_signal(symbol, interval, market, "OTC • AGUARDANDO SEGUNDO INDICADOR",
+                             "O indicador principal está isolado no Mercado Aberto. OTC permanece reservado ao segundo indicador.", source_state="READY")
+        out.update({"strategy":"SEGUNDO INDICADOR OTC • AGUARDANDO", "mode":"OTC_INDICATOR_WAITING",
+                    "legacy_ai_disabled":True,"legacy_indicators_disabled":True})
+        cache[key]=(time.time(),out)
+        return out
+
+    # BANCADA 33.56.0: o botão ONLINE/OFFLINE permanece disponível para receber
+    # o primeiro novo indicador, mas nenhuma IA antiga é executada.
+    if ai_only and not LEGACY_AI_ENABLED and not NEW_PRIMARY_INDICATOR_ENABLED:
+        out = neutral_signal(
+            symbol, interval, market,
+            "ONLINE • AGUARDANDO NOVO INDICADOR",
+            "Todas as IAs anteriores estão desativadas, sem exclusão do código. Aguardando o novo indicador principal.",
+            source_state="READY",
+        )
+        out.update({
+            "strategy": "NOVO INDICADOR PRINCIPAL • AGUARDANDO INSTALAÇÃO",
+            "mode": "NEW_INDICATOR_TEST",
+            "ai_provider": "DISABLED",
+            "ai_confirmed": False,
+            "technical": {"disabled": True, "legacy_preserved": True},
+            "legacy_ai_disabled": True,
+            "legacy_indicators_disabled": True,
+        })
+        cache[key] = (time.time(), out)
+        return out
+
+    # MODO ONLINE / IA PURA: código antigo PRESERVADO, porém desligado pelas flags acima.
     if ai_only:
         release_state = signal_release_state.setdefault(release_key, {})
         ai_cycle_seconds = 300
@@ -3931,6 +4073,25 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
         cache[key] = (time.time(), base)
         return base
+
+    # BANCADA 33.56.0: no modo OFFLINE, os indicadores/estratégias anteriores
+    # também permanecem preservados no arquivo, porém sem gerar sinais.
+    if not LEGACY_INDICATORS_ENABLED and not NEW_PRIMARY_INDICATOR_ENABLED and not NEW_OTC_INDICATOR_ENABLED:
+        out = neutral_signal(
+            symbol, interval, market,
+            "OFFLINE • AGUARDANDO NOVOS INDICADORES",
+            "Indicadores e estratégias anteriores desativados temporariamente. Aguardando os dois novos indicadores para teste.",
+            source_state="READY",
+        )
+        out.update({
+            "strategy": "BANCADA DE TESTE",
+            "mode": "NEW_INDICATOR_TEST",
+            "technical": {"disabled": True, "legacy_preserved": True},
+            "legacy_ai_disabled": True,
+            "legacy_indicators_disabled": True,
+        })
+        cache[key] = (time.time(), out)
+        return out
 
     # Mercado aberto mantém as estratégias/indicadores já existentes,
     # incluindo o mapa H1/H4. OTC usa SOMENTE o motor OTC próprio.
