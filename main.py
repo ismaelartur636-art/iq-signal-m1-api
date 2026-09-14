@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.35.0")
+app = FastAPI(title="MEGA IA", version="33.36.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -3799,20 +3799,20 @@ async def mega_ia_icon_192():
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = {
-        "id": "/mega-ia-trader-v34",
+        "id": "/mega-ia-trader-v36",
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v34",
+        "start_url": "/?pwa=v36",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=35", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=35", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=35", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=36", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=36", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=36", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -5239,9 +5239,9 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=35">
-<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=35">
-<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=35">
+<link rel="manifest" href="/manifest.webmanifest?v=36">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=36">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=36">
 <meta name="theme-color" content="#07182b">
 <meta name="application-name" content="Mega IA Trader">
 <meta name="apple-mobile-web-app-title" content="Mega IA Trader">
@@ -5534,7 +5534,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
                style="width:100%;box-sizing:border-box;margin-top:6px">
       </div>
 
-      <button id="iqConnectBtn" type="button" style="width:100%;margin-top:12px">🔐 CONECTAR</button>
+      <button id="iqConnectBtn" type="button" onclick="return window.megaConnectIQ ? window.megaConnectIQ(event) : false;" style="width:100%;margin-top:12px">🔐 CONECTAR</button>
       <button id="iqLogoutBtn" style="width:100%;margin-top:8px;display:none">🚪 DESCONECTAR</button>
 
       <div class="label" style="margin-top:10px;line-height:1.5">
@@ -5576,6 +5576,16 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 </div>
 
 <script>
+// MEGA IA build 33.36.0 — força o PWA antigo a abrir a versão atual.
+(function(){
+  try{
+    const u=new URL(window.location.href);
+    if(u.searchParams.get('pwa')!=='v36'){
+      u.searchParams.set('pwa','v36');
+      window.history.replaceState({},'',u.pathname+u.search+u.hash);
+    }
+  }catch(_){}
+})();
 const market=document.getElementById('market');
 const marketMode=document.getElementById('marketMode');
 const broker=document.getElementById('broker');
@@ -6768,10 +6778,6 @@ window.megaConnectIQ=async function(event){
   return false;
 };
 
-if(iqConnectBtn){
-  iqConnectBtn.addEventListener('click',window.megaConnectIQ);
-}
-
 if(interval){
   interval.addEventListener('change',()=>{
     loadPreSignals();
@@ -7483,7 +7489,15 @@ HTML_PAGE = HTML_PAGE.replace("__MEGA_IMAGE__", "/mega-ia.png")
 
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def home():
-    return HTMLResponse(HTML_PAGE)
+    return HTMLResponse(
+        HTML_PAGE,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "X-Mega-IA-Build": "33.36.0",
+        },
+    )
 
 
 if __name__ == "__main__":
