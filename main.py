@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.63.0")
-print("[MEGA IA] versão 33.63.0 • MODO ROBO LIMPO + RESET RESULTADOS carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.64.0")
+print("[MEGA IA] versão 33.64.0 • MODO ROBO LIMPO + RESET RESULTADOS carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -4443,6 +4443,17 @@ def _olymp_login_blocking(email: str, password: str):
     return client
 
 
+@app.get("/iq-login-ready")
+async def iq_login_ready():
+    print("[IQ LOGIN] preflight recebido do painel", flush=True)
+    return {
+        "ok": True,
+        "stage": "BACKEND_OK",
+        "iqoptionapi_loaded": IQ_Option is not None,
+        "version": "33.64.0",
+    }
+
+
 @app.post("/iq-login")
 async def iq_login(body: IQLoginBody, response: Response):
     email = body.email.strip()
@@ -6302,7 +6313,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
                style="width:100%;box-sizing:border-box;margin-top:6px">
       </div>
 
-      <button id="iqConnectBtn" type="button" style="width:100%;margin-top:12px">🔐 CONECTAR</button>
+      <button id="iqConnectBtn" type="button" onclick="return window.megaConnectIQ(event)" style="width:100%;margin-top:12px">🔐 CONECTAR</button>
       <button id="iqLogoutBtn" style="width:100%;margin-top:8px;display:none">🚪 DESCONECTAR</button>
 
       <div class="label" style="margin-top:10px;line-height:1.5">
@@ -7587,13 +7598,36 @@ window.megaConnectIQ=async function(event){
     }
 
     const url=b==='OLYMPTRADE'?'/olymp-login':'/iq-login';
-    const r=await fetch(url,{
-      method:'POST',
-      credentials:'include',
-      cache:'no-store',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({email:email,password:password})
-    });
+
+    // Diagnóstico Android/PWA: primeiro confirma que o toque chegou ao backend.
+    if(b==='IQ_OPTION'){
+      if(iqAccountStatus) iqAccountStatus.textContent='🟡 Etapa 1/3: verificando servidor...';
+      const ready=await fetch('/iq-login-ready?t='+Date.now(),{
+        method:'GET', credentials:'include', cache:'no-store'
+      });
+      let rd=null; try{ rd=await ready.json(); }catch(_){}
+      if(!ready.ok || !rd || !rd.ok) throw new Error('O painel não conseguiu confirmar o servidor de login.');
+      if(!rd.iqoptionapi_loaded) throw new Error('A biblioteca iqoptionapi não está carregada no servidor.');
+      if(iqAccountStatus) iqAccountStatus.textContent='🟡 Etapa 2/3: enviando login para IQ Option...';
+    }
+
+    const controller=new AbortController();
+    const loginTimer=setTimeout(()=>controller.abort(),65000);
+    let r;
+    try{
+      r=await fetch(url,{
+        method:'POST',
+        credentials:'include',
+        cache:'no-store',
+        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'33.64.0'},
+        body:JSON.stringify({email:email,password:password}),
+        signal:controller.signal
+      });
+    }catch(fetchErr){
+      if(fetchErr && fetchErr.name==='AbortError') throw new Error('O servidor recebeu a tentativa, mas a conexão da IQ Option excedeu 65 segundos.');
+      throw fetchErr;
+    }finally{ clearTimeout(loginTimer); }
+    if(b==='IQ_OPTION' && iqAccountStatus) iqAccountStatus.textContent='🟡 Etapa 3/3: validando sessão...';
 
     let d=null;
     try{ d=await r.json(); }catch(_){}
@@ -7630,12 +7664,7 @@ window.megaConnectIQ=async function(event){
 };
 
 
-if(iqConnectBtn){
-  // Fallback para Android/PWA: garante que o toque sempre chegue ao /iq-login.
-  iqConnectBtn.addEventListener('click',function(ev){
-    if(window.megaConnectIQ) window.megaConnectIQ(ev);
-  });
-}
+// O botão CONECTAR usa onclick direto no HTML para funcionar também em Android/PWA.
 
 if(interval){
   interval.addEventListener('change',()=>{
