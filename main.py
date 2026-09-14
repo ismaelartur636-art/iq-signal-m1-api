@@ -34,8 +34,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-app = FastAPI(title="MEGA IA", version="33.62.0")
-print("[MEGA IA] versão 33.62.0 • MODO ROBO LIMPO + RESET RESULTADOS carregada", flush=True)
+app = FastAPI(title="MEGA IA", version="33.63.0")
+print("[MEGA IA] versão 33.63.0 • MODO ROBO LIMPO + RESET RESULTADOS carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(BASE_DIR, "mega_ia.png")
@@ -3405,6 +3405,64 @@ async def candles(
             request=request,
         )
 
+    # Fonte principal no mercado aberto: IQ Option quando houver sessão conectada.
+    # Twelve Data fica apenas como fallback. O gráfico visual não é necessário
+    # para o robô calcular sinais; basta a sessão fornecer candles.
+    if market == "OPEN":
+        if iq_state is None and request is not None:
+            iq_state = _iq_session_state(request, required=False)
+
+        if iq_state is not None and _iq_connected(iq_state):
+            cache_key = f"OPEN|{symbol}|{interval}"
+            candle_cache = iq_state.setdefault("candle_cache", {})
+            cached = candle_cache.get(cache_key)
+
+            if (
+                cached
+                and time.time() - cached[0] < IQ_CANDLE_CACHE_TTL
+                and len(cached[1]) >= min(int(n), 20)
+            ):
+                return cached[1][-int(n):]
+
+            lock = iq_state.get("lock")
+            if lock is None:
+                lock = asyncio.Lock()
+                iq_state["lock"] = lock
+
+            try:
+                async with lock:
+                    cached = candle_cache.get(cache_key)
+                    if (
+                        cached
+                        and time.time() - cached[0] < IQ_CANDLE_CACHE_TTL
+                        and len(cached[1]) >= min(int(n), 20)
+                    ):
+                        return cached[1][-int(n):]
+
+                    data = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            iq_candles_blocking,
+                            iq_state,
+                            symbol,
+                            interval,
+                            max(80, int(n)),
+                            True,
+                        ),
+                        timeout=IQ_CANDLE_TIMEOUT + 5,
+                    )
+                    if data:
+                        candle_cache[cache_key] = (time.time(), data)
+                        return data[-int(n):]
+            except Exception as exc:
+                # Se a IQ Option falhar momentaneamente, usa cache recente da própria IQ.
+                stale = candle_cache.get(cache_key)
+                if stale and time.time() - stale[0] < 90:
+                    return stale[1][-int(n):]
+                # Não derruba o robô: cai automaticamente para a Twelve Data.
+                iq_state["last_error"] = str(exc)[:220]
+
+        return await candles_open(symbol, interval, n)
+
     if market == "IQ_OTC":
         if iq_state is None and request is not None:
             iq_state = _iq_session_state(
@@ -3877,17 +3935,20 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         return out
 
     if market == "OPEN":
-        age = _td_cache_age(symbol, interval)
-        safe_age = max(75.0, INTERVALS[interval] * 0.75)
-        if age > safe_age:
-            out = neutral_signal(
-                symbol, interval, market,
-                "AGUARDANDO DADOS ATUALIZADOS",
-                "A fonte de mercado está temporariamente limitada. Nenhuma entrada será liberada com candles antigos.",
-                source_state="WAITING",
-            )
-            cache[key] = (time.time(), out)
-            return out
+        # Quando os candles vierem da IQ Option, não aplica a trava de idade da Twelve Data.
+        using_iq_feed = bool(raw and isinstance(raw[-1], dict) and raw[-1].get("source"))
+        if not using_iq_feed:
+            age = _td_cache_age(symbol, interval)
+            safe_age = max(75.0, INTERVALS[interval] * 0.75)
+            if age > safe_age:
+                out = neutral_signal(
+                    symbol, interval, market,
+                    "AGUARDANDO DADOS ATUALIZADOS",
+                    "A fonte reserva está temporariamente limitada. Nenhuma entrada será liberada com candles antigos.",
+                    source_state="WAITING",
+                )
+                cache[key] = (time.time(), out)
+                return out
 
     closed = raw[:-1] if len(raw) > 1 else raw
 
@@ -4251,7 +4312,7 @@ async def health():
     return {
         "status": "ok",
         "app": "MEGA IA",
-        "version": "33.62.0",
+        "version": "33.63.0",
         "brasilia_time": iso(now()),
         "twelve_data": {
             "configured": bool(TD_KEY),
@@ -4714,7 +4775,7 @@ async def candles_endpoint(
                 "mirror_iq": True,
             }
 
-    state = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
+    state = _iq_session_state(request, required=False) if market in ("OPEN", "IQ_OTC") else None
 
     try:
         if market == "IQ_OTC" and not state:
@@ -4786,7 +4847,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
     if symbol not in SYMBOLS or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
 
-    state = _iq_session_state(request, required=False) if requested_market == "IQ_OTC" else None
+    state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
     fallback_twelve = requested_market == "IQ_OTC" and not state
     effective_market = "OPEN" if fallback_twelve else requested_market
 
@@ -4795,7 +4856,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             symbol,
             interval,
             effective_market,
-            state if effective_market == "IQ_OTC" else None,
+            state if effective_market in ("OPEN", "IQ_OTC") else None,
             request=request,
             ai_only=ai_only,
         )
@@ -4803,10 +4864,16 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             # Sempre informa ao frontend qual mercado foi pedido e qual fonte
             # realmente gerou o sinal. Isto evita fechar um sinal IQ_OTC como OPEN.
             data["requested_market"] = requested_market
-            data["feed_source"] = "TWELVE_DATA" if fallback_twelve else effective_market
-            data["feed_fallback"] = bool(fallback_twelve)
-            if fallback_twelve:
-                data["feed_message"] = "IQ Option desconectada: sinais usando Twelve Data (mercado aberto)."
+            if requested_market == "OPEN":
+                data["feed_source"] = "IQ_OPTION" if (state and _iq_connected(state)) else "TWELVE_DATA"
+                data["feed_fallback"] = not bool(state and _iq_connected(state))
+                if data["feed_fallback"]:
+                    data["feed_message"] = "IQ Option desconectada: usando a fonte reserva."
+            else:
+                data["feed_source"] = "TWELVE_DATA" if fallback_twelve else effective_market
+                data["feed_fallback"] = bool(fallback_twelve)
+                if fallback_twelve:
+                    data["feed_message"] = "IQ Option desconectada: sinais usando Twelve Data (mercado aberto)."
         _remember_accounting_signal(request, data)
         return data
     except Exception as exc:
