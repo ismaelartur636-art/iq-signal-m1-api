@@ -21,8 +21,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "33.70.0"
-PWA_VERSION = "v46"
+APP_VERSION = "33.73.0"
+PWA_VERSION = "v50"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -2597,11 +2597,19 @@ def json_extract(text):
 
 
 def _td_cache_ttl(interval: str) -> float:
-    sec = int(INTERVALS.get(interval, 60))
-    # Modo econômico para a cota gratuita da Twelve Data. O painel pode
-    # consultar seus endpoints frequentemente, mas somente este cache decide
-    # quando uma chamada externa será realmente feita.
-    return max(180.0, min(900.0, sec * 1.0))
+    # Mantém os candles frescos o bastante para a trava de segurança do sinal
+    # sem transformar cada polling visual em uma chamada externa.
+    # M1 precisa ficar abaixo de 75 s, senão o robô entra em
+    # "AGUARDANDO DADOS ATUALIZADOS" mesmo com a Twelve Data funcionando.
+    ttl_by_interval = {
+        "1min": 50.0,
+        "5min": 120.0,
+        "15min": 300.0,
+        "30min": 600.0,
+        "1h": 1200.0,
+        "4h": 3600.0,
+    }
+    return float(ttl_by_interval.get(interval, 50.0))
 
 
 def _td_cache_age(symbol: str, interval: str) -> float:
@@ -3214,7 +3222,7 @@ async def candles(
     if symbol not in SYMBOLS or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
 
-    # CLOUD MODE 33.70.0: mercado OPEN é 100% independente do login da IQ Option.
+    # CLOUD MODE 33.71.0: mercado OPEN é 100% independente do login da IQ Option.
     # Os candles são obtidos pela fonte de mercado configurada no Render (Twelve Data).
     # A IQ Option fica somente como corretora de execução e não participa da análise OPEN.
     if market == "OPEN":
@@ -3613,8 +3621,13 @@ def next_boundary(interval):
 
 
 def entry_window(interval):
+    # 33.72.0: todo sinal precisa ter pelo menos 35 segundos de antecedência.
+    # Se a confirmação chegar tarde demais para a próxima vela, agenda a entrada
+    # para a vela seguinte em vez de liberar uma entrada corrida.
     entry = next_boundary(interval)
-    return entry - timedelta(seconds=15), entry, entry + timedelta(seconds=INTERVALS[interval])
+    if (entry - now()).total_seconds() < 35:
+        entry = entry + timedelta(seconds=INTERVALS[interval])
+    return entry - timedelta(seconds=35), entry, entry + timedelta(seconds=INTERVALS[interval])
 
 
 def neutral_signal(symbol, interval, market, status, reason, *, confidence=0, source_state="UNAVAILABLE"):
@@ -4146,20 +4159,20 @@ async def mega_ia_icon_192():
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = {
-        "id": "/mega-ia-trader-v46",
+        "id": "/mega-ia-trader-v50",
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v46",
+        "start_url": "/?pwa=v50",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=45", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=45", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=45", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=50", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=50", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=50", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -4929,9 +4942,11 @@ async def radar(request: Request, interval="1min", market="OPEN"):
 
     rkey = f"{market}|{interval}"
     previous = radar_cache.get(rkey)
-    # Proteção do feed: várias telas/clientes reaproveitam o mesmo snapshot do Radar.
-    # Isso impede que cada atualização visual dispare uma nova consulta de candles.
-    if previous and (time.time() - float(previous[0])) < 540.0:
+    # Snapshot curto: evita chamadas duplicadas quando a tela dispara o radar
+    # várias vezes quase ao mesmo tempo, mas permite que o índice avance de
+    # verdade. O cache antigo de 9 minutos fazia apenas um ativo ser lido por
+    # vários minutos e deixava o restante preso em AGUARDANDO LEITURA.
+    if previous and (time.time() - float(previous[0])) < 12.0:
         return list(previous[1])
     suffix = "" if market == "OPEN" else " • IQ OTC"
 
@@ -4943,6 +4958,7 @@ async def radar(request: Request, interval="1min", market="OPEN"):
             "confidence": 0,
             "status": "AGUARDANDO LEITURA",
             "clickable": False,
+            "updated_at": None,
         }
         for sym in SYMBOLS
     ]
@@ -4974,6 +4990,7 @@ async def radar(request: Request, interval="1min", market="OPEN"):
                     ("TWELVE DATA • " + status_text) if fallback_twelve else status_text
                 ),
                 "clickable": direction in ("CALL", "PUT"),
+                "updated_at": iso(now()),
                 "feed_source": "TWELVE_DATA" if fallback_twelve else market,
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
@@ -4986,6 +5003,7 @@ async def radar(request: Request, interval="1min", market="OPEN"):
                 "confidence": 0,
                 "status": "POUCOS CANDLES",
                 "clickable": False,
+                "updated_at": iso(now()),
             }
     except Exception:
         item = {
@@ -4995,6 +5013,7 @@ async def radar(request: Request, interval="1min", market="OPEN"):
             "confidence": 0,
             "status": "FONTE EM ESPERA",
             "clickable": False,
+            "updated_at": iso(now()),
         }
 
     # replace same symbol slot
@@ -5491,7 +5510,7 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=45">
+<link rel="manifest" href="/manifest.webmanifest?v=50">
 <link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=45">
 <link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=45">
 <meta name="theme-color" content="#07182b">
@@ -5505,10 +5524,18 @@ body{margin:0;background:radial-gradient(circle at 50% 0,#07182b 0,#030812 42%,#
 .brand{display:flex;align-items:center;gap:10px;font-size:42px;font-weight:900;letter-spacing:1px;margin:8px 0 2px}
 .brand span{color:#14c8ff}
 .brand-robot{width:54px;height:54px;object-fit:contain;border-radius:14px;filter:drop-shadow(0 0 8px #14c8ff55)}
+.brand-flag{font-size:30px;line-height:1;filter:drop-shadow(0 0 7px #16d66a55);margin-left:2px}
 .subtitle{font-size:13px;color:#91a9c8;letter-spacing:.7px}
 .card{background:linear-gradient(180deg,#0c1a2c,#091422);border:1px solid #164f80;border-radius:20px;padding:16px;box-shadow:0 12px 30px #0008,0 0 18px #009cff12;margin-top:12px}
 .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
 .signal{grid-column:span 2;text-align:center;min-height:270px;position:relative}
+.signal{overflow:hidden}
+.money-fx{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:5;border-radius:20px}
+.money-note{position:absolute;left:var(--x);top:var(--start);min-width:54px;padding:5px 7px;border-radius:7px;border:1px solid #f3d36b;background:linear-gradient(135deg,#1d8d49,#33c86c 55%,#14753a);color:#fff8c4;font-size:13px;font-weight:1000;letter-spacing:.2px;box-shadow:0 0 10px #41ff8a66,0 4px 8px #0006;opacity:0;transform:translate(-50%,0) rotate(var(--rot));white-space:nowrap}
+.money-fx.win .money-note{animation:moneyRise var(--dur) ease-out var(--delay) forwards}
+.money-fx.loss .money-note{animation:moneyFall var(--dur) ease-in var(--delay) forwards}
+@keyframes moneyRise{0%{opacity:0;transform:translate(-50%,70px) rotate(var(--rot)) scale(.8)}12%{opacity:1}78%{opacity:1}100%{opacity:0;transform:translate(-50%,-330px) rotate(calc(var(--rot) * -1)) scale(1.08)}}
+@keyframes moneyFall{0%{opacity:0;transform:translate(-50%,-90px) rotate(var(--rot)) scale(.82)}12%{opacity:1}80%{opacity:1}100%{opacity:0;transform:translate(-50%,330px) rotate(calc(var(--rot) * -1)) scale(1.06)}}
 .big{font-size:32px;font-weight:800;margin:8px}
 .call{color:#45ff9b}
 .put{color:#ff5c7a}
@@ -5590,6 +5617,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   .hero img{height:250px}
   .brand{font-size:36px}
   .brand-robot{width:48px;height:48px}
+  .brand-flag{font-size:26px}
   .app-power-card{align-items:stretch;flex-direction:column}
   #appPowerBtn{width:100%;min-width:0;min-height:62px;font-size:18px}
   #chartTab.active{padding-top:8vh}
@@ -5616,7 +5644,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
 <body>
 <div class="wrap">
-  <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span></div>
+  <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
@@ -5682,7 +5710,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </div>
 
     <div class="grid">
-      <div class="card signal">
+      <div class="card signal" id="signalCard">
+        <div id="moneyFx" class="money-fx" aria-hidden="true"></div>
         <div class="label">SINAL ATUAL</div>
         <div id="direction" class="big neutral">AGUARDANDO</div>
         <div id="confidence">Confiança: --</div>
@@ -5855,12 +5884,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 </div>
 
 <script>
-// MEGA IA build 33.68.0 — força o PWA antigo a abrir a versão atual.
+// MEGA IA build 33.73.0 — força o PWA antigo a abrir a versão atual.
 (function(){
   try{
     const u=new URL(window.location.href);
-    if(u.searchParams.get('pwa')!=='v46'){
-      u.searchParams.set('pwa','v46');
+    if(u.searchParams.get('pwa')!=='v50'){
+      u.searchParams.set('pwa','v50');
       window.history.replaceState({},'',u.pathname+u.search+u.hash);
     }
   }catch(_){}
@@ -5956,6 +5985,8 @@ const iqAccountStatus=document.getElementById('iqAccountStatus');
 let brokerConnected={IQ_OPTION:false};
 const chartInfo=document.getElementById('chartInfo');
 const direction=document.getElementById('direction');
+const signalCard=document.getElementById('signalCard');
+const moneyFx=document.getElementById('moneyFx');
 const confidence=document.getElementById('confidence');
 const entry=document.getElementById('entry');
 const countdown=document.getElementById('countdown');
@@ -6001,13 +6032,17 @@ try{
 }
 let lastSignalVoice='';
 let lastAnalysis=0;
-let fifteen=false;
+let thirtyFive=false;
 let five=false;
 let entered=false;
 let reskey='';
+let moneyFxKey='';
+let moneyFxTimer=null;
 let sigBusy=false;
 let chartBusy=false;
 let radBusy=false;
+let lastRadarAutoKey='';
+let radarAutoBusy=false;
 let perfBusy=false;
 let robotTimer=null;
 let arrowTimer=null;
@@ -6450,6 +6485,32 @@ function showEntryArrow(dir){
     entryArrow.className='entry-arrow';
     heroBox.style.display='none';
   },6000);
+}
+
+function playMoneyRain(kind){
+  if(!moneyFx) return;
+  const mode=String(kind||'').toUpperCase().startsWith('WIN')?'win':'loss';
+  moneyFx.className='money-fx '+mode;
+  moneyFx.innerHTML='';
+  clearTimeout(moneyFxTimer);
+
+  const total=22;
+  for(let i=0;i<total;i++){
+    const note=document.createElement('span');
+    note.className='money-note';
+    note.textContent=(i%3===0?'R$ 100':'R$ 50');
+    note.style.setProperty('--x',(5+Math.random()*90).toFixed(1)+'%');
+    note.style.setProperty('--start',(mode==='win'?(72+Math.random()*25):(-20-Math.random()*35)).toFixed(0)+'px');
+    note.style.setProperty('--rot',(-28+Math.random()*56).toFixed(0)+'deg');
+    note.style.setProperty('--dur',(2.2+Math.random()*1.4).toFixed(2)+'s');
+    note.style.setProperty('--delay',(Math.random()*1.15).toFixed(2)+'s');
+    moneyFx.appendChild(note);
+  }
+
+  moneyFxTimer=setTimeout(()=>{
+    moneyFx.className='money-fx';
+    moneyFx.innerHTML='';
+  },4700);
 }
 
 function loadMegaVoices(){
@@ -7134,7 +7195,7 @@ window.megaConnectIQ=async function(event){
         method:'POST',
         credentials:'include',
         cache:'no-store',
-        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'33.70.0'},
+        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'33.71.0'},
         body:JSON.stringify({email:email,password:password}),
         signal:controller.signal
       });
@@ -7246,7 +7307,7 @@ async function setAppPower(enabled){
     cur=null;
     chartPreSignal=null;
     lastCountdownSignalKey='';
-    fifteen=false;
+    thirtyFive=false;
     five=false;
     entered=false;
   }
@@ -7310,7 +7371,7 @@ async function setRobotPower(enabled){
   chartData=[];
   chartPreSignal=null;
   lastCountdownSignalKey='';
-  fifteen=false;
+  thirtyFive=false;
   five=false;
   entered=false;
 
@@ -7390,15 +7451,9 @@ async function sig(announce=false){
       const k=cur.symbol+'|'+cur.interval+'|'+cur.entry_time+'|'+cur.direction;
 
       if(k!==lastSignalVoice){
+        // A voz principal do sinal é disparada no cronômetro, 35 segundos
+        // antes da entrada. Aqui apenas marcamos que é um novo sinal.
         lastSignalVoice=k;
-
-        if(voiceEnabled){
-          speak(
-            cur.direction==='CALL'
-            ? 'Análise concluída. Sinal de CALL identificado.'
-            : 'Análise concluída. Sinal de PUT identificado.'
-          );
-        }
       }
 
     }else if(announce && voiceEnabled && cur.source_state==='READY'){
@@ -7412,7 +7467,7 @@ async function sig(announce=false){
 
     if(countdownSignalKey !== lastCountdownSignalKey){
       lastCountdownSignalKey=countdownSignalKey;
-      fifteen=false;
+      thirtyFive=false;
       five=false;
       entered=false;
     }
@@ -7464,7 +7519,7 @@ function radarCard(item){
   const opportunity=(dir==='CALL'||dir==='PUT');
   const cls=opportunity ? ('radar-opportunity '+(dir==='CALL'?'radar-call':'radar-put')) : '';
   const icon=dir==='CALL'?'🟢':dir==='PUT'?'🔴':'⚪';
-  const hint=opportunity?'<small>Toque para abrir este ativo</small>':'';
+  const hint=opportunity?'<small>Toque para abrir este ativo • também vai automaticamente ao robô</small>':'';
   return `<div class="${cls}" data-radar-symbol="${sym}" data-radar-opportunity="${opportunity?'1':'0'}">
     <b>${icon} ${sym}</b><br>
     <span>${dir==='NEUTRO'?'AGUARDANDO':dir}</span>
@@ -7473,8 +7528,65 @@ function radarCard(item){
   </div>`;
 }
 
+function radarOpportunityIsFresh(item){
+  const raw=item&&item.updated_at;
+  if(!raw) return false;
+  const ts=Date.parse(raw);
+  if(!Number.isFinite(ts)) return false;
+  // O radar gira um ativo por ciclo. Só envia automaticamente ao robô a
+  // oportunidade que acabou de ser analisada, nunca um cartão antigo.
+  return (Date.now()-ts)>=-5000 && (Date.now()-ts)<=90000;
+}
+
+function robotHasActiveSignal(){
+  if(!cur || String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO') return false;
+  if(!cur.expiry_time) return false;
+  const ts=Date.parse(cur.expiry_time);
+  return Number.isFinite(ts) && ts>Date.now()+1000;
+}
+
+async function sendRadarOpportunityToRobot(items){
+  if(radarAutoBusy || !appEnabled || !robotEnabled || !S) return;
+  const list=(Array.isArray(items)?items:[])
+    .filter(item=>{
+      const dir=String((item&&item.direction)||'').toUpperCase();
+      return (dir==='CALL'||dir==='PUT') && radarOpportunityIsFresh(item);
+    })
+    .sort((a,b)=>Number(b.confidence||0)-Number(a.confidence||0));
+
+  if(!list.length) return;
+  const best=list[0];
+  const sym=radarBaseSymbol(best);
+  const dir=String(best.direction||'').toUpperCase();
+  if(!sym) return;
+
+  // Não abandona uma operação que já foi liberada e ainda não expirou.
+  if(robotHasActiveSignal() && cur && cur.symbol!==sym) return;
+
+  const key=[market.value,interval.value,sym,dir,best.updated_at||''].join('|');
+  if(key===lastRadarAutoKey) return;
+  lastRadarAutoKey=key;
+
+  const exists=[...S.options].some(o=>o.value===sym);
+  if(!exists) return;
+
+  radarAutoBusy=true;
+  try{
+    S.value=sym;
+    try{ localStorage.setItem('mega_symbol',sym); }catch(_){}
+    lastSignalVoice='';
+    lastCountdownSignalKey='';
+    if(mainTab && typeof mainTab.click==='function') mainTab.click();
+    if(statusBox) statusBox.textContent=`RADAR → ROBÔ • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
+    await sig(true);
+  }finally{
+    radarAutoBusy=false;
+  }
+}
+
 async function rad(){
-  if(!appEnabled || !radar) return;
+  if(!appEnabled || !radar || radBusy) return;
+  radBusy=true;
   try{
     const items=await get(`/radar?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}`);
     const list=Array.isArray(items)?items:[];
@@ -7491,14 +7603,22 @@ async function rad(){
           const exists=[...S.options].some(o=>o.value===sym);
           if(exists) S.value=sym;
         }
+        try{ localStorage.setItem('mega_symbol',sym); }catch(_){}
         if(mainTab && typeof mainTab.click==='function') mainTab.click();
         if(statusBox) statusBox.textContent='ATIVO SELECIONADO PELO RADAR • CONFIRMANDO OPORTUNIDADE';
         await sig(true);
         window.scrollTo({top:0,behavior:'smooth'});
       };
     });
+
+    // NOVO: quando o radar encontra uma oportunidade recém-analisada,
+    // encaminha o ativo automaticamente para o robô principal. O cartão
+    // continua clicável exatamente como antes.
+    await sendRadarOpportunityToRobot(list);
   }catch(e){
     radar.innerHTML='<div>📡 Radar ativo • fonte temporariamente indisponível</div>';
+  }finally{
+    radBusy=false;
   }
 }
 
@@ -7545,6 +7665,10 @@ async function clk(){
   }
 }
 
+function spokenAssetName(symbol){
+  return String(symbol||'').replace('/', ' ');
+}
+
 function cd(){
   if(!cur || cur.direction==='NEUTRO' || !cur.entry_time){
     countdown.textContent='Sem entrada confirmada';
@@ -7570,17 +7694,18 @@ function cd(){
     expiryCountdown.textContent='⏱ EXPIRAÇÃO: --:--';
   }
 
-  if(n<=15 && n>13 && !fifteen){
-    fifteen=true;
+  if(n<=35 && n>0 && !thirtyFive){
+    thirtyFive=true;
     if(voiceEnabled){
-      speak('Atenção. Sinal confirmado de '+cur.direction+'. Entrada em 15 segundos.');
+      const ativoFalado=spokenAssetName(cur.symbol || (S&&S.value) || '');
+      speak('Olá trader. Entrada encontrada no ativo '+ativoFalado+'.');
     }
   }
 
   if(n<=5 && n>3 && !five){
     five=true;
     if(voiceEnabled){
-      speak('Atenção. Entrada em 5 segundos.');
+      speak('Entre agora.');
     }
   }
 
@@ -7698,18 +7823,19 @@ async function resultCheck(){
 
       const k=t.symbol+'|'+t.direction+'|'+t.expiry_time;
 
+      // Resultado visual: dinheiro sobe no WIN e desce no LOSS.
+      // Sem aviso de voz, conforme configuração do painel.
+      if(k!==moneyFxKey){
+        moneyFxKey=k;
+        if(String(x.result||'').toUpperCase().startsWith('WIN')){
+          playMoneyRain('WIN');
+        }else if(String(x.result||'').toUpperCase().startsWith('LOSS')){
+          playMoneyRain('LOSS');
+        }
+      }
+
       if(k!==reskey){
         reskey=k;
-
-        if(voiceEnabled){
-          if(x.result==='WIN'){
-            speak('Resultado da entrada: WIN.');
-          }else if(x.result==='LOSS'){
-            speak('Resultado da entrada: LOSS.');
-          }else{
-            speak('Operação finalizada. Resultado '+x.result+'.');
-          }
-        }
       }
 
       // Atualiza também os dados do servidor após o resultado final.
@@ -7849,11 +7975,12 @@ setInterval(()=>{
 },2000);
 
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) perf(); },5000);
-// Radar usa o mesmo cache de candles do robô e gira um ativo por ciclo.
-// Intervalo conservador para evitar consumir o limite da fonte de dados.
+// Radar econômico: gira somente um ativo por ciclo e reaproveita o mesmo
+// cache de candles do robô. Em M1, 1 varredura/min mantém o consumo controlado
+// e permite que uma oportunidade nova seja enviada automaticamente ao robô.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress) rad();
-},600000);
+},60000);
 // Pré-análise atualizada a cada 1 minuto; a confirmação continua usando a janela final de 1 minuto.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress && !robotEnabled) loadPreSignals();
