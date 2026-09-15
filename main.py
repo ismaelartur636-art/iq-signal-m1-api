@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "33.68.0"
+APP_VERSION = "33.68.1"
 PWA_VERSION = "v46"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -3052,7 +3052,7 @@ def _iq_connect_fresh(email: str, password: str):
     print("[IQ LOGIN] iniciando stable_api", flush=True)
     th = threading.Thread(target=stable_worker, daemon=True)
     th.start()
-    th.join(32.0)
+    th.join(IQ_CONNECT_TIMEOUT)
 
     if not th.is_alive():
         elapsed_ms = round((time.monotonic() - stable_box["started"]) * 1000)
@@ -3105,7 +3105,7 @@ def _iq_connect_fresh(email: str, password: str):
             f"construtor_ms={stable_box.get('constructor_ms')}",
             flush=True,
         )
-        print("[IQ LOGIN] stable_api excedeu 32s; cancelando sem abrir conexão concorrente", flush=True)
+        print(f"[IQ LOGIN] stable_api excedeu {IQ_CONNECT_TIMEOUT:.0f}s; conexão travada na iqoptionapi", flush=True)
         if stage == "construtor_IQ_Option":
             detail = "travou ao criar o cliente IQ_Option antes de iniciar o login."
         elif stage == "connect_HTTP_WebSocket":
@@ -3113,7 +3113,7 @@ def _iq_connect_fresh(email: str, password: str):
         else:
             detail = f"travou na etapa {stage}."
         raise TimeoutError(
-            "A IQ Option não respondeu ao servidor dentro de 32 segundos; " + detail
+            f"A IQ Option não respondeu ao servidor dentro de {IQ_CONNECT_TIMEOUT:.0f} segundos; " + detail
         )
 
     fallback_box = {"stage": "aguardando", "started": time.monotonic()}
@@ -4518,7 +4518,7 @@ async def iq_login(body: IQLoginBody, response: Response):
                     email,
                     password,
                 ),
-                timeout=58,
+                timeout=IQ_CONNECT_TIMEOUT + 8,
             )
             if client is not None:
                 break
@@ -4542,7 +4542,7 @@ async def iq_login(body: IQLoginBody, response: Response):
         if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
             raise HTTPException(
                 504,
-                "A IQ Option não respondeu ao servidor dentro do tempo limite. Tente novamente em alguns segundos."
+                "A conexão da IQ Option travou na autenticação/WebSocket da iqoptionapi. Verifique os logs [IQ DIAG]; se DNS/TCP 443 estiverem OK, o bloqueio está na sessão/WebSocket e não no botão do painel."
             )
         raise HTTPException(
             401,
