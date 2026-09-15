@@ -21,8 +21,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "33.76.1"
-PWA_VERSION = "v55"
+APP_VERSION = "33.76.2"
+PWA_VERSION = "v56"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -7863,7 +7863,7 @@ async function setRobotPower(enabled){
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
   if(voiceEnabled){
-    speak(robotEnabled ? 'Robô RSI online.' : 'Robô RSI offline.');
+    speak(robotEnabled ? 'Robô principal online.' : 'Robô principal offline.');
   }
 }
 
