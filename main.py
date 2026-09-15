@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "33.81.0"
-PWA_VERSION = "v63"
+APP_VERSION = "33.81.1"
+PWA_VERSION = "v64"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -4699,20 +4699,20 @@ async def mega_ia_icon_192():
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = {
-        "id": "/mega-ia-trader-v55",
+        "id": "/mega-ia-trader-v64",
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v55",
+        "start_url": "/?pwa=v64",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=50", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=50", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=50", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=64", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=64", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=64", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -6511,9 +6511,9 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=63">
-<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=45">
-<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=45">
+<link rel="manifest" href="/manifest.webmanifest?v=64">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=64">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=64">
 <meta name="theme-color" content="#07182b">
 <meta name="application-name" content="Mega IA Trader">
 <meta name="apple-mobile-web-app-title" content="Mega IA Trader">
@@ -6647,6 +6647,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão 33.81.1 • Painel Indicador</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -6979,12 +6980,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 </div>
 
 <script>
-// MEGA IA build 33.81.0 — força o PWA antigo a abrir a versão atual.
+// MEGA IA build 33.81.1 — força o PWA antigo a abrir a versão atual.
 (function(){
   try{
     const u=new URL(window.location.href);
-    if(u.searchParams.get('pwa')!=='v63'){
-      u.searchParams.set('pwa','v63');
+    if(u.searchParams.get('pwa')!=='v64'){
+      u.searchParams.set('pwa','v64');
       window.history.replaceState({},'',u.pathname+u.search+u.hash);
     }
   }catch(_){}
