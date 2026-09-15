@@ -21,8 +21,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "33.76.0"
-PWA_VERSION = "v54"
+APP_VERSION = "33.76.1"
+PWA_VERSION = "v55"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -4342,11 +4342,11 @@ async def mega_ia_icon_192():
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = {
-        "id": "/mega-ia-trader-v54",
+        "id": "/mega-ia-trader-v55",
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v54",
+        "start_url": "/?pwa=v55",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
@@ -6021,7 +6021,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Robô RSI">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🤖 ROBÔ RSI</div>
-      <div class="robot-mode-desc" id="robotModeDesc">RSI 14 original • cruzamento 30/70.</div>
+      <div class="robot-mode-desc" id="robotModeDesc">Leitura objetiva do mercado • sinal somente após confirmação no candle fechado.</div>
     </div>
     <button id="robotPowerBtn" type="button" style="font-weight:900">🟢 ONLINE</button>
   </div>
@@ -6030,7 +6030,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Inteligência Artificial">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧠 INTELIGÊNCIA ARTIFICIAL</div>
-      <div class="robot-mode-desc" id="aiModeDesc">RSI obrigatório + 2 de 4 confirmações: tendência, S/R+estrutura, vela e ATR. Volume é bônus.</div>
+      <div class="robot-mode-desc" id="aiModeDesc">Análise avançada de contexto • avalia direção, força, regiões importantes e risco antes da entrada.</div>
     </div>
     <button id="aiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -7813,11 +7813,11 @@ function applyRobotPowerState(){
   }
 
   if(robotModeDesc) robotModeDesc.textContent=robotEnabled
-    ? 'ONLINE: RSI 14 original analisando o timeframe selecionado.'
-    : 'OFFLINE: Robô RSI pausado.';
+    ? 'ONLINE: leitura objetiva do mercado com confirmação no fechamento.'
+    : 'OFFLINE: robô principal pausado.';
   if(aiModeDesc) aiModeDesc.textContent=aiEnabled
-    ? 'ONLINE: RSI + tendência + suporte/resistência + vela + volatilidade + estrutura + volume quando disponível.'
-    : 'OFFLINE: Inteligência Artificial pausada.';
+    ? 'ONLINE: análise avançada de contexto, força, regiões importantes e risco antes de liberar a entrada.'
+    : 'OFFLINE: análise inteligente pausada.';
 
   const engine=selectedRobotEngine();
   if(engine==='SMART'){
