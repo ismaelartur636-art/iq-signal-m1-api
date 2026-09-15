@@ -12,6 +12,11 @@ from typing import Any, Dict
 import httpx
 
 try:
+    import websocket
+except Exception:
+    websocket = None
+
+try:
     from iqoptionapi.stable_api import IQ_Option
 except Exception:
     IQ_Option = None
@@ -21,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "33.78.0"
-PWA_VERSION = "v60"
+APP_VERSION = "33.80.0"
+PWA_VERSION = "v62"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -51,6 +56,7 @@ WA2 = os.getenv("WHATSAPP_2", "55 84 99449-9442")
 IG = os.getenv("INSTAGRAM", "@Ismaelartur26")
 
 TD_URL = "https://api.twelvedata.com/time_series"
+TD_WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
 OAI_URL = "https://api.openai.com/v1/responses"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
@@ -111,13 +117,337 @@ TD_MIN_CALL_INTERVAL = float(os.getenv("TWELVE_DATA_MIN_INTERVAL", "15.0"))
 TD_STALE_MAX_AGE = float(os.getenv("TWELVE_DATA_STALE_MAX_AGE", "900"))
 TD_LIMIT_BACKOFF = float(os.getenv("TWELVE_DATA_LIMIT_BACKOFF", "900"))
 
+# TWELVE DATA WEBSOCKET — feed principal em tempo real.
+# A API REST fica para carregar histórico inicial/recuperar lacunas. Os ticks do
+# WebSocket atualizam os candles em memória e evitam gastar créditos REST em cada
+# polling do painel/radar.
+TD_WS_ENABLED = os.getenv("TWELVE_DATA_WS_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
+TD_WS_SYMBOLS_ENV = os.getenv("TWELVE_DATA_WS_SYMBOLS", "").strip()
+TD_WS_REQUESTED_SYMBOLS = [
+    s.strip().upper() for s in (TD_WS_SYMBOLS_ENV.split(",") if TD_WS_SYMBOLS_ENV else SYMBOLS)
+    if s.strip()
+]
+# remove duplicatas preservando a ordem e limita aos ativos conhecidos do app
+TD_WS_REQUESTED_SYMBOLS = list(dict.fromkeys([s for s in TD_WS_REQUESTED_SYMBOLS if s in SYMBOLS]))
+TD_WS_RECONNECT_MAX = float(os.getenv("TWELVE_DATA_WS_RECONNECT_MAX", "30"))
+TD_WS_FRESH_SECONDS = float(os.getenv("TWELVE_DATA_WS_FRESH_SECONDS", "90"))
+
+td_ws_lock = threading.RLock()
+td_ws_stop = threading.Event()
+td_ws_thread = None
+td_ws_app = None
+td_ws_connected = False
+td_ws_last_message_at = 0.0
+td_ws_last_error = ""
+td_ws_subscribed = set()
+td_ws_failed = {}
+td_ws_last_tick_at = {}
+td_ws_bars = {}             # "SYMBOL|INTERVAL" -> lista OHLCV em UTC
+td_ws_prev_day_volume = {}  # SYMBOL -> (timestamp, day_volume)
+
+
+def _td_ws_dt_string(bucket_ts: int) -> str:
+    return datetime.fromtimestamp(int(bucket_ts), tz=UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _td_ws_update_price(event: Dict[str, Any]):
+    """Converte um tick de preço do WS em candles OHLCV para todos os timeframes."""
+    global td_ws_last_message_at
+    try:
+        symbol = str(event.get("symbol", "")).strip().upper()
+        if symbol not in SYMBOLS:
+            return
+        price = float(event.get("price"))
+        ts = int(float(event.get("timestamp") or time.time()))
+        if price <= 0 or ts <= 0:
+            return
+    except Exception:
+        return
+
+    # day_volume é cumulativo quando existe. Convertemos apenas o incremento do
+    # tick em volume do candle; para Forex normalmente será 0/indisponível.
+    vol_delta = 0.0
+    try:
+        dv = event.get("day_volume")
+        if dv is not None:
+            dv = float(dv)
+            prev = td_ws_prev_day_volume.get(symbol)
+            if prev:
+                prev_ts, prev_dv = prev
+                same_day = datetime.fromtimestamp(prev_ts, tz=UTC).date() == datetime.fromtimestamp(ts, tz=UTC).date()
+                if same_day and dv >= prev_dv:
+                    vol_delta = max(0.0, dv - prev_dv)
+            td_ws_prev_day_volume[symbol] = (ts, dv)
+    except Exception:
+        vol_delta = 0.0
+
+    with td_ws_lock:
+        td_ws_last_message_at = time.time()
+        td_ws_last_tick_at[symbol] = time.time()
+        for interval, seconds in INTERVALS.items():
+            seconds = int(seconds)
+            bucket = (ts // seconds) * seconds
+            key = f"{symbol}|{interval}"
+            rows = td_ws_bars.setdefault(key, [])
+            dt_str = _td_ws_dt_string(bucket)
+
+            if rows:
+                last = rows[-1]
+                last_bucket = int(last.get("_bucket", 0) or 0)
+                if bucket < last_bucket:
+                    continue
+                if bucket == last_bucket:
+                    last["high"] = max(float(last["high"]), price)
+                    last["low"] = min(float(last["low"]), price)
+                    last["close"] = price
+                    last["volume"] = float(last.get("volume", 0) or 0) + vol_delta
+                    continue
+
+            rows.append({
+                "datetime": dt_str,
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": vol_delta,
+                "_bucket": bucket,
+                "source": "TWELVE_DATA_WS",
+            })
+            if len(rows) > 220:
+                del rows[:-220]
+
+
+def _td_ws_on_open(ws):
+    global td_ws_connected, td_ws_last_error
+    with td_ws_lock:
+        td_ws_connected = True
+        td_ws_last_error = ""
+    symbols = ",".join(TD_WS_REQUESTED_SYMBOLS)
+    if not symbols:
+        return
+    try:
+        ws.send(json.dumps({"action": "subscribe", "params": {"symbols": symbols}}))
+        print(f"[TD WS] conectado; solicitando {len(TD_WS_REQUESTED_SYMBOLS)} símbolos", flush=True)
+    except Exception as exc:
+        with td_ws_lock:
+            td_ws_last_error = str(exc)[:180]
+
+
+def _td_ws_on_message(ws, message):
+    global td_ws_last_message_at, td_ws_last_error
+    td_ws_last_message_at = time.time()
+    try:
+        data = json.loads(message)
+    except Exception:
+        return
+    event = str(data.get("event", "")).lower()
+    if event == "price":
+        _td_ws_update_price(data)
+        return
+    if event == "subscribe-status":
+        success = data.get("success") or []
+        fails = data.get("fails") or []
+        ok_symbols = []
+        fail_map = {}
+        for item in success:
+            if isinstance(item, dict):
+                s = str(item.get("symbol", "")).strip().upper()
+            else:
+                s = str(item).strip().upper()
+            if s:
+                ok_symbols.append(s)
+        for item in fails:
+            if isinstance(item, dict):
+                s = str(item.get("symbol") or item.get("code") or item).strip().upper()
+                reason = str(item.get("message") or item.get("reason") or item)[:160]
+            else:
+                s = str(item).strip().upper()
+                reason = str(item)[:160]
+            if s:
+                fail_map[s] = reason
+        with td_ws_lock:
+            td_ws_subscribed.clear()
+            td_ws_subscribed.update(ok_symbols)
+            td_ws_failed.clear()
+            td_ws_failed.update(fail_map)
+            if str(data.get("status", "")).lower() not in ("ok", "success") and not ok_symbols:
+                td_ws_last_error = str(data)[:220]
+        print(f"[TD WS] inscritos={len(ok_symbols)} falhas={len(fails)}", flush=True)
+        return
+    if event == "heartbeat":
+        return
+    # Algumas falhas chegam fora de subscribe-status.
+    if str(data.get("status", "")).lower() in ("error", "failed"):
+        with td_ws_lock:
+            td_ws_last_error = str(data.get("message") or data)[:220]
+
+
+def _td_ws_on_error(ws, error):
+    global td_ws_last_error
+    with td_ws_lock:
+        td_ws_last_error = str(error or "erro websocket")[:220]
+    print(f"[TD WS] erro: {td_ws_last_error}", flush=True)
+
+
+def _td_ws_on_close(ws, status_code, message):
+    global td_ws_connected
+    with td_ws_lock:
+        td_ws_connected = False
+    print(f"[TD WS] desconectado status={status_code} msg={str(message or '')[:120]}", flush=True)
+
+
+def _td_ws_runner():
+    global td_ws_app, td_ws_connected
+    backoff = 2.0
+    while not td_ws_stop.is_set():
+        if not TD_WS_ENABLED or not TD_KEY or websocket is None or not TD_WS_REQUESTED_SYMBOLS:
+            return
+        try:
+            url = f"{TD_WS_URL}?apikey={TD_KEY}"
+            app_ws = websocket.WebSocketApp(
+                url,
+                on_open=_td_ws_on_open,
+                on_message=_td_ws_on_message,
+                on_error=_td_ws_on_error,
+                on_close=_td_ws_on_close,
+            )
+            with td_ws_lock:
+                td_ws_app = app_ws
+            app_ws.run_forever(ping_interval=25, ping_timeout=10)
+        except Exception as exc:
+            _td_ws_on_error(None, exc)
+        finally:
+            with td_ws_lock:
+                td_ws_connected = False
+                td_ws_app = None
+        if td_ws_stop.wait(backoff):
+            break
+        backoff = min(TD_WS_RECONNECT_MAX, max(2.0, backoff * 1.7))
+
+
+def ensure_td_ws_started() -> bool:
+    global td_ws_thread
+    if not TD_WS_ENABLED or not TD_KEY or websocket is None or not TD_WS_REQUESTED_SYMBOLS:
+        return False
+    with td_ws_lock:
+        if td_ws_thread and td_ws_thread.is_alive():
+            return True
+        td_ws_stop.clear()
+        td_ws_thread = threading.Thread(target=_td_ws_runner, name="twelve-data-ws", daemon=True)
+        td_ws_thread.start()
+    return True
+
+
+def _td_ws_stop_now():
+    td_ws_stop.set()
+    app_ws = None
+    with td_ws_lock:
+        app_ws = td_ws_app
+    try:
+        if app_ws is not None:
+            app_ws.close()
+    except Exception:
+        pass
+
+
+def _td_ws_snapshot(symbol: str, interval: str):
+    key = f"{symbol}|{interval}"
+    with td_ws_lock:
+        rows = td_ws_bars.get(key, [])
+        return [dict(r) for r in rows]
+
+
+def _td_ws_active_symbols():
+    with td_ws_lock:
+        return set(td_ws_subscribed)
+
+
+def _td_ws_is_fresh(symbol: str, max_age: float | None = None) -> bool:
+    age_limit = float(max_age if max_age is not None else TD_WS_FRESH_SECONDS)
+    with td_ws_lock:
+        ts = float(td_ws_last_tick_at.get(symbol, 0.0) or 0.0)
+        return ts > 0 and (time.time() - ts) <= age_limit
+
+
+def _td_row_epoch(row: Dict[str, Any], interval: str) -> int | None:
+    raw = str(row.get("datetime", "")).strip()
+    if not raw:
+        return None
+    try:
+        d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=UTC)
+    else:
+        d = d.astimezone(UTC)
+    sec = int(INTERVALS.get(interval, 60))
+    return (int(d.timestamp()) // sec) * sec
+
+
+def _td_merge_rest_ws(rest_rows, ws_rows, interval: str):
+    """Mescla histórico REST (UTC) com candles formados por ticks WS."""
+    merged = {}
+    order = []
+    for row in list(rest_rows or []):
+        bucket = _td_row_epoch(row, interval)
+        if bucket is None:
+            continue
+        clean = dict(row)
+        clean.pop("_bucket", None)
+        merged[bucket] = clean
+        order.append(bucket)
+
+    for row in list(ws_rows or []):
+        bucket = int(row.get("_bucket") or (_td_row_epoch(row, interval) or 0))
+        if not bucket:
+            continue
+        live = dict(row)
+        live.pop("_bucket", None)
+        old = merged.get(bucket)
+        if old:
+            try:
+                merged[bucket] = {
+                    **old,
+                    "datetime": _td_ws_dt_string(bucket),
+                    "open": float(old.get("open", live["open"])),
+                    "high": max(float(old.get("high", live["high"])), float(live["high"])),
+                    "low": min(float(old.get("low", live["low"])), float(live["low"])),
+                    "close": float(live["close"]),
+                    "volume": max(float(old.get("volume", 0) or 0), float(live.get("volume", 0) or 0)),
+                    "source": "TWELVE_DATA_WS",
+                }
+            except Exception:
+                merged[bucket] = live
+        else:
+            merged[bucket] = live
+            order.append(bucket)
+
+    return [merged[b] for b in sorted(set(order)) if b in merged][-220:]
+
+
+@app.on_event("startup")
+async def _start_twelve_data_websocket():
+    if ensure_td_ws_started():
+        print("[TD WS] thread de streaming iniciada", flush=True)
+    elif TD_WS_ENABLED:
+        reason = "chave ausente" if not TD_KEY else "websocket-client indisponível"
+        print(f"[TD WS] não iniciado: {reason}", flush=True)
+
+
+@app.on_event("shutdown")
+async def _stop_twelve_data_websocket():
+    _td_ws_stop_now()
+
 # IQ OPTION — implementação reconstruída do zero.
 # O login é feito somente pelo painel; não há credenciais IQ no Render.
 IQ_SESSION_COOKIE = "mega_iq_session"
 IQ_SESSION_TTL = int(os.getenv("IQ_SESSION_TTL", "43200"))
-IQ_CONNECT_TIMEOUT = float(os.getenv("IQ_CONNECT_TIMEOUT", "35"))
+IQ_CONNECT_TIMEOUT = float(os.getenv("IQ_CONNECT_TIMEOUT", "32"))
 IQ_CANDLE_TIMEOUT = float(os.getenv("IQ_CANDLE_TIMEOUT", "15"))
 IQ_CANDLE_CACHE_TTL = float(os.getenv("IQ_CANDLE_CACHE_TTL", "3"))
+IQ_RECONNECT_BASE = float(os.getenv("IQ_RECONNECT_BASE", "4"))
+IQ_RECONNECT_MAX = float(os.getenv("IQ_RECONNECT_MAX", "45"))
 iq_sessions: Dict[str, Dict[str, Any]] = {}
 
 VALID_MARKETS = ("OPEN", "IQ_OTC")
@@ -2782,10 +3112,15 @@ def _td_cache_ttl(interval: str) -> float:
 
 
 def _td_cache_age(symbol: str, interval: str) -> float:
+    ages = []
     item = td_candle_cache.get(f"{symbol}|{interval}")
-    if not item:
-        return 10**9
-    return max(0.0, time.time() - float(item[0]))
+    if item:
+        ages.append(max(0.0, time.time() - float(item[0])))
+    with td_ws_lock:
+        tick_ts = float(td_ws_last_tick_at.get(symbol, 0.0) or 0.0)
+    if tick_ts > 0:
+        ages.append(max(0.0, time.time() - tick_ts))
+    return min(ages) if ages else 10**9
 
 
 async def candles_open(symbol, interval, n=80):
@@ -2793,11 +3128,27 @@ async def candles_open(symbol, interval, n=80):
     if not TD_KEY:
         raise HTTPException(500, "TWELVE_DATA_API_KEY não configurada.")
 
+    ensure_td_ws_started()
     n = max(20, min(int(n), 150))
     key = f"{symbol}|{interval}"
     now_ts = time.time()
     cached = td_candle_cache.get(key)
     ttl = _td_cache_ttl(interval)
+
+    # Se o WebSocket está trazendo preço fresco, ele passa a ser a fonte em
+    # tempo real. O histórico REST é apenas a base inicial e não precisa ser
+    # consultado novamente a cada polling.
+    ws_rows = _td_ws_snapshot(symbol, interval)
+    if ws_rows and _td_ws_is_fresh(symbol):
+        if cached:
+            merged = _td_merge_rest_ws(cached[1], ws_rows, interval)
+            if len(merged) >= min(n, 20):
+                td_candle_cache[key] = (time.time(), merged)
+                return merged[-n:]
+        elif len(ws_rows) >= min(n, 20):
+            merged = _td_merge_rest_ws([], ws_rows, interval)
+            td_candle_cache[key] = (time.time(), merged)
+            return merged[-n:]
 
     if cached and now_ts - cached[0] < ttl and len(cached[1]) >= min(n, 20):
         return cached[1][-n:]
@@ -2822,7 +3173,7 @@ async def candles_open(symbol, interval, n=80):
             raise HTTPException(503, f"Twelve Data em limite temporário. Nova tentativa em {wait}s.")
 
         fetch_n = max(100, n)
-        params = {"symbol": symbol, "interval": interval, "outputsize": fetch_n, "apikey": TD_KEY, "format": "JSON"}
+        params = {"symbol": symbol, "interval": interval, "outputsize": fetch_n, "apikey": TD_KEY, "format": "JSON", "timezone": "UTC"}
 
         async with td_rate_lock:
             delay = TD_MIN_CALL_INTERVAL - (time.time() - td_last_call_at)
@@ -2891,6 +3242,9 @@ async def candles_open(symbol, interval, n=80):
                 return cached[1][-n:]
             raise HTTPException(502, "Nenhum candle recebido da Twelve Data.")
 
+        ws_rows = _td_ws_snapshot(symbol, interval)
+        if ws_rows:
+            out = _td_merge_rest_ws(out, ws_rows, interval)
         td_candle_cache[key] = (time.time(), out)
         td_backoff_reason = ""
         return out[-n:]
@@ -2923,68 +3277,49 @@ def iq_seconds(interval: str):
     return INTERVALS[interval]
 
 
-def _iq_lowlevel_connect_worker(client, result_box):
-    """
-    Abre somente a camada HTTP/WebSocket da iqoptionapi.
-    Evita o travamento conhecido de algumas versões antigas de
-    stable_api.IQ_Option.connect() esperando balance_id.
-    """
+def _iq_parse_connect_result(result):
+    """Normaliza os formatos de retorno usados por forks diferentes da iqoptionapi."""
+    if isinstance(result, (tuple, list)):
+        ok = bool(result[0]) if result else False
+        reason = str(result[1] if len(result) > 1 else "")
+        return ok, reason
+    return bool(result), ""
+
+
+def _iq_reason_to_message(reason: str):
+    low = str(reason or "").lower()
+    if "2fa" in low or "verify" in low or "two-factor" in low:
+        return "A IQ Option está exigindo autenticação em duas etapas (2FA)."
+    if any(x in low for x in ("invalid_credentials", "wrong credentials", "invalid credentials", "incorrect credentials")):
+        return "E-mail ou senha da IQ Option estão incorretos."
+    if "blocked" in low or "forbidden" in low:
+        return "A IQ Option recusou a sessão deste servidor."
+    if reason:
+        return "A IQ Option recusou a conexão: " + str(reason)[:220]
+    return "A IQ Option não confirmou a conexão."
+
+
+def _iq_abort_client(client):
+    """Fecha uma tentativa presa sem deixar uma segunda conexão concorrente."""
+    if client is None:
+        return
     try:
-        from iqoptionapi.api import IQOptionAPI
-
-        api = IQOptionAPI(
-            "iqoption.com",
-            client.email,
-            client.password,
-        )
-
-        api.set_session(
-            headers=getattr(client, "SESSION_HEADER", {}),
-            cookies=getattr(client, "SESSION_COOKIE", {}),
-        )
-
-        client.api = api
-        check, reason = api.connect()
-
-        result_box["ok"] = bool(check)
-        result_box["reason"] = str(reason or "")
-
-    except Exception as exc:
-        result_box["error"] = repr(exc)
-
-
-def _iq_network_probe():
-    """Diagnóstico leve da rota Render -> IQ Option, sem usar credenciais."""
-    import socket
-    host = "iqoption.com"
-    out = {"dns_ok": False, "tcp443_ok": False, "dns_ms": None, "tcp_ms": None, "ip": ""}
-    try:
-        t0 = time.monotonic()
-        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-        out["dns_ms"] = round((time.monotonic() - t0) * 1000)
-        out["dns_ok"] = bool(infos)
-        if infos:
-            out["ip"] = str(infos[0][4][0])
-    except Exception as exc:
-        out["dns_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
-        return out
-
-    try:
-        t0 = time.monotonic()
-        sock = socket.create_connection((host, 443), timeout=6.0)
-        out["tcp_ms"] = round((time.monotonic() - t0) * 1000)
-        out["tcp443_ok"] = True
-        try:
-            sock.close()
-        except Exception:
-            pass
-    except Exception as exc:
-        out["tcp_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
-    return out
+        api = getattr(client, "api", None)
+        close = getattr(api, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
 
 
 def _iq_connect_fresh(email: str, password: str):
-    """Login IQ Option com diagnóstico por etapas e timeout real."""
+    """
+    Conector IQ Option compatível com o padrão encontrado no TOPWIN.
+
+    O painel usa apenas e-mail e senha. A própria iqoptionapi negocia autenticação HTTP,
+    sessão e WebSocket internamente. Mantemos uma única tentativa por cliente,
+    protegida por timeout, para evitar conexões duplicadas presas no Render.
+    """
     if IQ_Option is None:
         raise RuntimeError("Biblioteca iqoptionapi não carregada no servidor.")
 
@@ -2993,233 +3328,135 @@ def _iq_connect_fresh(email: str, password: str):
     if not email or not password:
         raise RuntimeError("Informe e-mail e senha da IQ Option.")
 
-    # 1) Verifica primeiro se o Render consegue resolver o domínio e abrir TCP 443.
-    probe = _iq_network_probe()
-    print(
-        "[IQ DIAG] rede "
-        f"dns={'OK' if probe.get('dns_ok') else 'FALHA'} "
-        f"dns_ms={probe.get('dns_ms')} "
-        f"tcp443={'OK' if probe.get('tcp443_ok') else 'FALHA'} "
-        f"tcp_ms={probe.get('tcp_ms')} "
-        f"ip={probe.get('ip') or '-'}",
-        flush=True,
-    )
-    if probe.get("dns_error"):
-        print(f"[IQ DIAG] DNS erro={probe['dns_error']}", flush=True)
-    if probe.get("tcp_error"):
-        print(f"[IQ DIAG] TCP443 erro={probe['tcp_error']}", flush=True)
-    if not probe.get("dns_ok") or not probe.get("tcp443_ok"):
-        # O teste TCP é apenas diagnóstico. Em algumas rotas/clouds ele pode
-        # falhar momentaneamente mesmo quando a própria biblioteca consegue
-        # negociar a sessão logo depois. Por isso não bloqueamos o login aqui:
-        # deixamos o IQ_Option.connect() fazer a tentativa real.
-        print(
-            "[IQ DIAG] aviso: probe 443 falhou; continuando com a tentativa real da iqoptionapi",
-            flush=True,
-        )
+    box = {
+        "stage": "CRIANDO_CLIENTE",
+        "started": time.monotonic(),
+        "client": None,
+    }
 
-    stable_box = {"stage": "aguardando", "started": time.monotonic()}
-
-    def stable_worker():
+    def worker():
         try:
-            stable_box["stage"] = "construtor_IQ_Option"
-            stable_box["stage_at"] = time.monotonic()
             client = IQ_Option(email, password)
-            stable_box["client"] = client
-            stable_box["constructor_ms"] = round((time.monotonic() - stable_box["stage_at"]) * 1000)
-            stable_box["stage"] = "connect_HTTP_WebSocket"
-            stable_box["stage_at"] = time.monotonic()
-            stable_box["result"] = client.connect()
-            stable_box["connect_ms"] = round((time.monotonic() - stable_box["stage_at"]) * 1000)
-            stable_box["stage"] = "connect_retorno"
+            box["client"] = client
+            box["stage"] = "AUTENTICANDO_E_ABRINDO_WEBSOCKET"
+            box["result"] = client.connect()
+            box["stage"] = "VALIDANDO_WEBSOCKET"
         except Exception as exc:
-            stable_box["stage"] = "excecao"
-            stable_box["error"] = exc
+            box["error"] = exc
+            box["stage"] = "ERRO"
 
-    print("[IQ LOGIN] iniciando stable_api", flush=True)
-    th = threading.Thread(target=stable_worker, daemon=True)
+    print("[IQ CONNECTOR] iniciando sessão interna iqoptionapi", flush=True)
+    th = threading.Thread(target=worker, daemon=True, name="mega-iq-login")
     th.start()
     th.join(IQ_CONNECT_TIMEOUT)
 
-    if not th.is_alive():
-        elapsed_ms = round((time.monotonic() - stable_box["started"]) * 1000)
+    if th.is_alive():
+        client = box.get("client")
+        _iq_abort_client(client)
+        stage = box.get("stage") or "DESCONHECIDA"
         print(
-            f"[IQ DIAG] stable terminou etapa={stable_box.get('stage')} "
-            f"total_ms={elapsed_ms} construtor_ms={stable_box.get('constructor_ms')} "
-            f"connect_ms={stable_box.get('connect_ms')}",
+            f"[IQ CONNECTOR] timeout após {IQ_CONNECT_TIMEOUT:.0f}s etapa={stage}",
             flush=True,
         )
-        if "error" in stable_box:
-            exc = stable_box["error"]
-            print(f"[IQ LOGIN] stable_api erro={type(exc).__name__}: {str(exc)[:180]}", flush=True)
-        else:
-            client = stable_box.get("client")
-            result = stable_box.get("result")
-            if isinstance(result, (tuple, list)):
-                ok = bool(result[0]) if result else False
-                reason = str(result[1] if len(result) > 1 else "")
-            else:
-                ok = bool(result)
-                reason = ""
-            print(
-                f"[IQ DIAG] stable connect retornou ok={ok} reason={reason[:120] or '-'}",
-                flush=True,
-            )
-            if ok and client is not None:
-                try:
-                    stable_box["stage"] = "check_connect_WebSocket"
-                    connected = bool(client.check_connect())
-                    print(f"[IQ DIAG] check_connect={connected}", flush=True)
-                    if connected:
-                        print("[IQ LOGIN] stable_api conectado", flush=True)
-                        return client
-                except Exception as exc:
-                    print(f"[IQ DIAG] check_connect erro={type(exc).__name__}: {str(exc)[:160]}", flush=True)
-            low = reason.lower()
-            if "2fa" in low or "verify" in low:
-                raise RuntimeError("A IQ Option está exigindo autenticação em duas etapas (2FA).")
-            if "invalid_credentials" in low or "wrong credentials" in low or "invalid credentials" in low:
-                raise RuntimeError("E-mail ou senha da IQ Option estão incorretos.")
-            print(f"[IQ LOGIN] stable_api sem conexão; fallback. motivo={reason[:120]}", flush=True)
-    else:
-        elapsed_ms = round((time.monotonic() - stable_box["started"]) * 1000)
-        stage = stable_box.get("stage") or "desconhecida"
-        stage_age_ms = None
-        if stable_box.get("stage_at"):
-            stage_age_ms = round((time.monotonic() - stable_box["stage_at"]) * 1000)
-        print(
-            f"[IQ DIAG] TIMEOUT stable etapa={stage} total_ms={elapsed_ms} etapa_ms={stage_age_ms} "
-            f"construtor_ms={stable_box.get('constructor_ms')}",
-            flush=True,
-        )
-        print(f"[IQ LOGIN] stable_api excedeu {IQ_CONNECT_TIMEOUT:.0f}s; conexão travada na iqoptionapi", flush=True)
-        if stage == "construtor_IQ_Option":
-            detail = "travou ao criar o cliente IQ_Option antes de iniciar o login."
-        elif stage == "connect_HTTP_WebSocket":
-            detail = "travou dentro de client.connect(), na etapa de autenticação/sessão/WebSocket da iqoptionapi."
-        else:
-            detail = f"travou na etapa {stage}."
         raise TimeoutError(
-            f"A IQ Option não respondeu ao servidor dentro de {IQ_CONNECT_TIMEOUT:.0f} segundos; " + detail
+            f"A IQ Option não respondeu em {IQ_CONNECT_TIMEOUT:.0f}s durante {stage}. "
+            "A sessão foi encerrada para evitar conexão duplicada."
         )
 
-    fallback_box = {"stage": "aguardando", "started": time.monotonic()}
+    if "error" in box:
+        exc = box["error"]
+        _iq_abort_client(box.get("client"))
+        print(f"[IQ CONNECTOR] erro={type(exc).__name__}: {str(exc)[:220]}", flush=True)
+        raise RuntimeError(str(exc) or exc.__class__.__name__)
 
-    def fallback_worker():
-        try:
-            fallback_box["stage"] = "construtor_IQ_Option"
-            fallback_box["stage_at"] = time.monotonic()
-            client = IQ_Option(email, password)
-            fallback_box["constructor_ms"] = round((time.monotonic() - fallback_box["stage_at"]) * 1000)
-            from iqoptionapi.api import IQOptionAPI
-            fallback_box["stage"] = "criar_IQOptionAPI"
-            api = IQOptionAPI("iqoption.com", email, password)
-            fallback_box["stage"] = "set_session"
-            api.set_session(
-                headers=getattr(client, "SESSION_HEADER", {}),
-                cookies=getattr(client, "SESSION_COOKIE", {}),
-            )
-            client.api = api
-            fallback_box["stage"] = "api_connect_HTTP_WebSocket"
-            fallback_box["stage_at"] = time.monotonic()
-            check, reason = api.connect()
-            fallback_box["connect_ms"] = round((time.monotonic() - fallback_box["stage_at"]) * 1000)
-            fallback_box["stage"] = "api_connect_retorno"
-            fallback_box["client"] = client
-            fallback_box["ok"] = bool(check)
-            fallback_box["reason"] = str(reason or "")
-        except Exception as exc:
-            fallback_box["stage"] = "excecao"
-            fallback_box["error"] = exc
-
-    print("[IQ LOGIN] iniciando fallback low-level", flush=True)
-    ft = threading.Thread(target=fallback_worker, daemon=True)
-    ft.start()
-    ft.join(20.0)
-
-    if ft.is_alive():
-        stage = fallback_box.get("stage") or "desconhecida"
-        stage_age_ms = None
-        if fallback_box.get("stage_at"):
-            stage_age_ms = round((time.monotonic() - fallback_box["stage_at"]) * 1000)
-        print(
-            f"[IQ DIAG] TIMEOUT fallback etapa={stage} etapa_ms={stage_age_ms} "
-            f"construtor_ms={fallback_box.get('constructor_ms')}",
-            flush=True,
-        )
-        print("[IQ LOGIN] fallback excedeu 20s", flush=True)
-        raise TimeoutError(
-            f"A biblioteca da IQ Option ficou travada no fallback na etapa {stage}."
-        )
-
-    if "error" in fallback_box:
-        exc = fallback_box["error"]
-        print(
-            f"[IQ DIAG] fallback exceção etapa={fallback_box.get('stage')} "
-            f"erro={type(exc).__name__}: {str(exc)[:180]}",
-            flush=True,
-        )
-        print(f"[IQ LOGIN] fallback erro={type(exc).__name__}: {str(exc)[:180]}", flush=True)
-        raise RuntimeError(f"Fallback IQ Option falhou: {str(exc)[:240]}")
-
-    ok = bool(fallback_box.get("ok"))
-    reason = str(fallback_box.get("reason") or "")
-    client = fallback_box.get("client")
-    print(
-        f"[IQ DIAG] fallback terminou etapa={fallback_box.get('stage')} ok={ok} "
-        f"connect_ms={fallback_box.get('connect_ms')} reason={reason[:120] or '-'}",
-        flush=True,
-    )
-
+    client = box.get("client")
+    ok, reason = _iq_parse_connect_result(box.get("result"))
     if not ok or client is None:
-        low = reason.lower()
-        if "2fa" in low or "verify" in low:
-            raise RuntimeError("A IQ Option está exigindo autenticação em duas etapas (2FA).")
-        if "invalid_credentials" in low or "wrong credentials" in low or "invalid credentials" in low:
-            raise RuntimeError("E-mail ou senha da IQ Option estão incorretos.")
-        raise RuntimeError("A IQ Option recusou a conexão" + (f": {reason}" if reason else "."))
+        _iq_abort_client(client)
+        raise RuntimeError(_iq_reason_to_message(reason))
 
-    try:
-        fallback_box["stage"] = "check_connect_WebSocket"
-        connected = bool(client.check_connect())
-        print(f"[IQ DIAG] fallback check_connect={connected}", flush=True)
-    except Exception as exc:
-        connected = False
-        print(f"[IQ DIAG] fallback check_connect erro={type(exc).__name__}: {str(exc)[:160]}", flush=True)
+    # Alguns forks retornam do connect() antes de check_connect refletir o estado.
+    deadline = time.monotonic() + 6.0
+    connected = False
+    while time.monotonic() < deadline:
+        try:
+            connected = bool(client.check_connect())
+        except Exception:
+            connected = False
+        if connected:
+            break
+        time.sleep(0.20)
 
     if not connected:
-        raise RuntimeError("A IQ Option abriu a sessão, mas o WebSocket não permaneceu conectado.")
+        _iq_abort_client(client)
+        raise RuntimeError("A IQ Option autenticou, mas o WebSocket não permaneceu conectado.")
 
-    print("[IQ LOGIN] fallback conectado", flush=True)
+    print("[IQ CONNECTOR] IQ Option conectada; sessão interna ativa", flush=True)
     return client
+
+
+def _iq_reconnect_delay(failure_count: int) -> float:
+    failure_count = max(1, int(failure_count or 1))
+    return min(IQ_RECONNECT_MAX, IQ_RECONNECT_BASE * (2 ** min(failure_count - 1, 4)))
+
 
 def _iq_reconnect_state(state: Dict[str, Any]):
     if _iq_connected(state):
         state["connected"] = True
+        state["failure_count"] = 0
+        state["reconnect_after"] = 0.0
+        state["reconnecting"] = False
         return state["client"]
 
     email = str(state.get("email") or "").strip()
     password = str(state.get("password") or "")
-
     if not email or not password:
-        raise RuntimeError(
-            "Sessão da IQ Option sem credenciais ativas. Faça login novamente."
-        )
+        raise RuntimeError("Sessão da IQ Option sem credenciais ativas. Faça login novamente.")
 
-    _iq_close_state(state)
+    sync_lock = state.get("sync_lock")
+    if sync_lock is None:
+        sync_lock = threading.RLock()
+        state["sync_lock"] = sync_lock
 
-    client = _iq_connect_fresh(
-        email,
-        password,
-    )
+    with sync_lock:
+        if _iq_connected(state):
+            state["connected"] = True
+            state["failure_count"] = 0
+            state["reconnect_after"] = 0.0
+            state["reconnecting"] = False
+            return state["client"]
 
-    state["client"] = client
-    state["connected"] = True
-    state["last_connected"] = time.time()
-    state["last_seen"] = time.time()
-    state["last_error"] = ""
+        now_ts = time.time()
+        reconnect_after = float(state.get("reconnect_after", 0.0) or 0.0)
+        if now_ts < reconnect_after:
+            wait = max(1, int(reconnect_after - now_ts + 0.999))
+            raise RuntimeError(f"IQ Option reconectando. Nova tentativa em {wait}s.")
 
-    return client
+        state["reconnecting"] = True
+        state["connected"] = False
+        state["last_attempt"] = now_ts
+        _iq_close_state(state)
+
+        try:
+            client = _iq_connect_fresh(email, password)
+        except Exception as exc:
+            failures = int(state.get("failure_count", 0) or 0) + 1
+            delay = _iq_reconnect_delay(failures)
+            state["failure_count"] = failures
+            state["reconnect_after"] = time.time() + delay
+            state["reconnecting"] = False
+            state["last_error"] = str(exc)[:260]
+            raise RuntimeError(f"{str(exc)[:220]} Nova tentativa automática em {int(delay)}s.")
+
+        state["client"] = client
+        state["connected"] = True
+        state["last_connected"] = time.time()
+        state["last_seen"] = time.time()
+        state["last_error"] = ""
+        state["failure_count"] = 0
+        state["reconnect_after"] = 0.0
+        state["reconnecting"] = False
+        return client
 
 
 def _normalize_iq_candle(item):
@@ -3260,54 +3497,41 @@ def _normalize_iq_candle(item):
 
 
 def _iq_get_candles_once(client, active: str, duration: int, count: int, endtime: float):
-    """Leitura direta pelo websocket da iqoptionapi."""
-    try:
-        import iqoptionapi.constants as iq_constants
-    except Exception as exc:
-        raise RuntimeError(
-            f"Constantes IQ Option indisponíveis: {exc}"
-        )
+    """
+    Busca candles pela API pública do stable_api.
 
-    active_id = iq_constants.ACTIVES.get(active)
-    if active_id is None:
-        raise RuntimeError(
-            f"Ativo OTC não reconhecido pela biblioteca: {active}"
-        )
+    Evita manipular diretamente api.candles.candles_data, porque isso cria corrida
+    entre requisições e varia entre forks da iqoptionapi. O método get_candles()
+    já usa o WebSocket autenticado e a sessão interna da biblioteca.
+    """
+    getter = getattr(client, "get_candles", None)
+    if not callable(getter):
+        raise RuntimeError("Esta versão da iqoptionapi não possui get_candles().")
 
-    api = getattr(client, "api", None)
-    if api is None:
-        raise RuntimeError("Cliente IQ Option sem websocket ativo.")
+    box = {}
 
-    candles_obj = getattr(api, "candles", None)
-    if candles_obj is None:
-        raise RuntimeError("Canal de candles da IQ Option não inicializado.")
-
-    candles_obj.candles_data = None
-    api.getcandles(active_id, duration, count, endtime)
-
-    deadline = time.monotonic() + IQ_CANDLE_TIMEOUT
-    while time.monotonic() < deadline:
-        data = candles_obj.candles_data
-        if data is not None:
-            return data
-
+    def worker():
         try:
-            if not client.check_connect():
-                raise RuntimeError(
-                    "Websocket IQ Option desconectou durante a leitura de candles."
-                )
-        except RuntimeError:
-            raise
+            box["data"] = getter(active, int(duration), int(count), float(endtime))
         except Exception as exc:
-            raise RuntimeError(
-                f"Falha ao verificar websocket IQ Option: {exc}"
-            )
+            box["error"] = exc
 
-        time.sleep(0.05)
+    th = threading.Thread(target=worker, daemon=True, name="mega-iq-candles")
+    th.start()
+    th.join(IQ_CANDLE_TIMEOUT)
 
-    raise TimeoutError(
-        f"A IQ Option não respondeu candles em {IQ_CANDLE_TIMEOUT:.0f} segundos."
-    )
+    if th.is_alive():
+        raise TimeoutError(
+            f"A IQ Option não respondeu candles de {active} em {IQ_CANDLE_TIMEOUT:.0f}s."
+        )
+    if "error" in box:
+        exc = box["error"]
+        raise RuntimeError(str(exc) or exc.__class__.__name__)
+
+    data = box.get("data")
+    if not isinstance(data, (list, tuple)):
+        raise RuntimeError(f"Resposta de candles inválida para {active}.")
+    return list(data)
 
 
 def iq_candles_blocking(state: Dict[str, Any], symbol: str, interval: str, n: int, regular_market: bool = False):
@@ -4461,7 +4685,7 @@ async def iq_login(body: IQLoginBody, response: Response):
         if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
             raise HTTPException(
                 504,
-                "A conexão da IQ Option travou na autenticação/WebSocket da iqoptionapi. Verifique os logs [IQ DIAG]; se DNS/TCP 443 estiverem OK, o bloqueio está na sessão/WebSocket e não no botão do painel."
+                "A IQ Option não respondeu dentro do limite. O MEGA IA encerrou a tentativa sem criar conexão duplicada. Tente novamente; se persistir, o servidor Render pode não estar conseguindo manter o WebSocket da corretora."
             )
         raise HTTPException(
             401,
@@ -4477,7 +4701,12 @@ async def iq_login(body: IQLoginBody, response: Response):
         "password": password,
         "client": client,
         "lock": asyncio.Lock(),
+        "sync_lock": threading.RLock(),
         "connected": True,
+        "reconnecting": False,
+        "failure_count": 0,
+        "reconnect_after": 0.0,
+        "last_attempt": time.time(),
         "last_seen": time.time(),
         "last_connected": time.time(),
         "last_error": "",
@@ -4797,6 +5026,47 @@ async def compatibility_test(
         "tested_at": iso(now()),
         **metrics,
         "note": "Teste técnico dos candles. Não é garantia de resultado financeiro e não valida OTC.",
+    }
+
+
+@app.get("/feed-status")
+async def feed_status():
+    """Diagnóstico simples da fonte de candles sem expor a chave da API."""
+    ensure_td_ws_started()
+    with td_ws_lock:
+        subscribed = sorted(td_ws_subscribed)
+        failed = dict(td_ws_failed)
+        last_ticks = {
+            sym: round(max(0.0, time.time() - ts), 1)
+            for sym, ts in td_ws_last_tick_at.items()
+        }
+        connected = bool(td_ws_connected)
+        last_error = td_ws_last_error
+        last_message_age = (
+            round(max(0.0, time.time() - td_ws_last_message_at), 1)
+            if td_ws_last_message_at else None
+        )
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "websocket": {
+            "enabled": TD_WS_ENABLED,
+            "library_loaded": websocket is not None,
+            "connected": connected,
+            "requested": list(TD_WS_REQUESTED_SYMBOLS),
+            "subscribed": subscribed,
+            "failed": failed,
+            "last_message_age_seconds": last_message_age,
+            "last_tick_age_seconds": last_ticks,
+            "last_error": last_error,
+        },
+        "rest": {
+            "backoff_active": time.time() < td_backoff_until,
+            "backoff_seconds": max(0, int(td_backoff_until - time.time())),
+            "backoff_reason": td_backoff_reason,
+            "cached_series": len(td_candle_cache),
+        },
+        "message": "WebSocket é a fonte em tempo real quando houver assinatura ativa; REST fica como histórico/reserva.",
     }
 
 
@@ -5408,11 +5678,25 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         for sym in SYMBOLS
     ]
 
-    # Aquece apenas um par por ciclo para não sobrecarregar os feeds.
+    # Aquece apenas um par por ciclo. Quando o WebSocket já confirmou as
+    # assinaturas, o radar prioriza exclusivamente esses ativos para não gastar
+    # REST continuamente nos pares que ficaram fora do limite de WS do plano.
+    scan_symbols = list(SYMBOLS)
+    if market == "OPEN":
+        ws_active = _td_ws_active_symbols()
+        active_known = [s for s in SYMBOLS if s in ws_active]
+        if active_known:
+            scan_symbols = active_known
+            for row in out:
+                base = str(row.get("base_symbol") or "").strip()
+                if base and base not in ws_active and row.get("direction") == "NEUTRO":
+                    if not row.get("updated_at"):
+                        row["status"] = "FORA DO STREAM • selecione para analisar"
+
     idx_key = f"RADAR_INDEX|{market}|{interval}|{engine}"
-    idx = int(cache.get(idx_key, (0, 0))[1] or 0) % len(SYMBOLS)
-    sym = SYMBOLS[idx]
-    cache[idx_key] = (time.time(), (idx + 1) % len(SYMBOLS))
+    idx = int(cache.get(idx_key, (0, 0))[1] or 0) % len(scan_symbols)
+    sym = scan_symbols[idx]
+    cache[idx_key] = (time.time(), (idx + 1) % len(scan_symbols))
 
     try:
         raw = await candles(sym, interval, 90, market, iq_state, request=request)
