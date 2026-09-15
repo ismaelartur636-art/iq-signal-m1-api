@@ -21,8 +21,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "33.73.0"
-PWA_VERSION = "v50"
+APP_VERSION = "33.74.1"
+PWA_VERSION = "v52"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -5032,14 +5032,41 @@ async def radar(request: Request, interval="1min", market="OPEN"):
 
 
 
+def _canonical_time_key(value: Any) -> str:
+    """Normaliza timestamps equivalentes para impedir contagem duplicada.
+
+    O painel pode enviar o mesmo instante como UTC (Z) ou com offset de
+    Brasília. A string muda, mas o instante é o mesmo. A contabilidade usa
+    epoch em segundos para que a mesma operação tenha sempre uma única chave.
+    """
+    if value in (None, ""):
+        return ""
+    try:
+        return str(int(parse_dt(str(value)).timestamp()))
+    except Exception:
+        return str(value).strip()
+
+
 def _accounting_key(payload: Dict[str, Any]) -> str:
     return "|".join([
         str(payload.get("market") or "OPEN").upper(),
         str(payload.get("symbol") or ""),
         str(payload.get("interval") or ""),
         str(payload.get("direction") or "").upper(),
-        str(payload.get("entry_time") or ""),
-        str(payload.get("expiry_time") or ""),
+        _canonical_time_key(payload.get("entry_time")),
+        _canonical_time_key(payload.get("expiry_time")),
+    ])
+
+
+def _result_operation_key(payload: Dict[str, Any], market: str = "OPEN") -> str:
+    """Chave única do desfecho final de uma operação."""
+    return "|".join([
+        str(market or payload.get("market") or "OPEN").upper(),
+        str(payload.get("symbol") or ""),
+        str(payload.get("interval") or ""),
+        str(payload.get("direction") or "").upper(),
+        _canonical_time_key(payload.get("entry_time")),
+        _canonical_time_key(payload.get("expiry_time")),
     ])
 
 
@@ -5152,10 +5179,7 @@ async def performance(request: Request, interval="1min", market="OPEN"):
     merged_direct = {}
     for x in done.values():
         if x.get("result") in ("WIN", "LOSS", "DRAW"):
-            k = "|".join([
-                market, str(x.get("symbol") or ""), str(x.get("interval") or ""),
-                str(x.get("direction") or ""), str(x.get("expiry_time") or "")
-            ])
+            k = _result_operation_key(x, market)
             merged_direct[k] = x
 
     if market == "IQ_OTC":
@@ -5166,34 +5190,44 @@ async def performance(request: Request, interval="1min", market="OPEN"):
 
     for x in direct_store.values():
         if x.get("result") in ("WIN", "LOSS", "DRAW"):
-            k = "|".join([
-                market, str(x.get("symbol") or ""), str(x.get("interval") or ""),
-                str(x.get("direction") or ""), str(x.get("expiry_time") or "")
-            ])
+            k = _result_operation_key(x, market)
             merged_direct[k] = x
 
-    wins = sum(1 for x in merged_direct.values() if x.get("result") == "WIN")
-    losses = sum(1 for x in merged_direct.values() if x.get("result") == "LOSS")
+    win_direct = sum(1 for x in merged_direct.values() if x.get("result") == "WIN")
+    loss_direct = sum(1 for x in merged_direct.values() if x.get("result") == "LOSS")
     draws = sum(1 for x in merged_direct.values() if x.get("result") == "DRAW")
-    total = wins + losses
 
-    # Gale fica apenas como informação separada.
+    # Gale é apurado como desfecho da MESMA operação.
+    # A primeira vela que perdeu continua aparecendo em LOSS DIRETO para análise,
+    # mas o placar principal só considera o resultado FINAL após G1/G2.
     if market == "IQ_OTC":
         state = _iq_session_state(request, required=False)
         gale_store = state.setdefault("results", {}) if state else {}
     else:
         gale_store = results.setdefault(market, {})
-    win_g1 = sum(1 for x in gale_store.values() if x.get("result") == "WIN G1")
-    win_g2 = sum(1 for x in gale_store.values() if x.get("result") == "WIN G2")
-    loss_g2 = sum(1 for x in gale_store.values() if x.get("result") == "LOSS G2")
+    # Deduplica o resultado final por operação. O mesmo sinal pode chegar pelo
+    # painel principal e pelo gráfico com timestamps escritos em formatos
+    # diferentes (ex.: -03:00 e Z). Isso não pode somar duas vezes.
+    final_ops = {}
+    for x in gale_store.values():
+        if x.get("result") in ("WIN G1", "WIN G2", "LOSS G2"):
+            final_ops[_result_operation_key(x, market)] = x
+
+    win_g1 = sum(1 for x in final_ops.values() if x.get("result") == "WIN G1")
+    win_g2 = sum(1 for x in final_ops.values() if x.get("result") == "WIN G2")
+    loss_g2 = sum(1 for x in final_ops.values() if x.get("result") == "LOSS G2")
+
+    wins = win_direct + win_g1 + win_g2
+    losses = loss_g2
+    total = wins + losses
 
     return {
         "wins": wins,
         "losses": losses,
         "total": total,
         "accuracy": round(wins / total * 100, 2) if total else 0,
-        "win_direct": wins,
-        "loss_direct": losses,
+        "win_direct": win_direct,
+        "loss_direct": loss_direct,
         "draws": draws,
         "pending": len(pending or {}),
         "win_g1": win_g1,
@@ -5318,6 +5352,18 @@ async def result(
     market="OPEN",
     direct_only: bool = False,
 ):
+    """Apura a entrada e, quando habilitado, acompanha G1 e G2.
+
+    Regras:
+    - WIN na entrada => WIN direto.
+    - LOSS na entrada => aguarda G1.
+    - WIN no G1 => WIN G1.
+    - LOSS/empate no G1 => aguarda G2.
+    - WIN no G2 => WIN G2; caso contrário => LOSS G2.
+
+    ``direct_only=true`` mantém compatibilidade com clientes que desejam apenas
+    o resultado da primeira vela. O painel principal usa o fluxo completo.
+    """
     if not expiry_time:
         raise HTTPException(400, "expiry_time é obrigatório.")
 
@@ -5330,40 +5376,44 @@ async def result(
     if direction not in ("CALL", "PUT"):
         raise HTTPException(400, "Direção inválida.")
 
+    if interval not in INTERVALS:
+        raise HTTPException(400, "Intervalo inválido.")
+
     state = _iq_session_state(request, required=True) if market == "IQ_OTC" else None
     store = state.setdefault("results", {}) if market == "IQ_OTC" else results.setdefault(market, {})
-    key = f"{market}|{symbol}|{interval}|{direction}|{expiry_time}"
+    mode_key = "DIRECT" if direct_only else "GALE"
+    # Usa o instante normalizado, não a representação textual do horário.
+    # Assim 03:16:00Z e 00:16:00-03:00 apontam para a mesma operação.
+    canonical_expiry = _canonical_time_key(expiry_time)
+    key = f"{market}|{symbol}|{interval}|{direction}|{canonical_expiry}|{mode_key}"
 
     if key in store and store[key].get("status") == "FINALIZADA":
         return store[key]
 
     expiry_dt = parse_dt(expiry_time)
     step = timedelta(seconds=INTERVALS[interval])
-
-    # Entrada original começa uma vela antes do expiry_time.
     entry_dt = expiry_dt - step
+
     if now() < expiry_dt:
         return {
             "status": "PENDENTE",
             "stage": "ENTRADA",
             "result": None,
+            "entry_result": None,
             "next_check": iso(expiry_dt),
         }
 
-    # Para resultado OPEN, tenta primeiro o cache já existente. Isso evita
-    # consumir créditos só para fechar WIN/LOSS.
-    cs = _cached_open_candles_for_result(symbol, interval, 100) if market == "OPEN" else []
-
+    # Para OPEN, aproveita o cache antes de gastar novos créditos.
+    cs = _cached_open_candles_for_result(symbol, interval, 140) if market == "OPEN" else []
     if not cs:
         try:
-            cs = await candles(symbol, interval, 40, market, state, request=request)
+            cs = await candles(symbol, interval, 80, market, state, request=request)
         except HTTPException as exc:
-            # Não devolve 503 ao painel. O resultado continua pendente e o
-            # navegador tenta novamente em ritmo controlado.
             return {
                 "status": "AGUARDANDO_FONTE",
                 "stage": "ENTRADA",
                 "result": None,
+                "entry_result": None,
                 "retry_after": 15,
                 "message": str(exc.detail)[:220],
             }
@@ -5372,135 +5422,226 @@ async def result(
                 "status": "AGUARDANDO_FONTE",
                 "stage": "ENTRADA",
                 "result": None,
+                "entry_result": None,
                 "retry_after": 15,
                 "message": str(exc)[:220],
             }
 
     def candle_near(target_dt):
-        target, best_delta, matched_dt = _nearest_candle_for_time(
-            cs, target_dt, INTERVALS[interval]
-        )
+        target, _, _ = _nearest_candle_for_time(cs, target_dt, INTERVALS[interval])
         return target
 
     def candle_result(candle):
-        if candle["close"] == candle["open"]:
+        if candle is None:
+            return None
+        op = float(candle["open"])
+        cl = float(candle["close"])
+        if cl == op:
             return "EMPATE"
-
         won = (
-            (direction == "CALL" and candle["close"] > candle["open"])
-            or
-            (direction == "PUT" and candle["close"] < candle["open"])
+            (direction == "CALL" and cl > op)
+            or (direction == "PUT" and cl < op)
         )
         return "WIN" if won else "LOSS"
 
-    # Entrada inicial.
-    base = candle_near(entry_dt)
-    if not base and market == "OPEN":
-        # O cache pode estar preenchido, mas não conter mais a vela da entrada.
-        # Força uma leitura maior uma única vez para conseguir fechar WIN/LOSS.
-        try:
+    async def ensure_candle(target_dt):
+        """Localiza uma vela já fechada, atualizando o histórico só se necessário."""
+        nonlocal cs
+        found = candle_near(target_dt)
+        if found:
+            return found
+
+        if market == "OPEN":
             cache_key = f"{symbol}|{interval}"
-            cached_item = td_candle_cache.pop(cache_key, None)
+            old_cache = td_candle_cache.pop(cache_key, None)
+            fresh_ok = False
             try:
-                cs = await candles(symbol, interval, 120, market, state, request=request)
+                fresh = await candles(symbol, interval, 140, market, state, request=request)
+                if fresh:
+                    cs = fresh
+                    fresh_ok = True
+            except Exception:
+                fresh_ok = False
             finally:
-                # Se a consulta falhar e havia cache anterior, não o perde.
-                if cache_key not in td_candle_cache and cached_item is not None:
-                    td_candle_cache[cache_key] = cached_item
-            base = candle_near(entry_dt)
-        except Exception:
-            base = None
+                if not fresh_ok and cache_key not in td_candle_cache and old_cache is not None:
+                    td_candle_cache[cache_key] = old_cache
 
-        # Se o histórico recente ainda não trouxe o horário da entrada,
-        # consulta uma janela exata ao redor da operação. É a última tentativa
-        # antes de devolver AGUARDANDO CANDLE.
-        if not base:
-            exact_cs = await _fetch_open_result_window(symbol, interval, entry_dt)
-            if exact_cs:
-                cs = exact_cs
-                base = candle_near(entry_dt)
+            found = candle_near(target_dt)
+            if found:
+                return found
 
-    if not base and market == "IQ_OTC" and state is not None:
-        # No OTC da IQ, o cache curto pode conter apenas candles muito recentes.
-        # Remove somente o cache deste ativo/timeframe e força histórico maior
-        # para localizar exatamente a vela da entrada e fechar WIN/LOSS.
-        try:
+            try:
+                exact = await _fetch_open_result_window(symbol, interval, target_dt)
+            except Exception:
+                exact = []
+            if exact:
+                cs = exact
+                found = candle_near(target_dt)
+                if found:
+                    return found
+
+        elif market == "IQ_OTC" and state is not None:
             cache_key = f"{symbol}|{interval}"
             iq_cache = state.setdefault("candle_cache", {})
-            old_iq_cache = iq_cache.pop(cache_key, None)
+            old_cache = iq_cache.pop(cache_key, None)
+            fresh_ok = False
             try:
-                cs = await candles(symbol, interval, 150, "IQ_OTC", state, request=request)
+                fresh = await candles(symbol, interval, 160, "IQ_OTC", state, request=request)
+                if fresh:
+                    cs = fresh
+                    fresh_ok = True
+            except Exception:
+                fresh_ok = False
             finally:
-                if cache_key not in iq_cache and old_iq_cache is not None:
-                    iq_cache[cache_key] = old_iq_cache
-            base = candle_near(entry_dt)
-            if base:
-                print(
-                    f"[RESULTADO] candle IQ_OTC recuperado {symbol} {interval} entrada={iso(entry_dt)}",
-                    flush=True,
-                )
-        except Exception as exc:
-            print(
-                f"[RESULTADO] falha ao recuperar histórico IQ_OTC {symbol} {interval}: {str(exc)[:180]}",
-                flush=True,
-            )
-            base = None
+                if not fresh_ok and cache_key not in iq_cache and old_cache is not None:
+                    iq_cache[cache_key] = old_cache
 
+            found = candle_near(target_dt)
+            if found:
+                return found
+
+        return None
+
+    def pending_payload(stage, next_dt, entry_result="LOSS", g1_result=None):
+        out = {
+            "status": "PENDENTE",
+            "stage": stage,
+            "result": None,
+            "entry_result": entry_result,
+            "next_check": iso(next_dt),
+            "retry_after": 5,
+        }
+        if g1_result is not None:
+            out["g1_result"] = g1_result
+        return out
+
+    def waiting_candle(stage, entry_result="LOSS", g1_result=None):
+        out = {
+            "status": "AGUARDANDO CANDLE",
+            "stage": stage,
+            "result": None,
+            "entry_result": entry_result,
+            "retry_after": 15,
+        }
+        if g1_result is not None:
+            out["g1_result"] = g1_result
+        return out
+
+    def finalize(final_result, stage, final_candle, entry_result, g1_result=None, g2_result=None, final_expiry_dt=None):
+        out = {
+            "status": "FINALIZADA",
+            "stage": stage,
+            "result": final_result,
+            "entry_result": entry_result,
+            # Metadados fazem /performance reconhecer que o resultado salvo em
+            # `results` e o resultado da contabilidade automática são a MESMA
+            # operação. Sem estes campos um WIN podia entrar duas vezes.
+            "market": market,
+            "symbol": symbol,
+            "interval": interval,
+            "direction": direction,
+            "candle_time": final_candle.get("datetime") if final_candle else None,
+            "entry_time": iso(entry_dt),
+            "expiry_time": expiry_time,
+            "final_expiry_time": iso(final_expiry_dt) if final_expiry_dt else expiry_time,
+            "simulated": True,
+            "direct_only": bool(direct_only),
+        }
+        if g1_result is not None:
+            out["g1_result"] = g1_result
+        if g2_result is not None:
+            out["g2_result"] = g2_result
+        store[key] = out
+
+        # A contabilidade automática guarda o resultado DIRETO separadamente.
+        # O resultado final com Gale permanece em `results`, evitando misturar
+        # LOSS da primeira vela com LOSS final da operação.
+        pending_acc, done_acc = _accounting_buckets(request, market)
+        if done_acc is not None:
+            acc_item = {
+                "market": market,
+                "symbol": symbol,
+                "interval": interval,
+                "direction": direction,
+                "entry_time": iso(entry_dt),
+                "expiry_time": expiry_time,
+            }
+            acc_key = _accounting_key(acc_item)
+            direct_value = "DRAW" if entry_result == "DRAW" else ("WIN" if entry_result == "WIN" else "LOSS")
+            done_acc[acc_key] = {
+                **acc_item,
+                "result": direct_value,
+                "final_result": final_result,
+                "candle_time": final_candle.get("datetime") if final_candle else None,
+            }
+            if pending_acc is not None:
+                pending_acc.pop(acc_key, None)
+
+        print(
+            f"[RESULTADO] {symbol} {interval} {direction} -> {final_result} "
+            f"entrada={iso(entry_dt)} etapa={stage}",
+            flush=True,
+        )
+        return out
+
+    # Entrada original.
+    base = await ensure_candle(entry_dt)
     if not base:
         print(
             f"[RESULTADO] aguardando candle {symbol} {interval} {direction} entrada={iso(entry_dt)}",
             flush=True,
         )
-        return {
-            "status": "AGUARDANDO CANDLE",
-            "stage": "ENTRADA",
-            "result": None,
-            "retry_after": 15,
-        }
+        return waiting_candle("ENTRADA", entry_result=None)
 
     base_result = candle_result(base)
-
-    # PLACAR PRINCIPAL: sempre fecha na vela original da entrada.
-    # G1/G2 não seguram mais WIN/LOSS nem a assertividade.
     if base_result == "EMPATE":
-        final_direct = "DRAW"
-    else:
-        final_direct = "WIN" if base_result == "WIN" else "LOSS"
+        return finalize("DRAW", "ENTRADA", base, "DRAW", final_expiry_dt=expiry_dt)
 
-    out = {
-        "status": "FINALIZADA",
-        "stage": "ENTRADA",
-        "result": final_direct,
-        "candle_time": base["datetime"],
-        "entry_time": iso(entry_dt),
-        "expiry_time": expiry_time,
-        "simulated": True,
-        "direct_only": True,
-    }
-    store[key] = out
-    print(
-        f"[RESULTADO] {symbol} {interval} {direction} -> {final_direct} "
-        f"entrada={iso(entry_dt)} candle={base.get('datetime')}",
-        flush=True,
+    if base_result == "WIN":
+        return finalize("WIN", "ENTRADA", base, "WIN", final_expiry_dt=expiry_dt)
+
+    # Compatibilidade: quem pedir apenas a primeira vela recebe LOSS direto.
+    if direct_only:
+        return finalize("LOSS", "ENTRADA", base, "LOSS", final_expiry_dt=expiry_dt)
+
+    # ------------------------- GALE 1 -------------------------
+    g1_entry_dt = expiry_dt
+    g1_expiry_dt = g1_entry_dt + step
+    if now() < g1_expiry_dt + timedelta(seconds=2):
+        return pending_payload("G1", g1_expiry_dt, entry_result="LOSS")
+
+    g1 = await ensure_candle(g1_entry_dt)
+    if not g1:
+        return waiting_candle("G1", entry_result="LOSS")
+
+    g1_result = candle_result(g1)
+    if g1_result == "WIN":
+        return finalize(
+            "WIN G1", "G1", g1, "LOSS",
+            g1_result="WIN", final_expiry_dt=g1_expiry_dt,
+        )
+
+    # ------------------------- GALE 2 -------------------------
+    g2_entry_dt = g1_expiry_dt
+    g2_expiry_dt = g2_entry_dt + step
+    if now() < g2_expiry_dt + timedelta(seconds=2):
+        return pending_payload("G2", g2_expiry_dt, entry_result="LOSS", g1_result=g1_result)
+
+    g2 = await ensure_candle(g2_entry_dt)
+    if not g2:
+        return waiting_candle("G2", entry_result="LOSS", g1_result=g1_result)
+
+    g2_result = candle_result(g2)
+    if g2_result == "WIN":
+        return finalize(
+            "WIN G2", "G2", g2, "LOSS",
+            g1_result=g1_result, g2_result="WIN", final_expiry_dt=g2_expiry_dt,
+        )
+
+    return finalize(
+        "LOSS G2", "G2", g2, "LOSS",
+        g1_result=g1_result, g2_result=g2_result, final_expiry_dt=g2_expiry_dt,
     )
-
-    # Mantém a contabilidade do servidor sincronizada com o /result.
-    pending_acc, done_acc = _accounting_buckets(request, market)
-    if done_acc is not None:
-        acc_item = {
-            "market": market,
-            "symbol": symbol,
-            "interval": interval,
-            "direction": direction,
-            "entry_time": iso(entry_dt),
-            "expiry_time": expiry_time,
-        }
-        acc_key = _accounting_key(acc_item)
-        done_acc[acc_key] = {**acc_item, "result": final_direct, "candle_time": base.get("datetime")}
-        if pending_acc is not None:
-            pending_acc.pop(acc_key, None)
-
-    return out
 
 
 HTML_PAGE = r"""
@@ -5510,7 +5651,7 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=50">
+<link rel="manifest" href="/manifest.webmanifest?v=52">
 <link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=45">
 <link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=45">
 <meta name="theme-color" content="#07182b">
@@ -5808,8 +5949,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
 
       <div class="label" style="margin-top:10px;line-height:1.5">
-        WIN DIRETO e LOSS DIRETO são registrados quando a operação termina sem Gale.
-        Quando o fluxo normal acompanha G1/G2, WIN G1, WIN G2 e LOSS G2 também entram no placar.
+        WIN DIRETO e LOSS DIRETO mostram o que aconteceu na primeira vela.
+        No placar principal, WIN G1 e WIN G2 contam como WIN; LOSS só é contado se perder até o G2.
         Cada operação é contabilizada uma única vez e o histórico fica salvo neste aparelho.
       </div>
     </div>
@@ -6057,7 +6198,7 @@ let lastChartSignalVoice='';
 const RESULT_RETRY_MS=15000;
 const RESULT_MAX_PENDING_AGE_MS=30*60*1000;
 
-const RESULT_STATS_KEY='mega_result_stats_v33310';
+const RESULT_STATS_KEY='mega_result_stats_v33741';
 const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33450';
 const RESULT_MARKETS=['OPEN','IQ_OTC'];
 
@@ -6127,15 +6268,23 @@ function signalResultMarket(sig){
   return m;
 }
 
+function canonicalTradeTime(v){
+  const ms=Date.parse(String(v||''));
+  if(Number.isFinite(ms)) return String(Math.floor(ms/1000));
+  return String(v||'').trim();
+}
+
 function resultTradeKey(t){
   if(!t) return '';
+  // A mesma entrada pode chegar em ISO UTC pelo gráfico e em horário com
+  // offset pelo painel. Converte ambos para epoch e impede WIN/LOSS em dobro.
   return [
     resultMarket(t.market),
     t.symbol||'',
     t.interval||'',
-    t.direction||'',
-    t.entry_time||'',
-    t.expiry_time||''
+    String(t.direction||'').toUpperCase(),
+    canonicalTradeTime(t.entry_time),
+    canonicalTradeTime(t.expiry_time)
   ].join('|');
 }
 
@@ -6231,8 +6380,10 @@ function mergeServerPerformance(p,m){
 function paintPersistentResults(){
   const m=activeResultMarket();
   const b=persistentResults[m]||emptyResultBucket();
-  const totalWins=b.win_direct;
-  const totalLosses=b.loss_direct;
+  // Placar principal = resultado FINAL da operação.
+  // WIN direto, WIN G1 ou WIN G2 contam como WIN; LOSS só após perder até G2.
+  const totalWins=Number(b.win_direct||0)+Number(b.win_g1||0)+Number(b.win_g2||0);
+  const totalLosses=Number(b.loss_g2||0);
   const total=totalWins+totalLosses;
   const acc=total?((totalWins/total)*100):0;
 
@@ -6294,6 +6445,7 @@ try{
     'mega_pending_trade_queue_v33400'
     ,'mega_pending_trade_v33410'
     ,'mega_pending_trade_queue_v33410'
+    ,'mega_result_stats_v33310'
   ].forEach(k=>{ try{ localStorage.removeItem(k); }catch(_){} });
 }catch(_){}
 
@@ -7764,7 +7916,7 @@ async function resultCheck(){
     pendingTrade=t;
 
     const x=await get(
-      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=true`
+      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}`
     );
 
     if(x && !x.result && (x.status==='AGUARDANDO_FONTE' || String(x.status||'').startsWith('AGUARDANDO'))){
@@ -7780,8 +7932,8 @@ async function resultCheck(){
       return;
     }
 
-    // A entrada original é contabilizada imediatamente após o fechamento da vela,
-    // mesmo que o acompanhamento de G1/G2 ainda continue.
+    // A primeira vela é registrada separadamente para diagnóstico.
+    // O placar principal só fecha quando houver WIN direto, WIN G1, WIN G2 ou LOSS G2.
     const accountingChanged=registerPersistentResult(t,x);
     if(accountingChanged){
       // Atualiza WIN/LOSS na tela imediatamente.
