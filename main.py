@@ -21,8 +21,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "33.76.2"
-PWA_VERSION = "v56"
+APP_VERSION = "33.78.0"
+PWA_VERSION = "v60"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -3708,13 +3708,13 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
     meaningful_body = body >= prev_rng * 0.35
     meaningful_volume = volume > 0 and last_volume > 0 and abs(volume - last_volume) / max(last_volume, 1.0) >= 0.20
 
-    # Nunca chama a API em rajada: mínimo de 12 s. Mesmo sem grande mudança,
-    # força uma revisão em até 30 s para não deixar o gráfico sem reavaliação.
+    # IA PURA 33.78.0: com candles fechados, os dados não mudam dentro do mesmo
+    # candle. Portanto a IA é consultada uma única vez por novo candle fechado.
+    # Isso evita respostas diferentes sobre os mesmos dados e reduz custo/quota.
     min_gap = 12.0
-    heartbeat = 30.0
-    due = (now_ts - last_call) >= heartbeat
-    changed = new_candle or meaningful_price or meaningful_body or meaningful_volume
-    should_call = last_call <= 0 or ((now_ts - last_call) >= min_gap and (changed or due))
+    heartbeat = float(INTERVALS.get(interval, 60))
+    changed = new_candle
+    should_call = last_call <= 0 or new_candle
 
     st.update({
         "candle_time": live.get("datetime"),
@@ -3894,13 +3894,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     closed = raw[:-1] if len(raw) > 1 else raw
 
-    # 33.75.0: dois motores independentes e selecionáveis no painel.
-    # RSI preserva exatamente o gatilho original. SMART usa o mesmo RSI como
-    # gatilho e exige confluência de mercado antes de liberar a entrada.
+    # 33.78.0: dois motores independentes e selecionáveis no painel.
+    # ROBÔ PRINCIPAL preserva o gatilho técnico original.
+    # INTELIGÊNCIA ARTIFICIAL é IA PURA: recebe somente candles OHLCV fechados
+    # e decide CALL, PUT ou NEUTRO sem usar RSI, médias, MACD, Bollinger, ATR
+    # ou qualquer outro indicador/score interno na decisão.
     if ai_only and NEW_PRIMARY_INDICATOR_ENABLED:
         tf_label = {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval)
-        engine_title = "INTELIGÊNCIA ARTIFICIAL" if engine == "SMART" else "ROBÔ RSI"
-        engine_mode = "SMART_CONFLUENCE" if engine == "SMART" else "PRIMARY_RSI_TEST"
+        engine_title = "INTELIGÊNCIA ARTIFICIAL" if engine == "SMART" else "ROBÔ PRINCIPAL"
+        engine_mode = "PURE_AI" if engine == "SMART" else "PRIMARY_RSI_TEST"
 
         if market != "OPEN":
             out = neutral_signal(
@@ -3910,26 +3912,30 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 source_state="READY",
             )
             out.update({
-                "strategy": f"{engine_title} {tf_label}",
+                "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else f"{engine_title} {tf_label}",
                 "mode": engine_mode,
                 "selected_engine": engine,
-                "ai_provider": "LOCAL_CONFLUENCE" if engine == "SMART" else "DISABLED",
-                "technical": {"legacy_disabled": True, "rsi_period": 14, "rsi_timeframe": interval},
-                "legacy_ai_disabled": True,
+                "ai_provider": "GEMINI_PURE" if engine == "SMART" else "DISABLED",
+                "technical": (
+                    {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
+                    if engine == "SMART"
+                    else {"legacy_disabled": True, "rsi_period": 14, "rsi_timeframe": interval}
+                ),
+                "legacy_ai_disabled": engine != "SMART",
                 "legacy_indicators_disabled": True,
             })
             cache[key] = (time.time(), out)
             return out
 
         try:
-            # Reaproveita os candles já carregados acima: evita gastar uma chamada
-            # extra da fonte apenas para trocar de motor.
+            # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
+            # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
+            # decisão independente do Robô Principal.
             engine_closed = closed[-90:] if len(closed) > 90 else closed
-            analysis = (
-                intelligent_artificial_strategy(engine_closed, interval)
-                if engine == "SMART"
-                else primary_rsi_cross_strategy(engine_closed, 14, interval)
-            )
+            if engine == "SMART":
+                analysis = await openai_direct_signal(symbol, interval, engine_closed, market)
+            else:
+                analysis = primary_rsi_cross_strategy(engine_closed, 14, interval)
         except Exception as exc:
             out = neutral_signal(
                 symbol, interval, market,
@@ -3937,42 +3943,63 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 f"Não foi possível concluir a análise no timeframe {interval} agora: {str(exc)[:180]}",
                 source_state="WAITING",
             )
-            out.update({"strategy": f"{engine_title} {tf_label}", "mode": engine_mode, "selected_engine": engine})
+            out.update({
+                "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else f"{engine_title} {tf_label}",
+                "mode": engine_mode,
+                "selected_engine": engine,
+            })
             cache[key] = (time.time(), out)
             return out
 
         release_state = signal_release_state.setdefault(release_key, {})
+        ai_available = bool(analysis.get("available", True)) if engine == "SMART" else True
         base = {
             "symbol": symbol, "interval": interval, "market": market,
             "direction": "NEUTRO",
-            "confidence": analysis.get("confidence", 0),
+            "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
             "ai_confirmed": bool(engine == "SMART" and analysis.get("confirmed")),
-            "ai_provider": "LOCAL_CONFLUENCE" if engine == "SMART" else "DISABLED",
-            "risk": "HIGH",
-            "strategy": analysis.get("strategy", f"{engine_title} {tf_label}"),
+            "ai_provider": "GEMINI_PURE" if engine == "SMART" else "DISABLED",
+            "risk": str(analysis.get("risk", "HIGH") if engine == "SMART" else "HIGH").upper(),
+            "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else analysis.get("strategy", f"{engine_title} {tf_label}"),
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
-            "technical": analysis,
-            "source_state": "READY",
+            "technical": (
+                {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
+                if engine == "SMART"
+                else analysis
+            ),
+            "source_state": "READY" if ai_available else "AI_UNAVAILABLE",
             "mode": engine_mode,
             "selected_engine": engine,
-            "legacy_ai_disabled": True,
+            "legacy_ai_disabled": engine != "SMART",
             "legacy_indicators_disabled": True,
         }
+
+        if engine == "SMART" and not ai_available:
+            reason = str(analysis.get("reason") or "IA temporariamente indisponível.")
+            low = reason.lower()
+            if "api_key" in low or "api key" in low or "não configurada" in low:
+                base["status"] = "IA PURA • CONFIGURAÇÃO DA API AUSENTE"
+            elif "429" in low or "quota" in low or "rate limit" in low:
+                base["status"] = "IA PURA • LIMITE DA API"
+            elif "timeout" in low or "timed out" in low:
+                base["status"] = "IA PURA • TIMEOUT"
+            else:
+                base["status"] = "IA PURA • TEMPORARIAMENTE INDISPONÍVEL"
 
         if analysis.get("confirmed") and analysis.get("direction") in ("CALL", "PUT"):
             direction_now = analysis["direction"]
             reference_candle = engine_closed[-1].get("datetime") if engine_closed else None
             signal_fingerprint = f"{engine}|{direction_now}|{reference_candle}"
-            fingerprint_key = "smart_fingerprint" if engine == "SMART" else "primary_rsi_fingerprint"
+            fingerprint_key = "pure_ai_fingerprint" if engine == "SMART" else "primary_rsi_fingerprint"
             if release_state.get(fingerprint_key) != signal_fingerprint:
                 announce, entry, expiry = entry_window(interval)
                 base.update({
                     "direction": direction_now,
-                    "status": "SINAL LIBERADO",
-                    "risk": "LOW" if engine == "SMART" and int(analysis.get("confirmations", 0) or 0) >= 5 else "MEDIUM",
+                    "status": "SINAL IA PURA LIBERADO" if engine == "SMART" else "SINAL LIBERADO",
+                    "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
                     "expiry_time": iso(expiry),
@@ -4542,6 +4569,234 @@ async def otc_status(request: Request, broker: str = "IQ_OPTION"):
             )
         ),
         "pairs": len(OTC_BASE),
+    }
+
+
+
+def _compat_dt(value):
+    """Normaliza o horário do candle para comparação, preservando ajuste de fuso separado."""
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                try:
+                    dt = datetime.strptime(raw, fmt)
+                    break
+                except Exception:
+                    dt = None
+            if dt is None:
+                return None
+
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(BR_TZ).replace(tzinfo=None)
+    return dt.replace(second=0, microsecond=0)
+
+
+def _compat_direction(candle):
+    try:
+        o = float(candle.get("open"))
+        c = float(candle.get("close"))
+    except Exception:
+        return "UNKNOWN"
+    eps = max(abs(o) * 1e-9, 1e-12)
+    if c > o + eps:
+        return "UP"
+    if c < o - eps:
+        return "DOWN"
+    return "DOJI"
+
+
+def _compare_candle_feeds(app_rows, broker_rows, sample=50):
+    """Compara fechamento/horário/direção de duas fontes sem alterar a estratégia de sinais."""
+    app_rows = list(app_rows or [])[-max(10, int(sample)):]
+    broker_rows = list(broker_rows or [])[-max(10, int(sample)):]
+
+    app_parsed = []
+    for row in app_rows:
+        dt = _compat_dt(row.get("datetime") if isinstance(row, dict) else None)
+        if dt:
+            app_parsed.append((dt, row))
+
+    broker_parsed = []
+    for row in broker_rows:
+        dt = _compat_dt(row.get("datetime") if isinstance(row, dict) else None)
+        if dt:
+            broker_parsed.append((dt, row))
+
+    base = max(1, min(len(app_parsed), len(broker_parsed), max(10, int(sample))))
+    broker_map = {dt: row for dt, row in broker_parsed}
+
+    # Twelve Data pode rotular o horário em outro fuso. Procuramos o melhor ajuste
+    # de horas, mas qualquer deslocamento residual de minuto é tratado como alerta.
+    best = None
+    for hour_shift in range(-12, 15):
+        for minute_shift in (-2, -1, 0, 1, 2):
+            shift = timedelta(hours=hour_shift, minutes=minute_shift)
+            pairs = []
+            for dt, row in app_parsed:
+                other = broker_map.get(dt + shift)
+                if other is not None:
+                    pairs.append((row, other))
+            score = (len(pairs), 1 if minute_shift == 0 else 0, -abs(hour_shift), -abs(minute_shift))
+            if best is None or score > best[0]:
+                best = (score, hour_shift, minute_shift, pairs)
+
+    _, hour_shift, minute_shift, pairs = best if best else ((0, 0, 0, 0), 0, 0, [])
+    matched = len(pairs)
+    time_match = round((matched / base) * 100.0, 2) if base else 0.0
+
+    direction_hits = 0
+    valid_direction = 0
+    close_diffs = []
+    examples = []
+    for app_c, broker_c in pairs:
+        ad = _compat_direction(app_c)
+        bd = _compat_direction(broker_c)
+        if ad != "UNKNOWN" and bd != "UNKNOWN":
+            valid_direction += 1
+            if ad == bd:
+                direction_hits += 1
+        try:
+            ac = float(app_c.get("close"))
+            bc = float(broker_c.get("close"))
+            denom = max(abs(ac), abs(bc), 1e-12)
+            close_diffs.append(abs(ac - bc) / denom * 100.0)
+        except Exception:
+            pass
+        if len(examples) < 5:
+            examples.append({
+                "app_direction": ad,
+                "broker_direction": bd,
+                "app_close": app_c.get("close"),
+                "broker_close": broker_c.get("close"),
+            })
+
+    direction_match = round((direction_hits / valid_direction) * 100.0, 2) if valid_direction else 0.0
+    avg_close_diff = round(sum(close_diffs) / len(close_diffs), 5) if close_diffs else None
+
+    if matched < min(20, base):
+        verdict = "AMOSTRA INSUFICIENTE"
+        grade = "WAITING"
+    elif minute_shift != 0:
+        verdict = "ATENÇÃO AO FECHAMENTO"
+        grade = "WARNING"
+    elif time_match >= 95 and direction_match >= 96:
+        verdict = "MUITO COMPATÍVEL"
+        grade = "EXCELLENT"
+    elif time_match >= 90 and direction_match >= 90:
+        verdict = "COMPATÍVEL"
+        grade = "GOOD"
+    elif time_match >= 80 and direction_match >= 80:
+        verdict = "ATENÇÃO"
+        grade = "WARNING"
+    else:
+        verdict = "NÃO RECOMENDADA PARA M1"
+        grade = "BAD"
+
+    return {
+        "sample_requested": int(sample),
+        "app_candles": len(app_parsed),
+        "broker_candles": len(broker_parsed),
+        "matched_candles": matched,
+        "time_match_percent": time_match,
+        "direction_match_percent": direction_match,
+        "average_close_difference_percent": avg_close_diff,
+        "detected_hour_shift": hour_shift,
+        "detected_minute_shift": minute_shift,
+        "verdict": verdict,
+        "grade": grade,
+        "examples": examples,
+    }
+
+
+@app.get("/compatibility-test")
+async def compatibility_test(
+    request: Request,
+    symbol: str = "EUR/USD",
+    interval: str = "1min",
+    sample: int = 50,
+    broker: str = "IQ_OPTION",
+):
+    """Compara o feed OPEN do MEGA IA com o mercado aberto da corretora conectada."""
+    symbol = str(symbol or "EUR/USD").upper()
+    interval = str(interval or "1min")
+    broker = str(broker or "IQ_OPTION").upper()
+    sample = max(20, min(int(sample or 50), 100))
+
+    if symbol not in SYMBOLS or interval not in INTERVALS:
+        raise HTTPException(400, "Ativo ou intervalo inválido.")
+    if broker != "IQ_OPTION":
+        raise HTTPException(400, "Esta versão mede automaticamente apenas a IQ Option.")
+
+    iq_state = _iq_session_state(request, required=False)
+    if not iq_state or not _iq_connected(iq_state):
+        return {
+            "ok": False,
+            "broker": "IQ Option",
+            "symbol": symbol,
+            "interval": interval,
+            "status": "CORRETORA DESCONECTADA",
+            "message": "Conecte a IQ Option na aba Corretora para comparar as velas do mercado aberto.",
+        }
+
+    # Pede uma margem extra e remove a vela em formação dos dois lados.
+    need = min(120, sample + 8)
+    try:
+        app_rows = await candles_open(symbol, interval, need)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "broker": "IQ Option",
+            "symbol": symbol,
+            "interval": interval,
+            "status": "FONTE DO APP INDISPONÍVEL",
+            "message": str(exc)[:220],
+        }
+
+    try:
+        lock = iq_state.get("lock") or asyncio.Lock()
+        iq_state["lock"] = lock
+        async with lock:
+            broker_rows = await asyncio.wait_for(
+                asyncio.to_thread(
+                    iq_candles_blocking,
+                    iq_state,
+                    symbol,
+                    interval,
+                    need,
+                    True,
+                ),
+                timeout=IQ_CANDLE_TIMEOUT + 5,
+            )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "broker": "IQ Option",
+            "symbol": symbol,
+            "interval": interval,
+            "status": "CANDLES DA CORRETORA INDISPONÍVEIS",
+            "message": str(exc)[:220],
+        }
+
+    app_closed = app_rows[:-1] if len(app_rows) > 1 else app_rows
+    broker_closed = broker_rows[:-1] if len(broker_rows) > 1 else broker_rows
+    metrics = _compare_candle_feeds(app_closed, broker_closed, sample)
+
+    return {
+        "ok": True,
+        "broker": "IQ Option",
+        "source": "MEGA IA • Mercado Aberto",
+        "symbol": symbol,
+        "interval": interval,
+        "tested_at": iso(now()),
+        **metrics,
+        "note": "Teste técnico dos candles. Não é garantia de resultado financeiro e não valida OTC.",
     }
 
 
@@ -5164,14 +5419,19 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         if len(raw) >= 25:
             closed = raw[:-1] if len(raw) > 1 else raw
             if market == "OPEN":
-                tech = (
-                    intelligent_artificial_strategy(closed, interval)
-                    if engine == "SMART"
-                    else primary_rsi_cross_strategy(closed, 14, interval)
-                )
-                direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
-                engine_label = "IA" if engine == "SMART" else "RSI"
-                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO")
+                if engine == "SMART":
+                    tech = await openai_direct_signal(sym, interval, closed, market)
+                    direction = tech.get("direction", "NEUTRO") if tech.get("available") and tech.get("confirmed") else "NEUTRO"
+                    engine_label = "IA PURA"
+                    if not tech.get("available"):
+                        status_text = "IA PURA • INDISPONÍVEL"
+                    else:
+                        status_text = ("IA PURA • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else "IA PURA • MONITORANDO")
+                else:
+                    tech = primary_rsi_cross_strategy(closed, 14, interval)
+                    direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
+                    engine_label = "ROBÔ PRINCIPAL"
+                    status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO")
             else:
                 tech = {"direction": "NEUTRO", "confidence": 0, "confirmed": False}
                 direction = "NEUTRO"
@@ -5255,14 +5515,19 @@ def _accounting_key(payload: Dict[str, Any]) -> str:
 
 
 def _result_operation_key(payload: Dict[str, Any], market: str = "OPEN") -> str:
-    """Chave única do desfecho final de uma operação."""
+    """Chave única da operação física, independente do caminho que a registrou.
+
+    O mesmo sinal pode chegar ao servidor pelo painel e pela rotina de
+    resultado com pequenas diferenças no campo de expiração. A entrada
+    (mercado + ativo + timeframe + direção + instante de entrada) é a
+    identidade estável da operação e impede WIN/LOSS em dobro.
+    """
     return "|".join([
         str(market or payload.get("market") or "OPEN").upper(),
         str(payload.get("symbol") or ""),
         str(payload.get("interval") or ""),
         str(payload.get("direction") or "").upper(),
         _canonical_time_key(payload.get("entry_time")),
-        _canonical_time_key(payload.get("expiry_time")),
     ])
 
 
@@ -5370,13 +5635,14 @@ async def performance(request: Request, interval="1min", market="OPEN"):
     pending, done = _accounting_buckets(request, market)
     done = done or {}
 
-    # Une resultados da contabilidade automática e do endpoint /result.
-    # A chave simplificada impede dupla contagem da mesma entrada.
+    # 33.77.1 — uma operação física só pode produzir UM resultado final.
+    # A entrada é identificada por mercado+ativo+timeframe+direção+horário.
+    # Isso evita que o mesmo WIN chegue pelo painel e pela contabilidade
+    # automática e seja somado duas vezes.
     merged_direct = {}
     for x in done.values():
         if x.get("result") in ("WIN", "LOSS", "DRAW"):
-            k = _result_operation_key(x, market)
-            merged_direct[k] = x
+            merged_direct[_result_operation_key(x, market)] = x
 
     if market == "IQ_OTC":
         state_direct = _iq_session_state(request, required=False)
@@ -5384,34 +5650,37 @@ async def performance(request: Request, interval="1min", market="OPEN"):
     else:
         direct_store = results.setdefault(market, {})
 
+    # Diagnóstico da primeira vela (LOSS DIRETO = foi para Gale).
     for x in direct_store.values():
-        if x.get("result") in ("WIN", "LOSS", "DRAW"):
+        entry_result = str(x.get("entry_result") or "").upper()
+        if entry_result in ("WIN", "LOSS", "DRAW"):
             k = _result_operation_key(x, market)
-            merged_direct[k] = x
+            merged_direct[k] = {**x, "result": entry_result}
+        elif x.get("result") in ("WIN", "LOSS", "DRAW"):
+            merged_direct[_result_operation_key(x, market)] = x
 
-    win_direct = sum(1 for x in merged_direct.values() if x.get("result") == "WIN")
     loss_direct = sum(1 for x in merged_direct.values() if x.get("result") == "LOSS")
     draws = sum(1 for x in merged_direct.values() if x.get("result") == "DRAW")
 
-    # Gale é apurado como desfecho da MESMA operação.
-    # A primeira vela que perdeu continua aparecendo em LOSS DIRETO para análise,
-    # mas o placar principal só considera o resultado FINAL após G1/G2.
-    if market == "IQ_OTC":
-        state = _iq_session_state(request, required=False)
-        gale_store = state.setdefault("results", {}) if state else {}
-    else:
-        gale_store = results.setdefault(market, {})
-    # Deduplica o resultado final por operação. O mesmo sinal pode chegar pelo
-    # painel principal e pelo gráfico com timestamps escritos em formatos
-    # diferentes (ex.: -03:00 e Z). Isso não pode somar duas vezes.
+    # Resultado FINAL por operação. Resultado de Gale sempre prevalece sobre
+    # o resultado da primeira vela. LOSS da primeira vela não é LOSS final.
     final_ops = {}
-    for x in gale_store.values():
-        if x.get("result") in ("WIN G1", "WIN G2", "LOSS G2"):
-            final_ops[_result_operation_key(x, market)] = x
+    for x in done.values():
+        if x.get("result") == "WIN":
+            final_ops[_result_operation_key(x, market)] = "WIN"
 
-    win_g1 = sum(1 for x in final_ops.values() if x.get("result") == "WIN G1")
-    win_g2 = sum(1 for x in final_ops.values() if x.get("result") == "WIN G2")
-    loss_g2 = sum(1 for x in final_ops.values() if x.get("result") == "LOSS G2")
+    for x in direct_store.values():
+        r = str(x.get("result") or "").upper()
+        k = _result_operation_key(x, market)
+        if r in ("WIN G1", "WIN G2", "LOSS G2"):
+            final_ops[k] = r
+        elif r == "WIN" and k not in final_ops:
+            final_ops[k] = "WIN"
+
+    win_direct = sum(1 for r in final_ops.values() if r == "WIN")
+    win_g1 = sum(1 for r in final_ops.values() if r == "WIN G1")
+    win_g2 = sum(1 for r in final_ops.values() if r == "WIN G2")
+    loss_g2 = sum(1 for r in final_ops.values() if r == "LOSS G2")
 
     wins = win_direct + win_g1 + win_g2
     losses = loss_g2
@@ -6018,9 +6287,9 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   <div class="robot-mode-card" id="robotModeCard">
-    <img src="__MEGA_IMAGE__" alt="Robô RSI">
+    <img src="__MEGA_IMAGE__" alt="Robô principal">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">🤖 ROBÔ RSI</div>
+      <div class="robot-mode-title">🤖 ROBÔ PRINCIPAL</div>
       <div class="robot-mode-desc" id="robotModeDesc">Leitura objetiva do mercado • sinal somente após confirmação no candle fechado.</div>
     </div>
     <button id="robotPowerBtn" type="button" style="font-weight:900">🟢 ONLINE</button>
@@ -6030,7 +6299,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Inteligência Artificial">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧠 INTELIGÊNCIA ARTIFICIAL</div>
-      <div class="robot-mode-desc" id="aiModeDesc">Análise avançada de contexto • avalia direção, força, regiões importantes e risco antes da entrada.</div>
+      <div class="robot-mode-desc" id="aiModeDesc">IA pura • lê somente os candles do gráfico e decide CALL, PUT ou NEUTRO sem usar indicadores.</div>
     </div>
     <button id="aiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -6040,6 +6309,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button class="tabbtn" id="tabChart">📈 Gráfico</button>
     <button class="tabbtn" id="tabResults">🎯 Resultados</button>
     <button class="tabbtn" id="tabHistory">🗓️ Histórico 15 dias</button>
+    <button class="tabbtn" id="tabCompatibility">🧪 Compatibilidade</button>
     <button class="tabbtn" id="tabAccount">🏦 Corretora</button>
   </div>
 
@@ -6174,6 +6444,64 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </div>
   </div>
 
+  <div id="compatibilityTab" class="tab">
+    <div class="card">
+      <h2 style="margin-top:0">🧪 Compatibilidade de corretoras</h2>
+      <div class="label">COMPARAÇÃO REAL DE CANDLES • MERCADO ABERTO</div>
+      <div style="margin-top:10px;line-height:1.5">
+        Compara os últimos 50 candles fechados do ativo selecionado no MEGA IA com a IQ Option.
+        O teste mede sincronização de horário, direção das velas e diferença média de fechamento.
+      </div>
+
+      <div class="grid" style="margin-top:12px">
+        <div class="card">
+          <div class="label">CORRETORA TESTADA</div>
+          <div class="big" style="font-size:20px">IQ Option</div>
+        </div>
+        <div class="card">
+          <div class="label">AMOSTRA</div>
+          <div class="big" style="font-size:20px">50 velas</div>
+        </div>
+        <div class="card">
+          <div class="label">MERCADO</div>
+          <div class="big" style="font-size:20px">ABERTO</div>
+        </div>
+      </div>
+
+      <button id="compatTestBtn" type="button" style="width:100%;margin-top:12px;font-weight:900">
+        🔍 TESTAR ATIVO SELECIONADO
+      </button>
+
+      <div id="compatStatus" class="card" style="margin-top:12px">
+        ⚪ Aguardando teste de compatibilidade.
+      </div>
+
+      <div id="compatMetrics" class="grid" style="margin-top:12px;display:none">
+        <div class="card">
+          <div class="label">DIREÇÃO IGUAL</div>
+          <div id="compatDirection" class="big" style="font-size:24px">--</div>
+        </div>
+        <div class="card">
+          <div class="label">HORÁRIO ALINHADO</div>
+          <div id="compatTime" class="big" style="font-size:24px">--</div>
+        </div>
+        <div class="card">
+          <div class="label">VELAS COMPARADAS</div>
+          <div id="compatMatched" class="big" style="font-size:24px">--</div>
+        </div>
+        <div class="card">
+          <div class="label">DIFERENÇA MÉDIA</div>
+          <div id="compatPrice" class="big" style="font-size:24px">--</div>
+        </div>
+      </div>
+
+      <div class="label" style="margin-top:12px;line-height:1.5">
+        O teste usa somente mercado aberto. OTC não é considerado compatível por este módulo.
+        A classificação é uma medição técnica interna e não garante resultado de operação.
+      </div>
+    </div>
+  </div>
+
   <div id="accountTab" class="tab">
     <div class="card">
       <h2 style="margin-top:0">🏦 Corretora</h2>
@@ -6304,8 +6632,8 @@ const robotModeDesc=document.getElementById('robotModeDesc');
 const aiPowerBtn=document.getElementById('aiPowerBtn');
 const aiModeDesc=document.getElementById('aiModeDesc');
 const voiceBtn=document.getElementById('voiceBtn');
-let robotEnabled=true; // Robô RSI original
-let aiEnabled=false;   // Inteligência Artificial por confluência
+let robotEnabled=true; // Robô principal
+let aiEnabled=false;   // Inteligência Artificial pura, sem indicadores
 try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
   aiEnabled=localStorage.getItem('mega_ai_power')==='ONLINE';
@@ -6333,8 +6661,17 @@ const chartTab=document.getElementById('chartTab');
 const accountTab=document.getElementById('accountTab');
 const resultsTab=document.getElementById('resultsTab');
 const historyTab=document.getElementById('historyTab');
+const compatibilityTab=document.getElementById('compatibilityTab');
 const tabResults=document.getElementById('tabResults');
 const tabHistory=document.getElementById('tabHistory');
+const tabCompatibility=document.getElementById('tabCompatibility');
+const compatTestBtn=document.getElementById('compatTestBtn');
+const compatStatus=document.getElementById('compatStatus');
+const compatMetrics=document.getElementById('compatMetrics');
+const compatDirection=document.getElementById('compatDirection');
+const compatTime=document.getElementById('compatTime');
+const compatMatched=document.getElementById('compatMatched');
+const compatPrice=document.getElementById('compatPrice');
 const historyList=document.getElementById('historyList');
 const historySummary=document.getElementById('historySummary');
 const winDirect=document.getElementById('winDirect');
@@ -6445,6 +6782,7 @@ function emptyResultBucket(){
     processed_keys:[],
     entry_keys:[],
     gale_keys:[],
+    final_ops:{},
     history:[]
   };
 }
@@ -6465,10 +6803,22 @@ function normalizeResultBucket(x){
   b.processed_keys=Array.isArray(x.processed_keys)?x.processed_keys.slice(-1500):[];
   b.entry_keys=Array.isArray(x.entry_keys)?x.entry_keys.slice(-1500):[];
   b.gale_keys=Array.isArray(x.gale_keys)?x.gale_keys.slice(-1500):[];
+  b.final_ops=(x.final_ops && typeof x.final_ops==='object' && !Array.isArray(x.final_ops)) ? {...x.final_ops} : {};
   const cutoff=Date.now()-(15*24*60*60*1000);
   b.history=(Array.isArray(x.history)?x.history:[])
     .filter(h=>{ const ms=Date.parse(String((h&&h.timestamp)||'')); return Number.isFinite(ms) && ms>=cutoff; })
     .slice(-1000);
+
+  // Migração automática: versões antigas não tinham final_ops. O histórico
+  // já contém uma linha por operação e permite corrigir um placar duplicado.
+  if(!Object.keys(b.final_ops).length && b.history.length){
+    b.history.forEach(h=>{
+      if(h && h.key && ['WIN','WIN G1','WIN G2','LOSS G2'].includes(String(h.result||'').toUpperCase())){
+        b.final_ops[String(h.key)]=String(h.result).toUpperCase();
+      }
+    });
+  }
+  recountFinalBucket(b);
   return b;
 }
 
@@ -6524,6 +6874,26 @@ function resultTradeKey(t){
     canonicalTradeTime(t.entry_time),
     canonicalTradeTime(t.expiry_time)
   ].join('|');
+}
+
+function resultOperationKey(t){
+  if(!t) return '';
+  return [
+    resultMarket(t.market),
+    t.symbol||'',
+    t.interval||'',
+    String(t.direction||'').toUpperCase(),
+    canonicalTradeTime(t.entry_time)
+  ].join('|');
+}
+
+function recountFinalBucket(b){
+  if(!b) return;
+  const vals=Object.values(b.final_ops||{}).map(v=>String(v||'').toUpperCase());
+  b.win_direct=vals.filter(v=>v==='WIN').length;
+  b.win_g1=vals.filter(v=>v==='WIN G1').length;
+  b.win_g2=vals.filter(v=>v==='WIN G2').length;
+  b.loss_g2=vals.filter(v=>v==='LOSS G2').length;
 }
 
 function loadPersistentResults(){
@@ -6593,10 +6963,10 @@ function renderHistory(){
 }
 
 function isResultAlreadyCounted(t){
-  const key=resultTradeKey(t);
+  const key=resultOperationKey(t);
   if(!key) return false;
   const b=persistentResults[resultMarket(t.market)]||emptyResultBucket();
-  return b.processed_keys.includes(key);
+  return !!(b.final_ops && b.final_ops[key]) || b.processed_keys.includes(key);
 }
 
 function registerPersistentResult(t,x){
@@ -6605,42 +6975,39 @@ function registerPersistentResult(t,x){
   const b=persistentResults[m]||emptyResultBucket();
   persistentResults[m]=b;
   const key=resultTradeKey(t);
-  if(!key) return false;
+  const opKey=resultOperationKey(t);
+  if(!key || !opKey) return false;
 
   let changed=false;
   const entryResult=String(x.entry_result||((x.result==='WIN'||x.result==='LOSS')?x.result:'')).toUpperCase();
-  const entryKey=key+'|ENTRY';
+  const entryKey=opKey+'|ENTRY';
 
-  // WIN/LOSS principal: contabiliza assim que a PRIMEIRA vela fecha.
-  if((entryResult==='WIN'||entryResult==='LOSS') && !b.entry_keys.includes(entryKey)){
+  // LOSS da primeira vela é apenas diagnóstico: mostra quantas operações
+  // precisaram de Gale. WIN direto é contado somente no resultado FINAL.
+  if(entryResult==='LOSS' && !b.entry_keys.includes(entryKey)){
     b.entry_keys.push(entryKey);
     if(b.entry_keys.length>1500) b.entry_keys=b.entry_keys.slice(-1500);
-    if(entryResult==='WIN') b.win_direct++;
-    else b.loss_direct++;
+    b.loss_direct++;
     changed=true;
   }
 
-  // Gale é apenas estatística separada e nunca altera o placar principal.
   const r=String(x.result||'').toUpperCase();
-  const galeKey=key+'|FINAL';
-  if(['WIN G1','WIN G2','LOSS G2'].includes(r) && !b.gale_keys.includes(galeKey)){
-    b.gale_keys.push(galeKey);
-    if(b.gale_keys.length>1500) b.gale_keys=b.gale_keys.slice(-1500);
-    if(r==='WIN G1') b.win_g1++;
-    else if(r==='WIN G2') b.win_g2++;
-    else b.loss_g2++;
-    changed=true;
-  }
-
-  // Histórico detalhado: registra somente o desfecho FINAL da operação.
-  // LOSS da primeira vela não entra aqui, pois ainda pode virar WIN G1/G2.
   if(['WIN','WIN G1','WIN G2','LOSS G2'].includes(r)){
-    const historyExists=(b.history||[]).some(h=>h && h.key===key);
+    b.final_ops=b.final_ops||{};
+    if(!b.final_ops[opKey]){
+      b.final_ops[opKey]=r;
+      recountFinalBucket(b);
+      changed=true;
+    }
+
+    // Histórico detalhado: exatamente uma linha para a mesma operação.
+    const historyExists=(b.history||[]).some(h=>h && (h.op_key===opKey || h.key===key));
     if(!historyExists){
       const stamp=t.entry_time||t.expiry_time||new Date().toISOString();
       b.history=(b.history||[]);
       b.history.push({
         key:key,
+        op_key:opKey,
         timestamp:stamp,
         symbol:t.symbol||'',
         interval:t.interval||'',
@@ -6651,12 +7018,12 @@ function registerPersistentResult(t,x){
       pruneHistory(b);
       changed=true;
     }
-  }
 
-  if(r && ['WIN','LOSS','WIN G1','WIN G2','LOSS G2'].includes(r) && !b.processed_keys.includes(key)){
-    b.processed_keys.push(key);
-    if(b.processed_keys.length>1500) b.processed_keys=b.processed_keys.slice(-1500);
-    changed=true;
+    if(!b.processed_keys.includes(opKey)){
+      b.processed_keys.push(opKey);
+      if(b.processed_keys.length>1500) b.processed_keys=b.processed_keys.slice(-1500);
+      changed=true;
+    }
   }
 
   if(changed){
@@ -6666,28 +7033,37 @@ function registerPersistentResult(t,x){
   return changed;
 }
 
+
 function mergeServerPerformance(p,m){
   if(!p) return;
   m=resultMarket(m);
   const b=persistentResults[m]||emptyResultBucket();
   persistentResults[m]=b;
 
-  // O servidor funciona como segunda fonte. Uma resposta zerada/atrasada
-  // NUNCA pode apagar um WIN/LOSS que o navegador acabou de confirmar.
-  const serverWins=Math.max(0,Number(p.win_direct||p.wins||0));
-  const serverLosses=Math.max(0,Number(p.loss_direct||p.losses||0));
-  b.win_direct=Math.max(Number(b.win_direct||0),serverWins);
-  b.loss_direct=Math.max(Number(b.loss_direct||0),serverLosses);
-  // Gales continuam apenas como estatística separada.
-  b.win_g1=Math.max(b.win_g1,Number(p.win_g1||0));
-  b.win_g2=Math.max(b.win_g2,Number(p.win_g2||0));
-  b.loss_g2=Math.max(b.loss_g2,Number(p.loss_g2||0));
+  // 33.77.1: depois que este aparelho registrou uma operação, o histórico
+  // local passa a ser a fonte do placar. Assim uma resposta duplicada do
+  // servidor nunca transforma 1 WIN em 2 WIN.
+  const hasLocalFinal=Object.keys(b.final_ops||{}).length>0 || (b.history||[]).length>0;
+  if(hasLocalFinal){
+    recountFinalBucket(b);
+    savePersistentResults();
+    return;
+  }
+
+  // Hidratação inicial apenas quando o aparelho ainda não tem histórico.
+  b.win_direct=Math.max(0,Number(p.win_direct||0));
+  b.win_g1=Math.max(0,Number(p.win_g1||0));
+  b.win_g2=Math.max(0,Number(p.win_g2||0));
+  b.loss_direct=Math.max(0,Number(p.loss_direct||0));
+  b.loss_g2=Math.max(0,Number(p.loss_g2||0));
   savePersistentResults();
 }
+
 
 function paintPersistentResults(){
   const m=activeResultMarket();
   const b=persistentResults[m]||emptyResultBucket();
+  if(Object.keys(b.final_ops||{}).length) recountFinalBucket(b);
   // Placar principal = resultado FINAL da operação.
   // WIN direto, WIN G1 ou WIN G2 contam como WIN; LOSS só após perder até G2.
   const totalWins=Number(b.win_direct||0)+Number(b.win_g1||0)+Number(b.win_g2||0);
@@ -7516,18 +7892,21 @@ function showTab(which){
   const chart=which==='chart';
   const results=which==='results';
   const history=which==='history';
+  const compatibility=which==='compatibility';
   const account=which==='account';
 
   mainTab.classList.toggle('active',main);
   chartTab.classList.toggle('active',chart);
   resultsTab.classList.toggle('active',results);
   historyTab.classList.toggle('active',history);
+  compatibilityTab.classList.toggle('active',compatibility);
   accountTab.classList.toggle('active',account);
 
   tabMain.classList.toggle('active',main);
   tabChart.classList.toggle('active',chart);
   tabResults.classList.toggle('active',results);
   tabHistory.classList.toggle('active',history);
+  tabCompatibility.classList.toggle('active',compatibility);
   tabAccount.classList.toggle('active',account);
 
   if(chart){
@@ -7543,6 +7922,10 @@ function showTab(which){
     renderHistory();
   }
 
+  if(compatibility){
+    runCompatibilityTest(false);
+  }
+
   if(account){
     refreshAccountStatus();
   }
@@ -7552,9 +7935,63 @@ tabMain.onclick=()=>showTab('main');
 tabChart.onclick=()=>showTab('chart');
 tabResults.onclick=()=>showTab('results');
 tabHistory.onclick=()=>showTab('history');
+tabCompatibility.onclick=()=>showTab('compatibility');
 tabAccount.onclick=()=>showTab('account');
 
 window.addEventListener('resize',resizeChart);
+
+let compatBusy=false;
+
+function compatibilityVerdictStyle(grade){
+  if(grade==='EXCELLENT' || grade==='GOOD') return 'color:#31e981;border-color:#31e981';
+  if(grade==='BAD') return 'color:#ff5f73;border-color:#ff5f73';
+  return 'color:#ffd54f;border-color:#ffd54f';
+}
+
+async function runCompatibilityTest(manual=true){
+  if(compatBusy || !compatStatus) return;
+  compatBusy=true;
+  if(compatTestBtn) compatTestBtn.disabled=true;
+  const sym=(S&&S.value)||'EUR/USD';
+  const tf=(interval&&interval.value)||'1min';
+  compatStatus.setAttribute('style','margin-top:12px');
+  compatStatus.innerHTML='⏳ Comparando '+sym+' • '+tf+' com a IQ Option...';
+  if(compatMetrics) compatMetrics.style.display='none';
+  try{
+    const d=await get('/compatibility-test?broker=IQ_OPTION&symbol='+encodeURIComponent(sym)+'&interval='+encodeURIComponent(tf)+'&sample=50');
+    if(!d.ok){
+      compatStatus.innerHTML='⚠️ <b>'+(d.status||'TESTE INDISPONÍVEL')+'</b><br><span style="opacity:.8">'+(d.message||'Não foi possível comparar agora.')+'</span>';
+      return;
+    }
+    compatStatus.setAttribute('style','margin-top:12px;'+compatibilityVerdictStyle(d.grade));
+    compatStatus.innerHTML='🧪 <b>'+d.verdict+'</b><br><span style="opacity:.85">'+d.symbol+' • '+d.interval+' • '+d.broker+'</span>';
+    if(compatDirection) compatDirection.textContent=Number(d.direction_match_percent||0).toFixed(1)+'%';
+    if(compatTime) compatTime.textContent=Number(d.time_match_percent||0).toFixed(1)+'%';
+    if(compatMatched) compatMatched.textContent=String(d.matched_candles||0)+' / '+String(d.sample_requested||50);
+    if(compatPrice){
+      const v=d.average_close_difference_percent;
+      compatPrice.textContent=(v===null || v===undefined)?'--':Number(v).toFixed(4)+'%';
+    }
+    if(compatMetrics) compatMetrics.style.display='grid';
+  }catch(e){
+    compatStatus.innerHTML='⚠️ Falha temporária ao executar o teste de compatibilidade.';
+  }finally{
+    compatBusy=false;
+    if(compatTestBtn) compatTestBtn.disabled=false;
+  }
+}
+
+if(compatTestBtn){
+  compatTestBtn.onclick=()=>runCompatibilityTest(true);
+}
+
+// Enquanto a aba estiver aberta, refaz a medição a cada 10 minutos.
+// Isso evita gastar créditos da fonte em excesso.
+setInterval(()=>{
+  if(compatibilityTab && compatibilityTab.classList.contains('active')){
+    runCompatibilityTest(false);
+  }
+},600000);
 
 async function refreshAccountStatus(){
   const b=(broker&&broker.value)||'IQ_OPTION';
@@ -7816,23 +8253,23 @@ function applyRobotPowerState(){
     ? 'ONLINE: leitura objetiva do mercado com confirmação no fechamento.'
     : 'OFFLINE: robô principal pausado.';
   if(aiModeDesc) aiModeDesc.textContent=aiEnabled
-    ? 'ONLINE: análise avançada de contexto, força, regiões importantes e risco antes de liberar a entrada.'
+    ? 'ONLINE: IA pura analisando somente candles e contexto de preço, sem indicadores.'
     : 'OFFLINE: análise inteligente pausada.';
 
   const engine=selectedRobotEngine();
   if(engine==='SMART'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='INTELIGÊNCIA ARTIFICIAL ONLINE • ANALISANDO CONFLUÊNCIAS';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='INTELIGÊNCIA ARTIFICIAL ONLINE • IA PURA ANALISANDO CANDLES';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 Inteligência Artificial selecionada.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar IA ativo • procurando oportunidades</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar IA pura ativo • analisando candles</div>';
     rad();
   }else if(engine==='RSI'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔ RSI ONLINE • MONITORANDO O TIMEFRAME SELECIONADO';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 Robô RSI original selecionado.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar RSI ativo • procurando oportunidades</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔ PRINCIPAL ONLINE • MONITORANDO O TIMEFRAME SELECIONADO';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 Robô principal selecionado.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar do robô principal ativo • procurando oportunidades</div>';
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔS OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ Robô RSI e Inteligência Artificial estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ Robô principal e Inteligência Artificial estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -8081,7 +8518,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':'ROBÔ RSI'} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
+    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':'ROBÔ PRINCIPAL'} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
     await sig(true);
   }finally{
     radarAutoBusy=false;
