@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "33.80.0"
-PWA_VERSION = "v62"
+APP_VERSION = "33.81.0"
+PWA_VERSION = "v63"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -2693,6 +2693,100 @@ def primary_rsi_cross_strategy(cs, period=14, timeframe="15min"):
             "reason": f"Sem confirmação de entrada agora em {tf_label}."}
 
 
+
+def hidden_indicator_strategy(cs, timeframe="1min"):
+    """Motor INDICADOR de teste, não-repaint e somente com candles fechados.
+
+    A biblioteca externa do TradingView não está disponível no servidor. Por isso,
+    o app usa uma conversão própria dos parâmetros 30/5/5 como detector de zona e
+    reversão, com confirmações internas. Os nomes e parâmetros ficam ocultos no
+    painel para que o teste seja feito apenas pelo resultado dos sinais.
+    """
+    depth = 30
+    deviation = 5
+    backstep = 5
+    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
+
+    if len(cs) < depth + backstep + 3:
+        return {
+            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+            "strategy": "INDICADOR",
+            "reason": f"Aguardando histórico suficiente em {tf_label}.",
+            "hidden": True,
+        }
+
+    sample = cs[-(depth + backstep + 6):]
+    last = sample[-1]
+    previous = sample[:-1]
+    zone_rows = previous[-depth:]
+    recent_rows = sample[-backstep:]
+
+    closes = [float(c["close"]) for c in sample]
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+    if e9 is None or e21 is None:
+        return {
+            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+            "strategy": "INDICADOR", "reason": "Aguardando confirmação interna.", "hidden": True,
+        }
+
+    o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"])
+    candle_range = max(h - l, 1e-12)
+    body = abs(c - o)
+    body_ratio = body / candle_range
+
+    prior_for_avg = previous[-12:] if len(previous) >= 12 else previous
+    avg_range = sum(max(float(x["high"]) - float(x["low"]), 1e-12) for x in prior_for_avg) / max(1, len(prior_for_avg))
+    avg_body = sum(abs(float(x["close"]) - float(x["open"])) for x in prior_for_avg) / max(1, len(prior_for_avg))
+
+    zone_low = min(float(x["low"]) for x in zone_rows)
+    zone_high = max(float(x["high"]) for x in zone_rows)
+    zone_span = max(zone_high - zone_low, avg_range, 1e-12)
+    tolerance = max(avg_range * 0.45, zone_span * (deviation / 100.0))
+
+    local_low = min(float(x["low"]) for x in recent_rows)
+    local_high = max(float(x["high"]) for x in recent_rows)
+
+    bullish = c > o
+    bearish = c < o
+    strong = body_ratio >= 0.55 and body >= avg_body * 0.90
+    trend_up = e9 > e21 and c >= e9
+    trend_down = e9 < e21 and c <= e9
+
+    buy_zone = l <= zone_low + tolerance and l <= local_low + (avg_range * 0.05)
+    sell_zone = h >= zone_high - tolerance and h >= local_high - (avg_range * 0.05)
+
+    # Evita aceitar uma vela enorme causada apenas por pico fora do padrão.
+    healthy_range = candle_range <= avg_range * 2.8
+
+    call_ok = buy_zone and bullish and strong and trend_up and healthy_range
+    put_ok = sell_zone and bearish and strong and trend_down and healthy_range
+
+    ema_sep = abs(e9 - e21) / max(avg_range, 1e-12)
+    strength_bonus = min(8.0, max(0.0, (body_ratio - 0.55) * 20.0))
+    trend_bonus = min(7.0, ema_sep * 8.0)
+    confidence = min(95.0, 80.0 + strength_bonus + trend_bonus)
+
+    if call_ok:
+        return {
+            "direction": "CALL", "confidence": round(confidence, 1), "confirmed": True,
+            "strategy": "INDICADOR", "reason": "Confluência interna de compra confirmada no candle fechado.",
+            "risk": "MEDIUM", "hidden": True,
+        }
+    if put_ok:
+        return {
+            "direction": "PUT", "confidence": round(confidence, 1), "confirmed": True,
+            "strategy": "INDICADOR", "reason": "Confluência interna de venda confirmada no candle fechado.",
+            "risk": "MEDIUM", "hidden": True,
+        }
+
+    return {
+        "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+        "strategy": "INDICADOR", "reason": f"Indicador online • aguardando confirmação em {tf_label}.",
+        "hidden": True,
+    }
+
+
 def intelligent_artificial_strategy(cs, timeframe="1min"):
     """
     INTELIGÊNCIA ARTIFICIAL local por confluência enxuta.
@@ -4050,7 +4144,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     market = (market or "OPEN").upper()
     engine = (engine or "RSI").upper()
-    if engine not in ("RSI", "SMART"):
+    if engine not in ("RSI", "SMART", "INDICATOR"):
         engine = "RSI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}"
@@ -4125,8 +4219,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     # ou qualquer outro indicador/score interno na decisão.
     if ai_only and NEW_PRIMARY_INDICATOR_ENABLED:
         tf_label = {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval)
-        engine_title = "INTELIGÊNCIA ARTIFICIAL" if engine == "SMART" else "ROBÔ PRINCIPAL"
-        engine_mode = "PURE_AI" if engine == "SMART" else "PRIMARY_RSI_TEST"
+        if engine == "SMART":
+            engine_title = "INTELIGÊNCIA ARTIFICIAL"
+            engine_mode = "PURE_AI"
+        elif engine == "INDICATOR":
+            engine_title = "INDICADOR"
+            engine_mode = "HIDDEN_INDICATOR_TEST"
+        else:
+            engine_title = "ROBÔ PRINCIPAL"
+            engine_mode = "PRIMARY_RSI_TEST"
 
         if market != "OPEN":
             out = neutral_signal(
@@ -4136,14 +4237,14 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 source_state="READY",
             )
             out.update({
-                "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else f"{engine_title} {tf_label}",
+                "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("INDICADOR" if engine == "INDICATOR" else f"{engine_title} {tf_label}"),
                 "mode": engine_mode,
                 "selected_engine": engine,
                 "ai_provider": "GEMINI_PURE" if engine == "SMART" else "DISABLED",
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
-                    else {"legacy_disabled": True, "rsi_period": 14, "rsi_timeframe": interval}
+                    else ({"hidden": True, "mode": "INDICATOR"} if engine == "INDICATOR" else {"legacy_disabled": True, "rsi_period": 14, "rsi_timeframe": interval})
                 ),
                 "legacy_ai_disabled": engine != "SMART",
                 "legacy_indicators_disabled": True,
@@ -4158,6 +4259,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_closed = closed[-90:] if len(closed) > 90 else closed
             if engine == "SMART":
                 analysis = await openai_direct_signal(symbol, interval, engine_closed, market)
+            elif engine == "INDICATOR":
+                analysis = hidden_indicator_strategy(engine_closed, interval)
             else:
                 analysis = primary_rsi_cross_strategy(engine_closed, 14, interval)
         except Exception as exc:
@@ -4168,7 +4271,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 source_state="WAITING",
             )
             out.update({
-                "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else f"{engine_title} {tf_label}",
+                "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("INDICADOR" if engine == "INDICATOR" else f"{engine_title} {tf_label}"),
                 "mode": engine_mode,
                 "selected_engine": engine,
             })
@@ -4186,13 +4289,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "ai_confirmed": bool(engine == "SMART" and analysis.get("confirmed")),
             "ai_provider": "GEMINI_PURE" if engine == "SMART" else "DISABLED",
             "risk": str(analysis.get("risk", "HIGH") if engine == "SMART" else "HIGH").upper(),
-            "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else analysis.get("strategy", f"{engine_title} {tf_label}"),
+            "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("INDICADOR" if engine == "INDICATOR" else analysis.get("strategy", f"{engine_title} {tf_label}")),
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
             "technical": (
                 {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                 if engine == "SMART"
-                else analysis
+                else ({"hidden": True, "mode": "INDICATOR"} if engine == "INDICATOR" else analysis)
             ),
             "source_state": "READY" if ai_available else "AI_UNAVAILABLE",
             "mode": engine_mode,
@@ -4217,12 +4320,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             direction_now = analysis["direction"]
             reference_candle = engine_closed[-1].get("datetime") if engine_closed else None
             signal_fingerprint = f"{engine}|{direction_now}|{reference_candle}"
-            fingerprint_key = "pure_ai_fingerprint" if engine == "SMART" else "primary_rsi_fingerprint"
+            fingerprint_key = (
+                "pure_ai_fingerprint" if engine == "SMART"
+                else ("indicator_fingerprint" if engine == "INDICATOR" else "primary_rsi_fingerprint")
+            )
             if release_state.get(fingerprint_key) != signal_fingerprint:
                 announce, entry, expiry = entry_window(interval)
                 base.update({
                     "direction": direction_now,
-                    "status": "SINAL IA PURA LIBERADO" if engine == "SMART" else "SINAL LIBERADO",
+                    "status": ("SINAL IA PURA LIBERADO" if engine == "SMART" else ("SINAL INDICADOR LIBERADO" if engine == "INDICATOR" else "SINAL LIBERADO")),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -5208,8 +5314,8 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
 
     if symbol not in SYMBOLS or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
-    if engine not in ("RSI", "SMART"):
-        raise HTTPException(400, "Motor inválido. Use RSI ou SMART.")
+    if engine not in ("RSI", "SMART", "INDICATOR"):
+        raise HTTPException(400, "Motor inválido. Use RSI, SMART ou INDICATOR.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
     fallback_twelve = requested_market == "IQ_OTC" and not state
@@ -5646,8 +5752,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
 
     if interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Intervalo ou mercado inválido.")
-    if engine not in ("RSI", "SMART"):
-        raise HTTPException(400, "Motor inválido. Use RSI ou SMART.")
+    if engine not in ("RSI", "SMART", "INDICATOR"):
+        raise HTTPException(400, "Motor inválido. Use RSI, SMART ou INDICATOR.")
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if requested_market == "IQ_OTC" else None
@@ -5711,6 +5817,11 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                         status_text = "IA PURA • INDISPONÍVEL"
                     else:
                         status_text = ("IA PURA • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else "IA PURA • MONITORANDO")
+                elif engine == "INDICATOR":
+                    tech = hidden_indicator_strategy(closed, interval)
+                    direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
+                    engine_label = "INDICADOR"
+                    status_text = ("INDICADOR • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else "INDICADOR • MONITORANDO")
                 else:
                     tech = primary_rsi_cross_strategy(closed, 14, interval)
                     direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
@@ -6400,7 +6511,7 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=52">
+<link rel="manifest" href="/manifest.webmanifest?v=63">
 <link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=45">
 <link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=45">
 <meta name="theme-color" content="#07182b">
@@ -6469,7 +6580,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .robot-mode-copy{min-width:150px}
 .robot-mode-title{font-weight:900;font-size:13px;letter-spacing:.4px}
 .robot-mode-desc{font-size:11px;color:#9fb2ca;margin-top:3px;max-width:245px}
-#robotPowerBtn,#aiPowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+#robotPowerBtn,#aiPowerBtn,#indicatorPowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
 .app-power-card{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:14px 0 6px;padding:14px 16px;border:1px solid #227db5;border-radius:18px;background:linear-gradient(180deg,#0b1c30,#081523);box-shadow:0 0 22px #00aaff22}
 .app-power-copy{min-width:0}
 .app-power-title{font-size:14px;font-weight:900;letter-spacing:.5px}
@@ -6591,6 +6702,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="tabs">
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
     <button class="tabbtn" id="tabChart">📈 Gráfico</button>
+    <button class="tabbtn" id="tabIndicator">⚙️ Indicador</button>
     <button class="tabbtn" id="tabResults">🎯 Resultados</button>
     <button class="tabbtn" id="tabHistory">🗓️ Histórico 15 dias</button>
     <button class="tabbtn" id="tabCompatibility">🧪 Compatibilidade</button>
@@ -6626,7 +6738,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
 
       <div class="card">
-        <div class="label">STATUS IA</div>
+        <div class="label">STATUS</div>
         <div id="status" class="big" style="font-size:18px">MONITORANDO</div>
         <div id="risk">Risco: --</div>
       </div>
@@ -6649,6 +6761,18 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         <div class="label">★ RESULTADO</div>
         <div id="result" class="big">--</div>
       </div>
+    </div>
+  </div>
+
+  <div id="indicatorTab" class="tab">
+    <div class="card" style="max-width:620px;margin:0 auto">
+      <h2 style="margin-top:0">⚙️ Indicador</h2>
+      <div class="label">MODO DE TESTE</div>
+      <div style="margin-top:10px;line-height:1.5">
+        A configuração interna fica oculta durante o teste. O painel mostra somente os sinais confirmados.
+      </div>
+      <button id="indicatorPowerBtn" type="button" style="width:100%;margin-top:14px;font-weight:900">🔴 OFFLINE</button>
+      <div id="indicatorModeDesc" class="label" style="margin-top:10px">Indicador offline.</div>
     </div>
   </div>
 
@@ -6855,12 +6979,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 </div>
 
 <script>
-// MEGA IA build 33.73.0 — força o PWA antigo a abrir a versão atual.
+// MEGA IA build 33.81.0 — força o PWA antigo a abrir a versão atual.
 (function(){
   try{
     const u=new URL(window.location.href);
-    if(u.searchParams.get('pwa')!=='v50'){
-      u.searchParams.set('pwa','v50');
+    if(u.searchParams.get('pwa')!=='v63'){
+      u.searchParams.set('pwa','v63');
       window.history.replaceState({},'',u.pathname+u.search+u.hash);
     }
   }catch(_){}
@@ -6915,16 +7039,22 @@ const robotPowerBtn=document.getElementById('robotPowerBtn');
 const robotModeDesc=document.getElementById('robotModeDesc');
 const aiPowerBtn=document.getElementById('aiPowerBtn');
 const aiModeDesc=document.getElementById('aiModeDesc');
+const indicatorPowerBtn=document.getElementById('indicatorPowerBtn');
+const indicatorModeDesc=document.getElementById('indicatorModeDesc');
 const voiceBtn=document.getElementById('voiceBtn');
 let robotEnabled=true; // Robô principal
 let aiEnabled=false;   // Inteligência Artificial pura, sem indicadores
+let indicatorEnabled=false; // Motor Indicador oculto para teste
 try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
   aiEnabled=localStorage.getItem('mega_ai_power')==='ONLINE';
-  // Nunca deixa os dois motores disputarem o mesmo sinal.
-  if(robotEnabled && aiEnabled) aiEnabled=false;
+  indicatorEnabled=localStorage.getItem('mega_indicator_power')==='ONLINE';
+  // Nunca deixa os motores disputarem o mesmo sinal.
+  if(indicatorEnabled){ robotEnabled=false; aiEnabled=false; }
+  else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
+  if(indicatorEnabled) return 'INDICATOR';
   if(aiEnabled) return 'SMART';
   if(robotEnabled) return 'RSI';
   return 'OFF';
@@ -6942,6 +7072,7 @@ const entryArrowLabel=document.getElementById('entryArrowLabel');
 const analysisText=document.getElementById('analysisText');
 const mainTab=document.getElementById('mainTab');
 const chartTab=document.getElementById('chartTab');
+const indicatorTab=document.getElementById('indicatorTab');
 const accountTab=document.getElementById('accountTab');
 const resultsTab=document.getElementById('resultsTab');
 const historyTab=document.getElementById('historyTab');
@@ -6968,6 +7099,7 @@ const galeLastResult=document.getElementById('galeLastResult');
 const galeStageStatus=document.getElementById('galeStageStatus');
 const tabMain=document.getElementById('tabMain');
 const tabChart=document.getElementById('tabChart');
+const tabIndicator=document.getElementById('tabIndicator');
 const tabAccount=document.getElementById('tabAccount');
 const iqEmail=document.getElementById('iqEmail');
 const accountUserLabel=document.getElementById('accountUserLabel');
@@ -8174,6 +8306,7 @@ async function loadChart(){
 function showTab(which){
   const main=which==='main';
   const chart=which==='chart';
+  const indicator=which==='indicator';
   const results=which==='results';
   const history=which==='history';
   const compatibility=which==='compatibility';
@@ -8181,6 +8314,7 @@ function showTab(which){
 
   mainTab.classList.toggle('active',main);
   chartTab.classList.toggle('active',chart);
+  indicatorTab.classList.toggle('active',indicator);
   resultsTab.classList.toggle('active',results);
   historyTab.classList.toggle('active',history);
   compatibilityTab.classList.toggle('active',compatibility);
@@ -8188,6 +8322,7 @@ function showTab(which){
 
   tabMain.classList.toggle('active',main);
   tabChart.classList.toggle('active',chart);
+  tabIndicator.classList.toggle('active',indicator);
   tabResults.classList.toggle('active',results);
   tabHistory.classList.toggle('active',history);
   tabCompatibility.classList.toggle('active',compatibility);
@@ -8217,6 +8352,7 @@ function showTab(which){
 
 tabMain.onclick=()=>showTab('main');
 tabChart.onclick=()=>showTab('chart');
+tabIndicator.onclick=()=>showTab('indicator');
 tabResults.onclick=()=>showTab('results');
 tabHistory.onclick=()=>showTab('history');
 tabCompatibility.onclick=()=>showTab('compatibility');
@@ -8532,6 +8668,12 @@ function applyRobotPowerState(){
     aiPowerBtn.style.color='#fff';
     aiPowerBtn.style.borderColor=aiEnabled?'#16c56b':'#ff5252';
   }
+  if(indicatorPowerBtn){
+    indicatorPowerBtn.textContent=indicatorEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    indicatorPowerBtn.style.background=indicatorEnabled?'#0b7a3d':'#7d1d1d';
+    indicatorPowerBtn.style.color='#fff';
+    indicatorPowerBtn.style.borderColor=indicatorEnabled?'#16c56b':'#ff5252';
+  }
 
   if(robotModeDesc) robotModeDesc.textContent=robotEnabled
     ? 'ONLINE: leitura objetiva do mercado com confirmação no fechamento.'
@@ -8539,9 +8681,17 @@ function applyRobotPowerState(){
   if(aiModeDesc) aiModeDesc.textContent=aiEnabled
     ? 'ONLINE: IA pura analisando somente candles e contexto de preço, sem indicadores.'
     : 'OFFLINE: análise inteligente pausada.';
+  if(indicatorModeDesc) indicatorModeDesc.textContent=indicatorEnabled
+    ? 'Indicador online • configuração interna oculta • aguardando sinais confirmados.'
+    : 'Indicador offline.';
 
   const engine=selectedRobotEngine();
-  if(engine==='SMART'){
+  if(engine==='INDICATOR'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='INDICADOR ONLINE • MONITORANDO O MERCADO';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚙️ Indicador selecionado.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar do indicador ativo • procurando oportunidades</div>';
+    rad();
+  }else if(engine==='SMART'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='INTELIGÊNCIA ARTIFICIAL ONLINE • IA PURA ANALISANDO CANDLES';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 Inteligência Artificial selecionada.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar IA pura ativo • analisando candles</div>';
@@ -8552,8 +8702,8 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar do robô principal ativo • procurando oportunidades</div>';
     rad();
   }else{
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔS OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ Robô principal e Inteligência Artificial estão offline.</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ Robô principal, Inteligência Artificial e Indicador estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -8573,10 +8723,11 @@ function resetEngineVisualState(){
 
 async function setRobotPower(enabled){
   robotEnabled=!!enabled;
-  if(robotEnabled) aiEnabled=false;
+  if(robotEnabled){ aiEnabled=false; indicatorEnabled=false; }
   try{
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_indicator_power', indicatorEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -8590,10 +8741,11 @@ async function setRobotPower(enabled){
 
 async function setAiPower(enabled){
   aiEnabled=!!enabled;
-  if(aiEnabled) robotEnabled=false;
+  if(aiEnabled){ robotEnabled=false; indicatorEnabled=false; }
   try{
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_indicator_power', indicatorEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -8605,11 +8757,32 @@ async function setAiPower(enabled){
   }
 }
 
+async function setIndicatorPower(enabled){
+  indicatorEnabled=!!enabled;
+  if(indicatorEnabled){ robotEnabled=false; aiEnabled=false; }
+  try{
+    localStorage.setItem('mega_indicator_power', indicatorEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled){
+    speak(indicatorEnabled ? 'Indicador online.' : 'Indicador offline.');
+  }
+}
+
 if(robotPowerBtn){
   robotPowerBtn.onclick=()=>{ setRobotPower(!robotEnabled); };
 }
 if(aiPowerBtn){
   aiPowerBtn.onclick=()=>{ setAiPower(!aiEnabled); };
+}
+if(indicatorPowerBtn){
+  indicatorPowerBtn.onclick=()=>{ setIndicatorPower(!indicatorEnabled); };
 }
 
 async function sig(announce=false){
@@ -8629,7 +8802,7 @@ async function sig(announce=false){
   try{
     const engine=selectedRobotEngine();
     if(engine==='OFF'){
-      cur={direction:'NEUTRO',confidence:0,status:'ROBÔS OFFLINE • SINAIS PAUSADOS',risk:'--',source_state:'READY'};
+      cur={direction:'NEUTRO',confidence:0,status:'MOTORES OFFLINE • SINAIS PAUSADOS',risk:'--',source_state:'READY'};
       direction.textContent='NEUTRO';
       direction.className='big neutral';
       confidence.textContent='Confiança: 0%';
@@ -8802,7 +8975,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':'ROBÔ PRINCIPAL'} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
+    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='INDICATOR'?'INDICADOR':'ROBÔ PRINCIPAL')} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
     await sig(true);
   }finally{
     radarAutoBusy=false;
