@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "2.1"
-PWA_VERSION = "v76"
+APP_VERSION = "2.2"
+PWA_VERSION = "v77"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -4840,15 +4840,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         raw = await candles(symbol, interval, 150, market, iq_state, request=request)
     except HTTPException as exc:
         status = (
-            "FONTE EM LIMITE"
+            "TWELVE DATA • LIMITE/ESPERA"
             if market == "OPEN" and exc.status_code in (429, 503)
-            else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "FONTE INDISPONÍVEL")
+            else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "TWELVE DATA • INDISPONÍVEL")
         )
         out = neutral_signal(symbol, interval, market, status, exc.detail, source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
     except Exception as exc:
-        status = "IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "FONTE INDISPONÍVEL"
+        status = "IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "TWELVE DATA • INDISPONÍVEL"
         out = neutral_signal(symbol, interval, market, status, str(exc), source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
@@ -4872,8 +4872,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             if age > safe_age:
                 out = neutral_signal(
                     symbol, interval, market,
-                    "AGUARDANDO DADOS ATUALIZADOS",
-                    "A fonte de mercado na nuvem está temporariamente limitada. Nenhuma entrada será liberada com candles antigos.",
+                    "TWELVE DATA • AGUARDANDO DADOS ATUALIZADOS",
+                    "A Twelve Data está temporariamente limitada ou sem atualização recente. Nenhuma entrada será liberada com candles antigos.",
                     source_state="WAITING",
                 )
                 cache[key] = (time.time(), out)
@@ -6974,9 +6974,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             base = str(row.get("base_symbol") or "").strip()
             if base and row.get("direction") == "NEUTRO" and not row.get("updated_at"):
                 if base in ws_active:
-                    row["status"] = "AUTO RADAR • STREAM ATIVO • aguardando varredura"
+                    row["status"] = "TWELVE DATA • STREAM ATIVO • aguardando varredura"
                 else:
-                    row["status"] = "AUTO RADAR • FILA AUTOMÁTICA • aguardando varredura"
+                    row["status"] = "TWELVE DATA • FILA AUTOMÁTICA • aguardando varredura"
 
     idx_key = f"RADAR_INDEX|{market}|{interval}|{engine}"
     idx = int(cache.get(idx_key, (0, 0))[1] or 0) % len(scan_symbols)
@@ -7027,11 +7027,11 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    ("TWELVE DATA • " + status_text) if fallback_twelve else status_text
+                    ("TWELVE DATA • " + status_text) if market == "OPEN" else status_text
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": "TWELVE_DATA" if fallback_twelve else market,
+                "feed_source": "TWELVE_DATA_CLOUD" if market == "OPEN" else ("TWELVE_DATA" if fallback_twelve else market),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
@@ -7042,19 +7042,38 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "base_symbol": sym,
                 "direction": "NEUTRO",
                 "confidence": 0,
-                "status": "POUCOS CANDLES",
+                "status": "TWELVE DATA • POUCOS CANDLES" if market == "OPEN" else "POUCOS CANDLES",
                 "clickable": False,
                 "updated_at": iso(now()),
             }
-    except Exception:
+    except Exception as exc:
+        detail = str(getattr(exc, "detail", None) or exc or "").replace("\n", " ").strip()
+        low = detail.lower()
+        if market == "OPEN":
+            if "api_key" in low or "não configurada" in low:
+                source_status = "TWELVE DATA • CHAVE NÃO CONFIGURADA"
+            elif "429" in low or "limite" in low or "credit" in low:
+                source_status = "TWELVE DATA • LIMITE DA API"
+            elif "timeout" in low or "timed out" in low:
+                source_status = "TWELVE DATA • TIMEOUT"
+            elif "nenhum candle" in low:
+                source_status = "TWELVE DATA • SEM CANDLES"
+            else:
+                source_status = "TWELVE DATA • FONTE EM ESPERA"
+        else:
+            source_status = "IQ OPTION • FONTE EM ESPERA"
+        if detail:
+            source_status = f"{source_status} • {detail[:88]}"
         item = {
             "symbol": sym + suffix,
             "base_symbol": sym,
             "direction": "NEUTRO",
             "confidence": 0,
-            "status": "FONTE EM ESPERA",
+            "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
+            "feed_source": "TWELVE_DATA_CLOUD" if market == "OPEN" else market,
+            "feed_error": detail[:180],
         }
 
     # replace same symbol slot
