@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "2.2"
-PWA_VERSION = "v77"
+APP_VERSION = "2.3"
+PWA_VERSION = "v78"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -4631,14 +4631,26 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
     ]
     price_ctx = _pure_ai_price_context(cs)
 
-    prompt = f"""Você é o módulo de confirmação da MEGA IA.
-Ativo {symbol}, timeframe {interval}.
-Use SOMENTE candles fechados.
-Não invente dados futuros.
-Estratégias internas: reversão, tendência, momentum, price action e breakout com filtro de volatilidade.
-Análise técnica preliminar: {json.dumps(analysis, ensure_ascii=False)}
-Retorne SOMENTE JSON:
-{{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
+    prompt = f"""Você é a inteligência artificial autônoma da MEGA IA, especializada em prever SOMENTE a direção da PRÓXIMA vela completa.
+Ativo: {symbol}. Timeframe: {interval}. Mercado: {market}.
+OBJETIVO PRINCIPAL: aumentar WIN DIRETO (sem depender de Gale). Prefira perder uma oportunidade a liberar uma entrada fraca.
+Este é o MODO IA PURA: NÃO use RSI, MACD, Bollinger, médias móveis, ATR, estocástico, ADX, score técnico ou qualquer indicador calculado pelo aplicativo.
+Use SOMENTE os candles OHLCV FECHADOS fornecidos. Não há candle em formação nesta entrada.
+
+Avalie price action de curto prazo: sequência de altas/baixas, corpos, pavios, rejeição, continuidade, rompimento real, falso rompimento, estrutura recente, aceleração/desaceleração, alternância/lateralização, localização dentro do range recente e volume apenas se estiver disponível.
+A previsão é para UMA vela à frente, não para a tendência geral.
+
+REGRAS DE QUALIDADE:
+- Se houver alternância frequente, corpos pequenos, pavios dos dois lados, compressão ou direção pouco clara: NEUTRO.
+- Não persiga movimento já esticado sem nova confirmação.
+- CALL/PUT exige pelo menos duas evidências independentes de price action para a próxima vela.
+- Para M1 seja especialmente rigoroso.
+- Gale, recuperação e resultados anteriores NÃO podem influenciar a decisão.
+- Só marque risk LOW ou MEDIUM quando houver vantagem clara. Em dúvida: HIGH + NEUTRO.
+
+Classifique o setup como TREND, REVERSAL, BREAKOUT, REJECTION ou NONE.
+Retorne SOMENTE JSON válido:
+{{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"setup":"TREND|REVERSAL|BREAKOUT|REJECTION|NONE","reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
 Candles: {json.dumps(data, ensure_ascii=False)}"""
 
     try:
