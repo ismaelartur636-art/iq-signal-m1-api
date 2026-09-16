@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "2.4"
-PWA_VERSION = "v79"
+APP_VERSION = "2.6"
+PWA_VERSION = "v80"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -48,6 +48,23 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 GEMINI_MODEL_FALLBACKS = []
 OAI_MIN = float(os.getenv("OPENAI_MIN_CONFIDENCE", "70"))
 OAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "15"))
+
+# v2.5 — Gemini principal com proteção de quota do nível gratuito.
+# Defaults deixam margem abaixo do limite observado no projeto (5 RPM / 50 RPD).
+GEMINI_RPM_BUDGET = max(1, int(os.getenv("GEMINI_RPM_BUDGET", "4")))
+GEMINI_DAILY_BUDGET = max(1, int(os.getenv("GEMINI_DAILY_BUDGET", "45")))
+GEMINI_PREFILTER_MIN = float(os.getenv("GEMINI_PREFILTER_MIN", "64"))
+GEMINI_QUOTA_TZ = ZoneInfo("America/Los_Angeles")
+_gemini_quota_lock = threading.RLock()
+_gemini_quota_state = {
+    "date": None,
+    "daily_used": 0,
+    "minute_calls": [],
+    "blocked_until": 0.0,
+    "last_429": 0.0,
+    "consecutive_429": 0,
+    "last_reason": "",
+}
 
 
 LICENSE = os.getenv("LICENSE_EXPIRES", "2026-12-31")
@@ -4040,6 +4057,110 @@ _gemini_models_cache = []
 _gemini_models_checked_at = 0.0
 _gemini_model_cooldown = {}
 
+
+def _gemini_quota_reset_if_needed(now_ts=None):
+    now_ts = float(now_ts or time.time())
+    pacific_date = datetime.fromtimestamp(now_ts, tz=GEMINI_QUOTA_TZ).date().isoformat()
+    with _gemini_quota_lock:
+        if _gemini_quota_state.get("date") != pacific_date:
+            _gemini_quota_state.update({
+                "date": pacific_date,
+                "daily_used": 0,
+                "minute_calls": [],
+                "blocked_until": 0.0,
+                "last_429": 0.0,
+                "consecutive_429": 0,
+                "last_reason": "",
+            })
+        _gemini_quota_state["minute_calls"] = [
+            float(x) for x in (_gemini_quota_state.get("minute_calls") or [])
+            if now_ts - float(x) < 60.0
+        ]
+    return pacific_date
+
+
+def _seconds_to_next_pacific_day(now_ts=None):
+    now_ts = float(now_ts or time.time())
+    current = datetime.fromtimestamp(now_ts, tz=GEMINI_QUOTA_TZ)
+    nxt = (current + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+    return max(60, int((nxt - current).total_seconds()))
+
+
+def _gemini_quota_snapshot():
+    now_ts = time.time()
+    _gemini_quota_reset_if_needed(now_ts)
+    with _gemini_quota_lock:
+        minute_used = len(_gemini_quota_state.get("minute_calls") or [])
+        daily_used = int(_gemini_quota_state.get("daily_used", 0) or 0)
+        blocked_until = float(_gemini_quota_state.get("blocked_until", 0.0) or 0.0)
+        return {
+            "rpm_budget": GEMINI_RPM_BUDGET,
+            "rpm_used": minute_used,
+            "rpm_remaining": max(0, GEMINI_RPM_BUDGET - minute_used),
+            "daily_budget": GEMINI_DAILY_BUDGET,
+            "daily_used_process": daily_used,
+            "daily_remaining_process": max(0, GEMINI_DAILY_BUDGET - daily_used),
+            "blocked": now_ts < blocked_until,
+            "retry_in": max(0, int(blocked_until - now_ts)),
+            "last_reason": str(_gemini_quota_state.get("last_reason") or "")[:160],
+            "date_pacific": _gemini_quota_state.get("date"),
+        }
+
+
+def _gemini_quota_reserve():
+    now_ts = time.time()
+    _gemini_quota_reset_if_needed(now_ts)
+    with _gemini_quota_lock:
+        blocked_until = float(_gemini_quota_state.get("blocked_until", 0.0) or 0.0)
+        if now_ts < blocked_until:
+            return False, f"proteção de quota em espera por {int(blocked_until-now_ts)}s"
+        minute_calls = list(_gemini_quota_state.get("minute_calls") or [])
+        if len(minute_calls) >= GEMINI_RPM_BUDGET:
+            retry = max(1, int(60.0 - (now_ts - min(minute_calls))))
+            return False, f"proteção RPM ativa; nova tentativa em ~{retry}s"
+        daily_used = int(_gemini_quota_state.get("daily_used", 0) or 0)
+        if daily_used >= GEMINI_DAILY_BUDGET:
+            wait = _seconds_to_next_pacific_day(now_ts)
+            _gemini_quota_state["blocked_until"] = now_ts + wait
+            _gemini_quota_state["last_reason"] = "orçamento diário local atingido"
+            return False, f"orçamento diário Gemini protegido; nova janela em ~{wait//60} min"
+        minute_calls.append(now_ts)
+        _gemini_quota_state["minute_calls"] = minute_calls
+        _gemini_quota_state["daily_used"] = daily_used + 1
+        return True, "ok"
+
+
+def _gemini_note_success():
+    with _gemini_quota_lock:
+        _gemini_quota_state["consecutive_429"] = 0
+        _gemini_quota_state["last_reason"] = "ok"
+
+
+def _gemini_note_429(detail=""):
+    now_ts = time.time()
+    _gemini_quota_reset_if_needed(now_ts)
+    with _gemini_quota_lock:
+        last_429 = float(_gemini_quota_state.get("last_429", 0.0) or 0.0)
+        consecutive = int(_gemini_quota_state.get("consecutive_429", 0) or 0)
+        consecutive = consecutive + 1 if now_ts - last_429 < 900 else 1
+        _gemini_quota_state["consecutive_429"] = consecutive
+        _gemini_quota_state["last_429"] = now_ts
+        # Primeiro 429: protege alguns minutos. Repetição rápida: assume quota diária
+        # ou limitação prolongada e evita martelar a API até a próxima janela.
+        if consecutive >= 3:
+            wait = _seconds_to_next_pacific_day(now_ts)
+        elif consecutive == 2:
+            wait = 15 * 60
+        else:
+            wait = 2 * 60
+        _gemini_quota_state["blocked_until"] = max(
+            float(_gemini_quota_state.get("blocked_until", 0.0) or 0.0),
+            now_ts + wait,
+        )
+        _gemini_quota_state["last_reason"] = (str(detail or "Gemini HTTP 429")[:160])
+        return wait
+
+
 async def _gemini_list_models(client, force=False):
     """Lista modelos generateContent disponíveis sem expor a chave."""
     global _gemini_models_cache, _gemini_models_checked_at
@@ -4124,7 +4245,7 @@ def _extract_openai_output_text(payload):
 
 
 async def _openai_json(prompt):
-    """OpenAI como provedor principal. Retorna somente um objeto JSON parseado."""
+    """OpenAI como provedor de reserva. Retorna somente um objeto JSON parseado."""
     if not OAI_KEY:
         raise RuntimeError("OPENAI_API_KEY não configurada.")
 
@@ -4169,26 +4290,26 @@ async def _openai_json(prompt):
 
 
 async def _external_ai_json(prompt):
-    """OpenAI primeiro; Gemini somente como reserva; erro combinado se ambos falharem."""
+    """Gemini primeiro; OpenAI apenas como reserva; fallback local se ambos falharem."""
     errors = []
-
-    if OAI_KEY:
-        try:
-            return await _openai_json(prompt), "OPENAI"
-        except Exception as exc:
-            errors.append(f"OpenAI: {str(exc)[:180]}")
-            print(f"[IA OPENAI] falhou; tentando reserva: {str(exc)[:180]}", flush=True)
-    else:
-        errors.append("OpenAI: OPENAI_API_KEY não configurada")
 
     if GEMINI_KEY:
         try:
             return await _gemini_json(prompt), "GEMINI"
         except Exception as exc:
             errors.append(f"Gemini: {str(exc)[:180]}")
-            print(f"[IA GEMINI] reserva falhou: {str(exc)[:180]}", flush=True)
+            print(f"[IA GEMINI] principal falhou; tentando reserva: {str(exc)[:180]}", flush=True)
     else:
         errors.append("Gemini: GEMINI_API_KEY não configurada")
+
+    if OAI_KEY:
+        try:
+            return await _openai_json(prompt), "OPENAI"
+        except Exception as exc:
+            errors.append(f"OpenAI: {str(exc)[:180]}")
+            print(f"[IA OPENAI] reserva falhou: {str(exc)[:180]}", flush=True)
+    else:
+        errors.append("OpenAI: OPENAI_API_KEY não configurada")
 
     raise RuntimeError(" | ".join(errors)[:360])
 
@@ -4215,11 +4336,22 @@ async def _gemini_json(prompt):
             model = await _gemini_pick_model(client, force=(attempt > 0), exclude=tried)
             tried.append(model)
             url = GEMINI_URL.format(model=model)
+            allowed, quota_reason = _gemini_quota_reserve()
+            if not allowed:
+                raise RuntimeError(f"Gemini quota protegida: {quota_reason}")
             try:
                 response = await client.post(url, headers=headers, json=body)
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 last_error = exc
                 raise
+
+            if response.status_code == 429:
+                try:
+                    detail_429 = response.text[:220]
+                except Exception:
+                    detail_429 = "Gemini HTTP 429"
+                wait = _gemini_note_429(detail_429)
+                raise RuntimeError(f"Gemini HTTP 429; proteção ativada por {wait}s. {detail_429[:140]}")
 
             if response.status_code in (404, 503):
                 last_error = RuntimeError(f"Gemini HTTP {response.status_code} no modelo {model}")
@@ -4243,6 +4375,7 @@ async def _gemini_json(prompt):
                 raise ValueError("Resposta inválida da IA Gemini.")
             _gemini_selected_model = model
             _gemini_model_checked_at = time.time()
+            _gemini_note_success()
             return parsed
 
     if last_error:
@@ -4397,6 +4530,60 @@ def _pure_ai_price_context(cs):
     }
 
 
+def _gemini_candidate_prefilter(cs, interval="1min"):
+    """Triagem barata com OHLCV cru para economizar chamadas Gemini.
+
+    Não decide CALL/PUT. Apenas mede se há estrutura/força suficiente para valer
+    uma consulta à IA externa. A decisão final continua sendo da Gemini + gate.
+    """
+    ctx = _pure_ai_price_context(cs)
+    if not ctx.get("ready"):
+        return False, 0.0, "contexto insuficiente", ctx
+    if ctx.get("choppy"):
+        return False, 35.0, "mercado lateral/alternado", ctx
+
+    efficiency = float(ctx.get("efficiency", 0.0) or 0.0)
+    avg_body = float(ctx.get("avg_body_ratio", 0.0) or 0.0)
+    last_body = float(ctx.get("last_body_ratio", 0.0) or 0.0)
+    bull = int(ctx.get("bull_count_6", 0) or 0)
+    bear = int(ctx.get("bear_count_6", 0) or 0)
+    lower = float(ctx.get("last_lower_wick", 0.0) or 0.0)
+    upper = float(ctx.get("last_upper_wick", 0.0) or 0.0)
+    close_pos = float(ctx.get("last_close_position", 0.5) or 0.5)
+    last_close = float(ctx.get("last_close", 0.0) or 0.0)
+    prior_high = float(ctx.get("prior_high_6", last_close) or last_close)
+    prior_low = float(ctx.get("prior_low_6", last_close) or last_close)
+
+    score = 30.0
+    score += min(18.0, efficiency * 36.0)
+    score += min(16.0, avg_body * 42.0)
+    score += min(14.0, last_body * 28.0)
+    score += min(12.0, abs(bull - bear) * 3.0)
+
+    rejection = (lower >= 0.34 and close_pos >= 0.56) or (upper >= 0.34 and close_pos <= 0.44)
+    breakout = (last_close >= prior_high) or (last_close <= prior_low)
+    if rejection:
+        score += 7.0
+    if breakout:
+        score += 9.0
+
+    score = clamp(score, 0, 100)
+    threshold = float(GEMINI_PREFILTER_MIN) + (2.0 if interval == "1min" else 0.0)
+    reasons = []
+    if efficiency >= 0.22:
+        reasons.append("estrutura direcional")
+    if avg_body >= 0.22:
+        reasons.append("corpos saudáveis")
+    if abs(bull - bear) >= 2:
+        reasons.append("sequência dominante")
+    if rejection:
+        reasons.append("rejeição")
+    if breakout:
+        reasons.append("rompimento")
+    reason = ", ".join(reasons[:3]) or "sem vantagem local forte"
+    return score >= threshold, round(score, 1), reason, ctx
+
+
 def _pure_ai_direction_gate(direction, setup, ctx):
     """Validação final do sinal com candles crus, adaptada ao tipo de setup."""
     direction = str(direction or "NEUTRO").upper()
@@ -4457,7 +4644,7 @@ def _pure_ai_direction_gate(direction, setup, ctx):
 def _local_ohlcv_fallback_signal(cs, interval="1min", api_reason=""):
     """Fallback local usando SOMENTE candles OHLCV fechados.
 
-    É ativado apenas quando a Gemini não pode responder (quota, timeout,
+    É ativado apenas quando as IAs externas não podem responder (quota, timeout,
     indisponibilidade ou chave ausente). Não usa RSI, MACD, médias, Bollinger,
     ATR ou qualquer indicador técnico calculado. A finalidade é impedir que o
     MEGA IA fique totalmente parado por causa da API externa.
@@ -4716,11 +4903,40 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
         cached["next_review_seconds"] = max(0, int(min(heartbeat, max(min_gap, heartbeat - (now_ts - last_call)))))
         return cached
 
+    # v2.5: Twelve Data varre todos os ativos, mas a Gemini só recebe candidatos
+    # com price action local suficiente. Isso preserva a cota sem deixar o radar parado.
+    prefilter_ok, prefilter_score, prefilter_reason, price_ctx = _gemini_candidate_prefilter(cs, interval)
+    if not prefilter_ok:
+        out = {
+            "available": True,
+            "direction": "NEUTRO",
+            "confidence": prefilter_score,
+            "confirmed": False,
+            "risk": "HIGH",
+            "setup": "NONE",
+            "reason": f"Pré-filtro de quota: {prefilter_reason}. Gemini preservada para candidatos mais fortes.",
+            "smart_scan": True,
+            "api_called": False,
+            "provider": "LOCAL_PREFILTER",
+            "fallback": False,
+            "api_available": bool(GEMINI_KEY or OAI_KEY),
+            "quota_protected": True,
+            "prefilter_score": prefilter_score,
+            "direct_win_filter": {
+                "enabled": True,
+                "blocked": True,
+                "prefilter": True,
+                "price_context": price_ctx,
+            },
+        }
+        st["last_call"] = now_ts
+        st["last_result"] = dict(out)
+        return out
+
     data = [
         {"time": x["datetime"], "o": x["open"], "h": x["high"], "l": x["low"], "c": x["close"], "v": x.get("volume", 0)}
         for x in cs[-60:]
     ]
-    price_ctx = _pure_ai_price_context(cs)
 
     prompt = f"""Você é a inteligência artificial autônoma da MEGA IA, especializada em prever SOMENTE a direção da PRÓXIMA vela completa.
 Ativo: {symbol}. Timeframe: {interval}. Mercado: {market}.
@@ -5422,12 +5638,16 @@ async def health():
         "openai": {
             "configured": bool(OAI_KEY),
             "model": OAI_MODEL or "gpt-5.6-luna",
-            "priority": 1,
+            "priority": 2,
+            "role": "RESERVA",
         },
         "gemini": {
             "configured": bool(GEMINI_KEY),
             "model": _gemini_selected_model or GEMINI_MODEL or None,
-            "priority": 2,
+            "priority": 1,
+            "role": "PRINCIPAL",
+            "quota_guard": _gemini_quota_snapshot(),
+            "prefilter_min": GEMINI_PREFILTER_MIN,
         },
         "telegram": {
             "configured": bool(TELEGRAM_BOT_TOKEN),
@@ -10107,15 +10327,14 @@ async function loadChart(){
   if(chartBusy) return;
 
   const selectedBroker=(broker&&broker.value)||'IQ_OPTION';
-  const iqSelected=true;
+  const iqSelected=(selectedBroker==='IQ_OPTION');
   const openMode=(marketMode && marketMode.value==='OPEN');
   const iqConnected=!!brokerConnected.IQ_OPTION;
 
-  // Regras do gráfico:
-  // 1) IQ Option + Mercado Aberto + conectada = candles reais do mercado aberto da IQ Option.
-  // 2) IQ Option + OTC + conectada = candles reais OTC da IQ Option.
-  // 3) Mercado Aberto sem sessão IQ = gráfico atual da Twelve Data, para o gráfico não ficar vazio.
-  // 4) OTC sem sessão IQ continua offline, pois OTC precisa da própria corretora.
+  // Regras do gráfico v2.6:
+  // 1) Mercado Aberto = SEMPRE Twelve Data, mesmo com a IQ Option conectada.
+  // 2) IQ OTC = candles reais OTC da sessão IQ Option.
+  // 3) OTC sem sessão IQ fica offline, pois Twelve Data não representa o OTC da IQ.
   if(iqSelected && !openMode && !iqConnected){
     chartData=[];
     chartPreSignal=null;
@@ -10127,8 +10346,9 @@ async function loadChart(){
   chartBusy=true;
 
   try{
-    const useIqMirror=iqSelected && iqConnected;
-    const chartMarket=(iqSelected && openMode && !iqConnected) ? 'OPEN' : market.value;
+    // A IQ só espelha o gráfico no OTC. Em OPEN a fonte permanece Twelve Data.
+    const useIqMirror=iqSelected && !openMode && iqConnected;
+    const chartMarket=openMode ? 'OPEN' : market.value;
     const mirrorParam=useIqMirror?'&mirror_iq=true':'';
     const [d,pre]=await Promise.all([
       get(
@@ -10170,8 +10390,7 @@ async function loadChart(){
     }
 
     let chartSourceLabel='MERCADO ABERTO • TWELVE DATA';
-    if(useIqMirror && openMode) chartSourceLabel='IQ OPTION • MERCADO ABERTO';
-    else if(useIqMirror && !openMode) chartSourceLabel='IQ OPTION • OTC';
+    if(useIqMirror && !openMode) chartSourceLabel='IQ OPTION • OTC';
     else if(!openMode) chartSourceLabel=brokerName()+' • OTC';
 
     chartInfo.textContent=
