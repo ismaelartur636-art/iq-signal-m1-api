@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "1.4"
-PWA_VERSION = "v69"
+APP_VERSION = "1.6"
+PWA_VERSION = "v71"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -4368,13 +4368,15 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         confirmed = bool(parsed.get("confirmed", False))
         original_reason = str(parsed.get("reason", ""))[:220]
 
-        # v1.4: o filtro anterior ainda estava travando sinal demais.
-        # A IA PURA passa a usar um limiar próprio, independente da antiga
-        # variável OPENAI_MIN_CONFIDENCE (que pode estar alta no Render).
-        # LOW: 68% no M1; MEDIUM: 72%. O gate local vira segunda opinião e
-        # só bloqueia de fato quando há lateralização forte.
-        low_min = 68.0 if interval == "1min" else 67.0
-        required_conf = low_min if risk == "LOW" else max(low_min + 4.0, 72.0)
+        # v1.5: o radar mostrou leituras confirmadas sendo descartadas apenas
+        # por um corte de confiança alto demais (ex.: 65% MEDIUM < 72%).
+        # Mantemos as proteções importantes: risco HIGH e lateralização forte
+        # continuam bloqueados. Para M1, a confiança passa a ser um piso leve
+        # para não transformar uma leitura utilizável em NEUTRO desnecessariamente.
+        if interval == "1min":
+            required_conf = 64.0 if risk == "LOW" else 65.0
+        else:
+            required_conf = 65.0 if risk == "LOW" else 67.0
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
 
         blocked_reason = None
@@ -6431,7 +6433,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     # várias vezes quase ao mesmo tempo, mas permite que o índice avance de
     # verdade. O cache antigo de 9 minutos fazia apenas um ativo ser lido por
     # vários minutos e deixava o restante preso em AGUARDANDO LEITURA.
-    if previous and (time.time() - float(previous[0])) < 12.0:
+    if previous and (time.time() - float(previous[0])) < 10.0:
         return list(previous[1])
     suffix = "" if market == "OPEN" else " • IQ OTC"
 
@@ -6448,20 +6450,21 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         for sym in SYMBOLS
     ]
 
-    # Aquece apenas um par por ciclo. Quando o WebSocket já confirmou as
-    # assinaturas, o radar prioriza exclusivamente esses ativos para não gastar
-    # REST continuamente nos pares que ficaram fora do limite de WS do plano.
+    # RADAR AUTOMÁTICO: todos os ativos entram na fila de análise, mesmo quando
+    # o plano da Twelve Data não mantém todos eles no WebSocket ao mesmo tempo.
+    # Para os símbolos sem stream fresco, candles_open usa cache/REST com o
+    # limitador global já existente. Assim nenhum cartão depende de toque para
+    # começar a ser analisado e evitamos estourar a cota da fonte de dados.
     scan_symbols = list(SYMBOLS)
     if market == "OPEN":
         ws_active = _td_ws_active_symbols()
-        active_known = [s for s in SYMBOLS if s in ws_active]
-        if active_known:
-            scan_symbols = active_known
-            for row in out:
-                base = str(row.get("base_symbol") or "").strip()
-                if base and base not in ws_active and row.get("direction") == "NEUTRO":
-                    if not row.get("updated_at"):
-                        row["status"] = "FORA DO STREAM • selecione para analisar"
+        for row in out:
+            base = str(row.get("base_symbol") or "").strip()
+            if base and row.get("direction") == "NEUTRO" and not row.get("updated_at"):
+                if base in ws_active:
+                    row["status"] = "AUTO RADAR • STREAM ATIVO • aguardando varredura"
+                else:
+                    row["status"] = "AUTO RADAR • FILA AUTOMÁTICA • aguardando varredura"
 
     idx_key = f"RADAR_INDEX|{market}|{interval}|{engine}"
     idx = int(cache.get(idx_key, (0, 0))[1] or 0) % len(scan_symbols)
@@ -10662,12 +10665,13 @@ setInterval(()=>{
 },2000);
 
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) perf(); },5000);
-// Radar econômico: gira somente um ativo por ciclo e reaproveita o mesmo
-// cache de candles do robô. Em M1, 1 varredura/min mantém o consumo controlado
-// e permite que uma oportunidade nova seja enviada automaticamente ao robô.
+// Radar automático: gira por TODOS os ativos sem exigir toque no cartão.
+// Um ativo é processado por ciclo; 15 s acompanha o limitador REST da Twelve
+// Data e permite completar a fila inteira sem disparar várias requisições de
+// mercado ao mesmo tempo. Símbolos com WebSocket fresco usam o stream/cache.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress) rad();
-},60000);
+},15000);
 // Pré-alerta atualizado a cada 10 s no último minuto antes da próxima abertura; não confirma nem executa a entrada.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress && selectedRobotEngine()!=='OFF') loadPreSignals();
