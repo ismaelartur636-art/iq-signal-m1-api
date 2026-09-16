@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "1.3"
-PWA_VERSION = "v68"
+APP_VERSION = "1.4"
+PWA_VERSION = "v69"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -4267,12 +4267,11 @@ def _pure_ai_direction_gate(direction, setup, ctx):
 
 
 async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
-    """IA PURA seletiva para melhorar WIN DIRETO.
+    """IA PURA equilibrada para a próxima vela.
 
     A decisão continua sem indicadores internos. A Gemini recebe apenas candles
-    OHLCV fechados. Depois, um filtro local de price action valida se a direção
-    escolhida tem suporte real nos próprios candles, reduzindo sinais em zonas
-    laterais/indecisas. Isso tende a gerar menos sinais, porém mais seletivos.
+    OHLCV fechados. Um filtro local de price action só bloqueia contextos de
+    lateralização forte; nos demais casos ele funciona como segunda opinião.
     """
     if not GEMINI_KEY:
         return {
@@ -4333,7 +4332,7 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
 
     prompt = f"""Você é a inteligência artificial autônoma da MEGA IA, especializada em prever SOMENTE a direção da PRÓXIMA vela completa.
 Ativo: {symbol}. Timeframe: {interval}. Mercado: {market}.
-OBJETIVO PRINCIPAL: aumentar WIN DIRETO (sem depender de Gale). Prefira perder uma oportunidade a liberar uma entrada fraca.
+OBJETIVO PRINCIPAL: prever a direção da PRÓXIMA vela completa com equilíbrio entre qualidade e frequência.
 Este é o MODO IA PURA: NÃO use RSI, MACD, Bollinger, médias móveis, ATR, estocástico, ADX, score técnico ou qualquer indicador calculado pelo aplicativo.
 Use SOMENTE os candles OHLCV FECHADOS fornecidos. Não há candle em formação nesta entrada.
 
@@ -4341,12 +4340,12 @@ Avalie price action de curto prazo: sequência de altas/baixas, corpos, pavios, 
 A previsão é para UMA vela à frente, não para a tendência geral.
 
 REGRAS DE QUALIDADE:
-- Se houver alternância frequente, corpos pequenos, pavios dos dois lados, compressão ou direção pouco clara: NEUTRO.
-- Não persiga movimento já esticado sem nova confirmação.
-- CALL/PUT exige pelo menos duas evidências independentes de price action para a próxima vela.
-- Para M1 seja especialmente rigoroso.
+- Use NEUTRO somente quando o contexto estiver realmente indefinido ou lateral.
+- Quando houver vantagem direcional clara, retorne CALL ou PUT mesmo que o setup não seja perfeito.
+- Não persiga movimento claramente esticado sem confirmação.
+- Uma combinação coerente de estrutura + força/rejeição já pode confirmar CALL/PUT.
 - Gale, recuperação e resultados anteriores NÃO podem influenciar a decisão.
-- Só marque risk LOW ou MEDIUM quando houver vantagem clara. Em dúvida: HIGH + NEUTRO.
+- risk HIGH deve ficar reservado para leituras frágeis; sinais utilizáveis devem sair como LOW ou MEDIUM.
 
 Classifique o setup como TREND, REVERSAL, BREAKOUT, REJECTION ou NONE.
 Retorne SOMENTE JSON válido:
@@ -4369,12 +4368,13 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         confirmed = bool(parsed.get("confirmed", False))
         original_reason = str(parsed.get("reason", ""))[:220]
 
-        # Equilíbrio entre qualidade e frequência. A versão 1.2 exigia 82/86%
-        # e ainda aplicava um gate muito estreito; na prática a IA ficava quase
-        # sempre em NEUTRO. Mantemos o filtro de qualidade, mas aceitamos sinais
-        # bons a partir da faixa de 72-76%, sem forçar entradas em mercado ruim.
-        low_min = max(float(OAI_MIN), 72.0 if interval == "1min" else 71.0)
-        required_conf = low_min if risk == "LOW" else max(low_min + 4.0, 76.0)
+        # v1.4: o filtro anterior ainda estava travando sinal demais.
+        # A IA PURA passa a usar um limiar próprio, independente da antiga
+        # variável OPENAI_MIN_CONFIDENCE (que pode estar alta no Render).
+        # LOW: 68% no M1; MEDIUM: 72%. O gate local vira segunda opinião e
+        # só bloqueia de fato quando há lateralização forte.
+        low_min = 68.0 if interval == "1min" else 67.0
+        required_conf = low_min if risk == "LOW" else max(low_min + 4.0, 72.0)
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
 
         blocked_reason = None
@@ -4384,22 +4384,19 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             elif risk == "HIGH":
                 blocked_reason = "risco alto"
             elif confidence < required_conf:
-                blocked_reason = f"confiança {confidence:.0f}% abaixo do mínimo seletivo {required_conf:.0f}%"
+                blocked_reason = f"confiança {confidence:.0f}% abaixo do mínimo {required_conf:.0f}%"
             elif price_ctx.get("choppy"):
                 blocked_reason = "lateralização/alternância forte detectada"
-            elif not gate_ok and confidence < (required_conf + 5.0):
-                # O gate local agora funciona como segunda opinião. Se a IA
-                # estiver muito forte (5 pontos acima do mínimo), não matamos
-                # automaticamente um sinal só porque uma regra rígida de candle
-                # não encaixou perfeitamente.
-                blocked_reason = gate_reason
 
         if blocked_reason:
             direction, confirmed = "NEUTRO", False
             reason = f"Filtro WIN DIRETO bloqueou a entrada: {blocked_reason}. Leitura IA: {original_reason}"[:300]
         elif direction in ("CALL", "PUT"):
             confirmed = True
-            reason = f"{original_reason} • Filtro WIN DIRETO: {gate_reason}."[:300]
+            if gate_ok:
+                reason = f"{original_reason} • Price action local confirmou: {gate_reason}."[:300]
+            else:
+                reason = f"{original_reason} • IA liberada; filtro local ficou apenas como alerta: {gate_reason}."[:300]
         else:
             confirmed = False
             reason = original_reason or "Sem vantagem clara para a próxima vela."
@@ -6482,8 +6479,13 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     engine_label = "IA PURA"
                     if not tech.get("available"):
                         status_text = "IA PURA • INDISPONÍVEL"
+                    elif direction != "NEUTRO":
+                        status_text = "IA PURA • OPORTUNIDADE ENCONTRADA"
                     else:
-                        status_text = ("IA PURA • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else "IA PURA • MONITORANDO")
+                        # Mostra no próprio radar por que a IA não liberou sinal.
+                        # Facilita distinguir falta de oportunidade de erro/API.
+                        why = str(tech.get("reason") or "sem vantagem clara").replace("\n", " ")[:78]
+                        status_text = f"IA PURA • MONITORANDO • {why}"
                 elif engine == "EA":
                     tech = ea_binary_strategy(closed, interval)
                     direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
