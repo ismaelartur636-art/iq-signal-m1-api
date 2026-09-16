@@ -26,7 +26,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "33.82.0"
+APP_VERSION = "1.0"
 PWA_VERSION = "v65"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -4231,14 +4231,61 @@ def next_boundary(interval):
     return datetime.fromtimestamp(((timestamp // seconds) + 1) * seconds, tz=BR_TZ)
 
 
-def entry_window(interval):
-    # 33.72.0: todo sinal precisa ter pelo menos 35 segundos de antecedência.
-    # Se a confirmação chegar tarde demais para a próxima vela, agenda a entrada
-    # para a vela seguinte em vez de liberar uma entrada corrida.
+ENTRY_MODES = {"BIRTH", "MIDDLE", "CLOSE"}
+
+
+def normalize_entry_mode(value: str | None) -> str:
+    mode = str(value or "BIRTH").strip().upper()
+    aliases = {
+        "NASCIMENTO": "BIRTH",
+        "NASCER": "BIRTH",
+        "MEIO": "MIDDLE",
+        "FECHAMENTO": "CLOSE",
+    }
+    mode = aliases.get(mode, mode)
+    return mode if mode in ENTRY_MODES else "BIRTH"
+
+
+def current_boundary(interval):
+    seconds = INTERVALS[interval]
+    timestamp = int(now().timestamp())
+    return datetime.fromtimestamp((timestamp // seconds) * seconds, tz=BR_TZ)
+
+
+def entry_window(interval, entry_mode="BIRTH"):
+    """Agenda entradas sempre em abertura de candle para manter a apuração exata.
+
+    BIRTH: tenta liberar na vela que acabou de nascer (janela de até 10 s).
+    MIDDLE: sinal é preparado na metade do candle e entra na PRÓXIMA abertura.
+    CLOSE: preserva a regra anterior de antecedência mínima de 35 s.
+    """
+    mode = normalize_entry_mode(entry_mode)
+    step = timedelta(seconds=INTERVALS[interval])
+    current = current_boundary(interval)
+    age = max(0.0, (now() - current).total_seconds())
+
+    if mode == "BIRTH":
+        # O frontend consulta a cada 5 s. Aceitar até 10 s absorve latência da IA/rede
+        # sem transformar uma entrada tardia em "nascimento" de candle.
+        entry = current if age <= 10 else current + step
+        announce = now() if entry <= now() else entry
+        return announce, entry, entry + step
+
+    if mode == "MIDDLE":
+        # O sinal pode ser estudado no meio, mas a entrada continua alinhada à
+        # abertura seguinte. Assim WIN/LOSS usa um candle inteiro e não uma
+        # aproximação de meia vela.
+        entry = current + step
+        announce = current + timedelta(seconds=INTERVALS[interval] / 2)
+        if announce <= now():
+            announce = now()
+        return announce, entry, entry + step
+
+    # CLOSE: comportamento legado.
     entry = next_boundary(interval)
     if (entry - now()).total_seconds() < 35:
-        entry = entry + timedelta(seconds=INTERVALS[interval])
-    return entry - timedelta(seconds=35), entry, entry + timedelta(seconds=INTERVALS[interval])
+        entry = entry + step
+    return entry - timedelta(seconds=35), entry, entry + step
 
 
 def neutral_signal(symbol, interval, market, status, reason, *, confidence=0, source_state="UNAVAILABLE"):
@@ -4262,18 +4309,19 @@ def neutral_signal(symbol, interval, market, status, reason, *, confidence=0, so
     }
 
 
-async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "RSI"):
+async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "RSI", entry_mode: str = "BIRTH"):
     if symbol not in SYMBOLS or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
 
     market = (market or "OPEN").upper()
     engine = (engine or "RSI").upper()
+    entry_mode = normalize_entry_mode(entry_mode)
     if engine not in ("RSI", "SMART", "EA", "INDICATOR"):
         engine = "RSI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
-    key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}"
+    key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
 
-    release_key = f"{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}"
+    release_key = f"{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
     release_state = signal_release_state.get(release_key) or {}
 
     active_signal = release_state.get("active_signal")
@@ -4431,6 +4479,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "selected_engine": engine,
             "legacy_ai_disabled": engine != "SMART",
             "legacy_indicators_disabled": True,
+            "entry_mode": entry_mode,
         }
 
         if engine == "SMART" and not ai_available:
@@ -4454,7 +4503,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 else ("ea_fingerprint" if engine == "EA" else ("indicator_fingerprint" if engine == "INDICATOR" else "primary_rsi_fingerprint"))
             )
             if release_state.get(fingerprint_key) != signal_fingerprint:
-                announce, entry, expiry = entry_window(interval)
+                announce, entry, expiry = entry_window(interval, entry_mode)
                 base.update({
                     "direction": direction_now,
                     "status": ("SINAL IA PURA LIBERADO" if engine == "SMART" else ("SINAL EA LIBERADO" if engine == "EA" else ("SINAL INDICADOR LIBERADO" if engine == "INDICATOR" else "SINAL LIBERADO"))),
@@ -4526,12 +4575,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "technical": {"disabled": True, "mode": "AI_ONLY"},
             "source_state": "READY" if ai.get("available") else "AI_UNAVAILABLE",
             "mode": "AI_ONLY",
+            "entry_mode": entry_mode,
         }
 
         if ai.get("available") and ai.get("confirmed") and ai.get("direction") in ("CALL", "PUT"):
             base["direction"] = ai["direction"]
             base["status"] = "SINAL IA GEMINI LIBERADO"
-            announce, entry, expiry = entry_window(interval)
+            announce, entry, expiry = entry_window(interval, entry_mode)
             base["entry_time"] = iso(entry)
             base["announce_time"] = iso(announce)
             base["expiry_time"] = iso(expiry)
@@ -4667,6 +4717,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         "reason": analysis["reason"],
         "non_repaint": True,
         "technical": analysis,
+        "entry_mode": entry_mode,
     }
 
     if analysis["confirmed"]:
@@ -4724,7 +4775,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 risk="HIGH",
             )
         else:
-            announce, entry, expiry = entry_window(interval)
+            announce, entry, expiry = entry_window(interval, entry_mode)
             base["entry_time"] = iso(entry)
             base["announce_time"] = iso(announce)
             base["expiry_time"] = iso(expiry)
@@ -5437,9 +5488,10 @@ async def candles_endpoint(
 
 
 @app.get("/signal-ai")
-async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "RSI"):
+async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "RSI", entry_mode: str = "BIRTH"):
     requested_market = (market or "OPEN").upper()
     engine = (engine or "RSI").upper()
+    entry_mode = normalize_entry_mode(entry_mode)
 
     if symbol not in SYMBOLS or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
@@ -5459,6 +5511,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             request=request,
             ai_only=ai_only,
             engine=engine,
+            entry_mode=entry_mode,
         )
         if isinstance(data, dict):
             # Sempre informa ao frontend qual mercado foi pedido e qual fonte
@@ -6781,7 +6834,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão 33.81.1 • Painel Indicador</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • Painel Indicador</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -6811,6 +6864,13 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <option>15min</option>
       <option>30min</option>
     </select>
+
+    <select id="entryMode" title="Momento da entrada">
+      <option value="BIRTH">🟢 Entrada: NASCIMENTO</option>
+      <option value="MIDDLE">🟡 Entrada: MEIO → próxima vela</option>
+      <option value="CLOSE">🔵 Entrada: FECHAMENTO</option>
+    </select>
+    <div id="entryModeNote" class="label" style="grid-column:1/-1">Nascimento: usa somente candles já fechados e tenta liberar nos primeiros 10 s da nova vela.</div>
 
     <button id="voiceBtn" type="button" onclick="voice()" style="font-weight:900">🔇 VOZ OFFLINE</button>
     <div id="otcNote" class="label" style="display:none"></div>
@@ -6875,7 +6935,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
 
       <div class="card schedule-card">
-        <div class="label">⏱ CRONOGRAMA • ENTRADA</div>
+        <div class="label" id="entryScheduleLabel">⏱ CRONOGRAMA • ENTRADA</div>
         <div id="entry" class="big">--:--:--</div>
         <div id="countdown">--</div>
         <div id="expiryCountdown" style="margin-top:8px;font-weight:800">⏱ EXPIRAÇÃO: --:--</div>
@@ -6989,6 +7049,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <h2 style="margin-top:0">🗓️ Histórico • últimos 15 dias</h2>
       <div class="label">DATA • HORÁRIO • ATIVO • DIREÇÃO • RESULTADO FINAL</div>
       <div id="historySummary" style="margin-top:10px;font-weight:800">Nenhuma operação registrada.</div>
+      <div id="historyAnalysis" class="card" style="margin-top:12px;padding:12px">
+        <div style="font-weight:1000">🧠 Diagnóstico automático da IA</div>
+        <div class="label" style="margin-top:5px">Aguardando histórico suficiente para comparar ativo, direção, horário e estágio do resultado.</div>
+      </div>
       <div id="historyList" style="display:grid;gap:8px;margin-top:12px"></div>
       <div class="label" style="margin-top:12px;line-height:1.5">
         O histórico guarda o resultado final de cada operação neste aparelho por até 15 dias: WIN, WIN G1, WIN G2 ou LOSS G2.
@@ -7239,6 +7303,7 @@ const compatMatched=document.getElementById('compatMatched');
 const compatPrice=document.getElementById('compatPrice');
 const historyList=document.getElementById('historyList');
 const historySummary=document.getElementById('historySummary');
+const historyAnalysis=document.getElementById('historyAnalysis');
 const winDirect=document.getElementById('winDirect');
 const winG1=document.getElementById('winG1');
 const winG2=document.getElementById('winG2');
@@ -7266,6 +7331,9 @@ const signalCard=document.getElementById('signalCard');
 const moneyFx=document.getElementById('moneyFx');
 const confidence=document.getElementById('confidence');
 const entry=document.getElementById('entry');
+const entryMode=document.getElementById('entryMode');
+const entryModeNote=document.getElementById('entryModeNote');
+const entryScheduleLabel=document.getElementById('entryScheduleLabel');
 const countdown=document.getElementById('countdown');
 const statusBox=document.getElementById('status');
 const risk=document.getElementById('risk');
@@ -7289,6 +7357,8 @@ try{
   }
   const savedBroker=localStorage.getItem('mega_broker')||'IQ_OPTION';
   const savedMode=localStorage.getItem('mega_market_mode')||'OPEN';
+  const savedEntryMode=localStorage.getItem('mega_entry_mode')||'BIRTH';
+  if(entryMode) entryMode.value=['BIRTH','MIDDLE','CLOSE'].includes(savedEntryMode)?savedEntryMode:'BIRTH';
   if(marketMode) marketMode.value=(savedMode==='OTC'?'OTC':'OPEN');
   setTimeout(()=>syncBroker(savedBroker),0);
 }catch(_){}
@@ -7492,6 +7562,115 @@ function pruneHistory(bucket){
   return bucket.history;
 }
 
+function renderHistoryAnalysis(items){
+  if(!historyAnalysis) return;
+  items=Array.isArray(items)?items:[];
+  if(!items.length){
+    historyAnalysis.innerHTML=`<div style="font-weight:1000">🧠 Diagnóstico automático da IA</div><div class="label" style="margin-top:5px">Aguardando operações para iniciar a análise.</div>`;
+    return;
+  }
+
+  const isWin=x=>String((x&&x.result)||'').toUpperCase().startsWith('WIN');
+  const pct=(n,d)=>d?((100*n/d).toFixed(2)+'%'):'0.00%';
+  const total=items.length;
+  const wins=items.filter(isWin).length;
+  const losses=total-wins;
+  const direct=items.filter(x=>String(x.result||'').toUpperCase()==='WIN').length;
+  const g1=items.filter(x=>String(x.result||'').toUpperCase()==='WIN G1').length;
+  const g2=items.filter(x=>String(x.result||'').toUpperCase()==='WIN G2').length;
+  const lossG2=items.filter(x=>String(x.result||'').toUpperCase()==='LOSS G2').length;
+
+  function statMap(keyFn){
+    const map={};
+    items.forEach(x=>{
+      const key=String(keyFn(x)||'--');
+      if(!map[key]) map[key]={key,total:0,wins:0,losses:0};
+      map[key].total++;
+      if(isWin(x)) map[key].wins++; else map[key].losses++;
+    });
+    return Object.values(map).map(v=>({...v,accuracy:v.total?100*v.wins/v.total:0,lossRate:v.total?100*v.losses/v.total:0}));
+  }
+
+  const bySymbol=statMap(x=>String(x.symbol||'--').toUpperCase())
+    .sort((a,b)=>b.total-a.total || b.losses-a.losses);
+  const byDirection=statMap(x=>String(x.direction||'--').toUpperCase())
+    .sort((a,b)=>b.losses-a.losses || b.total-a.total);
+  const byWindow=statMap(x=>{
+    const d=new Date(x.timestamp);
+    if(!Number.isFinite(d.getTime())) return '--';
+    let h=Number(new Intl.DateTimeFormat('en-US',{timeZone:'America/Sao_Paulo',hour:'2-digit',hour12:false,hourCycle:'h23'}).format(d));
+    if(!Number.isFinite(h)) return '--';
+    h=((h%24)+24)%24;
+    const start=Math.floor(h/3)*3;
+    const end=(start+2)%24;
+    return String(start).padStart(2,'0')+':00–'+String(end).padStart(2,'0')+':59';
+  }).sort((a,b)=>b.losses-a.losses || b.lossRate-a.lossRate || b.total-a.total);
+
+  const lossSymbol=[...bySymbol].sort((a,b)=>b.losses-a.losses || b.lossRate-a.lossRate || b.total-a.total)[0];
+  const lossDirection=byDirection[0];
+  const lossWindow=byWindow[0];
+
+  const symbolRows=bySymbol.slice(0,8).map(v=>`<div style="display:grid;grid-template-columns:1.2fr .6fr .6fr .8fr;gap:6px;padding:7px 0;border-top:1px solid rgba(120,180,255,.12);font-size:12px">
+    <b>${v.key}</b><span>${v.wins}W</span><span>${v.losses}L</span><span>${pct(v.wins,v.total)}</span>
+  </div>`).join('');
+
+  const enough=total>=30;
+  const overallAcc=total?100*wins/total:0;
+  const minGroup=Math.max(6,Math.ceil(total*0.08));
+  const candidates=[];
+  function consider(kind, rows){
+    const weak=(rows||[])
+      .filter(v=>v.total>=minGroup && v.losses>=2)
+      .sort((a,b)=>a.accuracy-b.accuracy || b.total-a.total)[0];
+    if(weak && weak.accuracy <= overallAcc-6){
+      candidates.push({kind,...weak,delta:overallAcc-weak.accuracy});
+    }
+  }
+  consider('Ativo',bySymbol);
+  consider('Direção',byDirection);
+  consider('Horário',byWindow);
+  const candidateRows=candidates.length
+    ? candidates.slice(0,3).map(v=>`<div style="padding:7px 0;border-top:1px solid rgba(120,180,255,.12)"><b>${v.kind}: ${v.key}</b> • ${v.wins}W/${v.losses}L • ${v.accuracy.toFixed(2)}% <span class="label">(${v.delta.toFixed(1)} p.p. abaixo da média)</span></div>`).join('')
+    : '<div class="label" style="margin-top:6px">Nenhum grupo com amostra suficiente está claramente abaixo da média neste momento.</div>';
+  const confItems=items.filter(x=>Number(x.confidence||0)>0);
+  const confWins=confItems.filter(isWin).map(x=>Number(x.confidence||0));
+  const confLoss=confItems.filter(x=>!isWin(x)).map(x=>Number(x.confidence||0));
+  const avg=a=>a.length?a.reduce((s,v)=>s+v,0)/a.length:0;
+  const confText=confItems.length>=10
+    ? `Confiança registrada: WIN média ${avg(confWins).toFixed(1)}% • LOSS média ${avg(confLoss).toFixed(1)}%.`
+    : 'A partir desta versão, confiança/risco/motor também serão guardados para descobrir filtros mais precisos.';
+  const headline=losses
+    ? `Nos ${total} registros, a maior concentração observada de LOSS está em <b>${lossSymbol?lossSymbol.key:'--'}</b> (${lossSymbol?lossSymbol.losses:0}/${lossSymbol?lossSymbol.total:0}), direção <b>${lossDirection?lossDirection.key:'--'}</b> (${lossDirection?lossDirection.losses:0}/${lossDirection?lossDirection.total:0}) e faixa <b>${lossWindow?lossWindow.key:'--'}</b> (${lossWindow?lossWindow.losses:0}/${lossWindow?lossWindow.total:0}).`
+    : `Ainda não há LOSS no histórico analisado. Continue coletando operações para localizar padrões de erro.`;
+
+  historyAnalysis.innerHTML=`
+    <div style="font-weight:1000">🧠 Diagnóstico automático da IA</div>
+    <div class="label" style="margin-top:4px">Base: ${total} operações do mercado selecionado • últimos 15 dias</div>
+    <div style="margin-top:10px;line-height:1.45">${headline}</div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px;margin-top:12px">
+      <div class="card" style="padding:10px"><div class="label">ACERTO FINAL</div><b style="font-size:18px">${pct(wins,total)}</b><div class="label">${wins} WIN / ${losses} LOSS</div></div>
+      <div class="card" style="padding:10px"><div class="label">WIN DIRETO</div><b style="font-size:18px">${pct(direct,total)}</b><div class="label">${direct} de ${total}</div></div>
+      <div class="card" style="padding:10px"><div class="label">RECUPERAÇÃO</div><b style="font-size:18px">${g1+g2}</b><div class="label">G1 ${g1} • G2 ${g2}</div></div>
+      <div class="card" style="padding:10px"><div class="label">LOSS G2</div><b style="font-size:18px">${lossG2}</b><div class="label">${pct(lossG2,total)} das operações</div></div>
+    </div>
+
+    <div class="card" style="margin-top:10px;padding:10px">
+      <div style="font-weight:900">🔎 Filtros candidatos para reduzir LOSS (ainda NÃO aplicados)</div>
+      <div class="label" style="margin-top:5px">Só aparecem grupos com amostra mínima de ${minGroup} operações e desempenho pelo menos 6 p.p. abaixo da média geral.</div>
+      ${candidateRows}
+      <div class="label" style="margin-top:8px">${confText}</div>
+    </div>
+
+    <div class="card" style="margin-top:10px;padding:10px">
+      <div style="font-weight:900">Por ativo</div>
+      <div class="label" style="display:grid;grid-template-columns:1.2fr .6fr .6fr .8fr;gap:6px;margin-top:7px"><span>ATIVO</span><span>WIN</span><span>LOSS</span><span>ACERTO</span></div>
+      ${symbolRows}
+    </div>
+
+    <div class="label" style="margin-top:9px;line-height:1.45">${enough?'A amostra já permite procurar concentrações, mas elas são padrões observados — não prova de causa nem garantia para sinais futuros.':'Amostra ainda pequena. Evite criar filtros antes de acumular pelo menos 30 operações.'}</div>`;
+}
+
 function renderHistory(){
   if(!historyList || !historySummary) return;
   const m=activeResultMarket();
@@ -7502,12 +7681,14 @@ function renderHistory(){
   if(!items.length){
     historySummary.textContent='Nenhuma operação registrada nos últimos 15 dias.';
     historyList.innerHTML='<div class="card" style="opacity:.75">Aguardando novos resultados.</div>';
+    renderHistoryAnalysis([]);
     return;
   }
 
   const wins15=items.filter(x=>String(x.result||'').startsWith('WIN')).length;
   const losses15=items.filter(x=>String(x.result||'').startsWith('LOSS')).length;
   historySummary.textContent=`${items.length} operações • ${wins15} WIN • ${losses15} LOSS`;
+  renderHistoryAnalysis(items);
 
   historyList.innerHTML=items.map(h=>{
     const dt=new Date(h.timestamp);
@@ -7579,7 +7760,12 @@ function registerPersistentResult(t,x){
         interval:t.interval||'',
         direction:String(t.direction||'').toUpperCase(),
         market:m,
-        result:r
+        result:r,
+        confidence:Number(t.confidence||0),
+        risk:String(t.risk||''),
+        strategy:String(t.strategy||''),
+        engine:String(t.engine||''),
+        entry_mode:String(t.entry_mode||'')
       });
       pruneHistory(b);
       changed=true;
@@ -7715,6 +7901,30 @@ try{
   pendingTradeQueue=[];
 }
 
+function paintEntryModeNote(){
+  if(!entryMode || !entryModeNote) return;
+  const mode=entryMode.value||'BIRTH';
+  if(entryScheduleLabel) entryScheduleLabel.textContent='⏱ CRONOGRAMA • '+(mode==='BIRTH'?'NASCIMENTO':(mode==='MIDDLE'?'MEIO → PRÓXIMA VELA':'FECHAMENTO'));
+  if(mode==='BIRTH'){
+    entryModeNote.textContent='🟢 NASCIMENTO: analisa apenas candles fechados e tenta liberar nos primeiros 10 s da vela nova.';
+  }else if(mode==='MIDDLE'){
+    entryModeNote.textContent='🟡 MEIO: prepara o sinal na metade do candle, mas entra na próxima abertura para manter WIN/LOSS exato.';
+  }else{
+    entryModeNote.textContent='🔵 FECHAMENTO: mantém o agendamento anterior, com entrada na abertura de uma vela seguinte.';
+  }
+}
+if(entryMode){
+  paintEntryModeNote();
+  entryMode.onchange=()=>{
+    try{localStorage.setItem('mega_entry_mode',entryMode.value||'BIRTH')}catch(_){}
+    lastSignalVoice='';
+    lastCountdownSignalKey='';
+    thirtyFive=false; five=false; entered=false;
+    paintEntryModeNote();
+    if(appEnabled) sig(true);
+  };
+}
+
 function savePendingTrade(){
   try{
     if(pendingTrade){
@@ -7790,7 +8000,12 @@ function rememberPendingTrade(sig){
     interval:sig.interval,
     direction:sig.direction,
     entry_time:sig.entry_time,
-    expiry_time:sig.expiry_time
+    expiry_time:sig.expiry_time,
+    confidence:Number(sig.confidence||0),
+    risk:String(sig.risk||''),
+    strategy:String(sig.strategy||''),
+    engine:String(sig.selected_engine||sig.mode||''),
+    entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH'))
   });
 }
 
@@ -8671,7 +8886,7 @@ window.megaConnectIQ=async function(event){
         method:'POST',
         credentials:'include',
         cache:'no-store',
-        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'33.71.0'},
+        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'__APP_VERSION__'},
         body:JSON.stringify({email:email,password:password}),
         signal:controller.signal
       });
@@ -9002,7 +9217,7 @@ async function sig(announce=false){
       return;
     }
     cur=await get(
-      `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}`
+      `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent((entryMode&&entryMode.value)||'BIRTH')}`
     );
 
     if(announce){
@@ -9298,7 +9513,8 @@ function cd(){
     }
   }
 
-  if(n<=0 && n>-2 && !entered){
+  const birthGrace=(String(cur.entry_mode||'').toUpperCase()==='BIRTH')?12:2;
+  if(n<=0 && n>-birthGrace && !entered){
     entered=true;
     showEntryArrow(cur.direction);
 
@@ -9585,6 +9801,7 @@ setInterval(()=>{ if(appEnabled) cd(); },250);
 """
 
 HTML_PAGE = HTML_PAGE.replace("__MEGA_IMAGE__", "/mega-ia.png")
+HTML_PAGE = HTML_PAGE.replace("__APP_VERSION__", APP_VERSION)
 
 
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
