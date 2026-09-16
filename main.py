@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "1.2"
-PWA_VERSION = "v67"
+APP_VERSION = "1.3"
+PWA_VERSION = "v68"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -4177,9 +4177,12 @@ def _pure_ai_price_context(cs):
     # Combina alternância + baixa eficiência e corpo pequeno para identificar
     # zonas onde prever a próxima vela tende a ser mais frágil.
     choppy = bool(
-        (flip_ratio >= 0.67 and efficiency < 0.30)
-        or (efficiency < 0.18 and avg_body < 0.30)
-        or (avg_body < 0.20 and flip_ratio >= 0.50)
+        # Trava só lateralização realmente clara. A versão 1.2 estava
+        # classificando contexto demais como lateral e praticamente zerava
+        # a quantidade de sinais válidos no M1.
+        (flip_ratio >= 0.80 and efficiency < 0.22)
+        or (efficiency < 0.12 and avg_body < 0.22)
+        or (avg_body < 0.16 and flip_ratio >= 0.67)
     )
 
     return {
@@ -4227,23 +4230,26 @@ def _pure_ai_direction_gate(direction, setup, ctx):
     prior_low = float(ctx.get("prior_low_6", last_close) or last_close)
 
     if setup == "TREND":
-        ok = (net > 0 and bull >= 4 and not ctx.get("last_bearish")) if call else (net < 0 and bear >= 4 and not ctx.get("last_bullish"))
+        # 3 de 6 candles + deslocamento líquido já é confluência suficiente.
+        # Não exige que o último candle tenha a mesma cor, porque um pequeno
+        # pullback pode anteceder justamente a continuação na próxima vela.
+        ok = (net > 0 and bull >= 3) if call else (net < 0 and bear >= 3)
         return ok, "continuidade de tendência não confirmada nos últimos candles" if not ok else "tendência curta confirmada"
 
     if setup == "BREAKOUT":
         if call:
-            ok = last_close >= prior_high and ctx.get("last_bullish") and body >= 0.42 and close_pos >= 0.68
+            ok = last_close >= prior_high and ctx.get("last_bullish") and body >= 0.34 and close_pos >= 0.62
         else:
-            ok = last_close <= prior_low and ctx.get("last_bearish") and body >= 0.42 and close_pos <= 0.32
+            ok = last_close <= prior_low and ctx.get("last_bearish") and body >= 0.34 and close_pos <= 0.38
         return ok, "rompimento sem fechamento/força suficientes" if not ok else "rompimento confirmado no candle fechado"
 
     if setup in ("REVERSAL", "REJECTION"):
         if call:
-            location_ok = pos <= 0.48 or net < 0
-            reaction_ok = (lower >= 0.32 and close_pos >= 0.56) or (ctx.get("last_bullish") and body >= 0.45)
+            location_ok = pos <= 0.58 or net < 0
+            reaction_ok = (lower >= 0.26 and close_pos >= 0.52) or (ctx.get("last_bullish") and body >= 0.36)
         else:
-            location_ok = pos >= 0.52 or net > 0
-            reaction_ok = (upper >= 0.32 and close_pos <= 0.44) or (ctx.get("last_bearish") and body >= 0.45)
+            location_ok = pos >= 0.42 or net > 0
+            reaction_ok = (upper >= 0.26 and close_pos <= 0.48) or (ctx.get("last_bearish") and body >= 0.36)
         ok = location_ok and reaction_ok
         return ok, "reversão/rejeição sem localização e reação suficientes" if not ok else "reversão/rejeição confirmada"
 
@@ -4251,11 +4257,11 @@ def _pure_ai_direction_gate(direction, setup, ctx):
     # direção OU rejeição evidente, além de corpo médio recente saudável.
     if call:
         direction_ok = net > 0 and bull >= 3
-        rejection_ok = lower >= 0.35 and close_pos >= 0.58
+        rejection_ok = lower >= 0.30 and close_pos >= 0.54
     else:
         direction_ok = net < 0 and bear >= 3
-        rejection_ok = upper >= 0.35 and close_pos <= 0.42
-    healthy_body = float(ctx.get("avg_body_ratio", 0.0) or 0.0) >= 0.24
+        rejection_ok = upper >= 0.30 and close_pos <= 0.46
+    healthy_body = float(ctx.get("avg_body_ratio", 0.0) or 0.0) >= 0.20
     ok = healthy_body and (direction_ok or rejection_ok)
     return ok, "price action sem confluência suficiente para a próxima vela" if not ok else "price action confirmado"
 
@@ -4363,11 +4369,12 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         confirmed = bool(parsed.get("confirmed", False))
         original_reason = str(parsed.get("reason", ""))[:220]
 
-        # Filtro mais rigoroso para aumentar acertos na entrada inicial.
-        # LOW precisa de 80% (ou OAI_MIN, se maior); MEDIUM precisa de 86%.
-        # Em M1, o mínimo LOW sobe para 82% devido ao ruído maior.
-        low_min = max(float(OAI_MIN), 82.0 if interval == "1min" else 80.0)
-        required_conf = low_min if risk == "LOW" else max(low_min + 4.0, 86.0)
+        # Equilíbrio entre qualidade e frequência. A versão 1.2 exigia 82/86%
+        # e ainda aplicava um gate muito estreito; na prática a IA ficava quase
+        # sempre em NEUTRO. Mantemos o filtro de qualidade, mas aceitamos sinais
+        # bons a partir da faixa de 72-76%, sem forçar entradas em mercado ruim.
+        low_min = max(float(OAI_MIN), 72.0 if interval == "1min" else 71.0)
+        required_conf = low_min if risk == "LOW" else max(low_min + 4.0, 76.0)
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
 
         blocked_reason = None
@@ -4378,7 +4385,13 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
                 blocked_reason = "risco alto"
             elif confidence < required_conf:
                 blocked_reason = f"confiança {confidence:.0f}% abaixo do mínimo seletivo {required_conf:.0f}%"
-            elif not gate_ok:
+            elif price_ctx.get("choppy"):
+                blocked_reason = "lateralização/alternância forte detectada"
+            elif not gate_ok and confidence < (required_conf + 5.0):
+                # O gate local agora funciona como segunda opinião. Se a IA
+                # estiver muito forte (5 pontos acima do mínimo), não matamos
+                # automaticamente um sinal só porque uma regra rígida de candle
+                # não encaixou perfeitamente.
                 blocked_reason = gate_reason
 
         if blocked_reason:
