@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "2.3"
-PWA_VERSION = "v78"
+APP_VERSION = "2.4"
+PWA_VERSION = "v79"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -4103,6 +4103,96 @@ async def _gemini_pick_model(client, force=False, exclude=None):
     print(f"[IA GEMINI] modelo selecionado: {_gemini_selected_model}", flush=True)
     return _gemini_selected_model
 
+def _extract_openai_output_text(payload):
+    """Extrai texto da resposta REST da Responses API sem depender do SDK."""
+    if not isinstance(payload, dict):
+        return ""
+    direct = payload.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    pieces = []
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for part in item.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                pieces.append(text.strip())
+    return "\n".join(pieces).strip()
+
+
+async def _openai_json(prompt):
+    """OpenAI como provedor principal. Retorna somente um objeto JSON parseado."""
+    if not OAI_KEY:
+        raise RuntimeError("OPENAI_API_KEY não configurada.")
+
+    model = OAI_MODEL or "gpt-5.6-luna"
+    headers = {
+        "Authorization": f"Bearer {OAI_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": model,
+        "input": prompt,
+        "max_output_tokens": 600,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=OAI_TIMEOUT) as client:
+            response = await client.post(OAI_URL, headers=headers, json=body)
+    except httpx.TimeoutException as exc:
+        raise RuntimeError("OpenAI timeout.") from exc
+    except httpx.NetworkError as exc:
+        raise RuntimeError(f"OpenAI indisponível: {str(exc)[:120]}") from exc
+
+    if response.status_code >= 400:
+        detail = ""
+        try:
+            data = response.json()
+            err = data.get("error") if isinstance(data, dict) else None
+            if isinstance(err, dict):
+                detail = str(err.get("message") or err.get("code") or "")
+            elif err:
+                detail = str(err)
+        except Exception:
+            detail = response.text[:180]
+        raise RuntimeError(f"OpenAI HTTP {response.status_code}: {detail[:180]}")
+
+    payload = response.json()
+    text = _extract_openai_output_text(payload)
+    parsed = json_extract(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("Resposta inválida da IA OpenAI.")
+    return parsed
+
+
+async def _external_ai_json(prompt):
+    """OpenAI primeiro; Gemini somente como reserva; erro combinado se ambos falharem."""
+    errors = []
+
+    if OAI_KEY:
+        try:
+            return await _openai_json(prompt), "OPENAI"
+        except Exception as exc:
+            errors.append(f"OpenAI: {str(exc)[:180]}")
+            print(f"[IA OPENAI] falhou; tentando reserva: {str(exc)[:180]}", flush=True)
+    else:
+        errors.append("OpenAI: OPENAI_API_KEY não configurada")
+
+    if GEMINI_KEY:
+        try:
+            return await _gemini_json(prompt), "GEMINI"
+        except Exception as exc:
+            errors.append(f"Gemini: {str(exc)[:180]}")
+            print(f"[IA GEMINI] reserva falhou: {str(exc)[:180]}", flush=True)
+    else:
+        errors.append("Gemini: GEMINI_API_KEY não configurada")
+
+    raise RuntimeError(" | ".join(errors)[:360])
+
+
 async def _gemini_json(prompt):
     """Executa Gemini; em 503/404 troca automaticamente de modelo sem expor a chave."""
     global _gemini_selected_model, _gemini_model_checked_at
@@ -4163,8 +4253,8 @@ async def _gemini_json(prompt):
 
 
 async def openai_confirm(symbol, interval, cs, analysis):
-    if not GEMINI_KEY:
-        return {"available": False, "reason": "GEMINI_API_KEY não configurada."}
+    if not OAI_KEY and not GEMINI_KEY:
+        return {"available": False, "reason": "Nenhuma IA externa configurada (OPENAI_API_KEY/GEMINI_API_KEY)."}
 
     key = f"{symbol}|{interval}|{cs[-1]['datetime']}"
     if key in oai_cache and time.time() - oai_cache[key][0] < 55:
@@ -4186,7 +4276,7 @@ Retorne SOMENTE JSON:
 Candles: {json.dumps(data, ensure_ascii=False)}"""
 
     try:
-        p = await _gemini_json(prompt)
+        p, provider = await _external_ai_json(prompt)
 
         out = {
             "available": True,
@@ -4195,6 +4285,7 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             "confirmed": bool(p.get("confirmed", False)),
             "risk": str(p.get("risk", "HIGH")).upper(),
             "reason": str(p.get("reason", ""))[:300],
+            "provider": provider,
         }
 
         if out["direction"] not in ("CALL", "PUT", "NEUTRO"):
@@ -4583,9 +4674,9 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
             "reason": "Sem candles suficientes.",
         }
 
-    if not GEMINI_KEY:
+    if not OAI_KEY and not GEMINI_KEY:
         return _local_ohlcv_fallback_signal(
-            cs, interval, "GEMINI_API_KEY não configurada. Fallback em modo monitor."
+            cs, interval, "Nenhuma IA externa configurada (OPENAI_API_KEY/GEMINI_API_KEY). Fallback em modo monitor."
         )
 
     live = cs[-1]
@@ -4654,7 +4745,7 @@ Retorne SOMENTE JSON válido:
 Candles: {json.dumps(data, ensure_ascii=False)}"""
 
     try:
-        parsed = await _gemini_json(prompt)
+        parsed, provider = await _external_ai_json(prompt)
 
         direction = str(parsed.get("direction", "NEUTRO")).upper()
         if direction not in ("CALL", "PUT", "NEUTRO"):
@@ -4707,7 +4798,7 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             "reason": reason,
             "smart_scan": True,
             "api_called": True,
-            "provider": "GEMINI_PURE",
+            "provider": f"{provider}_PURE",
             "fallback": False,
             "api_available": True,
             "direct_win_filter": {
@@ -4924,7 +5015,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("EA" if engine == "EA" else ("INDICADOR" if engine == "INDICATOR" else f"{engine_title} {tf_label}")),
                 "mode": engine_mode,
                 "selected_engine": engine,
-                "ai_provider": "GEMINI_PURE" if engine == "SMART" else "DISABLED",
+                "ai_provider": (analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else "DISABLED",
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
@@ -4973,7 +5064,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
             "ai_confirmed": bool(engine == "SMART" and analysis.get("confirmed")),
-            "ai_provider": (analysis.get("provider") or "GEMINI_PURE") if engine == "SMART" else "DISABLED",
+            "ai_provider": (analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else "DISABLED",
             "risk": str(analysis.get("risk", "HIGH") if engine == "SMART" else "HIGH").upper(),
             "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("EA" if engine == "EA" else ("INDICADOR" if engine == "INDICATOR" else analysis.get("strategy", f"{engine_title} {tf_label}"))),
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
@@ -5081,8 +5172,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "status": "IA PURA • VARREDURA 5s • ANÁLISE INTELIGENTE",
             "ai_confirmed": bool(ai.get("confirmed", False)),
             "risk": ai.get("risk", "HIGH"),
-            "strategy": "IA GEMINI",
-            "ai_provider": "GEMINI",
+            "strategy": "IA PURA",
+            "ai_provider": ai.get("provider") or "EXTERNAL_AI",
             "reason": ai.get("reason") or "IA analisando os mesmos candles exibidos no gráfico.",
             "non_repaint": True,
             "technical": {"disabled": True, "mode": "AI_ONLY"},
@@ -5093,7 +5184,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
         if ai.get("available") and ai.get("confirmed") and ai.get("direction") in ("CALL", "PUT"):
             base["direction"] = ai["direction"]
-            base["status"] = "SINAL IA GEMINI LIBERADO"
+            base["status"] = "SINAL IA PURA LIBERADO"
             announce, entry, expiry = entry_window(interval, entry_mode)
             base["entry_time"] = iso(entry)
             base["announce_time"] = iso(announce)
@@ -5111,7 +5202,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif "429" in low_reason or "rate limit" in low_reason or "quota" in low_reason:
                 base["status"] = "IA INDISPONÍVEL • LIMITE DA API"
             elif "503" in low_reason or "service unavailable" in low_reason or "temporariamente indisponível" in low_reason:
-                base["status"] = "IA GEMINI • SERVIÇO TEMPORARIAMENTE INDISPONÍVEL"
+                base["status"] = "IA EXTERNA • SERVIÇO TEMPORARIAMENTE INDISPONÍVEL"
             else:
                 base["status"] = "IA INDISPONÍVEL • ERRO DA API"
             base["reason"] = ai_reason[:300]
@@ -5328,9 +5419,15 @@ async def health():
             "library": bool(IQ_Option is not None),
             "sessions": len(iq_sessions),
         },
+        "openai": {
+            "configured": bool(OAI_KEY),
+            "model": OAI_MODEL or "gpt-5.6-luna",
+            "priority": 1,
+        },
         "gemini": {
             "configured": bool(GEMINI_KEY),
             "model": _gemini_selected_model or GEMINI_MODEL or None,
+            "priority": 2,
         },
         "telegram": {
             "configured": bool(TELEGRAM_BOT_TOKEN),
