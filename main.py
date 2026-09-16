@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "1.9"
-PWA_VERSION = "v74"
+APP_VERSION = "2.1"
+PWA_VERSION = "v76"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -55,15 +55,12 @@ WA1 = os.getenv("WHATSAPP_1", "55 84 99841-1282")
 WA2 = os.getenv("WHATSAPP_2", "55 84 99449-9442")
 IG = os.getenv("INSTAGRAM", "@Ismaelartur26")
 
-# WhatsApp Cloud API (Meta) — usado somente para alertas de sinais.
-# O token nunca é enviado ao navegador.
-WA_CLOUD_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
-WA_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
-WA_GRAPH_VERSION = os.getenv("WHATSAPP_GRAPH_VERSION", "v23.0").strip() or "v23.0"
-WA_TEMPLATE_NAME = os.getenv("WHATSAPP_TEMPLATE_NAME", "").strip()
-WA_TEMPLATE_LANG = os.getenv("WHATSAPP_TEMPLATE_LANG", "pt_BR").strip() or "pt_BR"
-WA_SEND_TIMEOUT = float(os.getenv("WHATSAPP_SEND_TIMEOUT", "15"))
-wa_sent_cache: Dict[str, float] = {}
+# Telegram Bot API — usado para enviar sinais ao grupo configurado.
+# O token fica somente no servidor Render e nunca é enviado ao navegador.
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_SEND_TIMEOUT = float(os.getenv("TELEGRAM_SEND_TIMEOUT", "15"))
+telegram_sent_cache: Dict[str, float] = {}
 
 TD_URL = "https://api.twelvedata.com/time_series"
 TD_WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
@@ -483,8 +480,8 @@ class IQAutoOrderResultBody(BaseModel):
     order_id: str
 
 
-class WhatsAppSignalBody(BaseModel):
-    to: str
+class TelegramSignalBody(BaseModel):
+    chat_id: str | None = None
     symbol: str = "--"
     interval: str = "1min"
     direction: str = "NEUTRO"
@@ -3524,6 +3521,80 @@ def iq_regular_active_candidates(symbol: str):
     ]))
 
 
+def _iq_active_norm(value: Any) -> str:
+    """Normaliza nomes de ativos da IQ para comparar variações como EURUSD-OTC."""
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _iq_otc_open_pairs_blocking(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Lista pares OTC abertos usando get_all_open_time quando o fork suporta.
+
+    O resultado fica em cache curto por sessão para não sobrecarregar o websocket
+    da IQ Option. Se o fork não expuser get_all_open_time, devolve os pares que
+    tiveram candles OTC confirmados recentemente pelo próprio app.
+    """
+    now_ts = time.time()
+    cached = state.get("otc_open_pairs_cache") if state else None
+    if isinstance(cached, dict) and now_ts - float(cached.get("ts", 0) or 0) < 15:
+        return dict(cached)
+
+    client = state.get("client") if state else None
+    if client is None or not _iq_connected(state):
+        result = {"ts": now_ts, "pairs": [], "source": "OFFLINE", "exact": False}
+        if state is not None:
+            state["otc_open_pairs_cache"] = dict(result)
+        return result
+
+    open_names = set()
+    source = "RECENT_CANDLES"
+    exact = False
+    error = ""
+
+    getter = getattr(client, "get_all_open_time", None)
+    if callable(getter):
+        try:
+            sync_lock = state.get("sync_lock")
+            if sync_lock is None:
+                sync_lock = threading.RLock()
+                state["sync_lock"] = sync_lock
+            with sync_lock:
+                raw = getter()
+            if isinstance(raw, dict):
+                for book in raw.values():
+                    if not isinstance(book, dict):
+                        continue
+                    for active_name, info in book.items():
+                        if isinstance(info, dict) and bool(info.get("open")):
+                            open_names.add(_iq_active_norm(active_name))
+                source = "IQ_OPEN_TIME"
+                exact = True
+        except Exception as exc:
+            error = str(exc)[:180]
+
+    pairs = []
+    if exact:
+        for symbol in SYMBOLS:
+            otc_candidates = [c for c in iq_active_candidates(symbol) if "OTC" in _iq_active_norm(c)]
+            if any(_iq_active_norm(c) in open_names for c in otc_candidates):
+                pairs.append(symbol)
+    else:
+        recent = state.get("otc_recent_available") or {}
+        for symbol in SYMBOLS:
+            ts = float(recent.get(symbol, 0) or 0)
+            if now_ts - ts <= 90:
+                pairs.append(symbol)
+
+    result = {
+        "ts": now_ts,
+        "pairs": pairs,
+        "source": source,
+        "exact": exact,
+        "error": error,
+    }
+    state["otc_open_pairs_cache"] = dict(result)
+    return result
+
+
 def iq_seconds(interval: str):
     if interval not in INTERVALS:
         raise RuntimeError("Intervalo inválido para IQ Option.")
@@ -3896,6 +3967,7 @@ async def candles(
             and time.time() - cached[0] < IQ_CANDLE_CACHE_TTL
             and len(cached[1]) >= min(int(n), 20)
         ):
+            iq_state.setdefault("otc_recent_available", {})[symbol] = time.time()
             return cached[1][-int(n):]
 
         lock = iq_state.get("lock")
@@ -3934,6 +4006,9 @@ async def candles(
                     time.time(),
                     data,
                 )
+                iq_state.setdefault("otc_recent_available", {})[symbol] = time.time()
+                # Invalida a lista curta para refletir rapidamente um ativo que abriu.
+                iq_state.pop("otc_open_pairs_cache", None)
                 return data[-int(n):]
 
         except asyncio.TimeoutError:
@@ -3948,6 +4023,7 @@ async def candles(
             stale = candle_cache.get(cache_key)
 
             if stale and time.time() - stale[0] < 90:
+                iq_state.setdefault("otc_recent_available", {})[symbol] = time.time()
                 return stale[1][-int(n):]
 
             raise HTTPException(
@@ -5244,10 +5320,9 @@ async def health():
             "configured": bool(GEMINI_KEY),
             "model": _gemini_selected_model or GEMINI_MODEL or None,
         },
-        "whatsapp": {
-            "configured": bool(WA_CLOUD_TOKEN and WA_PHONE_NUMBER_ID),
-            "template_configured": bool(WA_TEMPLATE_NAME),
-            "mode": "TEMPLATE" if WA_TEMPLATE_NAME else "TEXT_24H_WINDOW",
+        "telegram": {
+            "configured": bool(TELEGRAM_BOT_TOKEN),
+            "default_chat_configured": bool(TELEGRAM_CHAT_ID),
         },
     }
 
@@ -5430,6 +5505,8 @@ async def iq_login(body: IQLoginBody, response: Response):
         "results": {},
         "auto_orders": {},
         "auto_account": "PRACTICE",
+        "otc_recent_available": {},
+        "otc_open_pairs_cache": {},
         "order_lock": asyncio.Lock(),
     }
     iq_sessions[token] = state
@@ -5774,6 +5851,67 @@ async def otc_status(request: Request, broker: str = "IQ_OPTION"):
             )
         ),
         "pairs": len(OTC_BASE),
+    }
+
+
+@app.get("/otc-active-pairs")
+async def otc_active_pairs(request: Request):
+    """Retorna somente os pares OTC que estão disponíveis na sessão IQ agora."""
+    state = _iq_session_state(request, required=False)
+    if not state or not _iq_connected(state):
+        return {
+            "ok": True,
+            "connected": False,
+            "pairs": [],
+            "count": 0,
+            "status": "IQ OPTION OFFLINE",
+            "message": "Conecte sua conta da IQ Option para consultar os ativos OTC abertos.",
+        }
+
+    try:
+        info = await asyncio.wait_for(
+            asyncio.to_thread(_iq_otc_open_pairs_blocking, state),
+            timeout=8,
+        )
+    except Exception as exc:
+        info = {
+            "pairs": [],
+            "source": "ERROR",
+            "exact": False,
+            "error": str(exc)[:180],
+        }
+
+    pairs = [s for s in info.get("pairs", []) if s in SYMBOLS]
+
+    # Se o fork não informa open_time, o radar vai construindo a lista com
+    # candles OTC recentes. Faz um probe leve de um ativo por chamada, sem
+    # consultar todos ao mesmo tempo.
+    if not info.get("exact"):
+        idx_key = "OTC_ACTIVE_PROBE_INDEX"
+        idx = int(state.get(idx_key, 0) or 0) % len(SYMBOLS)
+        probe_symbol = SYMBOLS[idx]
+        state[idx_key] = (idx + 1) % len(SYMBOLS)
+        try:
+            await candles(probe_symbol, "1min", 30, "IQ_OTC", state, request=request)
+            state.setdefault("otc_recent_available", {})[probe_symbol] = time.time()
+        except Exception:
+            pass
+        recent = state.get("otc_recent_available") or {}
+        pairs = [s for s in SYMBOLS if time.time() - float(recent.get(s, 0) or 0) <= 90]
+
+    return {
+        "ok": True,
+        "connected": True,
+        "pairs": pairs,
+        "count": len(pairs),
+        "status": "OTC ATIVOS" if pairs else "NENHUM OTC ABERTO DETECTADO",
+        "source": info.get("source", "UNKNOWN"),
+        "exact": bool(info.get("exact")),
+        "message": (
+            f"{len(pairs)} ativo(s) OTC disponível(is) agora."
+            if pairs else
+            "Nenhum ativo OTC aberto foi detectado neste momento."
+        ),
     }
 
 
@@ -6177,16 +6315,7 @@ async def candles_endpoint(
         }
 
 
-def _wa_normalize_number(value: str) -> str:
-    digits = re.sub(r"\D+", "", str(value or ""))
-    if digits.startswith("00"):
-        digits = digits[2:]
-    if not 10 <= len(digits) <= 15:
-        raise HTTPException(400, "Número do WhatsApp inválido. Use código do país + DDD + número.")
-    return digits
-
-
-def _wa_display_time(value: str | None) -> str:
+def _tg_display_time(value: str | None) -> str:
     if not value:
         return "--:--"
     try:
@@ -6195,137 +6324,150 @@ def _wa_display_time(value: str | None) -> str:
         return str(value)[:19]
 
 
-def _wa_signal_text(body: WhatsAppSignalBody) -> str:
+def _tg_chat_id(value: str | None) -> str:
+    chat_id = str(value or TELEGRAM_CHAT_ID or "").strip()
+    if not chat_id:
+        raise HTTPException(
+            400,
+            "Chat ID do Telegram não configurado. Use a aba Telegram para localizar o grupo ou defina TELEGRAM_CHAT_ID no Render."
+        )
+    if chat_id.startswith("@"):
+        return chat_id
+    if not re.fullmatch(r"-?\d+", chat_id):
+        raise HTTPException(400, "Chat ID do Telegram inválido.")
+    return chat_id
+
+
+def _tg_signal_text(body: TelegramSignalBody) -> str:
     if body.test:
         return (
-            "✅ MEGA IA • TESTE WHATSAPP\n"
-            "Integração ativa. Quando um sinal confirmado for liberado, "
-            "o alerta poderá ser enviado para este número."
+            "✅ MEGA IA • TESTE TELEGRAM\n"
+            "Integração ativa. Os próximos sinais CALL/PUT confirmados poderão ser enviados para este grupo."
         )
     direction = str(body.direction or "NEUTRO").upper()
     emoji = "🟢" if direction == "CALL" else "🔴" if direction == "PUT" else "⚪"
-    market_label = "MERCADO ABERTO" if str(body.market or "OPEN").upper() == "OPEN" else "OTC"
+    market_label = "MERCADO ABERTO" if str(body.market or "OPEN").upper() == "OPEN" else "OTC • IQ OPTION"
     return (
         f"🚨 MEGA IA • SINAL CONFIRMADO\n"
         f"{emoji} {body.symbol} • {direction}\n"
         f"🎯 Confiança: {float(body.confidence or 0):.0f}%\n"
-        f"⏱ Entrada: {_wa_display_time(body.entry_time)}\n"
-        f"⌛ Expiração: {_wa_display_time(body.expiry_time)}\n"
+        f"⏱ Entrada: {_tg_display_time(body.entry_time)}\n"
+        f"⌛ Expiração: {_tg_display_time(body.expiry_time)}\n"
         f"🕐 Período: {body.interval}\n"
         f"🌐 Mercado: {market_label}\n"
         f"⚠️ Risco: {str(body.risk or '--').upper()}"
     )
 
 
-def _wa_template_payload(body: WhatsAppSignalBody, recipient: str) -> dict:
-    # O template aprovado no Meta deve ter 8 variáveis no corpo, nesta ordem:
-    # ativo, direção, confiança, entrada, expiração, período, mercado, risco.
-    market_label = "MERCADO ABERTO" if str(body.market or "OPEN").upper() == "OPEN" else "OTC"
-    values = [
-        str(body.symbol or "--"),
-        str(body.direction or "NEUTRO").upper(),
-        f"{float(body.confidence or 0):.0f}%",
-        _wa_display_time(body.entry_time),
-        _wa_display_time(body.expiry_time),
-        str(body.interval or "1min"),
-        market_label,
-        str(body.risk or "--").upper(),
-    ]
-    return {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": recipient,
-        "type": "template",
-        "template": {
-            "name": WA_TEMPLATE_NAME,
-            "language": {"code": WA_TEMPLATE_LANG},
-            "components": [{
-                "type": "body",
-                "parameters": [{"type": "text", "text": v} for v in values],
-            }],
-        },
-    }
-
-
-async def _wa_send(body: WhatsAppSignalBody) -> dict:
-    if not WA_CLOUD_TOKEN or not WA_PHONE_NUMBER_ID:
+async def _tg_request(method: str, payload: dict | None = None) -> dict:
+    if not TELEGRAM_BOT_TOKEN:
         raise HTTPException(
             503,
-            "WhatsApp Cloud API não configurada. Defina WHATSAPP_ACCESS_TOKEN e WHATSAPP_PHONE_NUMBER_ID no Render."
+            "Telegram não configurado. Defina TELEGRAM_BOT_TOKEN no Render."
         )
-    recipient = _wa_normalize_number(body.to)
-    url = f"https://graph.facebook.com/{WA_GRAPH_VERSION}/{WA_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WA_CLOUD_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    # Para alertas proativos 24/7, use template aprovado. Sem template, usamos
-    # texto livre — ele só é aceito pela Meta dentro da janela de atendimento.
-    if WA_TEMPLATE_NAME:
-        payload = _wa_template_payload(body, recipient)
-        mode = "TEMPLATE"
-    else:
-        payload = {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": recipient,
-            "type": "text",
-            "text": {"preview_url": False, "body": _wa_signal_text(body)},
-        }
-        mode = "TEXT"
-    dedupe_key = None
-    if not body.test:
-        dedupe_key = "|".join([recipient, str(body.symbol), str(body.direction).upper(), str(body.entry_time or "")])
-        now_ts = time.time()
-        for k, ts in list(wa_sent_cache.items()):
-            if now_ts - ts > 21600:
-                wa_sent_cache.pop(k, None)
-        if dedupe_key in wa_sent_cache:
-            return {"ok": True, "mode": mode, "duplicate": True, "message_id": None}
-
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     try:
-        async with httpx.AsyncClient(timeout=WA_SEND_TIMEOUT) as client:
-            response = await client.post(url, headers=headers, json=payload)
+        async with httpx.AsyncClient(timeout=TELEGRAM_SEND_TIMEOUT) as client:
+            response = await client.post(url, json=payload or {})
         try:
             data = response.json()
         except Exception:
-            data = {"raw": response.text[:500]}
-        if response.status_code >= 400:
-            detail = ""
-            if isinstance(data, dict):
-                err = data.get("error") or {}
-                if isinstance(err, dict):
-                    detail = str(err.get("message") or err.get("error_user_msg") or "")
-            raise HTTPException(response.status_code, (detail or "WhatsApp recusou o envio.")[:300])
-        message_id = None
-        if isinstance(data, dict) and data.get("messages"):
-            message_id = (data.get("messages") or [{}])[0].get("id")
-        if dedupe_key:
-            wa_sent_cache[dedupe_key] = time.time()
-        return {"ok": True, "mode": mode, "message_id": message_id}
+            data = {"ok": False, "description": response.text[:500]}
+        if response.status_code >= 400 or not bool(data.get("ok")):
+            detail = str(data.get("description") or "Telegram recusou a solicitação.")
+            raise HTTPException(response.status_code if response.status_code >= 400 else 502, detail[:300])
+        return data
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(502, f"Falha ao enviar WhatsApp: {str(exc)[:220]}")
+        raise HTTPException(502, f"Falha ao comunicar com Telegram: {str(exc)[:220]}")
 
 
-@app.get("/whatsapp-status")
-async def whatsapp_status():
+async def _tg_send(body: TelegramSignalBody) -> dict:
+    chat_id = _tg_chat_id(body.chat_id)
+    dedupe_key = None
+    if not body.test:
+        dedupe_key = "|".join([
+            chat_id,
+            str(body.symbol),
+            str(body.direction).upper(),
+            str(body.entry_time or "")
+        ])
+        now_ts = time.time()
+        for k, ts in list(telegram_sent_cache.items()):
+            if now_ts - ts > 21600:
+                telegram_sent_cache.pop(k, None)
+        if dedupe_key in telegram_sent_cache:
+            return {"ok": True, "duplicate": True, "message_id": None, "chat_id": chat_id}
+
+    data = await _tg_request("sendMessage", {
+        "chat_id": chat_id,
+        "text": _tg_signal_text(body),
+        "disable_web_page_preview": True,
+    })
+    result = data.get("result") or {}
+    if dedupe_key:
+        telegram_sent_cache[dedupe_key] = time.time()
     return {
         "ok": True,
-        "configured": bool(WA_CLOUD_TOKEN and WA_PHONE_NUMBER_ID),
-        "template_configured": bool(WA_TEMPLATE_NAME),
-        "mode": "TEMPLATE" if WA_TEMPLATE_NAME else "TEXT_24H_WINDOW",
-        "graph_version": WA_GRAPH_VERSION,
+        "duplicate": False,
+        "message_id": result.get("message_id"),
+        "chat_id": str((result.get("chat") or {}).get("id") or chat_id),
     }
 
 
-@app.post("/whatsapp-send")
-async def whatsapp_send(body: WhatsAppSignalBody):
+@app.get("/telegram-status")
+async def telegram_status():
+    return {
+        "ok": True,
+        "configured": bool(TELEGRAM_BOT_TOKEN),
+        "default_chat_configured": bool(TELEGRAM_CHAT_ID),
+        "default_chat_id": TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID else None,
+    }
+
+
+@app.get("/telegram-chats")
+async def telegram_chats():
+    """Lista grupos/supergrupos/canais vistos recentemente pelo bot.
+
+    Para o grupo aparecer, adicione o bot ao grupo e envie /start ou /id no grupo.
+    """
+    data = await _tg_request("getUpdates", {"limit": 100, "timeout": 0})
+    chats: dict[str, dict] = {}
+    for upd in data.get("result") or []:
+        if not isinstance(upd, dict):
+            continue
+        msg = (
+            upd.get("message")
+            or upd.get("edited_message")
+            or upd.get("channel_post")
+            or upd.get("edited_channel_post")
+        )
+        if not isinstance(msg, dict):
+            continue
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id")
+        if chat_id is None:
+            continue
+        chat_type = str(chat.get("type") or "")
+        if chat_type not in ("group", "supergroup", "channel"):
+            continue
+        title = str(chat.get("title") or chat.get("username") or f"Grupo {chat_id}")
+        chats[str(chat_id)] = {
+            "chat_id": str(chat_id),
+            "title": title,
+            "type": chat_type,
+            "username": chat.get("username"),
+        }
+    return {"ok": True, "chats": list(chats.values())}
+
+
+@app.post("/telegram-send")
+async def telegram_send(body: TelegramSignalBody):
     direction = str(body.direction or "NEUTRO").upper()
     if not body.test and direction not in ("CALL", "PUT"):
         raise HTTPException(400, "Somente sinais CALL ou PUT confirmados podem ser enviados.")
-    return await _wa_send(body)
+    return await _tg_send(body)
 
 
 @app.get("/signal-ai")
@@ -7771,7 +7913,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button class="tabbtn" id="tabResults">🎯 Resultados</button>
     <button class="tabbtn" id="tabHistory">🗓️ Histórico 15 dias</button>
     <button class="tabbtn" id="tabCompatibility">🧪 Compatibilidade</button>
-    <button class="tabbtn" id="tabWhatsApp">📲 WhatsApp</button>
+    <button class="tabbtn" id="tabTelegram">✈️ Telegram</button>
     <button class="tabbtn" id="tabAccount">🏦 Corretora</button>
   </div>
 
@@ -7980,36 +8122,43 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </div>
   </div>
 
-  <div id="whatsappTab" class="tab">
+  <div id="telegramTab" class="tab">
     <div class="card" style="max-width:680px;margin:0 auto">
-      <h2 style="margin-top:0">📲 Sinais no WhatsApp</h2>
-      <div class="label">ENVIA SOMENTE SINAIS CALL/PUT CONFIRMADOS PELO MOTOR ATIVO</div>
+      <h2 style="margin-top:0">✈️ Sinais no Telegram</h2>
+      <div class="label">ENVIA SINAIS CALL/PUT CONFIRMADOS PARA O SEU GRUPO</div>
 
-      <div id="whatsappApiStatus" class="card" style="margin-top:12px">
-        ⚪ Verificando WhatsApp Cloud API...
+      <div id="telegramApiStatus" class="card" style="margin-top:12px">
+        ⚪ Verificando Telegram Bot API...
       </div>
 
       <div style="margin-top:12px">
-        <div class="label">NÚMERO QUE VAI RECEBER OS SINAIS</div>
-        <input id="whatsappNumber" type="tel" inputmode="tel" autocomplete="tel"
-               placeholder="Ex.: 5584999999999"
+        <div class="label">GRUPO QUE VAI RECEBER OS SINAIS</div>
+        <input id="telegramChatId" type="text" inputmode="text" autocomplete="off"
+               placeholder="Ex.: -1001234567890"
                style="width:100%;box-sizing:border-box;margin-top:6px">
-        <div class="label" style="margin-top:6px">Use código do país + DDD + número, somente números.</div>
+        <div class="label" style="margin-top:6px">
+          Adicione o bot ao grupo, envie <b>/start</b> ou <b>/id</b> no grupo e toque em LOCALIZAR GRUPO.
+        </div>
       </div>
+
+      <select id="telegramChatSelect" style="width:100%;margin-top:10px;display:none">
+        <option value="">Selecione o grupo encontrado</option>
+      </select>
 
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px">
-        <button id="whatsappToggle" type="button" style="font-weight:1000">🔴 WHATSAPP OFF</button>
-        <button id="whatsappTestBtn" type="button" style="font-weight:900">🧪 ENVIAR TESTE</button>
+        <button id="telegramFindBtn" type="button" style="font-weight:900">🔎 LOCALIZAR GRUPO</button>
+        <button id="telegramTestBtn" type="button" style="font-weight:900">🧪 ENVIAR TESTE</button>
       </div>
 
-      <div id="whatsappSendStatus" class="card" style="margin-top:12px">
-        ⚪ Salve o número e ative o envio.
+      <button id="telegramToggle" type="button" style="width:100%;margin-top:10px;font-weight:1000">🔴 TELEGRAM OFF</button>
+
+      <div id="telegramSendStatus" class="card" style="margin-top:12px">
+        ⚪ Configure o bot e escolha o grupo.
       </div>
 
       <div class="label" style="margin-top:12px;line-height:1.55">
-        O token da Meta fica somente no servidor Render e nunca é mostrado no navegador.
-        Para alertas proativos 24 horas por dia, configure também um template aprovado no WhatsApp Business Platform.
-        Sem template, mensagens de texto livre dependem da janela de atendimento permitida pela Meta.
+        O token do bot fica somente no servidor Render e não aparece no navegador.
+        Os sinais são enviados pelo bot diretamente ao grupo selecionado.
       </div>
     </div>
   </div>
@@ -8108,7 +8257,18 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div id="preSignals" class="radar" style="margin-top:10px"></div>
     </div>
 
-<div id="radar" class="radar"></div>
+<div style="margin-top:12px;border-top:1px solid #173c5e;padding-top:12px">
+      <div class="label">🌐 RADAR MERCADO ABERTO</div>
+      <small style="opacity:.72">Oportunidades do mercado aberto • continua usando o motor selecionado</small>
+      <div id="radar" class="radar" style="margin-top:8px"></div>
+    </div>
+
+    <div style="margin-top:14px;border-top:1px solid #173c5e;padding-top:12px">
+      <div class="label">🟣 RADAR OTC • IQ OPTION</div>
+      <small style="opacity:.72">Mostra somente os pares OTC disponíveis na IQ Option neste momento</small>
+      <div id="radarOtcStatus" style="margin-top:8px;font-size:12px;opacity:.82">⚪ Aguardando conexão da IQ Option...</div>
+      <div id="radarOtc" class="radar" style="margin-top:8px"></div>
+    </div>
   </div>
 
   <div id="licenseCard" class="card" style="display:none">
@@ -8118,12 +8278,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 </div>
 
 <script>
-// MEGA IA v1.0 — base anterior preservada + pré-alerta de até 1 minuto antes da entrada.
+// MEGA IA v2.0 — radar OPEN e radar OTC IQ Option separados.
 (function(){
   try{
     const u=new URL(window.location.href);
-    if(u.searchParams.get('pwa')!=='v65'){
-      u.searchParams.set('pwa','v65');
+    if(u.searchParams.get('pwa')!=='v75'){
+      u.searchParams.set('pwa','v75');
       window.history.replaceState({},'',u.pathname+u.search+u.hash);
     }
   }catch(_){}
@@ -8223,16 +8383,18 @@ const accountTab=document.getElementById('accountTab');
 const resultsTab=document.getElementById('resultsTab');
 const historyTab=document.getElementById('historyTab');
 const compatibilityTab=document.getElementById('compatibilityTab');
-const whatsappTab=document.getElementById('whatsappTab');
+const telegramTab=document.getElementById('telegramTab');
 const tabResults=document.getElementById('tabResults');
 const tabHistory=document.getElementById('tabHistory');
 const tabCompatibility=document.getElementById('tabCompatibility');
-const tabWhatsApp=document.getElementById('tabWhatsApp');
-const whatsappNumber=document.getElementById('whatsappNumber');
-const whatsappToggle=document.getElementById('whatsappToggle');
-const whatsappTestBtn=document.getElementById('whatsappTestBtn');
-const whatsappApiStatus=document.getElementById('whatsappApiStatus');
-const whatsappSendStatus=document.getElementById('whatsappSendStatus');
+const tabTelegram=document.getElementById('tabTelegram');
+const telegramChatId=document.getElementById('telegramChatId');
+const telegramChatSelect=document.getElementById('telegramChatSelect');
+const telegramToggle=document.getElementById('telegramToggle');
+const telegramTestBtn=document.getElementById('telegramTestBtn');
+const telegramFindBtn=document.getElementById('telegramFindBtn');
+const telegramApiStatus=document.getElementById('telegramApiStatus');
+const telegramSendStatus=document.getElementById('telegramSendStatus');
 const compatTestBtn=document.getElementById('compatTestBtn');
 const compatStatus=document.getElementById('compatStatus');
 const compatMetrics=document.getElementById('compatMetrics');
@@ -8273,12 +8435,12 @@ let autoTradeEnabled=false;
 let autoOrderBusy=false;
 const autoExecutedKeys=new Set();
 const autoGaleRuns=new Set();
-const WHATSAPP_ENABLED_KEY='mega_whatsapp_enabled_v1';
-const WHATSAPP_NUMBER_KEY='mega_whatsapp_number_v1';
-const WHATSAPP_LAST_SIGNAL_KEY='mega_whatsapp_last_signal_v1';
-let whatsappEnabled=false;
-let whatsappBusy=false;
-let whatsappLastSignalKey='';
+const TELEGRAM_ENABLED_KEY='mega_telegram_enabled_v1';
+const TELEGRAM_CHAT_ID_KEY='mega_telegram_chat_id_v1';
+const TELEGRAM_LAST_SIGNAL_KEY='mega_telegram_last_signal_v1';
+let telegramEnabled=false;
+let telegramBusy=false;
+let telegramLastSignalKey='';
 let brokerConnected={IQ_OPTION:false};
 const chartInfo=document.getElementById('chartInfo');
 const direction=document.getElementById('direction');
@@ -8297,6 +8459,8 @@ const losses=document.getElementById('losses');
 const accuracy=document.getElementById('accuracy');
 const result=document.getElementById('result');
 const radar=document.getElementById('radar');
+const radarOtc=document.getElementById('radarOtc');
+const radarOtcStatus=document.getElementById('radarOtcStatus');
 const licenseCard=document.getElementById('licenseCard');
 const licenseBox=document.getElementById('license');
 const clock=document.getElementById('clock');
@@ -8358,6 +8522,7 @@ let moneyFxTimer=null;
 let sigBusy=false;
 let chartBusy=false;
 let radBusy=false;
+let otcRadarBusy=false;
 let lastRadarAutoKey='';
 let radarAutoBusy=false;
 let perfBusy=false;
@@ -9903,96 +10068,133 @@ async function loadChart(){
   }
 }
 
-function normalizeWhatsAppNumber(value){
-  return String(value||'').replace(/\D/g,'');
+function normalizeTelegramChatId(value){
+  return String(value||'').trim();
 }
 
-function loadWhatsAppSettings(){
+function loadTelegramSettings(){
   try{
-    whatsappEnabled=localStorage.getItem(WHATSAPP_ENABLED_KEY)==='1';
-    whatsappLastSignalKey=localStorage.getItem(WHATSAPP_LAST_SIGNAL_KEY)||'';
-    if(whatsappNumber) whatsappNumber.value=localStorage.getItem(WHATSAPP_NUMBER_KEY)||'';
+    telegramEnabled=localStorage.getItem(TELEGRAM_ENABLED_KEY)==='1';
+    telegramLastSignalKey=localStorage.getItem(TELEGRAM_LAST_SIGNAL_KEY)||'';
+    if(telegramChatId) telegramChatId.value=localStorage.getItem(TELEGRAM_CHAT_ID_KEY)||'';
   }catch(_){
-    whatsappEnabled=false;
+    telegramEnabled=false;
   }
-  paintWhatsAppSettings();
+  paintTelegramSettings();
 }
 
-function paintWhatsAppSettings(){
-  if(whatsappToggle){
-    whatsappToggle.textContent=whatsappEnabled?'🟢 WHATSAPP ON':'🔴 WHATSAPP OFF';
-    whatsappToggle.style.borderColor=whatsappEnabled?'#19d27c':'#ff5252';
+function paintTelegramSettings(){
+  if(telegramToggle){
+    telegramToggle.textContent=telegramEnabled?'🟢 TELEGRAM ON':'🔴 TELEGRAM OFF';
+    telegramToggle.style.borderColor=telegramEnabled?'#19d27c':'#ff5252';
   }
 }
 
-function saveWhatsAppNumber(){
-  const n=normalizeWhatsAppNumber(whatsappNumber&&whatsappNumber.value);
-  if(whatsappNumber) whatsappNumber.value=n;
-  try{ localStorage.setItem(WHATSAPP_NUMBER_KEY,n); }catch(_){ }
-  return n;
+function saveTelegramChatId(value){
+  const id=normalizeTelegramChatId(value!==undefined?value:(telegramChatId&&telegramChatId.value));
+  if(telegramChatId) telegramChatId.value=id;
+  try{ localStorage.setItem(TELEGRAM_CHAT_ID_KEY,id); }catch(_){ }
+  return id;
 }
 
-async function refreshWhatsAppStatus(){
-  if(!whatsappApiStatus) return;
+async function refreshTelegramStatus(){
+  if(!telegramApiStatus) return;
   try{
-    const d=await get('/whatsapp-status');
+    const d=await get('/telegram-status');
     if(!d.configured){
-      whatsappApiStatus.innerHTML='🟠 <b>API NÃO CONFIGURADA</b><br><span style="opacity:.8">Adicione WHATSAPP_ACCESS_TOKEN e WHATSAPP_PHONE_NUMBER_ID no Render.</span>';
+      telegramApiStatus.innerHTML='🟠 <b>BOT NÃO CONFIGURADO</b><br><span style="opacity:.8">Adicione TELEGRAM_BOT_TOKEN no Render.</span>';
       return;
     }
-    const mode=d.template_configured?'TEMPLATE 24/7':'TEXTO • JANELA DE ATENDIMENTO';
-    whatsappApiStatus.innerHTML='🟢 <b>WHATSAPP CLOUD API CONFIGURADA</b><br><span style="opacity:.8">Modo: '+mode+'</span>';
+    telegramApiStatus.innerHTML='🟢 <b>TELEGRAM BOT API CONFIGURADA</b><br><span style="opacity:.8">'+
+      (d.default_chat_configured?'Grupo padrão configurado no servidor.':'Agora adicione o bot ao grupo e localize o Chat ID.')+
+      '</span>';
+    if(!saveTelegramChatId() && d.default_chat_id){
+      saveTelegramChatId(d.default_chat_id);
+    }
   }catch(e){
-    whatsappApiStatus.textContent='⚠️ Não foi possível verificar a configuração do WhatsApp agora.';
+    telegramApiStatus.textContent='⚠️ Não foi possível verificar a configuração do Telegram agora.';
   }
 }
 
-async function sendWhatsAppPayload(payload){
-  if(whatsappBusy) return null;
-  whatsappBusy=true;
+async function findTelegramGroups(){
+  if(!telegramFindBtn) return;
+  telegramFindBtn.disabled=true;
+  if(telegramSendStatus) telegramSendStatus.textContent='🔎 Procurando grupos vistos pelo bot...';
   try{
-    const r=await post('/whatsapp-send',payload);
-    return r;
+    const d=await get('/telegram-chats');
+    const chats=Array.isArray(d.chats)?d.chats:[];
+    if(!chats.length){
+      if(telegramChatSelect) telegramChatSelect.style.display='none';
+      if(telegramSendStatus) telegramSendStatus.textContent='⚠️ Nenhum grupo encontrado. Adicione o bot ao grupo, envie /start ou /id no grupo e tente novamente.';
+      return;
+    }
+    if(telegramChatSelect){
+      telegramChatSelect.innerHTML='<option value="">Selecione o grupo encontrado</option>';
+      chats.forEach(c=>{
+        const opt=document.createElement('option');
+        opt.value=String(c.chat_id||'');
+        opt.textContent=(c.title||'Grupo')+' • '+String(c.chat_id||'');
+        telegramChatSelect.appendChild(opt);
+      });
+      telegramChatSelect.style.display='block';
+      if(chats.length===1){
+        telegramChatSelect.value=String(chats[0].chat_id||'');
+        saveTelegramChatId(chats[0].chat_id||'');
+      }
+    }
+    if(telegramSendStatus) telegramSendStatus.textContent='✅ '+chats.length+' grupo(s) encontrado(s). Selecione o grupo e envie o teste.';
+  }catch(e){
+    if(telegramSendStatus) telegramSendStatus.textContent='❌ '+String(e&&e.message?e.message:e);
   }finally{
-    whatsappBusy=false;
+    telegramFindBtn.disabled=false;
   }
 }
 
-async function testWhatsApp(){
-  const to=saveWhatsAppNumber();
-  if(to.length<10){
-    if(whatsappSendStatus) whatsappSendStatus.textContent='⚠️ Digite o número com código do país + DDD + número.';
+async function sendTelegramPayload(payload){
+  if(telegramBusy) return null;
+  telegramBusy=true;
+  try{
+    return await post('/telegram-send',payload);
+  }finally{
+    telegramBusy=false;
+  }
+}
+
+async function testTelegram(){
+  const chat_id=saveTelegramChatId();
+  if(!chat_id){
+    if(telegramSendStatus) telegramSendStatus.textContent='⚠️ Localize ou informe primeiro o Chat ID do grupo.';
     return;
   }
-  if(whatsappTestBtn) whatsappTestBtn.disabled=true;
-  if(whatsappSendStatus) whatsappSendStatus.textContent='⏳ Enviando mensagem de teste...';
+  if(telegramTestBtn) telegramTestBtn.disabled=true;
+  if(telegramSendStatus) telegramSendStatus.textContent='⏳ Enviando mensagem de teste para o grupo...';
   try{
-    const r=await sendWhatsAppPayload({
-      to, symbol:'TESTE', interval:(interval&&interval.value)||'1min', direction:'CALL',
+    const r=await sendTelegramPayload({
+      chat_id, symbol:'TESTE', interval:(interval&&interval.value)||'1min', direction:'CALL',
       confidence:100, market:(market&&market.value)||'OPEN', risk:'LOW', test:true
     });
-    if(whatsappSendStatus) whatsappSendStatus.textContent='✅ Teste enviado pelo WhatsApp'+(r&&r.mode?' • '+r.mode:'')+'.';
+    if(telegramSendStatus) telegramSendStatus.textContent='✅ Teste enviado para o grupo Telegram'+(r&&r.message_id?' • mensagem '+r.message_id:'')+'.';
   }catch(e){
-    if(whatsappSendStatus) whatsappSendStatus.textContent='❌ '+String(e&&e.message?e.message:e);
+    if(telegramSendStatus) telegramSendStatus.textContent='❌ '+String(e&&e.message?e.message:e);
   }finally{
-    if(whatsappTestBtn) whatsappTestBtn.disabled=false;
+    if(telegramTestBtn) telegramTestBtn.disabled=false;
   }
 }
 
-async function maybeSendWhatsAppSignal(signal){
-  if(!whatsappEnabled || !signal || whatsappBusy) return;
+async function maybeSendTelegramSignal(signal){
+  if(!telegramEnabled || !signal || telegramBusy) return;
   const dir=String(signal.direction||'').toUpperCase();
   if((dir!=='CALL'&&dir!=='PUT') || !signal.entry_time) return;
-  const to=saveWhatsAppNumber();
-  if(to.length<10){
-    if(whatsappSendStatus) whatsappSendStatus.textContent='⚠️ WhatsApp ON, mas o número está incompleto.';
+  const chat_id=saveTelegramChatId();
+  if(!chat_id){
+    if(telegramSendStatus) telegramSendStatus.textContent='⚠️ Telegram ON, mas nenhum grupo foi selecionado.';
     return;
   }
   const key=[signal.symbol,signal.interval,dir,signal.entry_time].join('|');
-  if(key===whatsappLastSignalKey) return;
+  if(key===telegramLastSignalKey) return;
   try{
-    const r=await sendWhatsAppPayload({
-      to,
+    const r=await sendTelegramPayload({
+      chat_id,
       symbol:signal.symbol||((S&&S.value)||'--'),
       interval:signal.interval||((interval&&interval.value)||'1min'),
       direction:dir,
@@ -10003,33 +10205,39 @@ async function maybeSendWhatsAppSignal(signal){
       risk:signal.risk||'--',
       test:false
     });
-    whatsappLastSignalKey=key;
-    try{ localStorage.setItem(WHATSAPP_LAST_SIGNAL_KEY,key); }catch(_){ }
-    if(whatsappSendStatus) whatsappSendStatus.textContent='✅ Último sinal enviado: '+(signal.symbol||'--')+' '+dir+' • '+ft(signal.entry_time)+(r&&r.mode?' • '+r.mode:'');
+    telegramLastSignalKey=key;
+    try{ localStorage.setItem(TELEGRAM_LAST_SIGNAL_KEY,key); }catch(_){ }
+    if(telegramSendStatus) telegramSendStatus.textContent='✅ Último sinal enviado ao grupo: '+(signal.symbol||'--')+' '+dir+' • '+ft(signal.entry_time);
   }catch(e){
-    if(whatsappSendStatus) whatsappSendStatus.textContent='❌ Falha no WhatsApp: '+String(e&&e.message?e.message:e);
+    if(telegramSendStatus) telegramSendStatus.textContent='❌ Falha no Telegram: '+String(e&&e.message?e.message:e);
   }
 }
 
-if(whatsappNumber){
-  whatsappNumber.addEventListener('change',saveWhatsAppNumber);
-  whatsappNumber.addEventListener('blur',saveWhatsAppNumber);
+if(telegramChatId){
+  telegramChatId.addEventListener('change',()=>saveTelegramChatId());
+  telegramChatId.addEventListener('blur',()=>saveTelegramChatId());
 }
-if(whatsappToggle){
-  whatsappToggle.onclick=()=>{
-    const to=saveWhatsAppNumber();
-    if(!whatsappEnabled && to.length<10){
-      if(whatsappSendStatus) whatsappSendStatus.textContent='⚠️ Digite primeiro o número que vai receber os sinais.';
+if(telegramChatSelect){
+  telegramChatSelect.addEventListener('change',()=>{
+    if(telegramChatSelect.value) saveTelegramChatId(telegramChatSelect.value);
+  });
+}
+if(telegramToggle){
+  telegramToggle.onclick=()=>{
+    const chat_id=saveTelegramChatId();
+    if(!telegramEnabled && !chat_id){
+      if(telegramSendStatus) telegramSendStatus.textContent='⚠️ Escolha primeiro o grupo que vai receber os sinais.';
       return;
     }
-    whatsappEnabled=!whatsappEnabled;
-    try{ localStorage.setItem(WHATSAPP_ENABLED_KEY,whatsappEnabled?'1':'0'); }catch(_){ }
-    paintWhatsAppSettings();
-    if(whatsappSendStatus) whatsappSendStatus.textContent=whatsappEnabled?'🟢 Envio de sinais confirmado e ativado neste aparelho.':'🔴 Envio de sinais desligado.';
+    telegramEnabled=!telegramEnabled;
+    try{ localStorage.setItem(TELEGRAM_ENABLED_KEY,telegramEnabled?'1':'0'); }catch(_){ }
+    paintTelegramSettings();
+    if(telegramSendStatus) telegramSendStatus.textContent=telegramEnabled?'🟢 Envio automático de sinais para o grupo ativado neste aparelho.':'🔴 Envio de sinais para o Telegram desligado.';
   };
 }
-if(whatsappTestBtn) whatsappTestBtn.onclick=testWhatsApp;
-loadWhatsAppSettings();
+if(telegramFindBtn) telegramFindBtn.onclick=findTelegramGroups;
+if(telegramTestBtn) telegramTestBtn.onclick=testTelegram;
+loadTelegramSettings();
 
 function showTab(which){
   const main=which==='main';
@@ -10038,7 +10246,7 @@ function showTab(which){
   const results=which==='results';
   const history=which==='history';
   const compatibility=which==='compatibility';
-  const whatsapp=which==='whatsapp';
+  const telegram=which==='telegram';
   const account=which==='account';
 
   mainTab.classList.toggle('active',main);
@@ -10047,7 +10255,7 @@ function showTab(which){
   resultsTab.classList.toggle('active',results);
   historyTab.classList.toggle('active',history);
   compatibilityTab.classList.toggle('active',compatibility);
-  whatsappTab.classList.toggle('active',whatsapp);
+  telegramTab.classList.toggle('active',telegram);
   accountTab.classList.toggle('active',account);
 
   tabMain.classList.toggle('active',main);
@@ -10056,7 +10264,7 @@ function showTab(which){
   tabResults.classList.toggle('active',results);
   tabHistory.classList.toggle('active',history);
   tabCompatibility.classList.toggle('active',compatibility);
-  tabWhatsApp.classList.toggle('active',whatsapp);
+  tabTelegram.classList.toggle('active',telegram);
   tabAccount.classList.toggle('active',account);
 
   if(chart){
@@ -10076,8 +10284,8 @@ function showTab(which){
     runCompatibilityTest(false);
   }
 
-  if(whatsapp){
-    refreshWhatsAppStatus();
+  if(telegram){
+    refreshTelegramStatus();
   }
 
   if(account){
@@ -10091,7 +10299,7 @@ tabIndicator.onclick=()=>showTab('indicator');
 tabResults.onclick=()=>showTab('results');
 tabHistory.onclick=()=>showTab('history');
 tabCompatibility.onclick=()=>showTab('compatibility');
-tabWhatsApp.onclick=()=>showTab('whatsapp');
+tabTelegram.onclick=()=>showTab('telegram');
 tabAccount.onclick=()=>showTab('account');
 
 window.addEventListener('resize',resizeChart);
@@ -10622,7 +10830,7 @@ async function sig(announce=false){
 
     rememberPendingTrade(cur);
     if(cur.direction==='CALL' || cur.direction==='PUT'){
-      maybeSendWhatsAppSignal(cur);
+      maybeSendTelegramSignal(cur);
     }
 
     if(cur.direction!=='NEUTRO'){
@@ -10725,6 +10933,8 @@ function robotHasActiveSignal(){
 
 async function sendRadarOpportunityToRobot(items){
   if(radarAutoBusy || !appEnabled || selectedRobotEngine()==='OFF' || !S) return;
+  // O radar OPEN é separado do OTC. Não troca o mercado do usuário automaticamente.
+  if(market.value!=='OPEN') return;
   const list=(Array.isArray(items)?items:[])
     .filter(item=>{
       const dir=String((item&&item.direction)||'').toUpperCase();
@@ -10741,7 +10951,7 @@ async function sendRadarOpportunityToRobot(items){
   // Não abandona uma operação que já foi liberada e ainda não expirou.
   if(robotHasActiveSignal() && cur && cur.symbol!==sym) return;
 
-  const key=[selectedRobotEngine(),market.value,interval.value,sym,dir,best.updated_at||''].join('|');
+  const key=[selectedRobotEngine(),'OPEN',interval.value,sym,dir,best.updated_at||''].join('|');
   if(key===lastRadarAutoKey) return;
   lastRadarAutoKey=key;
 
@@ -10762,13 +10972,74 @@ async function sendRadarOpportunityToRobot(items){
   }
 }
 
+function otcRadarCard(sym){
+  return `<div class="radar-opportunity" data-otc-symbol="${sym}" style="border-color:#a855f7">
+    <b>🟣 ${sym}</b><br>
+    <span>OTC DISPONÍVEL</span><br>
+    <small>IQ Option • toque para abrir este ativo em OTC</small>
+  </div>`;
+}
+
+async function loadOtcRadar(){
+  if(!appEnabled || !radarOtc || otcRadarBusy) return;
+  otcRadarBusy=true;
+  try{
+    const d=await get('/otc-active-pairs');
+    if(!d || !d.connected){
+      if(radarOtcStatus) radarOtcStatus.textContent='⚪ IQ OPTION OFFLINE • conecte na aba Corretora para ver os OTC ativos';
+      radarOtc.innerHTML='<div>🟣 Radar OTC aguardando login da IQ Option</div>';
+      return;
+    }
+    const pairs=Array.isArray(d.pairs)?d.pairs:[];
+    if(radarOtcStatus){
+      radarOtcStatus.textContent=pairs.length
+        ? `🟢 ${pairs.length} OTC disponível(is) agora • lista atualizada automaticamente`
+        : '🟠 Nenhum ativo OTC aberto detectado agora';
+    }
+    radarOtc.innerHTML=pairs.length
+      ? pairs.map(otcRadarCard).join('')
+      : '<div>🟣 Nenhum OTC disponível neste momento</div>';
+
+    radarOtc.querySelectorAll('[data-otc-symbol]').forEach(card=>{
+      card.onclick=async()=>{
+        const sym=card.getAttribute('data-otc-symbol');
+        if(!sym) return;
+        if(marketMode){
+          marketMode.value='OTC';
+          syncMarketFromBroker();
+        }
+        fillSymbols();
+        if(S && [...S.options].some(o=>o.value===sym)) S.value=sym;
+        try{
+          localStorage.setItem('mega_symbol',sym);
+          localStorage.setItem('mega_market_mode','OTC');
+        }catch(_){ }
+        await updateMarketNote();
+        if(mainTab && typeof mainTab.click==='function') mainTab.click();
+        if(statusBox) statusBox.textContent='OTC IQ OPTION • '+sym+' selecionado pelo radar';
+        await sig(true);
+        if(chartTab && chartTab.classList.contains('active')) await loadChart();
+        window.scrollTo({top:0,behavior:'smooth'});
+      };
+    });
+  }catch(e){
+    if(radarOtcStatus) radarOtcStatus.textContent='🟠 Radar OTC aguardando resposta da IQ Option';
+    radarOtc.innerHTML='<div>🟣 OTC temporariamente indisponível</div>';
+  }finally{
+    otcRadarBusy=false;
+  }
+}
+
 async function rad(){
   if(!appEnabled || !radar || radBusy) return;
+  // O radar OTC é independente do motor OPEN e continua mostrando os ativos
+  // disponíveis mesmo quando nenhum robô de sinais está selecionado.
+  loadOtcRadar();
   radBusy=true;
   try{
     const engine=selectedRobotEngine();
     if(engine==='OFF'){ radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>'; return; }
-    const items=await get(`/radar?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}`);
+    const items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}`);
     const list=Array.isArray(items)?items:[];
     if(!list.length){
       radar.innerHTML='<div>📡 Radar ativo • aguardando leitura</div>';
@@ -11223,7 +11494,7 @@ setInterval(()=>{
 },2000);
 
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) perf(); },5000);
-// Radar automático: gira por TODOS os ativos sem exigir toque no cartão.
+// Radar automático: OPEN varre oportunidades e OTC lista somente ativos IQ disponíveis.
 // Um ativo é processado por ciclo; 15 s acompanha o limitador REST da Twelve
 // Data e permite completar a fila inteira sem disparar várias requisições de
 // mercado ao mesmo tempo. Símbolos com WebSocket fresco usam o stream/cache.
