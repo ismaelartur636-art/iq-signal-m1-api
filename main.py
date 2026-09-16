@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "1.7"
-PWA_VERSION = "v72"
+APP_VERSION = "1.8"
+PWA_VERSION = "v73"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -4230,26 +4230,23 @@ def _pure_ai_direction_gate(direction, setup, ctx):
     prior_low = float(ctx.get("prior_low_6", last_close) or last_close)
 
     if setup == "TREND":
-        # 3 de 6 candles + deslocamento líquido já é confluência suficiente.
-        # Não exige que o último candle tenha a mesma cor, porque um pequeno
-        # pullback pode anteceder justamente a continuação na próxima vela.
-        ok = (net > 0 and bull >= 3) if call else (net < 0 and bear >= 3)
+        ok = (net > 0 and bull >= 4 and not ctx.get("last_bearish")) if call else (net < 0 and bear >= 4 and not ctx.get("last_bullish"))
         return ok, "continuidade de tendência não confirmada nos últimos candles" if not ok else "tendência curta confirmada"
 
     if setup == "BREAKOUT":
         if call:
-            ok = last_close >= prior_high and ctx.get("last_bullish") and body >= 0.34 and close_pos >= 0.62
+            ok = last_close >= prior_high and ctx.get("last_bullish") and body >= 0.42 and close_pos >= 0.68
         else:
-            ok = last_close <= prior_low and ctx.get("last_bearish") and body >= 0.34 and close_pos <= 0.38
+            ok = last_close <= prior_low and ctx.get("last_bearish") and body >= 0.42 and close_pos <= 0.32
         return ok, "rompimento sem fechamento/força suficientes" if not ok else "rompimento confirmado no candle fechado"
 
     if setup in ("REVERSAL", "REJECTION"):
         if call:
-            location_ok = pos <= 0.58 or net < 0
-            reaction_ok = (lower >= 0.26 and close_pos >= 0.52) or (ctx.get("last_bullish") and body >= 0.36)
+            location_ok = pos <= 0.48 or net < 0
+            reaction_ok = (lower >= 0.32 and close_pos >= 0.56) or (ctx.get("last_bullish") and body >= 0.45)
         else:
-            location_ok = pos >= 0.42 or net > 0
-            reaction_ok = (upper >= 0.26 and close_pos <= 0.48) or (ctx.get("last_bearish") and body >= 0.36)
+            location_ok = pos >= 0.52 or net > 0
+            reaction_ok = (upper >= 0.32 and close_pos <= 0.44) or (ctx.get("last_bearish") and body >= 0.45)
         ok = location_ok and reaction_ok
         return ok, "reversão/rejeição sem localização e reação suficientes" if not ok else "reversão/rejeição confirmada"
 
@@ -4257,13 +4254,14 @@ def _pure_ai_direction_gate(direction, setup, ctx):
     # direção OU rejeição evidente, além de corpo médio recente saudável.
     if call:
         direction_ok = net > 0 and bull >= 3
-        rejection_ok = lower >= 0.30 and close_pos >= 0.54
+        rejection_ok = lower >= 0.35 and close_pos >= 0.58
     else:
         direction_ok = net < 0 and bear >= 3
-        rejection_ok = upper >= 0.30 and close_pos <= 0.46
-    healthy_body = float(ctx.get("avg_body_ratio", 0.0) or 0.0) >= 0.20
+        rejection_ok = upper >= 0.35 and close_pos <= 0.42
+    healthy_body = float(ctx.get("avg_body_ratio", 0.0) or 0.0) >= 0.24
     ok = healthy_body and (direction_ok or rejection_ok)
     return ok, "price action sem confluência suficiente para a próxima vela" if not ok else "price action confirmado"
+
 
 
 def _local_ohlcv_fallback_signal(cs, interval="1min", api_reason=""):
@@ -4419,57 +4417,54 @@ def _local_ohlcv_fallback_signal(cs, interval="1min", api_reason=""):
             "direct_win_filter": {"enabled": True, "blocked": True, "price_context": ctx},
         }
 
-    direction = "CALL" if call_score > put_score else ("PUT" if put_score > call_score else "NEUTRO")
+    candidate_direction = "CALL" if call_score > put_score else ("PUT" if put_score > call_score else "NEUTRO")
     best = max(call_score, put_score)
     gap = abs(call_score - put_score)
 
-    # O fallback é propositalmente conservador: precisa existir vantagem clara.
+    # v1.8: fallback SOMENTE MONITOR. Nunca libera entrada.
     if best < 2.10 or gap < 1.05 or avg_body < 0.16:
-        direction = "NEUTRO"
+        candidate_direction = "NEUTRO"
 
-    # Confiança é uma escala interna de seleção, não probabilidade garantida.
     confidence = clamp(59.0 + (gap * 4.2) + (best * 1.35), 0, 82)
-    required = 64.0 if interval == "1min" else 65.0
-    confirmed = direction in ("CALL", "PUT") and confidence >= required
-    risk = "LOW" if confirmed and confidence >= 74 else ("MEDIUM" if confirmed else "HIGH")
-
     if breakout_call or breakout_put:
         setup = "BREAKOUT"
     elif rejection_call or rejection_put:
         setup = "REJECTION"
-    elif direction in ("CALL", "PUT"):
+    elif candidate_direction in ("CALL", "PUT"):
         setup = "TREND"
     else:
         setup = "NONE"
 
-    chosen_reasons = reasons_call if direction == "CALL" else reasons_put if direction == "PUT" else []
-    if confirmed:
-        detail = ", ".join(chosen_reasons[:3]) or "confluência de candles fechados"
-        reason = f"Fallback local OHLCV confirmou {direction}: {detail}."
-    else:
-        reason = "Fallback local ativo; candles ainda sem vantagem direcional suficiente."
-
+    candidate_reasons = reasons_call if candidate_direction == "CALL" else reasons_put if candidate_direction == "PUT" else []
+    detail = ", ".join(candidate_reasons[:3]) or "sem confluência suficiente"
+    reason = (
+        f"Fallback local em modo MONITOR: candidato {candidate_direction} ({confidence:.0f}%), "
+        f"{detail}. Nenhuma entrada será liberada sem confirmação da IA externa."
+    )
     if api_reason:
-        reason = f"{reason} API externa indisponível nesta leitura: {str(api_reason)[:110]}"
+        reason += f" API externa indisponível nesta leitura: {str(api_reason)[:100]}"
 
     return {
         "available": True,
-        "direction": direction if confirmed else "NEUTRO",
+        "direction": "NEUTRO",
         "confidence": round(confidence, 1),
-        "confirmed": bool(confirmed),
-        "risk": risk,
+        "confirmed": False,
+        "risk": "HIGH",
         "setup": setup,
         "reason": reason[:300],
-        "provider": "LOCAL_OHLCV_FALLBACK",
+        "provider": "LOCAL_OHLCV_MONITOR",
         "fallback": True,
+        "fallback_monitor_only": True,
         "api_available": False,
         "api_reason": str(api_reason or "")[:180],
         "smart_scan": True,
         "api_called": False,
         "direct_win_filter": {
             "enabled": True,
-            "required_confidence": required,
-            "blocked": not bool(confirmed),
+            "required_confidence": 82.0 if interval == "1min" else 80.0,
+            "blocked": True,
+            "monitor_only": True,
+            "candidate_direction": candidate_direction,
             "price_context": ctx,
             "local_scores": {"CALL": round(call_score, 2), "PUT": round(put_score, 2)},
         },
@@ -4477,11 +4472,10 @@ def _local_ohlcv_fallback_signal(cs, interval="1min", api_reason=""):
 
 
 async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
-    """IA PURA equilibrada para a próxima vela.
+    """IA PURA seletiva da v1.2, com infraestrutura da v1.7.
 
-    A decisão continua sem indicadores internos. A Gemini recebe apenas candles
-    OHLCV fechados. Um filtro local de price action só bloqueia contextos de
-    lateralização forte; nos demais casos ele funciona como segunda opinião.
+    CALL/PUT só é liberado quando a IA externa responde e passa pelos filtros
+    rigorosos de WIN DIRETO. O fallback local permanece apenas como monitor.
     """
     if not cs:
         return {
@@ -4492,7 +4486,7 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
 
     if not GEMINI_KEY:
         return _local_ohlcv_fallback_signal(
-            cs, interval, "GEMINI_API_KEY não configurada."
+            cs, interval, "GEMINI_API_KEY não configurada. Fallback em modo monitor."
         )
 
     live = cs[-1]
@@ -4538,26 +4532,14 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
     ]
     price_ctx = _pure_ai_price_context(cs)
 
-    prompt = f"""Você é a inteligência artificial autônoma da MEGA IA, especializada em prever SOMENTE a direção da PRÓXIMA vela completa.
-Ativo: {symbol}. Timeframe: {interval}. Mercado: {market}.
-OBJETIVO PRINCIPAL: prever a direção da PRÓXIMA vela completa com equilíbrio entre qualidade e frequência.
-Este é o MODO IA PURA: NÃO use RSI, MACD, Bollinger, médias móveis, ATR, estocástico, ADX, score técnico ou qualquer indicador calculado pelo aplicativo.
-Use SOMENTE os candles OHLCV FECHADOS fornecidos. Não há candle em formação nesta entrada.
-
-Avalie price action de curto prazo: sequência de altas/baixas, corpos, pavios, rejeição, continuidade, rompimento real, falso rompimento, estrutura recente, aceleração/desaceleração, alternância/lateralização, localização dentro do range recente e volume apenas se estiver disponível.
-A previsão é para UMA vela à frente, não para a tendência geral.
-
-REGRAS DE QUALIDADE:
-- Use NEUTRO somente quando o contexto estiver realmente indefinido ou lateral.
-- Quando houver vantagem direcional clara, retorne CALL ou PUT mesmo que o setup não seja perfeito.
-- Não persiga movimento claramente esticado sem confirmação.
-- Uma combinação coerente de estrutura + força/rejeição já pode confirmar CALL/PUT.
-- Gale, recuperação e resultados anteriores NÃO podem influenciar a decisão.
-- risk HIGH deve ficar reservado para leituras frágeis; sinais utilizáveis devem sair como LOW ou MEDIUM.
-
-Classifique o setup como TREND, REVERSAL, BREAKOUT, REJECTION ou NONE.
-Retorne SOMENTE JSON válido:
-{{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"setup":"TREND|REVERSAL|BREAKOUT|REJECTION|NONE","reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
+    prompt = f"""Você é o módulo de confirmação da MEGA IA.
+Ativo {symbol}, timeframe {interval}.
+Use SOMENTE candles fechados.
+Não invente dados futuros.
+Estratégias internas: reversão, tendência, momentum, price action e breakout com filtro de volatilidade.
+Análise técnica preliminar: {json.dumps(analysis, ensure_ascii=False)}
+Retorne SOMENTE JSON:
+{{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
 Candles: {json.dumps(data, ensure_ascii=False)}"""
 
     try:
@@ -4576,15 +4558,11 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         confirmed = bool(parsed.get("confirmed", False))
         original_reason = str(parsed.get("reason", ""))[:220]
 
-        # v1.5: o radar mostrou leituras confirmadas sendo descartadas apenas
-        # por um corte de confiança alto demais (ex.: 65% MEDIUM < 72%).
-        # Mantemos as proteções importantes: risco HIGH e lateralização forte
-        # continuam bloqueados. Para M1, a confiança passa a ser um piso leve
-        # para não transformar uma leitura utilizável em NEUTRO desnecessariamente.
-        if interval == "1min":
-            required_conf = 64.0 if risk == "LOW" else 65.0
-        else:
-            required_conf = 65.0 if risk == "LOW" else 67.0
+        # Filtro mais rigoroso para aumentar acertos na entrada inicial.
+        # LOW precisa de 80% (ou OAI_MIN, se maior); MEDIUM precisa de 86%.
+        # Em M1, o mínimo LOW sobe para 82% devido ao ruído maior.
+        low_min = max(float(OAI_MIN), 82.0 if interval == "1min" else 80.0)
+        required_conf = low_min if risk == "LOW" else max(low_min + 4.0, 86.0)
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
 
         blocked_reason = None
@@ -4594,19 +4572,16 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             elif risk == "HIGH":
                 blocked_reason = "risco alto"
             elif confidence < required_conf:
-                blocked_reason = f"confiança {confidence:.0f}% abaixo do mínimo {required_conf:.0f}%"
-            elif price_ctx.get("choppy"):
-                blocked_reason = "lateralização/alternância forte detectada"
+                blocked_reason = f"confiança {confidence:.0f}% abaixo do mínimo seletivo {required_conf:.0f}%"
+            elif not gate_ok:
+                blocked_reason = gate_reason
 
         if blocked_reason:
             direction, confirmed = "NEUTRO", False
             reason = f"Filtro WIN DIRETO bloqueou a entrada: {blocked_reason}. Leitura IA: {original_reason}"[:300]
         elif direction in ("CALL", "PUT"):
             confirmed = True
-            if gate_ok:
-                reason = f"{original_reason} • Price action local confirmou: {gate_reason}."[:300]
-            else:
-                reason = f"{original_reason} • IA liberada; filtro local ficou apenas como alerta: {gate_reason}."[:300]
+            reason = f"{original_reason} • Filtro WIN DIRETO: {gate_reason}."[:300]
         else:
             confirmed = False
             reason = original_reason or "Sem vantagem clara para a próxima vela."
@@ -4636,15 +4611,15 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         st["last_result"] = dict(out)
         return out
     except Exception as exc:
-        # v1.7: quota/timeout/indisponibilidade da Gemini não paralisa mais o app.
-        # O motor local usa apenas OHLCV fechado e volta a tentar a API no
-        # próximo candle, sem substituir uma resposta válida da Gemini.
+        # v1.8: quota/timeout/indisponibilidade não gera mais entrada pelo fallback.
+        # O motor local apenas monitora OHLCV e a IA externa volta a ser tentada
+        # no próximo candle.
         out = _local_ohlcv_fallback_signal(cs, interval, str(exc))
         out["smart_scan"] = True
         out["api_called"] = True
         st["last_call"] = now_ts
         st["last_result"] = dict(out)
-        print(f"[IA FALLBACK] {symbol} {interval} LOCAL_OHLCV | API: {str(exc)[:160]}", flush=True)
+        print(f"[IA FALLBACK MONITOR] {symbol} {interval} LOCAL_OHLCV | API: {str(exc)[:160]}", flush=True)
         return out
 
 
@@ -4906,7 +4881,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         }
 
         if engine == "SMART" and analysis.get("fallback"):
-            base["status"] = "FALLBACK LOCAL OHLCV • MONITORANDO"
+            base["status"] = "FALLBACK LOCAL • SOMENTE MONITORAMENTO"
             base["source_state"] = "READY_FALLBACK"
 
         if engine == "SMART" and not ai_available:
@@ -4933,7 +4908,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 announce, entry, expiry = entry_window(interval, entry_mode)
                 base.update({
                     "direction": direction_now,
-                    "status": (("SINAL FALLBACK LOCAL OHLCV LIBERADO" if analysis.get("fallback") else "SINAL IA PURA LIBERADO") if engine == "SMART" else ("SINAL EA LIBERADO" if engine == "EA" else ("SINAL INDICADOR LIBERADO" if engine == "INDICATOR" else "SINAL LIBERADO"))),
+                    "status": (("FALLBACK LOCAL • BLOQUEADO PARA ENTRADA" if analysis.get("fallback") else "SINAL IA PURA LIBERADO") if engine == "SMART" else ("SINAL EA LIBERADO" if engine == "EA" else ("SINAL INDICADOR LIBERADO" if engine == "INDICATOR" else "SINAL LIBERADO"))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
