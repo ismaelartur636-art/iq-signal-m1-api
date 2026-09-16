@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "1.8"
-PWA_VERSION = "v73"
+APP_VERSION = "1.9"
+PWA_VERSION = "v74"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -54,6 +54,16 @@ LICENSE = os.getenv("LICENSE_EXPIRES", "2026-12-31")
 WA1 = os.getenv("WHATSAPP_1", "55 84 99841-1282")
 WA2 = os.getenv("WHATSAPP_2", "55 84 99449-9442")
 IG = os.getenv("INSTAGRAM", "@Ismaelartur26")
+
+# WhatsApp Cloud API (Meta) — usado somente para alertas de sinais.
+# O token nunca é enviado ao navegador.
+WA_CLOUD_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
+WA_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+WA_GRAPH_VERSION = os.getenv("WHATSAPP_GRAPH_VERSION", "v23.0").strip() or "v23.0"
+WA_TEMPLATE_NAME = os.getenv("WHATSAPP_TEMPLATE_NAME", "").strip()
+WA_TEMPLATE_LANG = os.getenv("WHATSAPP_TEMPLATE_LANG", "pt_BR").strip() or "pt_BR"
+WA_SEND_TIMEOUT = float(os.getenv("WHATSAPP_SEND_TIMEOUT", "15"))
+wa_sent_cache: Dict[str, float] = {}
 
 TD_URL = "https://api.twelvedata.com/time_series"
 TD_WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
@@ -471,6 +481,19 @@ class IQAutoOrderBody(BaseModel):
 
 class IQAutoOrderResultBody(BaseModel):
     order_id: str
+
+
+class WhatsAppSignalBody(BaseModel):
+    to: str
+    symbol: str = "--"
+    interval: str = "1min"
+    direction: str = "NEUTRO"
+    confidence: float = 0.0
+    entry_time: str | None = None
+    expiry_time: str | None = None
+    market: str = "OPEN"
+    risk: str = "--"
+    test: bool = False
 
 
 def now():
@@ -5221,6 +5244,11 @@ async def health():
             "configured": bool(GEMINI_KEY),
             "model": _gemini_selected_model or GEMINI_MODEL or None,
         },
+        "whatsapp": {
+            "configured": bool(WA_CLOUD_TOKEN and WA_PHONE_NUMBER_ID),
+            "template_configured": bool(WA_TEMPLATE_NAME),
+            "mode": "TEMPLATE" if WA_TEMPLATE_NAME else "TEXT_24H_WINDOW",
+        },
     }
 
 
@@ -6147,6 +6175,157 @@ async def candles_endpoint(
             "status": "TEMPORARIAMENTE INDISPONÍVEL",
             "message": str(exc)[:220],
         }
+
+
+def _wa_normalize_number(value: str) -> str:
+    digits = re.sub(r"\D+", "", str(value or ""))
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if not 10 <= len(digits) <= 15:
+        raise HTTPException(400, "Número do WhatsApp inválido. Use código do país + DDD + número.")
+    return digits
+
+
+def _wa_display_time(value: str | None) -> str:
+    if not value:
+        return "--:--"
+    try:
+        return parse_dt(value).strftime("%H:%M:%S")
+    except Exception:
+        return str(value)[:19]
+
+
+def _wa_signal_text(body: WhatsAppSignalBody) -> str:
+    if body.test:
+        return (
+            "✅ MEGA IA • TESTE WHATSAPP\n"
+            "Integração ativa. Quando um sinal confirmado for liberado, "
+            "o alerta poderá ser enviado para este número."
+        )
+    direction = str(body.direction or "NEUTRO").upper()
+    emoji = "🟢" if direction == "CALL" else "🔴" if direction == "PUT" else "⚪"
+    market_label = "MERCADO ABERTO" if str(body.market or "OPEN").upper() == "OPEN" else "OTC"
+    return (
+        f"🚨 MEGA IA • SINAL CONFIRMADO\n"
+        f"{emoji} {body.symbol} • {direction}\n"
+        f"🎯 Confiança: {float(body.confidence or 0):.0f}%\n"
+        f"⏱ Entrada: {_wa_display_time(body.entry_time)}\n"
+        f"⌛ Expiração: {_wa_display_time(body.expiry_time)}\n"
+        f"🕐 Período: {body.interval}\n"
+        f"🌐 Mercado: {market_label}\n"
+        f"⚠️ Risco: {str(body.risk or '--').upper()}"
+    )
+
+
+def _wa_template_payload(body: WhatsAppSignalBody, recipient: str) -> dict:
+    # O template aprovado no Meta deve ter 8 variáveis no corpo, nesta ordem:
+    # ativo, direção, confiança, entrada, expiração, período, mercado, risco.
+    market_label = "MERCADO ABERTO" if str(body.market or "OPEN").upper() == "OPEN" else "OTC"
+    values = [
+        str(body.symbol or "--"),
+        str(body.direction or "NEUTRO").upper(),
+        f"{float(body.confidence or 0):.0f}%",
+        _wa_display_time(body.entry_time),
+        _wa_display_time(body.expiry_time),
+        str(body.interval or "1min"),
+        market_label,
+        str(body.risk or "--").upper(),
+    ]
+    return {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient,
+        "type": "template",
+        "template": {
+            "name": WA_TEMPLATE_NAME,
+            "language": {"code": WA_TEMPLATE_LANG},
+            "components": [{
+                "type": "body",
+                "parameters": [{"type": "text", "text": v} for v in values],
+            }],
+        },
+    }
+
+
+async def _wa_send(body: WhatsAppSignalBody) -> dict:
+    if not WA_CLOUD_TOKEN or not WA_PHONE_NUMBER_ID:
+        raise HTTPException(
+            503,
+            "WhatsApp Cloud API não configurada. Defina WHATSAPP_ACCESS_TOKEN e WHATSAPP_PHONE_NUMBER_ID no Render."
+        )
+    recipient = _wa_normalize_number(body.to)
+    url = f"https://graph.facebook.com/{WA_GRAPH_VERSION}/{WA_PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WA_CLOUD_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    # Para alertas proativos 24/7, use template aprovado. Sem template, usamos
+    # texto livre — ele só é aceito pela Meta dentro da janela de atendimento.
+    if WA_TEMPLATE_NAME:
+        payload = _wa_template_payload(body, recipient)
+        mode = "TEMPLATE"
+    else:
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient,
+            "type": "text",
+            "text": {"preview_url": False, "body": _wa_signal_text(body)},
+        }
+        mode = "TEXT"
+    dedupe_key = None
+    if not body.test:
+        dedupe_key = "|".join([recipient, str(body.symbol), str(body.direction).upper(), str(body.entry_time or "")])
+        now_ts = time.time()
+        for k, ts in list(wa_sent_cache.items()):
+            if now_ts - ts > 21600:
+                wa_sent_cache.pop(k, None)
+        if dedupe_key in wa_sent_cache:
+            return {"ok": True, "mode": mode, "duplicate": True, "message_id": None}
+
+    try:
+        async with httpx.AsyncClient(timeout=WA_SEND_TIMEOUT) as client:
+            response = await client.post(url, headers=headers, json=payload)
+        try:
+            data = response.json()
+        except Exception:
+            data = {"raw": response.text[:500]}
+        if response.status_code >= 400:
+            detail = ""
+            if isinstance(data, dict):
+                err = data.get("error") or {}
+                if isinstance(err, dict):
+                    detail = str(err.get("message") or err.get("error_user_msg") or "")
+            raise HTTPException(response.status_code, (detail or "WhatsApp recusou o envio.")[:300])
+        message_id = None
+        if isinstance(data, dict) and data.get("messages"):
+            message_id = (data.get("messages") or [{}])[0].get("id")
+        if dedupe_key:
+            wa_sent_cache[dedupe_key] = time.time()
+        return {"ok": True, "mode": mode, "message_id": message_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"Falha ao enviar WhatsApp: {str(exc)[:220]}")
+
+
+@app.get("/whatsapp-status")
+async def whatsapp_status():
+    return {
+        "ok": True,
+        "configured": bool(WA_CLOUD_TOKEN and WA_PHONE_NUMBER_ID),
+        "template_configured": bool(WA_TEMPLATE_NAME),
+        "mode": "TEMPLATE" if WA_TEMPLATE_NAME else "TEXT_24H_WINDOW",
+        "graph_version": WA_GRAPH_VERSION,
+    }
+
+
+@app.post("/whatsapp-send")
+async def whatsapp_send(body: WhatsAppSignalBody):
+    direction = str(body.direction or "NEUTRO").upper()
+    if not body.test and direction not in ("CALL", "PUT"):
+        raise HTTPException(400, "Somente sinais CALL ou PUT confirmados podem ser enviados.")
+    return await _wa_send(body)
 
 
 @app.get("/signal-ai")
@@ -7592,6 +7771,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button class="tabbtn" id="tabResults">🎯 Resultados</button>
     <button class="tabbtn" id="tabHistory">🗓️ Histórico 15 dias</button>
     <button class="tabbtn" id="tabCompatibility">🧪 Compatibilidade</button>
+    <button class="tabbtn" id="tabWhatsApp">📲 WhatsApp</button>
     <button class="tabbtn" id="tabAccount">🏦 Corretora</button>
   </div>
 
@@ -7796,6 +7976,40 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="label" style="margin-top:12px;line-height:1.5">
         O teste usa somente mercado aberto. OTC não é considerado compatível por este módulo.
         A classificação é uma medição técnica interna e não garante resultado de operação.
+      </div>
+    </div>
+  </div>
+
+  <div id="whatsappTab" class="tab">
+    <div class="card" style="max-width:680px;margin:0 auto">
+      <h2 style="margin-top:0">📲 Sinais no WhatsApp</h2>
+      <div class="label">ENVIA SOMENTE SINAIS CALL/PUT CONFIRMADOS PELO MOTOR ATIVO</div>
+
+      <div id="whatsappApiStatus" class="card" style="margin-top:12px">
+        ⚪ Verificando WhatsApp Cloud API...
+      </div>
+
+      <div style="margin-top:12px">
+        <div class="label">NÚMERO QUE VAI RECEBER OS SINAIS</div>
+        <input id="whatsappNumber" type="tel" inputmode="tel" autocomplete="tel"
+               placeholder="Ex.: 5584999999999"
+               style="width:100%;box-sizing:border-box;margin-top:6px">
+        <div class="label" style="margin-top:6px">Use código do país + DDD + número, somente números.</div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px">
+        <button id="whatsappToggle" type="button" style="font-weight:1000">🔴 WHATSAPP OFF</button>
+        <button id="whatsappTestBtn" type="button" style="font-weight:900">🧪 ENVIAR TESTE</button>
+      </div>
+
+      <div id="whatsappSendStatus" class="card" style="margin-top:12px">
+        ⚪ Salve o número e ative o envio.
+      </div>
+
+      <div class="label" style="margin-top:12px;line-height:1.55">
+        O token da Meta fica somente no servidor Render e nunca é mostrado no navegador.
+        Para alertas proativos 24 horas por dia, configure também um template aprovado no WhatsApp Business Platform.
+        Sem template, mensagens de texto livre dependem da janela de atendimento permitida pela Meta.
       </div>
     </div>
   </div>
@@ -8009,9 +8223,16 @@ const accountTab=document.getElementById('accountTab');
 const resultsTab=document.getElementById('resultsTab');
 const historyTab=document.getElementById('historyTab');
 const compatibilityTab=document.getElementById('compatibilityTab');
+const whatsappTab=document.getElementById('whatsappTab');
 const tabResults=document.getElementById('tabResults');
 const tabHistory=document.getElementById('tabHistory');
 const tabCompatibility=document.getElementById('tabCompatibility');
+const tabWhatsApp=document.getElementById('tabWhatsApp');
+const whatsappNumber=document.getElementById('whatsappNumber');
+const whatsappToggle=document.getElementById('whatsappToggle');
+const whatsappTestBtn=document.getElementById('whatsappTestBtn');
+const whatsappApiStatus=document.getElementById('whatsappApiStatus');
+const whatsappSendStatus=document.getElementById('whatsappSendStatus');
 const compatTestBtn=document.getElementById('compatTestBtn');
 const compatStatus=document.getElementById('compatStatus');
 const compatMetrics=document.getElementById('compatMetrics');
@@ -8052,6 +8273,12 @@ let autoTradeEnabled=false;
 let autoOrderBusy=false;
 const autoExecutedKeys=new Set();
 const autoGaleRuns=new Set();
+const WHATSAPP_ENABLED_KEY='mega_whatsapp_enabled_v1';
+const WHATSAPP_NUMBER_KEY='mega_whatsapp_number_v1';
+const WHATSAPP_LAST_SIGNAL_KEY='mega_whatsapp_last_signal_v1';
+let whatsappEnabled=false;
+let whatsappBusy=false;
+let whatsappLastSignalKey='';
 let brokerConnected={IQ_OPTION:false};
 const chartInfo=document.getElementById('chartInfo');
 const direction=document.getElementById('direction');
@@ -9676,6 +9903,134 @@ async function loadChart(){
   }
 }
 
+function normalizeWhatsAppNumber(value){
+  return String(value||'').replace(/\D/g,'');
+}
+
+function loadWhatsAppSettings(){
+  try{
+    whatsappEnabled=localStorage.getItem(WHATSAPP_ENABLED_KEY)==='1';
+    whatsappLastSignalKey=localStorage.getItem(WHATSAPP_LAST_SIGNAL_KEY)||'';
+    if(whatsappNumber) whatsappNumber.value=localStorage.getItem(WHATSAPP_NUMBER_KEY)||'';
+  }catch(_){
+    whatsappEnabled=false;
+  }
+  paintWhatsAppSettings();
+}
+
+function paintWhatsAppSettings(){
+  if(whatsappToggle){
+    whatsappToggle.textContent=whatsappEnabled?'🟢 WHATSAPP ON':'🔴 WHATSAPP OFF';
+    whatsappToggle.style.borderColor=whatsappEnabled?'#19d27c':'#ff5252';
+  }
+}
+
+function saveWhatsAppNumber(){
+  const n=normalizeWhatsAppNumber(whatsappNumber&&whatsappNumber.value);
+  if(whatsappNumber) whatsappNumber.value=n;
+  try{ localStorage.setItem(WHATSAPP_NUMBER_KEY,n); }catch(_){ }
+  return n;
+}
+
+async function refreshWhatsAppStatus(){
+  if(!whatsappApiStatus) return;
+  try{
+    const d=await get('/whatsapp-status');
+    if(!d.configured){
+      whatsappApiStatus.innerHTML='🟠 <b>API NÃO CONFIGURADA</b><br><span style="opacity:.8">Adicione WHATSAPP_ACCESS_TOKEN e WHATSAPP_PHONE_NUMBER_ID no Render.</span>';
+      return;
+    }
+    const mode=d.template_configured?'TEMPLATE 24/7':'TEXTO • JANELA DE ATENDIMENTO';
+    whatsappApiStatus.innerHTML='🟢 <b>WHATSAPP CLOUD API CONFIGURADA</b><br><span style="opacity:.8">Modo: '+mode+'</span>';
+  }catch(e){
+    whatsappApiStatus.textContent='⚠️ Não foi possível verificar a configuração do WhatsApp agora.';
+  }
+}
+
+async function sendWhatsAppPayload(payload){
+  if(whatsappBusy) return null;
+  whatsappBusy=true;
+  try{
+    const r=await post('/whatsapp-send',payload);
+    return r;
+  }finally{
+    whatsappBusy=false;
+  }
+}
+
+async function testWhatsApp(){
+  const to=saveWhatsAppNumber();
+  if(to.length<10){
+    if(whatsappSendStatus) whatsappSendStatus.textContent='⚠️ Digite o número com código do país + DDD + número.';
+    return;
+  }
+  if(whatsappTestBtn) whatsappTestBtn.disabled=true;
+  if(whatsappSendStatus) whatsappSendStatus.textContent='⏳ Enviando mensagem de teste...';
+  try{
+    const r=await sendWhatsAppPayload({
+      to, symbol:'TESTE', interval:(interval&&interval.value)||'1min', direction:'CALL',
+      confidence:100, market:(market&&market.value)||'OPEN', risk:'LOW', test:true
+    });
+    if(whatsappSendStatus) whatsappSendStatus.textContent='✅ Teste enviado pelo WhatsApp'+(r&&r.mode?' • '+r.mode:'')+'.';
+  }catch(e){
+    if(whatsappSendStatus) whatsappSendStatus.textContent='❌ '+String(e&&e.message?e.message:e);
+  }finally{
+    if(whatsappTestBtn) whatsappTestBtn.disabled=false;
+  }
+}
+
+async function maybeSendWhatsAppSignal(signal){
+  if(!whatsappEnabled || !signal || whatsappBusy) return;
+  const dir=String(signal.direction||'').toUpperCase();
+  if((dir!=='CALL'&&dir!=='PUT') || !signal.entry_time) return;
+  const to=saveWhatsAppNumber();
+  if(to.length<10){
+    if(whatsappSendStatus) whatsappSendStatus.textContent='⚠️ WhatsApp ON, mas o número está incompleto.';
+    return;
+  }
+  const key=[signal.symbol,signal.interval,dir,signal.entry_time].join('|');
+  if(key===whatsappLastSignalKey) return;
+  try{
+    const r=await sendWhatsAppPayload({
+      to,
+      symbol:signal.symbol||((S&&S.value)||'--'),
+      interval:signal.interval||((interval&&interval.value)||'1min'),
+      direction:dir,
+      confidence:Number(signal.confidence||0),
+      entry_time:signal.entry_time||null,
+      expiry_time:signal.expiry_time||null,
+      market:signal.requested_market||signal.market||((market&&market.value)||'OPEN'),
+      risk:signal.risk||'--',
+      test:false
+    });
+    whatsappLastSignalKey=key;
+    try{ localStorage.setItem(WHATSAPP_LAST_SIGNAL_KEY,key); }catch(_){ }
+    if(whatsappSendStatus) whatsappSendStatus.textContent='✅ Último sinal enviado: '+(signal.symbol||'--')+' '+dir+' • '+ft(signal.entry_time)+(r&&r.mode?' • '+r.mode:'');
+  }catch(e){
+    if(whatsappSendStatus) whatsappSendStatus.textContent='❌ Falha no WhatsApp: '+String(e&&e.message?e.message:e);
+  }
+}
+
+if(whatsappNumber){
+  whatsappNumber.addEventListener('change',saveWhatsAppNumber);
+  whatsappNumber.addEventListener('blur',saveWhatsAppNumber);
+}
+if(whatsappToggle){
+  whatsappToggle.onclick=()=>{
+    const to=saveWhatsAppNumber();
+    if(!whatsappEnabled && to.length<10){
+      if(whatsappSendStatus) whatsappSendStatus.textContent='⚠️ Digite primeiro o número que vai receber os sinais.';
+      return;
+    }
+    whatsappEnabled=!whatsappEnabled;
+    try{ localStorage.setItem(WHATSAPP_ENABLED_KEY,whatsappEnabled?'1':'0'); }catch(_){ }
+    paintWhatsAppSettings();
+    if(whatsappSendStatus) whatsappSendStatus.textContent=whatsappEnabled?'🟢 Envio de sinais confirmado e ativado neste aparelho.':'🔴 Envio de sinais desligado.';
+  };
+}
+if(whatsappTestBtn) whatsappTestBtn.onclick=testWhatsApp;
+loadWhatsAppSettings();
+
 function showTab(which){
   const main=which==='main';
   const chart=which==='chart';
@@ -9683,6 +10038,7 @@ function showTab(which){
   const results=which==='results';
   const history=which==='history';
   const compatibility=which==='compatibility';
+  const whatsapp=which==='whatsapp';
   const account=which==='account';
 
   mainTab.classList.toggle('active',main);
@@ -9691,6 +10047,7 @@ function showTab(which){
   resultsTab.classList.toggle('active',results);
   historyTab.classList.toggle('active',history);
   compatibilityTab.classList.toggle('active',compatibility);
+  whatsappTab.classList.toggle('active',whatsapp);
   accountTab.classList.toggle('active',account);
 
   tabMain.classList.toggle('active',main);
@@ -9699,6 +10056,7 @@ function showTab(which){
   tabResults.classList.toggle('active',results);
   tabHistory.classList.toggle('active',history);
   tabCompatibility.classList.toggle('active',compatibility);
+  tabWhatsApp.classList.toggle('active',whatsapp);
   tabAccount.classList.toggle('active',account);
 
   if(chart){
@@ -9718,6 +10076,10 @@ function showTab(which){
     runCompatibilityTest(false);
   }
 
+  if(whatsapp){
+    refreshWhatsAppStatus();
+  }
+
   if(account){
     refreshAccountStatus();
   }
@@ -9729,6 +10091,7 @@ tabIndicator.onclick=()=>showTab('indicator');
 tabResults.onclick=()=>showTab('results');
 tabHistory.onclick=()=>showTab('history');
 tabCompatibility.onclick=()=>showTab('compatibility');
+tabWhatsApp.onclick=()=>showTab('whatsapp');
 tabAccount.onclick=()=>showTab('account');
 
 window.addEventListener('resize',resizeChart);
@@ -10258,6 +10621,9 @@ async function sig(announce=false){
     risk.textContent='Risco: '+(cur.risk||'--');
 
     rememberPendingTrade(cur);
+    if(cur.direction==='CALL' || cur.direction==='PUT'){
+      maybeSendWhatsAppSignal(cur);
+    }
 
     if(cur.direction!=='NEUTRO'){
       const k=cur.symbol+'|'+cur.interval+'|'+cur.entry_time+'|'+cur.direction;
