@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "1.0"
-PWA_VERSION = "v65"
+APP_VERSION = "1.2"
+PWA_VERSION = "v67"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -466,7 +466,11 @@ class IQAutoOrderBody(BaseModel):
     entry_time: str
     market: str = "OPEN"
     amount: float = 1.0
+    stage: str = "ENTRADA"
 
+
+class IQAutoOrderResultBody(BaseModel):
+    order_id: str
 
 
 def now():
@@ -4104,13 +4108,165 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         return {"available": False, "reason": str(exc)[:200]}
 
 
-async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
-    """Modo ONLINE otimizado.
+def _pure_ai_price_context(cs):
+    """Resume somente price action/OHLCV para filtrar entradas fracas da IA PURA.
 
-    O painel continua lendo o gráfico a cada ~5 s, mas a API da IA só é chamada
-    quando o candle mudou de forma relevante, nasceu um candle novo ou passou
-    um tempo máximo sem nova avaliação. Isso mantém resposta rápida sem fazer
-    uma chamada cara a cada polling.
+    Não usa RSI, médias, MACD, Bollinger, ATR ou qualquer indicador técnico.
+    O objetivo é evitar sinais em lateralização/indecisão e validar se o setup
+    declarado pela IA tem suporte visível nos candles fechados.
+    """
+    if len(cs) < 8:
+        return {
+            "ready": False,
+            "choppy": True,
+            "efficiency": 0.0,
+            "flip_ratio": 1.0,
+            "avg_body_ratio": 0.0,
+            "last_body_ratio": 0.0,
+            "bull_count_6": 0,
+            "bear_count_6": 0,
+            "net_move_6": 0.0,
+            "position_8": 0.5,
+        }
+
+    recent = cs[-8:]
+
+    def f(v, default=0.0):
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    opens = [f(x.get("open")) for x in recent]
+    highs = [f(x.get("high")) for x in recent]
+    lows = [f(x.get("low")) for x in recent]
+    closes = [f(x.get("close")) for x in recent]
+
+    ranges = [max(h-l, 1e-12) for h, l in zip(highs, lows)]
+    bodies = [abs(c-o) for o, c in zip(opens, closes)]
+    body_ratios = [b/r for b, r in zip(bodies, ranges)]
+
+    moves = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    travel = sum(abs(x) for x in moves)
+    efficiency = abs(closes[-1] - closes[0]) / max(travel, 1e-12)
+
+    # Alternância de direção entre fechamentos consecutivos; zeros são ignorados.
+    signs = [1 if x > 0 else (-1 if x < 0 else 0) for x in moves]
+    nz = [x for x in signs if x]
+    flips = sum(1 for a, b in zip(nz, nz[1:]) if a != b)
+    flip_ratio = flips / max(len(nz)-1, 1)
+
+    last6 = recent[-6:]
+    bull6 = sum(1 for x in last6 if f(x.get("close")) > f(x.get("open")))
+    bear6 = sum(1 for x in last6 if f(x.get("close")) < f(x.get("open")))
+    net6 = f(last6[-1].get("close")) - f(last6[0].get("open"))
+
+    hi8, lo8 = max(highs), min(lows)
+    position8 = (closes[-1] - lo8) / max(hi8 - lo8, 1e-12)
+
+    last = recent[-1]
+    lo = f(last.get("low")); hi = f(last.get("high")); op = f(last.get("open")); cl = f(last.get("close"))
+    rr = max(hi-lo, 1e-12)
+    lower_wick = max(min(op, cl)-lo, 0.0) / rr
+    upper_wick = max(hi-max(op, cl), 0.0) / rr
+    close_pos = (cl-lo) / rr
+
+    avg_body = sum(body_ratios[-4:]) / min(4, len(body_ratios))
+    last_body = body_ratios[-1]
+
+    # Combina alternância + baixa eficiência e corpo pequeno para identificar
+    # zonas onde prever a próxima vela tende a ser mais frágil.
+    choppy = bool(
+        (flip_ratio >= 0.67 and efficiency < 0.30)
+        or (efficiency < 0.18 and avg_body < 0.30)
+        or (avg_body < 0.20 and flip_ratio >= 0.50)
+    )
+
+    return {
+        "ready": True,
+        "choppy": choppy,
+        "efficiency": round(efficiency, 3),
+        "flip_ratio": round(flip_ratio, 3),
+        "avg_body_ratio": round(avg_body, 3),
+        "last_body_ratio": round(last_body, 3),
+        "bull_count_6": bull6,
+        "bear_count_6": bear6,
+        "net_move_6": net6,
+        "position_8": round(position8, 3),
+        "last_lower_wick": round(lower_wick, 3),
+        "last_upper_wick": round(upper_wick, 3),
+        "last_close_position": round(close_pos, 3),
+        "last_bullish": cl > op,
+        "last_bearish": cl < op,
+        "prior_high_6": max(f(x.get("high")) for x in recent[-7:-1]),
+        "prior_low_6": min(f(x.get("low")) for x in recent[-7:-1]),
+        "last_close": cl,
+    }
+
+
+def _pure_ai_direction_gate(direction, setup, ctx):
+    """Validação final do sinal com candles crus, adaptada ao tipo de setup."""
+    direction = str(direction or "NEUTRO").upper()
+    setup = str(setup or "NONE").upper()
+    if direction not in ("CALL", "PUT") or not ctx.get("ready"):
+        return False, "contexto de preço insuficiente"
+    if ctx.get("choppy"):
+        return False, "mercado alternando/lateral, sem eficiência direcional suficiente"
+
+    call = direction == "CALL"
+    bull = int(ctx.get("bull_count_6", 0))
+    bear = int(ctx.get("bear_count_6", 0))
+    net = float(ctx.get("net_move_6", 0.0) or 0.0)
+    pos = float(ctx.get("position_8", 0.5) or 0.5)
+    body = float(ctx.get("last_body_ratio", 0.0) or 0.0)
+    lower = float(ctx.get("last_lower_wick", 0.0) or 0.0)
+    upper = float(ctx.get("last_upper_wick", 0.0) or 0.0)
+    close_pos = float(ctx.get("last_close_position", 0.5) or 0.5)
+    last_close = float(ctx.get("last_close", 0.0) or 0.0)
+    prior_high = float(ctx.get("prior_high_6", last_close) or last_close)
+    prior_low = float(ctx.get("prior_low_6", last_close) or last_close)
+
+    if setup == "TREND":
+        ok = (net > 0 and bull >= 4 and not ctx.get("last_bearish")) if call else (net < 0 and bear >= 4 and not ctx.get("last_bullish"))
+        return ok, "continuidade de tendência não confirmada nos últimos candles" if not ok else "tendência curta confirmada"
+
+    if setup == "BREAKOUT":
+        if call:
+            ok = last_close >= prior_high and ctx.get("last_bullish") and body >= 0.42 and close_pos >= 0.68
+        else:
+            ok = last_close <= prior_low and ctx.get("last_bearish") and body >= 0.42 and close_pos <= 0.32
+        return ok, "rompimento sem fechamento/força suficientes" if not ok else "rompimento confirmado no candle fechado"
+
+    if setup in ("REVERSAL", "REJECTION"):
+        if call:
+            location_ok = pos <= 0.48 or net < 0
+            reaction_ok = (lower >= 0.32 and close_pos >= 0.56) or (ctx.get("last_bullish") and body >= 0.45)
+        else:
+            location_ok = pos >= 0.52 or net > 0
+            reaction_ok = (upper >= 0.32 and close_pos <= 0.44) or (ctx.get("last_bearish") and body >= 0.45)
+        ok = location_ok and reaction_ok
+        return ok, "reversão/rejeição sem localização e reação suficientes" if not ok else "reversão/rejeição confirmada"
+
+    # Fallback quando a IA não classifica o setup. Exige confluência mínima de
+    # direção OU rejeição evidente, além de corpo médio recente saudável.
+    if call:
+        direction_ok = net > 0 and bull >= 3
+        rejection_ok = lower >= 0.35 and close_pos >= 0.58
+    else:
+        direction_ok = net < 0 and bear >= 3
+        rejection_ok = upper >= 0.35 and close_pos <= 0.42
+    healthy_body = float(ctx.get("avg_body_ratio", 0.0) or 0.0) >= 0.24
+    ok = healthy_body and (direction_ok or rejection_ok)
+    return ok, "price action sem confluência suficiente para a próxima vela" if not ok else "price action confirmado"
+
+
+async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
+    """IA PURA seletiva para melhorar WIN DIRETO.
+
+    A decisão continua sem indicadores internos. A Gemini recebe apenas candles
+    OHLCV fechados. Depois, um filtro local de price action valida se a direção
+    escolhida tem suporte real nos próprios candles, reduzindo sinais em zonas
+    laterais/indecisas. Isso tende a gerar menos sinais, porém mais seletivos.
     """
     if not GEMINI_KEY:
         return {
@@ -4127,8 +4283,7 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
         }
 
     live = cs[-1]
-    prev = cs[-2] if len(cs) > 1 else live
-    state_key = f"AI_SMART|{market}|{symbol}|{interval}"
+    state_key = f"AI_SMART_V2|{market}|{symbol}|{interval}"
     st = ai_scan_state.setdefault(state_key, {})
     now_ts = time.time()
 
@@ -4138,32 +4293,16 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
         except Exception:
             return default
 
-    o, h, l, c = (f(live.get(k)) for k in ("open", "high", "low", "close"))
-    rng = max(abs(h - l), 1e-12)
-    body = abs(c - o)
-    prev_rng = max(abs(f(prev.get("high")) - f(prev.get("low"))), 1e-12)
-    prev_close = f(prev.get("close"), c)
+    c = f(live.get("close"))
     volume = f(live.get("volume"))
-
     last_candle = st.get("candle_time")
-    last_close = f(st.get("close"), c)
-    last_volume = f(st.get("volume"), volume)
     last_call = f(st.get("last_call"), 0.0)
-
     new_candle = bool(last_candle and last_candle != live.get("datetime"))
-    price_move = abs(c - last_close)
-    # Mudança relevante é medida pela faixa recente, sem transformar isso em
-    # indicador de decisão. Serve apenas para decidir QUANDO pedir nova análise.
-    meaningful_price = price_move >= max(prev_rng * 0.08, rng * 0.06)
-    meaningful_body = body >= prev_rng * 0.35
-    meaningful_volume = volume > 0 and last_volume > 0 and abs(volume - last_volume) / max(last_volume, 1.0) >= 0.20
 
-    # IA PURA 33.78.0: com candles fechados, os dados não mudam dentro do mesmo
-    # candle. Portanto a IA é consultada uma única vez por novo candle fechado.
-    # Isso evita respostas diferentes sobre os mesmos dados e reduz custo/quota.
+    # Candles fechados não mudam. Uma avaliação por novo candle evita respostas
+    # diferentes sobre os mesmos dados e conserva quota da API.
     min_gap = 12.0
     heartbeat = float(INTERVALS.get(interval, 60))
-    changed = new_candle
     should_call = last_call <= 0 or new_candle
 
     st.update({
@@ -4184,15 +4323,28 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
         {"time": x["datetime"], "o": x["open"], "h": x["high"], "l": x["low"], "c": x["close"], "v": x.get("volume", 0)}
         for x in cs[-60:]
     ]
+    price_ctx = _pure_ai_price_context(cs)
 
-    prompt = f"""Você é a inteligência artificial autônoma da MEGA IA.
+    prompt = f"""Você é a inteligência artificial autônoma da MEGA IA, especializada em prever SOMENTE a direção da PRÓXIMA vela completa.
 Ativo: {symbol}. Timeframe: {interval}. Mercado: {market}.
-Este é o MODO IA PURA: não receba nem use sinais de RSI, MACD, Bollinger, médias, score técnico ou estratégias internas do aplicativo.
-Analise SOMENTE os candles OHLCV fornecidos, os mesmos dados usados no gráfico do painel. O último candle pode estar EM FORMAÇÃO. Avalie contexto, sequência, força, rejeição, estrutura, momentum visível no preço e volume disponível.
-Não invente dados futuros. Se não houver vantagem clara, responda NEUTRO.
-Só confirme CALL ou PUT quando confidence >= {OAI_MIN:.0f} e risk não for HIGH.
+OBJETIVO PRINCIPAL: aumentar WIN DIRETO (sem depender de Gale). Prefira perder uma oportunidade a liberar uma entrada fraca.
+Este é o MODO IA PURA: NÃO use RSI, MACD, Bollinger, médias móveis, ATR, estocástico, ADX, score técnico ou qualquer indicador calculado pelo aplicativo.
+Use SOMENTE os candles OHLCV FECHADOS fornecidos. Não há candle em formação nesta entrada.
+
+Avalie price action de curto prazo: sequência de altas/baixas, corpos, pavios, rejeição, continuidade, rompimento real, falso rompimento, estrutura recente, aceleração/desaceleração, alternância/lateralização, localização dentro do range recente e volume apenas se estiver disponível.
+A previsão é para UMA vela à frente, não para a tendência geral.
+
+REGRAS DE QUALIDADE:
+- Se houver alternância frequente, corpos pequenos, pavios dos dois lados, compressão ou direção pouco clara: NEUTRO.
+- Não persiga movimento já esticado sem nova confirmação.
+- CALL/PUT exige pelo menos duas evidências independentes de price action para a próxima vela.
+- Para M1 seja especialmente rigoroso.
+- Gale, recuperação e resultados anteriores NÃO podem influenciar a decisão.
+- Só marque risk LOW ou MEDIUM quando houver vantagem clara. Em dúvida: HIGH + NEUTRO.
+
+Classifique o setup como TREND, REVERSAL, BREAKOUT, REJECTION ou NONE.
 Retorne SOMENTE JSON válido:
-{{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
+{{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"setup":"TREND|REVERSAL|BREAKOUT|REJECTION|NONE","reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
 Candles: {json.dumps(data, ensure_ascii=False)}"""
 
     try:
@@ -4201,32 +4353,71 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         direction = str(parsed.get("direction", "NEUTRO")).upper()
         if direction not in ("CALL", "PUT", "NEUTRO"):
             direction = "NEUTRO"
+        setup = str(parsed.get("setup", "NONE")).upper()
+        if setup not in ("TREND", "REVERSAL", "BREAKOUT", "REJECTION", "NONE"):
+            setup = "NONE"
         confidence = clamp(float(parsed.get("confidence", 0) or 0), 0, 100)
         risk = str(parsed.get("risk", "HIGH")).upper()
+        if risk not in ("LOW", "MEDIUM", "HIGH"):
+            risk = "HIGH"
         confirmed = bool(parsed.get("confirmed", False))
-        if direction in ("CALL", "PUT") and (not confirmed or confidence < OAI_MIN or risk == "HIGH"):
+        original_reason = str(parsed.get("reason", ""))[:220]
+
+        # Filtro mais rigoroso para aumentar acertos na entrada inicial.
+        # LOW precisa de 80% (ou OAI_MIN, se maior); MEDIUM precisa de 86%.
+        # Em M1, o mínimo LOW sobe para 82% devido ao ruído maior.
+        low_min = max(float(OAI_MIN), 82.0 if interval == "1min" else 80.0)
+        required_conf = low_min if risk == "LOW" else max(low_min + 4.0, 86.0)
+        gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
+
+        blocked_reason = None
+        if direction in ("CALL", "PUT"):
+            if not confirmed:
+                blocked_reason = "IA não confirmou a própria leitura"
+            elif risk == "HIGH":
+                blocked_reason = "risco alto"
+            elif confidence < required_conf:
+                blocked_reason = f"confiança {confidence:.0f}% abaixo do mínimo seletivo {required_conf:.0f}%"
+            elif not gate_ok:
+                blocked_reason = gate_reason
+
+        if blocked_reason:
             direction, confirmed = "NEUTRO", False
+            reason = f"Filtro WIN DIRETO bloqueou a entrada: {blocked_reason}. Leitura IA: {original_reason}"[:300]
+        elif direction in ("CALL", "PUT"):
+            confirmed = True
+            reason = f"{original_reason} • Filtro WIN DIRETO: {gate_reason}."[:300]
+        else:
+            confirmed = False
+            reason = original_reason or "Sem vantagem clara para a próxima vela."
 
         out = {
             "available": True,
             "direction": direction,
             "confidence": confidence,
             "confirmed": confirmed and direction in ("CALL", "PUT"),
-            "risk": risk if risk in ("LOW", "MEDIUM", "HIGH") else "HIGH",
-            "reason": str(parsed.get("reason", ""))[:300],
+            "risk": risk,
+            "setup": setup,
+            "reason": reason,
             "smart_scan": True,
             "api_called": True,
+            "direct_win_filter": {
+                "enabled": True,
+                "required_confidence": round(required_conf, 1),
+                "gate_ok": bool(gate_ok),
+                "blocked": bool(blocked_reason),
+                "price_context": price_ctx,
+            },
         }
         st["last_call"] = now_ts
         st["last_result"] = dict(out)
         return out
     except Exception as exc:
-        # Em erro de API, conserva a última leitura apenas como contexto, mas
-        # nunca reutiliza um CALL/PUT antigo como novo sinal.
         out = {
             "available": False, "direction": "NEUTRO", "confidence": 0,
             "confirmed": False, "risk": "HIGH", "reason": str(exc)[:200],
             "smart_scan": True, "api_called": True,
+            "direct_win_filter": {"enabled": True, "blocked": True},
         }
         st["last_call"] = now_ts
         st["last_result"] = dict(out)
@@ -4478,7 +4669,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
             "technical": (
-                {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
+                {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI", "direct_win_filter": analysis.get("direct_win_filter", {}), "setup": analysis.get("setup", "NONE")}
                 if engine == "SMART"
                 else (analysis if engine == "EA" else ({"hidden": True, "mode": "INDICATOR"} if engine == "INDICATOR" else analysis))
             ),
@@ -4898,9 +5089,9 @@ async def manifest():
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=64", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=64", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=64", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=66", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=66", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=66", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -5098,6 +5289,7 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
     direction = str(body.direction or "").upper()
     market = str(body.market or "OPEN").upper()
     amount = float(body.amount or 0)
+    stage = str(body.stage or "ENTRADA").upper()
 
     if symbol not in SYMBOLS:
         raise HTTPException(400, "Ativo inválido para AUTO ENTRADA.")
@@ -5109,6 +5301,8 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
         raise HTTPException(400, "Mercado inválido para AUTO ENTRADA.")
     if amount < 1 or amount > 1000:
         raise HTTPException(400, "No teste DEMO, use valor entre 1 e 1000 por entrada.")
+    if stage not in ("ENTRADA", "G1", "G2"):
+        raise HTTPException(400, "Etapa inválida para AUTO ENTRADA.")
 
     try:
         entry_dt = parse_dt(body.entry_time)
@@ -5127,6 +5321,7 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
         interval,
         direction,
         _canonical_time_key(body.entry_time),
+        stage,
         "PRACTICE",
     ])
 
@@ -5194,6 +5389,7 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
             "direction": direction,
             "market": market,
             "entry_time": iso(entry_dt),
+            "stage": stage,
             "created_at": iso(now()),
             "duplicate": False,
         }
@@ -5205,6 +5401,69 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
                 store.pop(old_key, None)
 
         return result
+
+
+def _iq_auto_order_result_snapshot(state: Dict[str, Any], order_id: str):
+    """Lê o resultado já fechado da ordem DEMO sem bloquear a thread.
+
+    A iqoptionapi publica as opções encerradas em ``api.socket_option_closed``.
+    Se a versão instalada não expuser esse mapa, devolvemos PENDENTE e o painel
+    usa o resultado da vela como fallback para decidir o Gale.
+    """
+    client = state.get("client") if state else None
+    api = getattr(client, "api", None) if client is not None else None
+    closed = getattr(api, "socket_option_closed", None) if api is not None else None
+    if not isinstance(closed, dict):
+        return {"settled": False, "result": None, "message": "Resultado da ordem ainda indisponível."}
+
+    keys = [order_id, str(order_id)]
+    try:
+        keys.append(int(float(str(order_id))))
+    except Exception:
+        pass
+
+    payload = None
+    for k in keys:
+        try:
+            if k in closed and closed.get(k):
+                payload = closed.get(k)
+                break
+        except Exception:
+            continue
+
+    if not isinstance(payload, dict):
+        return {"settled": False, "result": None}
+
+    win_raw = str(payload.get("win") or payload.get("result") or "").strip().lower()
+    amount = payload.get("amount", 0)
+    win_amount = payload.get("win_amount", payload.get("profit_amount", 0))
+    try:
+        amount = float(amount or 0)
+    except Exception:
+        amount = 0.0
+    try:
+        win_amount = float(win_amount or 0)
+    except Exception:
+        win_amount = 0.0
+
+    if win_raw in ("win", "won"):
+        profit = win_amount - amount if win_amount else None
+        return {"settled": True, "result": "WIN", "profit": profit, "order_id": str(order_id)}
+    if win_raw in ("equal", "draw", "tie"):
+        return {"settled": True, "result": "DRAW", "profit": 0.0, "order_id": str(order_id)}
+    if win_raw in ("loose", "loss", "lose", "lost"):
+        return {"settled": True, "result": "LOSS", "profit": -abs(amount) if amount else None, "order_id": str(order_id)}
+
+    return {"settled": False, "result": None}
+
+
+@app.post("/iq-auto-order-result")
+async def iq_auto_order_result(body: IQAutoOrderResultBody, request: Request):
+    state = _iq_session_state(request, required=True)
+    order_id = str(body.order_id or "").strip()
+    if not order_id:
+        raise HTTPException(400, "order_id é obrigatório.")
+    return _iq_auto_order_result_snapshot(state, order_id)
 
 
 @app.get("/iq-auto-status")
@@ -6911,9 +7170,9 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=64">
-<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=64">
-<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=64">
+<link rel="manifest" href="/manifest.webmanifest?v=66">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=66">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=66">
 <meta name="theme-color" content="#07182b">
 <meta name="application-name" content="Mega IA Trader">
 <meta name="apple-mobile-web-app-title" content="Mega IA Trader">
@@ -7374,11 +7633,27 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;align-items:end">
           <div>
-            <div class="label">VALOR POR ENTRADA</div>
+            <div class="label">VALOR BASE</div>
             <input id="autoTradeAmount" type="number" min="1" max="1000" step="1" value="1"
                    style="width:100%;box-sizing:border-box;margin-top:5px">
           </div>
+          <div>
+            <div class="label">NÍVEL DE GALE</div>
+            <select id="autoTradeGale" style="width:100%;margin-top:5px">
+              <option value="0">SEM GALE</option>
+              <option value="1">GALE 1</option>
+              <option value="2">GALE 2</option>
+            </select>
+          </div>
+          <div>
+            <div class="label">MULTIPLICADOR DO GALE</div>
+            <input id="autoTradeGaleMultiplier" type="number" min="1" max="5" step="0.1" value="2"
+                   style="width:100%;box-sizing:border-box;margin-top:5px">
+          </div>
           <button id="autoTradeToggle" type="button" style="width:100%;font-weight:1000">🔴 AUTO DEMO OFF</button>
+        </div>
+        <div id="autoTradePreview" class="label" style="margin-top:9px;line-height:1.5">
+          Entrada: 1.00 • Gale desligado
         </div>
         <div id="autoTradeStatus" style="margin-top:10px;font-size:12px;line-height:1.5">
           ⚪ Conecte a IQ Option e ative manualmente para testar.
@@ -7558,11 +7833,15 @@ const iqConnectBtn=document.getElementById('iqConnectBtn');
 const iqLogoutBtn=document.getElementById('iqLogoutBtn');
 const iqAccountStatus=document.getElementById('iqAccountStatus');
 const autoTradeAmount=document.getElementById('autoTradeAmount');
+const autoTradeGale=document.getElementById('autoTradeGale');
+const autoTradeGaleMultiplier=document.getElementById('autoTradeGaleMultiplier');
+const autoTradePreview=document.getElementById('autoTradePreview');
 const autoTradeToggle=document.getElementById('autoTradeToggle');
 const autoTradeStatus=document.getElementById('autoTradeStatus');
 let autoTradeEnabled=false;
 let autoOrderBusy=false;
 const autoExecutedKeys=new Set();
+const autoGaleRuns=new Set();
 let brokerConnected={IQ_OPTION:false};
 const chartInfo=document.getElementById('chartInfo');
 const direction=document.getElementById('direction');
@@ -7604,8 +7883,16 @@ try{
 
 try{
   const savedAutoAmount=Number(localStorage.getItem('mega_auto_trade_amount')||1);
+  const savedAutoGale=Number(localStorage.getItem('mega_auto_trade_gale')||0);
+  const savedAutoGaleMultiplier=Number(localStorage.getItem('mega_auto_trade_gale_multiplier')||2);
   if(autoTradeAmount && Number.isFinite(savedAutoAmount)){
     autoTradeAmount.value=String(Math.max(1,Math.min(1000,savedAutoAmount)));
+  }
+  if(autoTradeGale){
+    autoTradeGale.value=String([0,1,2].includes(savedAutoGale)?savedAutoGale:0);
+  }
+  if(autoTradeGaleMultiplier && Number.isFinite(savedAutoGaleMultiplier)){
+    autoTradeGaleMultiplier.value=String(Math.max(1,Math.min(5,savedAutoGaleMultiplier)));
   }
 }catch(_){}
 
@@ -8557,6 +8844,36 @@ async function post(u,data={}){
 }
 
 
+function autoTradeSettings(){
+  let amount=Number((autoTradeAmount&&autoTradeAmount.value)||1);
+  let gale=Number((autoTradeGale&&autoTradeGale.value)||0);
+  let multiplier=Number((autoTradeGaleMultiplier&&autoTradeGaleMultiplier.value)||2);
+  if(!Number.isFinite(amount)) amount=1;
+  if(!Number.isFinite(gale)) gale=0;
+  if(!Number.isFinite(multiplier)) multiplier=2;
+  amount=Math.max(1,Math.min(1000,amount));
+  gale=[0,1,2].includes(gale)?gale:0;
+  multiplier=Math.max(1,Math.min(5,multiplier));
+  return {amount,gale,multiplier};
+}
+
+function updateAutoTradePreview(){
+  if(!autoTradePreview) return;
+  const cfg=autoTradeSettings();
+  const fmt=v=>Number(v).toFixed(2);
+  if(cfg.gale===0){
+    autoTradePreview.textContent='Entrada: '+fmt(cfg.amount)+' • Gale desligado';
+    return;
+  }
+  const g1=cfg.amount*cfg.multiplier;
+  if(cfg.gale===1){
+    autoTradePreview.textContent='Entrada: '+fmt(cfg.amount)+' • G1: '+fmt(g1);
+    return;
+  }
+  const g2=g1*cfg.multiplier;
+  autoTradePreview.textContent='Entrada: '+fmt(cfg.amount)+' • G1: '+fmt(g1)+' • G2: '+fmt(g2);
+}
+
 function renderAutoTradeState(message=''){
   if(autoTradeToggle){
     autoTradeToggle.textContent=autoTradeEnabled?'🟢 AUTO DEMO ON':'🔴 AUTO DEMO OFF';
@@ -8567,6 +8884,7 @@ function renderAutoTradeState(message=''){
   }else if(autoTradeStatus && !autoTradeEnabled){
     autoTradeStatus.textContent='⚪ AUTO ENTRADA desligada • nenhuma ordem será enviada.';
   }
+  updateAutoTradePreview();
 }
 
 function disableAutoTrade(message='⚪ AUTO ENTRADA desligada.'){
@@ -8576,11 +8894,28 @@ function disableAutoTrade(message='⚪ AUTO ENTRADA desligada.'){
 
 if(autoTradeAmount){
   autoTradeAmount.onchange=()=>{
-    let v=Number(autoTradeAmount.value||1);
-    if(!Number.isFinite(v)) v=1;
-    v=Math.max(1,Math.min(1000,v));
-    autoTradeAmount.value=String(v);
-    try{ localStorage.setItem('mega_auto_trade_amount',String(v)); }catch(_){}
+    const cfg=autoTradeSettings();
+    autoTradeAmount.value=String(cfg.amount);
+    try{ localStorage.setItem('mega_auto_trade_amount',String(cfg.amount)); }catch(_){}
+    updateAutoTradePreview();
+  };
+}
+
+if(autoTradeGale){
+  autoTradeGale.onchange=()=>{
+    const cfg=autoTradeSettings();
+    autoTradeGale.value=String(cfg.gale);
+    try{ localStorage.setItem('mega_auto_trade_gale',String(cfg.gale)); }catch(_){}
+    updateAutoTradePreview();
+  };
+}
+
+if(autoTradeGaleMultiplier){
+  autoTradeGaleMultiplier.onchange=()=>{
+    const cfg=autoTradeSettings();
+    autoTradeGaleMultiplier.value=String(cfg.multiplier);
+    try{ localStorage.setItem('mega_auto_trade_gale_multiplier',String(cfg.multiplier)); }catch(_){}
+    updateAutoTradePreview();
   };
 }
 
@@ -8591,8 +8926,10 @@ if(autoTradeToggle){
         renderAutoTradeState('🟠 Conecte a IQ Option antes de ativar a AUTO ENTRADA.');
         return;
       }
+      const cfg=autoTradeSettings();
       autoTradeEnabled=true;
-      renderAutoTradeState('🟢 AUTO DEMO armada • aguardando o próximo sinal confirmado.');
+      const galeTxt=cfg.gale===0?'sem Gale':('até Gale '+cfg.gale+' • '+cfg.multiplier.toFixed(1)+'x');
+      renderAutoTradeState('🟢 AUTO DEMO armada • '+galeTxt+' • aguardando o próximo sinal confirmado.');
       if(voiceEnabled) speak('Auto entrada demo ativada.');
     }else{
       disableAutoTrade('🔴 AUTO DEMO desligada manualmente.');
@@ -8601,12 +8938,133 @@ if(autoTradeToggle){
   };
 }
 
+function autoSleep(ms){
+  return new Promise(resolve=>setTimeout(resolve,ms));
+}
+
+async function autoDirectCandleOutcome(sig, entryIso){
+  const stepMs=intervalSecondsValue(sig.interval||interval.value)*1000;
+  const expiryIso=new Date(new Date(entryIso).getTime()+stepMs).toISOString();
+  const url='/result?symbol='+encodeURIComponent(sig.symbol||S.value)+
+    '&interval='+encodeURIComponent(sig.interval||interval.value)+
+    '&direction='+encodeURIComponent(sig.direction)+
+    '&expiry_time='+encodeURIComponent(expiryIso)+
+    '&market='+encodeURIComponent(sig.market||market.value||'OPEN')+
+    '&direct_only=true';
+  try{
+    const d=await get(url);
+    if(d && d.status==='FINALIZADA' && ['WIN','LOSS','DRAW'].includes(d.result)) return d.result;
+  }catch(_){}
+  return null;
+}
+
+async function waitAutoOrderOutcome(orderId, sig, entryIso){
+  const stepMs=intervalSecondsValue(sig.interval||interval.value)*1000;
+  const expiryMs=new Date(entryIso).getTime()+stepMs;
+  const waitMs=expiryMs-Date.now()+900;
+  if(waitMs>0) await autoSleep(waitMs);
+
+  // Primeiro tenta o fechamento real da ordem da IQ Option.
+  if(orderId){
+    for(let i=0;i<3;i++){
+      try{
+        const d=await post('/iq-auto-order-result',{order_id:String(orderId)});
+        if(d && d.settled && ['WIN','LOSS','DRAW'].includes(d.result)) return d.result;
+      }catch(_){}
+      await autoSleep(900);
+    }
+  }
+
+  // Fallback: usa a direção da vela do próprio motor de resultados.
+  for(let i=0;i<3;i++){
+    const r=await autoDirectCandleOutcome(sig,entryIso);
+    if(r) return r;
+    await autoSleep(900);
+  }
+  return null;
+}
+
+async function placeAutoGaleOrder(sig, stage, entryIso, amount){
+  if(!autoTradeEnabled || !brokerConnected.IQ_OPTION) return null;
+  if(amount>1000){
+    renderAutoTradeState('🟠 '+stage+' cancelado: valor '+amount.toFixed(2)+' excede o limite DEMO de 1000.');
+    return null;
+  }
+
+  const key=[sig.market||market.value,S.value,interval.value,sig.direction,entryIso,stage,'PRACTICE'].join('|');
+  if(autoExecutedKeys.has(key)) return null;
+  autoExecutedKeys.add(key);
+
+  renderAutoTradeState('🟡 '+stage+' • enviando ordem DEMO • valor '+amount.toFixed(2)+'...');
+  try{
+    const d=await post('/iq-auto-order',{
+      symbol:sig.symbol||S.value,
+      interval:sig.interval||interval.value,
+      direction:sig.direction,
+      entry_time:entryIso,
+      market:sig.market||market.value||'OPEN',
+      amount:amount,
+      stage:stage
+    });
+    renderAutoTradeState('✅ '+stage+' ENVIADO • '+(d.active||sig.symbol||S.value)+' • '+sig.direction+' • valor '+amount.toFixed(2));
+    if(voiceEnabled) speak(stage+' enviado.');
+    return d;
+  }catch(e){
+    renderAutoTradeState('🔴 '+stage+': '+String((e&&e.message)||e));
+    if(voiceEnabled) speak(stage+' não foi executado.');
+    return null;
+  }
+}
+
+async function monitorAutoGale(sig, baseOrder, baseAmount, maxGale, multiplier, runKey){
+  try{
+    let stageEntryIso=sig.entry_time;
+    let order=baseOrder;
+    let amount=baseAmount;
+
+    for(let level=0;level<=maxGale;level++){
+      const outcome=await waitAutoOrderOutcome(order&&order.order_id, sig, stageEntryIso);
+      if(!autoTradeEnabled || !brokerConnected.IQ_OPTION) return;
+
+      const stageName=level===0?'ENTRADA':('G'+level);
+      if(outcome==='WIN'){
+        renderAutoTradeState('✅ '+stageName+' WIN • sequência encerrada.');
+        if(voiceEnabled) speak('Win '+(level?('Gale '+level):'direto')+'.');
+        return;
+      }
+      if(outcome==='DRAW'){
+        renderAutoTradeState('⚪ '+stageName+' EMPATE • sequência encerrada sem novo Gale.');
+        return;
+      }
+      if(outcome!=='LOSS'){
+        renderAutoTradeState('🟠 '+stageName+' sem resultado a tempo • Gale cancelado por segurança.');
+        return;
+      }
+      if(level>=maxGale){
+        renderAutoTradeState('❌ LOSS até '+(maxGale===0?'entrada':('Gale '+maxGale))+' • sequência encerrada.');
+        if(voiceEnabled) speak('Sequência encerrada em loss.');
+        return;
+      }
+
+      const stepMs=intervalSecondsValue(sig.interval||interval.value)*1000;
+      const nextEntryMs=new Date(stageEntryIso).getTime()+stepMs;
+      stageEntryIso=new Date(nextEntryMs).toISOString();
+      amount=Number((amount*multiplier).toFixed(2));
+      const nextStage='G'+(level+1);
+      order=await placeAutoGaleOrder(sig,nextStage,stageEntryIso,amount);
+      if(!order) return;
+    }
+  }finally{
+    autoGaleRuns.delete(runKey);
+  }
+}
+
 async function executeAutoTrade(sig){
   if(!autoTradeEnabled || autoOrderBusy) return;
   if(!brokerConnected.IQ_OPTION) return disableAutoTrade('🔴 IQ Option desconectada • AUTO DEMO desligada.');
   if(!sig || (sig.direction!=='CALL' && sig.direction!=='PUT') || !sig.entry_time) return;
 
-  const key=[sig.market||market.value,S.value,interval.value,sig.direction,sig.entry_time,'PRACTICE'].join('|');
+  const key=[sig.market||market.value,S.value,interval.value,sig.direction,sig.entry_time,'ENTRADA','PRACTICE'].join('|');
   if(autoExecutedKeys.has(key)) return;
 
   const entryMs=new Date(sig.entry_time).getTime();
@@ -8615,21 +9073,29 @@ async function executeAutoTrade(sig){
 
   autoExecutedKeys.add(key);
   autoOrderBusy=true;
-  renderAutoTradeState('🟡 Enviando ordem DEMO para IQ Option...');
+  renderAutoTradeState('🟡 ENTRADA • enviando ordem DEMO para IQ Option...');
 
   try{
-    const amount=Math.max(1,Math.min(1000,Number((autoTradeAmount&&autoTradeAmount.value)||1)));
+    const cfg=autoTradeSettings();
+    const amount=cfg.amount;
     const d=await post('/iq-auto-order',{
       symbol:sig.symbol||S.value,
       interval:sig.interval||interval.value,
       direction:sig.direction,
       entry_time:sig.entry_time,
       market:sig.market||market.value||'OPEN',
-      amount:amount
+      amount:amount,
+      stage:'ENTRADA'
     });
     const ativo=d.active||sig.symbol||S.value;
-    renderAutoTradeState('✅ ORDEM DEMO ENVIADA • '+ativo+' • '+sig.direction+' • valor '+amount);
+    const galeTxt=cfg.gale===0?'sem Gale':('até G'+cfg.gale);
+    renderAutoTradeState('✅ ENTRADA DEMO ENVIADA • '+ativo+' • '+sig.direction+' • valor '+amount.toFixed(2)+' • '+galeTxt);
     if(voiceEnabled) speak('Ordem demo enviada. '+(sig.direction==='CALL'?'Compra':'Venda')+'.');
+
+    if(cfg.gale>0 && !autoGaleRuns.has(key)){
+      autoGaleRuns.add(key);
+      monitorAutoGale(sig,d,amount,cfg.gale,cfg.multiplier,key);
+    }
   }catch(e){
     renderAutoTradeState('🔴 AUTO DEMO: '+String((e&&e.message)||e));
     if(voiceEnabled) speak('A ordem demo não foi executada.');
@@ -8639,6 +9105,7 @@ async function executeAutoTrade(sig){
 }
 
 renderAutoTradeState();
+
 
 async function updateMarketNote(){
   syncMarketFromBroker();
