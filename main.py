@@ -459,6 +459,14 @@ class IQLoginBody(BaseModel):
     password: str
 
 
+class IQAutoOrderBody(BaseModel):
+    symbol: str
+    interval: str = "1min"
+    direction: str
+    entry_time: str
+    market: str = "OPEN"
+    amount: float = 1.0
+
 
 
 def now():
@@ -4998,6 +5006,9 @@ async def iq_login(body: IQLoginBody, response: Response):
         "last_error": "",
         "candle_cache": {},
         "results": {},
+        "auto_orders": {},
+        "auto_account": "PRACTICE",
+        "order_lock": asyncio.Lock(),
     }
     iq_sessions[token] = state
 
@@ -5017,6 +5028,195 @@ async def iq_login(body: IQLoginBody, response: Response):
         "message": "IQ Option conectada.",
         "email_masked": _mask_email(email),
         "session_token": token,
+    }
+
+
+
+def _iq_parse_buy_result(result):
+    if isinstance(result, (tuple, list)):
+        ok = bool(result[0]) if result else False
+        order_id = result[1] if len(result) > 1 else None
+        return ok, order_id
+    if isinstance(result, bool):
+        return result, None
+    if result is None:
+        return False, None
+    return True, result
+
+
+def _iq_place_demo_order_blocking(state: Dict[str, Any], symbol: str, interval: str, direction: str, amount: float, market: str):
+    client = _iq_reconnect_state(state)
+    if not _iq_connected(state):
+        raise RuntimeError("IQ Option desconectada.")
+
+    changer = getattr(client, "change_balance", None)
+    if callable(changer):
+        changed = changer("PRACTICE")
+        if changed is False:
+            raise RuntimeError("Não foi possível selecionar a conta DEMO/PRACTICE.")
+
+    buyer = getattr(client, "buy", None)
+    if not callable(buyer):
+        raise RuntimeError("Esta versão da iqoptionapi não possui a função buy().")
+
+    action = "call" if direction == "CALL" else "put"
+    expiry_minutes = max(1, int(round(iq_seconds(interval) / 60)))
+    candidates = iq_active_candidates(symbol) if market == "IQ_OTC" else iq_regular_active_candidates(symbol)
+    errors = []
+
+    for active in candidates:
+        try:
+            result = buyer(float(amount), active, action, expiry_minutes)
+            ok, order_id = _iq_parse_buy_result(result)
+            if ok:
+                state["connected"] = True
+                state["last_seen"] = time.time()
+                state["last_error"] = ""
+                return {
+                    "ok": True,
+                    "order_id": str(order_id) if order_id is not None else "",
+                    "active": active,
+                    "action": action,
+                    "amount": round(float(amount), 2),
+                    "expiry_minutes": expiry_minutes,
+                    "account": "PRACTICE",
+                }
+            errors.append(f"{active}: ordem recusada")
+        except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
+            errors.append(f"{active}: {msg}")
+
+    raise RuntimeError("IQ Option recusou a ordem DEMO. " + " | ".join(errors[-3:])[:320])
+
+
+@app.post("/iq-auto-order")
+async def iq_auto_order(body: IQAutoOrderBody, request: Request):
+    state = _iq_session_state(request, required=True)
+
+    symbol = str(body.symbol or "").upper()
+    interval = str(body.interval or "1min")
+    direction = str(body.direction or "").upper()
+    market = str(body.market or "OPEN").upper()
+    amount = float(body.amount or 0)
+
+    if symbol not in SYMBOLS:
+        raise HTTPException(400, "Ativo inválido para AUTO ENTRADA.")
+    if interval not in INTERVALS:
+        raise HTTPException(400, "Intervalo inválido para AUTO ENTRADA.")
+    if direction not in ("CALL", "PUT"):
+        raise HTTPException(400, "Direção inválida para AUTO ENTRADA.")
+    if market not in VALID_MARKETS:
+        raise HTTPException(400, "Mercado inválido para AUTO ENTRADA.")
+    if amount < 1 or amount > 1000:
+        raise HTTPException(400, "No teste DEMO, use valor entre 1 e 1000 por entrada.")
+
+    try:
+        entry_dt = parse_dt(body.entry_time)
+    except Exception:
+        raise HTTPException(400, "Horário de entrada inválido.")
+
+    delta = (now() - entry_dt).total_seconds()
+    if delta < -8:
+        raise HTTPException(409, f"A entrada ainda não abriu. Faltam aproximadamente {int(abs(delta))}s.")
+    if delta > 15:
+        raise HTTPException(409, "Janela da entrada automática encerrada para este sinal.")
+
+    order_key = "|".join([
+        market,
+        symbol,
+        interval,
+        direction,
+        _canonical_time_key(body.entry_time),
+        "PRACTICE",
+    ])
+
+    order_lock = state.get("order_lock")
+    if order_lock is None:
+        order_lock = asyncio.Lock()
+        state["order_lock"] = order_lock
+
+    async with order_lock:
+        store = state.setdefault("auto_orders", {})
+        previous = store.get(order_key)
+        if previous:
+            return {**previous, "duplicate": True}
+
+        store[order_key] = {
+            "ok": False,
+            "status": "PLACING",
+            "order_key": order_key,
+            "account": "PRACTICE",
+            "created_at": iso(now()),
+        }
+
+        try:
+            placed = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _iq_place_demo_order_blocking,
+                    state,
+                    symbol,
+                    interval,
+                    direction,
+                    amount,
+                    market,
+                ),
+                timeout=18,
+            )
+        except asyncio.TimeoutError:
+            # Mantém a chave bloqueada: em timeout não repetimos, pois a corretora
+            # pode ter recebido a ordem mesmo sem a resposta voltar a tempo.
+            store[order_key] = {
+                "ok": False,
+                "status": "UNKNOWN_TIMEOUT",
+                "order_key": order_key,
+                "account": "PRACTICE",
+                "created_at": iso(now()),
+                "message": "Tempo excedido. A ordem não será reenviada automaticamente para evitar duplicidade.",
+            }
+            raise HTTPException(504, store[order_key]["message"])
+        except Exception as exc:
+            store[order_key] = {
+                "ok": False,
+                "status": "REJECTED",
+                "order_key": order_key,
+                "account": "PRACTICE",
+                "created_at": iso(now()),
+                "message": str(exc)[:350],
+            }
+            raise HTTPException(502, str(exc)[:350])
+
+        result = {
+            **placed,
+            "status": "PLACED",
+            "order_key": order_key,
+            "symbol": symbol,
+            "interval": interval,
+            "direction": direction,
+            "market": market,
+            "entry_time": iso(entry_dt),
+            "created_at": iso(now()),
+            "duplicate": False,
+        }
+        store[order_key] = result
+
+        # Limita memória da sessão sem perder os pedidos mais recentes.
+        if len(store) > 120:
+            for old_key in list(store.keys())[:-100]:
+                store.pop(old_key, None)
+
+        return result
+
+
+@app.get("/iq-auto-status")
+async def iq_auto_status(request: Request):
+    state = _iq_session_state(request, required=False)
+    if not state:
+        return {"connected": False, "account": "PRACTICE", "orders": []}
+    orders = list(state.get("auto_orders", {}).values())[-20:]
+    return {
+        "connected": _iq_connected(state),
+        "account": "PRACTICE",
+        "orders": orders,
     }
 
 
@@ -5593,12 +5793,17 @@ async def pre_signals(
     interval: str = "1min",
     market: str = "OPEN",
     limit: int = 4,
+    symbol: str | None = None,
 ):
     market = (market or "OPEN").upper()
     limit = max(1, min(int(limit), 4))
 
     if interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Intervalo ou mercado inválido.")
+    if symbol is not None:
+        symbol = str(symbol).strip().upper()
+        if symbol not in SYMBOLS:
+            raise HTTPException(400, "Ativo inválido para pré-alerta.")
 
     requested_market = market
     iq_state = (
@@ -5627,15 +5832,21 @@ async def pre_signals(
     pointer_key = f"PRE_SIGNAL_INDEX|{group_key}"
     pointer = int(cache.get(pointer_key, (0, 0))[1] or 0) % len(SYMBOLS)
 
-    batch_size = min(len(SYMBOLS), max(PRE_SIGNAL_BATCH, limit))
-    batch = [
-        SYMBOLS[(pointer + i) % len(SYMBOLS)]
-        for i in range(batch_size)
-    ]
-    cache[pointer_key] = (
-        time.time(),
-        (pointer + batch_size) % len(SYMBOLS),
-    )
+    if symbol:
+        # Para o pré-alerta do painel, analisa primeiro o ativo que o usuário
+        # realmente está acompanhando. Isso evita girar outros pares e reduz carga.
+        batch_size = 1
+        batch = [symbol]
+    else:
+        batch_size = min(len(SYMBOLS), max(PRE_SIGNAL_BATCH, limit))
+        batch = [
+            SYMBOLS[(pointer + i) % len(SYMBOLS)]
+            for i in range(batch_size)
+        ]
+        cache[pointer_key] = (
+            time.time(),
+            (pointer + batch_size) % len(SYMBOLS),
+        )
 
     # Remove candidatos vencidos.
     now_ts = time.time()
@@ -5692,6 +5903,8 @@ async def pre_signals(
     items = []
     for key, payload in pre_signal_cache.items():
         if not key.startswith(group_key + "|"):
+            continue
+        if symbol and str(payload.get("symbol") or "").upper() != symbol:
             continue
 
         try:
@@ -7152,6 +7365,25 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         O e-mail e a senha são usados apenas para abrir a sessão da corretora.
         A senha não é salva no navegador.
       </div>
+
+      <div class="card" style="margin-top:14px;border-color:#19d27c">
+        <div style="font-weight:1000">🤖 AUTO ENTRADA • TESTE DEMO</div>
+        <div class="label" style="margin-top:6px;line-height:1.5">
+          Executa na IQ Option apenas em PRACTICE/DEMO quando o horário do sinal chegar.
+          Fica OFF sempre que a página é aberta.
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;align-items:end">
+          <div>
+            <div class="label">VALOR POR ENTRADA</div>
+            <input id="autoTradeAmount" type="number" min="1" max="1000" step="1" value="1"
+                   style="width:100%;box-sizing:border-box;margin-top:5px">
+          </div>
+          <button id="autoTradeToggle" type="button" style="width:100%;font-weight:1000">🔴 AUTO DEMO OFF</button>
+        </div>
+        <div id="autoTradeStatus" style="margin-top:10px;font-size:12px;line-height:1.5">
+          ⚪ Conecte a IQ Option e ative manualmente para testar.
+        </div>
+      </div>
     </div>
   </div>
 
@@ -7161,8 +7393,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <div class="card" style="margin-top:12px">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
         <div>
-          <div class="label">ANÁLISE 1 MIN • CONFIRMAÇÃO NO ÚLTIMO MINUTO</div>
-          <small style="opacity:.75">Vela em formação — ainda não é entrada confirmada</small>
+          <div class="label">🔔 PRÉ-ALERTA • ATÉ 1 MINUTO ANTES</div>
+          <small style="opacity:.75">Avisa uma possível entrada antes da confirmação final • não executa ordem</small>
         </div>
         <select id="preSignalLimit" style="max-width:86px">
           <option value="1">1 ativo</option>
@@ -7172,7 +7404,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         </select>
       </div>
       <div id="preSignalStatus" style="margin-top:10px;font-size:12px;opacity:.8">
-        Monitorando...
+        Monitorando o ativo selecionado para pré-alerta...
       </div>
       <div id="preSignals" class="radar" style="margin-top:10px"></div>
     </div>
@@ -7187,7 +7419,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 </div>
 
 <script>
-// MEGA IA build 33.82.0 — adiciona motor EA binário com botão ONLINE/OFFLINE.
+// MEGA IA v1.0 — base anterior preservada + pré-alerta de até 1 minuto antes da entrada.
 (function(){
   try{
     const u=new URL(window.location.href);
@@ -7278,6 +7510,7 @@ const preSignalLimit=document.getElementById('preSignalLimit');
 const preSignals=document.getElementById('preSignals');
 const preSignalStatus=document.getElementById('preSignalStatus');
 let preSignalBusy=false;
+let lastPreAlertVoiceKey='';
 let iqLoginInProgress=false; // pausa temporariamente as consultas durante o login da IQ Option
 const heroBox=document.getElementById('heroBox');
 const entryArrow=document.getElementById('entryArrow');
@@ -7324,6 +7557,12 @@ const iqPassword=document.getElementById('iqPassword');
 const iqConnectBtn=document.getElementById('iqConnectBtn');
 const iqLogoutBtn=document.getElementById('iqLogoutBtn');
 const iqAccountStatus=document.getElementById('iqAccountStatus');
+const autoTradeAmount=document.getElementById('autoTradeAmount');
+const autoTradeToggle=document.getElementById('autoTradeToggle');
+const autoTradeStatus=document.getElementById('autoTradeStatus');
+let autoTradeEnabled=false;
+let autoOrderBusy=false;
+const autoExecutedKeys=new Set();
 let brokerConnected={IQ_OPTION:false};
 const chartInfo=document.getElementById('chartInfo');
 const direction=document.getElementById('direction');
@@ -7361,6 +7600,13 @@ try{
   if(entryMode) entryMode.value=['BIRTH','MIDDLE','CLOSE'].includes(savedEntryMode)?savedEntryMode:'BIRTH';
   if(marketMode) marketMode.value=(savedMode==='OTC'?'OTC':'OPEN');
   setTimeout(()=>syncBroker(savedBroker),0);
+}catch(_){}
+
+try{
+  const savedAutoAmount=Number(localStorage.getItem('mega_auto_trade_amount')||1);
+  if(autoTradeAmount && Number.isFinite(savedAutoAmount)){
+    autoTradeAmount.value=String(Math.max(1,Math.min(1000,savedAutoAmount)));
+  }
 }catch(_){}
 
 const syms=[
@@ -7916,6 +8162,7 @@ function paintEntryModeNote(){
 if(entryMode){
   paintEntryModeNote();
   entryMode.onchange=()=>{
+    lastPreAlertVoiceKey='';
     try{localStorage.setItem('mega_entry_mode',entryMode.value||'BIRTH')}catch(_){}
     lastSignalVoice='';
     lastCountdownSignalKey='';
@@ -8308,6 +8555,90 @@ async function post(u,data={}){
 
   return j;
 }
+
+
+function renderAutoTradeState(message=''){
+  if(autoTradeToggle){
+    autoTradeToggle.textContent=autoTradeEnabled?'🟢 AUTO DEMO ON':'🔴 AUTO DEMO OFF';
+    autoTradeToggle.style.borderColor=autoTradeEnabled?'#19d27c':'#ff5252';
+  }
+  if(autoTradeStatus && message){
+    autoTradeStatus.textContent=message;
+  }else if(autoTradeStatus && !autoTradeEnabled){
+    autoTradeStatus.textContent='⚪ AUTO ENTRADA desligada • nenhuma ordem será enviada.';
+  }
+}
+
+function disableAutoTrade(message='⚪ AUTO ENTRADA desligada.'){
+  autoTradeEnabled=false;
+  renderAutoTradeState(message);
+}
+
+if(autoTradeAmount){
+  autoTradeAmount.onchange=()=>{
+    let v=Number(autoTradeAmount.value||1);
+    if(!Number.isFinite(v)) v=1;
+    v=Math.max(1,Math.min(1000,v));
+    autoTradeAmount.value=String(v);
+    try{ localStorage.setItem('mega_auto_trade_amount',String(v)); }catch(_){}
+  };
+}
+
+if(autoTradeToggle){
+  autoTradeToggle.onclick=()=>{
+    if(!autoTradeEnabled){
+      if(!brokerConnected.IQ_OPTION){
+        renderAutoTradeState('🟠 Conecte a IQ Option antes de ativar a AUTO ENTRADA.');
+        return;
+      }
+      autoTradeEnabled=true;
+      renderAutoTradeState('🟢 AUTO DEMO armada • aguardando o próximo sinal confirmado.');
+      if(voiceEnabled) speak('Auto entrada demo ativada.');
+    }else{
+      disableAutoTrade('🔴 AUTO DEMO desligada manualmente.');
+      if(voiceEnabled) speak('Auto entrada desligada.');
+    }
+  };
+}
+
+async function executeAutoTrade(sig){
+  if(!autoTradeEnabled || autoOrderBusy) return;
+  if(!brokerConnected.IQ_OPTION) return disableAutoTrade('🔴 IQ Option desconectada • AUTO DEMO desligada.');
+  if(!sig || (sig.direction!=='CALL' && sig.direction!=='PUT') || !sig.entry_time) return;
+
+  const key=[sig.market||market.value,S.value,interval.value,sig.direction,sig.entry_time,'PRACTICE'].join('|');
+  if(autoExecutedKeys.has(key)) return;
+
+  const entryMs=new Date(sig.entry_time).getTime();
+  const delta=(Date.now()-entryMs)/1000;
+  if(delta < -8 || delta > 15) return;
+
+  autoExecutedKeys.add(key);
+  autoOrderBusy=true;
+  renderAutoTradeState('🟡 Enviando ordem DEMO para IQ Option...');
+
+  try{
+    const amount=Math.max(1,Math.min(1000,Number((autoTradeAmount&&autoTradeAmount.value)||1)));
+    const d=await post('/iq-auto-order',{
+      symbol:sig.symbol||S.value,
+      interval:sig.interval||interval.value,
+      direction:sig.direction,
+      entry_time:sig.entry_time,
+      market:sig.market||market.value||'OPEN',
+      amount:amount
+    });
+    const ativo=d.active||sig.symbol||S.value;
+    renderAutoTradeState('✅ ORDEM DEMO ENVIADA • '+ativo+' • '+sig.direction+' • valor '+amount);
+    if(voiceEnabled) speak('Ordem demo enviada. '+(sig.direction==='CALL'?'Compra':'Venda')+'.');
+  }catch(e){
+    renderAutoTradeState('🔴 AUTO DEMO: '+String((e&&e.message)||e));
+    if(voiceEnabled) speak('A ordem demo não foi executada.');
+  }finally{
+    autoOrderBusy=false;
+  }
+}
+
+renderAutoTradeState();
 
 async function updateMarketNote(){
   syncMarketFromBroker();
@@ -8950,6 +9281,7 @@ iqLogoutBtn.onclick=async()=>{
     localStorage.removeItem('mega_iq_session');
   }catch(_){}
   brokerConnected[b]=false;
+  disableAutoTrade('🔴 IQ Option desconectada • AUTO DEMO desligada.');
   iqPassword.value='';
   syncBroker(b);
   iqAccountStatus.textContent='⚪ IQ Option desconectada.';
@@ -8995,6 +9327,7 @@ async function setAppPower(enabled){
   try{ localStorage.setItem('mega_app_power', appEnabled ? 'ON' : 'OFF'); }catch(_){}
 
   if(!appEnabled){
+    disableAutoTrade('🔴 App desligado • AUTO DEMO desligada.');
     cur=null;
     chartPreSignal=null;
     lastCountdownSignalKey='';
@@ -9008,7 +9341,7 @@ async function setAppPower(enabled){
   if(appEnabled){
     await Promise.allSettled([sig(false), perf(), updateMarketNote()]);
     await Promise.allSettled([rad()]);
-    if(selectedRobotEngine()==='OFF') await Promise.allSettled([loadPreSignals()]);
+    if(selectedRobotEngine()!=='OFF') await Promise.allSettled([loadPreSignals()]);
     if(chartTab.classList.contains('active')) await loadChart();
     if(voiceEnabled) speak('Mega IA ligado. Análises e sinais ativados.');
   }else if(voiceEnabled){
@@ -9427,9 +9760,73 @@ async function rad(){
 }
 
 async function loadPreSignals(){
-  if(preSignalStatus) preSignalStatus.textContent='Pré-sinais antigos desativados durante o teste atual.';
-  if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 Teste isolado: somente o robô principal no timeframe selecionado.</div>';
-  return;
+  if(preSignalBusy || !appEnabled || iqLoginInProgress) return;
+
+  const engine=selectedRobotEngine();
+  if(engine==='OFF'){
+    if(preSignalStatus) preSignalStatus.textContent='Pré-alerta aguardando um motor ficar ONLINE.';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔕 Coloque Robô, IA, EA ou Indicador ONLINE para usar o pré-alerta.</div>';
+    return;
+  }
+
+  preSignalBusy=true;
+  try{
+    const lim=preSignalLimit ? Math.max(1,Math.min(4,Number(preSignalLimit.value||1))) : 1;
+    const sym=(S&&S.value) ? S.value : '';
+    const url=`/pre-signals?market=${encodeURIComponent(market.value)}&interval=${encodeURIComponent(interval.value)}&limit=${encodeURIComponent(lim)}&symbol=${encodeURIComponent(sym)}`;
+    const data=await get(url);
+    const items=Array.isArray(data&&data.items)?data.items:[];
+    const remain=Math.max(0,Number((data&&data.seconds_to_entry)||0));
+
+    if(preSignalStatus){
+      if(remain>60){
+        preSignalStatus.textContent=`Aguardando janela do pré-alerta • faltam ${Math.ceil(remain)}s para a próxima abertura.`;
+      }else{
+        preSignalStatus.textContent=`🔔 Janela de pré-alerta ativa • próxima abertura em ${Math.ceil(remain)}s.`;
+      }
+    }
+
+    if(!items.length){
+      if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚪ Nenhum pré-alerta confirmado na vela em formação. Continuo monitorando.</div>';
+      return;
+    }
+
+    if(preSignals){
+      preSignals.innerHTML=items.map(item=>{
+        const d=String(item.direction||'').toUpperCase();
+        const icon=d==='CALL'?'🟢':'🔴';
+        const conf=Math.round(Number(item.confidence||0));
+        const secs=Math.max(0,Number(item.seconds_to_entry||0));
+        const when=item.entry_time?ft(item.entry_time):'--:--';
+        return `<div class="${d==='CALL'?'radar-call':'radar-put'}" style="border:1px solid rgba(255,193,7,.65)">
+          <b>🔔 PRÉ-ALERTA • ${icon} ${item.symbol||sym} ${d}</b><br>
+          <span>Possível entrada às ${when} • em ${Math.ceil(secs)}s</span><br>
+          <small>Confiança preliminar ${conf}% • AGUARDE CONFIRMAÇÃO FINAL</small>
+        </div>`;
+      }).join('');
+    }
+
+    // Fala uma única vez por ativo/direção/horário de entrada.
+    // É um aviso preliminar: não transforma o pré-sinal em entrada confirmada.
+    const best=items[0];
+    const secs=Math.max(0,Number(best.seconds_to_entry||remain||0));
+    if(best && secs<=60 && secs>0){
+      const key=[best.symbol,best.direction,best.entry_time].join('|');
+      if(key!==lastPreAlertVoiceKey){
+        lastPreAlertVoiceKey=key;
+        if(voiceEnabled){
+          const lado=String(best.direction||'').toUpperCase()==='CALL'?'compra':'venda';
+          const ativoFalado=spokenAssetName(best.symbol||sym);
+          speak('Pré alerta. Possível entrada de '+lado+' no ativo '+ativoFalado+' em aproximadamente um minuto. Aguarde a confirmação final.');
+        }
+      }
+    }
+  }catch(e){
+    if(preSignalStatus) preSignalStatus.textContent='Pré-alerta monitorando • fonte temporariamente indisponível.';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔔 O robô continuará tentando o pré-alerta automaticamente.</div>';
+  }finally{
+    preSignalBusy=false;
+  }
 }
 
 async function lic(){
@@ -9514,6 +9911,9 @@ function cd(){
   }
 
   const birthGrace=(String(cur.entry_mode||'').toUpperCase()==='BIRTH')?12:2;
+  if(n<=0 && n>-birthGrace){
+    if(autoTradeEnabled) executeAutoTrade(cur);
+  }
   if(n<=0 && n>-birthGrace && !entered){
     entered=true;
     showEntryArrow(cur.direction);
@@ -9758,7 +10158,7 @@ async function bootApp(){
   if(appEnabled){
     safe('radar',rad);
   }
-  if(appEnabled && selectedRobotEngine()==='OFF'){
+  if(appEnabled && selectedRobotEngine()!=='OFF'){
     safe('pre-signals',loadPreSignals);
   }
   if(appEnabled && chartTab.classList.contains('active')){
@@ -9786,10 +10186,10 @@ setInterval(()=>{ if(appEnabled && !iqLoginInProgress) perf(); },5000);
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress) rad();
 },60000);
-// Pré-análise atualizada a cada 1 minuto; a confirmação continua usando a janela final de 1 minuto.
+// Pré-alerta atualizado a cada 10 s no último minuto antes da próxima abertura; não confirma nem executa a entrada.
 setInterval(()=>{
-  if(appEnabled && !iqLoginInProgress && selectedRobotEngine()==='OFF') loadPreSignals();
-},60000);
+  if(appEnabled && !iqLoginInProgress && selectedRobotEngine()!=='OFF') loadPreSignals();
+},10000);
 
 // Com o app ligado, acompanha o resultado das operações abertas.
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) resultCheck(); },5000);
