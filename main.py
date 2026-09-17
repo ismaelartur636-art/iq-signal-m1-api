@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.0"
-PWA_VERSION = "v81"
+APP_VERSION = "3.0.1"
+PWA_VERSION = "v82"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -102,7 +102,7 @@ BAROMETER_BARSMIN = 9
 BAROMETER_BARSMAX = 7200
 # Histórico bruto necessário para calcular o BAROMETER e ainda sobrar uma
 # margem de candles recentes para detectar a troca de direção do trail.
-BAROMETER_HISTORY = 1855
+BAROMETER_HISTORY = 1760
 
 INTERVALS = {"1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1h": 3600, "4h": 14400}
 SYMBOLS = [
@@ -5420,7 +5420,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("EA" if engine == "EA" else ("INDICADOR" if engine == "INDICATOR" else f"{engine_title} {tf_label}")),
                 "mode": engine_mode,
                 "selected_engine": engine,
-                "ai_provider": (analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else "DISABLED",
+                "ai_provider": "EXTERNAL_AI" if engine == "SMART" else "DISABLED",
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
@@ -5906,7 +5906,7 @@ async def manifest():
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v64",
+        "start_url": "/?pwa=v82",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
@@ -8268,7 +8268,7 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=66">
+<link rel="manifest" href="/manifest.webmanifest?v=82">
 <link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=66">
 <link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=66">
 <meta name="theme-color" content="#07182b">
@@ -12072,18 +12072,19 @@ async function bootApp(){
     await new Promise(r=>setTimeout(r,700));
   }
 
-  if(appEnabled) safe('signal',()=>sig(false));
+  // Abre o painel primeiro. O BAROMETER precisa de histórico longo e não deve
+  // bloquear a primeira pintura da tela nem disputar a primeira requisição com o radar.
   if(appEnabled){
-    safe('radar',rad);
+    setTimeout(()=>safe('signal',()=>sig(false)),350);
+    setTimeout(()=>safe('performance',perf),700);
+    setTimeout(()=>safe('radar',rad),2200);
   }
   if(appEnabled && selectedRobotEngine()!=='OFF'){
-    safe('pre-signals',loadPreSignals);
+    setTimeout(()=>safe('pre-signals',loadPreSignals),3200);
   }
   if(appEnabled && chartTab.classList.contains('active')){
-    safe('chart',loadChart);
+    setTimeout(()=>safe('chart',loadChart),1200);
   }
-
-  if(appEnabled) safe('performance',perf);
 }
 
 bootApp().catch(err=>{
