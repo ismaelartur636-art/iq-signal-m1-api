@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.8"
-PWA_VERSION = "v83"
+APP_VERSION = "3.9"
+PWA_VERSION = "v84"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -2915,6 +2915,152 @@ async def graphic_ai_strategy(symbol, interval, cs, market="OPEN", request=None,
 
 
 
+def ea_movement_force_strategy(cs, timeframe="1min", m5=None, h1=None, market="OPEN"):
+    """EA FORÇA DO MOVIMENTO — motor fechado para opções binárias.
+
+    Conversão do conceito do BLACK WOLF para binárias: não usa grid, hedge,
+    martingale, recuperação nem aumento de lote. Trabalha somente com candles
+    FECHADOS e libera CALL, PUT ou NEUTRO para a janela de entrada do app.
+
+    Os parâmetros permanecem somente no backend. O frontend recebe apenas o
+    estado do motor e o sinal final; as configurações internas não são expostas.
+    """
+    rows = list(cs or [])
+    m5 = list(m5 or [])
+    h1 = list(h1 or [])
+    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
+    name = f"EA Força do Movimento {tf_label}"
+
+    def neutral(reason, confidence=0.0, risk="HIGH"):
+        return {
+            "direction": "NEUTRO", "confidence": round(float(confidence or 0), 1),
+            "confirmed": False, "risk": risk, "strategy": name,
+            "engine": "EA_FORCE_MOVEMENT", "reason": reason,
+            "direct_win_only": True, "gale_signal": False,
+            "non_repaint": True, "config_hidden": True,
+        }
+
+    if len(rows) < 50:
+        return neutral(f"Aguardando histórico fechado suficiente em {tf_label}.")
+
+    closes = [float(x["close"]) for x in rows]
+    last, prev = rows[-1], rows[-2]
+    o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"])
+    rng = max(h - l, 1e-12)
+    body = abs(c - o)
+    body_ratio = body / rng
+
+    hist_ranges = [max(float(x["high"]) - float(x["low"]), 1e-12) for x in rows[-26:-1]]
+    avg_range = sum(hist_ranges[-20:]) / max(1, len(hist_ranges[-20:]))
+    range_ratio = rng / max(avg_range, 1e-12)
+
+    if body_ratio < 0.30 or range_ratio < 0.50:
+        return neutral("Movimento atual ainda sem força limpa suficiente para entrada direta.", 34)
+    if range_ratio > 2.25:
+        return neutral("Movimento muito esticado; o EA aguarda normalização antes de entrar.", 40)
+
+    lateral, lateral_score = sideways_filter(closes)
+    if lateral:
+        return neutral("Mercado lateral/ruidoso; força direcional insuficiente para entrada direta.", min(49, 36 + float(lateral_score) * 0.08))
+
+    call = 0.0
+    put = 0.0
+
+    close_pos = (c - l) / rng
+    if c > o:
+        if body_ratio >= 0.52: call += 24
+        if body_ratio >= 0.68: call += 7
+        if close_pos >= 0.72: call += 10
+    elif c < o:
+        if body_ratio >= 0.52: put += 24
+        if body_ratio >= 0.68: put += 7
+        if close_pos <= 0.28: put += 10
+
+    if 0.80 <= range_ratio <= 1.85:
+        if c > o: call += 10
+        elif c < o: put += 10
+
+    displacement = (closes[-1] - closes[-4]) / max(avg_range, 1e-12)
+    if displacement >= 0.70:
+        call += 16
+    elif displacement <= -0.70:
+        put += 16
+
+    bull2 = float(prev["close"]) > float(prev["open"]) and c > o
+    bear2 = float(prev["close"]) < float(prev["open"]) and c < o
+    if bull2: call += 8
+    if bear2: put += 8
+
+    e9, e21, e50 = ema(closes, 9), ema(closes, 21), ema(closes, 50)
+    if None not in (e9, e21, e50):
+        if e9 > e21 > e50 and c >= e9:
+            call += 16
+        elif e9 < e21 < e50 and c <= e9:
+            put += 16
+
+    if len(m5) >= 25:
+        m5c = [float(x["close"]) for x in m5]
+        a, b = ema(m5c, 9), ema(m5c, 21)
+        if a is not None and b is not None:
+            if a > b: call += 10
+            elif a < b: put += 10
+
+    if len(h1) >= 25:
+        h1c = [float(x["close"]) for x in h1]
+        a, b = ema(h1c, 9), ema(h1c, 21)
+        if a is not None and b is not None:
+            if a > b: call += 8
+            elif a < b: put += 8
+
+    recent_high = max(float(x["high"]) for x in rows[-9:-1])
+    recent_low = min(float(x["low"]) for x in rows[-9:-1])
+    if c > recent_high and c > o: call += 10
+    if c < recent_low and c < o: put += 10
+
+    upper = (h - max(o, c)) / rng
+    lower = (min(o, c) - l) / rng
+    if c > o and upper > 0.30: call -= 12
+    if c < o and lower > 0.30: put -= 12
+
+    vols = [float(x.get("volume", 0) or 0) for x in rows[-21:]]
+    hist_v = [v for v in vols[:-1] if v > 0]
+    volume_confirmed = False
+    if len(hist_v) >= 12 and vols[-1] > 0:
+        vavg = sum(hist_v[-20:]) / len(hist_v[-20:])
+        vr = vols[-1] / max(vavg, 1e-12)
+        if vr >= 1.15:
+            volume_confirmed = True
+            if c > o: call += 8
+            elif c < o: put += 8
+
+    call = max(0.0, call)
+    put = max(0.0, put)
+    best_dir = "CALL" if call > put else "PUT" if put > call else "NEUTRO"
+    best = max(call, put)
+    gap = abs(call - put)
+
+    if best_dir == "NEUTRO" or best < 72 or gap < 16:
+        return neutral("Força compradora e vendedora ainda sem vantagem clara; aguardando novo fechamento.", clamp(38 + best * 0.34, 38, 68), "HIGH")
+
+    confidence = clamp(74 + (best - 72) * 0.55 + (gap - 16) * 0.18, 74, 95)
+    risk = "LOW" if best >= 90 and gap >= 24 else "MEDIUM"
+    reason = (
+        "Força compradora confirmada por impulso, fechamento dominante e continuidade do movimento."
+        if best_dir == "CALL"
+        else "Força vendedora confirmada por impulso, fechamento dominante e continuidade do movimento."
+    )
+    if volume_confirmed:
+        reason += " Volume também confirmou a pressão."
+
+    return {
+        "direction": best_dir, "confidence": round(float(confidence), 1),
+        "confirmed": True, "risk": risk, "strategy": name,
+        "engine": "EA_FORCE_MOVEMENT", "reason": reason,
+        "direct_win_only": True, "gale_signal": False,
+        "non_repaint": True, "config_hidden": True,
+    }
+
+
 def ea_binary_strategy(cs, timeframe="1min", m5=None, h1=None, market="OPEN"):
     """EA AUTÔNOMA IQ — leitura seletiva para a próxima vela.
 
@@ -5629,7 +5775,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     entry_mode = normalize_entry_mode(entry_mode)
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
@@ -5653,21 +5799,22 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         return cache[key][1]
 
     try:
-        if engine == "EA":
+        if engine in ("EA", "FORCE"):
+            engine_label = "EA AUTÔNOMA" if engine == "EA" else "EA FORÇA DO MOVIMENTO"
+            engine_strategy = "EA AUTÔNOMA IQ" if engine == "EA" else "EA Força do Movimento"
+            engine_mode = "EA_AUTONOMOUS_IQ" if engine == "EA" else "EA_FORCE_MOVEMENT"
             if not iq_state:
                 out = neutral_signal(
                     symbol, interval, market,
-                    "EA AUTÔNOMA • IQ OPTION OFFLINE",
-                    "Conecte a IQ Option na aba Corretora. A EA usa a própria IQ Option em Mercado Aberto e OTC.",
+                    f"{engine_label} • IQ OPTION OFFLINE",
+                    f"Conecte a IQ Option na aba Corretora. {engine_label} usa candles da própria IQ Option em Mercado Aberto e OTC.",
                     source_state="WAITING",
                 )
                 out.update({
-                    "strategy": "EA AUTÔNOMA IQ",
-                    "mode": "EA_AUTONOMOUS_IQ",
-                    "selected_engine": "EA",
-                    "feed_source": "IQ_OPTION",
-                    "direct_win_only": True,
-                    "gale_signal": False,
+                    "strategy": engine_strategy, "mode": engine_mode,
+                    "selected_engine": engine, "feed_source": "IQ_OPTION",
+                    "direct_win_only": True, "gale_signal": False,
+                    "config_hidden": engine == "FORCE",
                 })
                 cache[key] = (time.time(), out)
                 return out
@@ -5679,8 +5826,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             raw = await candles(symbol, interval, 150, market, iq_state, request=request)
     except HTTPException as exc:
         status = (
-            "EA AUTÔNOMA • IQ OPTION EM ESPERA"
-            if engine == "EA"
+            ("EA AUTÔNOMA • IQ OPTION EM ESPERA" if engine == "EA" else "EA FORÇA DO MOVIMENTO • IQ OPTION EM ESPERA")
+            if engine in ("EA", "FORCE")
             else (
                 "TWELVE DATA • LIMITE/ESPERA"
                 if market == "OPEN" and exc.status_code in (429, 503)
@@ -5692,8 +5839,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         return out
     except Exception as exc:
         status = (
-            "EA AUTÔNOMA • IQ OPTION RECONECTANDO"
-            if engine == "EA"
+            ("EA AUTÔNOMA • IQ OPTION RECONECTANDO" if engine == "EA" else "EA FORÇA DO MOVIMENTO • IQ OPTION RECONECTANDO")
+            if engine in ("EA", "FORCE")
             else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "TWELVE DATA • INDISPONÍVEL")
         )
         out = neutral_signal(symbol, interval, market, status, str(exc), source_state="DEGRADED")
@@ -5741,11 +5888,14 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "EA":
             engine_title = "EA AUTÔNOMA IQ"
             engine_mode = "EA_AUTONOMOUS_IQ"
+        elif engine == "FORCE":
+            engine_title = "EA FORÇA DO MOVIMENTO"
+            engine_mode = "EA_FORCE_MOVEMENT"
         else:
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine != "EA":
+        if market != "OPEN" and engine not in ("EA", "FORCE"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -5775,7 +5925,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_closed = closed[-90:] if len(closed) > 90 else closed
             if engine == "SMART":
                 analysis = await openai_direct_signal(symbol, interval, engine_closed, market)
-            elif engine == "EA":
+            elif engine in ("EA", "FORCE"):
                 regular_iq = market == "OPEN"
                 if interval == "5min":
                     m5_raw = list(raw)
@@ -5790,13 +5940,14 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 )
                 m5_closed = m5_raw[:-1] if len(m5_raw) > 1 else m5_raw
                 h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
-                analysis = ea_binary_strategy(
-                    engine_closed,
-                    interval,
-                    m5=m5_closed,
-                    h1=h1_closed,
-                    market=market,
-                )
+                if engine == "FORCE":
+                    analysis = ea_movement_force_strategy(
+                        engine_closed, interval, m5=m5_closed, h1=h1_closed, market=market
+                    )
+                else:
+                    analysis = ea_binary_strategy(
+                        engine_closed, interval, m5=m5_closed, h1=h1_closed, market=market
+                    )
             else:
                 analysis = await graphic_ai_strategy(symbol, interval, engine_closed, market, request=request, iq_state=iq_state)
         except Exception as exc:
@@ -5824,14 +5975,19 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
             "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI") and analysis.get("confirmed")),
             "ai_provider": (analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else "DISABLED",
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA") else "HIGH").upper(),
-            "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else (analysis.get("strategy", "EA AUTÔNOMA IQ") if engine == "EA" else analysis.get("strategy", f"{engine_title} {tf_label}")),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE") else "HIGH").upper(),
+            "strategy": (
+                "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
+                else (analysis.get("strategy", "EA AUTÔNOMA IQ") if engine == "EA"
+                      else (analysis.get("strategy", "EA Força do Movimento") if engine == "FORCE"
+                            else analysis.get("strategy", f"{engine_title} {tf_label}")))
+            ),
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
             "technical": (
                 {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI", "direct_win_filter": analysis.get("direct_win_filter", {}), "setup": analysis.get("setup", "NONE")}
                 if engine == "SMART"
-                else analysis
+                else ({"config_hidden": True, "mode": "EA_FORCE_MOVEMENT", "non_repaint": True} if engine == "FORCE" else analysis)
             ),
             "source_state": "READY" if ai_available else "AI_UNAVAILABLE",
             "mode": engine_mode,
@@ -5863,7 +6019,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             signal_fingerprint = f"{engine}|{direction_now}|{reference_candle}"
             fingerprint_key = (
                 "pure_ai_fingerprint" if engine == "SMART"
-                else ("ea_fingerprint" if engine == "EA" else "graph_ai_fingerprint")
+                else ("ea_fingerprint" if engine == "EA"
+                      else ("force_fingerprint" if engine == "FORCE" else "graph_ai_fingerprint"))
             )
             if release_state.get(fingerprint_key) != signal_fingerprint:
                 # v3.6: SOMENTE a IA GRÁFICA tem intervalo mínimo de 4 minutos
@@ -5891,7 +6048,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 announce, entry, expiry = entry_window(interval, entry_mode)
                 base.update({
                     "direction": direction_now,
-                    "status": (("FALLBACK LOCAL • BLOQUEADO PARA ENTRADA" if analysis.get("fallback") else "SINAL IA PURA LIBERADO") if engine == "SMART" else ("SINAL EA AUTÔNOMA IQ LIBERADO" if engine == "EA" else "SINAL IA GRÁFICA LIBERADO")),
+                    "status": (("FALLBACK LOCAL • BLOQUEADO PARA ENTRADA" if analysis.get("fallback") else "SINAL IA PURA LIBERADO") if engine == "SMART" else ("SINAL EA AUTÔNOMA IQ LIBERADO" if engine == "EA" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -7402,11 +7559,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART ou EA.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA ou FORCE.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine == "EA":
+    if engine in ("EA", "FORCE"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -7428,13 +7585,14 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             # Sempre informa ao frontend qual mercado foi pedido e qual fonte
             # realmente gerou o sinal. Isto evita fechar um sinal IQ_OTC como OPEN.
             data["requested_market"] = requested_market
-            if engine == "EA":
+            if engine in ("EA", "FORCE"):
                 data["feed_source"] = "IQ_OPTION_OPEN" if requested_market == "OPEN" else "IQ_OPTION_OTC"
                 data["feed_fallback"] = False
+                engine_msg = "EA Autônoma" if engine == "EA" else "EA Força do Movimento"
                 data["feed_message"] = (
-                    "EA Autônoma lendo candles diretamente da IQ Option no mercado aberto."
+                    f"{engine_msg} lendo candles diretamente da IQ Option no mercado aberto."
                     if requested_market == "OPEN"
-                    else "EA Autônoma lendo candles OTC diretamente da IQ Option."
+                    else f"{engine_msg} lendo candles OTC diretamente da IQ Option."
                 )
             elif requested_market == "OPEN":
                 data["feed_source"] = "TWELVE_DATA_CLOUD"
@@ -7868,12 +8026,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART ou EA.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA ou FORCE.")
 
     requested_market = market
-    iq_state = _iq_session_state(request, required=False) if requested_market == "IQ_OTC" else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state
+    iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or engine in ("EA", "FORCE")) else None
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE")
     if fallback_twelve:
         market = "OPEN"
 
@@ -7906,7 +8064,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     # limitador global já existente. Assim nenhum cartão depende de toque para
     # começar a ser analisado e evitamos estourar a cota da fonte de dados.
     scan_symbols = list(SYMBOLS)
-    if market == "OPEN" and engine != "EA":
+    if market == "OPEN" and engine not in ("EA", "FORCE"):
         ws_active = _td_ws_active_symbols()
         for row in out:
             base = str(row.get("base_symbol") or "").strip()
@@ -7922,9 +8080,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     cache[idx_key] = (time.time(), (idx + 1) % len(scan_symbols))
 
     try:
-        if engine == "EA":
+        if engine in ("EA", "FORCE"):
             if not iq_state:
-                raise RuntimeError("Conecte a IQ Option para usar a EA Autônoma.")
+                raise RuntimeError("Conecte a IQ Option para usar o EA selecionado.")
             raw = await iq_ea_candles(
                 iq_state, sym, interval, 100,
                 regular_market=(market == "OPEN"),
@@ -7933,7 +8091,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             raw = await candles(sym, interval, 90, market, iq_state, request=request)
         if len(raw) >= 25:
             closed = raw[:-1] if len(raw) > 1 else raw
-            if engine == "EA":
+            if engine in ("EA", "FORCE"):
                 regular_iq = market == "OPEN"
                 if interval == "5min":
                     m5_raw = list(raw)
@@ -7948,15 +8106,21 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 )
                 m5_closed = m5_raw[:-1] if len(m5_raw) > 1 else m5_raw
                 h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
-                tech = ea_binary_strategy(
-                    closed, interval, m5=m5_closed, h1=h1_closed, market=market
-                )
+                if engine == "FORCE":
+                    tech = ea_movement_force_strategy(
+                        closed, interval, m5=m5_closed, h1=h1_closed, market=market
+                    )
+                    engine_label = "EA FORÇA DO MOVIMENTO"
+                else:
+                    tech = ea_binary_strategy(
+                        closed, interval, m5=m5_closed, h1=h1_closed, market=market
+                    )
+                    engine_label = "EA AUTÔNOMA IQ"
                 direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
-                engine_label = "EA AUTÔNOMA IQ"
                 status_text = (
-                    "EA AUTÔNOMA IQ • OPORTUNIDADE ENCONTRADA"
+                    f"{engine_label} • OPORTUNIDADE ENCONTRADA"
                     if direction != "NEUTRO"
-                    else "EA AUTÔNOMA IQ • MONITORANDO"
+                    else f"{engine_label} • MONITORANDO"
                 )
             elif market == "OPEN":
                 if engine == "SMART":
@@ -7988,12 +8152,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if engine == "EA"
+                    status_text if engine in ("EA", "FORCE")
                     else (("TWELVE DATA • " + status_text) if market == "OPEN" else status_text)
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": (("IQ_OPTION_OPEN" if market == "OPEN" else "IQ_OPTION_OTC") if engine == "EA" else ("TWELVE_DATA_CLOUD" if market == "OPEN" else ("TWELVE_DATA" if fallback_twelve else market))),
+                "feed_source": (("IQ_OPTION_OPEN" if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "FORCE") else ("TWELVE_DATA_CLOUD" if market == "OPEN" else ("TWELVE_DATA" if fallback_twelve else market))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
@@ -8011,7 +8175,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     except Exception as exc:
         detail = str(getattr(exc, "detail", None) or exc or "").replace("\n", " ").strip()
         low = detail.lower()
-        if market == "OPEN":
+        if engine in ("EA", "FORCE"):
+            source_status = "IQ OPTION • FONTE EM ESPERA"
+        elif market == "OPEN":
             if "api_key" in low or "não configurada" in low:
                 source_status = "TWELVE DATA • CHAVE NÃO CONFIGURADA"
             elif "429" in low or "limite" in low or "credit" in low:
@@ -8034,7 +8200,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": "TWELVE_DATA_CLOUD" if market == "OPEN" else market,
+            "feed_source": (("IQ_OPTION_OPEN" if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "FORCE") else ("TWELVE_DATA_CLOUD" if market == "OPEN" else market)),
             "feed_error": detail[:180],
         }
 
@@ -8405,7 +8571,7 @@ async def result(
     market = (market or "OPEN").upper()
     direction = (direction or "CALL").upper()
     engine = str(engine or "").upper()
-    ea_iq_result = engine == "EA"
+    ea_iq_result = engine in ("EA", "FORCE")
 
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
@@ -8440,7 +8606,7 @@ async def result(
             "next_check": iso(expiry_dt),
         }
 
-    # A EA Autônoma é apurada na MESMA fonte usada para analisar: IQ Option.
+    # Os EAs nativos são apurados na MESMA fonte usada para analisar: IQ Option.
     # Os outros motores preservam a apuração existente.
     cs = (
         []
@@ -8931,6 +9097,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="eaPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
+  <div class="robot-mode-card" id="forceModeCard">
+    <img src="__MEGA_IMAGE__" alt="EA Força do Movimento">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">💥 EA FORÇA DO MOVIMENTO</div>
+      <div class="robot-mode-desc" id="forceModeDesc">Configuração protegida • leitura de força do movimento • candles fechados • sem Gale.</div>
+    </div>
+    <button id="forcePowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
   <div class="tabs">
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
     <button class="tabbtn" id="tabChart">📈 Gráfico</button>
@@ -9353,19 +9528,24 @@ const aiPowerBtn=document.getElementById('aiPowerBtn');
 const aiModeDesc=document.getElementById('aiModeDesc');
 const eaPowerBtn=document.getElementById('eaPowerBtn');
 const eaModeDesc=document.getElementById('eaModeDesc');
+const forcePowerBtn=document.getElementById('forcePowerBtn');
+const forceModeDesc=document.getElementById('forceModeDesc');
 const voiceBtn=document.getElementById('voiceBtn');
-let robotEnabled=true; // Robô principal
-let aiEnabled=false;   // Inteligência Artificial pura, sem indicadores
-let eaEnabled=false;   // EA autônoma com leitura direta da IQ Option
+let robotEnabled=true;
+let aiEnabled=false;
+let eaEnabled=false;
+let forceEnabled=false;
 try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
   aiEnabled=localStorage.getItem('mega_ai_power')==='ONLINE';
   eaEnabled=localStorage.getItem('mega_ea_power')==='ONLINE';
-  // Nunca deixa os motores disputarem o mesmo sinal.
-  if(eaEnabled){ robotEnabled=false; aiEnabled=false; }
+  forceEnabled=localStorage.getItem('mega_force_power')==='ONLINE';
+  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; }
+  else if(eaEnabled){ robotEnabled=false; aiEnabled=false; }
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
+  if(forceEnabled) return 'FORCE';
   if(eaEnabled) return 'EA';
   if(aiEnabled) return 'SMART';
   if(robotEnabled) return 'GRAPH_AI';
@@ -10135,8 +10315,8 @@ function rememberPendingTrade(sig){
 
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
-    // EA Autônoma é WIN/LOSS somente na primeira vela; outros motores preservam G1/G2.
-    direct_only:String(sig.selected_engine||sig.mode||'').toUpperCase()==='EA',
+    // Os EAs de entrada direta são WIN/LOSS somente na primeira vela; outros motores preservam G1/G2.
+    direct_only:['EA','FORCE'].includes(String(sig.selected_engine||sig.mode||'').toUpperCase()),
     market:signalResultMarket(sig),
     requested_market:sig.requested_market || (market&&market.value) || 'OPEN',
     feed_source:sig.feed_source||'',
@@ -11682,6 +11862,12 @@ function applyRobotPowerState(){
     eaPowerBtn.style.color='#fff';
     eaPowerBtn.style.borderColor=eaEnabled?'#16c56b':'#ff5252';
   }
+  if(forcePowerBtn){
+    forcePowerBtn.textContent=forceEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    forcePowerBtn.style.background=forceEnabled?'#0b7a3d':'#7d1d1d';
+    forcePowerBtn.style.color='#fff';
+    forcePowerBtn.style.borderColor=forceEnabled?'#16c56b':'#ff5252';
+  }
 
   if(robotModeDesc) robotModeDesc.textContent=robotEnabled
     ? 'ONLINE: IA Gráfica lendo padrões, H1, Dow H4 e LTA/LTB sem RSI.'
@@ -11692,9 +11878,17 @@ function applyRobotPowerState(){
   if(eaModeDesc) eaModeDesc.textContent=eaEnabled
     ? 'ONLINE: EA Autônoma lendo a IQ Option diretamente • OPEN/OTC • foco em entrada direta.'
     : 'OFFLINE: EA Autônoma pausada.';
+  if(forceModeDesc) forceModeDesc.textContent=forceEnabled
+    ? 'ONLINE: analisando força do movimento com configuração protegida • OPEN/OTC • sem Gale.'
+    : 'OFFLINE: EA Força do Movimento pausado • configuração protegida.';
 
   const engine=selectedRobotEngine();
-  if(engine==='EA'){
+  if(engine==='FORCE'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA FORÇA DO MOVIMENTO ONLINE • CONFIGURAÇÃO PROTEGIDA • FOCO EM WIN DIRETO';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">💥 EA Força do Movimento selecionado • parâmetros não exibidos.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar do EA Força do Movimento ativo • lendo OPEN/OTC na IQ Option</div>';
+    rad();
+  }else if(engine==='EA'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA AUTÔNOMA IQ ONLINE • LENDO A IQ OPTION • FOCO EM WIN DIRETO';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ EA Autônoma IQ selecionada • não depende da aba Gráfico.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar da EA Autônoma IQ ativo • lendo OPEN/OTC na IQ Option</div>';
@@ -11711,7 +11905,7 @@ function applyRobotPowerState(){
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial e EA estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial e EAs estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -11731,68 +11925,76 @@ function resetEngineVisualState(){
 
 async function setRobotPower(enabled){
   robotEnabled=!!enabled;
-  if(robotEnabled){ aiEnabled=false; eaEnabled=false; }
+  if(robotEnabled){ aiEnabled=false; eaEnabled=false; forceEnabled=false; }
   try{
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled){
-    speak(robotEnabled ? 'Robô principal online.' : 'Robô principal offline.');
-  }
+  if(voiceEnabled) speak(robotEnabled ? 'Robô principal online.' : 'Robô principal offline.');
 }
 
 async function setAiPower(enabled){
   aiEnabled=!!enabled;
-  if(aiEnabled){ robotEnabled=false; eaEnabled=false; }
+  if(aiEnabled){ robotEnabled=false; eaEnabled=false; forceEnabled=false; }
   try{
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled){
-    speak(aiEnabled ? 'Inteligência artificial online.' : 'Inteligência artificial offline.');
-  }
+  if(voiceEnabled) speak(aiEnabled ? 'Inteligência artificial online.' : 'Inteligência artificial offline.');
 }
 
 async function setEaPower(enabled){
   eaEnabled=!!enabled;
-  if(eaEnabled){ robotEnabled=false; aiEnabled=false; }
+  if(eaEnabled){ robotEnabled=false; aiEnabled=false; forceEnabled=false; }
   try{
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled){
-    speak(eaEnabled ? 'EA online.' : 'EA offline.');
-  }
+  if(voiceEnabled) speak(eaEnabled ? 'EA online.' : 'EA offline.');
 }
 
+async function setForcePower(enabled){
+  forceEnabled=!!enabled;
+  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; }
+  try{
+    localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(forceEnabled ? 'EA Força do Movimento online.' : 'EA Força do Movimento offline.');
+}
 
-if(robotPowerBtn){
-  robotPowerBtn.onclick=()=>{ setRobotPower(!robotEnabled); };
-}
-if(aiPowerBtn){
-  aiPowerBtn.onclick=()=>{ setAiPower(!aiEnabled); };
-}
-if(eaPowerBtn){
-  eaPowerBtn.onclick=()=>{ setEaPower(!eaEnabled); };
-}
+if(robotPowerBtn) robotPowerBtn.onclick=()=>{ setRobotPower(!robotEnabled); };
+if(aiPowerBtn) aiPowerBtn.onclick=()=>{ setAiPower(!aiEnabled); };
+if(eaPowerBtn) eaPowerBtn.onclick=()=>{ setEaPower(!eaEnabled); };
+if(forcePowerBtn) forcePowerBtn.onclick=()=>{ setForcePower(!forceEnabled); };
 
 async function sig(announce=false){
   if(!appEnabled) return;
@@ -12003,7 +12205,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':'IA GRÁFICA')} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
+    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':'IA GRÁFICA'))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
     await sig(true);
   }finally{
     radarAutoBusy=false;
