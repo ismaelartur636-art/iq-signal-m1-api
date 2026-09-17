@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "2.9"
-PWA_VERSION = "v80"
+APP_VERSION = "3.0"
+PWA_VERSION = "v81"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -92,6 +92,17 @@ LEGACY_AI_ENABLED = False
 LEGACY_INDICATORS_ENABLED = False
 NEW_PRIMARY_INDICATOR_ENABLED = True
 NEW_OTC_INDICATOR_ENABLED = False
+
+# BAROMETER.mq4 convertido para o Robô Principal.
+# Parâmetros originais preservados; o app confirma somente candles fechados.
+BAROMETER_PER_MEAN = 300
+BAROMETER_BARS_CALCULUS = 1440
+BAROMETER_FACTOR = 15.0
+BAROMETER_BARSMIN = 9
+BAROMETER_BARSMAX = 7200
+# Histórico bruto necessário para calcular o BAROMETER e ainda sobrar uma
+# margem de candles recentes para detectar a troca de direção do trail.
+BAROMETER_HISTORY = 1855
 
 INTERVALS = {"1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1h": 3600, "4h": 14400}
 SYMBOLS = [
@@ -447,7 +458,7 @@ def _td_merge_rest_ws(rest_rows, ws_rows, interval: str):
             merged[bucket] = live
             order.append(bucket)
 
-    return [merged[b] for b in sorted(set(order)) if b in merged][-220:]
+    return [merged[b] for b in sorted(set(order)) if b in merged][-2200:]
 
 
 @app.on_event("startup")
@@ -2695,53 +2706,209 @@ def otc_engine(cs, context=None):
     }
 
 
-def primary_rsi_cross_strategy(cs, period=14, timeframe="15min"):
-    """
-    Conversão do indicador rsier1m2.mq4 para o timeframe selecionado no app.
+def barometer_strategy(
+    cs,
+    timeframe="1min",
+    per_mean=BAROMETER_PER_MEAN,
+    bars_calculus=BAROMETER_BARS_CALCULUS,
+    factor=BAROMETER_FACTOR,
+    barsmin=BAROMETER_BARSMIN,
+    barsmax=BAROMETER_BARSMAX,
+):
+    """Conversão do BAROMETER.mq4 para o Robô Principal, sem repaint.
 
-    Regra original preservada:
-      CALL -> RSI anterior <= 30 e RSI atual >= 30
-      PUT  -> RSI anterior >= 70 e RSI atual <= 70
+    A lógica central do indicador original é preservada:
+      • Align: conta, em ``per_mean`` passos, quantas médias progressivas estão
+        acima da média que inclui um candle mais antigo.
+      • LongBandWagon: soma a inclinação dessas médias progressivas.
+      • Trail adaptativo: usa a variação de Align em vários comprimentos e o
+        fator original para detectar mudança de regime.
+      • CALL: o estado do trail troca de venda/neutro para compra.
+      • PUT: o estado do trail troca de compra/neutro para venda.
 
-    RSI 14 roda em M1, M5, M15 ou M30 conforme a seleção do painel.
-    Somente candles fechados entram no cálculo para evitar repaint.
+    Proteção anti-repaint: ``cs`` deve conter somente candles FECHADOS e o
+    gatilho é aceito apenas quando a troca de estado acontece no último candle
+    fechado. A vela em formação nunca participa do cálculo.
     """
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"ROBÔ PRINCIPAL {tf_label}"
-    if len(cs) < period + 2:
+    name = f"BAROMETER {tf_label}"
+    per_mean = int(per_mean)
+    bars_calculus = int(bars_calculus)
+    barsmin = int(barsmin)
+    barsmax = int(barsmax)
+    factor = float(factor)
+
+    min_needed = per_mean + bars_calculus + 4
+    if len(cs) < min_needed:
         return {
             "direction": "NEUTRO", "confidence": 0, "confirmed": False,
             "strategy": name,
-            "reason": f"Aguardando pelo menos {period + 2} candles {tf_label} fechados.",
-            "rsi_period": period, "rsi_timeframe": timeframe,
+            "reason": f"BAROMETER aguardando histórico: {len(cs)}/{min_needed} candles {tf_label} fechados.",
+            "non_repaint": True,
+            "source": "BAROMETER.mq4",
+            "barometer_params": {
+                "perMean": per_mean, "BarsCalculus": bars_calculus,
+                "factor": factor, "barsmin": barsmin, "barsmax": barsmax,
+            },
         }
 
     closes = [float(c["close"]) for c in cs]
-    rsi_before = rsi(closes[:-1], period)
-    rsi_now = rsi(closes, period)
+    total = len(closes)
 
-    if rsi_before is None or rsi_now is None:
+    # Align e LongBandWagon em ordem cronológica (antigo -> recente).
+    align = [None] * total
+    wagon = [None] * total
+    for t in range(per_mean, total):
+        cumulative = 0.0
+        count_up = 0
+        slope_sum = 0.0
+        # Equivale ao loop do MQL4 sobre Close[i+n] / Close[i+n+1], mas
+        # convertido da indexação series (0 = atual) para ordem cronológica.
+        for n in range(per_mean):
+            cumulative += closes[t - n]
+            avg_now = cumulative / float(n + 1)
+            avg_with_older = (cumulative + closes[t - n - 1]) / float(n + 2)
+            if avg_now > avg_with_older:
+                count_up += 1
+            slope_sum += (avg_now - avg_with_older)
+        align[t] = float(count_up)
+        wagon[t] = float(slope_sum)
+
+    # O indicador original só inicia o trail depois de perMean + BarsCalculus.
+    first_t = per_mean + bars_calculus + 1
+    if first_t >= total:
         return {
             "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "strategy": name, "reason": "Dados ainda insuficientes para confirmar entrada.",
-            "rsi_period": period, "rsi_timeframe": timeframe,
+            "strategy": name,
+            "reason": f"BAROMETER ainda formando a janela estatística de {bars_calculus} candles.",
+            "non_repaint": True,
+            "source": "BAROMETER.mq4",
         }
 
+    atr_by_period = {}
+    trail = None
+    situation = 0
+    latest_trigger = None
+    latest_trail = None
+    latest_max_atr = 0.0
+
+    # Diffs de Align válidos; usados para inicializar cada ATR[p] sem incluir
+    # índices não calculados. Depois, cada p segue a atualização recursiva do MQL4.
+    for t in range(first_t, total):
+        current_align = float(align[t])
+        current_tr = abs(current_align - float(align[t - 1]))
+        max_period = min(barsmax, t - per_mean)
+        if max_period < barsmin:
+            continue
+
+        # Prefixo dos TRs do mais recente para trás. Isso inicializa qualquer
+        # período novo em O(max_period) e evita um loop quadrático pesado.
+        tr_prefix = [0.0]
+        acc = 0.0
+        for k in range(t, t - max_period, -1):
+            acc += abs(float(align[k]) - float(align[k - 1]))
+            tr_prefix.append(acc)
+
+        for p in range(barsmin, max_period + 1):
+            old = atr_by_period.get(p)
+            if old is None:
+                atr_by_period[p] = tr_prefix[p] / float(p)
+            else:
+                atr_by_period[p] = (old * float(p - 1) + current_tr) / float(p)
+
+        atr14 = atr_by_period.get(14)
+        if atr14 is None:
+            continue
+
+        max_atr = max(atr_by_period[p] for p in range(barsmin, max_period + 1))
+        latest_max_atr = max_atr
+        buy_trigger = False
+        sell_trigger = False
+
+        if trail is None:
+            trail = current_align - factor * float(atr14)
+            situation = 0
+
+        # SELL SIGNAL - mesma ordem de avaliação do BAROMETER.mq4.
+        if current_align < trail and situation >= 0:
+            trail = current_align + factor * max_atr
+            situation = -1
+            sell_trigger = True
+        if current_align < trail and situation <= 0:
+            candidate = current_align + factor * max_atr
+            trail = min(trail, candidate)
+
+        # BUY SIGNAL - mesma ordem de avaliação do BAROMETER.mq4.
+        if current_align > trail and situation <= 0:
+            trail = current_align - factor * max_atr
+            situation = 1
+            buy_trigger = True
+        if current_align > trail and situation >= 0:
+            candidate = current_align - factor * max_atr
+            trail = max(trail, candidate)
+
+        if t == total - 1:
+            latest_trail = float(trail)
+            if buy_trigger:
+                latest_trigger = "CALL"
+            elif sell_trigger:
+                latest_trigger = "PUT"
+
+    last_t = total - 1
+    current_align = float(align[last_t])
+    current_wagon = float(wagon[last_t])
+    stats_start = max(per_mean, last_t - bars_calculus + 1)
+    stats = [float(x) for x in wagon[stats_start:last_t + 1] if x is not None]
+    mean = sum(stats) / float(len(stats)) if stats else 0.0
+    variance = (sum((x - mean) ** 2 for x in stats) / float(len(stats))) if stats else 0.0
+    sigma = variance ** 0.5
+    zscore = (current_wagon - mean) / sigma if sigma > 1e-15 else 0.0
+
     base = {
-        "strategy": name, "rsi_period": period, "rsi_timeframe": timeframe,
-        "rsi_before": round(float(rsi_before), 2), "rsi_now": round(float(rsi_now), 2),
-        "legacy_disabled": True, "source": "rsier1m2.mq4",
+        "strategy": name,
+        "source": "BAROMETER.mq4",
+        "non_repaint": True,
+        "timeframe": timeframe,
+        "barometer_align": round(current_align, 3),
+        "barometer_trail": round(float(latest_trail if latest_trail is not None else 0.0), 3),
+        "barometer_wagon": round(current_wagon, 8),
+        "barometer_zscore": round(float(zscore), 3),
+        "barometer_atr_max": round(float(latest_max_atr), 6),
+        "barometer_state": "BULL" if situation > 0 else ("BEAR" if situation < 0 else "NEUTRAL"),
+        "barometer_params": {
+            "perMean": per_mean,
+            "BarsCalculus": bars_calculus,
+            "factor": factor,
+            "barsmin": barsmin,
+            "barsmax": barsmax,
+        },
+        "candles_used": total,
     }
 
-    if rsi_now >= 30.0 and rsi_before <= 30.0:
-        return {**base, "direction": "CALL", "confidence": 100, "confirmed": True,
-                "reason": f"Confirmação de compra detectada em {tf_label}."}
-    if rsi_before >= 70.0 and rsi_now <= 70.0:
-        return {**base, "direction": "PUT", "confidence": 100, "confirmed": True,
-                "reason": f"Confirmação de venda detectada em {tf_label}."}
-    return {**base, "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "reason": f"Sem confirmação de entrada agora em {tf_label}."}
+    if latest_trigger in ("CALL", "PUT"):
+        # 'confidence' aqui é força interna do setup para a interface; não é uma
+        # promessa de probabilidade de acerto. O gatilho continua sendo a troca
+        # real do trail no candle fechado.
+        strength = max(0.0, min(abs(float(zscore)), 3.0))
+        confidence = round(84.0 + strength * 4.0, 1)
+        return {
+            **base,
+            "direction": latest_trigger,
+            "confidence": min(confidence, 96.0),
+            "confirmed": True,
+            "reason": (
+                f"BAROMETER confirmou {'compra' if latest_trigger == 'CALL' else 'venda'} em {tf_label} "
+                f"pela troca do trail no último candle fechado. Sinal travado sem repaint."
+            ),
+        }
 
+    return {
+        **base,
+        "direction": "NEUTRO",
+        "confidence": 0,
+        "confirmed": False,
+        "reason": f"BAROMETER {tf_label} sem nova troca de direção no último candle fechado.",
+    }
 
 
 def hidden_indicator_strategy(cs, timeframe="1min"):
@@ -3415,7 +3582,7 @@ async def candles_open(symbol, interval, n=80):
         raise HTTPException(500, "TWELVE_DATA_API_KEY não configurada.")
 
     ensure_td_ws_started()
-    n = max(20, min(int(n), 150))
+    n = max(20, min(int(n), 2000))
     key = f"{symbol}|{interval}"
     now_ts = time.time()
     cached = td_candle_cache.get(key)
@@ -3428,15 +3595,15 @@ async def candles_open(symbol, interval, n=80):
     if ws_rows and _td_ws_is_fresh(symbol):
         if cached:
             merged = _td_merge_rest_ws(cached[1], ws_rows, interval)
-            if len(merged) >= min(n, 20):
+            if len(merged) >= n:
                 td_candle_cache[key] = (time.time(), merged)
                 return merged[-n:]
-        elif len(ws_rows) >= min(n, 20):
+        elif len(ws_rows) >= n:
             merged = _td_merge_rest_ws([], ws_rows, interval)
             td_candle_cache[key] = (time.time(), merged)
             return merged[-n:]
 
-    if cached and now_ts - cached[0] < ttl and len(cached[1]) >= min(n, 20):
+    if cached and now_ts - cached[0] < ttl and len(cached[1]) >= n:
         return cached[1][-n:]
 
     if now_ts < td_backoff_until:
@@ -3449,7 +3616,7 @@ async def candles_open(symbol, interval, n=80):
     async with lock:
         now_ts = time.time()
         cached = td_candle_cache.get(key)
-        if cached and now_ts - cached[0] < ttl and len(cached[1]) >= min(n, 20):
+        if cached and now_ts - cached[0] < ttl and len(cached[1]) >= n:
             return cached[1][-n:]
 
         if now_ts < td_backoff_until:
@@ -5144,15 +5311,17 @@ def neutral_signal(symbol, interval, market, status, reason, *, confidence=0, so
     }
 
 
-async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "RSI", entry_mode: str = "BIRTH"):
+async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "BAROMETER", entry_mode: str = "BIRTH"):
     if symbol not in SYMBOLS or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
 
     market = (market or "OPEN").upper()
-    engine = (engine or "RSI").upper()
+    engine = (engine or "BAROMETER").upper()
+    if engine == "RSI":  # compatibilidade com versões anteriores do painel
+        engine = "BAROMETER"
     entry_mode = normalize_entry_mode(entry_mode)
-    if engine not in ("RSI", "SMART", "EA", "INDICATOR"):
-        engine = "RSI"
+    if engine not in ("BAROMETER", "SMART", "EA", "INDICATOR"):
+        engine = "BAROMETER"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
 
@@ -5175,7 +5344,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         return cache[key][1]
 
     try:
-        raw = await candles(symbol, interval, 150, market, iq_state, request=request)
+        history_n = BAROMETER_HISTORY if engine == "BAROMETER" else 150
+        raw = await candles(symbol, interval, history_n, market, iq_state, request=request)
     except HTTPException as exc:
         status = (
             "TWELVE DATA • LIMITE/ESPERA"
@@ -5220,10 +5390,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     closed = raw[:-1] if len(raw) > 1 else raw
 
     # 33.78.0: dois motores independentes e selecionáveis no painel.
-    # ROBÔ PRINCIPAL preserva o gatilho técnico original.
+    # ROBÔ PRINCIPAL usa o BAROMETER convertido do MQL4, confirmado somente em candle fechado.
     # INTELIGÊNCIA ARTIFICIAL é IA PURA: recebe somente candles OHLCV fechados
-    # e decide CALL, PUT ou NEUTRO sem usar RSI, médias, MACD, Bollinger, ATR
-    # ou qualquer outro indicador/score interno na decisão.
+    # e decide CALL, PUT ou NEUTRO sem usar indicadores técnicos internos
+    # ou scores técnicos do Robô Principal na decisão.
     if ai_only and NEW_PRIMARY_INDICATOR_ENABLED:
         tf_label = {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval)
         if engine == "SMART":
@@ -5237,7 +5407,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_mode = "HIDDEN_INDICATOR_TEST"
         else:
             engine_title = "ROBÔ PRINCIPAL"
-            engine_mode = "PRIMARY_RSI_TEST"
+            engine_mode = "BAROMETER_NON_REPAINT"
 
         if market != "OPEN":
             out = neutral_signal(
@@ -5254,7 +5424,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
-                    else ({"ea_binary": True, "sma_period": 70, "rsi_period": 14, "rsi_high": 80, "rsi_low": 20} if engine == "EA" else ({"hidden": True, "mode": "INDICATOR"} if engine == "INDICATOR" else {"legacy_disabled": True, "rsi_period": 14, "rsi_timeframe": interval}))
+                    else ({"ea_binary": True, "sma_period": 70, "rsi_period": 14, "rsi_high": 80, "rsi_low": 20} if engine == "EA" else ({"hidden": True, "mode": "INDICATOR"} if engine == "INDICATOR" else {"legacy_disabled": True, "indicator": "BAROMETER", "non_repaint": True, "params": {"perMean": BAROMETER_PER_MEAN, "BarsCalculus": BAROMETER_BARS_CALCULUS, "factor": BAROMETER_FACTOR, "barsmin": BAROMETER_BARSMIN, "barsmax": BAROMETER_BARSMAX}}))
                 ),
                 "legacy_ai_disabled": engine != "SMART",
                 "legacy_indicators_disabled": True,
@@ -5266,7 +5436,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = closed[-90:] if len(closed) > 90 else closed
+            engine_closed = (closed[-BAROMETER_HISTORY:] if engine == "BAROMETER" else (closed[-90:] if len(closed) > 90 else closed))
             if engine == "SMART":
                 analysis = await openai_direct_signal(symbol, interval, engine_closed, market)
             elif engine == "EA":
@@ -5274,7 +5444,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "INDICATOR":
                 analysis = hidden_indicator_strategy(engine_closed, interval)
             else:
-                analysis = primary_rsi_cross_strategy(engine_closed, 14, interval)
+                analysis = barometer_strategy(engine_closed, interval)
         except Exception as exc:
             out = neutral_signal(
                 symbol, interval, market,
@@ -5339,7 +5509,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             signal_fingerprint = f"{engine}|{direction_now}|{reference_candle}"
             fingerprint_key = (
                 "pure_ai_fingerprint" if engine == "SMART"
-                else ("ea_fingerprint" if engine == "EA" else ("indicator_fingerprint" if engine == "INDICATOR" else "primary_rsi_fingerprint"))
+                else ("ea_fingerprint" if engine == "EA" else ("indicator_fingerprint" if engine == "INDICATOR" else "barometer_fingerprint"))
             )
             if release_state.get(fingerprint_key) != signal_fingerprint:
                 announce, entry, expiry = entry_window(interval, entry_mode)
@@ -6844,15 +7014,17 @@ async def telegram_send(body: TelegramSignalBody):
 
 
 @app.get("/signal-ai")
-async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "RSI", entry_mode: str = "BIRTH"):
+async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "BAROMETER", entry_mode: str = "BIRTH"):
     requested_market = (market or "OPEN").upper()
-    engine = (engine or "RSI").upper()
+    engine = (engine or "BAROMETER").upper()
+    if engine == "RSI":
+        engine = "BAROMETER"
     entry_mode = normalize_entry_mode(entry_mode)
 
     if symbol not in SYMBOLS or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
-    if engine not in ("RSI", "SMART", "EA", "INDICATOR"):
-        raise HTTPException(400, "Motor inválido. Use RSI, SMART, EA ou INDICATOR.")
+    if engine not in ("BAROMETER", "SMART", "EA", "INDICATOR"):
+        raise HTTPException(400, "Motor inválido. Use BAROMETER, SMART, EA ou INDICATOR.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
     fallback_twelve = requested_market == "IQ_OTC" and not state
@@ -7297,14 +7469,16 @@ async def chart_pre_signal(
         }
 
 @app.get("/radar")
-async def radar(request: Request, interval="1min", market="OPEN", engine: str = "RSI"):
+async def radar(request: Request, interval="1min", market="OPEN", engine: str = "BAROMETER"):
     market = (market or "OPEN").upper()
-    engine = (engine or "RSI").upper()
+    engine = (engine or "BAROMETER").upper()
+    if engine == "RSI":
+        engine = "BAROMETER"
 
     if interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Intervalo ou mercado inválido.")
-    if engine not in ("RSI", "SMART", "EA", "INDICATOR"):
-        raise HTTPException(400, "Motor inválido. Use RSI, SMART, EA ou INDICATOR.")
+    if engine not in ("BAROMETER", "SMART", "EA", "INDICATOR"):
+        raise HTTPException(400, "Motor inválido. Use BAROMETER, SMART, EA ou INDICATOR.")
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if requested_market == "IQ_OTC" else None
@@ -7357,7 +7531,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     cache[idx_key] = (time.time(), (idx + 1) % len(scan_symbols))
 
     try:
-        raw = await candles(sym, interval, 90, market, iq_state, request=request)
+        radar_history_n = BAROMETER_HISTORY if engine == "BAROMETER" else 90
+        raw = await candles(sym, interval, radar_history_n, market, iq_state, request=request)
         if len(raw) >= 25:
             closed = raw[:-1] if len(raw) > 1 else raw
             if market == "OPEN":
@@ -7386,7 +7561,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     engine_label = "INDICADOR"
                     status_text = ("INDICADOR • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else "INDICADOR • MONITORANDO")
                 else:
-                    tech = primary_rsi_cross_strategy(closed, 14, interval)
+                    tech = barometer_strategy(closed, interval)
                     direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
                     engine_label = "ROBÔ PRINCIPAL"
                     status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO")
@@ -8275,7 +8450,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Robô principal">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🤖 ROBÔ PRINCIPAL</div>
-      <div class="robot-mode-desc" id="robotModeDesc">Leitura objetiva do mercado • sinal somente após confirmação no candle fechado.</div>
+      <div class="robot-mode-desc" id="robotModeDesc">BAROMETER • sinal somente no candle fechado • sem repaint.</div>
     </div>
     <button id="robotPowerBtn" type="button" style="font-weight:900">🟢 ONLINE</button>
   </div>
@@ -8753,7 +8928,7 @@ function selectedRobotEngine(){
   if(eaEnabled) return 'EA';
   if(indicatorEnabled) return 'INDICATOR';
   if(aiEnabled) return 'SMART';
-  if(robotEnabled) return 'RSI';
+  if(robotEnabled) return 'BAROMETER';
   return 'OFF';
 }
 const otcNote=document.getElementById('otcNote');
@@ -11052,7 +11227,7 @@ function applyRobotPowerState(){
   }
 
   if(robotModeDesc) robotModeDesc.textContent=robotEnabled
-    ? 'ONLINE: leitura objetiva do mercado com confirmação no fechamento.'
+    ? 'ONLINE: BAROMETER analisando somente candles fechados • sem repaint.'
     : 'OFFLINE: robô principal pausado.';
   if(aiModeDesc) aiModeDesc.textContent=aiEnabled
     ? 'ONLINE: IA pura analisando somente candles e contexto de preço, sem indicadores.'
@@ -11080,10 +11255,10 @@ function applyRobotPowerState(){
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 Inteligência Artificial selecionada.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar IA pura ativo • analisando candles</div>';
     rad();
-  }else if(engine==='RSI'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔ PRINCIPAL ONLINE • MONITORANDO O TIMEFRAME SELECIONADO';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 Robô principal selecionado.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar do robô principal ativo • procurando oportunidades</div>';
+  }else if(engine==='BAROMETER'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔ PRINCIPAL • BAROMETER ONLINE • SEM REPAINT';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 BAROMETER selecionado no Robô Principal.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar BAROMETER ativo • procurando troca confirmada do trail</div>';
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
