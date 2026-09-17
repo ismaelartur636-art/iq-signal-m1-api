@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.3"
-PWA_VERSION = "v81"
+APP_VERSION = "3.4"
+PWA_VERSION = "v82"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -9313,6 +9313,7 @@ let reskey='';
 let moneyFxKey='';
 let moneyFxTimer=null;
 let sigBusy=false;
+let lastTransportVoiceAt=0;
 let chartBusy=false;
 let radBusy=false;
 let otcRadarBusy=false;
@@ -10194,25 +10195,52 @@ function authHeaders(extra={}){
 
 
 async function get(u){
-  const r=await fetch(u,{
-    cache:'no-store',
-    credentials:'include',
-    headers:authHeaders()
-  });
+  // v3.4 — erros de transporte/Render não são mais confundidos com falha da fonte.
+  // GETs importantes recebem até 3 tentativas em 502/503/504 ou falha de rede.
+  let lastErr=null;
+  for(let attempt=0; attempt<3; attempt++){
+    try{
+      const r=await fetch(u,{
+        cache:'no-store',
+        credentials:'include',
+        headers:authHeaders()
+      });
 
-  let j=null;
+      let j=null;
+      let raw='';
+      try{
+        raw=await r.text();
+        j=raw ? JSON.parse(raw) : null;
+      }catch(_){
+        j=null;
+      }
 
-  try{
-    j=await r.json();
-  }catch(_){
-    j=null;
+      if(r.ok){
+        return j;
+      }
+
+      const detail=(j&&j.detail)?j.detail:((j&&j.message)?j.message:('HTTP '+r.status));
+      const err=new Error(String(detail||('HTTP '+r.status)));
+      err.httpStatus=r.status;
+      lastErr=err;
+
+      if([502,503,504].includes(r.status) && attempt<2){
+        await new Promise(resolve=>setTimeout(resolve,900*(attempt+1)));
+        continue;
+      }
+      throw err;
+    }catch(e){
+      lastErr=e;
+      const code=Number(e&&e.httpStatus||0);
+      const retryable=!code || [502,503,504].includes(code);
+      if(retryable && attempt<2){
+        await new Promise(resolve=>setTimeout(resolve,900*(attempt+1)));
+        continue;
+      }
+      throw e;
+    }
   }
-
-  if(!r.ok){
-    throw Error((j&&j.detail)?j.detail:'HTTP '+r.status);
-  }
-
-  return j;
+  throw lastErr||new Error('Falha de comunicação com o servidor.');
 }
 
 async function post(u,data={}){
@@ -11682,14 +11710,28 @@ async function sig(announce=false){
     }
 
   }catch(e){
-    statusBox.textContent='PAINEL ATIVO • FONTE TEMPORARIAMENTE INDISPONÍVEL';
+    const msg=String((e&&e.message)||e||'Falha de comunicação').replace(/\s+/g,' ').slice(0,180);
+    const low=msg.toLowerCase();
+    const isDataSource=low.includes('twelve data') || low.includes('candle') || low.includes('limite da api') || low.includes('credit');
+    const isServer=low.includes('http 502') || low.includes('http 503') || low.includes('http 504') || low.includes('failed to fetch') || low.includes('network');
+
+    statusBox.textContent=(isDataSource
+      ? 'DADOS DE MERCADO EM ESPERA • '+msg
+      : (isServer ? 'SERVIDOR RECONECTANDO • '+msg : 'ERRO DE COMUNICAÇÃO • '+msg));
     direction.textContent='NEUTRO';
     direction.className='big neutral';
     entry.textContent='AGUARDANDO DADOS';
     countdown.textContent='Sem entrada confirmada';
 
-    if(announce&&voiceEnabled){
-      speak('A fonte de dados está temporariamente indisponível. O painel continua monitorando.');
+    // Evita repetir a mesma fala a cada polling de 5 segundos.
+    const nowVoice=Date.now();
+    if(voiceEnabled && nowVoice-lastTransportVoiceAt>45000){
+      lastTransportVoiceAt=nowVoice;
+      if(isDataSource){
+        speak('Os dados de mercado estão em espera. O Mega IA vai tentar novamente automaticamente.');
+      }else{
+        speak('O servidor está reconectando. O Mega IA vai tentar novamente automaticamente.');
+      }
     }
 
   }finally{
@@ -11890,7 +11932,7 @@ async function rad(){
     // continua clicável exatamente como antes.
     await sendRadarOpportunityToRobot(list);
   }catch(e){
-    radar.innerHTML='<div>📡 Radar ativo • fonte temporariamente indisponível</div>';
+    radar.innerHTML='<div>📡 Radar ativo • comunicação temporariamente indisponível</div>';
   }finally{
     radBusy=false;
   }
@@ -11959,7 +12001,7 @@ async function loadPreSignals(){
       }
     }
   }catch(e){
-    if(preSignalStatus) preSignalStatus.textContent='Pré-alerta monitorando • fonte temporariamente indisponível.';
+    if(preSignalStatus) preSignalStatus.textContent='Pré-alerta monitorando • comunicação temporariamente indisponível.';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔔 O robô continuará tentando o pré-alerta automaticamente.</div>';
   }finally{
     preSignalBusy=false;
