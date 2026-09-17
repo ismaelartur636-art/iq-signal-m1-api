@@ -26,7 +26,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.9"
+APP_VERSION = "3.11"
 PWA_VERSION = "v84"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -7549,6 +7549,240 @@ async def telegram_send(body: TelegramSignalBody):
     return await _tg_send(body)
 
 
+
+def _engine_moment_features(rows):
+    """Extrai somente características do preço para estudar qual motor combina melhor AGORA.
+
+    Este estudo NÃO usa resultados anteriores, não abre operação e não representa
+    probabilidade garantida de WIN. Ele mede compatibilidade entre o regime atual
+    do mercado e o tipo de leitura de cada motor.
+    """
+    rows = list(rows or [])
+    if len(rows) < 30:
+        return None
+
+    def f(v, default=0.0):
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    recent = rows[-30:]
+    closes = [f(x.get("close")) for x in recent]
+    opens = [f(x.get("open")) for x in recent]
+    highs = [f(x.get("high")) for x in recent]
+    lows = [f(x.get("low")) for x in recent]
+    volumes = [max(0.0, f(x.get("volume"))) for x in recent]
+
+    ranges = [max(h-l, 1e-12) for h,l in zip(highs,lows)]
+    bodies = [abs(c-o) for o,c in zip(opens,closes)]
+    body_ratios = [min(1.0, b/r) for b,r in zip(bodies,ranges)]
+
+    short = closes[-9:]
+    moves = [short[i]-short[i-1] for i in range(1,len(short))]
+    travel = sum(abs(x) for x in moves)
+    efficiency = abs(short[-1]-short[0]) / max(travel, 1e-12)
+    signs = [1 if x>0 else (-1 if x<0 else 0) for x in moves]
+    nz = [x for x in signs if x]
+    flips = sum(1 for a,b in zip(nz,nz[1:]) if a!=b)
+    flip_ratio = flips / max(len(nz)-1, 1)
+    directional_consistency = abs(sum(nz[-6:])) / max(len(nz[-6:]), 1)
+
+    avg_range = sum(ranges[-21:-1]) / max(len(ranges[-21:-1]),1)
+    range_ratio = ranges[-1] / max(avg_range,1e-12)
+    avg_body_ratio = sum(body_ratios[-6:]) / max(len(body_ratios[-6:]),1)
+    last_body_ratio = body_ratios[-1]
+
+    last_o,last_h,last_l,last_c = opens[-1],highs[-1],lows[-1],closes[-1]
+    last_rng=max(last_h-last_l,1e-12)
+    upper_wick=(last_h-max(last_o,last_c))/last_rng
+    lower_wick=(min(last_o,last_c)-last_l)/last_rng
+    rejection=min(1.0,max(upper_wick,lower_wick)*2.2)
+
+    short_move=closes[-1]-closes[-6]
+    medium_move=closes[-1]-closes[-20]
+    short_dir=1 if short_move>0 else (-1 if short_move<0 else 0)
+    medium_dir=1 if medium_move>0 else (-1 if medium_move<0 else 0)
+    alignment = 1.0 if short_dir and short_dir==medium_dir else (0.45 if short_dir==0 or medium_dir==0 else 0.0)
+
+    hi20=max(highs[-20:]); lo20=min(lows[-20:])
+    pos20=(closes[-1]-lo20)/max(hi20-lo20,1e-12)
+    near_edge=min(1.0,abs(pos20-0.5)*2.0)
+
+    nonzero_vol=[v for v in volumes[-21:-1] if v>0]
+    if nonzero_vol and volumes[-1]>0:
+        avg_vol=sum(nonzero_vol)/len(nonzero_vol)
+        volume_expansion=min(1.0,volumes[-1]/max(avg_vol,1e-12)/1.5)
+    else:
+        volume_expansion=0.5
+
+    choppy = flip_ratio >= 0.62 and efficiency <= 0.38
+    impulse = last_body_ratio >= 0.58 and range_ratio >= 1.12
+    trending = efficiency >= 0.52 and directional_consistency >= 0.55 and alignment >= 0.75
+
+    if choppy:
+        regime="LATERAL / RUIDOSO"
+    elif impulse and trending:
+        regime="IMPULSO COM TENDÊNCIA"
+    elif impulse:
+        regime="IMPULSO / EXPANSÃO"
+    elif trending:
+        regime="TENDÊNCIA ORGANIZADA"
+    else:
+        regime="TRANSIÇÃO / MISTO"
+
+    return {
+        "efficiency":clamp(efficiency,0,1),
+        "flip_ratio":clamp(flip_ratio,0,1),
+        "directional_consistency":clamp(directional_consistency,0,1),
+        "range_ratio":max(0.0,range_ratio),
+        "avg_body_ratio":clamp(avg_body_ratio,0,1),
+        "last_body_ratio":clamp(last_body_ratio,0,1),
+        "rejection":clamp(rejection,0,1),
+        "alignment":clamp(alignment,0,1),
+        "near_edge":clamp(near_edge,0,1),
+        "volume_expansion":clamp(volume_expansion,0,1),
+        "choppy":bool(choppy),
+        "impulse":bool(impulse),
+        "trending":bool(trending),
+        "regime":regime,
+    }
+
+
+def _engine_moment_scores(features, market="OPEN", iq_ready=False):
+    if not features:
+        return []
+    f=features
+    clean=1.0-f["flip_ratio"]
+    rr_quality=clamp(f["range_ratio"]/1.35,0,1)
+    not_choppy=0.0 if f["choppy"] else 1.0
+
+    graph = clamp(
+        28 + 18*clean + 16*f["efficiency"] + 13*f["rejection"] +
+        10*f["alignment"] + 8*f["near_edge"] + 7*f["avg_body_ratio"], 0, 100
+    )
+    smart = clamp(
+        36 + 16*not_choppy + 14*clean + 12*f["efficiency"] +
+        10*f["avg_body_ratio"] + 7*f["alignment"] + 5*rr_quality, 0, 100
+    )
+    autonomous = clamp(
+        24 + 24*f["alignment"] + 20*f["efficiency"] +
+        17*f["directional_consistency"] + 9*f["avg_body_ratio"] +
+        8*rr_quality - (14 if f["choppy"] else 0), 0, 100
+    )
+    force = clamp(
+        17 + 30*f["last_body_ratio"] + 24*rr_quality +
+        16*f["directional_consistency"] + 9*f["alignment"] +
+        7*f["volume_expansion"] - 14*f["flip_ratio"], 0, 100
+    )
+
+    ai_ready=bool(GEMINI_KEY or OAI_KEY)
+    defs=[
+        {
+            "key":"GRAPH_AI","name":"IA GRÁFICA","score":graph,
+            "supported":market=="OPEN","operational":market=="OPEN",
+            "reason": "Boa quando a estrutura e o price action estão organizados; perde qualidade em ruído/lateralização."
+        },
+        {
+            "key":"SMART","name":"INTELIGÊNCIA ARTIFICIAL","score":smart,
+            "supported":market=="OPEN","operational":market=="OPEN" and ai_ready,
+            "reason": "Mais flexível em cenários mistos, desde que o preço não esteja excessivamente lateral e a IA externa esteja disponível."
+        },
+        {
+            "key":"EA","name":"EA AUTÔNOMA IQ","score":autonomous,
+            "supported":True,"operational":bool(iq_ready),
+            "reason": "Favorecida por direção consistente e alinhamento do movimento; exige conexão ativa com a IQ Option para operar."
+        },
+        {
+            "key":"FORCE","name":"EA FORÇA DO MOVIMENTO","score":force,
+            "supported":True,"operational":bool(iq_ready),
+            "reason": "Favorecida por vela dominante, expansão de range e continuidade; cai bastante quando o mercado alterna direção."
+        },
+    ]
+    if market!="OPEN":
+        for x in defs:
+            if x["key"] in ("GRAPH_AI","SMART"):
+                x["score"]=0.0
+                x["reason"]="Este motor está reservado ao mercado aberto no app."
+    if not ai_ready:
+        for x in defs:
+            if x["key"]=="SMART":
+                x["operational"]=False
+                x["reason"]="A IA externa não está configurada/disponível no servidor neste momento."
+    for x in defs:
+        x["score"]=round(float(x["score"]),1)
+        if not x["supported"]:
+            x["status"]="NÃO DISPONÍVEL NESTE MERCADO"
+        elif not x["operational"]:
+            x["status"]="INDISPONÍVEL PARA OPERAR AGORA"
+        elif x["score"]>=78:
+            x["status"]="COMPATIBILIDADE ALTA"
+        elif x["score"]>=62:
+            x["status"]="COMPATIBILIDADE BOA"
+        elif x["score"]>=48:
+            x["status"]="COMPATIBILIDADE MODERADA"
+        else:
+            x["status"]="COMPATIBILIDADE BAIXA"
+    return defs
+
+
+@app.get("/engine-study")
+async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1min", market: str="OPEN"):
+    market=(market or "OPEN").upper()
+    if symbol not in SYMBOLS or interval not in INTERVALS or market not in VALID_MARKETS:
+        raise HTTPException(400,"Ativo, intervalo ou mercado inválido.")
+
+    iq_state=_iq_session_state(request, required=False)
+    iq_ready=bool(iq_state and _iq_connected(iq_state))
+
+    if market=="IQ_OTC":
+        if not iq_state:
+            raise HTTPException(401,"Conecte a IQ Option para estudar o mercado OTC.")
+        raw=await iq_ea_candles(iq_state,symbol,interval,150,regular_market=False)
+        source="IQ_OPTION_OTC"
+    else:
+        raw=await candles(symbol,interval,150,"OPEN",None,request=request)
+        source="TWELVE_DATA_CLOUD"
+
+    closed=list(raw[:-1] if len(raw)>1 else raw)
+    features=_engine_moment_features(closed)
+    if not features:
+        raise HTTPException(503,"Ainda não há candles fechados suficientes para o estudo de momento.")
+
+    engines=_engine_moment_scores(features,market=market,iq_ready=iq_ready)
+    candidates=[x for x in engines if x.get("supported") and x.get("operational")]
+    candidates.sort(key=lambda x:float(x.get("score",0)),reverse=True)
+    leader=candidates[0] if candidates else None
+    threshold=58.0
+
+    if leader and float(leader.get("score",0))>=threshold:
+        decision="MOTOR MAIS COMPATÍVEL AGORA"
+        recommendation=leader.get("key")
+        summary=f"{leader.get('name')} apresenta o maior encaixe com o regime atual ({leader.get('score'):.1f}% de compatibilidade)."
+    elif leader:
+        decision="MOMENTO SEM ENCAIXE FORTE"
+        recommendation=None
+        summary=f"Nenhum motor operacional passou do nível mínimo de compatibilidade agora. Maior leitura: {leader.get('name')} {leader.get('score'):.1f}%."
+    else:
+        decision="SEM MOTOR OPERACIONAL"
+        recommendation=None
+        summary="Nenhum motor compatível está operacional neste mercado agora."
+
+    return {
+        "ok":True,
+        "study_type":"CURRENT_MARKET_COMPATIBILITY",
+        "symbol":symbol,"interval":interval,"market":market,
+        "source":source,"candles_used":len(closed),
+        "market_regime":features.get("regime"),
+        "decision":decision,
+        "recommended_engine":recommendation,
+        "summary":summary,
+        "engines":engines,
+        "updated_at":iso(now()),
+        "notice":"Compatibilidade com o momento atual; não é taxa de acerto nem garantia de WIN. Nenhuma operação é aberta por este estudo.",
+    }
+
+
 @app.get("/signal-ai")
 async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH"):
     requested_market = (market or "OPEN").upper()
@@ -8959,7 +9193,26 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .robot-mode-copy{min-width:150px}
 .robot-mode-title{font-weight:900;font-size:13px;letter-spacing:.4px}
 .robot-mode-desc{font-size:11px;color:#9fb2ca;margin-top:3px;max-width:245px}
-#robotPowerBtn,#aiPowerBtn,#eaPowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+#robotPowerBtn,#aiPowerBtn,#eaPowerBtn,#forcePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+
+.daily-engine-board{margin-top:14px;border-color:#1c82c9;background:linear-gradient(180deg,#0b1b2e,#071321);box-shadow:0 0 24px #00aaff22}
+.daily-engine-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
+.daily-engine-head h3{margin:0;font-size:19px}
+.daily-engine-summary{margin-top:5px;color:#a8bad2;font-size:12px;line-height:1.45}
+.daily-engine-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px}
+.daily-engine-item{position:relative;padding:12px;border:1px solid #244b6e;border-radius:15px;background:#091727;min-height:122px;box-sizing:border-box}
+.daily-engine-item.leader{border-color:#ffd84d;box-shadow:0 0 18px #ffd84d2f,inset 0 0 18px #ffd84d12}
+.daily-engine-name{font-size:12px;font-weight:1000;line-height:1.25;min-height:31px}
+.daily-engine-pct{font-size:29px;font-weight:1000;margin-top:8px;color:#55d1ff}
+.daily-engine-item.leader .daily-engine-pct{color:#ffd84d}
+.daily-engine-record{font-size:12px;font-weight:900;margin-top:4px}
+.daily-engine-sample{font-size:10px;color:#8fa4bd;margin-top:4px}
+.daily-engine-badge{display:inline-block;margin-top:7px;padding:4px 7px;border-radius:999px;background:#10263c;border:1px solid #275f8c;font-size:9px;font-weight:1000;letter-spacing:.35px}
+.daily-engine-badge.leader{background:#3b3108;border-color:#a98a15;color:#ffe77c}
+.daily-engine-badge.small{background:#2a1b0b;border-color:#7c5522;color:#ffc977}
+@media(max-width:900px){.daily-engine-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:480px){.daily-engine-grid{grid-template-columns:1fr 1fr;gap:7px}.daily-engine-item{padding:10px;min-height:116px}.daily-engine-pct{font-size:25px}}
+
 .app-power-card{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:14px 0 6px;padding:14px 16px;border:1px solid #227db5;border-radius:18px;background:linear-gradient(180deg,#0b1c30,#081523);box-shadow:0 0 22px #00aaff22}
 .app-power-copy{min-width:0}
 .app-power-title{font-size:14px;font-weight:900;letter-spacing:.5px}
@@ -9167,6 +9420,25 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="card score-card score-result">
         <div class="label">★ RESULTADO</div>
         <div id="result" class="big">--</div>
+      </div>
+    </div>
+
+    <div class="card daily-engine-board" id="momentStudyBoard">
+      <div class="daily-engine-head">
+        <div>
+          <h3>🔎 Estudo antes de operar</h3>
+          <div class="daily-engine-summary" id="momentStudySummary">Analisa o mercado atual sem precisar que nenhum robô tenha operado antes.</div>
+        </div>
+        <div class="label" id="momentStudyMarketLabel">AGORA • --</div>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px">
+        <button id="momentStudyBtn" type="button" style="font-weight:1000;border-color:#19c7ff">🔎 ANALISAR AGORA</button>
+        <span class="label" id="momentStudyRegime">REGIME: --</span>
+      </div>
+      <div class="daily-engine-grid" id="momentStudyGrid" style="margin-top:12px"></div>
+      <div class="label" style="margin-top:10px;line-height:1.45">
+        O percentual abaixo é um <b>índice de compatibilidade com o momento atual</b>, calculado antes das entradas.
+        Não é taxa de acerto, não usa WIN/LOSS anterior e o estudo não abre nenhuma operação.
       </div>
     </div>
   </div>
@@ -9516,6 +9788,7 @@ function syncBroker(value){
 }
 
 const interval=document.getElementById('interval');
+const momentStudyBtn=document.getElementById('momentStudyBtn');
 const appPowerBtn=document.getElementById('appPowerBtn');
 const appPowerDesc=document.getElementById('appPowerDesc');
 let appEnabled=true;
@@ -10085,6 +10358,7 @@ function registerPersistentResult(t,x){
         direction:String(t.direction||'').toUpperCase(),
         market:m,
         result:r,
+        entry_result:entryResult||'',
         confidence:Number(t.confidence||0),
         risk:String(t.risk||''),
         strategy:String(t.strategy||''),
@@ -10136,6 +10410,123 @@ function mergeServerPerformance(p,m){
 }
 
 
+function saoPauloDayKey(value){
+  const d=value instanceof Date ? value : new Date(value);
+  if(!Number.isFinite(d.getTime())) return '';
+  try{
+    const parts=new Intl.DateTimeFormat('en-CA',{
+      timeZone:'America/Sao_Paulo',year:'numeric',month:'2-digit',day:'2-digit'
+    }).formatToParts(d);
+    const get=t=>(parts.find(x=>x.type===t)||{}).value||'';
+    return `${get('year')}-${get('month')}-${get('day')}`;
+  }catch(_){
+    return d.toISOString().slice(0,10);
+  }
+}
+
+function normalizeEngineKey(value){
+  const e=String(value||'').trim().toUpperCase();
+  if(e==='GRAPH_AI' || e==='GRAPH' || e==='ROBOT') return 'GRAPH_AI';
+  if(e==='SMART' || e==='AI' || e==='IA') return 'SMART';
+  if(e==='EA' || e==='EA_AUTONOMOUS_IQ') return 'EA';
+  if(e==='FORCE' || e==='EA_FORCE_MOVEMENT') return 'FORCE';
+  return '';
+}
+
+let momentStudyData=null;
+let momentStudyLoading=false;
+let momentStudyLastKey='';
+let momentStudyUpdatedAt=0;
+
+function momentStudyEngineName(key){
+  const names={
+    GRAPH_AI:'🧠 IA GRÁFICA',
+    SMART:'🤖 INTELIGÊNCIA ARTIFICIAL',
+    EA:'⚡ EA AUTÔNOMA IQ',
+    FORCE:'💥 EA FORÇA DO MOVIMENTO'
+  };
+  return names[String(key||'').toUpperCase()]||String(key||'MOTOR');
+}
+
+function renderMomentStudy(){
+  const grid=document.getElementById('momentStudyGrid');
+  const summary=document.getElementById('momentStudySummary');
+  const marketLabel=document.getElementById('momentStudyMarketLabel');
+  const regime=document.getElementById('momentStudyRegime');
+  if(!grid) return;
+
+  const m=(market&&market.value)||'OPEN';
+  const sym=(S&&S.value)||'EUR/USD';
+  const tf=(interval&&interval.value)||'1min';
+  if(marketLabel) marketLabel.textContent=`AGORA • ${m==='IQ_OTC'?'OTC IQ OPTION':'MERCADO ABERTO'} • ${sym} • ${tf.replace('min','M')}`;
+
+  if(momentStudyLoading){
+    if(summary) summary.textContent='Analisando candles fechados e comparando o encaixe de cada motor...';
+    grid.innerHTML='<div class="daily-engine-item" style="grid-column:1/-1"><div class="daily-engine-name">⏳ ESTUDO EM ANDAMENTO</div><div class="daily-engine-sample">Nenhuma operação será aberta.</div></div>';
+    return;
+  }
+
+  const d=momentStudyData;
+  if(!d || d.symbol!==sym || d.interval!==tf || d.market!==m){
+    if(summary) summary.textContent='Toque em ANALISAR AGORA para estudar qual motor combina melhor com o mercado neste momento.';
+    if(regime) regime.textContent='REGIME: --';
+    grid.innerHTML='<div class="daily-engine-item" style="grid-column:1/-1"><div class="daily-engine-name">SEM ESTUDO ATUAL</div><div class="daily-engine-sample">O estudo não depende de operações anteriores.</div></div>';
+    return;
+  }
+
+  if(summary) summary.textContent=d.summary||'Estudo concluído.';
+  if(regime) regime.textContent='REGIME: '+String(d.market_regime||'--');
+  const leader=String(d.recommended_engine||'').toUpperCase();
+  const engines=Array.isArray(d.engines)?d.engines:[];
+
+  grid.innerHTML=engines.map(e=>{
+    const key=String(e.key||'').toUpperCase();
+    const supported=e.supported!==false;
+    const operational=e.operational!==false;
+    const isLeader=leader && key===leader;
+    const score=(supported?Number(e.score||0):0);
+    let badge=String(e.status||'--');
+    let badgeClass='';
+    if(isLeader){badge='MAIOR ENCAIXE AGORA';badgeClass='leader';}
+    else if(!supported || !operational){badgeClass='small';}
+    return `<div class="daily-engine-item ${isLeader?'leader':''}">
+      <div class="daily-engine-name">${momentStudyEngineName(key)}</div>
+      <div class="daily-engine-pct">${supported?score.toFixed(1)+'%':'--'}</div>
+      <div class="daily-engine-record">COMPATIBILIDADE AGORA</div>
+      <div class="daily-engine-sample">${String(e.reason||'').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+      <span class="daily-engine-badge ${badgeClass}">${badge}</span>
+    </div>`;
+  }).join('');
+}
+
+async function loadMomentStudy(force=false){
+  if(momentStudyLoading) return;
+  const m=(market&&market.value)||'OPEN';
+  const sym=(S&&S.value)||'EUR/USD';
+  const tf=(interval&&interval.value)||'1min';
+  const key=`${m}|${sym}|${tf}`;
+  if(!force && momentStudyLastKey===key && (Date.now()-momentStudyUpdatedAt)<25000){
+    renderMomentStudy();
+    return;
+  }
+
+  momentStudyLoading=true;
+  renderMomentStudy();
+  try{
+    const d=await get('/engine-study?symbol='+encodeURIComponent(sym)+'&interval='+encodeURIComponent(tf)+'&market='+encodeURIComponent(m));
+    momentStudyData=d||null;
+    momentStudyLastKey=key;
+    momentStudyUpdatedAt=Date.now();
+  }catch(e){
+    momentStudyData={symbol:sym,interval:tf,market:m,engines:[],market_regime:'--',summary:String((e&&e.message)||e),recommended_engine:null};
+    momentStudyLastKey=key;
+    momentStudyUpdatedAt=Date.now();
+  }finally{
+    momentStudyLoading=false;
+    renderMomentStudy();
+  }
+}
+
 function paintPersistentResults(){
   const m=activeResultMarket();
   const b=persistentResults[m]||emptyResultBucket();
@@ -10155,6 +10546,7 @@ function paintPersistentResults(){
   if(winG2) winG2.textContent=String(b.win_g2);
   if(lossDirect) lossDirect.textContent=String(b.loss_direct);
   if(lossG2) lossG2.textContent=String(b.loss_g2);
+  renderMomentStudy();
   if(historyTab && historyTab.classList.contains('active')) renderHistory();
 }
 
@@ -11759,7 +12151,24 @@ window.megaConnectIQ=async function(event){
 if(interval){
   interval.addEventListener('change',()=>{
     loadPreSignals();
+    momentStudyData=null;
+    renderMomentStudy();
   });
+}
+if(market){
+  market.addEventListener('change',()=>{
+    momentStudyData=null;
+    renderMomentStudy();
+  });
+}
+if(S){
+  S.addEventListener('change',()=>{
+    momentStudyData=null;
+    renderMomentStudy();
+  });
+}
+if(momentStudyBtn){
+  momentStudyBtn.addEventListener('click',()=>loadMomentStudy(true));
 }
 
 iqLogoutBtn.onclick=async()=>{
@@ -12628,6 +13037,7 @@ marketMode.onchange=async()=>{
   lastSignalVoice='';
   lastChartSignalVoice='';
   chartData=[];
+  paintPersistentResults();
   sig(true);
   rad();
   loadPreSignals();
@@ -12755,6 +13165,8 @@ setInterval(()=>{
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) resultCheck(); },5000);
 setInterval(clk,1000);
 setInterval(()=>{ if(appEnabled) cd(); },250);
+
+setTimeout(()=>{ try{ renderMomentStudy(); loadMomentStudy(false); }catch(_){} },1200);
 </script>
 </body>
 </html>
