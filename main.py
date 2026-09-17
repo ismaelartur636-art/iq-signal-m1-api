@@ -26,7 +26,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "2.6"
+APP_VERSION = "2.9"
 PWA_VERSION = "v80"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -507,6 +507,7 @@ class TelegramSignalBody(BaseModel):
     expiry_time: str | None = None
     market: str = "OPEN"
     risk: str = "--"
+    result: str | None = None
     test: bool = False
 
 
@@ -2798,23 +2799,41 @@ def hidden_indicator_strategy(cs, timeframe="1min"):
 
     bullish = c > o
     bearish = c < o
-    strong = body_ratio >= 0.55 and body >= avg_body * 0.90
-    trend_up = e9 > e21 and c >= e9
-    trend_down = e9 < e21 and c <= e9
 
-    buy_zone = l <= zone_low + tolerance and l <= local_low + (avg_range * 0.05)
-    sell_zone = h >= zone_high - tolerance and h >= local_high - (avg_range * 0.05)
+    # 2.9 — indicador mais ativo sem virar "metralhadora" de sinais.
+    # A vela ainda precisa ter direção/força, mas a exigência foi reduzida para
+    # permitir setups válidos que antes ficavam presos por poucos décimos.
+    strong = body_ratio >= 0.42 and body >= avg_body * 0.70
 
-    # Evita aceitar uma vela enorme causada apenas por pico fora do padrão.
-    healthy_range = candle_range <= avg_range * 2.8
+    # Mantém o alinhamento EMA 9/21, porém aceita fechamento muito próximo da EMA 9.
+    # Isso captura pullbacks curtos em vez de exigir que toda confirmação feche
+    # estritamente acima/abaixo da média rápida.
+    trend_margin = avg_range * 0.12
+    trend_up = e9 > e21 and c >= (e9 - trend_margin)
+    trend_down = e9 < e21 and c <= (e9 + trend_margin)
+
+    # Antes o candle precisava coincidir AO MESMO TEMPO com extremo de 30 candles
+    # e extremo local de 5 candles. Agora uma das duas zonas basta, desde que a
+    # direção, força e tendência também confirmem.
+    zone_tolerance = max(tolerance, avg_range * 0.65)
+    major_buy_zone = l <= zone_low + zone_tolerance
+    major_sell_zone = h >= zone_high - zone_tolerance
+    local_buy_zone = l <= local_low + (avg_range * 0.22)
+    local_sell_zone = h >= local_high - (avg_range * 0.22)
+    buy_zone = major_buy_zone or local_buy_zone
+    sell_zone = major_sell_zone or local_sell_zone
+
+    # Continua bloqueando candles exageradamente grandes/picos anormais.
+    healthy_range = candle_range <= avg_range * 3.2
 
     call_ok = buy_zone and bullish and strong and trend_up and healthy_range
     put_ok = sell_zone and bearish and strong and trend_down and healthy_range
 
     ema_sep = abs(e9 - e21) / max(avg_range, 1e-12)
-    strength_bonus = min(8.0, max(0.0, (body_ratio - 0.55) * 20.0))
+    strength_bonus = min(9.0, max(0.0, (body_ratio - 0.42) * 18.0))
     trend_bonus = min(7.0, ema_sep * 8.0)
-    confidence = min(95.0, 80.0 + strength_bonus + trend_bonus)
+    zone_bonus = 3.0 if (major_buy_zone or major_sell_zone) else 0.0
+    confidence = min(94.0, 76.0 + strength_bonus + trend_bonus + zone_bonus)
 
     if call_ok:
         return {
@@ -6674,8 +6693,27 @@ def _tg_signal_text(body: TelegramSignalBody) -> str:
             "Integração ativa. Os próximos sinais CALL/PUT confirmados poderão ser enviados para este grupo."
         )
     direction = str(body.direction or "NEUTRO").upper()
-    emoji = "🟢" if direction == "CALL" else "🔴" if direction == "PUT" else "⚪"
     market_label = "MERCADO ABERTO" if str(body.market or "OPEN").upper() == "OPEN" else "OTC • IQ OPTION"
+    result_label = str(body.result or "").upper().strip()
+    if result_label.startswith("WIN"):
+        return (
+            f"🏆 MEGA IA • RESULTADO\n"
+            f"✅ {result_label}\n"
+            f"📊 {body.symbol} • {direction}\n"
+            f"🕐 Período: {body.interval}\n"
+            f"⏱ Entrada: {_tg_display_time(body.entry_time)}\n"
+            f"🌐 Mercado: {market_label}"
+        )
+    if result_label.startswith("LOSS"):
+        return (
+            f"📉 MEGA IA • RESULTADO\n"
+            f"❌ {result_label}\n"
+            f"📊 {body.symbol} • {direction}\n"
+            f"🕐 Período: {body.interval}\n"
+            f"⏱ Entrada: {_tg_display_time(body.entry_time)}\n"
+            f"🌐 Mercado: {market_label}"
+        )
+    emoji = "🟢" if direction == "CALL" else "🔴" if direction == "PUT" else "⚪"
     return (
         f"🚨 MEGA IA • SINAL CONFIRMADO\n"
         f"{emoji} {body.symbol} • {direction}\n"
@@ -6720,7 +6758,8 @@ async def _tg_send(body: TelegramSignalBody) -> dict:
             chat_id,
             str(body.symbol),
             str(body.direction).upper(),
-            str(body.entry_time or "")
+            str(body.entry_time or ""),
+            str(body.result or "SIGNAL").upper(),
         ])
         now_ts = time.time()
         for k, ts in list(telegram_sent_cache.items()):
@@ -6794,8 +6833,13 @@ async def telegram_chats():
 @app.post("/telegram-send")
 async def telegram_send(body: TelegramSignalBody):
     direction = str(body.direction or "NEUTRO").upper()
-    if not body.test and direction not in ("CALL", "PUT"):
-        raise HTTPException(400, "Somente sinais CALL ou PUT confirmados podem ser enviados.")
+    result_label = str(body.result or "").upper().strip()
+    if not body.test:
+        if result_label:
+            if result_label not in ("WIN", "WIN G1", "WIN G2", "LOSS G2"):
+                raise HTTPException(400, "Somente resultados finais WIN/WIN G1/WIN G2/LOSS G2 podem ser enviados automaticamente ao Telegram.")
+        elif direction not in ("CALL", "PUT"):
+            raise HTTPException(400, "Somente sinais CALL ou PUT confirmados podem ser enviados.")
     return await _tg_send(body)
 
 
@@ -8786,9 +8830,11 @@ const autoGaleRuns=new Set();
 const TELEGRAM_ENABLED_KEY='mega_telegram_enabled_v1';
 const TELEGRAM_CHAT_ID_KEY='mega_telegram_chat_id_v1';
 const TELEGRAM_LAST_SIGNAL_KEY='mega_telegram_last_signal_v1';
+const TELEGRAM_LAST_WIN_KEY='mega_telegram_last_win_v1';
 let telegramEnabled=false;
 let telegramBusy=false;
 let telegramLastSignalKey='';
+let telegramLastWinKey='';
 let brokerConnected={IQ_OPTION:false};
 const chartInfo=document.getElementById('chartInfo');
 const direction=document.getElementById('direction');
@@ -10423,6 +10469,7 @@ function loadTelegramSettings(){
   try{
     telegramEnabled=localStorage.getItem(TELEGRAM_ENABLED_KEY)==='1';
     telegramLastSignalKey=localStorage.getItem(TELEGRAM_LAST_SIGNAL_KEY)||'';
+    telegramLastWinKey=localStorage.getItem(TELEGRAM_LAST_WIN_KEY)||'';
     if(telegramChatId) telegramChatId.value=localStorage.getItem(TELEGRAM_CHAT_ID_KEY)||'';
   }catch(_){
     telegramEnabled=false;
@@ -10557,6 +10604,36 @@ async function maybeSendTelegramSignal(signal){
     if(telegramSendStatus) telegramSendStatus.textContent='✅ Último sinal enviado ao grupo: '+(signal.symbol||'--')+' '+dir+' • '+ft(signal.entry_time);
   }catch(e){
     if(telegramSendStatus) telegramSendStatus.textContent='❌ Falha no Telegram: '+String(e&&e.message?e.message:e);
+  }
+}
+
+async function maybeSendTelegramResult(trade,outcome){
+  if(!telegramEnabled || !trade || !outcome || telegramBusy) return;
+  const resultLabel=String(outcome.result||'').toUpperCase().trim();
+  if(!['WIN','WIN G1','WIN G2','LOSS G2'].includes(resultLabel)) return;
+  const chat_id=saveTelegramChatId();
+  if(!chat_id) return;
+  const key=[trade.symbol,trade.interval,trade.direction,trade.entry_time,resultLabel].join('|');
+  if(key===telegramLastWinKey) return;
+  try{
+    await sendTelegramPayload({
+      chat_id,
+      symbol:trade.symbol||((S&&S.value)||'--'),
+      interval:trade.interval||((interval&&interval.value)||'1min'),
+      direction:String(trade.direction||'NEUTRO').toUpperCase(),
+      confidence:Number(trade.confidence||0),
+      entry_time:trade.entry_time||null,
+      expiry_time:trade.expiry_time||null,
+      market:trade.requested_market||trade.market||((market&&market.value)||'OPEN'),
+      risk:trade.risk||'--',
+      result:resultLabel,
+      test:false
+    });
+    telegramLastWinKey=key;
+    try{ localStorage.setItem(TELEGRAM_LAST_WIN_KEY,key); }catch(_){ }
+    if(telegramSendStatus) telegramSendStatus.textContent=(resultLabel.startsWith('WIN')?'🏆 ':'❌ ')+'Resultado enviado ao grupo: '+(trade.symbol||'--')+' • '+resultLabel;
+  }catch(e){
+    if(telegramSendStatus) telegramSendStatus.textContent='❌ Falha ao enviar resultado: '+String(e&&e.message?e.message:e);
   }
 }
 
@@ -10984,7 +11061,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: EA analisando SMA 70 + RSI 14 em candles fechados para CALL/PUT.'
     : 'OFFLINE: EA pausado.';
   if(indicatorModeDesc) indicatorModeDesc.textContent=indicatorEnabled
-    ? 'Indicador online • configuração interna oculta • aguardando sinais confirmados.'
+    ? 'Indicador online • modo mais ativo • configuração interna oculta • aguardando confirmação.'
     : 'Indicador offline.';
 
   const engine=selectedRobotEngine();
@@ -11702,6 +11779,11 @@ async function resultCheck(){
 
       if(k!==reskey){
         reskey=k;
+      }
+
+      // Envia o resultado FINAL uma única vez ao grupo Telegram: WIN, WIN G1, WIN G2 ou LOSS G2.
+      if(['WIN','WIN G1','WIN G2','LOSS G2'].includes(String(x.result||'').toUpperCase())){
+        await maybeSendTelegramResult(t,x);
       }
 
       // Atualiza também os dados do servidor após o resultado final.
