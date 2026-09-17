@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.11"
-PWA_VERSION = "v84"
+APP_VERSION = "3.14"
+PWA_VERSION = "v86"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -81,6 +81,20 @@ telegram_sent_cache: Dict[str, float] = {}
 
 TD_URL = "https://api.twelvedata.com/time_series"
 TD_WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
+# MEGA IA 3.14 — trava de ciclo por ativo nas IAs + multifuente/multibroker.
+# Nenhuma destas fontes públicas é usada para fingir OTC da IQ Option.
+BINANCE_KLINES_URLS = [
+    "https://api.binance.com/api/v3/klines",
+    "https://data-api.binance.vision/api/v3/klines",
+]
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+MULTIFEED_ENABLED = os.getenv("MULTIFEED_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
+PUBLIC_FEED_TIMEOUT = float(os.getenv("PUBLIC_FEED_TIMEOUT", "12"))
+PUBLIC_FEED_STALE_MAX_AGE = float(os.getenv("PUBLIC_FEED_STALE_MAX_AGE", "240"))
+PUBLIC_FEED_USER_AGENT = os.getenv(
+    "PUBLIC_FEED_USER_AGENT",
+    "Mozilla/5.0 (compatible; MEGA-IA/3.14; +https://render.com)"
+).strip()
 OAI_URL = "https://api.openai.com/v1/responses"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
@@ -111,6 +125,16 @@ cache: Dict[str, Any] = {}
 # Mantém o mesmo sinal até a expiração e exige um novo setup antes de liberar outro
 # sinal na mesma direção.
 signal_release_state: Dict[str, Any] = {}
+
+# MEGA IA 3.14 — trava por ATIVO para as IAs.
+# Depois que IA Gráfica ou Inteligência Artificial libera uma entrada, o mesmo
+# ativo fica bloqueado para NOVOS CALL/PUT (inclusive se o usuário trocar entre
+# as duas IAs ou mudar o timeframe) até /result fechar a sequência completa:
+# WIN direto, WIN G1, WIN G2 ou LOSS G2. Outros ativos continuam livres.
+AI_ASSET_CYCLE_ENGINES = {"GRAPH_AI", "SMART"}
+ai_asset_cycle_locks: Dict[str, Dict[str, Any]] = {}
+ai_asset_cycle_guard = threading.RLock()
+
 ai_scan_state: Dict[str, Any] = {}
 oai_cache: Dict[str, Any] = {}
 results: Dict[str, Any] = {}
@@ -167,6 +191,25 @@ td_ws_failed = {}
 td_ws_last_tick_at = {}
 td_ws_bars = {}             # "SYMBOL|INTERVAL" -> lista OHLCV em UTC
 td_ws_prev_day_volume = {}  # SYMBOL -> (timestamp, day_volume)
+
+# Cache e telemetria do roteador multifuente OPEN.
+# Chave: SYMBOL|INTERVAL -> (timestamp_da_busca, rows, fonte).
+public_feed_cache: Dict[str, Any] = {}
+public_feed_locks: Dict[str, asyncio.Lock] = {}
+market_feed_status: Dict[str, Dict[str, Any]] = {}
+
+BINANCE_SYMBOLS = {
+    "BTC/USD": "BTCUSDT",
+    "ETH/USD": "ETHUSDT",
+    "LTC/USD": "LTCUSDT",
+}
+YAHOO_SYMBOLS = {
+    "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "JPY=X",
+    "AUD/USD": "AUDUSD=X", "USD/CAD": "CAD=X", "USD/CHF": "CHF=X",
+    "NZD/USD": "NZDUSD=X", "EUR/JPY": "EURJPY=X", "GBP/JPY": "GBPJPY=X",
+    "EUR/GBP": "EURGBP=X", "BTC/USD": "BTC-USD", "ETH/USD": "ETH-USD",
+    "LTC/USD": "LTC-USD",
+}
 
 
 def _td_ws_dt_string(bucket_ts: int) -> str:
@@ -3720,7 +3763,7 @@ def _td_cache_age(symbol: str, interval: str) -> float:
     return min(ages) if ages else 10**9
 
 
-async def candles_open(symbol, interval, n=80):
+async def candles_open_twelve(symbol, interval, n=80):
     global td_last_call_at, td_backoff_until, td_backoff_reason
     if not TD_KEY:
         raise HTTPException(500, "TWELVE_DATA_API_KEY não configurada.")
@@ -3846,6 +3889,299 @@ async def candles_open(symbol, interval, n=80):
         td_backoff_reason = ""
         return out[-n:]
 
+
+
+def _public_cache_ttl(interval: str) -> float:
+    return {
+        "1min": 18.0,
+        "5min": 45.0,
+        "15min": 120.0,
+        "30min": 240.0,
+        "1h": 600.0,
+        "4h": 1200.0,
+    }.get(interval, 30.0)
+
+
+def _feed_source_from_rows(rows) -> str:
+    rows = list(rows or [])
+    if not rows:
+        return "UNKNOWN"
+    row = rows[-1] if isinstance(rows[-1], dict) else {}
+    src = str(row.get("feed_source") or row.get("source") or "UNKNOWN").strip().upper()
+    if src.startswith("TWELVE_DATA_WS"):
+        return "TWELVE_DATA_WS"
+    if src.startswith("TWELVE"):
+        return "TWELVE_DATA"
+    if src.startswith("BINANCE"):
+        return "BINANCE_PUBLIC"
+    if src.startswith("YAHOO"):
+        return "YAHOO_PUBLIC"
+    if "OTC" in src or src.startswith("IQ_OPTION"):
+        return src
+    return src or "UNKNOWN"
+
+
+def _feed_source_label(source: str) -> str:
+    src = str(source or "UNKNOWN").upper()
+    labels = {
+        "TWELVE_DATA": "TWELVE DATA",
+        "TWELVE_DATA_WS": "TWELVE DATA • STREAM",
+        "BINANCE_PUBLIC": "BINANCE PÚBLICA",
+        "YAHOO_PUBLIC": "YAHOO PÚBLICO",
+        "IQ_OPTION_OPEN": "IQ OPTION • ABERTO",
+        "IQ_OPTION_OTC": "IQ OPTION • OTC",
+    }
+    return labels.get(src, src.replace("_", " "))
+
+
+def _tag_feed_rows(rows, source: str, source_symbol: str | None = None):
+    out = []
+    for item in list(rows or []):
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        # Preserva a informação de que o preço chegou pelo WS da Twelve Data.
+        row_source = str(row.get("source") or "").upper()
+        effective = "TWELVE_DATA_WS" if row_source.startswith("TWELVE_DATA_WS") else source
+        row["feed_source"] = effective
+        if source_symbol:
+            row["source_symbol"] = source_symbol
+        out.append(row)
+    return out
+
+
+def _open_rows_age_seconds(rows) -> float:
+    rows = list(rows or [])
+    if not rows:
+        return 10**9
+    try:
+        dt = parse_dt(str(rows[-1].get("datetime") or "")).astimezone(UTC)
+        return max(0.0, (datetime.now(UTC) - dt).total_seconds())
+    except Exception:
+        return 10**9
+
+
+def _open_feed_status_key(symbol: str, interval: str) -> str:
+    return f"{symbol}|{interval}"
+
+
+def _record_open_feed_status(symbol: str, interval: str, source: str, *, errors=None, source_symbol=None, rows=None, fallback=False):
+    market_feed_status[_open_feed_status_key(symbol, interval)] = {
+        "source": source,
+        "label": _feed_source_label(source),
+        "source_symbol": source_symbol,
+        "updated_at": iso(now()),
+        "last_success_ts": time.time(),
+        "last_candle_age_seconds": round(_open_rows_age_seconds(rows), 1) if rows else None,
+        "fallback": bool(fallback),
+        "errors": list(errors or [])[-4:],
+    }
+
+
+def _current_open_feed_info(symbol: str, interval: str) -> Dict[str, Any]:
+    info = dict(market_feed_status.get(_open_feed_status_key(symbol, interval)) or {})
+    if not info:
+        item = public_feed_cache.get(_open_feed_status_key(symbol, interval))
+        if item:
+            source = str(item[2] or "UNKNOWN")
+            info = {
+                "source": source,
+                "label": _feed_source_label(source),
+                "updated_at": iso(now()),
+                "fallback": False,
+            }
+    return info
+
+
+async def _binance_public_candles(symbol: str, interval: str, n: int = 80):
+    pair = BINANCE_SYMBOLS.get(symbol)
+    if not pair:
+        raise RuntimeError("Binance pública não possui mapeamento para este ativo.")
+    interval_map = {
+        "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m",
+        "1h": "1h", "4h": "4h",
+    }
+    b_interval = interval_map.get(interval)
+    if not b_interval:
+        raise RuntimeError("Intervalo não suportado pela Binance pública.")
+    limit = max(30, min(int(n) + 5, 500))
+    last_error = ""
+    for url in BINANCE_KLINES_URLS:
+        try:
+            async with httpx.AsyncClient(timeout=PUBLIC_FEED_TIMEOUT, follow_redirects=True) as client:
+                r = await client.get(url, params={"symbol": pair, "interval": b_interval, "limit": limit})
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list):
+                raise RuntimeError("Resposta inválida da Binance pública.")
+            out = []
+            for x in data:
+                try:
+                    ts = float(x[0]) / 1000.0
+                    out.append({
+                        "datetime": datetime.fromtimestamp(ts, tz=UTC).isoformat(),
+                        "open": float(x[1]), "high": float(x[2]), "low": float(x[3]), "close": float(x[4]),
+                        "volume": float(x[5] or 0),
+                        "feed_source": "BINANCE_PUBLIC",
+                        "source_symbol": pair,
+                    })
+                except Exception:
+                    continue
+            if len(out) >= min(20, int(n)):
+                return out[-int(n):]
+            last_error = "Binance pública retornou poucos candles."
+        except Exception as exc:
+            last_error = str(exc)[:180]
+    raise RuntimeError(last_error or "Binance pública indisponível.")
+
+
+async def _yahoo_public_candles(symbol: str, interval: str, n: int = 80):
+    ysymbol = YAHOO_SYMBOLS.get(symbol)
+    if not ysymbol:
+        raise RuntimeError("Yahoo público não possui mapeamento para este ativo.")
+    interval_map = {
+        "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m",
+        "1h": "60m", "4h": "60m",
+    }
+    range_map = {
+        "1min": "1d", "5min": "5d", "15min": "5d", "30min": "5d",
+        "1h": "1mo", "4h": "1mo",
+    }
+    q_interval = interval_map.get(interval)
+    if not q_interval:
+        raise RuntimeError("Intervalo não suportado pelo Yahoo público.")
+    url = YAHOO_CHART_URL.format(symbol=ysymbol)
+    params = {
+        "interval": q_interval,
+        "range": range_map.get(interval, "5d"),
+        "includePrePost": "false",
+        "events": "div,splits",
+    }
+    headers = {"User-Agent": PUBLIC_FEED_USER_AGENT, "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=PUBLIC_FEED_TIMEOUT, follow_redirects=True, headers=headers) as client:
+        r = await client.get(url, params=params)
+    r.raise_for_status()
+    data = r.json()
+    result = (((data or {}).get("chart") or {}).get("result") or [None])[0]
+    if not isinstance(result, dict):
+        err = (((data or {}).get("chart") or {}).get("error") or {})
+        raise RuntimeError(str(err.get("description") or "Yahoo público sem dados.")[:180])
+    timestamps = result.get("timestamp") or []
+    quote_list = (((result.get("indicators") or {}).get("quote") or [None]))
+    quote = quote_list[0] if quote_list and isinstance(quote_list[0], dict) else {}
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    volumes = quote.get("volume") or []
+    out = []
+    for i, ts in enumerate(timestamps):
+        try:
+            o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+            if None in (o, h, l, c):
+                continue
+            v = volumes[i] if i < len(volumes) and volumes[i] is not None else 0
+            out.append({
+                "datetime": datetime.fromtimestamp(float(ts), tz=UTC).isoformat(),
+                "open": float(o), "high": float(h), "low": float(l), "close": float(c),
+                "volume": float(v or 0),
+                "feed_source": "YAHOO_PUBLIC",
+                "source_symbol": ysymbol,
+            })
+        except Exception:
+            continue
+    if interval == "4h":
+        out = _aggregate_closed_candles(out, 14400)
+        out = _tag_feed_rows(out, "YAHOO_PUBLIC", ysymbol)
+    if len(out) < min(20, int(n)):
+        raise RuntimeError("Yahoo público retornou poucos candles.")
+    return out[-int(n):]
+
+
+async def candles_open(symbol, interval, n=80):
+    """Roteador multifuente do Mercado Aberto.
+
+    Cripto prioriza Binance pública. Forex usa Twelve Data quando a chave existe
+    e troca automaticamente para Yahoo público quando a fonte principal falha.
+    O cache multifuente serve apenas como tolerância curta a falhas; a trava de
+    idade do candle continua bloqueando sinais se os dados estiverem velhos.
+    """
+    n = max(20, min(int(n), 150))
+    key = _open_feed_status_key(symbol, interval)
+    now_ts = time.time()
+    cached = public_feed_cache.get(key)
+    ttl = _public_cache_ttl(interval)
+    if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= min(20, n):
+        return list(cached[1])[-n:]
+
+    lock = public_feed_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        cached = public_feed_cache.get(key)
+        now_ts = time.time()
+        if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= min(20, n):
+            return list(cached[1])[-n:]
+
+        providers = []
+        if symbol in BINANCE_SYMBOLS:
+            providers.append(("BINANCE_PUBLIC", _binance_public_candles))
+            if TD_KEY:
+                providers.append(("TWELVE_DATA", candles_open_twelve))
+            providers.append(("YAHOO_PUBLIC", _yahoo_public_candles))
+        else:
+            if TD_KEY:
+                providers.append(("TWELVE_DATA", candles_open_twelve))
+            providers.append(("YAHOO_PUBLIC", _yahoo_public_candles))
+
+        # Permite desativar o roteador e manter comportamento legado via env.
+        if not MULTIFEED_ENABLED:
+            if not TD_KEY:
+                raise HTTPException(500, "TWELVE_DATA_API_KEY não configurada e MULTIFEED_ENABLED=0.")
+            providers = [("TWELVE_DATA", candles_open_twelve)]
+
+        errors = []
+        for idx, (source, provider) in enumerate(providers):
+            try:
+                rows = await provider(symbol, interval, n)
+                rows = _tag_feed_rows(rows, source, (BINANCE_SYMBOLS.get(symbol) if source == "BINANCE_PUBLIC" else YAHOO_SYMBOLS.get(symbol) if source == "YAHOO_PUBLIC" else symbol))
+                if len(rows) < min(20, n):
+                    raise RuntimeError("Fonte retornou poucos candles.")
+                # Se uma fonte respondeu apenas com cache antigo, não aceita como
+                # sucesso: tenta a próxima fonte imediatamente. Isso é essencial
+                # para escapar do backoff/limite da Twelve Data sem parar o app.
+                provider_age = _open_rows_age_seconds(rows)
+                provider_fresh_limit = max(150.0, float(INTERVALS.get(interval, 60)) * 2.5)
+                if provider_age > provider_fresh_limit:
+                    raise RuntimeError(f"dados antigos ({int(provider_age)}s)")
+                source_symbol = rows[-1].get("source_symbol") if rows else None
+                effective_source = _feed_source_from_rows(rows)
+                public_feed_cache[key] = (time.time(), list(rows), effective_source)
+                _record_open_feed_status(
+                    symbol, interval, effective_source,
+                    errors=errors, source_symbol=source_symbol, rows=rows,
+                    fallback=(idx > 0),
+                )
+                return rows[-n:]
+            except HTTPException as exc:
+                errors.append(f"{source}: {str(exc.detail)[:150]}")
+            except Exception as exc:
+                errors.append(f"{source}: {str(exc)[:150]}")
+
+        # Cache curto evita tela vazia durante uma queda momentânea. A função de
+        # sinal verifica o horário do último candle antes de liberar qualquer entrada.
+        if cached and now_ts - float(cached[0]) <= PUBLIC_FEED_STALE_MAX_AGE:
+            rows = list(cached[1])[-n:]
+            source = str(cached[2] or _feed_source_from_rows(rows))
+            _record_open_feed_status(symbol, interval, source, errors=errors, rows=rows, fallback=True)
+            market_feed_status[key]["cache_fallback"] = True
+            return rows
+
+        detail = " | ".join(errors[-4:]) or "Nenhuma fonte pública respondeu."
+        market_feed_status[key] = {
+            "source": "UNAVAILABLE", "label": "MULTIFONTE INDISPONÍVEL",
+            "updated_at": iso(now()), "last_success_ts": 0, "fallback": True,
+            "errors": errors[-4:],
+        }
+        raise HTTPException(503, f"Motor multifuente sem candles: {detail[:320]}")
 
 def iq_active_candidates(symbol: str):
     base = symbol.replace("/", "").upper()
@@ -4346,9 +4682,9 @@ async def candles(
     if symbol not in SYMBOLS or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
 
-    # CLOUD MODE 33.71.0: mercado OPEN é 100% independente do login da IQ Option.
-    # Os candles são obtidos pela fonte de mercado configurada no Render (Twelve Data).
-    # A IQ Option fica somente como corretora de execução e não participa da análise OPEN.
+    # MEGA IA 3.13: mercado OPEN é independente do login da IQ Option e usa
+    # o roteador multifuente (Binance/Twelve Data/Yahoo conforme o ativo e disponibilidade).
+    # A IQ Option continua sendo usada diretamente para OTC e pelos EAs que exigem a corretora.
     if market == "OPEN":
         return await candles_open(symbol, interval, n)
 
@@ -5766,6 +6102,120 @@ def neutral_signal(symbol, interval, market, status, reason, *, confidence=0, so
     }
 
 
+def _ai_asset_cycle_key(market: str, symbol: str) -> str:
+    # A trava é por ativo, não por timeframe nem por IA. OPEN e OTC são ciclos
+    # separados porque representam mercados diferentes.
+    return f"{str(market or 'OPEN').upper()}|{str(symbol or '').upper()}"
+
+
+def _ai_asset_cycle_snapshot(market: str, symbol: str):
+    key = _ai_asset_cycle_key(market, symbol)
+    with ai_asset_cycle_guard:
+        item = ai_asset_cycle_locks.get(key)
+        return dict(item) if isinstance(item, dict) else None
+
+
+def _ai_asset_cycle_stage(lock: Dict[str, Any]) -> str:
+    try:
+        expiry_dt = parse_dt(str(lock.get("expiry_time") or ""))
+        step = timedelta(seconds=INTERVALS.get(str(lock.get("interval") or "1min"), 60))
+        current = now()
+        if current < expiry_dt:
+            return "ENTRADA"
+        if current < expiry_dt + step:
+            return "GALE 1"
+        if current < expiry_dt + (step * 2):
+            return "GALE 2"
+        return "APURANDO RESULTADO FINAL"
+    except Exception:
+        return "AGUARDANDO RESULTADO FINAL"
+
+
+def _acquire_ai_asset_cycle_lock(payload: Dict[str, Any], engine: str) -> bool:
+    engine = str(engine or "").upper()
+    if engine not in AI_ASSET_CYCLE_ENGINES or not isinstance(payload, dict):
+        return False
+    direction = str(payload.get("direction") or "").upper()
+    if direction not in ("CALL", "PUT"):
+        return False
+    if not payload.get("entry_time") or not payload.get("expiry_time"):
+        return False
+
+    market = str(payload.get("market") or "OPEN").upper()
+    symbol = str(payload.get("symbol") or "").upper()
+    key = _ai_asset_cycle_key(market, symbol)
+    item = {
+        "market": market,
+        "symbol": symbol,
+        "interval": str(payload.get("interval") or "1min"),
+        "direction": direction,
+        "engine": engine,
+        "entry_time": payload.get("entry_time"),
+        "expiry_time": payload.get("expiry_time"),
+        "strategy": payload.get("strategy"),
+        "locked_at": iso(now()),
+        "waiting_until": "FINAL_RESULT_UP_TO_G2",
+    }
+    with ai_asset_cycle_guard:
+        # Nunca substitui um ciclo ainda pendente por outro sinal.
+        if key in ai_asset_cycle_locks:
+            return False
+        ai_asset_cycle_locks[key] = item
+    return True
+
+
+def _release_ai_asset_cycle_lock(
+    market: str, symbol: str, interval: str, direction: str, expiry_time: str, engine: str = ""
+) -> bool:
+    key = _ai_asset_cycle_key(market, symbol)
+    wanted_expiry = _canonical_time_key(expiry_time)
+    wanted_direction = str(direction or "").upper()
+    wanted_engine = str(engine or "").upper()
+
+    with ai_asset_cycle_guard:
+        item = ai_asset_cycle_locks.get(key)
+        if not isinstance(item, dict):
+            return False
+        if str(item.get("direction") or "").upper() != wanted_direction:
+            return False
+        if _canonical_time_key(item.get("expiry_time")) != wanted_expiry:
+            return False
+        if wanted_engine and wanted_engine in AI_ASSET_CYCLE_ENGINES:
+            # O resultado deve pertencer à IA que abriu o ciclo.
+            if str(item.get("engine") or "").upper() != wanted_engine:
+                return False
+        ai_asset_cycle_locks.pop(key, None)
+        return True
+
+
+def _ai_asset_cycle_block_signal(symbol: str, interval: str, market: str, engine: str):
+    if str(engine or "").upper() not in AI_ASSET_CYCLE_ENGINES:
+        return None
+    lock = _ai_asset_cycle_snapshot(market, symbol)
+    if not lock:
+        return None
+    stage = _ai_asset_cycle_stage(lock)
+    out = neutral_signal(
+        symbol, interval, market,
+        f"ATIVO BLOQUEADO • {stage}",
+        (f"{symbol} já possui uma operação de IA em andamento. "
+         f"Nenhum novo CALL/PUT será liberado neste ativo até sair o resultado final da sequência até Gale 2."),
+        source_state="READY",
+    )
+    out.update({
+        "selected_engine": str(engine or "").upper(),
+        "asset_cycle_locked": True,
+        "asset_cycle_stage": stage,
+        "asset_cycle_origin_engine": lock.get("engine"),
+        "asset_cycle_origin_interval": lock.get("interval"),
+        "asset_cycle_direction": lock.get("direction"),
+        "asset_cycle_entry_time": lock.get("entry_time"),
+        "asset_cycle_expiry_time": lock.get("expiry_time"),
+        "asset_cycle_waiting_until": "FINAL_RESULT_UP_TO_G2",
+    })
+    return out
+
+
 async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH"):
     if symbol not in SYMBOLS or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
@@ -5795,11 +6245,22 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         if active_expiry and now() < active_expiry:
             return active_signal
 
+    # MEGA IA 3.14: depois da expiração da entrada, não libera outro sinal no
+    # mesmo ativo enquanto o resultado da sequência (até G2) estiver pendente.
+    # A trava é compartilhada entre IA Gráfica e Inteligência Artificial.
+    if ai_only and SELECTABLE_ENGINES_ENABLED and engine in AI_ASSET_CYCLE_ENGINES:
+        locked_out = _ai_asset_cycle_block_signal(symbol, interval, market, engine)
+        if locked_out:
+            cache[key] = (time.time(), locked_out)
+            return locked_out
+
     if key in cache and time.time() - cache[key][0] < 1:
         return cache[key][1]
 
     try:
-        if engine in ("EA", "FORCE"):
+        if engine == "EA" or (engine == "FORCE" and market == "IQ_OTC"):
+            # EA Autônoma continua nativa da IQ. O EA Força usa IQ somente no OTC,
+            # porque os candles OTC pertencem à própria corretora.
             engine_label = "EA AUTÔNOMA" if engine == "EA" else "EA FORÇA DO MOVIMENTO"
             engine_strategy = "EA AUTÔNOMA IQ" if engine == "EA" else "EA Força do Movimento"
             engine_mode = "EA_AUTONOMOUS_IQ" if engine == "EA" else "EA_FORCE_MOVEMENT"
@@ -5807,7 +6268,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 out = neutral_signal(
                     symbol, interval, market,
                     f"{engine_label} • IQ OPTION OFFLINE",
-                    f"Conecte a IQ Option na aba Corretora. {engine_label} usa candles da própria IQ Option em Mercado Aberto e OTC.",
+                    (f"Conecte a IQ Option na aba Corretora. {engine_label} usa candles da própria IQ Option."
+                     if engine == "EA" else
+                     "Conecte a IQ Option para usar o EA Força do Movimento no OTC. Em Mercado Aberto ele funciona sem login, pelo motor multifuente."),
                     source_state="WAITING",
                 )
                 out.update({
@@ -5823,25 +6286,31 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 regular_market=(market == "OPEN"),
             )
         else:
+            # Em OPEN, o EA Força do Movimento usa o mesmo roteador multifuente
+            # dos demais motores (Forex/cripto públicos), portanto não depende da IQ.
             raw = await candles(symbol, interval, 150, market, iq_state, request=request)
     except HTTPException as exc:
         status = (
-            ("EA AUTÔNOMA • IQ OPTION EM ESPERA" if engine == "EA" else "EA FORÇA DO MOVIMENTO • IQ OPTION EM ESPERA")
-            if engine in ("EA", "FORCE")
-            else (
-                "TWELVE DATA • LIMITE/ESPERA"
-                if market == "OPEN" and exc.status_code in (429, 503)
-                else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "TWELVE DATA • INDISPONÍVEL")
-            )
+            "EA AUTÔNOMA • IQ OPTION EM ESPERA"
+            if engine == "EA"
+            else ("EA FORÇA DO MOVIMENTO • IQ OPTION EM ESPERA"
+                  if engine == "FORCE" and market == "IQ_OTC"
+                  else (
+                      "MOTOR MULTIFONTE • TENTANDO FALLBACK"
+                      if market == "OPEN" and exc.status_code in (429, 503)
+                      else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL")
+                  ))
         )
         out = neutral_signal(symbol, interval, market, status, exc.detail, source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
     except Exception as exc:
         status = (
-            ("EA AUTÔNOMA • IQ OPTION RECONECTANDO" if engine == "EA" else "EA FORÇA DO MOVIMENTO • IQ OPTION RECONECTANDO")
-            if engine in ("EA", "FORCE")
-            else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "TWELVE DATA • INDISPONÍVEL")
+            "EA AUTÔNOMA • IQ OPTION RECONECTANDO"
+            if engine == "EA"
+            else ("EA FORÇA DO MOVIMENTO • IQ OPTION RECONECTANDO"
+                  if engine == "FORCE" and market == "IQ_OTC"
+                  else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL"))
         )
         out = neutral_signal(symbol, interval, market, status, str(exc), source_state="DEGRADED")
         cache[key] = (time.time(), out)
@@ -5858,20 +6327,22 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         return out
 
     if market == "OPEN":
-        # Quando os candles vierem da IQ Option, não aplica a trava de idade da Twelve Data.
-        using_iq_feed = bool(raw and isinstance(raw[-1], dict) and raw[-1].get("source"))
-        if not using_iq_feed:
-            age = _td_cache_age(symbol, interval)
-            safe_age = max(75.0, INTERVALS[interval] * 0.75)
-            if age > safe_age:
-                out = neutral_signal(
-                    symbol, interval, market,
-                    "TWELVE DATA • AGUARDANDO DADOS ATUALIZADOS",
-                    "A Twelve Data está temporariamente limitada ou sem atualização recente. Nenhuma entrada será liberada com candles antigos.",
-                    source_state="WAITING",
-                )
-                cache[key] = (time.time(), out)
-                return out
+        # Trava genérica de frescor: vale para Twelve Data, Binance, Yahoo ou cache.
+        # Nunca considera uma fonte "fresca" apenas porque a requisição respondeu;
+        # valida o horário real do último candle recebido.
+        source_now = _feed_source_from_rows(raw)
+        age = _open_rows_age_seconds(raw)
+        safe_age = max(105.0, INTERVALS[interval] * 1.8)
+        if age > safe_age:
+            out = neutral_signal(
+                symbol, interval, market,
+                f"{_feed_source_label(source_now)} • AGUARDANDO DADOS ATUALIZADOS",
+                f"O último candle desta fonte está antigo ({int(age)}s). Nenhuma entrada será liberada até chegar dado recente.",
+                source_state="WAITING",
+            )
+            out["feed_source"] = source_now
+            cache[key] = (time.time(), out)
+            return out
 
     closed = raw[:-1] if len(raw) > 1 else raw
 
@@ -5926,18 +6397,26 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             if engine == "SMART":
                 analysis = await openai_direct_signal(symbol, interval, engine_closed, market)
             elif engine in ("EA", "FORCE"):
-                regular_iq = market == "OPEN"
-                if interval == "5min":
-                    m5_raw = list(raw)
+                if engine == "FORCE" and market == "OPEN":
+                    # Multibroker OPEN: HTFs vêm do roteador público, sem login da IQ.
+                    if interval == "5min":
+                        m5_raw = list(raw)
+                    else:
+                        m5_raw = await candles(symbol, "5min", 100, "OPEN", None, request=request)
+                    h1_raw = await candles(symbol, "1h", 100, "OPEN", None, request=request)
                 else:
-                    m5_raw = await iq_ea_candles(
-                        iq_state, symbol, "5min", 100,
+                    regular_iq = market == "OPEN"
+                    if interval == "5min":
+                        m5_raw = list(raw)
+                    else:
+                        m5_raw = await iq_ea_candles(
+                            iq_state, symbol, "5min", 100,
+                            regular_market=regular_iq,
+                        )
+                    h1_raw = await iq_ea_candles(
+                        iq_state, symbol, "1h", 100,
                         regular_market=regular_iq,
                     )
-                h1_raw = await iq_ea_candles(
-                    iq_state, symbol, "1h", 100,
-                    regular_market=regular_iq,
-                )
                 m5_closed = m5_raw[:-1] if len(m5_raw) > 1 else m5_raw
                 h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
                 if engine == "FORCE":
@@ -6060,7 +6539,32 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     release_state["last_graph_signal_ts"] = time.time()
                     base["graph_signal_gap_seconds"] = 240
                     base["graph_signal_gap_remaining"] = 0
-                release_state["active_signal"] = dict(base)
+
+                # Só as IAs entram no ciclo com Gale. EAs continuam com sua
+                # regra própria de entrada direta/sem Gale. Fallback local da IA
+                # pura não abre ciclo porque não é uma entrada real liberada.
+                if engine in AI_ASSET_CYCLE_ENGINES and not bool(analysis.get("fallback")):
+                    acquired_cycle = _acquire_ai_asset_cycle_lock(base, engine)
+                    if acquired_cycle:
+                        base["asset_cycle_locked"] = True
+                        base["asset_cycle_waiting_until"] = "FINAL_RESULT_UP_TO_G2"
+                        base["asset_cycle_stage"] = "ENTRADA"
+                    else:
+                        # Uma corrida concorrente pode ter travado o ativo entre
+                        # a análise e a liberação. Nesse caso não deixa escapar
+                        # um segundo CALL/PUT.
+                        existing_cycle = _ai_asset_cycle_snapshot(market, symbol)
+                        if existing_cycle:
+                            base.update(
+                                direction="NEUTRO", entry_time=None, announce_time=None, expiry_time=None,
+                                status=f"ATIVO BLOQUEADO • {_ai_asset_cycle_stage(existing_cycle)}",
+                                reason=(f"{symbol} já possui uma operação de IA aguardando resultado final até Gale 2."),
+                                risk="HIGH",
+                                asset_cycle_locked=True,
+                                asset_cycle_waiting_until="FINAL_RESULT_UP_TO_G2",
+                            )
+
+                release_state["active_signal"] = dict(base) if base.get("direction") in ("CALL", "PUT") else None
             else:
                 base["status"] = f"ONLINE • {engine_title} • SINAL JÁ UTILIZADO"
                 base["reason"] = f"Este sinal {interval} já foi liberado; aguardando uma nova oportunidade."
@@ -7234,7 +7738,18 @@ async def feed_status():
             "backoff_reason": td_backoff_reason,
             "cached_series": len(td_candle_cache),
         },
-        "message": "WebSocket é a fonte em tempo real quando houver assinatura ativa; REST fica como histórico/reserva.",
+        "multi_source": {
+            "enabled": MULTIFEED_ENABLED,
+            "twelve_data_configured": bool(TD_KEY),
+            "binance_public_enabled": True,
+            "yahoo_public_enabled": True,
+            "cached_series": len(public_feed_cache),
+            "active_series": dict(list(market_feed_status.items())[-30:]),
+            "crypto_order": ["BINANCE_PUBLIC", "TWELVE_DATA", "YAHOO_PUBLIC"],
+            "forex_order": (["TWELVE_DATA", "YAHOO_PUBLIC"] if TD_KEY else ["YAHOO_PUBLIC"]),
+            "otc_source": "IQ_OPTION_ONLY",
+        },
+        "message": "Mercado Aberto usa roteador multifuente com fallback automático. OTC real continua usando somente a IQ Option.",
     }
 
 
@@ -7324,6 +7839,8 @@ async def candles_endpoint(
 
         values = await candles(symbol, interval, n, market, state, request=request)
 
+        feed_src = (_feed_source_from_rows(values) if market == "OPEN" else ("IQ_OPTION_OTC" if market == "IQ_OTC" else market))
+        feed_info = _current_open_feed_info(symbol, interval) if market == "OPEN" else {}
         return {
             "ok": True,
             "symbol": symbol,
@@ -7331,15 +7848,23 @@ async def candles_endpoint(
             "market": market,
             "candles": values,
             "status": "OK",
+            "feed_source": feed_src,
+            "feed_label": _feed_source_label(feed_src),
+            "feed_fallback": bool(feed_info.get("fallback")) if market == "OPEN" else False,
+            "source_symbol": (values[-1].get("source_symbol") if values and isinstance(values[-1], dict) else None),
         }
 
     except HTTPException as exc:
         stale = []
 
         if market == "OPEN":
-            item = td_candle_cache.get(f"{symbol}|{interval}")
+            item = public_feed_cache.get(f"{symbol}|{interval}")
             if item:
                 stale = item[1][-n:]
+            else:
+                item = td_candle_cache.get(f"{symbol}|{interval}")
+                if item:
+                    stale = item[1][-n:]
 
         elif market == "IQ_OTC" and state:
             item = state.setdefault("candle_cache", {}).get(f"{symbol}|{interval}")
@@ -7355,6 +7880,8 @@ async def candles_endpoint(
             "status": "TEMPORARIAMENTE INDISPONÍVEL",
             "message": str(exc.detail)[:220],
             "stale": bool(stale),
+            "feed_source": _feed_source_from_rows(stale) if stale else "UNAVAILABLE",
+            "feed_label": _feed_source_label(_feed_source_from_rows(stale)) if stale else "MULTIFONTE INDISPONÍVEL",
         }
 
     except Exception as exc:
@@ -7695,8 +8222,10 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
         },
         {
             "key":"FORCE","name":"EA FORÇA DO MOVIMENTO","score":force,
-            "supported":True,"operational":bool(iq_ready),
-            "reason": "Favorecida por vela dominante, expansão de range e continuidade; cai bastante quando o mercado alterna direção."
+            "supported":True,"operational":bool(market=="OPEN" or iq_ready),
+            "reason": ("Favorecida por vela dominante, expansão de range e continuidade; em OPEN usa o motor multifuente e pode ser usada em qualquer corretora Forex."
+                       if market=="OPEN" else
+                       "Favorecida por vela dominante, expansão de range e continuidade; no OTC exige conexão ativa com a IQ Option."),
         },
     ]
     if market!="OPEN":
@@ -7742,7 +8271,7 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
         source="IQ_OPTION_OTC"
     else:
         raw=await candles(symbol,interval,150,"OPEN",None,request=request)
-        source="TWELVE_DATA_CLOUD"
+        source=_feed_source_from_rows(raw)
 
     closed=list(raw[:-1] if len(raw)>1 else raw)
     features=_engine_moment_features(closed)
@@ -7819,24 +8348,47 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             # Sempre informa ao frontend qual mercado foi pedido e qual fonte
             # realmente gerou o sinal. Isto evita fechar um sinal IQ_OTC como OPEN.
             data["requested_market"] = requested_market
-            if engine in ("EA", "FORCE"):
+            if engine == "EA":
                 data["feed_source"] = "IQ_OPTION_OPEN" if requested_market == "OPEN" else "IQ_OPTION_OTC"
+                data["feed_label"] = _feed_source_label(data["feed_source"])
                 data["feed_fallback"] = False
-                engine_msg = "EA Autônoma" if engine == "EA" else "EA Força do Movimento"
                 data["feed_message"] = (
-                    f"{engine_msg} lendo candles diretamente da IQ Option no mercado aberto."
+                    "EA Autônoma lendo candles diretamente da IQ Option no mercado aberto."
                     if requested_market == "OPEN"
-                    else f"{engine_msg} lendo candles OTC diretamente da IQ Option."
+                    else "EA Autônoma lendo candles OTC diretamente da IQ Option."
                 )
-            elif requested_market == "OPEN":
-                data["feed_source"] = "TWELVE_DATA_CLOUD"
+            elif engine == "FORCE" and requested_market == "IQ_OTC":
+                data["feed_source"] = "IQ_OPTION_OTC"
+                data["feed_label"] = _feed_source_label(data["feed_source"])
                 data["feed_fallback"] = False
-                data["feed_message"] = "Mercado aberto analisado na nuvem; login da IQ Option não é necessário."
+                data["feed_message"] = "EA Força do Movimento lendo candles OTC diretamente da IQ Option."
+            elif requested_market == "OPEN":
+                feed_info = _current_open_feed_info(symbol, interval)
+                feed_src = str(feed_info.get("source") or _feed_source_from_rows([]) or "MULTIFEED")
+                if feed_src == "UNKNOWN":
+                    feed_src = "MULTIFEED"
+                data["feed_source"] = feed_src
+                data["feed_label"] = _feed_source_label(feed_src)
+                data["feed_fallback"] = bool(feed_info.get("fallback"))
+                data["feed_message"] = (
+                    f"Mercado aberto analisado por {_feed_source_label(feed_src)} via roteador multifuente; "
+                    "login da IQ Option não é necessário."
+                )
             else:
-                data["feed_source"] = "TWELVE_DATA" if fallback_twelve else effective_market
-                data["feed_fallback"] = bool(fallback_twelve)
                 if fallback_twelve:
-                    data["feed_message"] = "IQ Option desconectada: sinais usando Twelve Data (mercado aberto)."
+                    feed_info = _current_open_feed_info(symbol, interval)
+                    feed_src = str(feed_info.get("source") or "MULTIFEED")
+                    data["feed_source"] = feed_src
+                    data["feed_label"] = _feed_source_label(feed_src)
+                    data["feed_fallback"] = True
+                    data["feed_message"] = (
+                        f"IQ Option desconectada: leitura de Mercado Aberto via {_feed_source_label(feed_src)}. "
+                        "Este fallback não representa o gráfico OTC da IQ Option."
+                    )
+                else:
+                    data["feed_source"] = effective_market
+                    data["feed_label"] = _feed_source_label(effective_market)
+                    data["feed_fallback"] = False
         _remember_accounting_signal(request, data)
         return data
     except Exception as exc:
@@ -8039,6 +8591,8 @@ async def pre_signals(
         )
     )
 
+    feed_probe_symbol = symbol or (batch[0] if batch else SYMBOLS[0])
+    feed_src = ((_current_open_feed_info(feed_probe_symbol, interval).get("source") or "MULTIFEED") if market == "OPEN" else market)
     return {
         "ok": True,
         "message": (
@@ -8047,7 +8601,7 @@ async def pre_signals(
         ),
         "items": items[:limit],
         "seconds_to_entry": seconds_to_entry,
-        "feed_source": "TWELVE_DATA" if fallback_twelve else market,
+        "feed_source": feed_src,
         "feed_fallback": fallback_twelve,
         "requested_market": requested_market,
     }
@@ -8076,8 +8630,8 @@ async def chart_pre_signal(
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
 
     requested_market = market
-    iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or engine == "EA") else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine != "EA"
+    iq_state = _iq_session_state(request, required=False) if requested_market == "IQ_OTC" else None
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state
     if fallback_twelve:
         market = "OPEN"
 
@@ -8229,7 +8783,7 @@ async def chart_pre_signal(
             "cooldown_remaining": CHART_SIGNAL_COOLDOWN_SECONDS,
             "confirmation_count": CHART_SIGNAL_CONFIRM_READS,
             "confirmation_required": CHART_SIGNAL_CONFIRM_READS,
-            "feed_source": "TWELVE_DATA" if fallback_twelve else market,
+            "feed_source": (_feed_source_from_rows(raw) if market == "OPEN" else market),
             "feed_fallback": fallback_twelve,
             "requested_market": requested_market,
         }
@@ -8264,7 +8818,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA ou FORCE.")
 
     requested_market = market
-    iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or engine in ("EA", "FORCE")) else None
+    iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or engine == "EA") else None
     fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE")
     if fallback_twelve:
         market = "OPEN"
@@ -8306,7 +8860,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 if base in ws_active:
                     row["status"] = "TWELVE DATA • STREAM ATIVO • aguardando varredura"
                 else:
-                    row["status"] = "TWELVE DATA • FILA AUTOMÁTICA • aguardando varredura"
+                    row["status"] = "MOTOR MULTIFONTE • FILA AUTOMÁTICA • aguardando varredura"
 
     idx_key = f"RADAR_INDEX|{market}|{interval}|{engine}"
     idx = int(cache.get(idx_key, (0, 0))[1] or 0) % len(scan_symbols)
@@ -8314,9 +8868,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     cache[idx_key] = (time.time(), (idx + 1) % len(scan_symbols))
 
     try:
-        if engine in ("EA", "FORCE"):
+        if engine == "EA" or (engine == "FORCE" and market == "IQ_OTC"):
             if not iq_state:
-                raise RuntimeError("Conecte a IQ Option para usar o EA selecionado.")
+                raise RuntimeError("Conecte a IQ Option para usar este motor no mercado selecionado.")
             raw = await iq_ea_candles(
                 iq_state, sym, interval, 100,
                 regular_market=(market == "OPEN"),
@@ -8326,18 +8880,25 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         if len(raw) >= 25:
             closed = raw[:-1] if len(raw) > 1 else raw
             if engine in ("EA", "FORCE"):
-                regular_iq = market == "OPEN"
-                if interval == "5min":
-                    m5_raw = list(raw)
+                if engine == "FORCE" and market == "OPEN":
+                    if interval == "5min":
+                        m5_raw = list(raw)
+                    else:
+                        m5_raw = await candles(sym, "5min", 90, "OPEN", None, request=request)
+                    h1_raw = await candles(sym, "1h", 80, "OPEN", None, request=request)
                 else:
-                    m5_raw = await iq_ea_candles(
-                        iq_state, sym, "5min", 90,
+                    regular_iq = market == "OPEN"
+                    if interval == "5min":
+                        m5_raw = list(raw)
+                    else:
+                        m5_raw = await iq_ea_candles(
+                            iq_state, sym, "5min", 90,
+                            regular_market=regular_iq,
+                        )
+                    h1_raw = await iq_ea_candles(
+                        iq_state, sym, "1h", 80,
                         regular_market=regular_iq,
                     )
-                h1_raw = await iq_ea_candles(
-                    iq_state, sym, "1h", 80,
-                    regular_market=regular_iq,
-                )
                 m5_closed = m5_raw[:-1] if len(m5_raw) > 1 else m5_raw
                 h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
                 if engine == "FORCE":
@@ -8386,12 +8947,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if engine in ("EA", "FORCE")
-                    else (("TWELVE DATA • " + status_text) if market == "OPEN" else status_text)
+                    status_text if (engine == "EA" or (engine == "FORCE" and market == "IQ_OTC"))
+                    else (((_feed_source_label(_feed_source_from_rows(raw)) + " • " + status_text) if market == "OPEN" else status_text))
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": (("IQ_OPTION_OPEN" if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "FORCE") else ("TWELVE_DATA_CLOUD" if market == "OPEN" else ("TWELVE_DATA" if fallback_twelve else market))),
+                "feed_source": (("IQ_OPTION_OPEN" if market == "OPEN" else "IQ_OPTION_OTC") if engine == "EA" else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
@@ -8402,26 +8963,22 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "base_symbol": sym,
                 "direction": "NEUTRO",
                 "confidence": 0,
-                "status": "TWELVE DATA • POUCOS CANDLES" if market == "OPEN" else "POUCOS CANDLES",
+                "status": ((_feed_source_label(_feed_source_from_rows(raw)) + " • POUCOS CANDLES") if market == "OPEN" else "POUCOS CANDLES"),
                 "clickable": False,
                 "updated_at": iso(now()),
             }
     except Exception as exc:
         detail = str(getattr(exc, "detail", None) or exc or "").replace("\n", " ").strip()
         low = detail.lower()
-        if engine in ("EA", "FORCE"):
+        if engine == "EA" or (engine == "FORCE" and market == "IQ_OTC"):
             source_status = "IQ OPTION • FONTE EM ESPERA"
         elif market == "OPEN":
-            if "api_key" in low or "não configurada" in low:
-                source_status = "TWELVE DATA • CHAVE NÃO CONFIGURADA"
-            elif "429" in low or "limite" in low or "credit" in low:
-                source_status = "TWELVE DATA • LIMITE DA API"
-            elif "timeout" in low or "timed out" in low:
-                source_status = "TWELVE DATA • TIMEOUT"
-            elif "nenhum candle" in low:
-                source_status = "TWELVE DATA • SEM CANDLES"
+            if "timeout" in low or "timed out" in low:
+                source_status = "MOTOR MULTIFONTE • TIMEOUT"
+            elif "poucos candles" in low or "nenhum candle" in low:
+                source_status = "MOTOR MULTIFONTE • SEM CANDLES"
             else:
-                source_status = "TWELVE DATA • FONTE EM ESPERA"
+                source_status = "MOTOR MULTIFONTE • TENTANDO FONTES"
         else:
             source_status = "IQ OPTION • FONTE EM ESPERA"
         if detail:
@@ -8434,7 +8991,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (("IQ_OPTION_OPEN" if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "FORCE") else ("TWELVE_DATA_CLOUD" if market == "OPEN" else market)),
+            "feed_source": (("IQ_OPTION_OPEN" if market == "OPEN" else "IQ_OPTION_OTC") if engine == "EA" else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -8693,8 +9250,9 @@ async def reset_performance(request: Request, market="OPEN"):
 
 
 def _cached_open_candles_for_result(symbol: str, interval: str, n: int = 100):
-    """Usa o cache já carregado da Twelve Data sem gastar uma nova chamada."""
-    item = td_candle_cache.get(f"{symbol}|{interval}")
+    """Usa primeiro o cache multifuente OPEN sem gastar uma nova chamada."""
+    key = f"{symbol}|{interval}"
+    item = public_feed_cache.get(key) or td_candle_cache.get(key)
     if not item:
         return []
     try:
@@ -8805,7 +9363,7 @@ async def result(
     market = (market or "OPEN").upper()
     direction = (direction or "CALL").upper()
     engine = str(engine or "").upper()
-    ea_iq_result = engine in ("EA", "FORCE")
+    ea_iq_result = engine == "EA" or (engine == "FORCE" and market == "IQ_OTC")
 
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
@@ -8925,7 +9483,8 @@ async def result(
 
         elif market == "OPEN":
             cache_key = f"{symbol}|{interval}"
-            old_cache = td_candle_cache.pop(cache_key, None)
+            old_public_cache = public_feed_cache.pop(cache_key, None)
+            old_td_cache = td_candle_cache.pop(cache_key, None)
             fresh_ok = False
             try:
                 fresh = await candles(symbol, interval, 140, market, state, request=request)
@@ -8935,8 +9494,11 @@ async def result(
             except Exception:
                 fresh_ok = False
             finally:
-                if not fresh_ok and cache_key not in td_candle_cache and old_cache is not None:
-                    td_candle_cache[cache_key] = old_cache
+                if not fresh_ok:
+                    if cache_key not in public_feed_cache and old_public_cache is not None:
+                        public_feed_cache[cache_key] = old_public_cache
+                    if cache_key not in td_candle_cache and old_td_cache is not None:
+                        td_candle_cache[cache_key] = old_td_cache
 
             found = candle_near(target_dt)
             if found:
@@ -8982,6 +9544,8 @@ async def result(
             "entry_result": entry_result,
             "next_check": iso(next_dt),
             "retry_after": 5,
+            "asset_cycle_locked": bool(_ai_asset_cycle_snapshot(market, symbol)),
+            "asset_cycle_waiting_until": "FINAL_RESULT_UP_TO_G2",
         }
         if g1_result is not None:
             out["g1_result"] = g1_result
@@ -9024,6 +9588,16 @@ async def result(
         if g2_result is not None:
             out["g2_result"] = g2_result
         store[key] = out
+
+        # MEGA IA 3.14: o ativo só volta a aceitar novo CALL/PUT das IAs depois
+        # que esta operação tiver um resultado FINAL. A função valida ativo,
+        # direção e expiry_time para não liberar por engano um ciclo mais novo.
+        cycle_released = _release_ai_asset_cycle_lock(
+            market, symbol, interval, direction, expiry_time, engine
+        )
+        if cycle_released:
+            out["asset_cycle_released"] = True
+            out["asset_cycle_release_reason"] = "FINAL_RESULT"
 
         # A contabilidade automática guarda o resultado DIRETO separadamente.
         # O resultado final com Gale permanece em `results`, evitando misturar
@@ -9281,7 +9855,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • Painel IA</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • Painel IA • trava por ativo</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -9402,6 +9976,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         <div id="status" class="big" style="font-size:18px">MONITORANDO</div>
         <div id="risk">Risco: --</div>
       </div>
+    </div>
+
+    <div class="card" id="dataFeedCard" style="margin-top:10px">
+      <div class="label">🌐 FONTE DE DADOS • AUTOMÁTICA</div>
+      <div id="dataFeedText" style="font-weight:900;margin-top:5px">Aguardando leitura do mercado...</div>
+      <div style="font-size:12px;opacity:.75;margin-top:4px">Mercado Aberto usa fallback automático entre fontes. OTC real permanece na IQ Option.</div>
     </div>
 
     <div class="grid">
@@ -9913,6 +10493,7 @@ const entryModeNote=document.getElementById('entryModeNote');
 const entryScheduleLabel=document.getElementById('entryScheduleLabel');
 const countdown=document.getElementById('countdown');
 const statusBox=document.getElementById('status');
+const dataFeedText=document.getElementById('dataFeedText');
 const risk=document.getElementById('risk');
 const wins=document.getElementById('wins');
 const losses=document.getElementById('losses');
@@ -11606,7 +12187,7 @@ async function loadChart(){
   chartBusy=true;
 
   try{
-    // A IQ só espelha o gráfico no OTC. Em OPEN a fonte permanece Twelve Data.
+    // A IQ só espelha o gráfico no OTC. Em OPEN o roteador multifuente escolhe a fonte disponível.
     const useIqMirror=iqSelected && !openMode && iqConnected;
     const chartMarket=openMode ? 'OPEN' : market.value;
     const mirrorParam=useIqMirror?'&mirror_iq=true':'';
@@ -11649,7 +12230,7 @@ async function loadChart(){
       return;
     }
 
-    let chartSourceLabel='MERCADO ABERTO • TWELVE DATA';
+    let chartSourceLabel='MERCADO ABERTO • '+String(d.feed_label||d.feed_source||'MULTIFONTE').replaceAll('_',' ');
     if(useIqMirror && !openMode) chartSourceLabel='IQ OPTION • OTC';
     else if(!openMode) chartSourceLabel=brokerName()+' • OTC';
 
@@ -12288,14 +12869,14 @@ function applyRobotPowerState(){
     ? 'ONLINE: EA Autônoma lendo a IQ Option diretamente • OPEN/OTC • foco em entrada direta.'
     : 'OFFLINE: EA Autônoma pausada.';
   if(forceModeDesc) forceModeDesc.textContent=forceEnabled
-    ? 'ONLINE: analisando força do movimento com configuração protegida • OPEN/OTC • sem Gale.'
+    ? 'ONLINE: OPEN multifuente para qualquer corretora Forex • OTC pela IQ Option • configuração protegida • sem Gale.'
     : 'OFFLINE: EA Força do Movimento pausado • configuração protegida.';
 
   const engine=selectedRobotEngine();
   if(engine==='FORCE'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA FORÇA DO MOVIMENTO ONLINE • CONFIGURAÇÃO PROTEGIDA • FOCO EM WIN DIRETO';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">💥 EA Força do Movimento selecionado • parâmetros não exibidos.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar do EA Força do Movimento ativo • lendo OPEN/OTC na IQ Option</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar do EA Força do Movimento ativo • OPEN multifuente / OTC pela IQ Option</div>';
     rad();
   }else if(engine==='EA'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA AUTÔNOMA IQ ONLINE • LENDO A IQ OPTION • FOCO EM WIN DIRETO';
@@ -12430,6 +13011,7 @@ async function sig(announce=false){
       countdown.textContent='Sem entrada confirmada';
       statusBox.textContent=cur.status;
       risk.textContent='Risco: --';
+      if(dataFeedText) dataFeedText.textContent='MOTORES OFFLINE • nenhuma análise solicitada';
       return;
     }
     cur=await get(
@@ -12462,6 +13044,11 @@ async function sig(announce=false){
 
     statusBox.textContent=cur.status||'MONITORANDO';
     risk.textContent='Risco: '+(cur.risk||'--');
+    if(dataFeedText){
+      const src=String(cur.feed_label||cur.feed_source||'MULTIFONTE').replaceAll('_',' ');
+      const fb=cur.feed_fallback===true?' • FALLBACK ATIVO':'';
+      dataFeedText.textContent=src+fb;
+    }
 
     rememberPendingTrade(cur);
     if(cur.direction==='CALL' || cur.direction==='PUT'){
@@ -12506,6 +13093,7 @@ async function sig(announce=false){
     direction.className='big neutral';
     entry.textContent='AGUARDANDO DADOS';
     countdown.textContent='Sem entrada confirmada';
+    if(dataFeedText) dataFeedText.textContent='⚠️ Fonte temporariamente indisponível • fallback automático em andamento';
 
     // Evita repetir a mesma fala a cada polling de 5 segundos.
     const nowVoice=Date.now();
