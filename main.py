@@ -26,7 +26,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.2"
+APP_VERSION = "3.3"
 PWA_VERSION = "v81"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -2695,7 +2695,36 @@ def otc_engine(cs, context=None):
     }
 
 
-async def graphic_ai_strategy(symbol, interval, cs, market="OPEN", request=None, iq_state=None):
+def _aggregate_closed_candles(rows, target_seconds=14400):
+    """Agrega candles fechados em blocos maiores sem nova chamada externa.
+
+    Usado pela IA Gráfica para montar H4 a partir do H1 já carregado,
+    reduzindo o consumo de créditos da Twelve Data.
+    """
+    buckets = {}
+    for row in list(rows or []):
+        try:
+            dt = parse_dt(str(row.get("datetime") or "")).astimezone(UTC)
+            bucket = (int(dt.timestamp()) // int(target_seconds)) * int(target_seconds)
+            o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
+            v = float(row.get("volume", 0) or 0)
+        except Exception:
+            continue
+        cur = buckets.get(bucket)
+        if cur is None:
+            buckets[bucket] = {
+                "datetime": datetime.fromtimestamp(bucket, tz=UTC).isoformat(),
+                "open": o, "high": h, "low": l, "close": c, "volume": v,
+            }
+        else:
+            cur["high"] = max(float(cur["high"]), h)
+            cur["low"] = min(float(cur["low"]), l)
+            cur["close"] = c
+            cur["volume"] = float(cur.get("volume", 0) or 0) + v
+    return [buckets[k] for k in sorted(buckets)]
+
+
+async def graphic_ai_strategy(symbol, interval, cs, market="OPEN", request=None, iq_state=None, fetch_htf=True):
     """IA GRÁFICA estrutural para o primeiro motor do painel.
 
     Não usa RSI, médias, MACD, Bollinger ou outro indicador técnico como gatilho.
@@ -2731,17 +2760,25 @@ async def graphic_ai_strategy(symbol, interval, cs, market="OPEN", request=None,
     # 1) Padrões de vela: gatilho independente.
     pattern = _pure_ai_candle_pattern_filter(rows, "NEUTRO")
 
-    # 2) Contexto H1/H4. Falha de um timeframe não derruba o motor inteiro.
+    # 2) Contexto H1/H4 otimizado.
+    # O painel principal carrega somente H1 da Twelve Data e monta H4 localmente.
+    # O radar NÃO abre novas chamadas H1/H4: usa apenas o cache já existente.
+    # Isso evita que a IA Gráfica esgote a fonte de dados ao varrer muitos ativos.
     h1_closed, h4_closed = [], []
+    htf_error = None
     try:
-        h1_raw, h4_raw = await asyncio.gather(
-            candles(symbol, "1h", 100, "OPEN", None, request=request),
-            candles(symbol, "4h", 100, "OPEN", None, request=request),
-        )
+        if fetch_htf:
+            h1_raw = await candles(symbol, "1h", 150, "OPEN", None, request=request)
+        else:
+            cached_h1 = td_candle_cache.get(f"{symbol}|1h")
+            h1_raw = list(cached_h1[1]) if cached_h1 and cached_h1[1] else []
+
         h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
-        h4_closed = h4_raw[:-1] if len(h4_raw) > 1 else h4_raw
-    except Exception:
-        pass
+        h4_all = _aggregate_closed_candles(h1_closed, 4 * 60 * 60)
+        # O último bloco H4 pode ainda estar incompleto; só usamos blocos anteriores.
+        h4_closed = h4_all[:-1] if len(h4_all) > 1 else h4_all
+    except Exception as exc:
+        htf_error = str(getattr(exc, "detail", None) or exc)[:180]
 
     triggers = []
     diagnostics = {
@@ -2750,6 +2787,8 @@ async def graphic_ai_strategy(symbol, interval, cs, market="OPEN", request=None,
         "dow_h4": "NEUTRO",
         "lta": None,
         "ltb": None,
+        "htf_fetch": bool(fetch_htf),
+        "htf_error": htf_error,
     }
 
     if pattern.get("passed") and pattern.get("direction") in ("CALL", "PUT"):
@@ -7746,7 +7785,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     engine_label = "INDICADOR"
                     status_text = ("INDICADOR • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else "INDICADOR • MONITORANDO")
                 else:
-                    tech = await graphic_ai_strategy(sym, interval, closed, market, request=request, iq_state=iq_state)
+                    tech = await graphic_ai_strategy(sym, interval, closed, market, request=request, iq_state=iq_state, fetch_htf=False)
                     direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
                     engine_label = "IA GRÁFICA"
                     status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO")
@@ -12284,12 +12323,12 @@ setInterval(()=>{
 
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) perf(); },5000);
 // Radar automático: OPEN varre oportunidades e OTC lista somente ativos IQ disponíveis.
-// Um ativo é processado por ciclo; 15 s acompanha o limitador REST da Twelve
-// Data e permite completar a fila inteira sem disparar várias requisições de
-// mercado ao mesmo tempo. Símbolos com WebSocket fresco usam o stream/cache.
+// Um ativo é processado por ciclo. Na IA Gráfica o radar usa somente H1/H4 já
+// existentes em cache e nunca abre chamadas extras de timeframe alto. O ciclo de
+// 30 s também reduz o consumo REST em símbolos sem WebSocket fresco.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress) rad();
-},15000);
+},30000);
 // Pré-alerta atualizado a cada 10 s no último minuto antes da próxima abertura; não confirma nem executa a entrada.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress && selectedRobotEngine()!=='OFF') loadPreSignals();
