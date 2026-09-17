@@ -26,7 +26,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.7"
+APP_VERSION = "3.8"
 PWA_VERSION = "v83"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -2915,126 +2915,232 @@ async def graphic_ai_strategy(symbol, interval, cs, market="OPEN", request=None,
 
 
 
-def ea_binary_strategy(cs, timeframe="1min"):
-    """Conversão do CrudeOilScalpEA.mq5 para opções binárias.
+def ea_binary_strategy(cs, timeframe="1min", m5=None, h1=None, market="OPEN"):
+    """EA AUTÔNOMA IQ — leitura seletiva para a próxima vela.
 
-    Parâmetros originais preservados:
-      - SMA 70
-      - RSI 14
-      - Sobrecompra 80 / sobrevenda 20
-      - BUY/SELL por cruzamento da SMA + confirmação de 2 velas
-      - Reversão pelo RSI
+    Não depende da aba Gráfico e não usa Gale para decidir uma entrada.
+    A fonte esperada é a própria IQ Option:
+      - OPEN -> ativo normal da IQ Option;
+      - IQ_OTC -> ativo OTC da IQ Option.
 
-    A versão binária usa SOMENTE candles fechados. BUY vira CALL, SELL vira PUT.
-    SL, TP, lote e breakeven do EA original não participam da decisão binária.
+    O motor usa somente candles FECHADOS e exige contexto suficiente antes de
+    liberar CALL/PUT. A pontuação é um score interno de qualidade, não uma
+    probabilidade garantida de acerto.
     """
-    sma_period = 70
-    rsi_period = 14
-    rsi_high = 80.0
-    rsi_low = 20.0
+    rows = list(cs or [])
+    m5 = list(m5 or [])
+    h1 = list(h1 or [])
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"EA {tf_label}"
+    name = f"EA AUTÔNOMA IQ {tf_label}"
 
-    # Precisamos de SMA 70 também nas velas -3 e -2, além do RSI 14 atual/anterior.
-    if len(cs) < sma_period + 4:
+    if len(rows) < 55:
         return {
             "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "strategy": name,
-            "reason": f"EA online • aguardando pelo menos {sma_period + 4} candles {tf_label} fechados.",
-            "engine": "EA_BINARY",
+            "risk": "HIGH", "strategy": name, "engine": "EA_AUTONOMOUS_IQ",
+            "reason": f"Aguardando histórico suficiente da IQ Option em {tf_label}.",
+            "direct_win_only": True, "gale_signal": False,
         }
 
-    closes = [float(c["close"]) for c in cs]
-    last = cs[-1]      # MQL [1] = última vela fechada
-    prev = cs[-2]      # MQL [2]
-    prev2 = cs[-3]     # MQL [3]
-
-    # SMA correspondente exatamente à vela analisada, sem usar candles futuros.
-    sma_prev2 = sma(closes[:-2], sma_period)
-    sma_prev = sma(closes[:-1], sma_period)
-    rsi_prev = rsi(closes[:-1], rsi_period)
-    rsi_now = rsi(closes, rsi_period)
-
-    if None in (sma_prev2, sma_prev, rsi_prev, rsi_now):
+    if len(m5) < 35 or len(h1) < 25:
         return {
             "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "strategy": name, "reason": "EA online • dados insuficientes para fechar os cálculos.",
-            "engine": "EA_BINARY",
+            "risk": "HIGH", "strategy": name, "engine": "EA_AUTONOMOUS_IQ",
+            "reason": "Aguardando contexto M5/H1 da IQ Option antes de liberar uma entrada.",
+            "direct_win_only": True, "gale_signal": False,
         }
 
-    # Regras BUY/SELL do GetSignal() original.
-    cross_up = float(prev2["close"]) < float(sma_prev2) and float(prev["close"]) >= float(sma_prev)
-    buy_signal = (
-        cross_up
-        and float(prev["close"]) > float(prev["open"])
-        and float(last["high"]) > float(prev["high"])
-        and float(last["close"]) > float(last["open"])
-    )
+    closes = [float(x["close"]) for x in rows]
+    last = rows[-1]
+    prev = rows[-2]
+    price = float(last["close"])
+    o = float(last["open"])
+    h = float(last["high"])
+    l = float(last["low"])
+    rng = max(h - l, 1e-12)
+    body = abs(price - o)
+    body_ratio = body / rng
 
-    cross_down = float(prev2["low"]) > float(sma_prev2) and float(prev["low"]) <= float(sma_prev)
-    sell_signal = (
-        cross_down
-        and float(prev["close"]) < float(prev["open"])
-        and float(last["low"]) < float(prev["low"])
-        and float(last["close"]) < float(last["open"])
-    )
+    ranges = [max(float(x["high"]) - float(x["low"]), 1e-12) for x in rows[-20:]]
+    avg_range = sum(ranges) / max(1, len(ranges))
 
-    # Reversões do RSI do EA original.
-    reversal_put = float(rsi_prev) >= rsi_high and float(rsi_now) < rsi_high
-    reversal_call = (
-        float(rsi_prev) <= rsi_low
-        and float(rsi_now) > rsi_low
-        and float(last["open"]) < float(last["close"])
-    )
+    # Evita candle fraco, doji e explosão anormal.
+    if body_ratio < 0.28:
+        return {
+            "direction": "NEUTRO", "confidence": 35, "confirmed": False,
+            "risk": "HIGH", "strategy": name, "engine": "EA_AUTONOMOUS_IQ",
+            "reason": "Última vela fechada sem força suficiente; entrada direta bloqueada.",
+            "direct_win_only": True, "gale_signal": False,
+        }
+    if rng > avg_range * 2.35:
+        return {
+            "direction": "NEUTRO", "confidence": 38, "confirmed": False,
+            "risk": "HIGH", "strategy": name, "engine": "EA_AUTONOMOUS_IQ",
+            "reason": "Movimento muito esticado/explosivo; EA aguardando normalização.",
+            "direct_win_only": True, "gale_signal": False,
+        }
 
-    call_sources = []
-    put_sources = []
-    if buy_signal:
-        call_sources.append("BUY SMA70 + 2 velas")
-    if reversal_call:
-        call_sources.append("reversão RSI 20")
-    if sell_signal:
-        put_sources.append("SELL SMA70 + 2 velas")
-    if reversal_put:
-        put_sources.append("reversão RSI 80")
+    lateral, lateral_score = sideways_filter(closes)
+    if lateral:
+        return {
+            "direction": "NEUTRO", "confidence": 42, "confirmed": False,
+            "risk": "HIGH", "strategy": name, "engine": "EA_AUTONOMOUS_IQ",
+            "reason": f"Mercado lateral/ruidoso detectado ({lateral_score:.0f}); entrada direta bloqueada.",
+            "direct_win_only": True, "gale_signal": False,
+        }
 
-    base = {
-        "strategy": name,
-        "engine": "EA_BINARY",
-        "non_repaint": True,
-        "sma_period": sma_period,
-        "rsi_period": rsi_period,
-        "rsi_high": rsi_high,
-        "rsi_low": rsi_low,
-        "rsi_before": round(float(rsi_prev), 2),
-        "rsi_now": round(float(rsi_now), 2),
-        "sma_previous": round(float(sma_prev), 8),
-        "source": "CrudeOilScalpEA.mq5",
+    call_score = 0.0
+    put_score = 0.0
+    call_reasons, put_reasons = [], []
+
+    # Tendência curta no timeframe de entrada.
+    e9, e21, e50 = ema(closes, 9), ema(closes, 21), ema(closes, 50)
+    if None not in (e9, e21, e50):
+        if e9 > e21 > e50 and price >= e9:
+            call_score += 23
+            call_reasons.append("tendência curta alinhada")
+        if e9 < e21 < e50 and price <= e9:
+            put_score += 23
+            put_reasons.append("tendência curta alinhada")
+
+    # Contexto M5.
+    m5c = [float(x["close"]) for x in m5]
+    m5e9, m5e21 = ema(m5c, 9), ema(m5c, 21)
+    if m5e9 is not None and m5e21 is not None:
+        if m5e9 > m5e21 and m5c[-1] >= m5e9:
+            call_score += 18
+            call_reasons.append("M5 comprador")
+        elif m5e9 < m5e21 and m5c[-1] <= m5e9:
+            put_score += 18
+            put_reasons.append("M5 vendedor")
+
+    # Contexto H1 por direção + estrutura simples.
+    h1c = [float(x["close"]) for x in h1]
+    h1e9, h1e21 = ema(h1c, 9), ema(h1c, 21)
+    if h1e9 is not None and h1e21 is not None:
+        if h1e9 > h1e21:
+            call_score += 17
+            call_reasons.append("H1 comprador")
+        elif h1e9 < h1e21:
+            put_score += 17
+            put_reasons.append("H1 vendedor")
+
+    # Padrões de vela fechados.
+    pattern = _pure_ai_candle_pattern_filter(rows, "NEUTRO")
+    if pattern.get("passed") and pattern.get("direction") == "CALL":
+        call_score += 22
+        call_reasons.append("padrão comprador")
+    elif pattern.get("passed") and pattern.get("direction") == "PUT":
+        put_score += 22
+        put_reasons.append("padrão vendedor")
+
+    # Rejeição por pavio.
+    wi = wick_info(last)
+    if price > o and float(wi.get("call_wick", 0)) >= 0.32:
+        call_score += 10
+        call_reasons.append("rejeição compradora")
+    if price < o and float(wi.get("put_wick", 0)) >= 0.32:
+        put_score += 10
+        put_reasons.append("rejeição vendedora")
+
+    # Continuidade da vela fechada, sem perseguir candle gigante.
+    if price > o and body_ratio >= 0.52 and rng <= avg_range * 1.75:
+        call_score += 9
+        call_reasons.append("vela de força")
+    elif price < o and body_ratio >= 0.52 and rng <= avg_range * 1.75:
+        put_score += 9
+        put_reasons.append("vela de força")
+
+    # Suporte/resistência H1: favorece reação e bloqueia entrada contra uma zona próxima.
+    levels = _support_resistance_levels(h1, "1h")
+    supports = [float(x["price"]) for x in levels.get("supports", [])]
+    resistances = [float(x["price"]) for x in levels.get("resistances", [])]
+    h1_ranges = [max(float(x["high"]) - float(x["low"]), 1e-12) for x in h1[-20:]]
+    h1_avg_range = sum(h1_ranges) / max(1, len(h1_ranges))
+    zone_radius = max(float(levels.get("tolerance", 0.0) or 0.0) * 1.8,
+                      h1_avg_range * 0.24,
+                      abs(price) * 0.00018)
+    ns = min(supports, key=lambda x: abs(price - x)) if supports else None
+    nr = min(resistances, key=lambda x: abs(price - x)) if resistances else None
+    near_support = ns is not None and abs(price - ns) <= zone_radius
+    near_resistance = nr is not None and abs(price - nr) <= zone_radius
+
+    if near_support and not near_resistance:
+        call_score += 17
+        call_reasons.append("reação em suporte H1")
+        put_score -= 12
+    elif near_resistance and not near_support:
+        put_score += 17
+        put_reasons.append("reação em resistência H1")
+        call_score -= 12
+
+    # Microestrutura: rompimento com fechamento consistente.
+    recent_high = max(float(x["high"]) for x in rows[-8:-1])
+    recent_low = min(float(x["low"]) for x in rows[-8:-1])
+    if price > recent_high and price > o and rng <= avg_range * 1.9:
+        call_score += 11
+        call_reasons.append("rompimento confirmado")
+    if price < recent_low and price < o and rng <= avg_range * 1.9:
+        put_score += 11
+        put_reasons.append("rompimento confirmado")
+
+    call_score = max(0.0, call_score)
+    put_score = max(0.0, put_score)
+
+    # Critério seletivo: exige score forte e diferença clara entre os lados.
+    best_dir = "CALL" if call_score > put_score else "PUT" if put_score > call_score else "NEUTRO"
+    best_score = max(call_score, put_score)
+    margin = abs(call_score - put_score)
+
+    min_score = 78.0 if timeframe != "1min" else 82.0
+    min_margin = 16.0
+
+    diagnostics = {
+        "call_score": round(call_score, 1),
+        "put_score": round(put_score, 1),
+        "min_score": min_score,
+        "min_margin": min_margin,
+        "body_ratio": round(body_ratio, 3),
+        "near_support_h1": near_support,
+        "near_resistance_h1": near_resistance,
+        "market": market,
+        "feed": "IQ_OPTION",
     }
 
-    # O EA de CFD poderia abrir direções opostas no mesmo novo candle em um conflito.
-    # Em binárias isso é bloqueado: nenhuma entrada é liberada se CALL e PUT coincidirem.
-    if call_sources and put_sources:
+    if best_dir == "NEUTRO" or best_score < min_score or margin < min_margin:
         return {
-            **base, "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "reason": "EA detectou condições opostas no mesmo candle; entrada bloqueada para opções binárias.",
-        }
-    if call_sources:
-        return {
-            **base, "direction": "CALL", "confidence": 100, "confirmed": True,
-            "reason": "EA confirmou CALL no candle fechado: " + " + ".join(call_sources) + ".",
-            "risk": "MEDIUM",
-        }
-    if put_sources:
-        return {
-            **base, "direction": "PUT", "confidence": 100, "confirmed": True,
-            "reason": "EA confirmou PUT no candle fechado: " + " + ".join(put_sources) + ".",
-            "risk": "MEDIUM",
+            "direction": "NEUTRO",
+            "confidence": round(min(79.0, best_score), 1),
+            "confirmed": False,
+            "risk": "HIGH",
+            "strategy": name,
+            "engine": "EA_AUTONOMOUS_IQ",
+            "reason": (
+                f"EA autônoma aguardando entrada direta mais limpa. "
+                f"Score CALL {call_score:.0f} x PUT {put_score:.0f}."
+            ),
+            "direct_win_only": True,
+            "gale_signal": False,
+            "diagnostics": diagnostics,
+            "non_repaint": True,
         }
 
+    reasons = call_reasons if best_dir == "CALL" else put_reasons
+    # 'confidence' é força interna do setup, não taxa estatística garantida.
+    confidence = min(95.0, 80.0 + (best_score - min_score) * 0.55 + min(6.0, margin * 0.12))
+    risk = "LOW" if best_score >= min_score + 8 and margin >= 22 else "MEDIUM"
+
     return {
-        **base, "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-        "reason": f"EA online • SMA 70 e RSI 14 monitorando {tf_label}; aguardando confirmação.",
+        "direction": best_dir,
+        "confidence": round(confidence, 1),
+        "confirmed": True,
+        "risk": risk,
+        "strategy": name,
+        "engine": "EA_AUTONOMOUS_IQ",
+        "reason": "Entrada direta selecionada: " + " + ".join(reasons[:4]) + ".",
+        "direct_win_only": True,
+        "gale_signal": False,
+        "diagnostics": diagnostics,
+        "non_repaint": True,
     }
 
 
@@ -4016,6 +4122,66 @@ def iq_candles_blocking(state: Dict[str, Any], symbol: str, interval: str, n: in
     raise RuntimeError(
         "IQ Option sem candles. " + detail[:350]
     )
+
+
+async def iq_ea_candles(
+    state: Dict[str, Any],
+    symbol: str,
+    interval: str,
+    n: int = 120,
+    *,
+    regular_market: bool = True,
+):
+    """Candles da IQ Option usados exclusivamente pela EA autônoma."""
+    if not state:
+        raise HTTPException(401, "EA AUTÔNOMA: conecte a IQ Option na aba Corretora.")
+
+    market_key = "OPEN" if regular_market else "IQ_OTC"
+    cache_key = f"{market_key}|{symbol}|{interval}"
+    ea_cache = state.setdefault("ea_autonomous_candle_cache", {})
+    cached = ea_cache.get(cache_key)
+
+    ttl_by_interval = {
+        "1min": 20.0,
+        "5min": 55.0,
+        "15min": 150.0,
+        "30min": 300.0,
+        "1h": 600.0,
+        "4h": 1200.0,
+    }
+    ttl = float(ttl_by_interval.get(interval, 30.0))
+    now_ts = time.time()
+
+    if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= min(int(n), 20):
+        return list(cached[1])[-int(n):]
+
+    lock = state.get("lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        state["lock"] = lock
+
+    async with lock:
+        cached = ea_cache.get(cache_key)
+        now_ts = time.time()
+        if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= min(int(n), 20):
+            return list(cached[1])[-int(n):]
+
+        data = await asyncio.wait_for(
+            asyncio.to_thread(
+                iq_candles_blocking,
+                state,
+                symbol,
+                interval,
+                max(80, min(int(n), 150)),
+                bool(regular_market),
+            ),
+            timeout=IQ_CANDLE_TIMEOUT + 5,
+        )
+        if not data:
+            raise RuntimeError("IQ Option retornou zero candles para a EA autônoma.")
+
+        ea_cache[cache_key] = (time.time(), list(data))
+        return list(data)[-int(n):]
 
 
 async def candles(
@@ -5487,18 +5653,49 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         return cache[key][1]
 
     try:
-        raw = await candles(symbol, interval, 150, market, iq_state, request=request)
+        if engine == "EA":
+            if not iq_state:
+                out = neutral_signal(
+                    symbol, interval, market,
+                    "EA AUTÔNOMA • IQ OPTION OFFLINE",
+                    "Conecte a IQ Option na aba Corretora. A EA usa a própria IQ Option em Mercado Aberto e OTC.",
+                    source_state="WAITING",
+                )
+                out.update({
+                    "strategy": "EA AUTÔNOMA IQ",
+                    "mode": "EA_AUTONOMOUS_IQ",
+                    "selected_engine": "EA",
+                    "feed_source": "IQ_OPTION",
+                    "direct_win_only": True,
+                    "gale_signal": False,
+                })
+                cache[key] = (time.time(), out)
+                return out
+            raw = await iq_ea_candles(
+                iq_state, symbol, interval, 150,
+                regular_market=(market == "OPEN"),
+            )
+        else:
+            raw = await candles(symbol, interval, 150, market, iq_state, request=request)
     except HTTPException as exc:
         status = (
-            "TWELVE DATA • LIMITE/ESPERA"
-            if market == "OPEN" and exc.status_code in (429, 503)
-            else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "TWELVE DATA • INDISPONÍVEL")
+            "EA AUTÔNOMA • IQ OPTION EM ESPERA"
+            if engine == "EA"
+            else (
+                "TWELVE DATA • LIMITE/ESPERA"
+                if market == "OPEN" and exc.status_code in (429, 503)
+                else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "TWELVE DATA • INDISPONÍVEL")
+            )
         )
         out = neutral_signal(symbol, interval, market, status, exc.detail, source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
     except Exception as exc:
-        status = "IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "TWELVE DATA • INDISPONÍVEL"
+        status = (
+            "EA AUTÔNOMA • IQ OPTION RECONECTANDO"
+            if engine == "EA"
+            else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "TWELVE DATA • INDISPONÍVEL")
+        )
         out = neutral_signal(symbol, interval, market, status, str(exc), source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
@@ -5542,13 +5739,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "INTELIGÊNCIA ARTIFICIAL"
             engine_mode = "PURE_AI"
         elif engine == "EA":
-            engine_title = "EA"
-            engine_mode = "EA_BINARY"
+            engine_title = "EA AUTÔNOMA IQ"
+            engine_mode = "EA_AUTONOMOUS_IQ"
         else:
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN":
+        if market != "OPEN" and engine != "EA":
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -5559,11 +5756,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
                 "mode": engine_mode,
                 "selected_engine": engine,
-                "ai_provider": (analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else "DISABLED",
+                "ai_provider": "EXTERNAL_AI" if engine == "SMART" else "DISABLED",
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
-                    else ({"ea_binary": True, "sma_period": 70, "rsi_period": 14, "rsi_high": 80, "rsi_low": 20} if engine == "EA" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})
+                    else ({"ea_autonomous_iq": True, "feed": "IQ_OPTION", "markets": ["OPEN", "IQ_OTC"], "direct_win_only": True} if engine == "EA" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})
                 ),
                 "legacy_ai_disabled": engine != "SMART",
                 "legacy_technical_strategies_disabled": True,
@@ -5579,7 +5776,27 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             if engine == "SMART":
                 analysis = await openai_direct_signal(symbol, interval, engine_closed, market)
             elif engine == "EA":
-                analysis = ea_binary_strategy(engine_closed, interval)
+                regular_iq = market == "OPEN"
+                if interval == "5min":
+                    m5_raw = list(raw)
+                else:
+                    m5_raw = await iq_ea_candles(
+                        iq_state, symbol, "5min", 100,
+                        regular_market=regular_iq,
+                    )
+                h1_raw = await iq_ea_candles(
+                    iq_state, symbol, "1h", 100,
+                    regular_market=regular_iq,
+                )
+                m5_closed = m5_raw[:-1] if len(m5_raw) > 1 else m5_raw
+                h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
+                analysis = ea_binary_strategy(
+                    engine_closed,
+                    interval,
+                    m5=m5_closed,
+                    h1=h1_closed,
+                    market=market,
+                )
             else:
                 analysis = await graphic_ai_strategy(symbol, interval, engine_closed, market, request=request, iq_state=iq_state)
         except Exception as exc:
@@ -5607,8 +5824,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
             "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI") and analysis.get("confirmed")),
             "ai_provider": (analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else "DISABLED",
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI") else "HIGH").upper(),
-            "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("EA" if engine == "EA" else analysis.get("strategy", f"{engine_title} {tf_label}")),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA") else "HIGH").upper(),
+            "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else (analysis.get("strategy", "EA AUTÔNOMA IQ") if engine == "EA" else analysis.get("strategy", f"{engine_title} {tf_label}")),
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
             "technical": (
@@ -5674,7 +5891,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 announce, entry, expiry = entry_window(interval, entry_mode)
                 base.update({
                     "direction": direction_now,
-                    "status": (("FALLBACK LOCAL • BLOQUEADO PARA ENTRADA" if analysis.get("fallback") else "SINAL IA PURA LIBERADO") if engine == "SMART" else ("SINAL EA LIBERADO" if engine == "EA" else "SINAL IA GRÁFICA LIBERADO")),
+                    "status": (("FALLBACK LOCAL • BLOQUEADO PARA ENTRADA" if analysis.get("fallback") else "SINAL IA PURA LIBERADO") if engine == "SMART" else ("SINAL EA AUTÔNOMA IQ LIBERADO" if engine == "EA" else "SINAL IA GRÁFICA LIBERADO")),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -7168,8 +7385,8 @@ async def telegram_send(body: TelegramSignalBody):
     result_label = str(body.result or "").upper().strip()
     if not body.test:
         if result_label:
-            if result_label not in ("WIN", "WIN G1", "WIN G2", "LOSS G2"):
-                raise HTTPException(400, "Somente resultados finais WIN/WIN G1/WIN G2/LOSS G2 podem ser enviados automaticamente ao Telegram.")
+            if result_label not in ("WIN", "LOSS", "WIN G1", "WIN G2", "LOSS G2"):
+                raise HTTPException(400, "Somente resultados finais WIN/LOSS/WIN G1/WIN G2/LOSS G2 podem ser enviados automaticamente ao Telegram.")
         elif direction not in ("CALL", "PUT"):
             raise HTTPException(400, "Somente sinais CALL ou PUT confirmados podem ser enviados.")
     return await _tg_send(body)
@@ -7189,8 +7406,12 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART ou EA.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    fallback_twelve = requested_market == "IQ_OTC" and not state
-    effective_market = "OPEN" if fallback_twelve else requested_market
+    if engine == "EA":
+        fallback_twelve = False
+        effective_market = requested_market
+    else:
+        fallback_twelve = requested_market == "IQ_OTC" and not state
+        effective_market = "OPEN" if fallback_twelve else requested_market
 
     try:
         data = await signal(
@@ -7207,7 +7428,15 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             # Sempre informa ao frontend qual mercado foi pedido e qual fonte
             # realmente gerou o sinal. Isto evita fechar um sinal IQ_OTC como OPEN.
             data["requested_market"] = requested_market
-            if requested_market == "OPEN":
+            if engine == "EA":
+                data["feed_source"] = "IQ_OPTION_OPEN" if requested_market == "OPEN" else "IQ_OPTION_OTC"
+                data["feed_fallback"] = False
+                data["feed_message"] = (
+                    "EA Autônoma lendo candles diretamente da IQ Option no mercado aberto."
+                    if requested_market == "OPEN"
+                    else "EA Autônoma lendo candles OTC diretamente da IQ Option."
+                )
+            elif requested_market == "OPEN":
                 data["feed_source"] = "TWELVE_DATA_CLOUD"
                 data["feed_fallback"] = False
                 data["feed_message"] = "Mercado aberto analisado na nuvem; login da IQ Option não é necessário."
@@ -7455,8 +7684,8 @@ async def chart_pre_signal(
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
 
     requested_market = market
-    iq_state = _iq_session_state(request, required=False) if requested_market == "IQ_OTC" else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state
+    iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or engine == "EA") else None
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine != "EA"
     if fallback_twelve:
         market = "OPEN"
 
@@ -7677,7 +7906,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     # limitador global já existente. Assim nenhum cartão depende de toque para
     # começar a ser analisado e evitamos estourar a cota da fonte de dados.
     scan_symbols = list(SYMBOLS)
-    if market == "OPEN":
+    if market == "OPEN" and engine != "EA":
         ws_active = _td_ws_active_symbols()
         for row in out:
             base = str(row.get("base_symbol") or "").strip()
@@ -7693,10 +7922,43 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     cache[idx_key] = (time.time(), (idx + 1) % len(scan_symbols))
 
     try:
-        raw = await candles(sym, interval, 90, market, iq_state, request=request)
+        if engine == "EA":
+            if not iq_state:
+                raise RuntimeError("Conecte a IQ Option para usar a EA Autônoma.")
+            raw = await iq_ea_candles(
+                iq_state, sym, interval, 100,
+                regular_market=(market == "OPEN"),
+            )
+        else:
+            raw = await candles(sym, interval, 90, market, iq_state, request=request)
         if len(raw) >= 25:
             closed = raw[:-1] if len(raw) > 1 else raw
-            if market == "OPEN":
+            if engine == "EA":
+                regular_iq = market == "OPEN"
+                if interval == "5min":
+                    m5_raw = list(raw)
+                else:
+                    m5_raw = await iq_ea_candles(
+                        iq_state, sym, "5min", 90,
+                        regular_market=regular_iq,
+                    )
+                h1_raw = await iq_ea_candles(
+                    iq_state, sym, "1h", 80,
+                    regular_market=regular_iq,
+                )
+                m5_closed = m5_raw[:-1] if len(m5_raw) > 1 else m5_raw
+                h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
+                tech = ea_binary_strategy(
+                    closed, interval, m5=m5_closed, h1=h1_closed, market=market
+                )
+                direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
+                engine_label = "EA AUTÔNOMA IQ"
+                status_text = (
+                    "EA AUTÔNOMA IQ • OPORTUNIDADE ENCONTRADA"
+                    if direction != "NEUTRO"
+                    else "EA AUTÔNOMA IQ • MONITORANDO"
+                )
+            elif market == "OPEN":
                 if engine == "SMART":
                     tech = await openai_direct_signal(sym, interval, closed, market)
                     direction = tech.get("direction", "NEUTRO") if tech.get("available") and tech.get("confirmed") else "NEUTRO"
@@ -7711,11 +7973,6 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                         # Facilita distinguir falta de oportunidade de erro/API.
                         why = str(tech.get("reason") or "sem vantagem clara").replace("\n", " ")[:78]
                         status_text = (("FALLBACK LOCAL OHLCV • MONITORANDO • " if is_fallback else "IA PURA • MONITORANDO • ") + why)
-                elif engine == "EA":
-                    tech = ea_binary_strategy(closed, interval)
-                    direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
-                    engine_label = "EA"
-                    status_text = ("EA • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else "EA • MONITORANDO")
                 else:
                     tech = await graphic_ai_strategy(sym, interval, closed, market, request=request, iq_state=iq_state, fetch_htf=False)
                     direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
@@ -7731,11 +7988,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    ("TWELVE DATA • " + status_text) if market == "OPEN" else status_text
+                    status_text if engine == "EA"
+                    else (("TWELVE DATA • " + status_text) if market == "OPEN" else status_text)
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": "TWELVE_DATA_CLOUD" if market == "OPEN" else ("TWELVE_DATA" if fallback_twelve else market),
+                "feed_source": (("IQ_OPTION_OPEN" if market == "OPEN" else "IQ_OPTION_OTC") if engine == "EA" else ("TWELVE_DATA_CLOUD" if market == "OPEN" else ("TWELVE_DATA" if fallback_twelve else market))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
@@ -7982,6 +8240,8 @@ async def performance(request: Request, interval="1min", market="OPEN"):
         k = _result_operation_key(x, market)
         if r in ("WIN G1", "WIN G2", "LOSS G2"):
             final_ops[k] = r
+        elif r == "LOSS" and bool(x.get("direct_only")):
+            final_ops[k] = "LOSS"
         elif r == "WIN" and k not in final_ops:
             final_ops[k] = "WIN"
 
@@ -7989,9 +8249,10 @@ async def performance(request: Request, interval="1min", market="OPEN"):
     win_g1 = sum(1 for r in final_ops.values() if r == "WIN G1")
     win_g2 = sum(1 for r in final_ops.values() if r == "WIN G2")
     loss_g2 = sum(1 for r in final_ops.values() if r == "LOSS G2")
+    loss_direct_final = sum(1 for r in final_ops.values() if r == "LOSS")
 
     wins = win_direct + win_g1 + win_g2
-    losses = loss_g2
+    losses = loss_g2 + loss_direct_final
     total = wins + losses
 
     return {
@@ -8124,6 +8385,7 @@ async def result(
     expiry_time="",
     market="OPEN",
     direct_only: bool = False,
+    engine: str = "",
 ):
     """Apura a entrada e, quando habilitado, acompanha G1 e G2.
 
@@ -8142,6 +8404,8 @@ async def result(
 
     market = (market or "OPEN").upper()
     direction = (direction or "CALL").upper()
+    engine = str(engine or "").upper()
+    ea_iq_result = engine == "EA"
 
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
@@ -8152,7 +8416,7 @@ async def result(
     if interval not in INTERVALS:
         raise HTTPException(400, "Intervalo inválido.")
 
-    state = _iq_session_state(request, required=True) if market == "IQ_OTC" else None
+    state = _iq_session_state(request, required=True) if (market == "IQ_OTC" or ea_iq_result) else None
     store = state.setdefault("results", {}) if market == "IQ_OTC" else results.setdefault(market, {})
     mode_key = "DIRECT" if direct_only else "GALE"
     # Usa o instante normalizado, não a representação textual do horário.
@@ -8176,11 +8440,22 @@ async def result(
             "next_check": iso(expiry_dt),
         }
 
-    # Para OPEN, aproveita o cache antes de gastar novos créditos.
-    cs = _cached_open_candles_for_result(symbol, interval, 140) if market == "OPEN" else []
+    # A EA Autônoma é apurada na MESMA fonte usada para analisar: IQ Option.
+    # Os outros motores preservam a apuração existente.
+    cs = (
+        []
+        if ea_iq_result
+        else (_cached_open_candles_for_result(symbol, interval, 140) if market == "OPEN" else [])
+    )
     if not cs:
         try:
-            cs = await candles(symbol, interval, 80, market, state, request=request)
+            if ea_iq_result:
+                cs = await iq_ea_candles(
+                    state, symbol, interval, 120,
+                    regular_market=(market == "OPEN"),
+                )
+            else:
+                cs = await candles(symbol, interval, 80, market, state, request=request)
         except HTTPException as exc:
             return {
                 "status": "AGUARDANDO_FONTE",
@@ -8224,7 +8499,31 @@ async def result(
         if found:
             return found
 
-        if market == "OPEN":
+        if ea_iq_result and state is not None:
+            market_key = "OPEN" if market == "OPEN" else "IQ_OTC"
+            cache_key = f"{market_key}|{symbol}|{interval}"
+            ea_cache = state.setdefault("ea_autonomous_candle_cache", {})
+            old_cache = ea_cache.pop(cache_key, None)
+            fresh_ok = False
+            try:
+                fresh = await iq_ea_candles(
+                    state, symbol, interval, 140,
+                    regular_market=(market == "OPEN"),
+                )
+                if fresh:
+                    cs = fresh
+                    fresh_ok = True
+            except Exception:
+                fresh_ok = False
+            finally:
+                if not fresh_ok and cache_key not in ea_cache and old_cache is not None:
+                    ea_cache[cache_key] = old_cache
+
+            found = candle_near(target_dt)
+            if found:
+                return found
+
+        elif market == "OPEN":
             cache_key = f"{symbol}|{interval}"
             old_cache = td_candle_cache.pop(cache_key, None)
             fresh_ok = False
@@ -8626,8 +8925,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="robot-mode-card" id="eaModeCard">
     <img src="__MEGA_IMAGE__" alt="EA para opções binárias">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">⚡ EA</div>
-      <div class="robot-mode-desc" id="eaModeDesc">SMA 70 + RSI 14 (80/20) • converte BUY/SELL em CALL/PUT usando candles fechados.</div>
+      <div class="robot-mode-title">⚡ EA AUTÔNOMA IQ</div>
+      <div class="robot-mode-desc" id="eaModeDesc">Lê candles diretamente da IQ Option • Mercado Aberto + OTC • M5/H1 • price action • foco em entrada direta.</div>
     </div>
     <button id="eaPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -9057,7 +9356,7 @@ const eaModeDesc=document.getElementById('eaModeDesc');
 const voiceBtn=document.getElementById('voiceBtn');
 let robotEnabled=true; // Robô principal
 let aiEnabled=false;   // Inteligência Artificial pura, sem indicadores
-let eaEnabled=false;   // EA convertido para opções binárias
+let eaEnabled=false;   // EA autônoma com leitura direta da IQ Option
 try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
   aiEnabled=localStorage.getItem('mega_ai_power')==='ONLINE';
@@ -9373,7 +9672,7 @@ function recountFinalBucket(b){
   b.win_direct=vals.filter(v=>v==='WIN').length;
   b.win_g1=vals.filter(v=>v==='WIN G1').length;
   b.win_g2=vals.filter(v=>v==='WIN G2').length;
-  b.loss_g2=vals.filter(v=>v==='LOSS G2').length;
+  b.loss_g2=vals.filter(v=>v==='LOSS G2' || v==='LOSS').length;
 }
 
 function loadPersistentResults(){
@@ -9583,7 +9882,8 @@ function registerPersistentResult(t,x){
   }
 
   const r=String(x.result||'').toUpperCase();
-  if(['WIN','WIN G1','WIN G2','LOSS G2'].includes(r)){
+  const finalAllowed=['WIN','WIN G1','WIN G2','LOSS G2'].includes(r) || (t.direct_only && r==='LOSS');
+  if(finalAllowed){
     b.final_ops=b.final_ops||{};
     if(!b.final_ops[opKey]){
       b.final_ops[opKey]=r;
@@ -9835,8 +10135,8 @@ function rememberPendingTrade(sig){
 
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
-    // Placar principal sempre fecha na vela original da entrada.
-    direct_only:true,
+    // EA Autônoma é WIN/LOSS somente na primeira vela; outros motores preservam G1/G2.
+    direct_only:String(sig.selected_engine||sig.mode||'').toUpperCase()==='EA',
     market:signalResultMarket(sig),
     requested_market:sig.requested_market || (market&&market.value) || 'OPEN',
     feed_source:sig.feed_source||'',
@@ -10952,7 +11252,7 @@ async function maybeSendTelegramSignal(signal){
 async function maybeSendTelegramResult(trade,outcome){
   if(!telegramEnabled || !trade || !outcome || telegramBusy) return;
   const resultLabel=String(outcome.result||'').toUpperCase().trim();
-  if(!['WIN','WIN G1','WIN G2','LOSS G2'].includes(resultLabel)) return;
+  if(!['WIN','LOSS','WIN G1','WIN G2','LOSS G2'].includes(resultLabel)) return;
   const chat_id=saveTelegramChatId();
   if(!chat_id) return;
   const key=[trade.symbol,trade.interval,trade.direction,trade.entry_time,resultLabel].join('|');
@@ -11390,14 +11690,14 @@ function applyRobotPowerState(){
     ? 'ONLINE: IA pura analisando somente candles e contexto de preço, sem indicadores.'
     : 'OFFLINE: análise inteligente pausada.';
   if(eaModeDesc) eaModeDesc.textContent=eaEnabled
-    ? 'ONLINE: EA analisando SMA 70 + RSI 14 em candles fechados para CALL/PUT.'
-    : 'OFFLINE: EA pausado.';
+    ? 'ONLINE: EA Autônoma lendo a IQ Option diretamente • OPEN/OTC • foco em entrada direta.'
+    : 'OFFLINE: EA Autônoma pausada.';
 
   const engine=selectedRobotEngine();
   if(engine==='EA'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA ONLINE • SMA 70 + RSI 14 • MONITORANDO O MERCADO';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ EA selecionado.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar do EA ativo • procurando CALL/PUT</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA AUTÔNOMA IQ ONLINE • LENDO A IQ OPTION • FOCO EM WIN DIRETO';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ EA Autônoma IQ selecionada • não depende da aba Gráfico.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar da EA Autônoma IQ ativo • lendo OPEN/OTC na IQ Option</div>';
     rad();
   }else if(engine==='SMART'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='INTELIGÊNCIA ARTIFICIAL ONLINE • IA PURA ANALISANDO CANDLES';
@@ -12021,7 +12321,7 @@ async function resultCheck(){
     pendingTrade=t;
 
     const x=await get(
-      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}`
+      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=${t.direct_only?'true':'false'}&engine=${encodeURIComponent(t.engine||'')}`
     );
 
     if(x && !x.result && (x.status==='AGUARDANDO_FONTE' || String(x.status||'').startsWith('AGUARDANDO'))){
@@ -12072,7 +12372,7 @@ async function resultCheck(){
       if(galeStageStatus){
         galeStageStatus.textContent=
           x.result==='WIN' ? '✅ Venceu na entrada' :
-          x.result==='LOSS' ? '❌ Loss na entrada' :
+          x.result==='LOSS' ? (t.direct_only ? '❌ Loss direto • EA não usa Gale' : '❌ Loss na entrada') :
           x.result==='WIN G1' ? '✅ Venceu no Gale 1' :
           x.result==='WIN G2' ? '✅ Venceu no Gale 2' :
           '❌ Não venceu até o Gale 2';
@@ -12096,7 +12396,7 @@ async function resultCheck(){
       }
 
       // Envia o resultado FINAL uma única vez ao grupo Telegram: WIN, WIN G1, WIN G2 ou LOSS G2.
-      if(['WIN','WIN G1','WIN G2','LOSS G2'].includes(String(x.result||'').toUpperCase())){
+      if(['WIN','LOSS','WIN G1','WIN G2','LOSS G2'].includes(String(x.result||'').toUpperCase())){
         await maybeSendTelegramResult(t,x);
       }
 
