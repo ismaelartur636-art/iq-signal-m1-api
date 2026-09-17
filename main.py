@@ -26,8 +26,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.0.1"
-PWA_VERSION = "v82"
+APP_VERSION = "3.2"
+PWA_VERSION = "v81"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -92,17 +92,6 @@ LEGACY_AI_ENABLED = False
 LEGACY_INDICATORS_ENABLED = False
 NEW_PRIMARY_INDICATOR_ENABLED = True
 NEW_OTC_INDICATOR_ENABLED = False
-
-# BAROMETER.mq4 convertido para o Robô Principal.
-# Parâmetros originais preservados; o app confirma somente candles fechados.
-BAROMETER_PER_MEAN = 300
-BAROMETER_BARS_CALCULUS = 1440
-BAROMETER_FACTOR = 15.0
-BAROMETER_BARSMIN = 9
-BAROMETER_BARSMAX = 7200
-# Histórico bruto necessário para calcular o BAROMETER e ainda sobrar uma
-# margem de candles recentes para detectar a troca de direção do trail.
-BAROMETER_HISTORY = 1760
 
 INTERVALS = {"1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1h": 3600, "4h": 14400}
 SYMBOLS = [
@@ -458,7 +447,7 @@ def _td_merge_rest_ws(rest_rows, ws_rows, interval: str):
             merged[bucket] = live
             order.append(bucket)
 
-    return [merged[b] for b in sorted(set(order)) if b in merged][-2200:]
+    return [merged[b] for b in sorted(set(order)) if b in merged][-220:]
 
 
 @app.on_event("startup")
@@ -2706,210 +2695,185 @@ def otc_engine(cs, context=None):
     }
 
 
-def barometer_strategy(
-    cs,
-    timeframe="1min",
-    per_mean=BAROMETER_PER_MEAN,
-    bars_calculus=BAROMETER_BARS_CALCULUS,
-    factor=BAROMETER_FACTOR,
-    barsmin=BAROMETER_BARSMIN,
-    barsmax=BAROMETER_BARSMAX,
-):
-    """Conversão do BAROMETER.mq4 para o Robô Principal, sem repaint.
+async def graphic_ai_strategy(symbol, interval, cs, market="OPEN", request=None, iq_state=None):
+    """IA GRÁFICA estrutural para o primeiro motor do painel.
 
-    A lógica central do indicador original é preservada:
-      • Align: conta, em ``per_mean`` passos, quantas médias progressivas estão
-        acima da média que inclui um candle mais antigo.
-      • LongBandWagon: soma a inclinação dessas médias progressivas.
-      • Trail adaptativo: usa a variação de Align em vários comprimentos e o
-        fator original para detectar mudança de regime.
-      • CALL: o estado do trail troca de venda/neutro para compra.
-      • PUT: o estado do trail troca de compra/neutro para venda.
-
-    Proteção anti-repaint: ``cs`` deve conter somente candles FECHADOS e o
-    gatilho é aceito apenas quando a troca de estado acontece no último candle
-    fechado. A vela em formação nunca participa do cálculo.
+    Não usa RSI, médias, MACD, Bollinger ou outro indicador técnico como gatilho.
+    Trabalha com OHLC fechado, padrão de vela, regiões H1, estrutura de Dow no H4
+    e projeções simples de LTA/LTB por pivôs confirmados. Cada gatilho é independente:
+    o primeiro evento válido pode liberar CALL/PUT. Se dois gatilhos simultâneos
+    entrarem em conflito, a operação é bloqueada para reduzir entradas frágeis.
     """
-    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"BAROMETER {tf_label}"
-    per_mean = int(per_mean)
-    bars_calculus = int(bars_calculus)
-    barsmin = int(barsmin)
-    barsmax = int(barsmax)
-    factor = float(factor)
-
-    min_needed = per_mean + bars_calculus + 4
-    if len(cs) < min_needed:
+    rows = list(cs or [])
+    if market != "OPEN":
         return {
             "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "strategy": name,
-            "reason": f"BAROMETER aguardando histórico: {len(cs)}/{min_needed} candles {tf_label} fechados.",
-            "non_repaint": True,
-            "source": "BAROMETER.mq4",
-            "barometer_params": {
-                "perMean": per_mean, "BarsCalculus": bars_calculus,
-                "factor": factor, "barsmin": barsmin, "barsmax": barsmax,
-            },
+            "risk": "HIGH", "strategy": "IA GRÁFICA",
+            "reason": "IA Gráfica reservada ao mercado aberto nesta versão.",
+            "engine": "GRAPH_AI",
         }
-
-    closes = [float(c["close"]) for c in cs]
-    total = len(closes)
-
-    # Align e LongBandWagon em ordem cronológica (antigo -> recente).
-    align = [None] * total
-    wagon = [None] * total
-    for t in range(per_mean, total):
-        cumulative = 0.0
-        count_up = 0
-        slope_sum = 0.0
-        # Equivale ao loop do MQL4 sobre Close[i+n] / Close[i+n+1], mas
-        # convertido da indexação series (0 = atual) para ordem cronológica.
-        for n in range(per_mean):
-            cumulative += closes[t - n]
-            avg_now = cumulative / float(n + 1)
-            avg_with_older = (cumulative + closes[t - n - 1]) / float(n + 2)
-            if avg_now > avg_with_older:
-                count_up += 1
-            slope_sum += (avg_now - avg_with_older)
-        align[t] = float(count_up)
-        wagon[t] = float(slope_sum)
-
-    # O indicador original só inicia o trail depois de perMean + BarsCalculus.
-    first_t = per_mean + bars_calculus + 1
-    if first_t >= total:
+    if len(rows) < 30:
         return {
             "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "strategy": name,
-            "reason": f"BAROMETER ainda formando a janela estatística de {bars_calculus} candles.",
-            "non_repaint": True,
-            "source": "BAROMETER.mq4",
+            "risk": "HIGH", "strategy": "IA GRÁFICA",
+            "reason": "Aguardando histórico suficiente para leitura gráfica.",
+            "engine": "GRAPH_AI",
         }
 
-    atr_by_period = {}
-    trail = None
-    situation = 0
-    latest_trigger = None
-    latest_trail = None
-    latest_max_atr = 0.0
+    last = rows[-1]
+    price = float(last.get("close", 0) or 0)
+    o = float(last.get("open", price) or price)
+    h = float(last.get("high", price) or price)
+    l = float(last.get("low", price) or price)
+    recent_ranges = [max(float(x["high"]) - float(x["low"]), 1e-12) for x in rows[-20:]]
+    avg_range = sum(recent_ranges) / max(1, len(recent_ranges))
 
-    # Diffs de Align válidos; usados para inicializar cada ATR[p] sem incluir
-    # índices não calculados. Depois, cada p segue a atualização recursiva do MQL4.
-    for t in range(first_t, total):
-        current_align = float(align[t])
-        current_tr = abs(current_align - float(align[t - 1]))
-        max_period = min(barsmax, t - per_mean)
-        if max_period < barsmin:
-            continue
+    # 1) Padrões de vela: gatilho independente.
+    pattern = _pure_ai_candle_pattern_filter(rows, "NEUTRO")
 
-        # Prefixo dos TRs do mais recente para trás. Isso inicializa qualquer
-        # período novo em O(max_period) e evita um loop quadrático pesado.
-        tr_prefix = [0.0]
-        acc = 0.0
-        for k in range(t, t - max_period, -1):
-            acc += abs(float(align[k]) - float(align[k - 1]))
-            tr_prefix.append(acc)
+    # 2) Contexto H1/H4. Falha de um timeframe não derruba o motor inteiro.
+    h1_closed, h4_closed = [], []
+    try:
+        h1_raw, h4_raw = await asyncio.gather(
+            candles(symbol, "1h", 100, "OPEN", None, request=request),
+            candles(symbol, "4h", 100, "OPEN", None, request=request),
+        )
+        h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
+        h4_closed = h4_raw[:-1] if len(h4_raw) > 1 else h4_raw
+    except Exception:
+        pass
 
-        for p in range(barsmin, max_period + 1):
-            old = atr_by_period.get(p)
-            if old is None:
-                atr_by_period[p] = tr_prefix[p] / float(p)
-            else:
-                atr_by_period[p] = (old * float(p - 1) + current_tr) / float(p)
-
-        atr14 = atr_by_period.get(14)
-        if atr14 is None:
-            continue
-
-        max_atr = max(atr_by_period[p] for p in range(barsmin, max_period + 1))
-        latest_max_atr = max_atr
-        buy_trigger = False
-        sell_trigger = False
-
-        if trail is None:
-            trail = current_align - factor * float(atr14)
-            situation = 0
-
-        # SELL SIGNAL - mesma ordem de avaliação do BAROMETER.mq4.
-        if current_align < trail and situation >= 0:
-            trail = current_align + factor * max_atr
-            situation = -1
-            sell_trigger = True
-        if current_align < trail and situation <= 0:
-            candidate = current_align + factor * max_atr
-            trail = min(trail, candidate)
-
-        # BUY SIGNAL - mesma ordem de avaliação do BAROMETER.mq4.
-        if current_align > trail and situation <= 0:
-            trail = current_align - factor * max_atr
-            situation = 1
-            buy_trigger = True
-        if current_align > trail and situation >= 0:
-            candidate = current_align - factor * max_atr
-            trail = max(trail, candidate)
-
-        if t == total - 1:
-            latest_trail = float(trail)
-            if buy_trigger:
-                latest_trigger = "CALL"
-            elif sell_trigger:
-                latest_trigger = "PUT"
-
-    last_t = total - 1
-    current_align = float(align[last_t])
-    current_wagon = float(wagon[last_t])
-    stats_start = max(per_mean, last_t - bars_calculus + 1)
-    stats = [float(x) for x in wagon[stats_start:last_t + 1] if x is not None]
-    mean = sum(stats) / float(len(stats)) if stats else 0.0
-    variance = (sum((x - mean) ** 2 for x in stats) / float(len(stats))) if stats else 0.0
-    sigma = variance ** 0.5
-    zscore = (current_wagon - mean) / sigma if sigma > 1e-15 else 0.0
-
-    base = {
-        "strategy": name,
-        "source": "BAROMETER.mq4",
-        "non_repaint": True,
-        "timeframe": timeframe,
-        "barometer_align": round(current_align, 3),
-        "barometer_trail": round(float(latest_trail if latest_trail is not None else 0.0), 3),
-        "barometer_wagon": round(current_wagon, 8),
-        "barometer_zscore": round(float(zscore), 3),
-        "barometer_atr_max": round(float(latest_max_atr), 6),
-        "barometer_state": "BULL" if situation > 0 else ("BEAR" if situation < 0 else "NEUTRAL"),
-        "barometer_params": {
-            "perMean": per_mean,
-            "BarsCalculus": bars_calculus,
-            "factor": factor,
-            "barsmin": barsmin,
-            "barsmax": barsmax,
-        },
-        "candles_used": total,
+    triggers = []
+    diagnostics = {
+        "pattern": pattern,
+        "h1_region": "UNAVAILABLE",
+        "dow_h4": "NEUTRO",
+        "lta": None,
+        "ltb": None,
     }
 
-    if latest_trigger in ("CALL", "PUT"):
-        # 'confidence' aqui é força interna do setup para a interface; não é uma
-        # promessa de probabilidade de acerto. O gatilho continua sendo a troca
-        # real do trail no candle fechado.
-        strength = max(0.0, min(abs(float(zscore)), 3.0))
-        confidence = round(84.0 + strength * 4.0, 1)
+    if pattern.get("passed") and pattern.get("direction") in ("CALL", "PUT"):
+        triggers.append({
+            "direction": pattern["direction"],
+            "confidence": 88.0,
+            "source": "PADRAO_VELA",
+            "reason": pattern.get("reason") or "Padrão de vela forte confirmado.",
+        })
+
+    # 3) Suporte/resistência H1 validado por pivôs com 2+ toques: gatilho independente.
+    if len(h1_closed) >= 25:
+        levels = _support_resistance_levels(h1_closed, "1h")
+        supports = [float(x["price"]) for x in levels.get("supports", [])]
+        resistances = [float(x["price"]) for x in levels.get("resistances", [])]
+        h1_ranges = [max(float(x["high"]) - float(x["low"]), 1e-12) for x in h1_closed[-20:]]
+        h1_avg_range = sum(h1_ranges) / max(1, len(h1_ranges)) if h1_ranges else 0.0
+        radius = max(float(levels.get("tolerance", 0.0) or 0.0) * 2.0, h1_avg_range * 0.30, abs(price) * 0.00020)
+        ns = min(supports, key=lambda x: abs(price - x)) if supports else None
+        nr = min(resistances, key=lambda x: abs(price - x)) if resistances else None
+        ds = abs(price - ns) if ns is not None else None
+        dr = abs(price - nr) if nr is not None else None
+        near_s = ds is not None and ds <= radius
+        near_r = dr is not None and dr <= radius
+        if near_s and not near_r:
+            diagnostics["h1_region"] = "SUPPORT"
+            triggers.append({
+                "direction": "CALL", "confidence": 84.0, "source": "SUPORTE_H1",
+                "reason": "Preço tocou região de suporte H1 validada por pivôs recorrentes.",
+            })
+        elif near_r and not near_s:
+            diagnostics["h1_region"] = "RESISTANCE"
+            triggers.append({
+                "direction": "PUT", "confidence": 84.0, "source": "RESISTENCIA_H1",
+                "reason": "Preço tocou região de resistência H1 validada por pivôs recorrentes.",
+            })
+        elif near_s and near_r:
+            diagnostics["h1_region"] = "CONFLICT"
+        else:
+            diagnostics["h1_region"] = "MIDDLE"
+        diagnostics["h1_support"] = ns
+        diagnostics["h1_resistance"] = nr
+        diagnostics["h1_zone_radius"] = radius
+
+    # 4) Dow H4 + LTA/LTB projetadas por pivôs confirmados.
+    if len(h4_closed) >= 30:
+        sample = h4_closed[-90:]
+        highs, lows = _otc_swing_points(sample, 2, 2)
+        h4_ranges = [max(float(x["high"]) - float(x["low"]), 1e-12) for x in sample[-20:]]
+        h4_avg_range = sum(h4_ranges) / max(1, len(h4_ranges)) if h4_ranges else avg_range
+        line_tol = max(avg_range * 0.90, h4_avg_range * 0.16, abs(price) * 0.00025)
+
+        dow = "NEUTRO"
+        if len(highs) >= 2 and len(lows) >= 2:
+            ph1, ph2 = highs[-2], highs[-1]
+            pl1, pl2 = lows[-2], lows[-1]
+            if ph2["price"] > ph1["price"] and pl2["price"] > pl1["price"]:
+                dow = "CALL"
+            elif ph2["price"] < ph1["price"] and pl2["price"] < pl1["price"]:
+                dow = "PUT"
+        diagnostics["dow_h4"] = dow
+
+        current_idx = len(sample) - 1
+        if len(lows) >= 2:
+            a, b = lows[-2], lows[-1]
+            dx = max(1, int(b["index"]) - int(a["index"]))
+            slope = (float(b["price"]) - float(a["price"])) / dx
+            projected = float(b["price"]) + slope * (current_idx - int(b["index"]))
+            valid = slope > 0
+            near = valid and abs(price - projected) <= line_tol
+            diagnostics["lta"] = {"valid": valid, "projected": projected, "near": near, "slope": slope}
+            if near and dow == "CALL" and price >= projected - line_tol:
+                triggers.append({
+                    "direction": "CALL", "confidence": 90.0, "source": "DOW_H4_LTA",
+                    "reason": "Estrutura Dow H4 de alta com preço reagindo próximo da LTA projetada.",
+                })
+
+        if len(highs) >= 2:
+            a, b = highs[-2], highs[-1]
+            dx = max(1, int(b["index"]) - int(a["index"]))
+            slope = (float(b["price"]) - float(a["price"])) / dx
+            projected = float(b["price"]) + slope * (current_idx - int(b["index"]))
+            valid = slope < 0
+            near = valid and abs(price - projected) <= line_tol
+            diagnostics["ltb"] = {"valid": valid, "projected": projected, "near": near, "slope": slope}
+            if near and dow == "PUT" and price <= projected + line_tol:
+                triggers.append({
+                    "direction": "PUT", "confidence": 90.0, "source": "DOW_H4_LTB",
+                    "reason": "Estrutura Dow H4 de baixa com preço reagindo próximo da LTB projetada.",
+                })
+
+    # O primeiro gatilho válido trabalha sozinho; confluência não é obrigatória.
+    # Porém, se no mesmo fechamento surgirem gatilhos opostos, bloqueamos a entrada.
+    calls = [x for x in triggers if x["direction"] == "CALL"]
+    puts = [x for x in triggers if x["direction"] == "PUT"]
+    if calls and puts:
         return {
-            **base,
-            "direction": latest_trigger,
-            "confidence": min(confidence, 96.0),
-            "confirmed": True,
-            "reason": (
-                f"BAROMETER confirmou {'compra' if latest_trigger == 'CALL' else 'venda'} em {tf_label} "
-                f"pela troca do trail no último candle fechado. Sinal travado sem repaint."
-            ),
+            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+            "risk": "HIGH", "strategy": "IA GRÁFICA",
+            "reason": "Gatilhos gráficos opostos apareceram no mesmo fechamento; entrada bloqueada.",
+            "engine": "GRAPH_AI", "triggers": triggers, "diagnostics": diagnostics,
+        }
+
+    winners = calls or puts
+    if winners:
+        best = max(winners, key=lambda x: float(x.get("confidence", 0)))
+        same_dir = len(winners)
+        confidence = min(96.0, float(best["confidence"]) + max(0, same_dir - 1) * 2.0)
+        risk = "LOW" if confidence >= 90 else "MEDIUM"
+        return {
+            "direction": best["direction"], "confidence": round(confidence, 1),
+            "confirmed": True, "risk": risk, "strategy": "IA GRÁFICA",
+            "reason": best["reason"], "trigger": best["source"],
+            "engine": "GRAPH_AI", "triggers": triggers, "diagnostics": diagnostics,
+            "non_repaint": True,
         }
 
     return {
-        **base,
-        "direction": "NEUTRO",
-        "confidence": 0,
-        "confirmed": False,
-        "reason": f"BAROMETER {tf_label} sem nova troca de direção no último candle fechado.",
+        "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+        "risk": "HIGH", "strategy": "IA GRÁFICA",
+        "reason": "IA Gráfica monitorando: aguardando padrão, região H1 ou reação Dow H4 em LTA/LTB.",
+        "engine": "GRAPH_AI", "triggers": [], "diagnostics": diagnostics,
+        "non_repaint": True,
     }
-
 
 def hidden_indicator_strategy(cs, timeframe="1min"):
     """Motor INDICADOR de teste, não-repaint e somente com candles fechados.
@@ -3582,7 +3546,7 @@ async def candles_open(symbol, interval, n=80):
         raise HTTPException(500, "TWELVE_DATA_API_KEY não configurada.")
 
     ensure_td_ws_started()
-    n = max(20, min(int(n), 2000))
+    n = max(20, min(int(n), 150))
     key = f"{symbol}|{interval}"
     now_ts = time.time()
     cached = td_candle_cache.get(key)
@@ -3595,15 +3559,15 @@ async def candles_open(symbol, interval, n=80):
     if ws_rows and _td_ws_is_fresh(symbol):
         if cached:
             merged = _td_merge_rest_ws(cached[1], ws_rows, interval)
-            if len(merged) >= n:
+            if len(merged) >= min(n, 20):
                 td_candle_cache[key] = (time.time(), merged)
                 return merged[-n:]
-        elif len(ws_rows) >= n:
+        elif len(ws_rows) >= min(n, 20):
             merged = _td_merge_rest_ws([], ws_rows, interval)
             td_candle_cache[key] = (time.time(), merged)
             return merged[-n:]
 
-    if cached and now_ts - cached[0] < ttl and len(cached[1]) >= n:
+    if cached and now_ts - cached[0] < ttl and len(cached[1]) >= min(n, 20):
         return cached[1][-n:]
 
     if now_ts < td_backoff_until:
@@ -3616,7 +3580,7 @@ async def candles_open(symbol, interval, n=80):
     async with lock:
         now_ts = time.time()
         cached = td_candle_cache.get(key)
-        if cached and now_ts - cached[0] < ttl and len(cached[1]) >= n:
+        if cached and now_ts - cached[0] < ttl and len(cached[1]) >= min(n, 20):
             return cached[1][-n:]
 
         if now_ts < td_backoff_until:
@@ -5034,26 +4998,148 @@ def _local_ohlcv_fallback_signal(cs, interval="1min", api_reason=""):
     }
 
 
-async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
-    """IA PURA seletiva da v1.2, com infraestrutura da v1.7.
 
-    CALL/PUT só é liberado quando a IA externa responde e passa pelos filtros
-    rigorosos de WIN DIRETO. O fallback local permanece apenas como monitor.
+def _pure_ai_candle_pattern_filter(cs, expected_direction="NEUTRO"):
+    """Filtro de padrões de vela para a IA PURA usando somente OHLC fechado.
+
+    Não usa RSI, médias ou qualquer indicador calculado. O objetivo é validar
+    que a região H1 tenha uma reação de preço reconhecível antes de gastar cota
+    da IA externa. Os padrões são avaliados apenas em candles já fechados.
     """
-    if not cs:
+    rows = list(cs or [])
+    if len(rows) < 4:
         return {
-            "available": False, "direction": "NEUTRO", "confidence": 0,
-            "confirmed": False, "risk": "HIGH",
-            "reason": "Sem candles suficientes.",
+            "ready": False,
+            "passed": False,
+            "direction": "NEUTRO",
+            "patterns": [],
+            "reason": "Poucos candles fechados para validar padrão de vela.",
         }
 
-    if not OAI_KEY and not GEMINI_KEY:
-        return _local_ohlcv_fallback_signal(
-            cs, interval, "Nenhuma IA externa configurada (OPENAI_API_KEY/GEMINI_API_KEY). Fallback em modo monitor."
-        )
+    def m(c):
+        o = float(c.get("open", 0) or 0)
+        h = float(c.get("high", 0) or 0)
+        l = float(c.get("low", 0) or 0)
+        cl = float(c.get("close", 0) or 0)
+        rng = max(h - l, 1e-12)
+        body = abs(cl - o)
+        return {
+            "o": o, "h": h, "l": l, "c": cl,
+            "range": rng,
+            "body": body,
+            "body_ratio": body / rng,
+            "upper": (h - max(o, cl)) / rng,
+            "lower": (min(o, cl) - l) / rng,
+            "close_pos": (cl - l) / rng,
+            "bull": cl > o,
+            "bear": cl < o,
+        }
 
-    live = cs[-1]
-    state_key = f"AI_SMART_V2|{market}|{symbol}|{interval}"
+    a, b, c = m(rows[-3]), m(rows[-2]), m(rows[-1])
+    bull_patterns = []
+    bear_patterns = []
+
+    # Engolfo: corpo atual envolve o corpo anterior e fecha com força.
+    if b["bear"] and c["bull"] and c["body_ratio"] >= 0.50 and c["o"] <= b["c"] and c["c"] >= b["o"]:
+        bull_patterns.append("ENGOLFO_ALTA")
+    if b["bull"] and c["bear"] and c["body_ratio"] >= 0.50 and c["o"] >= b["c"] and c["c"] <= b["o"]:
+        bear_patterns.append("ENGOLFO_BAIXA")
+
+    # Hammer / Shooting Star e Pin Bar de rejeição.
+    if c["lower"] >= 0.55 and c["upper"] <= 0.18 and c["close_pos"] >= 0.62 and c["body_ratio"] <= 0.42:
+        bull_patterns.append("HAMMER_PINBAR_ALTA")
+    if c["upper"] >= 0.55 and c["lower"] <= 0.18 and c["close_pos"] <= 0.38 and c["body_ratio"] <= 0.42:
+        bear_patterns.append("SHOOTING_PINBAR_BAIXA")
+
+    # Morning / Evening Star sem exigir gap (mais adequado a forex/cripto contínuos).
+    if a["bear"] and a["body_ratio"] >= 0.48 and b["body_ratio"] <= 0.35 and c["bull"] and c["body_ratio"] >= 0.48:
+        mid_a = (a["o"] + a["c"]) / 2.0
+        if c["c"] >= mid_a:
+            bull_patterns.append("MORNING_STAR")
+    if a["bull"] and a["body_ratio"] >= 0.48 and b["body_ratio"] <= 0.35 and c["bear"] and c["body_ratio"] >= 0.48:
+        mid_a = (a["o"] + a["c"]) / 2.0
+        if c["c"] <= mid_a:
+            bear_patterns.append("EVENING_STAR")
+
+    # Doji + confirmação na vela seguinte.
+    if b["body_ratio"] <= 0.13 and c["bull"] and c["body_ratio"] >= 0.48 and c["c"] > b["h"]:
+        bull_patterns.append("DOJI_CONFIRMACAO_ALTA")
+    if b["body_ratio"] <= 0.13 and c["bear"] and c["body_ratio"] >= 0.48 and c["c"] < b["l"]:
+        bear_patterns.append("DOJI_CONFIRMACAO_BAIXA")
+
+    # Inside Bar + rompimento da barra-mãe com fechamento além do extremo.
+    inside = b["h"] < a["h"] and b["l"] > a["l"]
+    if inside and c["bull"] and c["body_ratio"] >= 0.45 and c["c"] > a["h"]:
+        bull_patterns.append("INSIDE_BREAKOUT_ALTA")
+    if inside and c["bear"] and c["body_ratio"] >= 0.45 and c["c"] < a["l"]:
+        bear_patterns.append("INSIDE_BREAKOUT_BAIXA")
+
+    # Rejeição forte simples: pavio dominante + fechamento na direção da reação.
+    if c["bull"] and c["lower"] >= 0.42 and c["close_pos"] >= 0.68 and c["body_ratio"] >= 0.28:
+        bull_patterns.append("REJEICAO_ALTA")
+    if c["bear"] and c["upper"] >= 0.42 and c["close_pos"] <= 0.32 and c["body_ratio"] >= 0.28:
+        bear_patterns.append("REJEICAO_BAIXA")
+
+    # Remove repetições preservando ordem.
+    bull_patterns = list(dict.fromkeys(bull_patterns))
+    bear_patterns = list(dict.fromkeys(bear_patterns))
+
+    expected = str(expected_direction or "NEUTRO").upper()
+    if expected == "CALL":
+        chosen, opposite = bull_patterns, bear_patterns
+        direction = "CALL" if chosen else "NEUTRO"
+    elif expected == "PUT":
+        chosen, opposite = bear_patterns, bull_patterns
+        direction = "PUT" if chosen else "NEUTRO"
+    else:
+        if bull_patterns and not bear_patterns:
+            chosen, opposite, direction = bull_patterns, bear_patterns, "CALL"
+        elif bear_patterns and not bull_patterns:
+            chosen, opposite, direction = bear_patterns, bull_patterns, "PUT"
+        else:
+            chosen, opposite, direction = [], bull_patterns + bear_patterns, "NEUTRO"
+
+    passed = bool(chosen) and not (expected in ("CALL", "PUT") and opposite and not chosen)
+    if passed:
+        reason = f"Padrão de vela alinhado: {', '.join(chosen[:3])}."
+    elif expected in ("CALL", "PUT") and opposite:
+        reason = f"Padrão de vela contrário à região H1: {', '.join(opposite[:3])}."
+    else:
+        reason = "Nenhum padrão de vela forte e alinhado foi confirmado nos candles fechados."
+
+    return {
+        "ready": True,
+        "passed": passed,
+        "direction": direction,
+        "patterns": chosen[:5],
+        "opposite_patterns": opposite[:5],
+        "reason": reason,
+        "last_body_ratio": round(c["body_ratio"], 4),
+        "last_upper_wick_ratio": round(c["upper"], 4),
+        "last_lower_wick_ratio": round(c["lower"], 4),
+    }
+
+
+async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
+    """IA PURA com três gatilhos independentes no mercado aberto.
+
+    Gatilhos independentes:
+      1) padrão de vela forte em OHLC fechado;
+      2) toque em suporte/resistência H1 validado;
+      3) análise externa Gemini/OpenAI por price action puro.
+
+    O primeiro gatilho válido pode liberar CALL/PUT sem exigir alinhamento entre eles.
+    Fallback local continua apenas como monitor quando a IA externa não responde.
+    """
+    rows = list(cs or [])
+    if not rows:
+        return {
+            "available": False, "direction": "NEUTRO", "confidence": 0,
+            "confirmed": False, "risk": "HIGH", "reason": "Sem candles suficientes.",
+        }
+
+    live = rows[-1]
+    state_key = f"AI_SMART_V3|{market}|{symbol}|{interval}"
     st = ai_scan_state.setdefault(state_key, {})
     now_ts = time.time()
 
@@ -5068,9 +5154,6 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
     last_candle = st.get("candle_time")
     last_call = f(st.get("last_call"), 0.0)
     new_candle = bool(last_candle and last_candle != live.get("datetime"))
-
-    # Candles fechados não mudam. Uma avaliação por novo candle evita respostas
-    # diferentes sobre os mesmos dados e conserva quota da API.
     min_gap = 12.0
     heartbeat = float(INTERVALS.get(interval, 60))
     should_call = last_call <= 0 or new_candle
@@ -5089,9 +5172,141 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
         cached["next_review_seconds"] = max(0, int(min(heartbeat, max(min_gap, heartbeat - (now_ts - last_call)))))
         return cached
 
-    # v2.5: Twelve Data varre todos os ativos, mas a Gemini só recebe candidatos
-    # com price action local suficiente. Isso preserva a cota sem deixar o radar parado.
-    prefilter_ok, prefilter_score, prefilter_reason, price_ctx = _gemini_candidate_prefilter(cs, interval)
+    # Contexto de price action usado somente pela IA externa e pelo gate final dela.
+    prefilter_ok, prefilter_score, prefilter_reason, price_ctx = _gemini_candidate_prefilter(rows, interval)
+
+    # GATILHO 1 — padrão de vela independente.
+    candle_pattern_filter = _pure_ai_candle_pattern_filter(rows, "NEUTRO")
+
+    # GATILHO 2 — região H1 independente.
+    h1_filter = {
+        "enabled": market == "OPEN",
+        "ready": False,
+        "region": "UNAVAILABLE",
+        "bias": "NEUTRO",
+        "support": None,
+        "resistance": None,
+        "distance_support": None,
+        "distance_resistance": None,
+        "zone_radius": 0.0,
+    }
+    if market == "OPEN":
+        try:
+            h1_raw = await candles(symbol, "1h", 100, "OPEN", None)
+            h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
+            h1_levels = _support_resistance_levels(h1_closed, "1h")
+            h1_supports = [float(x["price"]) for x in h1_levels.get("supports", [])]
+            h1_resistances = [float(x["price"]) for x in h1_levels.get("resistances", [])]
+            h1_tol = float(h1_levels.get("tolerance", 0.0) or 0.0)
+            h1_ranges = [max(float(x["high"]) - float(x["low"]), 1e-12) for x in h1_closed[-20:]]
+            h1_avg_range = (sum(h1_ranges) / len(h1_ranges)) if h1_ranges else 0.0
+            zone_radius = max(h1_tol * 2.0, h1_avg_range * 0.30, abs(c) * 0.00020)
+
+            nearest_support = min(h1_supports, key=lambda x: abs(c - x)) if h1_supports else None
+            nearest_resistance = min(h1_resistances, key=lambda x: abs(c - x)) if h1_resistances else None
+            ds = abs(c - nearest_support) if nearest_support is not None else None
+            dr = abs(c - nearest_resistance) if nearest_resistance is not None else None
+            near_support = ds is not None and ds <= zone_radius
+            near_resistance = dr is not None and dr <= zone_radius
+            region = "CONFLICT" if (near_support and near_resistance) else ("SUPPORT" if near_support else ("RESISTANCE" if near_resistance else "MIDDLE"))
+            bias = "CALL" if region == "SUPPORT" else ("PUT" if region == "RESISTANCE" else "NEUTRO")
+            h1_filter.update({
+                "ready": bool(h1_supports or h1_resistances),
+                "region": region,
+                "bias": bias,
+                "support": nearest_support,
+                "resistance": nearest_resistance,
+                "distance_support": ds,
+                "distance_resistance": dr,
+                "zone_radius": zone_radius,
+                "support_count": len(h1_supports),
+                "resistance_count": len(h1_resistances),
+            })
+        except Exception as exc:
+            h1_filter["error"] = str(exc)[:180]
+
+    # Cada gatilho local trabalha sozinho. Se os dois aparecerem na mesma leitura e
+    # apontarem lados opostos, bloqueamos por segurança em vez de escolher no escuro.
+    local_triggers = []
+    if candle_pattern_filter.get("passed") and candle_pattern_filter.get("direction") in ("CALL", "PUT"):
+        local_triggers.append({
+            "direction": candle_pattern_filter["direction"],
+            "confidence": 88.0,
+            "provider": "CANDLE_PATTERN_TRIGGER",
+            "setup": "REJECTION",
+            "reason": candle_pattern_filter.get("reason") or "Padrão de vela forte confirmado.",
+        })
+    if h1_filter.get("region") == "SUPPORT":
+        local_triggers.append({
+            "direction": "CALL", "confidence": 84.0, "provider": "H1_REGION_TRIGGER",
+            "setup": "REJECTION", "reason": "Preço tocou suporte H1 validado por pivôs recorrentes.",
+        })
+    elif h1_filter.get("region") == "RESISTANCE":
+        local_triggers.append({
+            "direction": "PUT", "confidence": 84.0, "provider": "H1_REGION_TRIGGER",
+            "setup": "REJECTION", "reason": "Preço tocou resistência H1 validada por pivôs recorrentes.",
+        })
+
+    local_dirs = {x["direction"] for x in local_triggers}
+    if len(local_dirs) == 1 and local_triggers:
+        # Padrão tem prioridade quando os dois surgem no mesmo candle, pois traz uma
+        # confirmação visual mais específica; fora disso, vale o gatilho disponível.
+        best = max(local_triggers, key=lambda x: float(x.get("confidence", 0)))
+        out = {
+            "available": True,
+            "direction": best["direction"],
+            "confidence": best["confidence"],
+            "confirmed": True,
+            "risk": "MEDIUM" if best["confidence"] < 90 else "LOW",
+            "setup": best["setup"],
+            "reason": best["reason"],
+            "smart_scan": True,
+            "api_called": False,
+            "provider": best["provider"],
+            "fallback": False,
+            "api_available": bool(GEMINI_KEY or OAI_KEY),
+            "h1_filter": h1_filter,
+            "candle_pattern_filter": candle_pattern_filter,
+            "independent_trigger": True,
+            "direct_win_filter": {
+                "enabled": True,
+                "blocked": False,
+                "source": best["provider"],
+                "price_context": price_ctx,
+            },
+        }
+        st["last_call"] = now_ts
+        st["last_result"] = dict(out)
+        return out
+    elif len(local_dirs) > 1:
+        out = {
+            "available": True, "direction": "NEUTRO", "confidence": 0,
+            "confirmed": False, "risk": "HIGH", "setup": "NONE",
+            "reason": "Padrão de vela e região H1 deram direções opostas no mesmo fechamento; entrada bloqueada.",
+            "smart_scan": True, "api_called": False, "provider": "LOCAL_TRIGGER_CONFLICT",
+            "fallback": False, "api_available": bool(GEMINI_KEY or OAI_KEY),
+            "h1_filter": h1_filter, "candle_pattern_filter": candle_pattern_filter,
+            "independent_trigger": True,
+        }
+        st["last_call"] = now_ts
+        st["last_result"] = dict(out)
+        return out
+
+    # GATILHO 3 — IA externa independente. Ela não precisa concordar com H1/padrão.
+    if not OAI_KEY and not GEMINI_KEY:
+        out = _local_ohlcv_fallback_signal(
+            rows, interval, "Nenhuma IA externa configurada (OPENAI_API_KEY/GEMINI_API_KEY). Fallback em modo monitor."
+        )
+        out.update({
+            "h1_filter": h1_filter,
+            "candle_pattern_filter": candle_pattern_filter,
+            "independent_trigger": True,
+        })
+        st["last_call"] = now_ts
+        st["last_result"] = dict(out)
+        return out
+
+    # Preserva quota da IA externa sem bloquear os dois gatilhos locais acima.
     if not prefilter_ok:
         out = {
             "available": True,
@@ -5100,19 +5315,19 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
             "confirmed": False,
             "risk": "HIGH",
             "setup": "NONE",
-            "reason": f"Pré-filtro de quota: {prefilter_reason}. Gemini preservada para candidatos mais fortes.",
+            "reason": f"IA externa aguardando price action mais limpo: {prefilter_reason}.",
             "smart_scan": True,
             "api_called": False,
             "provider": "LOCAL_PREFILTER",
             "fallback": False,
-            "api_available": bool(GEMINI_KEY or OAI_KEY),
+            "api_available": True,
             "quota_protected": True,
             "prefilter_score": prefilter_score,
+            "h1_filter": h1_filter,
+            "candle_pattern_filter": candle_pattern_filter,
+            "independent_trigger": True,
             "direct_win_filter": {
-                "enabled": True,
-                "blocked": True,
-                "prefilter": True,
-                "price_context": price_ctx,
+                "enabled": True, "blocked": True, "prefilter": True, "price_context": price_ctx,
             },
         }
         st["last_call"] = now_ts
@@ -5121,12 +5336,12 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
 
     data = [
         {"time": x["datetime"], "o": x["open"], "h": x["high"], "l": x["low"], "c": x["close"], "v": x.get("volume", 0)}
-        for x in cs[-60:]
+        for x in rows[-60:]
     ]
 
     prompt = f"""Você é a inteligência artificial autônoma da MEGA IA, especializada em prever SOMENTE a direção da PRÓXIMA vela completa.
 Ativo: {symbol}. Timeframe: {interval}. Mercado: {market}.
-OBJETIVO PRINCIPAL: aumentar WIN DIRETO (sem depender de Gale). Prefira perder uma oportunidade a liberar uma entrada fraca.
+OBJETIVO PRINCIPAL: aumentar WIN DIRETO e reduzir dependência de Gale. Prefira ficar NEUTRO a liberar uma entrada fraca.
 Este é o MODO IA PURA: NÃO use RSI, MACD, Bollinger, médias móveis, ATR, estocástico, ADX, score técnico ou qualquer indicador calculado pelo aplicativo.
 Use SOMENTE os candles OHLCV FECHADOS fornecidos. Não há candle em formação nesta entrada.
 
@@ -5137,6 +5352,7 @@ REGRAS DE QUALIDADE:
 - Se houver alternância frequente, corpos pequenos, pavios dos dois lados, compressão ou direção pouco clara: NEUTRO.
 - Não persiga movimento já esticado sem nova confirmação.
 - CALL/PUT exige pelo menos duas evidências independentes de price action para a próxima vela.
+- Região H1 e padrão de vela são motores independentes e NÃO precisam concordar com esta análise.
 - Para M1 seja especialmente rigoroso.
 - Gale, recuperação e resultados anteriores NÃO podem influenciar a decisão.
 - Só marque risk LOW ou MEDIUM quando houver vantagem clara. Em dúvida: HIGH + NEUTRO.
@@ -5148,7 +5364,6 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
 
     try:
         parsed, provider = await _external_ai_json(prompt)
-
         direction = str(parsed.get("direction", "NEUTRO")).upper()
         if direction not in ("CALL", "PUT", "NEUTRO"):
             direction = "NEUTRO"
@@ -5162,9 +5377,6 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         confirmed = bool(parsed.get("confirmed", False))
         original_reason = str(parsed.get("reason", ""))[:220]
 
-        # Filtro mais rigoroso para aumentar acertos na entrada inicial.
-        # LOW precisa de 80% (ou OAI_MIN, se maior); MEDIUM precisa de 86%.
-        # Em M1, o mínimo LOW sobe para 82% devido ao ruído maior.
         low_min = max(float(OAI_MIN), 82.0 if interval == "1min" else 80.0)
         required_conf = low_min if risk == "LOW" else max(low_min + 4.0, 86.0)
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
@@ -5203,6 +5415,9 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             "provider": f"{provider}_PURE",
             "fallback": False,
             "api_available": True,
+            "h1_filter": h1_filter,
+            "candle_pattern_filter": candle_pattern_filter,
+            "independent_trigger": True,
             "direct_win_filter": {
                 "enabled": True,
                 "required_confidence": round(required_conf, 1),
@@ -5215,44 +5430,16 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         st["last_result"] = dict(out)
         return out
     except Exception as exc:
-        # v1.8: quota/timeout/indisponibilidade não gera mais entrada pelo fallback.
-        # O motor local apenas monitora OHLCV e a IA externa volta a ser tentada
-        # no próximo candle.
-        out = _local_ohlcv_fallback_signal(cs, interval, str(exc))
+        out = _local_ohlcv_fallback_signal(rows, interval, str(exc))
         out["smart_scan"] = True
         out["api_called"] = True
+        out["h1_filter"] = h1_filter
+        out["candle_pattern_filter"] = candle_pattern_filter
+        out["independent_trigger"] = True
         st["last_call"] = now_ts
         st["last_result"] = dict(out)
         print(f"[IA FALLBACK MONITOR] {symbol} {interval} LOCAL_OHLCV | API: {str(exc)[:160]}", flush=True)
         return out
-
-
-def next_boundary(interval):
-    seconds = INTERVALS[interval]
-    timestamp = int(now().timestamp())
-    return datetime.fromtimestamp(((timestamp // seconds) + 1) * seconds, tz=BR_TZ)
-
-
-ENTRY_MODES = {"BIRTH", "MIDDLE", "CLOSE"}
-
-
-def normalize_entry_mode(value: str | None) -> str:
-    mode = str(value or "BIRTH").strip().upper()
-    aliases = {
-        "NASCIMENTO": "BIRTH",
-        "NASCER": "BIRTH",
-        "MEIO": "MIDDLE",
-        "FECHAMENTO": "CLOSE",
-    }
-    mode = aliases.get(mode, mode)
-    return mode if mode in ENTRY_MODES else "BIRTH"
-
-
-def current_boundary(interval):
-    seconds = INTERVALS[interval]
-    timestamp = int(now().timestamp())
-    return datetime.fromtimestamp((timestamp // seconds) * seconds, tz=BR_TZ)
-
 
 def entry_window(interval, entry_mode="BIRTH"):
     """Agenda entradas sempre em abertura de candle para manter a apuração exata.
@@ -5311,17 +5498,17 @@ def neutral_signal(symbol, interval, market, status, reason, *, confidence=0, so
     }
 
 
-async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "BAROMETER", entry_mode: str = "BIRTH"):
+async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH"):
     if symbol not in SYMBOLS or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
 
     market = (market or "OPEN").upper()
-    engine = (engine or "BAROMETER").upper()
-    if engine == "RSI":  # compatibilidade com versões anteriores do painel
-        engine = "BAROMETER"
+    engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
-    if engine not in ("BAROMETER", "SMART", "EA", "INDICATOR"):
-        engine = "BAROMETER"
+    if engine == "RSI":
+        engine = "GRAPH_AI"
+    if engine not in ("GRAPH_AI", "SMART", "EA", "INDICATOR"):
+        engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
 
@@ -5344,8 +5531,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         return cache[key][1]
 
     try:
-        history_n = BAROMETER_HISTORY if engine == "BAROMETER" else 150
-        raw = await candles(symbol, interval, history_n, market, iq_state, request=request)
+        raw = await candles(symbol, interval, 150, market, iq_state, request=request)
     except HTTPException as exc:
         status = (
             "TWELVE DATA • LIMITE/ESPERA"
@@ -5390,10 +5576,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     closed = raw[:-1] if len(raw) > 1 else raw
 
     # 33.78.0: dois motores independentes e selecionáveis no painel.
-    # ROBÔ PRINCIPAL usa o BAROMETER convertido do MQL4, confirmado somente em candle fechado.
+    # IA GRÁFICA substitui o antigo Robô Principal/RSI e usa somente leitura estrutural de preço.
     # INTELIGÊNCIA ARTIFICIAL é IA PURA: recebe somente candles OHLCV fechados
-    # e decide CALL, PUT ou NEUTRO sem usar indicadores técnicos internos
-    # ou scores técnicos do Robô Principal na decisão.
+    # e decide CALL, PUT ou NEUTRO sem usar RSI, médias, MACD, Bollinger, ATR
+    # ou qualquer outro indicador/score interno na decisão.
     if ai_only and NEW_PRIMARY_INDICATOR_ENABLED:
         tf_label = {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval)
         if engine == "SMART":
@@ -5406,8 +5592,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "INDICADOR"
             engine_mode = "HIDDEN_INDICATOR_TEST"
         else:
-            engine_title = "ROBÔ PRINCIPAL"
-            engine_mode = "BAROMETER_NON_REPAINT"
+            engine_title = "IA GRÁFICA"
+            engine_mode = "GRAPH_AI_STRUCTURE"
 
         if market != "OPEN":
             out = neutral_signal(
@@ -5420,11 +5606,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("EA" if engine == "EA" else ("INDICADOR" if engine == "INDICATOR" else f"{engine_title} {tf_label}")),
                 "mode": engine_mode,
                 "selected_engine": engine,
-                "ai_provider": "EXTERNAL_AI" if engine == "SMART" else "DISABLED",
+                "ai_provider": (analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else "DISABLED",
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
-                    else ({"ea_binary": True, "sma_period": 70, "rsi_period": 14, "rsi_high": 80, "rsi_low": 20} if engine == "EA" else ({"hidden": True, "mode": "INDICATOR"} if engine == "INDICATOR" else {"legacy_disabled": True, "indicator": "BAROMETER", "non_repaint": True, "params": {"perMean": BAROMETER_PER_MEAN, "BarsCalculus": BAROMETER_BARS_CALCULUS, "factor": BAROMETER_FACTOR, "barsmin": BAROMETER_BARSMIN, "barsmax": BAROMETER_BARSMAX}}))
+                    else ({"ea_binary": True, "sma_period": 70, "rsi_period": 14, "rsi_high": 80, "rsi_low": 20} if engine == "EA" else ({"hidden": True, "mode": "INDICATOR"} if engine == "INDICATOR" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]}))
                 ),
                 "legacy_ai_disabled": engine != "SMART",
                 "legacy_indicators_disabled": True,
@@ -5436,7 +5622,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = (closed[-BAROMETER_HISTORY:] if engine == "BAROMETER" else (closed[-90:] if len(closed) > 90 else closed))
+            engine_closed = closed[-90:] if len(closed) > 90 else closed
             if engine == "SMART":
                 analysis = await openai_direct_signal(symbol, interval, engine_closed, market)
             elif engine == "EA":
@@ -5444,7 +5630,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "INDICATOR":
                 analysis = hidden_indicator_strategy(engine_closed, interval)
             else:
-                analysis = barometer_strategy(engine_closed, interval)
+                analysis = await graphic_ai_strategy(symbol, interval, engine_closed, market, request=request, iq_state=iq_state)
         except Exception as exc:
             out = neutral_signal(
                 symbol, interval, market,
@@ -5468,9 +5654,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine == "SMART" and analysis.get("confirmed")),
+            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI") and analysis.get("confirmed")),
             "ai_provider": (analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else "DISABLED",
-            "risk": str(analysis.get("risk", "HIGH") if engine == "SMART" else "HIGH").upper(),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI") else "HIGH").upper(),
             "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("EA" if engine == "EA" else ("INDICADOR" if engine == "INDICATOR" else analysis.get("strategy", f"{engine_title} {tf_label}"))),
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
@@ -5509,7 +5695,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             signal_fingerprint = f"{engine}|{direction_now}|{reference_candle}"
             fingerprint_key = (
                 "pure_ai_fingerprint" if engine == "SMART"
-                else ("ea_fingerprint" if engine == "EA" else ("indicator_fingerprint" if engine == "INDICATOR" else "barometer_fingerprint"))
+                else ("ea_fingerprint" if engine == "EA" else ("indicator_fingerprint" if engine == "INDICATOR" else "primary_rsi_fingerprint"))
             )
             if release_state.get(fingerprint_key) != signal_fingerprint:
                 announce, entry, expiry = entry_window(interval, entry_mode)
@@ -5906,7 +6092,7 @@ async def manifest():
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v82",
+        "start_url": "/?pwa=v64",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
@@ -7014,17 +7200,17 @@ async def telegram_send(body: TelegramSignalBody):
 
 
 @app.get("/signal-ai")
-async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "BAROMETER", entry_mode: str = "BIRTH"):
+async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH"):
     requested_market = (market or "OPEN").upper()
-    engine = (engine or "BAROMETER").upper()
-    if engine == "RSI":
-        engine = "BAROMETER"
+    engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
 
     if symbol not in SYMBOLS or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
-    if engine not in ("BAROMETER", "SMART", "EA", "INDICATOR"):
-        raise HTTPException(400, "Motor inválido. Use BAROMETER, SMART, EA ou INDICATOR.")
+    if engine == "RSI":
+        engine = "GRAPH_AI"
+    if engine not in ("GRAPH_AI", "SMART", "EA", "INDICATOR"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA ou INDICATOR.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
     fallback_twelve = requested_market == "IQ_OTC" and not state
@@ -7469,16 +7655,16 @@ async def chart_pre_signal(
         }
 
 @app.get("/radar")
-async def radar(request: Request, interval="1min", market="OPEN", engine: str = "BAROMETER"):
+async def radar(request: Request, interval="1min", market="OPEN", engine: str = "GRAPH_AI"):
     market = (market or "OPEN").upper()
-    engine = (engine or "BAROMETER").upper()
-    if engine == "RSI":
-        engine = "BAROMETER"
+    engine = (engine or "GRAPH_AI").upper()
 
     if interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Intervalo ou mercado inválido.")
-    if engine not in ("BAROMETER", "SMART", "EA", "INDICATOR"):
-        raise HTTPException(400, "Motor inválido. Use BAROMETER, SMART, EA ou INDICATOR.")
+    if engine == "RSI":
+        engine = "GRAPH_AI"
+    if engine not in ("GRAPH_AI", "SMART", "EA", "INDICATOR"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA ou INDICATOR.")
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if requested_market == "IQ_OTC" else None
@@ -7531,8 +7717,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     cache[idx_key] = (time.time(), (idx + 1) % len(scan_symbols))
 
     try:
-        radar_history_n = BAROMETER_HISTORY if engine == "BAROMETER" else 90
-        raw = await candles(sym, interval, radar_history_n, market, iq_state, request=request)
+        raw = await candles(sym, interval, 90, market, iq_state, request=request)
         if len(raw) >= 25:
             closed = raw[:-1] if len(raw) > 1 else raw
             if market == "OPEN":
@@ -7561,9 +7746,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     engine_label = "INDICADOR"
                     status_text = ("INDICADOR • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else "INDICADOR • MONITORANDO")
                 else:
-                    tech = barometer_strategy(closed, interval)
+                    tech = await graphic_ai_strategy(sym, interval, closed, market, request=request, iq_state=iq_state)
                     direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
-                    engine_label = "ROBÔ PRINCIPAL"
+                    engine_label = "IA GRÁFICA"
                     status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO")
             else:
                 tech = {"direction": "NEUTRO", "confidence": 0, "confirmed": False}
@@ -8268,7 +8453,7 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=82">
+<link rel="manifest" href="/manifest.webmanifest?v=66">
 <link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=66">
 <link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=66">
 <meta name="theme-color" content="#07182b">
@@ -8447,10 +8632,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   <div class="robot-mode-card" id="robotModeCard">
-    <img src="__MEGA_IMAGE__" alt="Robô principal">
+    <img src="__MEGA_IMAGE__" alt="IA Gráfica">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">🤖 ROBÔ PRINCIPAL</div>
-      <div class="robot-mode-desc" id="robotModeDesc">BAROMETER • sinal somente no candle fechado • sem repaint.</div>
+      <div class="robot-mode-title">🧠 IA GRÁFICA</div>
+      <div class="robot-mode-desc" id="robotModeDesc">Price action • padrões de vela • regiões H1 • Dow H4 • LTA/LTB • candles fechados.</div>
     </div>
     <button id="robotPowerBtn" type="button" style="font-weight:900">🟢 ONLINE</button>
   </div>
@@ -8928,7 +9113,7 @@ function selectedRobotEngine(){
   if(eaEnabled) return 'EA';
   if(indicatorEnabled) return 'INDICATOR';
   if(aiEnabled) return 'SMART';
-  if(robotEnabled) return 'BAROMETER';
+  if(robotEnabled) return 'GRAPH_AI';
   return 'OFF';
 }
 const otcNote=document.getElementById('otcNote');
@@ -11227,8 +11412,8 @@ function applyRobotPowerState(){
   }
 
   if(robotModeDesc) robotModeDesc.textContent=robotEnabled
-    ? 'ONLINE: BAROMETER analisando somente candles fechados • sem repaint.'
-    : 'OFFLINE: robô principal pausado.';
+    ? 'ONLINE: IA Gráfica lendo padrões, H1, Dow H4 e LTA/LTB sem RSI.'
+    : 'OFFLINE: IA Gráfica pausada.';
   if(aiModeDesc) aiModeDesc.textContent=aiEnabled
     ? 'ONLINE: IA pura analisando somente candles e contexto de preço, sem indicadores.'
     : 'OFFLINE: análise inteligente pausada.';
@@ -11255,14 +11440,14 @@ function applyRobotPowerState(){
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 Inteligência Artificial selecionada.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar IA pura ativo • analisando candles</div>';
     rad();
-  }else if(engine==='BAROMETER'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔ PRINCIPAL • BAROMETER ONLINE • SEM REPAINT';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 BAROMETER selecionado no Robô Principal.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar BAROMETER ativo • procurando troca confirmada do trail</div>';
+  }else if(engine==='GRAPH_AI'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA GRÁFICA ONLINE • PADRÕES + H1 + DOW H4 + LTA/LTB';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Gráfica selecionada.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar da IA Gráfica ativo • procurando oportunidades</div>';
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ Robô principal, Inteligência Artificial, EA e Indicador estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial, EA e Indicador estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -11564,7 +11749,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':(selectedRobotEngine()==='INDICATOR'?'INDICADOR':'ROBÔ PRINCIPAL'))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
+    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':(selectedRobotEngine()==='INDICATOR'?'INDICADOR':'IA GRÁFICA'))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
     await sig(true);
   }finally{
     radarAutoBusy=false;
@@ -12072,19 +12257,18 @@ async function bootApp(){
     await new Promise(r=>setTimeout(r,700));
   }
 
-  // Abre o painel primeiro. O BAROMETER precisa de histórico longo e não deve
-  // bloquear a primeira pintura da tela nem disputar a primeira requisição com o radar.
+  if(appEnabled) safe('signal',()=>sig(false));
   if(appEnabled){
-    setTimeout(()=>safe('signal',()=>sig(false)),350);
-    setTimeout(()=>safe('performance',perf),700);
-    setTimeout(()=>safe('radar',rad),2200);
+    safe('radar',rad);
   }
   if(appEnabled && selectedRobotEngine()!=='OFF'){
-    setTimeout(()=>safe('pre-signals',loadPreSignals),3200);
+    safe('pre-signals',loadPreSignals);
   }
   if(appEnabled && chartTab.classList.contains('active')){
-    setTimeout(()=>safe('chart',loadChart),1200);
+    safe('chart',loadChart);
   }
+
+  if(appEnabled) safe('performance',perf);
 }
 
 bootApp().catch(err=>{
