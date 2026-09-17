@@ -26,7 +26,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.5"
+APP_VERSION = "3.6"
 PWA_VERSION = "v82"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -5765,6 +5765,28 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 else ("ea_fingerprint" if engine == "EA" else ("indicator_fingerprint" if engine == "INDICATOR" else "primary_rsi_fingerprint"))
             )
             if release_state.get(fingerprint_key) != signal_fingerprint:
+                # v3.6: SOMENTE a IA GRÁFICA tem intervalo mínimo de 4 minutos
+                # entre sinais liberados. Os demais motores mantêm seu comportamento.
+                if engine == "GRAPH_AI":
+                    graph_gap_seconds = 240
+                    last_graph_signal_ts = float(release_state.get("last_graph_signal_ts", 0.0) or 0.0)
+                    graph_remaining = max(
+                        0,
+                        int(graph_gap_seconds - (time.time() - last_graph_signal_ts))
+                    ) if last_graph_signal_ts else 0
+
+                    if graph_remaining > 0:
+                        base["status"] = "ONLINE • IA GRÁFICA • INTERVALO DE 4 MINUTOS"
+                        base["reason"] = (
+                            f"Novo sinal gráfico bloqueado por mais {graph_remaining}s "
+                            "para manter no mínimo 4 minutos entre entradas."
+                        )
+                        base["graph_signal_gap_seconds"] = graph_gap_seconds
+                        base["graph_signal_gap_remaining"] = graph_remaining
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
+
                 announce, entry, expiry = entry_window(interval, entry_mode)
                 base.update({
                     "direction": direction_now,
@@ -5776,6 +5798,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "reference_candle": reference_candle,
                 })
                 release_state[fingerprint_key] = signal_fingerprint
+                if engine == "GRAPH_AI":
+                    release_state["last_graph_signal_ts"] = time.time()
+                    base["graph_signal_gap_seconds"] = 240
+                    base["graph_signal_gap_remaining"] = 0
                 release_state["active_signal"] = dict(base)
             else:
                 base["status"] = f"ONLINE • {engine_title} • SINAL JÁ UTILIZADO"
