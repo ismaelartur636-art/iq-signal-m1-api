@@ -26,7 +26,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.4"
+APP_VERSION = "3.5"
 PWA_VERSION = "v82"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -5479,6 +5479,34 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         st["last_result"] = dict(out)
         print(f"[IA FALLBACK MONITOR] {symbol} {interval} LOCAL_OHLCV | API: {str(exc)[:160]}", flush=True)
         return out
+
+
+def next_boundary(interval):
+    seconds = INTERVALS[interval]
+    timestamp = int(now().timestamp())
+    return datetime.fromtimestamp(((timestamp // seconds) + 1) * seconds, tz=BR_TZ)
+
+
+ENTRY_MODES = {"BIRTH", "MIDDLE", "CLOSE"}
+
+
+def normalize_entry_mode(value: str | None) -> str:
+    mode = str(value or "BIRTH").strip().upper()
+    aliases = {
+        "NASCIMENTO": "BIRTH",
+        "NASCER": "BIRTH",
+        "MEIO": "MIDDLE",
+        "FECHAMENTO": "CLOSE",
+    }
+    mode = aliases.get(mode, mode)
+    return mode if mode in ENTRY_MODES else "BIRTH"
+
+
+def current_boundary(interval):
+    seconds = INTERVALS[interval]
+    timestamp = int(now().timestamp())
+    return datetime.fromtimestamp((timestamp // seconds) * seconds, tz=BR_TZ)
+
 
 def entry_window(interval, entry_mode="BIRTH"):
     """Agenda entradas sempre em abertura de candle para manter a apuração exata.
