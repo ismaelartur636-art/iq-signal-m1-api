@@ -27,7 +27,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.16"
+APP_VERSION = "3.17"
 PWA_VERSION = "v88"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -82,7 +82,7 @@ telegram_sent_cache: Dict[str, float] = {}
 
 TD_URL = "https://api.twelvedata.com/time_series"
 TD_WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
-# MEGA IA 3.16 — Crypto IDX da Binomo + stream público de cotações + multifuente/multibroker.
+# MEGA IA 3.17 — Crypto IDX da Binomo + login autorizado + feed autenticado + multifuente/multibroker.
 # Nenhuma destas fontes públicas é usada para fingir OTC da IQ Option.
 BINANCE_KLINES_URLS = [
     "https://api.binance.com/api/v3/klines",
@@ -107,16 +107,34 @@ BINOMO_EXTRA_HEADERS_JSON = os.getenv("BINOMO_EXTRA_HEADERS_JSON", "").strip()
 # Stream de cotações do Crypto IDX. É um endpoint não documentado da Binomo;
 # por isso fica isolado, com diagnóstico e fallback, e nunca é usado para
 # inventar preços quando estiver indisponível. Não usa SSID, senha ou login.
-BINOMO_QUOTE_WS_ENABLED = os.getenv("BINOMO_QUOTE_WS_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
+BINOMO_QUOTE_WS_ENABLED = os.getenv("BINOMO_QUOTE_WS_ENABLED", "0").strip().lower() not in ("0", "false", "off", "no")
 BINOMO_QUOTE_WS_URL = os.getenv("BINOMO_QUOTE_WS_URL", "wss://as.binomo.com/").strip() or "wss://as.binomo.com/"
 BINOMO_QUOTE_WS_FRESH_SECONDS = float(os.getenv("BINOMO_QUOTE_WS_FRESH_SECONDS", "20"))
 BINOMO_QUOTE_WS_RECONNECT_SECONDS = float(os.getenv("BINOMO_QUOTE_WS_RECONNECT_SECONDS", "5"))
+# Login REST + WebSocket autenticado. A senha é usada somente durante o POST
+# de login e nunca é persistida em binomo_sessions. O token de autenticação
+# fica apenas na memória do processo Render até logout/restart/expiração.
+BINOMO_LOGIN_URL_V2 = os.getenv(
+    "BINOMO_LOGIN_URL_V2",
+    "https://api.binomo.com/passport/v2/sign_in?locale=en",
+).strip()
+BINOMO_LOGIN_URL_V1 = os.getenv(
+    "BINOMO_LOGIN_URL_V1",
+    "https://api.binomo.com/passport/v1/sign_in?locale=en",
+).strip()
+BINOMO_AUTH_WS_ENABLED = os.getenv("BINOMO_AUTH_WS_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
+BINOMO_AUTH_WS_URL = os.getenv(
+    "BINOMO_AUTH_WS_URL",
+    "wss://ws.binomo.com/?v=2&vsn=2.0.0",
+).strip() or "wss://ws.binomo.com/?v=2&vsn=2.0.0"
+BINOMO_SESSION_TTL = int(os.getenv("BINOMO_SESSION_TTL", "21600"))
+BINOMO_AUTH_WS_RECONNECT_SECONDS = float(os.getenv("BINOMO_AUTH_WS_RECONNECT_SECONDS", "6"))
 MULTIFEED_ENABLED = os.getenv("MULTIFEED_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
 PUBLIC_FEED_TIMEOUT = float(os.getenv("PUBLIC_FEED_TIMEOUT", "12"))
 PUBLIC_FEED_STALE_MAX_AGE = float(os.getenv("PUBLIC_FEED_STALE_MAX_AGE", "240"))
 PUBLIC_FEED_USER_AGENT = os.getenv(
     "PUBLIC_FEED_USER_AGENT",
-    "Mozilla/5.0 (compatible; MEGA-IA/3.16; +https://render.com)"
+    "Mozilla/5.0 (compatible; MEGA-IA/3.17; +https://render.com)"
 ).strip()
 OAI_URL = "https://api.openai.com/v1/responses"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -579,7 +597,7 @@ def _binomo_quote_ws_rows(interval: str, n: int = 80):
     with binomo_quote_ws_lock:
         rows = [dict(x) for x in (binomo_quote_ws_bars.get(key) or [])]
         last_tick = float(binomo_quote_ws_last_tick_at or 0)
-        connected = bool(binomo_quote_ws_connected)
+        connected = bool(binomo_quote_ws_connected) or _binomo_any_authenticated_ws_connected()
     if not rows:
         return []
     # Não entrega stream abandonado como se ainda estivesse online.
@@ -721,6 +739,7 @@ async def _start_twelve_data_websocket():
 async def _stop_twelve_data_websocket():
     _td_ws_stop_now()
     _binomo_quote_ws_stop_now()
+    _close_all_binomo_sessions()
 
 # IQ OPTION — implementação reconstruída do zero.
 # O login é feito somente pelo painel; não há credenciais IQ no Render.
@@ -733,8 +752,16 @@ IQ_RECONNECT_BASE = float(os.getenv("IQ_RECONNECT_BASE", "4"))
 IQ_RECONNECT_MAX = float(os.getenv("IQ_RECONNECT_MAX", "45"))
 iq_sessions: Dict[str, Dict[str, Any]] = {}
 
+# BINOMO — sessão separada e somente para leitura do Crypto IDX.
+BINOMO_SESSION_COOKIE = "mega_binomo_session"
+binomo_sessions: Dict[str, Dict[str, Any]] = {}
+
 VALID_MARKETS = ("OPEN", "IQ_OTC")
 
+
+class BinomoLoginBody(BaseModel):
+    email: str
+    password: str
 
 
 class IQLoginBody(BaseModel):
@@ -937,7 +964,384 @@ def _iq_state_for_request(request: Request, required: bool = False):
     return _iq_session_state(request, required=required)
 
 
+# BINOMO / CRYPTO IDX — autenticação de sessão e stream somente leitura --------
+def _binomo_any_authenticated_ws_connected() -> bool:
+    try:
+        return any(bool(state.get("ws_connected")) for state in binomo_sessions.values())
+    except Exception:
+        return False
 
+
+def _binomo_close_state(state: Dict[str, Any] | None):
+    if not state:
+        return
+    stop = state.get("ws_stop")
+    try:
+        if stop is not None:
+            stop.set()
+    except Exception:
+        pass
+    app_ws = state.get("ws_app")
+    try:
+        if app_ws is not None:
+            app_ws.close()
+    except Exception:
+        pass
+    state["ws_app"] = None
+    state["ws_connected"] = False
+    state["auth_token"] = ""
+    state["cookies"] = {}
+
+
+def _cleanup_binomo_sessions():
+    now_ts = time.time()
+    expired = [
+        token for token, state in list(binomo_sessions.items())
+        if now_ts - float(state.get("last_seen", now_ts)) > BINOMO_SESSION_TTL
+    ]
+    for token in expired:
+        state = binomo_sessions.pop(token, None)
+        _binomo_close_state(state)
+
+
+def _close_all_binomo_sessions():
+    for token, state in list(binomo_sessions.items()):
+        _binomo_close_state(state)
+    binomo_sessions.clear()
+
+
+def _binomo_session_state(request: Request, required: bool = False):
+    _cleanup_binomo_sessions()
+    header_token = request.headers.get("X-Binomo-Session", "")
+    cookie_token = request.cookies.get(BINOMO_SESSION_COOKIE, "")
+    for token in (header_token, cookie_token):
+        if not token:
+            continue
+        state = binomo_sessions.get(token)
+        if state:
+            state["session_id"] = token
+            state["last_seen"] = time.time()
+            return state
+    if required:
+        raise HTTPException(401, "Conecte a Binomo na aba Corretora para autorizar o Crypto IDX.")
+    return None
+
+
+def _binomo_login_error(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    candidates = []
+    if isinstance(payload, dict):
+        for key in ("message", "error", "detail", "description"):
+            value = payload.get(key)
+            if value:
+                candidates.append(str(value))
+        data = payload.get("data")
+        if isinstance(data, dict):
+            for key in ("message", "error", "detail"):
+                value = data.get(key)
+                if value:
+                    candidates.append(str(value))
+        errors = payload.get("errors")
+        if isinstance(errors, (list, tuple)):
+            candidates.extend(str(x) for x in errors[:2])
+    msg = " | ".join(x for x in candidates if x).strip()
+    if response.status_code in (401, 422) and not msg:
+        msg = "credenciais recusadas"
+    elif response.status_code == 403 and not msg:
+        msg = "acesso recusado pelo servidor/Cloudflare"
+    elif response.status_code == 429 and not msg:
+        msg = "muitas tentativas; aguarde antes de tentar novamente"
+    return (msg or f"HTTP {response.status_code}")[:260]
+
+
+async def _binomo_login_http(email: str, password: str, device_id: str):
+    """Faz somente o login REST e devolve token/cookies; nunca persiste senha."""
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "pt-BR,pt;q=0.9,en;q=0.7",
+        "content-type": "application/json",
+        "device-id": str(device_id),
+        "device-type": "web",
+        "origin": "https://binomo.com",
+        "referer": "https://binomo.com/",
+        "user-agent": PUBLIC_FEED_USER_AGENT,
+        "user-timezone": "America/Sao_Paulo",
+    }
+    payload = {"email": email, "password": password}
+    timeout = httpx.Timeout(max(10.0, BINOMO_FEED_TIMEOUT), connect=max(10.0, BINOMO_FEED_TIMEOUT))
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+        # Ajuda a obter os cookies públicos antes do POST, mas uma falha aqui não impede o login.
+        try:
+            await client.get("https://binomo.com/")
+        except Exception:
+            pass
+
+        response = await client.post(BINOMO_LOGIN_URL_V2, json=payload)
+        if response.status_code in (404, 405, 422) and BINOMO_LOGIN_URL_V1:
+            response = await client.post(BINOMO_LOGIN_URL_V1, json=payload)
+        if response.status_code != 200:
+            raise RuntimeError(_binomo_login_error(response))
+
+        try:
+            obj = response.json()
+        except Exception as exc:
+            raise RuntimeError("Login Binomo respondeu sem JSON válido.") from exc
+
+        data = obj.get("data") if isinstance(obj, dict) else None
+        if not isinstance(data, dict):
+            data = obj if isinstance(obj, dict) else {}
+        auth_token = str(data.get("authtoken") or data.get("auth_token") or data.get("token") or "").strip()
+        user_id = str(data.get("user_id") or data.get("userId") or data.get("id") or "").strip()
+        if not auth_token:
+            raise RuntimeError("Login aceito, mas a Binomo não devolveu o token de sessão esperado.")
+        cookies = {str(k): str(v) for k, v in client.cookies.items()}
+        cookies["authtoken"] = auth_token
+        cookies["device_type"] = "web"
+        cookies["device_id"] = str(device_id)
+        return auth_token, user_id, cookies
+
+
+def _binomo_auth_ws_extract(message):
+    """Extrai ticks do Z-CRY/IDX de mensagens Phoenix/JSON sem assumir um único evento."""
+    found = []
+    try:
+        # Mantém compatibilidade com o formato antigo de as.binomo.com.
+        found.extend(_binomo_quote_ws_extract(message))
+    except Exception:
+        pass
+    try:
+        root = json.loads(message) if isinstance(message, str) else message
+    except Exception:
+        return found
+
+    target_values = {
+        BINOMO_CRYPTO_IDX_RIC.upper(),
+        BINOMO_CRYPTO_IDX_SYMBOL.upper(),
+        BINOMO_CRYPTO_IDX_RIC.replace("/", "").upper(),
+    }
+    seen = {(round(float(px), 10), int(dt.timestamp())) for px, dt in found}
+
+    def asset_match(value) -> bool:
+        text = str(value or "").strip().upper()
+        compact = text.replace("/", "")
+        return text in target_values or compact in target_values or BINOMO_CRYPTO_IDX_RIC.upper() in text
+
+    def add(price, raw_time=None):
+        try:
+            px = float(price)
+            if px <= 0:
+                return
+            dt = _binomo_parse_timestamp(raw_time).astimezone(UTC) if raw_time is not None else datetime.now(UTC)
+            key = (round(px, 10), int(dt.timestamp()))
+            if key in seen:
+                return
+            seen.add(key)
+            found.append((px, dt))
+        except Exception:
+            return
+
+    def walk(node, asset_context=False):
+        if isinstance(node, dict):
+            local = asset_context
+            topic = str(node.get("topic") or "")
+            if "asset:" in topic.lower() and asset_match(topic.split(":", 1)[-1]):
+                local = True
+            for key in ("ric", "asset", "symbol", "ticker", "instrument", "name"):
+                if key in node and asset_match(node.get(key)):
+                    local = True
+                    break
+            if local:
+                price = None
+                for key in ("rate", "price", "value", "close", "last", "quote"):
+                    value = node.get(key)
+                    if isinstance(value, (int, float, str)) and str(value).strip():
+                        try:
+                            float(value)
+                            price = value
+                            break
+                        except Exception:
+                            pass
+                if price is not None:
+                    raw_time = None
+                    for key in ("created_at", "createdAt", "timestamp", "time", "t", "ts", "updated_at"):
+                        if node.get(key) is not None:
+                            raw_time = node.get(key)
+                            break
+                    add(price, raw_time)
+            for key, value in node.items():
+                if isinstance(value, (dict, list, tuple)):
+                    walk(value, local or (key == "payload" and asset_context))
+        elif isinstance(node, (list, tuple)):
+            if asset_context and len(node) >= 2:
+                # Alguns streams compactam [timestamp, price]. Só aceita dentro do tópico do ativo.
+                try:
+                    float(node[-1])
+                    add(node[-1], node[-2])
+                except Exception:
+                    pass
+            for item in node:
+                if isinstance(item, (dict, list, tuple)):
+                    walk(item, asset_context)
+
+    walk(root, False)
+    return found
+
+
+def _binomo_ws_cookie_header(state: Dict[str, Any], ws_device: str) -> str:
+    cookies = dict(state.get("cookies") or {})
+    token = str(state.get("auth_token") or "")
+    if token:
+        cookies["authtoken"] = token
+    cookies["device_type"] = "web"
+    cookies["device_id"] = str(ws_device)
+    return "; ".join(f"{k}={v}" for k, v in cookies.items() if k and v is not None)
+
+
+def _binomo_auth_ws_run(state: Dict[str, Any]):
+    if websocket is None:
+        state["ws_last_error"] = "websocket-client não instalado"
+        return
+    stop = state.get("ws_stop")
+    if stop is None:
+        stop = threading.Event()
+        state["ws_stop"] = stop
+
+    candidates = []
+    for value in (state.get("user_id"), state.get("device_id")):
+        value = str(value or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+    if not candidates:
+        candidates = [str(state.get("device_id") or "web")]
+
+    attempt = 0
+    while not stop.is_set() and state.get("auth_token"):
+        ws_device = candidates[attempt % len(candidates)]
+        attempt += 1
+        token = str(state.get("auth_token") or "")
+        sep = "&" if "?" in BINOMO_AUTH_WS_URL else "?"
+        ws_url = (
+            BINOMO_AUTH_WS_URL
+            + sep
+            + "authtoken=" + urllib.parse.quote(token, safe="")
+            + "&device=web&device_id=" + urllib.parse.quote(ws_device, safe="")
+        )
+        header_lines = [
+            "Cache-Control: no-cache",
+            "Pragma: no-cache",
+            "Accept-Language: pt-BR,pt;q=0.9,en;q=0.7",
+            f"User-Agent: {PUBLIC_FEED_USER_AGENT}",
+            f"authorization-token: {token}",
+            f"device-id: {ws_device}",
+            "device-type: web",
+        ]
+        cookie_header = _binomo_ws_cookie_header(state, ws_device)
+        state["ws_mode"] = f"AUTH_DEVICE_{'USER_ID' if ws_device == str(state.get('user_id') or '') else 'LOGIN_DEVICE'}"
+        state["ws_last_attempt"] = time.time()
+        state["ws_last_error"] = ""
+
+        heartbeat_stop = threading.Event()
+
+        try:
+            def on_open(ws):
+                state["ws_connected"] = True
+                state["ws_last_error"] = ""
+                state["ws_last_message_at"] = time.time()
+                auth_join = {
+                    "topic": "auth",
+                    "event": "phx_join",
+                    "payload": {"token": token, "device_id": ws_device},
+                    "ref": "1",
+                }
+                asset_join = {
+                    "topic": f"asset:{BINOMO_CRYPTO_IDX_RIC}",
+                    "event": "phx_join",
+                    "payload": {},
+                    "ref": "2",
+                    "join_ref": "2",
+                }
+                try:
+                    ws.send(json.dumps(auth_join, separators=(",", ":")))
+                    ws.send(json.dumps(asset_join, separators=(",", ":")))
+                except Exception as exc:
+                    state["ws_last_error"] = f"Falha ao assinar Crypto IDX: {str(exc)[:180]}"
+
+                def heartbeat_loop():
+                    ref = 100
+                    while not heartbeat_stop.wait(22.0) and not stop.is_set():
+                        try:
+                            ref += 1
+                            ws.send(json.dumps({
+                                "topic": "phoenix",
+                                "event": "heartbeat",
+                                "payload": {},
+                                "ref": str(ref),
+                            }, separators=(",", ":")))
+                        except Exception:
+                            break
+                threading.Thread(target=heartbeat_loop, name="binomo-auth-heartbeat", daemon=True).start()
+
+            def on_message(ws, message):
+                state["ws_last_message_at"] = time.time()
+                hits = _binomo_auth_ws_extract(message)
+                if hits:
+                    state["ws_last_tick_at"] = time.time()
+                    for px, dt in hits:
+                        _binomo_quote_ws_update(px, dt)
+
+            def on_error(ws, error):
+                state["ws_last_error"] = str(error)[:260]
+
+            def on_close(ws, status_code, close_msg):
+                state["ws_connected"] = False
+                heartbeat_stop.set()
+                if close_msg or status_code:
+                    state["ws_last_error"] = f"close {status_code}: {close_msg or ''}"[:260]
+
+            app_ws = websocket.WebSocketApp(
+                ws_url,
+                header=header_lines,
+                cookie=cookie_header,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            state["ws_app"] = app_ws
+            app_ws.run_forever(
+                origin="https://binomo.com",
+                ping_interval=20,
+                ping_timeout=10,
+            )
+        except Exception as exc:
+            state["ws_last_error"] = str(exc)[:260]
+        finally:
+            heartbeat_stop.set()
+            state["ws_connected"] = False
+            state["ws_app"] = None
+        if not stop.wait(max(1.0, BINOMO_AUTH_WS_RECONNECT_SECONDS)):
+            continue
+
+
+def _start_binomo_auth_ws(state: Dict[str, Any]) -> bool:
+    if not BINOMO_AUTH_WS_ENABLED or websocket is None or not state.get("auth_token"):
+        return False
+    thread = state.get("ws_thread")
+    if thread and thread.is_alive():
+        return True
+    stop = state.get("ws_stop")
+    if stop is None:
+        stop = threading.Event()
+        state["ws_stop"] = stop
+    else:
+        stop.clear()
+    thread = threading.Thread(target=_binomo_auth_ws_run, args=(state,), name="binomo-auth-crypto-idx", daemon=True)
+    state["ws_thread"] = thread
+    thread.start()
+    return True
 
 
 def ema(values, period):
@@ -4510,7 +4914,7 @@ async def _binomo_crypto_idx_candles(symbol: str, interval: str, n: int = 80):
     if str(symbol).upper() != BINOMO_CRYPTO_IDX_SYMBOL:
         raise RuntimeError("Feed Binomo reservado ao Crypto IDX.")
     errors = []
-    live_rows = _binomo_quote_ws_rows(interval, n) if BINOMO_QUOTE_WS_ENABLED else []
+    live_rows = _binomo_quote_ws_rows(interval, n)
     if len(live_rows) >= min(20, int(n)):
         return _tag_feed_rows(live_rows[-int(n):], "BINOMO_CRYPTO_IDX_WS", BINOMO_CRYPTO_IDX_RIC)
     if live_rows:
@@ -7308,6 +7712,12 @@ async def health():
             "library": bool(IQ_Option is not None),
             "sessions": len(iq_sessions),
         },
+        "binomo_crypto_idx": {
+            "auth_enabled": bool(BINOMO_AUTH_WS_ENABLED),
+            "sessions": len(binomo_sessions),
+            "authenticated_ws_connected": _binomo_any_authenticated_ws_connected(),
+            "public_ws_enabled": bool(BINOMO_QUOTE_WS_ENABLED),
+        },
         "openai": {
             "configured": bool(OAI_KEY),
             "model": OAI_MODEL or "gpt-5.6-luna",
@@ -7407,6 +7817,112 @@ async def manifest():
         media_type="application/manifest+json",
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
+
+
+@app.get("/binomo-login-ready")
+async def binomo_login_ready():
+    return {
+        "ok": True,
+        "stage": "BACKEND_OK",
+        "websocket_client_loaded": websocket is not None,
+        "auth_ws_enabled": bool(BINOMO_AUTH_WS_ENABLED),
+        "asset": BINOMO_CRYPTO_IDX_SYMBOL,
+        "ric": BINOMO_CRYPTO_IDX_RIC,
+        "version": APP_VERSION,
+    }
+
+
+@app.post("/binomo-login")
+async def binomo_login(body: BinomoLoginBody, request: Request, response: Response):
+    email = str(body.email or "").strip()
+    password = str(body.password or "")
+    if not email or not password:
+        raise HTTPException(400, "Informe e-mail e senha da Binomo.")
+
+    # Remove somente a sessão Binomo anterior deste navegador, se existir.
+    old_token = request.headers.get("X-Binomo-Session", "") or request.cookies.get(BINOMO_SESSION_COOKIE, "")
+    old_state = binomo_sessions.pop(old_token, None) if old_token else None
+    if old_state:
+        _binomo_close_state(old_state)
+
+    app_session = secrets.token_urlsafe(32)
+    device_id = str(100000000 + secrets.randbelow(900000000))
+    try:
+        auth_token, user_id, cookies = await asyncio.wait_for(
+            _binomo_login_http(email, password, device_id),
+            timeout=max(20.0, BINOMO_FEED_TIMEOUT + 10.0),
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "A Binomo não respondeu ao login dentro do limite.")
+    except Exception as exc:
+        # Nunca inclui e-mail, senha ou token no log.
+        print(f"[BINOMO LOGIN] falhou: {type(exc).__name__}: {str(exc)[:220]}", flush=True)
+        raise HTTPException(401, "Não foi possível conectar à Binomo: " + str(exc)[:260])
+
+    state = {
+        "session_id": app_session,
+        "email_masked": _mask_email(email),
+        "auth_token": auth_token,
+        "user_id": user_id,
+        "device_id": device_id,
+        "cookies": cookies,
+        "created_at": time.time(),
+        "last_seen": time.time(),
+        "ws_connected": False,
+        "ws_last_error": "",
+        "ws_last_message_at": 0.0,
+        "ws_last_tick_at": 0.0,
+        "ws_mode": "",
+        "ws_stop": threading.Event(),
+        "ws_app": None,
+        "ws_thread": None,
+    }
+    binomo_sessions[app_session] = state
+    started = _start_binomo_auth_ws(state)
+
+    response.set_cookie(
+        BINOMO_SESSION_COOKIE,
+        app_session,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=BINOMO_SESSION_TTL,
+        expires=BINOMO_SESSION_TTL,
+        path="/",
+    )
+
+    # Dá uma pequena janela para o diagnóstico já refletir o primeiro handshake,
+    # sem transformar o login em uma espera longa.
+    if started:
+        await asyncio.sleep(0.6)
+
+    return {
+        "authenticated": True,
+        "feed_connecting": bool(started),
+        "feed_connected": bool(state.get("ws_connected")),
+        "message": (
+            "Login Binomo aceito. Feed do Crypto IDX conectado."
+            if state.get("ws_connected") else
+            "Login Binomo aceito. Tentando conectar o feed do Crypto IDX."
+            if started else
+            "Login Binomo aceito, mas o WebSocket não pôde ser iniciado."
+        ),
+        "email_masked": state["email_masked"],
+        "asset": BINOMO_CRYPTO_IDX_SYMBOL,
+        "ric": BINOMO_CRYPTO_IDX_RIC,
+        "session_token": app_session,
+    }
+
+
+@app.post("/binomo-logout")
+async def binomo_logout(request: Request, response: Response):
+    header_token = request.headers.get("X-Binomo-Session", "")
+    cookie_token = request.cookies.get(BINOMO_SESSION_COOKIE, "")
+    token = header_token if header_token in binomo_sessions else cookie_token
+    state = binomo_sessions.pop(token, None)
+    _binomo_close_state(state)
+    response.delete_cookie(BINOMO_SESSION_COOKIE, path="/")
+    return {"authenticated": False, "connected": False, "message": "Binomo desconectada."}
 
 
 @app.get("/iq-login-ready")
@@ -8146,7 +8662,8 @@ async def compatibility_test(
 
 
 @app.get("/binomo-feed-status")
-async def binomo_feed_status():
+async def binomo_feed_status(request: Request):
+    state = _binomo_session_state(request, required=False)
     active = {
         k: v for k, v in market_feed_status.items()
         if k.startswith(BINOMO_CRYPTO_IDX_SYMBOL + "|")
@@ -8156,12 +8673,60 @@ async def binomo_feed_status():
         for v in active.values() if isinstance(v, dict)
     )
     with binomo_quote_ws_lock:
-        ws_connected = bool(binomo_quote_ws_connected)
-        ws_last_tick_age = (round(max(0.0, time.time() - binomo_quote_ws_last_tick_at), 1) if binomo_quote_ws_last_tick_at else None)
-        ws_last_error = binomo_quote_ws_last_error
-        ws_counts = {k: len(v) for k, v in binomo_quote_ws_bars.items() if k.startswith(BINOMO_CRYPTO_IDX_SYMBOL + "|")}
-    connector_ready = bool(BINOMO_QUOTE_WS_ENABLED or BINOMO_DIRECT_REST_ENABLED or BINOMO_CANDLES_URL)
-    recent_success = recent_success or (ws_connected and ws_last_tick_age is not None and ws_last_tick_age <= BINOMO_QUOTE_WS_FRESH_SECONDS)
+        public_ws_connected = bool(binomo_quote_ws_connected)
+        ws_last_tick_age = (
+            round(max(0.0, time.time() - binomo_quote_ws_last_tick_at), 1)
+            if binomo_quote_ws_last_tick_at else None
+        )
+        public_ws_last_error = binomo_quote_ws_last_error
+        ws_counts = {
+            k: len(v) for k, v in binomo_quote_ws_bars.items()
+            if k.startswith(BINOMO_CRYPTO_IDX_SYMBOL + "|")
+        }
+
+    auth_ws_connected = bool(state and state.get("ws_connected"))
+    auth_ws_last_error = str(state.get("ws_last_error") or "")[:260] if state else ""
+    auth_ws_last_message_age = (
+        round(max(0.0, time.time() - float(state.get("ws_last_message_at") or 0)), 1)
+        if state and state.get("ws_last_message_at") else None
+    )
+    auth_ws_last_tick_age = (
+        round(max(0.0, time.time() - float(state.get("ws_last_tick_at") or 0)), 1)
+        if state and state.get("ws_last_tick_at") else None
+    )
+
+    any_ws_connected = public_ws_connected or auth_ws_connected
+    connector_ready = bool(
+        BINOMO_AUTH_WS_ENABLED
+        or BINOMO_QUOTE_WS_ENABLED
+        or BINOMO_DIRECT_REST_ENABLED
+        or BINOMO_CANDLES_URL
+    )
+    recent_success = recent_success or (
+        any_ws_connected
+        and ws_last_tick_age is not None
+        and ws_last_tick_age <= BINOMO_QUOTE_WS_FRESH_SECONDS
+    )
+
+    if recent_success:
+        status = "ONLINE"
+        message = "Crypto IDX recebendo cotações reais da Binomo e montando candles ao vivo."
+    elif state and auth_ws_connected:
+        status = "LOGIN OK • AGUARDANDO COTAÇÃO"
+        message = "Binomo autenticada e WebSocket aberto; aguardando a primeira cotação válida do Crypto IDX."
+    elif state:
+        status = "LOGIN OK • CONECTANDO FEED"
+        message = "Login Binomo aceito; o MEGA IA está tentando abrir o stream autenticado do Crypto IDX."
+    elif BINOMO_AUTH_WS_ENABLED:
+        status = "AGUARDANDO LOGIN BINOMO"
+        message = "Abra a aba Corretora e conecte a Binomo para autorizar o feed do Crypto IDX. Sem SSID."
+    elif connector_ready:
+        status = "PRONTO PARA TESTE"
+        message = "Conector Binomo configurado; aguardando uma fonte de cotações válida."
+    else:
+        status = "AGUARDANDO FONTE BINOMO"
+        message = "Configure um conector Binomo. O app não substitui Crypto IDX por Binance/Twelve/Yahoo."
+
     return {
         "ok": True,
         "configured": connector_ready,
@@ -8169,23 +8734,26 @@ async def binomo_feed_status():
         "asset": BINOMO_CRYPTO_IDX_SYMBOL,
         "ric": BINOMO_CRYPTO_IDX_RIC,
         "mode": "BINOMO_ONLY",
+        "session_authenticated": bool(state),
+        "session_email_masked": state.get("email_masked") if state else None,
+        "auth_ws_enabled": bool(BINOMO_AUTH_WS_ENABLED),
+        "auth_ws_connected": auth_ws_connected,
+        "auth_ws_mode": state.get("ws_mode") if state else None,
+        "auth_ws_url": BINOMO_AUTH_WS_URL,
+        "auth_ws_last_message_age_seconds": auth_ws_last_message_age,
+        "auth_ws_last_tick_age_seconds": auth_ws_last_tick_age,
+        "auth_ws_last_error": auth_ws_last_error,
         "quote_ws_enabled": bool(BINOMO_QUOTE_WS_ENABLED),
-        "quote_ws_connected": ws_connected,
+        "quote_ws_connected": public_ws_connected,
         "quote_ws_url": BINOMO_QUOTE_WS_URL,
         "quote_ws_last_tick_age_seconds": ws_last_tick_age,
-        "quote_ws_last_error": ws_last_error,
+        "quote_ws_last_error": public_ws_last_error,
         "quote_ws_candles": ws_counts,
         "direct_rest_enabled": bool(BINOMO_DIRECT_REST_ENABLED),
         "bridge_configured": bool(BINOMO_CANDLES_URL),
-        "status": ("ONLINE" if recent_success else "PRONTO PARA TESTE" if connector_ready else "AGUARDANDO FONTE BINOMO"),
+        "status": status,
         "active_series": active,
-        "message": (
-            "Crypto IDX recebendo cotações reais da Binomo e montando candles ao vivo."
-            if recent_success else
-            "Conector Binomo pronto; aguardando a primeira cotação do Crypto IDX."
-            if connector_ready else
-            "Configure um conector Binomo. O app não substitui Crypto IDX por Binance/Twelve/Yahoo."
-        ),
+        "message": message,
     }
 
 
@@ -8237,9 +8805,12 @@ async def feed_status():
             "forex_order": (["TWELVE_DATA", "YAHOO_PUBLIC"] if TD_KEY else ["YAHOO_PUBLIC"]),
             "crypto_idx_order": ["BINOMO_ONLY"],
             "binomo_crypto_idx": {
-                "configured": bool(BINOMO_QUOTE_WS_ENABLED or BINOMO_DIRECT_REST_ENABLED or BINOMO_CANDLES_URL),
+                "configured": bool(BINOMO_AUTH_WS_ENABLED or BINOMO_QUOTE_WS_ENABLED or BINOMO_DIRECT_REST_ENABLED or BINOMO_CANDLES_URL),
                 "ric": BINOMO_CRYPTO_IDX_RIC,
                 "source": "BINOMO_ONLY",
+                "authenticated_sessions": len(binomo_sessions),
+                "auth_ws_enabled": bool(BINOMO_AUTH_WS_ENABLED),
+                "auth_ws_connected": _binomo_any_authenticated_ws_connected(),
                 "quote_ws_enabled": bool(BINOMO_QUOTE_WS_ENABLED),
                 "quote_ws_connected": bool(binomo_quote_ws_connected),
                 "quote_ws_last_tick_age_seconds": (round(max(0.0, time.time() - binomo_quote_ws_last_tick_at), 1) if binomo_quote_ws_last_tick_at else None),
@@ -10772,6 +11343,35 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         A senha não é salva no navegador.
       </div>
 
+      <div class="card" style="margin-top:14px;border-color:#f0b90b">
+        <div style="font-weight:1000">📊 BINOMO • FONTE CRYPTO IDX</div>
+        <div class="label" style="margin-top:6px;line-height:1.5">
+          Conexão somente para leitura do gráfico <b>CRYPTO IDX (Z-CRY/IDX)</b>. Não executa ordens na Binomo.
+        </div>
+        <div id="binomoAccountStatus" class="card" style="margin-top:10px">
+          ⚪ Binomo desconectada • conecte para autorizar o feed do Crypto IDX.
+        </div>
+        <div style="margin-top:10px">
+          <div class="label">E-MAIL BINOMO</div>
+          <input id="binomoEmail" type="email" autocomplete="username"
+                 placeholder="seuemail@exemplo.com"
+                 style="width:100%;box-sizing:border-box;margin-top:6px">
+        </div>
+        <div style="margin-top:10px">
+          <div class="label">SENHA BINOMO</div>
+          <input id="binomoPassword" type="password" autocomplete="current-password"
+                 placeholder="Sua senha"
+                 style="width:100%;box-sizing:border-box;margin-top:6px">
+        </div>
+        <button id="binomoConnectBtn" type="button" onclick="return window.megaConnectBinomo(event)"
+                style="width:100%;margin-top:12px;font-weight:1000;border-color:#f0b90b">🔐 CONECTAR BINOMO</button>
+        <button id="binomoLogoutBtn" type="button"
+                style="width:100%;margin-top:8px;display:none">🚪 DESCONECTAR BINOMO</button>
+        <div class="label" style="margin-top:10px;line-height:1.5">
+          Sem SSID. A senha é usada somente no login e não é gravada pelo MEGA IA. O token da sessão fica apenas na memória do servidor até logout, expiração ou reinício.
+        </div>
+      </div>
+
       <div class="card" style="margin-top:14px;border-color:#19d27c">
         <div style="font-weight:1000">🤖 AUTO ENTRADA • TESTE DEMO</div>
         <div class="label" style="margin-top:6px;line-height:1.5">
@@ -11001,6 +11601,12 @@ const iqPassword=document.getElementById('iqPassword');
 const iqConnectBtn=document.getElementById('iqConnectBtn');
 const iqLogoutBtn=document.getElementById('iqLogoutBtn');
 const iqAccountStatus=document.getElementById('iqAccountStatus');
+const binomoEmail=document.getElementById('binomoEmail');
+const binomoPassword=document.getElementById('binomoPassword');
+const binomoConnectBtn=document.getElementById('binomoConnectBtn');
+const binomoLogoutBtn=document.getElementById('binomoLogoutBtn');
+const binomoAccountStatus=document.getElementById('binomoAccountStatus');
+let binomoFeedAuthenticated=false;
 const autoTradeAmount=document.getElementById('autoTradeAmount');
 const autoTradeGale=document.getElementById('autoTradeGale');
 const autoTradeGaleMultiplier=document.getElementById('autoTradeGaleMultiplier');
@@ -12097,6 +12703,10 @@ function authHeaders(extra={}){
     if(iqSession){
       h['X-IQ-Session']=iqSession;
     }
+    const binomoSession=localStorage.getItem('mega_binomo_session')||'';
+    if(binomoSession){
+      h['X-Binomo-Session']=binomoSession;
+    }
   }catch(_){}
   return h;
 }
@@ -12781,6 +13391,14 @@ async function loadChart(){
       return;
     }
 
+    if(S.value==='CRYPTO IDX' && d.ok===false && !(d.candles||[]).length){
+      chartData=[];
+      chartPreSignal=null;
+      chartInfo.textContent='⚪ CRYPTO IDX OFFLINE • '+(d.message||'Conecte a Binomo na aba Corretora');
+      drawChart([]);
+      return;
+    }
+
     let chartSourceLabel='MERCADO ABERTO • '+String(d.feed_label||d.feed_source||'MULTIFONTE').replaceAll('_',' ');
     if(useIqMirror && !openMode) chartSourceLabel='IQ OPTION • OTC';
     else if(!openMode) chartSourceLabel=brokerName()+' • OTC';
@@ -13133,6 +13751,118 @@ async function refreshAccountStatus(){
   }
   syncBroker(b);
   await updateMarketNote();
+}
+
+async function refreshBinomoStatus(){
+  if(!binomoAccountStatus) return null;
+  try{
+    const d=await get('/binomo-feed-status?t='+Date.now());
+    binomoFeedAuthenticated=!!d.session_authenticated;
+    const feedOnline=!!d.connected;
+    if(feedOnline){
+      binomoAccountStatus.textContent='🟢 BINOMO • CRYPTO IDX ONLINE • '+(d.session_email_masked||'sessão autorizada');
+    }else if(binomoFeedAuthenticated){
+      const err=String(d.auth_ws_last_error||'').trim();
+      binomoAccountStatus.textContent='🟠 LOGIN BINOMO OK • '+(d.status||'CONECTANDO FEED')+(err?' • '+err:'');
+    }else{
+      binomoAccountStatus.textContent='⚪ BINOMO DESCONECTADA • conecte para autorizar o feed do Crypto IDX.';
+    }
+    if(binomoConnectBtn) binomoConnectBtn.style.display=binomoFeedAuthenticated?'none':'block';
+    if(binomoLogoutBtn) binomoLogoutBtn.style.display=binomoFeedAuthenticated?'block':'none';
+    return d;
+  }catch(e){
+    binomoFeedAuthenticated=false;
+    binomoAccountStatus.textContent='🔴 Não foi possível verificar a sessão Binomo agora.';
+    if(binomoConnectBtn) binomoConnectBtn.style.display='block';
+    if(binomoLogoutBtn) binomoLogoutBtn.style.display='none';
+    return null;
+  }
+}
+
+window.megaConnectBinomo=async function(event){
+  if(event){
+    try{event.preventDefault();}catch(_){}
+    try{event.stopPropagation();}catch(_){}
+  }
+  const email=(binomoEmail&&binomoEmail.value||'').trim();
+  const password=(binomoPassword&&binomoPassword.value||'');
+  if(!email || !password){
+    if(binomoAccountStatus) binomoAccountStatus.textContent='🟠 Informe e-mail e senha da Binomo.';
+    return false;
+  }
+
+  if(binomoConnectBtn) binomoConnectBtn.disabled=true;
+  iqLoginInProgress=true;
+  if(binomoAccountStatus) binomoAccountStatus.textContent='🟡 Etapa 1/3: verificando conector Binomo...';
+  try{
+    try{localStorage.removeItem('mega_binomo_session');}catch(_){}
+    const ready=await fetch('/binomo-login-ready?t='+Date.now(),{method:'GET',credentials:'include',cache:'no-store'});
+    let rd=null; try{rd=await ready.json();}catch(_){}
+    if(!ready.ok || !rd || !rd.ok) throw new Error('O servidor não confirmou o conector Binomo.');
+    if(!rd.websocket_client_loaded) throw new Error('A biblioteca websocket-client não está carregada no servidor.');
+
+    if(binomoAccountStatus) binomoAccountStatus.textContent='🟡 Etapa 2/3: autenticando na Binomo...';
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),45000);
+    let r;
+    try{
+      r=await fetch('/binomo-login',{
+        method:'POST',
+        credentials:'include',
+        cache:'no-store',
+        headers:{'Content-Type':'application/json','X-Mega-Client-Version':'__APP_VERSION__'},
+        body:JSON.stringify({email:email,password:password}),
+        signal:controller.signal
+      });
+    }catch(fetchErr){
+      if(fetchErr && fetchErr.name==='AbortError') throw new Error('A Binomo não respondeu ao login dentro de 45 segundos.');
+      throw fetchErr;
+    }finally{clearTimeout(timer);}
+
+    let d=null; try{d=await r.json();}catch(_){}
+    if(!r.ok) throw new Error((d&&d.detail)?d.detail:('HTTP '+r.status));
+    if(d&&d.session_token){
+      try{localStorage.setItem('mega_binomo_session',d.session_token);}catch(_){}
+    }
+    if(binomoPassword) binomoPassword.value='';
+    if(binomoAccountStatus) binomoAccountStatus.textContent='🟡 Etapa 3/3: '+((d&&d.message)||'Login aceito; conectando feed...');
+    await new Promise(resolve=>setTimeout(resolve,900));
+    await refreshBinomoStatus();
+    await updateMarketNote();
+    if(S&&S.value==='CRYPTO IDX'){
+      chartData=[];
+      chartPreSignal=null;
+      if(chartTab&&chartTab.classList.contains('active')) await loadChart();
+    }
+  }catch(e){
+    binomoFeedAuthenticated=false;
+    if(binomoAccountStatus) binomoAccountStatus.textContent='🔴 '+String((e&&e.message)||e);
+    if(binomoConnectBtn) binomoConnectBtn.style.display='block';
+    if(binomoLogoutBtn) binomoLogoutBtn.style.display='none';
+  }finally{
+    iqLoginInProgress=false;
+    if(binomoConnectBtn) binomoConnectBtn.disabled=false;
+  }
+  return false;
+};
+
+if(binomoLogoutBtn){
+  binomoLogoutBtn.onclick=async()=>{
+    try{await post('/binomo-logout',{});}catch(_){}
+    try{localStorage.removeItem('mega_binomo_session');}catch(_){}
+    binomoFeedAuthenticated=false;
+    if(binomoPassword) binomoPassword.value='';
+    if(binomoAccountStatus) binomoAccountStatus.textContent='⚪ Binomo desconectada • Crypto IDX offline.';
+    if(binomoConnectBtn) binomoConnectBtn.style.display='block';
+    if(binomoLogoutBtn) binomoLogoutBtn.style.display='none';
+    if(S&&S.value==='CRYPTO IDX'){
+      chartData=[];
+      chartPreSignal=null;
+      if(chartInfo) chartInfo.textContent='⚪ CRYPTO IDX OFFLINE • CONECTE A BINOMO';
+      drawChart([]);
+    }
+    await updateMarketNote();
+  };
 }
 
 if(preSignalLimit){
@@ -14263,6 +14993,7 @@ async function bootApp(){
   safe('clock',clk);
   safe('license',lic);
   safe('account',refreshAccountStatus);
+  safe('binomo',refreshBinomoStatus);
   safe('market-status',updateMarketNote);
 
   if(market.value!=='OPEN'){
@@ -14295,6 +15026,7 @@ setInterval(()=>{
 },2000);
 
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) perf(); },5000);
+setInterval(()=>{ if(!iqLoginInProgress) refreshBinomoStatus(); },10000);
 // Radar automático: OPEN varre oportunidades e OTC lista somente ativos IQ disponíveis.
 // Um ativo é processado por ciclo. Na IA Gráfica o radar usa somente H1/H4 já
 // existentes em cache e nunca abre chamadas extras de timeframe alto. O ciclo de
