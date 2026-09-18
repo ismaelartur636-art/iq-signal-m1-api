@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.29"
-PWA_VERSION = "v96"
+APP_VERSION = "3.30"
+PWA_VERSION = "v97"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -137,6 +137,10 @@ CTRADER_JSON_LIVE_URL = os.getenv("CTRADER_JSON_LIVE_URL", "wss://live.ctraderap
 CTRADER_DATA_TIMEOUT = float(os.getenv("CTRADER_DATA_TIMEOUT", "12"))
 CTRADER_SYMBOL_CACHE_TTL = max(60, int(os.getenv("CTRADER_SYMBOL_CACHE_TTL", "600")))
 CTRADER_CANDLE_CACHE_TTL = max(1.0, float(os.getenv("CTRADER_CANDLE_CACHE_TTL", "3")))
+# Quando a cTrader estiver conectada e o ativo existir na conta, ela vira a
+# fonte exclusiva do Mercado Aberto. Isso evita exibir Twelve/Binance no gráfico
+# enquanto o painel diz que cTrader é a fonte principal.
+CTRADER_STRICT_PRIMARY = os.getenv("CTRADER_STRICT_PRIMARY", "1").strip().lower() not in ("0", "false", "off", "no")
 ctrader_data_guard = threading.RLock()
 ctrader_symbol_union = set()
 ctrader_last_error = ""
@@ -5107,13 +5111,33 @@ async def _binomo_crypto_idx_candles(symbol: str, interval: str, n: int = 80):
     raise RuntimeError(" | ".join(errors[-2:]))
 
 
+def _ctrader_symbol_supported(item: Dict[str, Any] | None, symbol: str) -> bool:
+    if not item:
+        return False
+    symbol_map = item.get("symbols_map") or {}
+    target = str(symbol or "").strip().upper()
+    if target in symbol_map:
+        return True
+    compact = re.sub(r"[^A-Z0-9]", "", target)
+    for row in symbol_map.values():
+        if not isinstance(row, dict):
+            continue
+        display = str(row.get("symbol") or "").strip().upper()
+        raw = str(row.get("raw_symbol") or "").strip().upper()
+        if target in (display, raw):
+            return True
+        if compact and compact in (re.sub(r"[^A-Z0-9]", "", display), re.sub(r"[^A-Z0-9]", "", raw)):
+            return True
+    return False
+
+
 async def candles_open(symbol, interval, n=80, request: Request | None = None):
     """Roteador multifuente do Mercado Aberto.
 
-    Cripto prioriza Binance pública. Forex usa Twelve Data quando a chave existe
-    e troca automaticamente para Yahoo público quando a fonte principal falha.
-    O cache multifuente serve apenas como tolerância curta a falhas; a trava de
-    idade do candle continua bloqueando sinais se os dados estiverem velhos.
+    Quando a cTrader está conectada e possui o ativo, ela é a fonte principal
+    (e, por padrão, exclusiva) do Mercado Aberto. Sem cTrader/ativo compatível,
+    o app usa o roteador legado Binance/Twelve Data/Yahoo. Crypto IDX continua
+    exclusivamente na Binomo.
     """
     n = max(20, min(int(n), 150))
     key = _open_feed_status_key(symbol, interval)
@@ -5124,10 +5148,11 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
             ctrader_session_id, ctrader_item = _ctrader_session_from_request(request)
         except Exception:
             ctrader_session_id, ctrader_item = None, None
-    cache_key = key + (f"|CTRADER:{ctrader_session_id}" if ctrader_item else "")
+    ctrader_symbol_ok = _ctrader_symbol_supported(ctrader_item, symbol)
+    cache_key = key + (f"|CTRADER:{ctrader_session_id}" if ctrader_item and ctrader_symbol_ok else "")
     now_ts = time.time()
     cached = public_feed_cache.get(cache_key)
-    ttl = min(_public_cache_ttl(interval), CTRADER_CANDLE_CACHE_TTL) if ctrader_item else _public_cache_ttl(interval)
+    ttl = min(_public_cache_ttl(interval), CTRADER_CANDLE_CACHE_TTL) if ctrader_item and ctrader_symbol_ok else _public_cache_ttl(interval)
     if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= min(20, n):
         return list(cached[1])[-n:]
 
@@ -5147,25 +5172,28 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
             # cTrader é a fonte PRINCIPAL do Mercado Aberto quando esta sessão
             # do navegador estiver autorizada. Se o ativo não existir na conta
             # ou a Open API estiver indisponível, cai nas fontes antigas.
-            if ctrader_item:
+            if ctrader_item and ctrader_symbol_ok:
                 async def _ct_provider(sym, tf, count):
                     return await _ctrader_candles(ctrader_item, sym, tf, count)
                 providers.append(("CTRADER_OPEN", _ct_provider))
 
-            if symbol in BINANCE_SYMBOLS:
-                providers.append(("BINANCE_PUBLIC", _binance_public_candles))
-                if TD_KEY:
-                    providers.append(("TWELVE_DATA", candles_open_twelve))
-                providers.append(("YAHOO_PUBLIC", _yahoo_public_candles))
-            else:
-                if TD_KEY:
-                    providers.append(("TWELVE_DATA", candles_open_twelve))
-                providers.append(("YAHOO_PUBLIC", _yahoo_public_candles))
+            # Se a cTrader tem o ativo e o modo estrito está ligado, não mascaramos
+            # falha de cTrader com outra fonte. Assim gráfico e IA usam a mesma vela.
+            if not (CTRADER_STRICT_PRIMARY and ctrader_item and ctrader_symbol_ok):
+                if symbol in BINANCE_SYMBOLS:
+                    providers.append(("BINANCE_PUBLIC", _binance_public_candles))
+                    if TD_KEY:
+                        providers.append(("TWELVE_DATA", candles_open_twelve))
+                    providers.append(("YAHOO_PUBLIC", _yahoo_public_candles))
+                else:
+                    if TD_KEY:
+                        providers.append(("TWELVE_DATA", candles_open_twelve))
+                    providers.append(("YAHOO_PUBLIC", _yahoo_public_candles))
 
         # Permite desativar o roteador e manter comportamento legado via env.
         # A exceção é Crypto IDX: ele continua BINOMO_ONLY para não falsificar o gráfico.
         if not MULTIFEED_ENABLED and symbol != BINOMO_CRYPTO_IDX_SYMBOL:
-            if ctrader_item:
+            if ctrader_item and ctrader_symbol_ok:
                 async def _ct_only_provider(sym, tf, count):
                     return await _ctrader_candles(ctrader_item, sym, tf, count)
                 providers = [("CTRADER_OPEN", _ct_only_provider)]
@@ -8765,29 +8793,35 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
     is_live = bool(entry["is_live"])
     token = str(item.get("access_token") or "").strip()
     seconds = int(INTERVALS.get(interval, 60))
-    # Janela folgada, porém compatível com os limites de histórico por período.
-    days_map = {"1min": 3, "5min": 7, "15min": 14, "30min": 30, "1h": 60, "4h": 180}
     to_ms = int(time.time() * 1000)
-    from_ms = to_ms - int(days_map.get(interval, 7) * 86400 * 1000)
+    count = max(20, min(int(n), 150))
 
+    # A documentação da cTrader permite pedir `count` para trás a partir de
+    # toTimestamp sem obrigar fromTimestamp. Isso evita rejeição por janelas
+    # históricas excessivas. Se o broker não devolver barras assim, fazemos uma
+    # segunda tentativa com uma janela proporcional ao timeframe.
     ws = _ctrader_open_socket(is_live)
     try:
         _ctrader_application_auth(ws)
         _ctrader_account_auth(ws, token, account_id)
+        request_payload = {
+            "ctidTraderAccountId": account_id,
+            "toTimestamp": to_ms,
+            "period": _ctrader_period(interval),
+            "symbolId": symbol_id,
+            "count": count,
+        }
         body = _ctrader_send_wait(
-            ws,
-            2137,
-            {
-                "ctidTraderAccountId": account_id,
-                "fromTimestamp": from_ms,
-                "toTimestamp": to_ms,
-                "period": _ctrader_period(interval),
-                "symbolId": symbol_id,
-                "count": max(20, min(int(n), 150)),
-            },
-            2138,
+            ws, 2137, request_payload, 2138,
             timeout=max(CTRADER_DATA_TIMEOUT, 15),
         )
+        if not (body.get("trendbar") or []):
+            lookback_seconds = max(seconds * count * 4, 12 * 3600)
+            request_payload["fromTimestamp"] = to_ms - int(lookback_seconds * 1000)
+            body = _ctrader_send_wait(
+                ws, 2137, request_payload, 2138,
+                timeout=max(CTRADER_DATA_TIMEOUT, 15),
+            )
     finally:
         try:
             ws.close()
@@ -8830,13 +8864,20 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
 
 
 async def _ctrader_candles(item: Dict[str, Any], symbol: str, interval: str, n: int = 80) -> list:
+    global ctrader_last_error
     try:
-        return await asyncio.wait_for(
+        rows = await asyncio.wait_for(
             asyncio.to_thread(_ctrader_candles_blocking, item, symbol, interval, n),
             timeout=max(CTRADER_DATA_TIMEOUT * 4, 35),
         )
+        ctrader_last_error = ""
+        return rows
     except asyncio.TimeoutError:
-        raise RuntimeError("cTrader demorou demais para responder aos candles.")
+        ctrader_last_error = "cTrader demorou demais para responder aos candles."
+        raise RuntimeError(ctrader_last_error)
+    except Exception as exc:
+        ctrader_last_error = str(exc)[:240]
+        raise
 
 
 @app.get("/ctrader/symbols")
@@ -9012,6 +9053,7 @@ async def health():
             "scope": CTRADER_SCOPE,
             "read_only": True,
             "primary_for_open": True,
+            "strict_primary": bool(CTRADER_STRICT_PRIMARY),
             "last_data_error": ctrader_last_error[:160],
         },
         "binomo_crypto_idx": {
@@ -15203,10 +15245,10 @@ async function loadChart(){
   const openMode=(marketMode && marketMode.value==='OPEN');
   const iqConnected=!!brokerConnected.IQ_OPTION;
 
-  // Regras do gráfico v2.6:
-  // 1) Mercado Aberto = SEMPRE Twelve Data, mesmo com a IQ Option conectada.
-  // 2) IQ OTC = candles reais OTC da sessão IQ Option.
-  // 3) OTC sem sessão IQ fica offline, pois Twelve Data não representa o OTC da IQ.
+  // Regras do gráfico v3.30:
+  // 1) Mercado Aberto = cTrader quando a sessão está conectada e o ativo existe nela.
+  // 2) Sem cTrader/ativo compatível, usa o roteador público de fallback.
+  // 3) IQ OTC = candles reais OTC da sessão IQ Option.
   if(iqSelected && !openMode && !iqConnected){
     chartData=[];
     chartPreSignal=null;
@@ -15269,7 +15311,17 @@ async function loadChart(){
       return;
     }
 
+    if(openMode && ctraderConnected && d.ok===false && !(d.candles||[]).length){
+      chartData=[];
+      chartPreSignal=null;
+      chartInfo.textContent='🔴 cTRADER • FONTE INDISPONÍVEL • '+(d.message||'Falha ao carregar candles cTrader');
+      drawChart([]);
+      return;
+    }
+
     let chartSourceLabel='MERCADO ABERTO • '+String(d.feed_label||d.feed_source||'MULTIFONTE').replaceAll('_',' ');
+    if(openMode && ctraderConnected && String(d.feed_source||'').toUpperCase()!=='CTRADER_OPEN' && S.value!=='CRYPTO IDX')
+      chartSourceLabel='⚠️ '+chartSourceLabel+' • cTrader não forneceu este ativo';
     if(useIqMirror && !openMode) chartSourceLabel='IQ OPTION • OTC';
     else if(!openMode) chartSourceLabel=brokerName()+' • OTC';
 
