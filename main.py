@@ -12,6 +12,21 @@ from typing import Any, Dict
 
 import httpx
 
+# MEGA IA 3.28 — camada estatística XGBoost para o motor de IA.
+# O app continua funcionando caso o pacote não esteja disponível no ambiente.
+try:
+    import math
+    import numpy as np
+    from xgboost import XGBClassifier
+    XGBOOST_OK = True
+    XGBOOST_IMPORT_ERROR = ""
+except Exception as exc:
+    math = None
+    np = None
+    XGBClassifier = None
+    XGBOOST_OK = False
+    XGBOOST_IMPORT_ERROR = str(exc)[:180]
+
 try:
     import websocket
 except Exception:
@@ -27,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.27"
-PWA_VERSION = "v94"
+APP_VERSION = "3.28"
+PWA_VERSION = "v95"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -50,7 +65,18 @@ GEMINI_MODEL_FALLBACKS = []
 OAI_MIN = float(os.getenv("OPENAI_MIN_CONFIDENCE", "70"))
 OAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "15"))
 
-# v2.5 — Gemini principal com proteção de quota do nível gratuito.
+# XGBoost: modelo local treinado apenas com candles fechados e validação temporal.
+# Não usa candle futuro nas features e não libera sinal sozinho.
+XGB_ENABLED = os.getenv("XGB_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
+XGB_MIN_CANDLES = max(90, int(os.getenv("XGB_MIN_CANDLES", "120")))
+XGB_MIN_TRAIN_SAMPLES = max(60, int(os.getenv("XGB_MIN_TRAIN_SAMPLES", "80")))
+XGB_RETRAIN_SECONDS = max(120, int(os.getenv("XGB_RETRAIN_SECONDS", "900")))
+XGB_MIN_PROBABILITY = min(0.80, max(0.52, float(os.getenv("XGB_MIN_PROBABILITY", "0.60"))))
+XGB_MIN_VALIDATION_ACCURACY = min(0.80, max(0.50, float(os.getenv("XGB_MIN_VALIDATION_ACCURACY", "0.52"))))
+xgb_model_cache: Dict[str, Dict[str, Any]] = {}
+xgb_model_guard = threading.RLock()
+
+# Gemini permanece como fallback com proteção de quota.
 # Defaults deixam margem abaixo do limite observado no projeto (5 RPM / 50 RPD).
 GEMINI_RPM_BUDGET = max(1, int(os.getenv("GEMINI_RPM_BUDGET", "4")))
 GEMINI_DAILY_BUDGET = max(1, int(os.getenv("GEMINI_DAILY_BUDGET", "45")))
@@ -5983,7 +6009,7 @@ async def _openai_json(prompt):
     if not OAI_KEY:
         raise RuntimeError("OPENAI_API_KEY não configurada.")
 
-    model = OAI_MODEL or "gpt-5.6-luna"
+    model = OAI_MODEL or "gpt-5.6-terra"
     headers = {
         "Authorization": f"Bearer {OAI_KEY}",
         "Content-Type": "application/json",
@@ -6024,26 +6050,26 @@ async def _openai_json(prompt):
 
 
 async def _external_ai_json(prompt):
-    """Gemini primeiro; OpenAI apenas como reserva; fallback local se ambos falharem."""
+    """GPT-5.6 Terra primeiro; Gemini como fallback quando a OpenAI falhar."""
     errors = []
-
-    if GEMINI_KEY:
-        try:
-            return await _gemini_json(prompt), "GEMINI"
-        except Exception as exc:
-            errors.append(f"Gemini: {str(exc)[:180]}")
-            print(f"[IA GEMINI] principal falhou; tentando reserva: {str(exc)[:180]}", flush=True)
-    else:
-        errors.append("Gemini: GEMINI_API_KEY não configurada")
 
     if OAI_KEY:
         try:
-            return await _openai_json(prompt), "OPENAI"
+            return await _openai_json(prompt), "OPENAI_TERRA"
         except Exception as exc:
             errors.append(f"OpenAI: {str(exc)[:180]}")
-            print(f"[IA OPENAI] reserva falhou: {str(exc)[:180]}", flush=True)
+            print(f"[IA OPENAI] principal falhou; tentando Gemini: {str(exc)[:180]}", flush=True)
     else:
         errors.append("OpenAI: OPENAI_API_KEY não configurada")
+
+    if GEMINI_KEY:
+        try:
+            return await _gemini_json(prompt), "GEMINI_FALLBACK"
+        except Exception as exc:
+            errors.append(f"Gemini: {str(exc)[:180]}")
+            print(f"[IA GEMINI] fallback falhou: {str(exc)[:180]}", flush=True)
+    else:
+        errors.append("Gemini: GEMINI_API_KEY não configurada")
 
     raise RuntimeError(" | ".join(errors)[:360])
 
@@ -6164,6 +6190,222 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
     except Exception as exc:
         return {"available": False, "reason": str(exc)[:200]}
 
+
+
+def _xgb_float(value, default=0.0):
+    try:
+        v = float(value)
+        if math is not None and not math.isfinite(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _xgb_feature_vector(rows, idx):
+    """Features apenas de candles conhecidos até ``idx``; sem look-ahead."""
+    if idx < 20 or idx >= len(rows):
+        return None
+    try:
+        opens = [_xgb_float(x.get("open")) for x in rows]
+        highs = [_xgb_float(x.get("high")) for x in rows]
+        lows = [_xgb_float(x.get("low")) for x in rows]
+        closes = [_xgb_float(x.get("close")) for x in rows]
+        vols = [_xgb_float(x.get("volume")) for x in rows]
+        c = closes[idx]
+        if c == 0:
+            return None
+
+        def ret(k):
+            base = closes[idx-k]
+            return (c-base) / max(abs(base), 1e-12)
+
+        rng = max(highs[idx]-lows[idx], 1e-12)
+        body = closes[idx]-opens[idx]
+        upper = max(highs[idx]-max(opens[idx], closes[idx]), 0.0) / rng
+        lower = max(min(opens[idx], closes[idx])-lows[idx], 0.0) / rng
+        close_pos = (closes[idx]-lows[idx]) / rng
+        body_ratio = abs(body) / rng
+        body_dir = 1.0 if body > 0 else (-1.0 if body < 0 else 0.0)
+
+        recent_ranges = [max(highs[j]-lows[j], 1e-12) for j in range(idx-9, idx+1)]
+        avg_range = sum(recent_ranges) / len(recent_ranges)
+        range_ratio = rng / max(avg_range, 1e-12)
+
+        r1s = []
+        for j in range(idx-9, idx+1):
+            prev = closes[j-1]
+            r1s.append((closes[j]-prev)/max(abs(prev), 1e-12))
+        mean_r = sum(r1s)/len(r1s)
+        vol_r = (sum((x-mean_r)**2 for x in r1s)/len(r1s))**0.5
+
+        trend5 = (c-closes[idx-5]) / max(avg_range*5.0, 1e-12)
+        trend10 = (c-closes[idx-10]) / max(avg_range*10.0, 1e-12)
+        bull5 = sum(1 for j in range(idx-4, idx+1) if closes[j] > opens[j]) / 5.0
+        bear5 = sum(1 for j in range(idx-4, idx+1) if closes[j] < opens[j]) / 5.0
+
+        nonzero_vol = [vols[j] for j in range(idx-9, idx) if vols[j] > 0]
+        avg_vol = sum(nonzero_vol)/len(nonzero_vol) if nonzero_vol else 0.0
+        vol_ratio = vols[idx]/avg_vol if avg_vol > 0 and vols[idx] > 0 else 1.0
+        vol_ratio = min(5.0, max(0.0, vol_ratio))
+
+        hour_sin = hour_cos = 0.0
+        try:
+            dt = parse_dt(rows[idx].get("datetime"))
+            h = dt.astimezone(BR_TZ).hour + dt.minute/60.0
+            hour_sin = math.sin(2*math.pi*h/24.0)
+            hour_cos = math.cos(2*math.pi*h/24.0)
+        except Exception:
+            pass
+
+        vec = [
+            ret(1), ret(2), ret(3), ret(5), ret(10),
+            body_dir, body_ratio, upper, lower, close_pos,
+            range_ratio, mean_r, vol_r, trend5, trend10,
+            bull5, bear5, vol_ratio, hour_sin, hour_cos,
+        ]
+        if math is not None and not all(math.isfinite(float(x)) for x in vec):
+            return None
+        return vec
+    except Exception:
+        return None
+
+
+def _xgb_train_or_predict(rows, symbol, interval):
+    """Treina/valida em ordem temporal e prevê a próxima vela.
+
+    O alvo de cada amostra é a direção da vela seguinte. A validação usa o bloco
+    final do histórico, nunca embaralhado, para reduzir look-ahead e overfit.
+    """
+    base = {
+        "available": bool(XGBOOST_OK and XGB_ENABLED),
+        "ready": False,
+        "confirmed": False,
+        "direction": "NEUTRO",
+        "confidence": 0.0,
+        "prob_call": 0.0,
+        "prob_put": 0.0,
+        "validation_accuracy": 0.0,
+        "samples": 0,
+        "reason": "",
+    }
+    if not XGB_ENABLED:
+        base["reason"] = "XGBoost desligado por configuração."
+        return base
+    if not XGBOOST_OK:
+        base["reason"] = "XGBoost indisponível: " + (XGBOOST_IMPORT_ERROR or "pacote não carregado")
+        return base
+    rows = list(rows or [])
+    if len(rows) < XGB_MIN_CANDLES:
+        base["reason"] = f"XGBoost coletando candles ({len(rows)}/{XGB_MIN_CANDLES})."
+        return base
+
+    model_key = f"{str(symbol).upper()}|{interval}"
+    last_key = str(rows[-1].get("datetime") or "")
+    now_ts = time.time()
+
+    with xgb_model_guard:
+        cached = xgb_model_cache.get(model_key)
+        need_train = not cached
+        if cached:
+            age = now_ts - float(cached.get("trained_at") or 0)
+            if age >= XGB_RETRAIN_SECONDS and str(cached.get("last_candle") or "") != last_key:
+                need_train = True
+
+        if need_train:
+            X, y = [], []
+            for i in range(20, len(rows)-1):
+                feat = _xgb_feature_vector(rows, i)
+                if feat is None:
+                    continue
+                cur = _xgb_float(rows[i].get("close"))
+                nxt = _xgb_float(rows[i+1].get("close"))
+                if nxt == cur:
+                    continue
+                X.append(feat)
+                y.append(1 if nxt > cur else 0)
+
+            if len(X) < XGB_MIN_TRAIN_SAMPLES or len(set(y)) < 2:
+                base["samples"] = len(X)
+                base["reason"] = f"XGBoost aguardando amostras úteis ({len(X)}/{XGB_MIN_TRAIN_SAMPLES})."
+                return base
+
+            val_n = max(20, int(len(X)*0.20))
+            if len(X)-val_n < 50:
+                val_n = max(12, len(X)//5)
+            split = len(X)-val_n
+            X_train = np.asarray(X[:split], dtype=np.float32)
+            y_train = np.asarray(y[:split], dtype=np.int32)
+            X_val = np.asarray(X[split:], dtype=np.float32)
+            y_val = np.asarray(y[split:], dtype=np.int32)
+
+            pos = max(1, int((y_train == 1).sum()))
+            neg = max(1, int((y_train == 0).sum()))
+            model = XGBClassifier(
+                n_estimators=180,
+                max_depth=3,
+                learning_rate=0.04,
+                min_child_weight=3,
+                subsample=0.85,
+                colsample_bytree=0.85,
+                reg_lambda=2.0,
+                reg_alpha=0.10,
+                objective="binary:logistic",
+                eval_metric="logloss",
+                random_state=42,
+                n_jobs=1,
+                tree_method="hist",
+                scale_pos_weight=float(neg/pos),
+                verbosity=0,
+            )
+            model.fit(X_train, y_train)
+            val_prob = model.predict_proba(X_val)[:, 1]
+            val_pred = (val_prob >= 0.5).astype(np.int32)
+            val_acc = float((val_pred == y_val).mean()) if len(y_val) else 0.0
+            cached = {
+                "model": model,
+                "trained_at": now_ts,
+                "last_candle": last_key,
+                "validation_accuracy": val_acc,
+                "samples": len(X),
+                "validation_samples": len(y_val),
+            }
+            xgb_model_cache[model_key] = cached
+
+        model = cached.get("model") if cached else None
+        if model is None:
+            base["reason"] = "Modelo XGBoost ainda não treinado."
+            return base
+        feat = _xgb_feature_vector(rows, len(rows)-1)
+        if feat is None:
+            base["reason"] = "Features XGBoost insuficientes para o candle atual."
+            return base
+        prob_call = float(model.predict_proba(np.asarray([feat], dtype=np.float32))[0][1])
+        prob_put = 1.0-prob_call
+        confidence = max(prob_call, prob_put)
+        direction = "CALL" if prob_call >= 0.5 else "PUT"
+        val_acc = float(cached.get("validation_accuracy") or 0.0)
+        samples = int(cached.get("samples") or 0)
+
+    base.update({
+        "ready": True,
+        "direction": direction,
+        "confidence": round(confidence*100.0, 1),
+        "prob_call": round(prob_call*100.0, 1),
+        "prob_put": round(prob_put*100.0, 1),
+        "validation_accuracy": round(val_acc*100.0, 1),
+        "samples": samples,
+    })
+    valid = val_acc >= XGB_MIN_VALIDATION_ACCURACY
+    strong = confidence >= XGB_MIN_PROBABILITY
+    base["confirmed"] = bool(valid and strong)
+    if not valid:
+        base["reason"] = f"Validação temporal baixa ({val_acc*100:.1f}%)."
+    elif not strong:
+        base["reason"] = f"Probabilidade XGBoost sem vantagem suficiente ({confidence*100:.1f}%)."
+    else:
+        base["reason"] = f"XGBoost {direction} {confidence*100:.1f}% • validação {val_acc*100:.1f}%."
+    return base
 
 def _pure_ai_price_context(cs):
     """Resume somente price action/OHLCV para filtrar entradas fracas da IA PURA.
@@ -6759,6 +7001,17 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
     # Contexto de price action usado somente pela IA externa e pelo gate final dela.
     prefilter_ok, prefilter_score, prefilter_reason, price_ctx = _gemini_candidate_prefilter(rows, interval)
 
+    # Camada 1: XGBoost calcula uma probabilidade independente da próxima vela.
+    # O treino roda fora do event loop e o resultado nunca libera entrada sozinho.
+    try:
+        xgb_signal = await asyncio.to_thread(_xgb_train_or_predict, rows, symbol, interval)
+    except Exception as exc:
+        xgb_signal = {
+            "available": False, "ready": False, "confirmed": False,
+            "direction": "NEUTRO", "confidence": 0.0,
+            "reason": f"XGBoost falhou: {str(exc)[:160]}",
+        }
+
     # GATILHO 1 — padrão de vela independente.
     candle_pattern_filter = _pure_ai_candle_pattern_filter(rows, "NEUTRO")
 
@@ -6832,36 +7085,13 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
         })
 
     local_dirs = {x["direction"] for x in local_triggers}
+    local_trigger_hint = None
     if len(local_dirs) == 1 and local_triggers:
-        # Padrão tem prioridade quando os dois surgem no mesmo candle, pois traz uma
-        # confirmação visual mais específica; fora disso, vale o gatilho disponível.
-        best = max(local_triggers, key=lambda x: float(x.get("confidence", 0)))
-        out = {
-            "available": True,
-            "direction": best["direction"],
-            "confidence": best["confidence"],
-            "confirmed": True,
-            "risk": "MEDIUM" if best["confidence"] < 90 else "LOW",
-            "setup": best["setup"],
-            "reason": best["reason"],
-            "smart_scan": True,
-            "api_called": False,
-            "provider": best["provider"],
-            "fallback": False,
-            "api_available": bool(GEMINI_KEY or OAI_KEY),
-            "h1_filter": h1_filter,
-            "candle_pattern_filter": candle_pattern_filter,
-            "independent_trigger": True,
-            "direct_win_filter": {
-                "enabled": True,
-                "blocked": False,
-                "source": best["provider"],
-                "price_context": price_ctx,
-            },
-        }
-        st["last_call"] = now_ts
-        st["last_result"] = dict(out)
-        return out
+        # A partir da 3.28 o gatilho local vira CONTEXTO. O sinal final passa por
+        # XGBoost + GPT-5.6 Terra (Gemini somente se a OpenAI falhar).
+        local_trigger_hint = max(local_triggers, key=lambda x: float(x.get("confidence", 0)))
+        prefilter_ok = True
+        prefilter_reason = "gatilho local forte encaminhado ao ensemble"
     elif len(local_dirs) > 1:
         out = {
             "available": True, "direction": "NEUTRO", "confidence": 0,
@@ -6884,7 +7114,9 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
         out.update({
             "h1_filter": h1_filter,
             "candle_pattern_filter": candle_pattern_filter,
-            "independent_trigger": True,
+            "independent_trigger": False,
+            "xgboost": xgb_signal,
+            "local_trigger_hint": local_trigger_hint,
         })
         st["last_call"] = now_ts
         st["last_result"] = dict(out)
@@ -6913,6 +7145,8 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
             "direct_win_filter": {
                 "enabled": True, "blocked": True, "prefilter": True, "price_context": price_ctx,
             },
+            "xgboost": xgb_signal,
+            "local_trigger_hint": local_trigger_hint,
         }
         st["last_call"] = now_ts
         st["last_result"] = dict(out)
@@ -6942,6 +7176,12 @@ REGRAS DE QUALIDADE:
 - Só marque risk LOW ou MEDIUM quando houver vantagem clara. Em dúvida: HIGH + NEUTRO.
 
 Classifique o setup como TREND, REVERSAL, BREAKOUT, REJECTION ou NONE.
+
+CAMADA ESTATÍSTICA XGBOOST (não copie cegamente; use como evidência quantitativa):
+{json.dumps(xgb_signal, ensure_ascii=False)}
+CONTEXTO LOCAL FORTE, se houver:
+{json.dumps(local_trigger_hint, ensure_ascii=False)}
+
 Retorne SOMENTE JSON válido:
 {{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"setup":"TREND|REVERSAL|BREAKOUT|REJECTION|NONE","reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
 Candles: {json.dumps(data, ensure_ascii=False)}"""
@@ -6961,6 +7201,13 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         confirmed = bool(parsed.get("confirmed", False))
         original_reason = str(parsed.get("reason", ""))[:220]
 
+        # Ensemble: quando o XGBoost está pronto, GPT e XGBoost precisam concordar.
+        xgb_ready = bool(xgb_signal.get("ready"))
+        xgb_confirmed = bool(xgb_signal.get("confirmed"))
+        xgb_direction = str(xgb_signal.get("direction") or "NEUTRO").upper()
+        xgb_confidence = float(xgb_signal.get("confidence") or 0.0)
+        xgb_agrees = bool(direction in ("CALL", "PUT") and xgb_direction == direction)
+
         low_min = max(float(OAI_MIN), 82.0 if interval == "1min" else 80.0)
         required_conf = low_min if risk == "LOW" else max(low_min + 4.0, 86.0)
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
@@ -6973,8 +7220,15 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
                 blocked_reason = "risco alto"
             elif confidence < required_conf:
                 blocked_reason = f"confiança {confidence:.0f}% abaixo do mínimo seletivo {required_conf:.0f}%"
+            elif xgb_ready and not xgb_confirmed:
+                blocked_reason = "XGBoost sem vantagem estatística/validação suficiente"
+            elif xgb_ready and xgb_confirmed and not xgb_agrees:
+                blocked_reason = f"GPT e XGBoost discordaram ({direction} x {xgb_direction})"
             elif not gate_ok:
                 blocked_reason = gate_reason
+
+        if direction in ("CALL", "PUT") and xgb_ready and xgb_confirmed and xgb_agrees:
+            confidence = round(min(97.0, confidence * 0.65 + xgb_confidence * 0.35), 1)
 
         if blocked_reason:
             direction, confirmed = "NEUTRO", False
@@ -6996,12 +7250,21 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             "reason": reason,
             "smart_scan": True,
             "api_called": True,
-            "provider": f"{provider}_PURE",
+            "provider": f"{provider}+XGBOOST" if xgb_ready else f"{provider}+XGB_PENDING",
             "fallback": False,
             "api_available": True,
             "h1_filter": h1_filter,
             "candle_pattern_filter": candle_pattern_filter,
-            "independent_trigger": True,
+            "local_trigger_hint": local_trigger_hint,
+            "xgboost": xgb_signal,
+            "ensemble": {
+                "xgb_ready": xgb_ready,
+                "xgb_confirmed": xgb_confirmed,
+                "xgb_agrees": xgb_agrees,
+                "openai_primary": bool(OAI_KEY),
+                "gemini_fallback": bool(GEMINI_KEY),
+            },
+            "independent_trigger": False,
             "direct_win_filter": {
                 "enabled": True,
                 "required_confidence": round(required_conf, 1),
@@ -7019,7 +7282,9 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         out["api_called"] = True
         out["h1_filter"] = h1_filter
         out["candle_pattern_filter"] = candle_pattern_filter
-        out["independent_trigger"] = True
+        out["xgboost"] = xgb_signal
+        out["local_trigger_hint"] = local_trigger_hint
+        out["independent_trigger"] = False
         st["last_call"] = now_ts
         st["last_result"] = dict(out)
         print(f"[IA FALLBACK MONITOR] {symbol} {interval} LOCAL_OHLCV | API: {str(exc)[:160]}", flush=True)
@@ -7627,9 +7892,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 regular_market=(market == "OPEN"),
             )
         else:
-            # Em OPEN, o EA Força do Movimento usa o mesmo roteador multifuente
-            # dos demais motores (Forex/cripto públicos), portanto não depende da IQ.
-            raw = await candles(symbol, interval, 150, market, iq_state, request=request)
+            # SMART pede histórico maior para treinar/validar o XGBoost.
+            # Os demais motores mantêm a janela anterior para reduzir carga.
+            request_n = 240 if (engine == "SMART" and market == "OPEN") else 150
+            raw = await candles(symbol, interval, request_n, market, iq_state, request=request)
     except HTTPException as exc:
         status = (
             "EA AUTÔNOMA • IQ OPTION EM ESPERA"
@@ -7734,7 +8000,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = closed[-90:] if len(closed) > 90 else closed
+            engine_closed = closed[-220:] if (engine == "SMART" and len(closed) > 220) else (closed[-90:] if len(closed) > 90 else closed)
             if engine == "SMART":
                 analysis = await openai_direct_signal(symbol, interval, engine_closed, market)
             elif engine in ("EA", "FORCE"):
@@ -8730,17 +8996,28 @@ async def health():
             "authenticated_ws_connected": _binomo_any_authenticated_ws_connected(),
             "public_ws_enabled": bool(BINOMO_QUOTE_WS_ENABLED),
         },
+        "xgboost": {
+            "configured": bool(XGB_ENABLED),
+            "available": bool(XGBOOST_OK),
+            "priority": 1,
+            "role": "CAMADA ESTATISTICA",
+            "cached_models": len(xgb_model_cache),
+            "min_candles": XGB_MIN_CANDLES,
+            "min_probability": XGB_MIN_PROBABILITY,
+            "min_validation_accuracy": XGB_MIN_VALIDATION_ACCURACY,
+            "import_error": XGBOOST_IMPORT_ERROR or None,
+        },
         "openai": {
             "configured": bool(OAI_KEY),
-            "model": OAI_MODEL or "gpt-5.6-luna",
+            "model": OAI_MODEL or "gpt-5.6-terra",
             "priority": 2,
-            "role": "RESERVA",
+            "role": "CONFIRMACAO PRINCIPAL",
         },
         "gemini": {
             "configured": bool(GEMINI_KEY),
             "model": _gemini_selected_model or GEMINI_MODEL or None,
-            "priority": 1,
-            "role": "PRINCIPAL",
+            "priority": 3,
+            "role": "FALLBACK",
             "quota_guard": _gemini_quota_snapshot(),
             "prefilter_min": GEMINI_PREFILTER_MIN,
         },
