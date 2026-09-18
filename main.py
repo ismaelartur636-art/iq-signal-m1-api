@@ -27,8 +27,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.23"
-PWA_VERSION = "v90"
+APP_VERSION = "3.26"
+PWA_VERSION = "v93"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -96,6 +96,17 @@ CTRADER_OAUTH_STATE_COOKIE = "mega_ctrader_oauth_state"
 CTRADER_SESSION_TTL = max(300, int(os.getenv("CTRADER_SESSION_TTL", "2628000")))
 ctrader_sessions: Dict[str, Dict[str, Any]] = {}
 ctrader_oauth_states: Dict[str, float] = {}
+
+# MEGA IA 3.24 — cTrader como fonte principal do Mercado Aberto.
+# Usa o protocolo JSON oficial na porta 5036 e mantém o OAuth somente leitura.
+CTRADER_JSON_DEMO_URL = os.getenv("CTRADER_JSON_DEMO_URL", "wss://demo.ctraderapi.com:5036").strip()
+CTRADER_JSON_LIVE_URL = os.getenv("CTRADER_JSON_LIVE_URL", "wss://live.ctraderapi.com:5036").strip()
+CTRADER_DATA_TIMEOUT = float(os.getenv("CTRADER_DATA_TIMEOUT", "12"))
+CTRADER_SYMBOL_CACHE_TTL = max(60, int(os.getenv("CTRADER_SYMBOL_CACHE_TTL", "600")))
+CTRADER_CANDLE_CACHE_TTL = max(1.0, float(os.getenv("CTRADER_CANDLE_CACHE_TTL", "3")))
+ctrader_data_guard = threading.RLock()
+ctrader_symbol_union = set()
+ctrader_last_error = ""
 
 TD_URL = "https://api.twelvedata.com/time_series"
 TD_WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
@@ -180,6 +191,36 @@ OTC_BASE = {
     "LTC/USD": "LTCUSD-OTC"
 }
 
+
+def _symbol_allowed(symbol: str, market: str = "OPEN") -> bool:
+    """Aceita a lista nativa e, em OPEN, os símbolos dinâmicos da cTrader.
+
+    A disponibilidade real de um símbolo dinâmico é sempre validada contra a
+    conta cTrader autorizada antes de buscar candles. Em OTC mantemos somente
+    os ativos conhecidos da IQ Option.
+    """
+    sym = str(symbol or "").strip().upper()
+    market = str(market or "OPEN").strip().upper()
+    if sym in SYMBOLS:
+        return True
+    if market != "OPEN":
+        return False
+    if not (1 <= len(sym) <= 64):
+        return False
+    return bool(re.fullmatch(r"[A-Z0-9][A-Z0-9 ._/#&+():-]{0,63}", sym))
+
+
+def _ctrader_canonical_symbol_name(raw_name: str) -> str:
+    raw = str(raw_name or "").strip()
+    upper = raw.upper()
+    compact = re.sub(r"[^A-Z0-9]", "", upper)
+    for known in SYMBOLS:
+        if known == BINOMO_CRYPTO_IDX_SYMBOL:
+            continue
+        if re.sub(r"[^A-Z0-9]", "", known.upper()) == compact:
+            return known
+    return upper
+
 cache: Dict[str, Any] = {}
 # Controle anti-repetição de sinais.
 # Mantém o mesmo sinal até a expiração e exige um novo setup antes de liberar outro
@@ -211,6 +252,10 @@ ADAPTIVE_LEARNING_ENABLED = os.getenv("ADAPTIVE_LEARNING_ENABLED", "1").strip().
 ADAPTIVE_MIN_SYMBOL_SAMPLES = max(12, int(os.getenv("ADAPTIVE_MIN_SYMBOL_SAMPLES", "20")))
 ADAPTIVE_MIN_GROUP_SAMPLES = max(5, int(os.getenv("ADAPTIVE_MIN_GROUP_SAMPLES", "8")))
 ADAPTIVE_BASE_CONFIDENCE = float(os.getenv("ADAPTIVE_BASE_CONFIDENCE", "68"))
+# v3.26 — foco em WIN DIRETO. O alvo não promete taxa futura; ele serve apenas
+# para tornar o filtro mais seletivo quando o histórico mostra dependência excessiva de Gale.
+ADAPTIVE_DIRECT_WIN_TARGET = max(55.0, min(78.0, float(os.getenv("ADAPTIVE_DIRECT_WIN_TARGET", "65"))))
+ADAPTIVE_DIRECT_GROUP_SAMPLES = max(8, int(os.getenv("ADAPTIVE_DIRECT_GROUP_SAMPLES", "10")))
 adaptive_learning_store: Dict[str, Dict[str, Any]] = {}
 adaptive_learning_guard = threading.RLock()
 
@@ -4627,6 +4672,8 @@ def _feed_source_from_rows(rows) -> str:
         return "BINANCE_PUBLIC"
     if src.startswith("YAHOO"):
         return "YAHOO_PUBLIC"
+    if src.startswith("CTRADER"):
+        return "CTRADER_OPEN"
     if src.startswith("BINOMO_CRYPTO_IDX_WS"):
         return "BINOMO_CRYPTO_IDX_WS"
     if src.startswith("BINOMO"):
@@ -4643,6 +4690,7 @@ def _feed_source_label(source: str) -> str:
         "TWELVE_DATA_WS": "TWELVE DATA • STREAM",
         "BINANCE_PUBLIC": "BINANCE PÚBLICA",
         "YAHOO_PUBLIC": "YAHOO PÚBLICO",
+        "CTRADER_OPEN": "cTRADER OPEN API",
         "BINOMO_CRYPTO_IDX": "BINOMO • CRYPTO IDX",
         "BINOMO_CRYPTO_IDX_WS": "BINOMO • CRYPTO IDX • AO VIVO",
         "IQ_OPTION_OPEN": "IQ OPTION • ABERTO",
@@ -4661,7 +4709,7 @@ def _tag_feed_rows(rows, source: str, source_symbol: str | None = None):
         row_source = str(row.get("source") or "").upper()
         effective = "TWELVE_DATA_WS" if row_source.startswith("TWELVE_DATA_WS") else source
         row["feed_source"] = effective
-        if source_symbol:
+        if source_symbol and not row.get("source_symbol"):
             row["source_symbol"] = source_symbol
         out.append(row)
     return out
@@ -5026,7 +5074,7 @@ async def _binomo_crypto_idx_candles(symbol: str, interval: str, n: int = 80):
     raise RuntimeError(" | ".join(errors[-2:]))
 
 
-async def candles_open(symbol, interval, n=80):
+async def candles_open(symbol, interval, n=80, request: Request | None = None):
     """Roteador multifuente do Mercado Aberto.
 
     Cripto prioriza Binance pública. Forex usa Twelve Data quando a chave existe
@@ -5036,15 +5084,23 @@ async def candles_open(symbol, interval, n=80):
     """
     n = max(20, min(int(n), 150))
     key = _open_feed_status_key(symbol, interval)
+    ctrader_session_id = None
+    ctrader_item = None
+    if request is not None:
+        try:
+            ctrader_session_id, ctrader_item = _ctrader_session_from_request(request)
+        except Exception:
+            ctrader_session_id, ctrader_item = None, None
+    cache_key = key + (f"|CTRADER:{ctrader_session_id}" if ctrader_item else "")
     now_ts = time.time()
-    cached = public_feed_cache.get(key)
-    ttl = _public_cache_ttl(interval)
+    cached = public_feed_cache.get(cache_key)
+    ttl = min(_public_cache_ttl(interval), CTRADER_CANDLE_CACHE_TTL) if ctrader_item else _public_cache_ttl(interval)
     if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= min(20, n):
         return list(cached[1])[-n:]
 
     lock = public_feed_locks.setdefault(key, asyncio.Lock())
     async with lock:
-        cached = public_feed_cache.get(key)
+        cached = public_feed_cache.get(cache_key)
         now_ts = time.time()
         if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= min(20, n):
             return list(cached[1])[-n:]
@@ -5052,24 +5108,38 @@ async def candles_open(symbol, interval, n=80):
         providers = []
         if symbol == BINOMO_CRYPTO_IDX_SYMBOL:
             # Crypto IDX é exclusivo da Binomo. Nunca substitui por BTC, Binance,
-            # Twelve Data ou Yahoo porque isso produziria velas diferentes.
+            # Twelve Data, Yahoo ou cTrader porque isso produziria velas diferentes.
             providers = [("BINOMO_CRYPTO_IDX", _binomo_crypto_idx_candles)]
-        elif symbol in BINANCE_SYMBOLS:
-            providers.append(("BINANCE_PUBLIC", _binance_public_candles))
-            if TD_KEY:
-                providers.append(("TWELVE_DATA", candles_open_twelve))
-            providers.append(("YAHOO_PUBLIC", _yahoo_public_candles))
         else:
-            if TD_KEY:
-                providers.append(("TWELVE_DATA", candles_open_twelve))
-            providers.append(("YAHOO_PUBLIC", _yahoo_public_candles))
+            # cTrader é a fonte PRINCIPAL do Mercado Aberto quando esta sessão
+            # do navegador estiver autorizada. Se o ativo não existir na conta
+            # ou a Open API estiver indisponível, cai nas fontes antigas.
+            if ctrader_item:
+                async def _ct_provider(sym, tf, count):
+                    return await _ctrader_candles(ctrader_item, sym, tf, count)
+                providers.append(("CTRADER_OPEN", _ct_provider))
+
+            if symbol in BINANCE_SYMBOLS:
+                providers.append(("BINANCE_PUBLIC", _binance_public_candles))
+                if TD_KEY:
+                    providers.append(("TWELVE_DATA", candles_open_twelve))
+                providers.append(("YAHOO_PUBLIC", _yahoo_public_candles))
+            else:
+                if TD_KEY:
+                    providers.append(("TWELVE_DATA", candles_open_twelve))
+                providers.append(("YAHOO_PUBLIC", _yahoo_public_candles))
 
         # Permite desativar o roteador e manter comportamento legado via env.
         # A exceção é Crypto IDX: ele continua BINOMO_ONLY para não falsificar o gráfico.
         if not MULTIFEED_ENABLED and symbol != BINOMO_CRYPTO_IDX_SYMBOL:
-            if not TD_KEY:
-                raise HTTPException(500, "TWELVE_DATA_API_KEY não configurada e MULTIFEED_ENABLED=0.")
-            providers = [("TWELVE_DATA", candles_open_twelve)]
+            if ctrader_item:
+                async def _ct_only_provider(sym, tf, count):
+                    return await _ctrader_candles(ctrader_item, sym, tf, count)
+                providers = [("CTRADER_OPEN", _ct_only_provider)]
+            else:
+                if not TD_KEY:
+                    raise HTTPException(500, "TWELVE_DATA_API_KEY não configurada e MULTIFEED_ENABLED=0.")
+                providers = [("TWELVE_DATA", candles_open_twelve)]
 
         errors = []
         for idx, (source, provider) in enumerate(providers):
@@ -5087,7 +5157,7 @@ async def candles_open(symbol, interval, n=80):
                     raise RuntimeError(f"dados antigos ({int(provider_age)}s)")
                 source_symbol = rows[-1].get("source_symbol") if rows else None
                 effective_source = _feed_source_from_rows(rows)
-                public_feed_cache[key] = (time.time(), list(rows), effective_source)
+                public_feed_cache[cache_key] = (time.time(), list(rows), effective_source)
                 _record_open_feed_status(
                     symbol, interval, effective_source,
                     errors=errors, source_symbol=source_symbol, rows=rows,
@@ -5615,7 +5685,7 @@ async def candles(
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
 
-    if symbol not in SYMBOLS or interval not in INTERVALS:
+    if not _symbol_allowed(symbol, market) or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
     if symbol == BINOMO_CRYPTO_IDX_SYMBOL and market != "OPEN":
         raise HTTPException(400, "Crypto IDX usa somente o feed da Binomo no modo Mercado Aberto do app.")
@@ -5624,7 +5694,7 @@ async def candles(
     # o roteador multifuente (Binance/Twelve Data/Yahoo conforme o ativo e disponibilidade).
     # A IQ Option continua sendo usada diretamente para OTC e pelos EAs que exigem a corretora.
     if market == "OPEN":
-        return await candles_open(symbol, interval, n)
+        return await candles_open(symbol, interval, n, request=request)
 
     if market == "IQ_OTC":
         if iq_state is None and request is not None:
@@ -5712,7 +5782,7 @@ async def candles(
                 f"IQ Option OTC indisponível: {str(exc)[:260]}"
             )
 
-    return await candles_open(symbol, interval, n)
+    return await candles_open(symbol, interval, n, request=request)
 
 
 _gemini_selected_model = None
@@ -7037,9 +7107,9 @@ def _adaptive_result_score(result: Any) -> float:
     if r == "WIN":
         return 1.0
     if r == "WIN G1":
-        return 0.55
+        return 0.35
     if r == "WIN G2":
-        return 0.25
+        return 0.10
     if r in ("LOSS", "LOSS G2"):
         return 0.0
     return -1.0
@@ -7088,7 +7158,7 @@ def _adaptive_clean_history(history: Any) -> list[dict[str, Any]]:
         market = str(raw.get("market") or "OPEN").upper().strip()
         interval = str(raw.get("interval") or "1min").strip()
         direction = str(raw.get("direction") or "").upper().strip()
-        if symbol not in SYMBOLS or market not in VALID_MARKETS or interval not in INTERVALS:
+        if not _symbol_allowed(symbol, market) or market not in VALID_MARKETS or interval not in INTERVALS:
             continue
         if direction not in ("CALL", "PUT"):
             continue
@@ -7137,6 +7207,13 @@ def _adaptive_stats(rows: list[dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _adaptive_profile_for_candidate(request: Request | None, payload: Dict[str, Any], engine: str = "") -> Dict[str, Any]:
+    """Monta o filtro adaptativo priorizando acerto na PRIMEIRA entrada.
+
+    O histórico final continua sendo observado, mas WIN G1/G2 não mascaram uma
+    primeira entrada fraca. Grupos pequenos nunca são bloqueados: primeiro o
+    sistema coleta amostra, depois ele aumenta a exigência ou filtra contextos
+    cuja taxa de WIN direto permanece baixa.
+    """
     client_id = _adaptive_client_id(request)
     with adaptive_learning_guard:
         state = dict(adaptive_learning_store.get(client_id) or {})
@@ -7160,46 +7237,89 @@ def _adaptive_profile_for_candidate(request: Request | None, payload: Dict[str, 
 
     active = enabled and overall["samples"] >= ADAPTIVE_MIN_SYMBOL_SAMPLES
     adjustment = 0.0
+    direct_penalty = 0.0
     notes = []
 
-    def add_adjustment(stats, good_min, bad_max, good_delta, bad_delta, label, min_samples):
+    def add_quality_adjustment(stats, good_min, bad_max, good_delta, bad_delta, label, min_samples):
         nonlocal adjustment
         if stats["samples"] < min_samples:
             return
         q = stats["quality"]
         if q >= good_min:
             adjustment += good_delta
-            notes.append(f"{label} forte {q:.0f}%")
+            notes.append(f"{label} qualidade {q:.0f}%")
         elif q <= bad_max:
             adjustment += bad_delta
-            notes.append(f"{label} fraco {q:.0f}%")
+            notes.append(f"{label} qualidade fraca {q:.0f}%")
+
+    def add_direct_penalty(stats, label, min_samples, weight=1.0):
+        """Aumenta a confiança exigida quando o grupo depende demais de Gale."""
+        nonlocal direct_penalty
+        if stats["samples"] < min_samples:
+            return
+        rate = float(stats.get("direct_win_rate") or 0.0)
+        gap = ADAPTIVE_DIRECT_WIN_TARGET - rate
+        if gap > 0:
+            # Cada 5 p.p. abaixo do alvo acrescenta ~1 ponto de confiança,
+            # com teto por grupo para não matar completamente a frequência.
+            delta = min(4.0, (gap / 5.0) * float(weight))
+            direct_penalty += delta
+            notes.append(f"{label} WIN direto {rate:.0f}%")
+        elif rate >= ADAPTIVE_DIRECT_WIN_TARGET + 6:
+            # Histórico muito bom pode aliviar pouco; nunca afrouxa demais.
+            direct_penalty -= min(0.75, ((rate - ADAPTIVE_DIRECT_WIN_TARGET) / 10.0) * 0.5)
+            notes.append(f"{label} WIN direto forte {rate:.0f}%")
 
     if active:
-        add_adjustment(overall, 72, 48, 1.5, -2.5, "ativo", ADAPTIVE_MIN_SYMBOL_SAMPLES)
-        add_adjustment(interval_stats, 72, 46, 1.0, -2.0, "timeframe", max(8, ADAPTIVE_MIN_GROUP_SAMPLES))
-        add_adjustment(direction_stats, 74, 45, 1.0, -2.0, "direção", max(8, ADAPTIVE_MIN_GROUP_SAMPLES))
-        add_adjustment(hour_stats, 76, 44, 1.0, -3.0, "horário", ADAPTIVE_MIN_GROUP_SAMPLES)
-        add_adjustment(engine_stats, 74, 45, 0.75, -1.5, "motor", ADAPTIVE_MIN_GROUP_SAMPLES)
-        add_adjustment(strategy_stats, 78, 44, 1.5, -3.0, "estratégia", ADAPTIVE_MIN_GROUP_SAMPLES)
+        # Qualidade final ainda conta, porém com peso menor que o WIN direto.
+        add_quality_adjustment(overall, 76, 42, 0.5, -1.0, "ativo", ADAPTIVE_MIN_SYMBOL_SAMPLES)
+        add_quality_adjustment(hour_stats, 78, 40, 0.5, -1.5, "horário", ADAPTIVE_DIRECT_GROUP_SAMPLES)
+        add_quality_adjustment(strategy_stats, 80, 38, 0.5, -1.5, "estratégia", ADAPTIVE_DIRECT_GROUP_SAMPLES)
 
-    adjustment = max(-8.0, min(4.0, adjustment))
+        add_direct_penalty(overall, "ativo", ADAPTIVE_MIN_SYMBOL_SAMPLES, 1.25)
+        add_direct_penalty(interval_stats, "timeframe", ADAPTIVE_DIRECT_GROUP_SAMPLES, 1.0)
+        add_direct_penalty(direction_stats, "direção", ADAPTIVE_DIRECT_GROUP_SAMPLES, 0.9)
+        add_direct_penalty(hour_stats, "horário", ADAPTIVE_DIRECT_GROUP_SAMPLES, 1.25)
+        add_direct_penalty(engine_stats, "motor", ADAPTIVE_DIRECT_GROUP_SAMPLES, 0.8)
+        add_direct_penalty(strategy_stats, "estratégia", ADAPTIVE_DIRECT_GROUP_SAMPLES, 1.25)
+
+    adjustment = max(-4.0, min(2.0, adjustment))
+    direct_penalty = max(-1.5, min(12.0, direct_penalty))
+
     required_conf = ADAPTIVE_BASE_CONFIDENCE
     if active:
-        # Desempenho fraco torna o filtro mais exigente; desempenho forte pode
-        # aliviar no máximo 2 pontos, sem transformar histórico em garantia.
+        # BTC/USD recebe um piso ligeiramente mais seletivo porque o modo dedicado
+        # foi criado para priorizar qualidade em vez de quantidade de sinais.
+        if symbol == "BTC/USD":
+            required_conf = max(required_conf, 70.0)
         required_conf += max(0.0, -adjustment)
-        required_conf -= min(2.0, max(0.0, adjustment) * 0.5)
-    required_conf = round(max(66.0, min(80.0, required_conf)), 1)
+        required_conf -= min(1.0, max(0.0, adjustment) * 0.35)
+        required_conf += max(0.0, direct_penalty)
+        required_conf -= min(0.75, max(0.0, -direct_penalty))
+    required_conf = round(max(68.0, min(86.0, required_conf)), 1)
 
     hard_block = False
     hard_reason = ""
     if active:
-        if hour_stats["samples"] >= 10 and hour_stats["losses"] >= 5 and hour_stats["quality"] <= 35:
+        # Bloqueio de contexto é deliberadamente conservador: só acontece com
+        # amostra razoável e taxa de WIN direto persistentemente baixa.
+        direct_block_checks = [
+            ("horário", hour_stats, f"faixa {hour_bucket}"),
+            ("estratégia", strategy_stats, "estratégia atual"),
+            ("direção", direction_stats, f"direção {direction}"),
+        ]
+        for _label, stats, description in direct_block_checks:
+            if stats["samples"] >= max(12, ADAPTIVE_DIRECT_GROUP_SAMPLES) and stats["direct_win_rate"] <= 38.0:
+                hard_block = True
+                hard_reason = (
+                    f"{description} teve somente {stats['direct_win_rate']:.0f}% de WIN direto "
+                    f"em {stats['samples']} operações"
+                )
+                break
+
+        if not hard_block and hour_stats["samples"] >= 12 and hour_stats["losses"] >= 5 and hour_stats["quality"] <= 32:
             hard_block = True
             hard_reason = f"faixa {hour_bucket} teve qualidade {hour_stats['quality']:.0f}% em {hour_stats['samples']} operações"
-        elif strategy_stats["samples"] >= 10 and strategy_stats["losses"] >= 5 and strategy_stats["quality"] <= 30:
-            hard_block = True
-            hard_reason = f"estratégia teve qualidade {strategy_stats['quality']:.0f}% em {strategy_stats['samples']} operações"
 
     confidence = float(payload.get("confidence") or 0.0)
     confidence_block = bool(active and confidence < required_conf)
@@ -7207,13 +7327,20 @@ def _adaptive_profile_for_candidate(request: Request | None, payload: Dict[str, 
     if hard_block:
         decision_reason = hard_reason
     elif confidence_block:
-        decision_reason = f"confiança {confidence:.1f}% abaixo do mínimo adaptativo {required_conf:.1f}%"
+        decision_reason = (
+            f"foco WIN direto: confiança {confidence:.1f}% abaixo do mínimo adaptativo "
+            f"{required_conf:.1f}%"
+        )
     elif not enabled:
         decision_reason = "aprendizado desligado"
     elif not active:
         decision_reason = f"coletando histórico ({overall['samples']}/{ADAPTIVE_MIN_SYMBOL_SAMPLES})"
     else:
-        decision_reason = "perfil adaptativo aprovado" + ((" • " + "; ".join(notes[:3])) if notes else "")
+        decision_reason = (
+            f"perfil aprovado • WIN direto {overall['direct_win_rate']:.1f}% "
+            f"(alvo adaptativo {ADAPTIVE_DIRECT_WIN_TARGET:.0f}%)"
+            + ((" • " + "; ".join(notes[:3])) if notes else "")
+        )
 
     return {
         "enabled": enabled,
@@ -7224,8 +7351,10 @@ def _adaptive_profile_for_candidate(request: Request | None, payload: Dict[str, 
         "quality": overall["quality"],
         "final_accuracy": overall["final_accuracy"],
         "direct_win_rate": overall["direct_win_rate"],
+        "direct_win_target": ADAPTIVE_DIRECT_WIN_TARGET,
         "required_confidence": required_conf,
         "adjustment": round(adjustment, 2),
+        "direct_penalty": round(direct_penalty, 2),
         "hour_bucket": hour_bucket,
         "hour": hour_stats,
         "direction": direction_stats,
@@ -7429,10 +7558,10 @@ def _ai_asset_cycle_block_signal(symbol: str, interval: str, market: str, engine
 
 
 async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH"):
-    if symbol not in SYMBOLS or interval not in INTERVALS:
+    market = (market or "OPEN").upper()
+    if not _symbol_allowed(symbol, market) or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
 
-    market = (market or "OPEN").upper()
     engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
     if engine == "RSI":
@@ -8121,6 +8250,341 @@ async def _ctrader_exchange_authorization_code(code: str) -> Dict[str, Any]:
     return data
 
 
+
+
+def _ctrader_ws_url(is_live: bool) -> str:
+    return CTRADER_JSON_LIVE_URL if bool(is_live) else CTRADER_JSON_DEMO_URL
+
+
+def _ctrader_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _ctrader_send_wait(ws, payload_type: int, payload: Dict[str, Any], expected_type: int, timeout: float | None = None) -> Dict[str, Any]:
+    client_msg_id = "mega_" + secrets.token_urlsafe(10)
+    message = {
+        "clientMsgId": client_msg_id,
+        "payloadType": int(payload_type),
+        "payload": payload or {},
+    }
+    ws.send(json.dumps(message, separators=(",", ":")))
+    deadline = time.time() + float(timeout or CTRADER_DATA_TIMEOUT)
+    while time.time() < deadline:
+        raw = ws.recv()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        data = json.loads(raw)
+        ptype = int(data.get("payloadType") or 0)
+        body = data.get("payload") or {}
+        # heartbeat técnico
+        if ptype == 51:
+            continue
+        if ptype in (50, 2142):
+            code = str(body.get("errorCode") or "CTRADER_ERROR")
+            desc = str(body.get("description") or "")
+            raise RuntimeError((code + (": " + desc if desc else ""))[:300])
+        if str(data.get("clientMsgId") or "") == client_msg_id or ptype == int(expected_type):
+            if ptype != int(expected_type):
+                continue
+            return body
+    raise TimeoutError(f"cTrader timeout aguardando payload {expected_type}.")
+
+
+def _ctrader_open_socket(is_live: bool):
+    if websocket is None:
+        raise RuntimeError("websocket-client não está instalado no servidor.")
+    url = _ctrader_ws_url(is_live)
+    return websocket.create_connection(url, timeout=CTRADER_DATA_TIMEOUT, enable_multithread=True)
+
+
+def _ctrader_application_auth(ws) -> None:
+    _ctrader_send_wait(
+        ws,
+        2100,
+        {"clientId": CTRADER_CLIENT_ID, "clientSecret": CTRADER_CLIENT_SECRET},
+        2101,
+    )
+
+
+def _ctrader_account_auth(ws, access_token: str, account_id: int) -> None:
+    _ctrader_send_wait(
+        ws,
+        2102,
+        {"ctidTraderAccountId": int(account_id), "accessToken": access_token},
+        2103,
+    )
+
+
+def _ctrader_fetch_accounts_once(access_token: str, is_live_endpoint: bool) -> list:
+    ws = _ctrader_open_socket(is_live_endpoint)
+    try:
+        _ctrader_application_auth(ws)
+        body = _ctrader_send_wait(ws, 2149, {"accessToken": access_token}, 2150)
+        rows = body.get("ctidTraderAccount") or []
+        return [dict(x) for x in rows if isinstance(x, dict)]
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def _ctrader_fetch_accounts_blocking(item: Dict[str, Any]) -> list:
+    global ctrader_last_error
+    token = str(item.get("access_token") or "").strip()
+    if not token:
+        raise RuntimeError("Sessão cTrader sem accessToken.")
+    merged = {}
+    errors = []
+    # A lista de contas é uma mensagem de autenticação. Tentamos os dois
+    # ambientes porque demo e live usam proxies separados.
+    for is_live_endpoint in (False, True):
+        try:
+            for acc in _ctrader_fetch_accounts_once(token, is_live_endpoint):
+                aid = int(acc.get("ctidTraderAccountId") or 0)
+                if aid:
+                    merged[aid] = acc
+        except Exception as exc:
+            errors.append(str(exc)[:160])
+    if not merged:
+        ctrader_last_error = " | ".join(errors[-2:])
+        raise RuntimeError(ctrader_last_error or "cTrader não retornou contas autorizadas.")
+    ctrader_last_error = ""
+    return list(merged.values())
+
+
+def _ctrader_symbols_for_account_blocking(item: Dict[str, Any], account: Dict[str, Any]) -> list:
+    token = str(item.get("access_token") or "").strip()
+    account_id = int(account.get("ctidTraderAccountId") or 0)
+    is_live = _ctrader_bool(account.get("isLive"))
+    if not account_id:
+        return []
+    ws = _ctrader_open_socket(is_live)
+    try:
+        _ctrader_application_auth(ws)
+        _ctrader_account_auth(ws, token, account_id)
+        body = _ctrader_send_wait(
+            ws,
+            2114,
+            {"ctidTraderAccountId": account_id, "includeArchivedSymbols": False},
+            2115,
+        )
+        return [dict(x) for x in (body.get("symbol") or []) if isinstance(x, dict)]
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def _ctrader_refresh_catalog_blocking(item: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
+    global ctrader_last_error
+    now_ts = time.time()
+    with ctrader_data_guard:
+        cached_at = float(item.get("symbols_cached_at") or 0)
+        cached = item.get("symbols_map") or {}
+        if cached and not force and now_ts - cached_at < CTRADER_SYMBOL_CACHE_TTL:
+            return {"accounts": list(item.get("accounts") or []), "symbols_map": dict(cached)}
+
+    accounts = _ctrader_fetch_accounts_blocking(item)
+    # Demo primeiro durante desenvolvimento; se o mesmo símbolo existir em
+    # várias contas, a primeira conta será usada apenas como fonte de preço.
+    accounts.sort(key=lambda a: (1 if _ctrader_bool(a.get("isLive")) else 0, int(a.get("ctidTraderAccountId") or 0)))
+    symbol_map = {}
+    errors = []
+    for acc in accounts:
+        try:
+            rows = _ctrader_symbols_for_account_blocking(item, acc)
+        except Exception as exc:
+            errors.append(str(exc)[:160])
+            continue
+        for row in rows:
+            if row.get("enabled") is False:
+                continue
+            raw_name = str(row.get("symbolName") or row.get("name") or "").strip()
+            symbol_id = int(row.get("symbolId") or 0)
+            if not raw_name or not symbol_id:
+                continue
+            display = _ctrader_canonical_symbol_name(raw_name)
+            key = display.upper()
+            entry = {
+                "symbol": display,
+                "raw_symbol": raw_name,
+                "symbol_id": symbol_id,
+                "account_id": int(acc.get("ctidTraderAccountId") or 0),
+                "is_live": _ctrader_bool(acc.get("isLive")),
+                "broker": str(acc.get("brokerTitleShort") or "cTrader"),
+                "trader_login": acc.get("traderLogin"),
+            }
+            # Preserve a primeira ocorrência (demo antes de live).
+            symbol_map.setdefault(key, entry)
+
+    if not symbol_map:
+        ctrader_last_error = " | ".join(errors[-3:])
+        raise RuntimeError(ctrader_last_error or "cTrader não retornou símbolos habilitados.")
+
+    with ctrader_data_guard:
+        item["accounts"] = accounts
+        item["symbols_map"] = symbol_map
+        item["symbols_cached_at"] = time.time()
+        item.setdefault("candle_cache", {})
+        ctrader_symbol_union.update(symbol_map.keys())
+        ctrader_last_error = ""
+    return {"accounts": accounts, "symbols_map": symbol_map}
+
+
+async def _ctrader_catalog(item: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
+    return await asyncio.wait_for(
+        asyncio.to_thread(_ctrader_refresh_catalog_blocking, item, force),
+        timeout=max(CTRADER_DATA_TIMEOUT * 6, 45),
+    )
+
+
+def _ctrader_period(interval: str) -> int:
+    periods = {"1min": 1, "5min": 5, "15min": 7, "30min": 8, "1h": 9, "4h": 10}
+    if interval not in periods:
+        raise RuntimeError("Intervalo não suportado pela fonte cTrader.")
+    return periods[interval]
+
+
+def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, n: int) -> list:
+    catalog = _ctrader_refresh_catalog_blocking(item, False)
+    symbol_map = catalog.get("symbols_map") or {}
+    entry = symbol_map.get(str(symbol or "").upper())
+    if not entry:
+        # Tenta também casar pelo nome bruto, útil para símbolos com sufixos.
+        target = str(symbol or "").strip().upper()
+        for cand in symbol_map.values():
+            if str(cand.get("raw_symbol") or "").strip().upper() == target:
+                entry = cand
+                break
+    if not entry:
+        raise RuntimeError(f"Ativo {symbol} não existe na conta cTrader conectada.")
+
+    cache_key = f"{entry['account_id']}|{entry['symbol_id']}|{interval}"
+    now_ts = time.time()
+    with ctrader_data_guard:
+        cached = (item.get("candle_cache") or {}).get(cache_key)
+        if cached and now_ts - float(cached[0]) < CTRADER_CANDLE_CACHE_TTL and len(cached[1]) >= min(20, int(n)):
+            return list(cached[1])[-int(n):]
+
+    account_id = int(entry["account_id"])
+    symbol_id = int(entry["symbol_id"])
+    is_live = bool(entry["is_live"])
+    token = str(item.get("access_token") or "").strip()
+    seconds = int(INTERVALS.get(interval, 60))
+    # Janela folgada, porém compatível com os limites de histórico por período.
+    days_map = {"1min": 3, "5min": 7, "15min": 14, "30min": 30, "1h": 60, "4h": 180}
+    to_ms = int(time.time() * 1000)
+    from_ms = to_ms - int(days_map.get(interval, 7) * 86400 * 1000)
+
+    ws = _ctrader_open_socket(is_live)
+    try:
+        _ctrader_application_auth(ws)
+        _ctrader_account_auth(ws, token, account_id)
+        body = _ctrader_send_wait(
+            ws,
+            2137,
+            {
+                "ctidTraderAccountId": account_id,
+                "fromTimestamp": from_ms,
+                "toTimestamp": to_ms,
+                "period": _ctrader_period(interval),
+                "symbolId": symbol_id,
+                "count": max(20, min(int(n), 150)),
+            },
+            2138,
+            timeout=max(CTRADER_DATA_TIMEOUT, 15),
+        )
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+    rows = []
+    for bar in body.get("trendbar") or []:
+        if not isinstance(bar, dict):
+            continue
+        try:
+            low_i = int(bar.get("low") or 0)
+            open_i = low_i + int(bar.get("deltaOpen") or 0)
+            close_i = low_i + int(bar.get("deltaClose") or 0)
+            high_i = low_i + int(bar.get("deltaHigh") or 0)
+            ts_min = int(bar.get("utcTimestampInMinutes") or 0)
+            if low_i <= 0 or ts_min <= 0:
+                continue
+            rows.append({
+                "datetime": datetime.fromtimestamp(ts_min * 60, tz=UTC).isoformat(),
+                "open": open_i / 100000.0,
+                "high": high_i / 100000.0,
+                "low": low_i / 100000.0,
+                "close": close_i / 100000.0,
+                "volume": float(bar.get("volume") or 0),
+                "feed_source": "CTRADER_OPEN",
+                "source_symbol": str(entry.get("raw_symbol") or symbol),
+                "ctrader_account_id": account_id,
+                "ctrader_broker": str(entry.get("broker") or "cTrader"),
+            })
+        except Exception:
+            continue
+    rows.sort(key=lambda x: str(x.get("datetime") or ""))
+    if not rows:
+        raise RuntimeError("cTrader retornou zero candles para este ativo/período.")
+
+    with ctrader_data_guard:
+        item.setdefault("candle_cache", {})[cache_key] = (time.time(), list(rows))
+    return rows[-int(n):]
+
+
+async def _ctrader_candles(item: Dict[str, Any], symbol: str, interval: str, n: int = 80) -> list:
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_ctrader_candles_blocking, item, symbol, interval, n),
+            timeout=max(CTRADER_DATA_TIMEOUT * 4, 35),
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError("cTrader demorou demais para responder aos candles.")
+
+
+@app.get("/ctrader/symbols")
+async def ctrader_symbols(request: Request, refresh: bool = False):
+    _, item = _ctrader_session_from_request(request)
+    if not item:
+        raise HTTPException(401, "Autorize a cTrader primeiro na aba Corretora.")
+    try:
+        data = await _ctrader_catalog(item, bool(refresh))
+    except Exception as exc:
+        raise HTTPException(503, f"Não foi possível carregar os ativos cTrader: {str(exc)[:240]}")
+    symbol_map = data.get("symbols_map") or {}
+    rows = sorted(symbol_map.values(), key=lambda x: str(x.get("symbol") or ""))
+    return {
+        "ok": True,
+        "source": "CTRADER_OPEN",
+        "primary_for_open": True,
+        "count": len(rows),
+        "accounts": [
+            {
+                "account_id": int(a.get("ctidTraderAccountId") or 0),
+                "is_live": _ctrader_bool(a.get("isLive")),
+                "trader_login": a.get("traderLogin"),
+                "broker": str(a.get("brokerTitleShort") or "cTrader"),
+            }
+            for a in (data.get("accounts") or [])
+        ],
+        "symbols": [
+            {
+                "symbol": r.get("symbol"),
+                "raw_symbol": r.get("raw_symbol"),
+                "broker": r.get("broker"),
+                "is_live": bool(r.get("is_live")),
+            }
+            for r in rows
+        ],
+    }
+
 @app.get("/ctrader/login")
 async def ctrader_login():
     """Inicia OAuth oficial da cTrader com acesso somente leitura."""
@@ -8215,6 +8679,10 @@ async def ctrader_status(request: Request):
         "expires_in_seconds": expires_in,
         "redirect_uri": CTRADER_REDIRECT_URI,
         "server_session": bool(session_id and item),
+        "primary_for_open": True,
+        "symbols_cached": len((item or {}).get("symbols_map") or {}),
+        "accounts_cached": len((item or {}).get("accounts") or []),
+        "last_data_error": ctrader_last_error[:180],
     }
 
 
@@ -8253,6 +8721,8 @@ async def health():
             "sessions": len(ctrader_sessions),
             "scope": CTRADER_SCOPE,
             "read_only": True,
+            "primary_for_open": True,
+            "last_data_error": ctrader_last_error[:160],
         },
         "binomo_crypto_idx": {
             "auth_enabled": bool(BINOMO_AUTH_WS_ENABLED),
@@ -8612,6 +9082,109 @@ def _iq_parse_buy_result(result):
     return True, result
 
 
+def _iq_auto_candidates(symbol: str, market: str):
+    """Nomes que podem ser enviados para a IQ, sem misturar OPEN e OTC."""
+    market = str(market or "OPEN").upper()
+    if market == "IQ_OTC":
+        # Nunca cai silenciosamente para o ativo normal quando o usuário pediu OTC.
+        return [c for c in iq_active_candidates(symbol) if "OTC" in _iq_active_norm(c)]
+    return [c for c in iq_regular_active_candidates(symbol) if "OTC" not in _iq_active_norm(c)]
+
+
+def _iq_auto_open_books_blocking(state: Dict[str, Any]):
+    """Obtém os ativos realmente abertos para turbo/binary/digital, com cache curto."""
+    now_ts = time.time()
+    cached = state.get("auto_open_time_cache") if state else None
+    if isinstance(cached, dict) and now_ts - float(cached.get("ts", 0) or 0) < 12:
+        return cached
+
+    client = state.get("client") if state else None
+    getter = getattr(client, "get_all_open_time", None) if client is not None else None
+    if not callable(getter):
+        result = {"ts": now_ts, "exact": False, "books": {}, "error": "get_all_open_time indisponível"}
+        if state is not None:
+            state["auto_open_time_cache"] = result
+        return result
+
+    try:
+        sync_lock = state.get("sync_lock")
+        if sync_lock is None:
+            sync_lock = threading.RLock()
+            state["sync_lock"] = sync_lock
+        with sync_lock:
+            raw = getter()
+        books = {}
+        if isinstance(raw, dict):
+            for book_name in ("turbo", "binary", "digital"):
+                book = raw.get(book_name) or {}
+                if not isinstance(book, dict):
+                    continue
+                opened = {}
+                for active_name, info in book.items():
+                    if isinstance(info, dict) and bool(info.get("open")):
+                        opened[_iq_active_norm(active_name)] = str(active_name)
+                books[book_name] = opened
+        result = {"ts": now_ts, "exact": bool(books), "books": books, "error": ""}
+    except Exception as exc:
+        result = {"ts": now_ts, "exact": False, "books": {}, "error": str(exc)[:180]}
+
+    state["auto_open_time_cache"] = result
+    return result
+
+
+def _iq_auto_capability_blocking(state: Dict[str, Any], symbol: str, interval: str, market: str):
+    client = _iq_reconnect_state(state)
+    if not _iq_connected(state):
+        return {"available": False, "reason": "IQ Option desconectada.", "methods": []}
+
+    expiry_minutes = max(1, int(round(iq_seconds(interval) / 60)))
+    candidates = _iq_auto_candidates(symbol, market)
+    snap = _iq_auto_open_books_blocking(state)
+    books = snap.get("books") or {}
+    methods = []
+    actives = []
+
+    for book_name in (("turbo", "binary") if expiry_minutes <= 5 else ("binary", "turbo")):
+        book = books.get(book_name) or {}
+        for candidate in candidates:
+            matched = book.get(_iq_active_norm(candidate))
+            if matched:
+                methods.append(book_name.upper())
+                actives.append(matched)
+                break
+
+    if expiry_minutes in (1, 5):
+        book = books.get("digital") or {}
+        for candidate in candidates:
+            matched = book.get(_iq_active_norm(candidate))
+            if matched:
+                methods.append("DIGITAL")
+                actives.append(matched)
+                break
+
+    methods = list(dict.fromkeys(methods))
+    actives = list(dict.fromkeys(actives))
+    if snap.get("exact"):
+        return {
+            "available": bool(methods),
+            "reason": ("Disponível: " + ", ".join(methods)) if methods else "Ativo fechado/indisponível para opções na IQ Option.",
+            "methods": methods,
+            "actives": actives,
+            "exact": True,
+        }
+
+    # Se o fork não conseguiu listar abertura, permitimos a tentativa controlada
+    # e deixamos a própria IQ responder; assim uma falha do catálogo não trava o robô.
+    return {
+        "available": True,
+        "reason": "Não foi possível validar o catálogo; a ordem fará tentativa controlada.",
+        "methods": [],
+        "actives": candidates,
+        "exact": False,
+        "catalog_error": snap.get("error", ""),
+    }
+
+
 def _iq_place_demo_order_blocking(state: Dict[str, Any], symbol: str, interval: str, direction: str, amount: float, market: str):
     client = _iq_reconnect_state(state)
     if not _iq_connected(state):
@@ -8623,38 +9196,126 @@ def _iq_place_demo_order_blocking(state: Dict[str, Any], symbol: str, interval: 
         if changed is False:
             raise RuntimeError("Não foi possível selecionar a conta DEMO/PRACTICE.")
 
-    buyer = getattr(client, "buy", None)
-    if not callable(buyer):
-        raise RuntimeError("Esta versão da iqoptionapi não possui a função buy().")
-
     action = "call" if direction == "CALL" else "put"
     expiry_minutes = max(1, int(round(iq_seconds(interval) / 60)))
-    candidates = iq_active_candidates(symbol) if market == "IQ_OTC" else iq_regular_active_candidates(symbol)
-    errors = []
+    candidates = _iq_auto_candidates(symbol, market)
+    if not candidates:
+        raise RuntimeError("Ativo sem mapeamento válido para este mercado da IQ Option.")
 
-    for active in candidates:
+    snap = _iq_auto_open_books_blocking(state)
+    books = snap.get("books") or {}
+    exact = bool(snap.get("exact"))
+    errors = []
+    attempted = set()
+
+    def finish(order_id, active, order_type, book_name):
+        state["connected"] = True
+        state["last_seen"] = time.time()
+        state["last_error"] = ""
+        return {
+            "ok": True,
+            "order_id": str(order_id) if order_id is not None else "",
+            "active": active,
+            "action": action,
+            "amount": round(float(amount), 2),
+            "expiry_minutes": expiry_minutes,
+            "account": "PRACTICE",
+            "order_type": order_type,
+            "market_book": book_name,
+        }
+
+    def try_binary(active, book_name="turbo"):
+        buyer = getattr(client, "buy", None)
+        if not callable(buyer):
+            errors.append("BINARY: função buy() indisponível")
+            return None
+        tag = ("BINARY", active)
+        if tag in attempted:
+            return None
+        attempted.add(tag)
         try:
             result = buyer(float(amount), active, action, expiry_minutes)
             ok, order_id = _iq_parse_buy_result(result)
             if ok:
-                state["connected"] = True
-                state["last_seen"] = time.time()
-                state["last_error"] = ""
-                return {
-                    "ok": True,
-                    "order_id": str(order_id) if order_id is not None else "",
-                    "active": active,
-                    "action": action,
-                    "amount": round(float(amount), 2),
-                    "expiry_minutes": expiry_minutes,
-                    "account": "PRACTICE",
-                }
-            errors.append(f"{active}: ordem recusada")
+                return finish(order_id, active, "BINARY", book_name.upper())
+            detail = str(order_id) if order_id not in (None, "") else "ordem recusada"
+            errors.append(f"{book_name.upper()} {active}: {detail}")
         except Exception as exc:
-            msg = str(exc) or exc.__class__.__name__
-            errors.append(f"{active}: {msg}")
+            errors.append(f"{book_name.upper()} {active}: {str(exc) or exc.__class__.__name__}")
+        return None
 
-    raise RuntimeError("IQ Option recusou a ordem DEMO. " + " | ".join(errors[-3:])[:320])
+    def try_digital(active):
+        if expiry_minutes not in (1, 5):
+            return None
+        tag = ("DIGITAL", active)
+        if tag in attempted:
+            return None
+        attempted.add(tag)
+        methods = [
+            ("buy_digital_spot_v2", getattr(client, "buy_digital_spot_v2", None)),
+            ("buy_digital_spot", getattr(client, "buy_digital_spot", None)),
+        ]
+        available_method = False
+        for method_name, method in methods:
+            if not callable(method):
+                continue
+            available_method = True
+            try:
+                result = method(active, float(amount), action, expiry_minutes)
+                ok, order_id = _iq_parse_buy_result(result)
+                if ok:
+                    return finish(order_id, active, "DIGITAL", method_name.upper())
+                detail = str(order_id) if order_id not in (None, "") else "ordem recusada"
+                errors.append(f"DIGITAL {active}/{method_name}: {detail}")
+            except Exception as exc:
+                errors.append(f"DIGITAL {active}/{method_name}: {str(exc) or exc.__class__.__name__}")
+        if not available_method:
+            errors.append("DIGITAL: método de compra indisponível nesta iqoptionapi")
+        return None
+
+    # 1) Quando o catálogo está disponível, usamos SOMENTE ativos realmente abertos.
+    if exact:
+        binary_books = ("turbo", "binary") if expiry_minutes <= 5 else ("binary", "turbo")
+        for book_name in binary_books:
+            book = books.get(book_name) or {}
+            for candidate in candidates:
+                active = book.get(_iq_active_norm(candidate))
+                if active:
+                    placed = try_binary(active, book_name)
+                    if placed:
+                        return placed
+                    break
+
+        if expiry_minutes in (1, 5):
+            digital_book = books.get("digital") or {}
+            for candidate in candidates:
+                active = digital_book.get(_iq_active_norm(candidate))
+                if active:
+                    placed = try_digital(active)
+                    if placed:
+                        return placed
+                    break
+
+        if not attempted:
+            raise RuntimeError(
+                f"{symbol} não está aberto agora em TURBO/BINARY/DIGITAL na IQ Option para {interval}."
+            )
+
+    # 2) Se o catálogo do fork falhou, mantém compatibilidade: tenta os nomes conhecidos,
+    #    primeiro binária/turbo e depois digital (M1/M5).
+    else:
+        for active in candidates:
+            placed = try_binary(active, "fallback")
+            if placed:
+                return placed
+        if expiry_minutes in (1, 5):
+            for active in candidates:
+                placed = try_digital(active)
+                if placed:
+                    return placed
+
+    detail = " | ".join(errors[-5:])[:520]
+    raise RuntimeError("IQ Option recusou a ordem DEMO. " + (detail or "Nenhum método de opções disponível para este ativo."))
 
 
 @app.post("/iq-auto-order")
@@ -8689,7 +9350,7 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
     delta = (now() - entry_dt).total_seconds()
     if delta < -8:
         raise HTTPException(409, f"A entrada ainda não abriu. Faltam aproximadamente {int(abs(delta))}s.")
-    if delta > 15:
+    if delta > 20:
         raise HTTPException(409, "Janela da entrada automática encerrada para este sinal.")
 
     order_key = "|".join([
@@ -8711,7 +9372,13 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
         store = state.setdefault("auto_orders", {})
         previous = store.get(order_key)
         if previous:
-            return {**previous, "duplicate": True}
+            prev_status = str(previous.get("status") or "").upper()
+            if prev_status == "PLACED":
+                return {**previous, "duplicate": True}
+            if prev_status == "UNKNOWN_TIMEOUT":
+                raise HTTPException(409, "A tentativa anterior ficou sem confirmação. Não será reenviada para evitar ordem duplicada.")
+            # REJECTED/PLACING antigo não é tratado como sucesso. Libera nova tentativa.
+            store.pop(order_key, None)
 
         store[order_key] = {
             "ok": False,
@@ -8732,7 +9399,7 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
                     amount,
                     market,
                 ),
-                timeout=18,
+                timeout=24,
             )
         except asyncio.TimeoutError:
             # Mantém a chave bloqueada: em timeout não repetimos, pois a corretora
@@ -8854,6 +9521,32 @@ async def iq_auto_status(request: Request):
         "account": "PRACTICE",
         "orders": orders,
     }
+
+
+@app.get("/iq-auto-capability")
+async def iq_auto_capability(request: Request, symbol: str = "EUR/USD", interval: str = "1min", market: str = "OPEN"):
+    state = _iq_session_state(request, required=False)
+    if not state or not _iq_connected(state):
+        return {"connected": False, "available": False, "reason": "Conecte a IQ Option primeiro.", "methods": []}
+
+    symbol = str(symbol or "").upper()
+    interval = str(interval or "1min")
+    market = str(market or "OPEN").upper()
+    if interval not in INTERVALS:
+        raise HTTPException(400, "Intervalo inválido.")
+    if market not in VALID_MARKETS:
+        raise HTTPException(400, "Mercado inválido.")
+    if symbol == BINOMO_CRYPTO_IDX_SYMBOL:
+        return {"connected": True, "available": False, "reason": "Crypto IDX não é um ativo de opções da IQ Option.", "methods": []}
+
+    try:
+        data = await asyncio.wait_for(
+            asyncio.to_thread(_iq_auto_capability_blocking, state, symbol, interval, market),
+            timeout=12,
+        )
+    except asyncio.TimeoutError:
+        data = {"available": True, "reason": "Catálogo da IQ demorou; a ordem fará tentativa controlada.", "methods": [], "exact": False}
+    return {"connected": True, "symbol": symbol, "interval": interval, "market": market, **data}
 
 
 @app.post("/iq-logout")
@@ -9160,7 +9853,7 @@ async def compatibility_test(
     # Pede uma margem extra e remove a vela em formação dos dois lados.
     need = min(120, sample + 8)
     try:
-        app_rows = await candles_open(symbol, interval, need)
+        app_rows = await candles_open(symbol, interval, need, request=request)
     except Exception as exc:
         return {
             "ok": False,
@@ -9408,8 +10101,8 @@ async def feed_status():
             "yahoo_public_enabled": True,
             "cached_series": len(public_feed_cache),
             "active_series": dict(list(market_feed_status.items())[-30:]),
-            "crypto_order": ["BINANCE_PUBLIC", "TWELVE_DATA", "YAHOO_PUBLIC"],
-            "forex_order": (["TWELVE_DATA", "YAHOO_PUBLIC"] if TD_KEY else ["YAHOO_PUBLIC"]),
+            "crypto_order": ["CTRADER_OPEN", "BINANCE_PUBLIC", "TWELVE_DATA", "YAHOO_PUBLIC"],
+            "forex_order": (["CTRADER_OPEN", "TWELVE_DATA", "YAHOO_PUBLIC"] if TD_KEY else ["CTRADER_OPEN", "YAHOO_PUBLIC"]),
             "crypto_idx_order": ["BINOMO_ONLY"],
             "binomo_crypto_idx": {
                 "configured": bool(BINOMO_AUTH_WS_ENABLED or BINOMO_QUOTE_WS_ENABLED or BINOMO_DIRECT_REST_ENABLED or BINOMO_CANDLES_URL),
@@ -9441,7 +10134,7 @@ async def candles_endpoint(
 ):
     market = (market or "OPEN").upper()
 
-    if symbol not in SYMBOLS or interval not in INTERVALS or market not in VALID_MARKETS:
+    if not _symbol_allowed(symbol, market) or interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if symbol == BINOMO_CRYPTO_IDX_SYMBOL and market != "OPEN":
         raise HTTPException(400, "Crypto IDX é Binomo e não pode ser usado como OTC da IQ Option.")
@@ -9970,7 +10663,7 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
 @app.get("/engine-study")
 async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1min", market: str="OPEN"):
     market=(market or "OPEN").upper()
-    if symbol not in SYMBOLS or interval not in INTERVALS or market not in VALID_MARKETS:
+    if not _symbol_allowed(symbol, market) or interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400,"Ativo, intervalo ou mercado inválido.")
 
     iq_state=_iq_session_state(request, required=False)
@@ -10030,7 +10723,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
     engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
 
-    if symbol not in SYMBOLS or interval not in INTERVALS or requested_market not in VALID_MARKETS:
+    if not _symbol_allowed(symbol, requested_market) or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
@@ -10177,7 +10870,7 @@ async def pre_signals(
         raise HTTPException(400, "Intervalo ou mercado inválido.")
     if symbol is not None:
         symbol = str(symbol).strip().upper()
-        if symbol not in SYMBOLS:
+        if not _symbol_allowed(symbol, market):
             raise HTTPException(400, "Ativo inválido para pré-alerta.")
 
     requested_market = market
@@ -10338,7 +11031,7 @@ async def chart_pre_signal(
     """
     market = (market or "OPEN").upper()
 
-    if symbol not in SYMBOLS or interval not in INTERVALS or market not in VALID_MARKETS:
+    if not _symbol_allowed(symbol, market) or interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
 
     requested_market = market
@@ -10525,7 +11218,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
 
     if interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Intervalo ou mercado inválido.")
-    if symbol and symbol not in SYMBOLS:
+    if symbol and not _symbol_allowed(symbol, market):
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
@@ -11610,8 +12303,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="btcOnlyBtn" type="button" style="font-weight:1000">₿ SÓ BTC/USD • OFF</button>
     <div id="btcOnlyNote" class="label" style="display:none;grid-column:1/-1">Modo BTC/USD ativo • painel, gráfico, pré-alerta e radar focados somente neste ativo.</div>
 
-    <button id="adaptiveLearningBtn" type="button" style="font-weight:1000">🧠 APRENDIZADO • ON</button>
-    <div id="adaptiveLearningNote" class="label" style="grid-column:1/-1">Coletando resultados por ativo • o filtro só muda sinais depois de amostra suficiente.</div>
+    <button id="adaptiveLearningBtn" type="button" style="font-weight:1000">🧠 APRENDIZADO WIN DIRETO • ON</button>
+    <div id="adaptiveLearningNote" class="label" style="grid-column:1/-1">Coletando resultados por ativo • prioridade: WIN na primeira entrada; G1/G2 têm peso reduzido.</div>
 
     <select id="interval">
       <option>1min</option>
@@ -11975,8 +12668,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="card" style="margin-top:14px;border-color:#38bdf8">
         <div style="font-weight:1000">📡 cTrader OPEN API • FONTE AUTORIZADA</div>
         <div class="label" style="margin-top:6px;line-height:1.5">
-          Conexão oficial em modo <b>somente leitura</b> (scope accounts). O MEGA IA não recebe sua senha cTrader
-          e não solicita permissão para executar ordens.
+          Conexão oficial em modo <b>somente leitura</b> (scope accounts). Quando conectada, a cTrader vira a
+          <b>fonte principal do Mercado Aberto</b> e seus ativos habilitados são carregados automaticamente no app.
         </div>
         <div id="ctraderAccountStatus" class="card" style="margin-top:10px">
           ⚪ cTrader • verificando configuração...
@@ -12106,8 +12799,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 (function(){
   try{
     const u=new URL(window.location.href);
-    if(u.searchParams.get('pwa')!=='v76'){
-      u.searchParams.set('pwa','v76');
+    if(u.searchParams.get('pwa')!=='v91'){
+      u.searchParams.set('pwa','v91');
       window.history.replaceState({},'',u.pathname+u.search+u.hash);
     }
   }catch(_){}
@@ -12269,6 +12962,9 @@ const iqAccountStatus=document.getElementById('iqAccountStatus');
 const ctraderAccountStatus=document.getElementById('ctraderAccountStatus');
 const ctraderConnectBtn=document.getElementById('ctraderConnectBtn');
 const ctraderLogoutBtn=document.getElementById('ctraderLogoutBtn');
+let ctraderConnected=false;
+let ctraderSymbols=[];
+let ctraderAccounts=[];
 const binomoEmail=document.getElementById('binomoEmail');
 const binomoPassword=document.getElementById('binomoPassword');
 const binomoConnectBtn=document.getElementById('binomoConnectBtn');
@@ -12580,7 +13276,7 @@ function adaptiveLearningHistory(){
 
 function renderAdaptiveLearningState(){
   if(adaptiveLearningBtn){
-    adaptiveLearningBtn.textContent=adaptiveLearningEnabled?'🧠 APRENDIZADO • ON':'🧠 APRENDIZADO • OFF';
+    adaptiveLearningBtn.textContent=adaptiveLearningEnabled?'🧠 APRENDIZADO WIN DIRETO • ON':'🧠 APRENDIZADO • OFF';
     adaptiveLearningBtn.style.background=adaptiveLearningEnabled?'#0b7a3d':'#7d1d1d';
     adaptiveLearningBtn.style.color='#fff';
     adaptiveLearningBtn.style.borderColor=adaptiveLearningEnabled?'#16c56b':'#ff5252';
@@ -12598,7 +13294,7 @@ function renderAdaptiveLearningState(){
     const q=Number(row.quality||0).toFixed(1);
     const direct=Number(row.direct_win_rate||0).toFixed(1);
     adaptiveLearningNote.textContent=n>=minN
-      ? `Perfil ${sym} ATIVO • ${n} operações • qualidade ${q}% • WIN direto ${direct}% • filtros adaptativos liberados.`
+      ? `Perfil ${sym} ATIVO • ${n} operações • qualidade ${q}% • WIN direto ${direct}% • foco: elevar acerto de primeira entrada.`
       : `Perfil ${sym}: coletando ${n}/${minN} operações • qualidade ${q}% • ainda sem alterar sinais.`;
   }else{
     adaptiveLearningNote.textContent=`Coletando resultados de ${sym} • o filtro só atua depois de ${minN} operações.`;
@@ -13291,15 +13987,21 @@ function fillSymbols(){
   const previous=S.value;
   S.innerHTML='';
 
-  const suffix=(marketMode && marketMode.value==='OTC')
-    ? ' • IQ OTC'
-    : '';
-
-  const visibleSymbols=btcOnlyEnabled ? ['BTC/USD'] : syms;
+  const isOtc=!!(marketMode && marketMode.value==='OTC');
+  const suffix=isOtc ? ' • IQ OTC' : '';
+  const ctSet=new Set((ctraderSymbols||[]).map(x=>String(x).toUpperCase()));
+  const baseSet=new Set(syms.map(x=>String(x).toUpperCase()));
+  const ctraderExtra=(ctraderSymbols||[])
+    .filter(x=>!baseSet.has(String(x).toUpperCase()) && String(x).toUpperCase()!=='CRYPTO IDX')
+    .sort((a,b)=>String(a).localeCompare(String(b)));
+  const openSymbols=[...syms.filter(x=>x!=='CRYPTO IDX'),...ctraderExtra,'CRYPTO IDX'];
+  const visibleSymbols=btcOnlyEnabled ? ['BTC/USD'] : (isOtc ? syms : openSymbols);
 
   visibleSymbols.forEach(x=>{
-    if(marketMode && marketMode.value==='OTC' && x==='CRYPTO IDX') return;
-    const extra=(x==='CRYPTO IDX' && (!marketMode || marketMode.value!=='OTC')) ? ' • BINOMO' : suffix;
+    if(isOtc && x==='CRYPTO IDX') return;
+    let extra=suffix;
+    if(!isOtc && x==='CRYPTO IDX') extra=' • BINOMO';
+    else if(!isOtc && ctSet.has(String(x).toUpperCase())) extra=' • cTrader';
     S.add(new Option(x+extra,x));
   });
 
@@ -13566,7 +14268,10 @@ async function post(u,data={}){
   }
 
   if(!r.ok){
-    throw Error((j&&j.detail)?j.detail:'HTTP '+r.status);
+    const err=Error((j&&j.detail)?j.detail:'HTTP '+r.status);
+    err.status=r.status;
+    err.payload=j;
+    throw err;
   }
 
   return j;
@@ -13649,17 +14354,33 @@ if(autoTradeGaleMultiplier){
 }
 
 if(autoTradeToggle){
-  autoTradeToggle.onclick=()=>{
+  autoTradeToggle.onclick=async()=>{
     if(!autoTradeEnabled){
       if(!brokerConnected.IQ_OPTION){
         renderAutoTradeState('🟠 Conecte a IQ Option antes de ativar a AUTO ENTRADA.');
         return;
       }
-      const cfg=autoTradeSettings();
-      autoTradeEnabled=true;
-      const galeTxt=cfg.gale===0?'sem Gale':('até Gale '+cfg.gale+' • '+cfg.multiplier.toFixed(1)+'x');
-      renderAutoTradeState('🟢 AUTO DEMO armada • '+galeTxt+' • aguardando o próximo sinal confirmado.');
-      if(voiceEnabled) speak('Auto entrada demo ativada.');
+      autoTradeToggle.disabled=true;
+      renderAutoTradeState('🟡 Verificando se '+String(S.value||'ativo')+' está aberto para opções na IQ...');
+      try{
+        const cap=await get('/iq-auto-capability?symbol='+encodeURIComponent(S.value)+
+          '&interval='+encodeURIComponent(interval.value)+
+          '&market='+encodeURIComponent(market.value||'OPEN'));
+        if(cap && cap.available===false){
+          renderAutoTradeState('🟠 AUTO DEMO não armada • '+String(cap.reason||'ativo indisponível na IQ Option.'));
+          return;
+        }
+        const cfg=autoTradeSettings();
+        autoTradeEnabled=true;
+        const galeTxt=cfg.gale===0?'sem Gale':('até Gale '+cfg.gale+' • '+cfg.multiplier.toFixed(1)+'x');
+        const route=(cap&&Array.isArray(cap.methods)&&cap.methods.length)?(' • '+cap.methods.join('/')):'';
+        renderAutoTradeState('🟢 AUTO DEMO armada'+route+' • '+galeTxt+' • aguardando o próximo sinal confirmado.');
+        if(voiceEnabled) speak('Auto entrada demo ativada.');
+      }catch(e){
+        renderAutoTradeState('🟠 Não foi possível validar a IQ agora: '+String((e&&e.message)||e));
+      }finally{
+        autoTradeToggle.disabled=false;
+      }
     }else{
       disableAutoTrade('🔴 AUTO DEMO desligada manualmente.');
       if(voiceEnabled) speak('Auto entrada desligada.');
@@ -13735,7 +14456,9 @@ async function placeAutoGaleOrder(sig, stage, entryIso, amount){
       amount:amount,
       stage:stage
     });
-    renderAutoTradeState('✅ '+stage+' ENVIADO • '+(d.active||sig.symbol||S.value)+' • '+sig.direction+' • valor '+amount.toFixed(2));
+    if(!d || d.ok!==true || d.status!=='PLACED') throw Error((d&&d.message)||'A IQ não confirmou a ordem.');
+    const route=d.order_type?(' • '+d.order_type):'';
+    renderAutoTradeState('✅ '+stage+' ENVIADO'+route+' • '+(d.active||sig.symbol||S.value)+' • '+sig.direction+' • valor '+amount.toFixed(2));
     if(voiceEnabled) speak(stage+' enviado.');
     return d;
   }catch(e){
@@ -13798,7 +14521,7 @@ async function executeAutoTrade(sig){
 
   const entryMs=new Date(sig.entry_time).getTime();
   const delta=(Date.now()-entryMs)/1000;
-  if(delta < -8 || delta > 15) return;
+  if(delta < -8 || delta > 20) return;
 
   autoExecutedKeys.add(key);
   autoOrderBusy=true;
@@ -13816,9 +14539,11 @@ async function executeAutoTrade(sig){
       amount:amount,
       stage:'ENTRADA'
     });
+    if(!d || d.ok!==true || d.status!=='PLACED') throw Error((d&&d.message)||'A IQ não confirmou a ordem.');
     const ativo=d.active||sig.symbol||S.value;
+    const route=d.order_type?(' • '+d.order_type):'';
     const galeTxt=cfg.gale===0?'sem Gale':('até G'+cfg.gale);
-    renderAutoTradeState('✅ ENTRADA DEMO ENVIADA • '+ativo+' • '+sig.direction+' • valor '+amount.toFixed(2)+' • '+galeTxt);
+    renderAutoTradeState('✅ ENTRADA DEMO ENVIADA'+route+' • '+ativo+' • '+sig.direction+' • valor '+amount.toFixed(2)+' • '+galeTxt);
     if(voiceEnabled) speak('Ordem demo enviada. '+(sig.direction==='CALL'?'Compra':'Venda')+'.');
 
     if(cfg.gale>0 && !autoGaleRuns.has(key)){
@@ -14600,28 +15325,67 @@ async function refreshAccountStatus(){
   await updateMarketNote();
 }
 
+
+async function refreshCTraderSymbols(force=false){
+  if(!ctraderConnected){
+    ctraderSymbols=[];
+    ctraderAccounts=[];
+    fillSymbols();
+    return null;
+  }
+  try{
+    const d=await get('/ctrader/symbols?refresh='+(force?'true':'false')+'&t='+Date.now());
+    ctraderSymbols=(Array.isArray(d.symbols)?d.symbols:[])
+      .map(x=>String((x&&x.symbol)||'').trim().toUpperCase())
+      .filter(Boolean);
+    ctraderAccounts=Array.isArray(d.accounts)?d.accounts:[];
+    fillSymbols();
+    try{
+      const saved=localStorage.getItem('mega_symbol');
+      if(saved && S && [...S.options].some(o=>o.value===saved)) S.value=saved;
+    }catch(_){}
+    return d;
+  }catch(e){
+    return null;
+  }
+}
+
 async function refreshCTraderStatus(){
   if(!ctraderAccountStatus) return null;
   try{
     const d=await get('/ctrader/status?t='+Date.now());
     if(!d.configured){
+      ctraderConnected=false;
+      ctraderSymbols=[];
       ctraderAccountStatus.textContent='🔴 cTrader • faltam CTRADER_CLIENT_ID/CTRADER_CLIENT_SECRET no Render';
       if(ctraderConnectBtn) ctraderConnectBtn.style.display='block';
       if(ctraderLogoutBtn) ctraderLogoutBtn.style.display='none';
+      fillSymbols();
       return d;
     }
     if(d.connected){
+      ctraderConnected=true;
       const days=Math.max(0,Number(d.expires_in_seconds||0))/86400;
-      ctraderAccountStatus.textContent='🟢 cTrader CONECTADA • SOMENTE LEITURA • token '+(days>=1?days.toFixed(1)+' dias':Math.ceil(days*24)+' h');
       if(ctraderConnectBtn) ctraderConnectBtn.style.display='none';
       if(ctraderLogoutBtn) ctraderLogoutBtn.style.display='block';
+      let count=Number(d.symbols_cached||0);
+      if(!ctraderSymbols.length){
+        const cat=await refreshCTraderSymbols(false);
+        if(cat) count=Number(cat.count||ctraderSymbols.length||0);
+      }
+      ctraderAccountStatus.textContent='🟢 cTrader CONECTADA • FONTE PRINCIPAL OPEN • '+count+' ativos • SOMENTE LEITURA • token '+(days>=1?days.toFixed(1)+' dias':Math.ceil(days*24)+' h');
     }else{
+      ctraderConnected=false;
+      ctraderSymbols=[];
+      ctraderAccounts=[];
       ctraderAccountStatus.textContent='⚪ cTrader configurada • toque em CONECTAR para autorizar acesso somente leitura';
       if(ctraderConnectBtn) ctraderConnectBtn.style.display='block';
       if(ctraderLogoutBtn) ctraderLogoutBtn.style.display='none';
+      fillSymbols();
     }
     return d;
   }catch(e){
+    ctraderConnected=false;
     ctraderAccountStatus.textContent='🔴 Não foi possível verificar a sessão cTrader agora.';
     if(ctraderConnectBtn) ctraderConnectBtn.style.display='block';
     if(ctraderLogoutBtn) ctraderLogoutBtn.style.display='none';
@@ -14643,6 +15407,10 @@ if(ctraderLogoutBtn){
       await fetch('/ctrader/logout',{method:'POST',credentials:'include',cache:'no-store'});
     }catch(_){ }
     ctraderLogoutBtn.disabled=false;
+    ctraderConnected=false;
+    ctraderSymbols=[];
+    ctraderAccounts=[];
+    fillSymbols();
     await refreshCTraderStatus();
   };
 }
