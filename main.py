@@ -27,7 +27,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.20"
+APP_VERSION = "3.21"
 PWA_VERSION = "v88"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -107,7 +107,7 @@ BINOMO_EXTRA_HEADERS_JSON = os.getenv("BINOMO_EXTRA_HEADERS_JSON", "").strip()
 # Stream de cotações do Crypto IDX. É um endpoint não documentado da Binomo;
 # por isso fica isolado, com diagnóstico e fallback, e nunca é usado para
 # inventar preços quando estiver indisponível. Não usa SSID, senha ou login.
-BINOMO_QUOTE_WS_ENABLED = os.getenv("BINOMO_QUOTE_WS_ENABLED", "0").strip().lower() not in ("0", "false", "off", "no")
+BINOMO_QUOTE_WS_ENABLED = os.getenv("BINOMO_QUOTE_WS_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
 BINOMO_QUOTE_WS_URL = os.getenv("BINOMO_QUOTE_WS_URL", "wss://as.binomo.com/").strip() or "wss://as.binomo.com/"
 BINOMO_QUOTE_WS_FRESH_SECONDS = float(os.getenv("BINOMO_QUOTE_WS_FRESH_SECONDS", "20"))
 BINOMO_QUOTE_WS_RECONNECT_SECONDS = float(os.getenv("BINOMO_QUOTE_WS_RECONNECT_SECONDS", "5"))
@@ -253,6 +253,8 @@ binomo_quote_ws_connected = False
 binomo_quote_ws_last_message_at = 0.0
 binomo_quote_ws_last_tick_at = 0.0
 binomo_quote_ws_last_error = ""
+binomo_quote_ws_message_count = 0
+binomo_quote_ws_last_payload_preview = ""
 binomo_quote_ws_bars: Dict[str, list] = {}
 
 BINANCE_SYMBOLS = {
@@ -611,47 +613,69 @@ def _binomo_quote_ws_rows(interval: str, n: int = 80):
 
 
 def _binomo_quote_ws_extract(message):
-    """Extrai (preço, horário) do formato observado no stream as.binomo.com."""
+    """Extrai ticks do Z-CRY/IDX do stream público sem assumir um único envelope JSON.
+
+    O formato histórico observado em as.binomo.com é data -> assets -> {ric, rate,
+    created_at}. Como o endpoint não é documentado, o parser também aceita níveis
+    extras de data/items/result, mas só transforma em tick quando o RIC é o Crypto IDX.
+    """
     try:
         payload = json.loads(message) if isinstance(message, str) else message
     except Exception:
         return []
-    found = []
-    blocks = []
-    if isinstance(payload, dict):
-        data = payload.get("data")
-        if isinstance(data, list):
-            blocks.extend(data)
-        else:
-            blocks.append(payload)
-    elif isinstance(payload, list):
-        blocks.extend(payload)
 
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        assets = block.get("assets")
-        if not isinstance(assets, list):
-            continue
-        for asset in assets:
-            if not isinstance(asset, dict):
-                continue
-            raw_price = asset.get("rate")
-            raw_time = asset.get("created_at") or asset.get("createdAt") or asset.get("timestamp") or asset.get("time")
-            if raw_price is None or raw_time is None:
-                continue
+    target = str(BINOMO_CRYPTO_IDX_RIC or "").strip().upper()
+    found = []
+
+    def walk(node, inherited_ric="", depth=0):
+        if depth > 7:
+            return
+        if isinstance(node, list):
+            for item in node[:300]:
+                walk(item, inherited_ric, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+
+        raw_ric = _binomo_pick(node, "ric", "asset_ric", "symbol", "asset", "ticker")
+        ric = str(raw_ric or inherited_ric or "").strip().upper()
+        raw_price = _binomo_pick(node, "rate", "price", "quote", "last", "close")
+        raw_time = _binomo_pick(node, "created_at", "createdAt", "timestamp", "time", "datetime", "ts")
+
+        # Não mistura outro ativo no Crypto IDX. O feed público pode entregar mais
+        # de um ativo no mesmo envelope.
+        if raw_price is not None and raw_time is not None and ric == target:
             try:
                 px = float(raw_price)
                 dt = _binomo_parse_timestamp(raw_time).astimezone(UTC)
+                if px > 0:
+                    found.append((px, dt))
             except Exception:
-                continue
-            found.append((px, dt))
-    return found
+                pass
 
+        next_ric = ric or inherited_ric
+        for key in ("data", "assets", "items", "result", "values", "quotes", "ticks", "payload"):
+            child = node.get(key)
+            if isinstance(child, (dict, list)):
+                walk(child, next_ric, depth + 1)
+
+    walk(payload)
+
+    # Remove duplicatas do mesmo tick sem alterar a ordem recebida.
+    uniq = []
+    seen = set()
+    for px, dt in found:
+        key = (round(float(px), 12), int(dt.timestamp() * 1000))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((px, dt))
+    return uniq
 
 def _binomo_quote_ws_run():
     global binomo_quote_ws_app, binomo_quote_ws_connected
     global binomo_quote_ws_last_message_at, binomo_quote_ws_last_error
+    global binomo_quote_ws_message_count, binomo_quote_ws_last_payload_preview
     if websocket is None:
         binomo_quote_ws_last_error = "websocket-client não instalado"
         return
@@ -662,14 +686,30 @@ def _binomo_quote_ws_run():
                 global binomo_quote_ws_connected, binomo_quote_ws_last_error
                 binomo_quote_ws_connected = True
                 binomo_quote_ws_last_error = ""
+                # Protocolo de cotação observado no endpoint público histórico.
+                # É somente leitura: não envia login, ordem, carteira ou credencial.
                 ws.send(f"subscribe:{BINOMO_CRYPTO_IDX_RIC}")
-                print(f"[BINOMO IDX WS] inscrito em {BINOMO_CRYPTO_IDX_RIC}", flush=True)
+                print(f"[BINOMO IDX PUBLIC WS] conectado • subscribe:{BINOMO_CRYPTO_IDX_RIC}", flush=True)
 
             def on_message(ws, message):
-                global binomo_quote_ws_last_message_at
+                global binomo_quote_ws_last_message_at, binomo_quote_ws_last_error
+                global binomo_quote_ws_message_count, binomo_quote_ws_last_payload_preview
                 binomo_quote_ws_last_message_at = time.time()
-                for px, dt in _binomo_quote_ws_extract(message):
+                binomo_quote_ws_message_count += 1
+                try:
+                    preview = message.decode("utf-8", "ignore") if isinstance(message, (bytes, bytearray)) else str(message)
+                    binomo_quote_ws_last_payload_preview = preview[:220]
+                    low = preview.lower()
+                    if "blocked_country" in low or "platform_not_available" in low:
+                        binomo_quote_ws_last_error = "feed público recusado por restrição regional"
+                except Exception:
+                    pass
+
+                ticks = _binomo_quote_ws_extract(message)
+                for px, dt in ticks:
                     _binomo_quote_ws_update(px, dt)
+                if ticks:
+                    binomo_quote_ws_last_error = ""
 
             def on_error(ws, error):
                 global binomo_quote_ws_last_error
@@ -680,16 +720,27 @@ def _binomo_quote_ws_run():
                 binomo_quote_ws_connected = False
                 if close_msg:
                     binomo_quote_ws_last_error = f"close {status_code}: {close_msg}"[:220]
+                elif status_code:
+                    binomo_quote_ws_last_error = f"close {status_code}"[:220]
 
             app_ws = websocket.WebSocketApp(
                 BINOMO_QUOTE_WS_URL,
+                header=[
+                    f"User-Agent: {PUBLIC_FEED_USER_AGENT}",
+                    "Pragma: no-cache",
+                    "Cache-Control: no-cache",
+                ],
                 on_open=on_open,
                 on_message=on_message,
                 on_error=on_error,
                 on_close=on_close,
             )
             binomo_quote_ws_app = app_ws
-            app_ws.run_forever(ping_interval=20, ping_timeout=10)
+            app_ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10,
+                origin="https://binomo.com",
+            )
         except Exception as exc:
             binomo_quote_ws_last_error = str(exc)[:220]
         finally:
@@ -697,7 +748,6 @@ def _binomo_quote_ws_run():
             binomo_quote_ws_app = None
         if not binomo_quote_ws_stop.wait(max(1.0, BINOMO_QUOTE_WS_RECONNECT_SECONDS)):
             continue
-
 
 def ensure_binomo_quote_ws_started():
     global binomo_quote_ws_thread
@@ -8676,6 +8726,52 @@ async def compatibility_test(
     }
 
 
+@app.get("/binomo-public-test")
+async def binomo_public_test():
+    """Teste somente leitura do Crypto IDX sem login Binomo.
+
+    Liga o stream público e tenta preencher o histórico pelo REST público/não
+    documentado. Não usa senha, SSID, token de conta nem envia ordens.
+    """
+    started = ensure_binomo_quote_ws_started()
+    rest_ok = False
+    rest_count = 0
+    rest_error = ""
+    try:
+        rows = await _binomo_direct_rest_candles(BINOMO_CRYPTO_IDX_SYMBOL, "1min", 25)
+        rest_count = len(rows)
+        rest_ok = rest_count >= 20
+    except Exception as exc:
+        rest_error = str(exc)[:260]
+
+    await asyncio.sleep(0.15)
+    with binomo_quote_ws_lock:
+        connected = bool(binomo_quote_ws_connected)
+        last_tick_age = (
+            round(max(0.0, time.time() - binomo_quote_ws_last_tick_at), 1)
+            if binomo_quote_ws_last_tick_at else None
+        )
+        last_error = str(binomo_quote_ws_last_error or "")[:260]
+        messages = int(binomo_quote_ws_message_count or 0)
+        candle_count = len(binomo_quote_ws_bars.get(f"{BINOMO_CRYPTO_IDX_SYMBOL}|1min") or [])
+
+    return {
+        "ok": bool(rest_ok or (connected and last_tick_age is not None)),
+        "asset": BINOMO_CRYPTO_IDX_SYMBOL,
+        "ric": BINOMO_CRYPTO_IDX_RIC,
+        "public_ws_started": bool(started),
+        "public_ws_connected": connected,
+        "public_ws_messages": messages,
+        "public_ws_last_tick_age_seconds": last_tick_age,
+        "public_ws_candles_m1": candle_count,
+        "public_ws_last_error": last_error,
+        "rest_ok": rest_ok,
+        "rest_candles": rest_count,
+        "rest_error": rest_error,
+        "mode": "READ_ONLY_NO_LOGIN",
+    }
+
+
 @app.get("/binomo-feed-status")
 async def binomo_feed_status(request: Request):
     state = _binomo_session_state(request, required=False)
@@ -8694,6 +8790,8 @@ async def binomo_feed_status(request: Request):
             if binomo_quote_ws_last_tick_at else None
         )
         public_ws_last_error = binomo_quote_ws_last_error
+        public_ws_message_count = int(binomo_quote_ws_message_count or 0)
+        public_ws_payload_preview = str(binomo_quote_ws_last_payload_preview or "")[:220]
         ws_counts = {
             k: len(v) for k, v in binomo_quote_ws_bars.items()
             if k.startswith(BINOMO_CRYPTO_IDX_SYMBOL + "|")
@@ -8726,6 +8824,12 @@ async def binomo_feed_status(request: Request):
     if recent_success:
         status = "ONLINE"
         message = "Crypto IDX recebendo cotações reais da Binomo e montando candles ao vivo."
+    elif BINOMO_QUOTE_WS_ENABLED and public_ws_connected:
+        status = "FEED PÚBLICO CONECTADO • AGUARDANDO TICK"
+        message = "WebSocket público somente leitura conectado sem login; aguardando a primeira cotação válida de Z-CRY/IDX."
+    elif BINOMO_QUOTE_WS_ENABLED:
+        status = "TESTANDO FEED PÚBLICO SEM LOGIN"
+        message = "MEGA IA está tentando o feed somente leitura de Z-CRY/IDX sem login. Se a Binomo recusar, o diagnóstico mostrará o erro sem tentar contornar a restrição."
     elif state and auth_ws_connected:
         status = "LOGIN OK • AGUARDANDO COTAÇÃO"
         message = "Binomo autenticada e WebSocket aberto; aguardando a primeira cotação válida do Crypto IDX."
@@ -8734,7 +8838,7 @@ async def binomo_feed_status(request: Request):
         message = "Login Binomo aceito; o MEGA IA está tentando abrir o stream autenticado do Crypto IDX."
     elif BINOMO_AUTH_WS_ENABLED:
         status = "AGUARDANDO LOGIN BINOMO"
-        message = "Abra a aba Corretora e conecte a Binomo para autorizar o feed do Crypto IDX. Sem SSID."
+        message = "O feed autenticado requer sessão Binomo. O teste público sem login está desativado por configuração."
     elif connector_ready:
         status = "PRONTO PARA TESTE"
         message = "Conector Binomo configurado; aguardando uma fonte de cotações válida."
@@ -8763,6 +8867,8 @@ async def binomo_feed_status(request: Request):
         "quote_ws_url": BINOMO_QUOTE_WS_URL,
         "quote_ws_last_tick_age_seconds": ws_last_tick_age,
         "quote_ws_last_error": public_ws_last_error,
+        "quote_ws_message_count": public_ws_message_count,
+        "quote_ws_payload_preview": public_ws_payload_preview,
         "quote_ws_candles": ws_counts,
         "direct_rest_enabled": bool(BINOMO_DIRECT_REST_ENABLED),
         "bridge_configured": bool(BINOMO_CANDLES_URL),
@@ -10978,7 +11084,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • BTC/USD • Gráfico fluido</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • Crypto IDX teste público • Gráfico fluido</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -11371,8 +11477,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
           O feed oficial depende de a própria Binomo permitir o acesso na região da conexão.
         </div>
         <div id="binomoAccountStatus" class="card" style="margin-top:10px">
-          ⚪ Binomo desconectada • conecte para autorizar o feed do Crypto IDX.
+          🟡 Crypto IDX • testando feed público somente leitura, sem login...
         </div>
+        <button id="binomoPublicTestBtn" type="button"
+                style="width:100%;margin-top:10px;font-weight:1000;border-color:#38bdf8">🧪 TESTAR CRYPTO IDX SEM LOGIN</button>
         <div style="margin-top:10px">
           <div class="label">E-MAIL BINOMO</div>
           <input id="binomoEmail" type="email" autocomplete="username"
@@ -11634,6 +11742,7 @@ const iqAccountStatus=document.getElementById('iqAccountStatus');
 const binomoEmail=document.getElementById('binomoEmail');
 const binomoPassword=document.getElementById('binomoPassword');
 const binomoConnectBtn=document.getElementById('binomoConnectBtn');
+const binomoPublicTestBtn=document.getElementById('binomoPublicTestBtn');
 const binomoLogoutBtn=document.getElementById('binomoLogoutBtn');
 const binomoAccountStatus=document.getElementById('binomoAccountStatus');
 let binomoFeedAuthenticated=false;
@@ -13884,12 +13993,18 @@ async function refreshBinomoStatus(){
     binomoFeedAuthenticated=!!d.session_authenticated;
     const feedOnline=!!d.connected;
     if(feedOnline){
-      binomoAccountStatus.textContent='🟢 BINOMO • CRYPTO IDX ONLINE • '+(d.session_email_masked||'sessão autorizada');
+      const viaPublic=!!d.quote_ws_enabled && d.quote_ws_last_tick_age_seconds!==null && d.quote_ws_last_tick_age_seconds!==undefined;
+      binomoAccountStatus.textContent='🟢 BINOMO • CRYPTO IDX ONLINE • '+(viaPublic?'feed somente leitura sem login':(d.session_email_masked||'sessão autorizada'));
+    }else if(d.quote_ws_enabled){
+      const err=String(d.quote_ws_last_error||'').trim();
+      const msgCount=Number(d.quote_ws_message_count||0);
+      const state=d.quote_ws_connected?'WS CONECTADO • AGUARDANDO TICK':'TESTANDO FEED PÚBLICO SEM LOGIN';
+      binomoAccountStatus.textContent='🟡 CRYPTO IDX • '+state+(msgCount?' • msgs '+msgCount:'')+(err?' • '+err:'');
     }else if(binomoFeedAuthenticated){
       const err=String(d.auth_ws_last_error||'').trim();
       binomoAccountStatus.textContent='🟠 LOGIN BINOMO OK • '+(d.status||'CONECTANDO FEED')+(err?' • '+err:'');
     }else{
-      binomoAccountStatus.textContent='⚪ BINOMO DESCONECTADA • conecte para autorizar o feed do Crypto IDX.';
+      binomoAccountStatus.textContent='⚪ Crypto IDX sem feed no momento.';
     }
     if(binomoConnectBtn) binomoConnectBtn.style.display=binomoFeedAuthenticated?'none':'block';
     if(binomoLogoutBtn) binomoLogoutBtn.style.display=binomoFeedAuthenticated?'block':'none';
@@ -13901,6 +14016,36 @@ async function refreshBinomoStatus(){
     if(binomoLogoutBtn) binomoLogoutBtn.style.display='none';
     return null;
   }
+}
+
+if(binomoPublicTestBtn){
+  binomoPublicTestBtn.onclick=async()=>{
+    binomoPublicTestBtn.disabled=true;
+    if(binomoAccountStatus) binomoAccountStatus.textContent='🟡 Testando Z-CRY/IDX sem login...';
+    try{
+      const d=await get('/binomo-public-test?t='+Date.now());
+      const parts=[];
+      if(d.public_ws_connected) parts.push('WS conectado');
+      if(d.public_ws_last_tick_age_seconds!==null && d.public_ws_last_tick_age_seconds!==undefined) parts.push('tick '+d.public_ws_last_tick_age_seconds+'s');
+      if(Number(d.public_ws_messages||0)>0) parts.push('msgs '+d.public_ws_messages);
+      if(d.rest_ok) parts.push('REST '+d.rest_candles+' candles');
+      if(d.ok){
+        binomoAccountStatus.textContent='🟢 CRYPTO IDX • '+(parts.join(' • ')||'feed disponível');
+        if(S){ S.value='CRYPTO IDX'; }
+        chartData=[];
+        chartPreSignal=null;
+        if(chartTab&&chartTab.classList.contains('active')) await loadChart();
+      }else{
+        const err=String(d.public_ws_last_error||d.rest_error||'nenhuma cotação recebida ainda');
+        binomoAccountStatus.textContent='🟠 CRYPTO IDX • teste sem login ainda sem dados • '+err;
+      }
+      await updateMarketNote();
+    }catch(e){
+      binomoAccountStatus.textContent='🔴 Falha no teste Crypto IDX • '+String((e&&e.message)||e);
+    }finally{
+      binomoPublicTestBtn.disabled=false;
+    }
+  };
 }
 
 window.megaConnectBinomo=async function(event){
@@ -13999,7 +14144,7 @@ if(binomoLogoutBtn){
     if(S&&S.value==='CRYPTO IDX'){
       chartData=[];
       chartPreSignal=null;
-      if(chartInfo) chartInfo.textContent='⚪ CRYPTO IDX OFFLINE • CONECTE A BINOMO';
+      if(chartInfo) chartInfo.textContent='⚪ CRYPTO IDX OFFLINE • TESTANDO FEED SOMENTE LEITURA';
       drawChart([]);
     }
     await updateMarketNote();
