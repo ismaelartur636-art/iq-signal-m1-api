@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.28"
-PWA_VERSION = "v95"
+APP_VERSION = "3.29"
+PWA_VERSION = "v96"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -75,6 +75,13 @@ XGB_MIN_PROBABILITY = min(0.80, max(0.52, float(os.getenv("XGB_MIN_PROBABILITY",
 XGB_MIN_VALIDATION_ACCURACY = min(0.80, max(0.50, float(os.getenv("XGB_MIN_VALIDATION_ACCURACY", "0.52"))))
 xgb_model_cache: Dict[str, Dict[str, Any]] = {}
 xgb_model_guard = threading.RLock()
+
+# Diagnóstico das IAs externas para o /health sem expor chaves.
+external_ai_runtime: Dict[str, Any] = {
+    "last_provider": "",
+    "last_success_at": None,
+    "last_error": "",
+}
 
 # Gemini permanece como fallback com proteção de quota.
 # Defaults deixam margem abaixo do limite observado no projeto (5 RPM / 50 RPD).
@@ -6050,12 +6057,18 @@ async def _openai_json(prompt):
 
 
 async def _external_ai_json(prompt):
-    """GPT-5.6 Terra primeiro; Gemini como fallback quando a OpenAI falhar."""
+    """OpenAI primeiro; Gemini como fallback quando a OpenAI falhar."""
     errors = []
 
     if OAI_KEY:
         try:
-            return await _openai_json(prompt), "OPENAI_TERRA"
+            out = await _openai_json(prompt)
+            external_ai_runtime.update({
+                "last_provider": "OPENAI",
+                "last_success_at": iso(now()),
+                "last_error": "",
+            })
+            return out, "OPENAI"
         except Exception as exc:
             errors.append(f"OpenAI: {str(exc)[:180]}")
             print(f"[IA OPENAI] principal falhou; tentando Gemini: {str(exc)[:180]}", flush=True)
@@ -6064,14 +6077,25 @@ async def _external_ai_json(prompt):
 
     if GEMINI_KEY:
         try:
-            return await _gemini_json(prompt), "GEMINI_FALLBACK"
+            out = await _gemini_json(prompt)
+            external_ai_runtime.update({
+                "last_provider": "GEMINI",
+                "last_success_at": iso(now()),
+                "last_error": "",
+            })
+            return out, "GEMINI_FALLBACK"
         except Exception as exc:
             errors.append(f"Gemini: {str(exc)[:180]}")
             print(f"[IA GEMINI] fallback falhou: {str(exc)[:180]}", flush=True)
     else:
         errors.append("Gemini: GEMINI_API_KEY não configurada")
 
-    raise RuntimeError(" | ".join(errors)[:360])
+    final_error = " | ".join(errors)[:360]
+    external_ai_runtime.update({
+        "last_provider": "",
+        "last_error": final_error,
+    })
+    raise RuntimeError(final_error)
 
 
 async def _gemini_json(prompt):
@@ -8000,7 +8024,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = closed[-220:] if (engine == "SMART" and len(closed) > 220) else (closed[-90:] if len(closed) > 90 else closed)
+            engine_closed = (closed[-220:] if engine == "SMART" else (closed[-90:] if len(closed) > 90 else closed))
             if engine == "SMART":
                 analysis = await openai_direct_signal(symbol, interval, engine_closed, market)
             elif engine in ("EA", "FORCE"):
@@ -9005,6 +9029,7 @@ async def health():
             "min_candles": XGB_MIN_CANDLES,
             "min_probability": XGB_MIN_PROBABILITY,
             "min_validation_accuracy": XGB_MIN_VALIDATION_ACCURACY,
+            "input_candles_target": max(150, XGB_MIN_CANDLES),
             "import_error": XGBOOST_IMPORT_ERROR or None,
         },
         "openai": {
@@ -9012,6 +9037,9 @@ async def health():
             "model": OAI_MODEL or "gpt-5.6-terra",
             "priority": 2,
             "role": "CONFIRMACAO PRINCIPAL",
+            "last_provider": external_ai_runtime.get("last_provider"),
+            "last_success_at": external_ai_runtime.get("last_success_at"),
+            "last_error": external_ai_runtime.get("last_error"),
         },
         "gemini": {
             "configured": bool(GEMINI_KEY),
@@ -11561,7 +11589,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 regular_market=(market == "OPEN"),
             )
         else:
-            raw = await candles(sym, interval, 90, market, iq_state, request=request)
+            raw = await candles(sym, interval, (150 if engine == "SMART" else 90), market, iq_state, request=request)
         if len(raw) >= 25:
             closed = raw[:-1] if len(raw) > 1 else raw
             if engine in ("EA", "FORCE"):
