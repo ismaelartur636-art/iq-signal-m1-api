@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.33"
-PWA_VERSION = "v100"
+APP_VERSION = "3.34"
+PWA_VERSION = "v101"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -6866,7 +6866,7 @@ def _local_ohlcv_fallback_signal(cs, interval="1min", api_reason=""):
         "api_called": False,
         "direct_win_filter": {
             "enabled": True,
-            "required_confidence": 82.0 if interval == "1min" else 80.0,
+            "required_confidence": 80.0 if interval == "1min" else 80.0,
             "blocked": True,
             "monitor_only": True,
             "candidate_direction": candidate_direction,
@@ -7260,7 +7260,9 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         xgb_confidence = float(xgb_signal.get("confidence") or 0.0)
         xgb_agrees = bool(direction in ("CALL", "PUT") and xgb_direction == direction)
 
-        low_min = max(float(OAI_MIN), 82.0 if interval == "1min" else 80.0)
+        # v3.34 — leve ajuste de frequência: M1 baixa só 2 pontos, sem remover
+        # concordância GPT + XGBoost nem o bloqueio de risco HIGH.
+        low_min = max(float(OAI_MIN), 80.0 if interval == "1min" else 80.0)
         required_conf = low_min if risk == "LOW" else max(low_min + 4.0, 86.0)
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
 
