@@ -27,7 +27,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.18"
+APP_VERSION = "3.19"
 PWA_VERSION = "v88"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -9926,12 +9926,15 @@ async def chart_pre_signal(
         }
 
 @app.get("/radar")
-async def radar(request: Request, interval="1min", market="OPEN", engine: str = "GRAPH_AI"):
+async def radar(request: Request, interval="1min", market="OPEN", engine: str = "GRAPH_AI", symbol: str = ""):
     market = (market or "OPEN").upper()
     engine = (engine or "GRAPH_AI").upper()
+    symbol = str(symbol or "").strip().upper()
 
     if interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Intervalo ou mercado inválido.")
+    if symbol and symbol not in SYMBOLS:
+        raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
     if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE"):
@@ -9943,7 +9946,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     if fallback_twelve:
         market = "OPEN"
 
-    rkey = f"{market}|{interval}|{engine}"
+    rkey = f"{market}|{interval}|{engine}|{symbol or 'ALL'}"
     previous = radar_cache.get(rkey)
     # Snapshot curto: evita chamadas duplicadas quando a tela dispara o radar
     # várias vezes quase ao mesmo tempo, mas permite que o índice avance de
@@ -9963,7 +9966,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "clickable": False,
             "updated_at": None,
         }
-        for sym in SYMBOLS
+        for sym in ([symbol] if symbol else SYMBOLS)
     ]
 
     # RADAR AUTOMÁTICO: todos os ativos entram na fila de análise, mesmo quando
@@ -9971,7 +9974,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     # Para os símbolos sem stream fresco, candles_open usa cache/REST com o
     # limitador global já existente. Assim nenhum cartão depende de toque para
     # começar a ser analisado e evitamos estourar a cota da fonte de dados.
-    scan_symbols = list(SYMBOLS)
+    scan_symbols = [symbol] if symbol else list(SYMBOLS)
     if market == "OPEN" and engine not in ("EA", "FORCE"):
         ws_active = _td_ws_active_symbols()
         for row in out:
@@ -10975,7 +10978,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • Diagnóstico Binomo regional • Crypto IDX</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • Modo BTC/USD exclusivo</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -10998,6 +11001,9 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <input id="market" type="hidden" value="OPEN">
 
     <select id="symbol"></select>
+
+    <button id="btcOnlyBtn" type="button" style="font-weight:1000">₿ SÓ BTC/USD • OFF</button>
+    <div id="btcOnlyNote" class="label" style="display:none;grid-column:1/-1">Modo BTC/USD ativo • painel, gráfico, pré-alerta e radar focados somente neste ativo.</div>
 
     <select id="interval">
       <option>1min</option>
@@ -11472,8 +11478,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 (function(){
   try{
     const u=new URL(window.location.href);
-    if(u.searchParams.get('pwa')!=='v75'){
-      u.searchParams.set('pwa','v75');
+    if(u.searchParams.get('pwa')!=='v76'){
+      u.searchParams.set('pwa','v76');
       window.history.replaceState({},'',u.pathname+u.search+u.hash);
     }
   }catch(_){}
@@ -11538,6 +11544,14 @@ const eaModeDesc=document.getElementById('eaModeDesc');
 const forcePowerBtn=document.getElementById('forcePowerBtn');
 const forceModeDesc=document.getElementById('forceModeDesc');
 const voiceBtn=document.getElementById('voiceBtn');
+const btcOnlyBtn=document.getElementById('btcOnlyBtn');
+const btcOnlyNote=document.getElementById('btcOnlyNote');
+let btcOnlyEnabled=false;
+try{
+  btcOnlyEnabled=localStorage.getItem('mega_btc_only_mode')==='ON';
+}catch(_){
+  btcOnlyEnabled=false;
+}
 let robotEnabled=true;
 let aiEnabled=false;
 let eaEnabled=false;
@@ -12522,6 +12536,22 @@ function rememberChartSignal(pre){
   });
 }
 
+function renderBtcOnlyState(){
+  if(btcOnlyBtn){
+    btcOnlyBtn.textContent=btcOnlyEnabled?'₿ BTC/USD ONLY • ON':'₿ SÓ BTC/USD • OFF';
+    btcOnlyBtn.style.background=btcOnlyEnabled?'#0b7a3d':'#18283a';
+    btcOnlyBtn.style.color='#fff';
+    btcOnlyBtn.style.borderColor=btcOnlyEnabled?'#16c56b':'#2c5f86';
+  }
+  if(btcOnlyNote){
+    btcOnlyNote.style.display=btcOnlyEnabled?'block':'none';
+  }
+  if(S){
+    S.disabled=!!btcOnlyEnabled;
+    S.title=btcOnlyEnabled?'Modo BTC/USD exclusivo ativo':'Selecione o ativo';
+  }
+}
+
 function fillSymbols(){
   const previous=S.value;
   S.innerHTML='';
@@ -12530,15 +12560,21 @@ function fillSymbols(){
     ? ' • IQ OTC'
     : '';
 
-  syms.forEach(x=>{
+  const visibleSymbols=btcOnlyEnabled ? ['BTC/USD'] : syms;
+
+  visibleSymbols.forEach(x=>{
     if(marketMode && marketMode.value==='OTC' && x==='CRYPTO IDX') return;
     const extra=(x==='CRYPTO IDX' && (!marketMode || marketMode.value!=='OTC')) ? ' • BINOMO' : suffix;
     S.add(new Option(x+extra,x));
   });
 
-  if(previous && [...S.options].some(o=>o.value===previous)){
+  if(btcOnlyEnabled){
+    S.value='BTC/USD';
+  }else if(previous && [...S.options].some(o=>o.value===previous)){
     S.value=previous;
   }
+
+  renderBtcOnlyState();
 }
 
 function showRobot(){
@@ -14548,7 +14584,10 @@ async function loadOtcRadar(){
       radarOtc.innerHTML='<div>🟣 Radar OTC aguardando login da IQ Option</div>';
       return;
     }
-    const pairs=Array.isArray(d.pairs)?d.pairs:[];
+    let pairs=Array.isArray(d.pairs)?d.pairs:[];
+    if(btcOnlyEnabled){
+      pairs=pairs.filter(sym=>String(sym||'').toUpperCase()==='BTC/USD');
+    }
     if(radarOtcStatus){
       radarOtcStatus.textContent=pairs.length
         ? `🟢 ${pairs.length} OTC disponível(is) agora • lista atualizada automaticamente`
@@ -14597,7 +14636,8 @@ async function rad(){
   try{
     const engine=selectedRobotEngine();
     if(engine==='OFF'){ radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>'; return; }
-    const items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}`);
+    const onlySymbol=btcOnlyEnabled?'&symbol='+encodeURIComponent('BTC/USD'):'';
+    const items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}${onlySymbol}`);
     const list=Array.isArray(items)?items:[];
     if(!list.length){
       radar.innerHTML='<div>📡 Radar ativo • aguardando leitura</div>';
@@ -14937,6 +14977,40 @@ async function resultCheck(){
   }finally{
     resultBusy=false;
   }
+}
+
+if(btcOnlyBtn){
+  btcOnlyBtn.onclick=async()=>{
+    if(!btcOnlyEnabled && S && S.value && S.value!=='BTC/USD'){
+      try{localStorage.setItem('mega_btc_previous_symbol',S.value);}catch(_){}
+    }
+
+    btcOnlyEnabled=!btcOnlyEnabled;
+    try{localStorage.setItem('mega_btc_only_mode',btcOnlyEnabled?'ON':'OFF');}catch(_){}
+
+    fillSymbols();
+
+    if(btcOnlyEnabled){
+      if(S) S.value='BTC/USD';
+      try{localStorage.setItem('mega_symbol','BTC/USD');}catch(_){}
+      if(statusBox) statusBox.textContent='₿ MODO BTC/USD ATIVO • analisando somente BTC/USD';
+    }else{
+      let restore='BTC/USD';
+      try{restore=localStorage.getItem('mega_btc_previous_symbol')||'BTC/USD';}catch(_){}
+      if(S && [...S.options].some(o=>o.value===restore)) S.value=restore;
+      try{localStorage.setItem('mega_symbol',S&&S.value?S.value:'BTC/USD');}catch(_){}
+      if(statusBox) statusBox.textContent='MODO BTC/USD DESATIVADO • todos os ativos disponíveis';
+    }
+
+    lastSignalVoice='';
+    lastChartSignalVoice='';
+    lastRadarAutoKey='';
+    chartData=[];
+    chartPreSignal=null;
+
+    await Promise.allSettled([sig(true),rad(),loadPreSignals(),loadOtcRadar(),updateMarketNote()]);
+    if(chartTab && chartTab.classList.contains('active')) await loadChart();
+  };
 }
 
 marketMode.onchange=async()=>{
