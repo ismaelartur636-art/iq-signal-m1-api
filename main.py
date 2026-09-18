@@ -5,6 +5,7 @@ import json
 import re
 import secrets
 import threading
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict
@@ -26,8 +27,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.14"
-PWA_VERSION = "v86"
+APP_VERSION = "3.15"
+PWA_VERSION = "v87"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -81,19 +82,34 @@ telegram_sent_cache: Dict[str, float] = {}
 
 TD_URL = "https://api.twelvedata.com/time_series"
 TD_WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
-# MEGA IA 3.14 — trava de ciclo por ativo nas IAs + multifuente/multibroker.
+# MEGA IA 3.15 — Crypto IDX da Binomo + trava por ativo + multifuente/multibroker.
 # Nenhuma destas fontes públicas é usada para fingir OTC da IQ Option.
 BINANCE_KLINES_URLS = [
     "https://api.binance.com/api/v3/klines",
     "https://data-api.binance.vision/api/v3/klines",
 ]
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+
+# BINOMO / CRYPTO IDX ---------------------------------------------------------
+# O Crypto IDX (RIC Z-CRY/IDX) é um ativo sintético interno da Binomo.
+# Por segurança, o MEGA IA NÃO substitui esse ativo por BTC/USDT da Binance,
+# Twelve Data ou Yahoo. O espelho só fica online quando um feed Binomo real é
+# configurado no servidor. BINOMO_CANDLES_URL pode apontar para um endpoint
+# autenticado/bridge que devolva OHLCV do Z-CRY/IDX em JSON.
+BINOMO_CRYPTO_IDX_SYMBOL = "CRYPTO IDX"
+BINOMO_CRYPTO_IDX_RIC = os.getenv("BINOMO_CRYPTO_IDX_RIC", "Z-CRY/IDX").strip() or "Z-CRY/IDX"
+BINOMO_DIRECT_REST_ENABLED = os.getenv("BINOMO_DIRECT_REST_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
+BINOMO_PUBLIC_CANDLE_BASE = os.getenv("BINOMO_PUBLIC_CANDLE_BASE", "https://api.binomo.com/platform/candles").strip().rstrip("/")
+BINOMO_CANDLES_URL = os.getenv("BINOMO_CANDLES_URL", "").strip()
+BINOMO_CANDLES_TOKEN = os.getenv("BINOMO_CANDLES_TOKEN", "").strip()
+BINOMO_FEED_TIMEOUT = float(os.getenv("BINOMO_FEED_TIMEOUT", "12"))
+BINOMO_EXTRA_HEADERS_JSON = os.getenv("BINOMO_EXTRA_HEADERS_JSON", "").strip()
 MULTIFEED_ENABLED = os.getenv("MULTIFEED_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
 PUBLIC_FEED_TIMEOUT = float(os.getenv("PUBLIC_FEED_TIMEOUT", "12"))
 PUBLIC_FEED_STALE_MAX_AGE = float(os.getenv("PUBLIC_FEED_STALE_MAX_AGE", "240"))
 PUBLIC_FEED_USER_AGENT = os.getenv(
     "PUBLIC_FEED_USER_AGENT",
-    "Mozilla/5.0 (compatible; MEGA-IA/3.14; +https://render.com)"
+    "Mozilla/5.0 (compatible; MEGA-IA/3.15; +https://render.com)"
 ).strip()
 OAI_URL = "https://api.openai.com/v1/responses"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -109,8 +125,10 @@ SELECTABLE_ENGINES_ENABLED = True
 INTERVALS = {"1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1h": 3600, "4h": 14400}
 SYMBOLS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF",
-    "NZD/USD", "EUR/JPY", "GBP/JPY", "EUR/GBP", "BTC/USD", "ETH/USD", "LTC/USD"
+    "NZD/USD", "EUR/JPY", "GBP/JPY", "EUR/GBP", "BTC/USD", "ETH/USD", "LTC/USD",
+    BINOMO_CRYPTO_IDX_SYMBOL,
 ]
+OTC_SYMBOLS = [s for s in SYMBOLS if s != BINOMO_CRYPTO_IDX_SYMBOL]
 
 OTC_BASE = {
     "EUR/USD": "EURUSD-OTC", "GBP/USD": "GBPUSD-OTC", "USD/JPY": "USDJPY-OTC",
@@ -175,7 +193,7 @@ TD_WS_REQUESTED_SYMBOLS = [
     if s.strip()
 ]
 # remove duplicatas preservando a ordem e limita aos ativos conhecidos do app
-TD_WS_REQUESTED_SYMBOLS = list(dict.fromkeys([s for s in TD_WS_REQUESTED_SYMBOLS if s in SYMBOLS]))
+TD_WS_REQUESTED_SYMBOLS = list(dict.fromkeys([s for s in TD_WS_REQUESTED_SYMBOLS if s in SYMBOLS and s != BINOMO_CRYPTO_IDX_SYMBOL]))
 TD_WS_RECONNECT_MAX = float(os.getenv("TWELVE_DATA_WS_RECONNECT_MAX", "30"))
 TD_WS_FRESH_SECONDS = float(os.getenv("TWELVE_DATA_WS_FRESH_SECONDS", "90"))
 
@@ -3916,6 +3934,8 @@ def _feed_source_from_rows(rows) -> str:
         return "BINANCE_PUBLIC"
     if src.startswith("YAHOO"):
         return "YAHOO_PUBLIC"
+    if src.startswith("BINOMO"):
+        return "BINOMO_CRYPTO_IDX"
     if "OTC" in src or src.startswith("IQ_OPTION"):
         return src
     return src or "UNKNOWN"
@@ -3928,6 +3948,7 @@ def _feed_source_label(source: str) -> str:
         "TWELVE_DATA_WS": "TWELVE DATA • STREAM",
         "BINANCE_PUBLIC": "BINANCE PÚBLICA",
         "YAHOO_PUBLIC": "YAHOO PÚBLICO",
+        "BINOMO_CRYPTO_IDX": "BINOMO • CRYPTO IDX",
         "IQ_OPTION_OPEN": "IQ OPTION • ABERTO",
         "IQ_OPTION_OTC": "IQ OPTION • OTC",
     }
@@ -4098,6 +4119,212 @@ async def _yahoo_public_candles(symbol: str, interval: str, n: int = 80):
     return out[-int(n):]
 
 
+def _binomo_extra_headers() -> Dict[str, str]:
+    headers = {"Accept": "application/json", "User-Agent": PUBLIC_FEED_USER_AGENT}
+    if BINOMO_CANDLES_TOKEN:
+        headers["Authorization"] = f"Bearer {BINOMO_CANDLES_TOKEN}"
+    if BINOMO_EXTRA_HEADERS_JSON:
+        try:
+            extra = json.loads(BINOMO_EXTRA_HEADERS_JSON)
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    if str(k).strip() and v is not None:
+                        headers[str(k)] = str(v)
+        except Exception:
+            pass
+    return headers
+
+
+def _binomo_pick(obj: Dict[str, Any], *names):
+    for name in names:
+        if name in obj and obj.get(name) is not None:
+            return obj.get(name)
+    return None
+
+
+def _binomo_parse_timestamp(value) -> datetime:
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10**12:
+            ts /= 1000.0
+        return datetime.fromtimestamp(ts, tz=UTC)
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("timestamp ausente")
+    try:
+        numeric = float(text)
+        if numeric > 10**12:
+            numeric /= 1000.0
+        return datetime.fromtimestamp(numeric, tz=UTC)
+    except Exception:
+        return parse_dt(text).astimezone(UTC)
+
+
+def _binomo_extract_candle_list(payload):
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("candles", "items", "result", "values", "history", "data"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            for nested in ("candles", "items", "result", "values", "history"):
+                rows = value.get(nested)
+                if isinstance(rows, list):
+                    return rows
+    return []
+
+
+def _binomo_normalize_candles(payload, n: int = 80):
+    rows = _binomo_extract_candle_list(payload)
+    out = []
+    for item in rows:
+        try:
+            if isinstance(item, (list, tuple)) and len(item) >= 5:
+                dt = _binomo_parse_timestamp(item[0])
+                o, h, l, c = float(item[1]), float(item[2]), float(item[3]), float(item[4])
+                v = float(item[5] or 0) if len(item) > 5 else 0.0
+            elif isinstance(item, dict):
+                raw_ts = _binomo_pick(item, "datetime", "time", "timestamp", "created_at", "createdAt", "from", "t")
+                dt = _binomo_parse_timestamp(raw_ts)
+                o = float(_binomo_pick(item, "open", "o"))
+                h = float(_binomo_pick(item, "high", "h", "max"))
+                l = float(_binomo_pick(item, "low", "l", "min"))
+                c = float(_binomo_pick(item, "close", "c"))
+                v = float(_binomo_pick(item, "volume", "v", "vol") or 0)
+            else:
+                continue
+            if min(o, h, l, c) <= 0:
+                continue
+            out.append({
+                "datetime": dt.isoformat(),
+                "open": o, "high": h, "low": l, "close": c, "volume": v,
+                "feed_source": "BINOMO_CRYPTO_IDX",
+                "source_symbol": BINOMO_CRYPTO_IDX_RIC,
+            })
+        except Exception:
+            continue
+    out.sort(key=lambda x: parse_dt(str(x["datetime"])))
+    # Remove timestamps duplicados preservando o candle mais recente recebido.
+    uniq = {}
+    for row in out:
+        uniq[str(row["datetime"])] = row
+    out = list(uniq.values())
+    out.sort(key=lambda x: parse_dt(str(x["datetime"])))
+    return out[-int(n):]
+
+
+async def _binomo_direct_rest_candles(symbol: str, interval: str, n: int = 80):
+    """Tenta o histórico HTTP da própria Binomo usado por clientes não oficiais antigos.
+
+    É uma rota não documentada oficialmente; por isso qualquer erro apenas derruba
+    esta tentativa e deixa o roteador seguir para o bridge configurável.
+    """
+    if not BINOMO_DIRECT_REST_ENABLED:
+        raise RuntimeError("REST direto da Binomo desativado por configuração.")
+    if str(symbol).upper() != BINOMO_CRYPTO_IDX_SYMBOL:
+        raise RuntimeError("REST Binomo reservado ao Crypto IDX.")
+    seconds = int(INTERVALS.get(interval, 0) or 0)
+    if seconds <= 0:
+        raise RuntimeError("Intervalo inválido para o feed Binomo.")
+
+    ric_path = urllib.parse.quote(BINOMO_CRYPTO_IDX_RIC, safe="")
+    required = max(20, min(int(n), 150))
+    # Pede uma janela maior que a necessária. Se o servidor limitar a resposta,
+    # uma segunda tentativa começa mais atrás no tempo.
+    window_seconds = max(seconds * (required + 30), 6 * 3600)
+    starts = [
+        datetime.now(UTC) - timedelta(seconds=window_seconds),
+        datetime.now(UTC) - timedelta(seconds=max(window_seconds * 3, 2 * 86400)),
+    ]
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": PUBLIC_FEED_USER_AGENT,
+        "Origin": "https://binomo.com",
+        "Referer": "https://binomo.com/",
+    }
+    errors = []
+    best = []
+    async with httpx.AsyncClient(timeout=BINOMO_FEED_TIMEOUT, follow_redirects=True, headers=headers) as client:
+        for start_dt in starts:
+            start_text = start_dt.strftime("%Y-%m-%dT%H:%M:00")
+            url = f"{BINOMO_PUBLIC_CANDLE_BASE}/{ric_path}/{start_text}/{seconds}"
+            try:
+                response = await client.get(url, params={"locale": "en"})
+                if response.status_code in (401, 403):
+                    raise RuntimeError(f"HTTP {response.status_code} (acesso negado)")
+                response.raise_for_status()
+                payload = response.json()
+                rows = _binomo_normalize_candles(payload, n=max(required + 20, 80))
+                if len(rows) > len(best):
+                    best = rows
+                if len(rows) >= required:
+                    return rows[-required:]
+                errors.append(f"{response.status_code}: poucos candles ({len(rows)})")
+            except Exception as exc:
+                errors.append(str(exc)[:160])
+    if len(best) >= min(20, required):
+        return best[-required:]
+    raise RuntimeError("REST Binomo sem candles suficientes: " + " | ".join(errors[-2:]))
+
+
+async def _binomo_bridge_candles(symbol: str, interval: str, n: int = 80):
+    if not BINOMO_CANDLES_URL:
+        raise RuntimeError("Bridge Binomo não configurado.")
+    seconds = int(INTERVALS.get(interval, 0) or 0)
+    if seconds <= 0:
+        raise RuntimeError("Intervalo inválido para o feed Binomo.")
+    params = {
+        "symbol": BINOMO_CRYPTO_IDX_SYMBOL,
+        "asset": BINOMO_CRYPTO_IDX_RIC,
+        "ric": BINOMO_CRYPTO_IDX_RIC,
+        "interval": interval,
+        "timeframe": seconds,
+        "timeframe_seconds": seconds,
+        "limit": max(30, min(int(n) + 5, 200)),
+    }
+    async with httpx.AsyncClient(
+        timeout=BINOMO_FEED_TIMEOUT,
+        follow_redirects=True,
+        headers=_binomo_extra_headers(),
+    ) as client:
+        response = await client.get(BINOMO_CANDLES_URL, params=params)
+    if response.status_code in (401, 403):
+        raise RuntimeError("Bridge Binomo recusou a autenticação. Verifique token/cabeçalhos.")
+    response.raise_for_status()
+    try:
+        payload = response.json()
+    except Exception:
+        raise RuntimeError("Bridge Binomo respondeu sem JSON válido.")
+    out = _binomo_normalize_candles(payload, n=max(30, int(n)))
+    if len(out) < min(20, int(n)):
+        raise RuntimeError(f"Bridge Binomo retornou poucos candles ({len(out)}).")
+    return out[-int(n):]
+
+
+async def _binomo_crypto_idx_candles(symbol: str, interval: str, n: int = 80):
+    if str(symbol).upper() != BINOMO_CRYPTO_IDX_SYMBOL:
+        raise RuntimeError("Feed Binomo reservado ao Crypto IDX.")
+    errors = []
+    if BINOMO_DIRECT_REST_ENABLED:
+        try:
+            rows = await _binomo_direct_rest_candles(symbol, interval, n)
+            return _tag_feed_rows(rows, "BINOMO_CRYPTO_IDX", BINOMO_CRYPTO_IDX_RIC)
+        except Exception as exc:
+            errors.append("REST direto: " + str(exc)[:180])
+    if BINOMO_CANDLES_URL:
+        try:
+            rows = await _binomo_bridge_candles(symbol, interval, n)
+            return _tag_feed_rows(rows, "BINOMO_CRYPTO_IDX", BINOMO_CRYPTO_IDX_RIC)
+        except Exception as exc:
+            errors.append("bridge: " + str(exc)[:180])
+    if not errors:
+        errors.append("nenhum conector Binomo habilitado")
+    raise RuntimeError(" | ".join(errors[-2:]))
+
+
 async def candles_open(symbol, interval, n=80):
     """Roteador multifuente do Mercado Aberto.
 
@@ -4122,7 +4349,11 @@ async def candles_open(symbol, interval, n=80):
             return list(cached[1])[-n:]
 
         providers = []
-        if symbol in BINANCE_SYMBOLS:
+        if symbol == BINOMO_CRYPTO_IDX_SYMBOL:
+            # Crypto IDX é exclusivo da Binomo. Nunca substitui por BTC, Binance,
+            # Twelve Data ou Yahoo porque isso produziria velas diferentes.
+            providers = [("BINOMO_CRYPTO_IDX", _binomo_crypto_idx_candles)]
+        elif symbol in BINANCE_SYMBOLS:
             providers.append(("BINANCE_PUBLIC", _binance_public_candles))
             if TD_KEY:
                 providers.append(("TWELVE_DATA", candles_open_twelve))
@@ -4133,7 +4364,8 @@ async def candles_open(symbol, interval, n=80):
             providers.append(("YAHOO_PUBLIC", _yahoo_public_candles))
 
         # Permite desativar o roteador e manter comportamento legado via env.
-        if not MULTIFEED_ENABLED:
+        # A exceção é Crypto IDX: ele continua BINOMO_ONLY para não falsificar o gráfico.
+        if not MULTIFEED_ENABLED and symbol != BINOMO_CRYPTO_IDX_SYMBOL:
             if not TD_KEY:
                 raise HTTPException(500, "TWELVE_DATA_API_KEY não configurada e MULTIFEED_ENABLED=0.")
             providers = [("TWELVE_DATA", candles_open_twelve)]
@@ -4142,7 +4374,7 @@ async def candles_open(symbol, interval, n=80):
         for idx, (source, provider) in enumerate(providers):
             try:
                 rows = await provider(symbol, interval, n)
-                rows = _tag_feed_rows(rows, source, (BINANCE_SYMBOLS.get(symbol) if source == "BINANCE_PUBLIC" else YAHOO_SYMBOLS.get(symbol) if source == "YAHOO_PUBLIC" else symbol))
+                rows = _tag_feed_rows(rows, source, (BINANCE_SYMBOLS.get(symbol) if source == "BINANCE_PUBLIC" else YAHOO_SYMBOLS.get(symbol) if source == "YAHOO_PUBLIC" else BINOMO_CRYPTO_IDX_RIC if source == "BINOMO_CRYPTO_IDX" else symbol))
                 if len(rows) < min(20, n):
                     raise RuntimeError("Fonte retornou poucos candles.")
                 # Se uma fonte respondeu apenas com cache antigo, não aceita como
@@ -4176,11 +4408,14 @@ async def candles_open(symbol, interval, n=80):
             return rows
 
         detail = " | ".join(errors[-4:]) or "Nenhuma fonte pública respondeu."
+        unavailable_label = "BINOMO • CRYPTO IDX INDISPONÍVEL" if symbol == BINOMO_CRYPTO_IDX_SYMBOL else "MULTIFONTE INDISPONÍVEL"
         market_feed_status[key] = {
-            "source": "UNAVAILABLE", "label": "MULTIFONTE INDISPONÍVEL",
+            "source": "UNAVAILABLE", "label": unavailable_label,
             "updated_at": iso(now()), "last_success_ts": 0, "fallback": True,
             "errors": errors[-4:],
         }
+        if symbol == BINOMO_CRYPTO_IDX_SYMBOL:
+            raise HTTPException(503, f"Crypto IDX exige o feed real da Binomo: {detail[:320]}")
         raise HTTPException(503, f"Motor multifuente sem candles: {detail[:320]}")
 
 def iq_active_candidates(symbol: str):
@@ -4256,13 +4491,13 @@ def _iq_otc_open_pairs_blocking(state: Dict[str, Any]) -> Dict[str, Any]:
 
     pairs = []
     if exact:
-        for symbol in SYMBOLS:
+        for symbol in OTC_SYMBOLS:
             otc_candidates = [c for c in iq_active_candidates(symbol) if "OTC" in _iq_active_norm(c)]
             if any(_iq_active_norm(c) in open_names for c in otc_candidates):
                 pairs.append(symbol)
     else:
         recent = state.get("otc_recent_available") or {}
-        for symbol in SYMBOLS:
+        for symbol in OTC_SYMBOLS:
             ts = float(recent.get(symbol, 0) or 0)
             if now_ts - ts <= 90:
                 pairs.append(symbol)
@@ -4681,6 +4916,8 @@ async def candles(
 
     if symbol not in SYMBOLS or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
+    if symbol == BINOMO_CRYPTO_IDX_SYMBOL and market != "OPEN":
+        raise HTTPException(400, "Crypto IDX usa somente o feed da Binomo no modo Mercado Aberto do app.")
 
     # MEGA IA 3.13: mercado OPEN é independente do login da IQ Option e usa
     # o roteador multifuente (Binance/Twelve Data/Yahoo conforme o ativo e disponibilidade).
@@ -7446,16 +7683,16 @@ async def otc_active_pairs(request: Request):
     # consultar todos ao mesmo tempo.
     if not info.get("exact"):
         idx_key = "OTC_ACTIVE_PROBE_INDEX"
-        idx = int(state.get(idx_key, 0) or 0) % len(SYMBOLS)
-        probe_symbol = SYMBOLS[idx]
-        state[idx_key] = (idx + 1) % len(SYMBOLS)
+        idx = int(state.get(idx_key, 0) or 0) % len(OTC_SYMBOLS)
+        probe_symbol = OTC_SYMBOLS[idx]
+        state[idx_key] = (idx + 1) % len(OTC_SYMBOLS)
         try:
             await candles(probe_symbol, "1min", 30, "IQ_OTC", state, request=request)
             state.setdefault("otc_recent_available", {})[probe_symbol] = time.time()
         except Exception:
             pass
         recent = state.get("otc_recent_available") or {}
-        pairs = [s for s in SYMBOLS if time.time() - float(recent.get(s, 0) or 0) <= 90]
+        pairs = [s for s in OTC_SYMBOLS if time.time() - float(recent.get(s, 0) or 0) <= 90]
 
     return {
         "ok": True,
@@ -7701,6 +7938,38 @@ async def compatibility_test(
     }
 
 
+@app.get("/binomo-feed-status")
+async def binomo_feed_status():
+    active = {
+        k: v for k, v in market_feed_status.items()
+        if k.startswith(BINOMO_CRYPTO_IDX_SYMBOL + "|")
+    }
+    recent_success = any(
+        (time.time() - float(v.get("last_success_ts", 0) or 0)) < 300
+        for v in active.values() if isinstance(v, dict)
+    )
+    connector_ready = bool(BINOMO_DIRECT_REST_ENABLED or BINOMO_CANDLES_URL)
+    return {
+        "ok": True,
+        "configured": connector_ready,
+        "connected": recent_success,
+        "asset": BINOMO_CRYPTO_IDX_SYMBOL,
+        "ric": BINOMO_CRYPTO_IDX_RIC,
+        "mode": "BINOMO_ONLY",
+        "direct_rest_enabled": bool(BINOMO_DIRECT_REST_ENABLED),
+        "bridge_configured": bool(BINOMO_CANDLES_URL),
+        "status": ("ONLINE" if recent_success else "PRONTO PARA TESTE" if connector_ready else "AGUARDANDO FONTE BINOMO"),
+        "active_series": active,
+        "message": (
+            "Crypto IDX recebendo candles reais da Binomo."
+            if recent_success else
+            "Conector Binomo pronto; selecione Crypto IDX para testar a rota direta."
+            if connector_ready else
+            "Configure um conector Binomo. O app não substitui Crypto IDX por Binance/Twelve/Yahoo."
+        ),
+    }
+
+
 @app.get("/feed-status")
 async def feed_status():
     """Diagnóstico simples da fonte de candles sem expor a chave da API."""
@@ -7747,9 +8016,17 @@ async def feed_status():
             "active_series": dict(list(market_feed_status.items())[-30:]),
             "crypto_order": ["BINANCE_PUBLIC", "TWELVE_DATA", "YAHOO_PUBLIC"],
             "forex_order": (["TWELVE_DATA", "YAHOO_PUBLIC"] if TD_KEY else ["YAHOO_PUBLIC"]),
+            "crypto_idx_order": ["BINOMO_ONLY"],
+            "binomo_crypto_idx": {
+                "configured": bool(BINOMO_DIRECT_REST_ENABLED or BINOMO_CANDLES_URL),
+                "ric": BINOMO_CRYPTO_IDX_RIC,
+                "source": "BINOMO_ONLY",
+                "direct_rest_enabled": bool(BINOMO_DIRECT_REST_ENABLED),
+                "bridge_configured": bool(BINOMO_CANDLES_URL),
+            },
             "otc_source": "IQ_OPTION_ONLY",
         },
-        "message": "Mercado Aberto usa roteador multifuente com fallback automático. OTC real continua usando somente a IQ Option.",
+        "message": "Mercado Aberto usa roteador multifuente. Crypto IDX usa somente feed Binomo real. OTC real continua usando somente a IQ Option.",
     }
 
 
@@ -7766,6 +8043,10 @@ async def candles_endpoint(
 
     if symbol not in SYMBOLS or interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
+    if symbol == BINOMO_CRYPTO_IDX_SYMBOL and market != "OPEN":
+        raise HTTPException(400, "Crypto IDX é Binomo e não pode ser usado como OTC da IQ Option.")
+    if symbol == BINOMO_CRYPTO_IDX_SYMBOL and mirror_iq:
+        raise HTTPException(400, "Crypto IDX não pode ser espelhado pela IQ Option; use o feed Binomo.")
 
     n = max(20, min(int(n), 150))
 
@@ -7881,7 +8162,11 @@ async def candles_endpoint(
             "message": str(exc.detail)[:220],
             "stale": bool(stale),
             "feed_source": _feed_source_from_rows(stale) if stale else "UNAVAILABLE",
-            "feed_label": _feed_source_label(_feed_source_from_rows(stale)) if stale else "MULTIFONTE INDISPONÍVEL",
+            "feed_label": (
+                _feed_source_label(_feed_source_from_rows(stale))
+                if stale else
+                ("BINOMO • CRYPTO IDX INDISPONÍVEL" if symbol == BINOMO_CRYPTO_IDX_SYMBOL else "MULTIFONTE INDISPONÍVEL")
+            ),
         }
 
     except Exception as exc:
@@ -9855,7 +10140,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • Painel IA • trava por ativo</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • Painel IA • Crypto IDX Binomo</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -9981,7 +10266,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <div class="card" id="dataFeedCard" style="margin-top:10px">
       <div class="label">🌐 FONTE DE DADOS • AUTOMÁTICA</div>
       <div id="dataFeedText" style="font-weight:900;margin-top:5px">Aguardando leitura do mercado...</div>
-      <div style="font-size:12px;opacity:.75;margin-top:4px">Mercado Aberto usa fallback automático entre fontes. OTC real permanece na IQ Option.</div>
+      <div style="font-size:12px;opacity:.75;margin-top:4px">Mercado Aberto usa fallback automático; Crypto IDX usa somente o feed Binomo real; OTC permanece na IQ Option.</div>
     </div>
 
     <div class="grid">
@@ -10340,6 +10625,10 @@ function brokerName(){
 
 function syncMarketFromBroker(){
   if(!market || !marketMode) return;
+  const selectedSymbol=document.getElementById('symbol');
+  if(selectedSymbol && selectedSymbol.value==='CRYPTO IDX' && marketMode.value!=='OPEN'){
+    marketMode.value='OPEN';
+  }
   if(marketMode.value==='OPEN'){
     market.value='OPEN';
   }else{
@@ -10540,7 +10829,7 @@ try{
 
 const syms=[
   'EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF',
-  'NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD'
+  'NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD','CRYPTO IDX'
 ];
 
 const S=document.getElementById('symbol');
@@ -11371,7 +11660,9 @@ function fillSymbols(){
     : '';
 
   syms.forEach(x=>{
-    S.add(new Option(x+suffix,x));
+    if(marketMode && marketMode.value==='OTC' && x==='CRYPTO IDX') return;
+    const extra=(x==='CRYPTO IDX' && (!marketMode || marketMode.value!=='OTC')) ? ' • BINOMO' : suffix;
+    S.add(new Option(x+extra,x));
   });
 
   if(previous && [...S.options].some(o=>o.value===previous)){
@@ -11903,7 +12194,18 @@ async function updateMarketNote(){
   if(!otcNote) return;
 
   if(marketMode.value!=='OTC'){
-    otcNote.style.display='none';
+    if(S && S.value==='CRYPTO IDX'){
+      otcNote.style.display='block';
+      otcNote.textContent='🟠 Crypto IDX • verificando fonte Binomo...';
+      try{
+        const d=await get('/binomo-feed-status');
+        otcNote.textContent=(d.connected?'🟢 ':d.configured?'🟠 ':'🔴 ')+'Crypto IDX • '+(d.message||d.status||'BINOMO');
+      }catch(e){
+        otcNote.textContent='🔴 Crypto IDX • fonte Binomo indisponível';
+      }
+    }else{
+      otcNote.style.display='none';
+    }
     return;
   }
 
@@ -12744,8 +13046,15 @@ if(market){
 }
 if(S){
   S.addEventListener('change',()=>{
+    if(S.value==='CRYPTO IDX' && marketMode && marketMode.value!=='OPEN'){
+      marketMode.value='OPEN';
+      syncMarketFromBroker();
+      fillSymbols();
+      S.value='CRYPTO IDX';
+    }
     momentStudyData=null;
     renderMomentStudy();
+    updateMarketNote();
   });
 }
 if(momentStudyBtn){
