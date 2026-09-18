@@ -27,7 +27,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.17"
+APP_VERSION = "3.18"
 PWA_VERSION = "v88"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -1034,10 +1034,16 @@ def _binomo_login_error(response: httpx.Response) -> str:
         payload = None
     candidates = []
     if isinstance(payload, dict):
-        for key in ("message", "error", "detail", "description"):
+        for key in ("code", "message", "error", "detail", "description"):
             value = payload.get(key)
             if value:
                 candidates.append(str(value))
+        context = payload.get("context")
+        if isinstance(context, dict):
+            for key in ("code", "field", "message", "error", "detail"):
+                value = context.get(key)
+                if value:
+                    candidates.append(str(value))
         data = payload.get("data")
         if isinstance(data, dict):
             for key in ("message", "error", "detail"):
@@ -7856,8 +7862,17 @@ async def binomo_login(body: BinomoLoginBody, request: Request, response: Respon
         raise HTTPException(504, "A Binomo não respondeu ao login dentro do limite.")
     except Exception as exc:
         # Nunca inclui e-mail, senha ou token no log.
-        print(f"[BINOMO LOGIN] falhou: {type(exc).__name__}: {str(exc)[:220]}", flush=True)
-        raise HTTPException(401, "Não foi possível conectar à Binomo: " + str(exc)[:260])
+        error_text = str(exc)[:260]
+        print(f"[BINOMO LOGIN] falhou: {type(exc).__name__}: {error_text[:220]}", flush=True)
+        low = error_text.lower()
+        if "blocked_country" in low or "not available for use in your country" in low:
+            raise HTTPException(
+                451,
+                "BINOMO • BLOQUEIO REGIONAL: a própria Binomo recusou o login para este país/região. "
+                "Não é falha de senha nem do MEGA IA. O Crypto IDX oficial ficará offline enquanto a Binomo não autorizar o acesso. "
+                "O aplicativo não tentará contornar essa restrição."
+            )
+        raise HTTPException(401, "Não foi possível conectar à Binomo: " + error_text)
 
     state = {
         "session_id": app_session,
@@ -10960,7 +10975,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • Painel IA • Crypto IDX Binomo</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • Diagnóstico Binomo regional • Crypto IDX</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -11347,6 +11362,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         <div style="font-weight:1000">📊 BINOMO • FONTE CRYPTO IDX</div>
         <div class="label" style="margin-top:6px;line-height:1.5">
           Conexão somente para leitura do gráfico <b>CRYPTO IDX (Z-CRY/IDX)</b>. Não executa ordens na Binomo.
+          O feed oficial depende de a própria Binomo permitir o acesso na região da conexão.
         </div>
         <div id="binomoAccountStatus" class="card" style="margin-top:10px">
           ⚪ Binomo desconectada • conecte para autorizar o feed do Crypto IDX.
@@ -13820,7 +13836,15 @@ window.megaConnectBinomo=async function(event){
     }finally{clearTimeout(timer);}
 
     let d=null; try{d=await r.json();}catch(_){}
-    if(!r.ok) throw new Error((d&&d.detail)?d.detail:('HTTP '+r.status));
+    if(!r.ok){
+      const detail=(d&&d.detail)?String(d.detail):('HTTP '+r.status);
+      if(r.status===451 || detail.toLowerCase().includes('blocked_country') || detail.toLowerCase().includes('bloqueio regional')){
+        const err=new Error('BINOMO • BLOQUEIO REGIONAL: o acesso foi recusado pela própria Binomo para este país/região. O Crypto IDX oficial ficará offline; o MEGA IA não tentará contornar a restrição.');
+        err.regionBlocked=true;
+        throw err;
+      }
+      throw new Error(detail);
+    }
     if(d&&d.session_token){
       try{localStorage.setItem('mega_binomo_session',d.session_token);}catch(_){}
     }
@@ -13837,7 +13861,16 @@ window.megaConnectBinomo=async function(event){
   }catch(e){
     binomoFeedAuthenticated=false;
     if(binomoAccountStatus) binomoAccountStatus.textContent='🔴 '+String((e&&e.message)||e);
-    if(binomoConnectBtn) binomoConnectBtn.style.display='block';
+    if(binomoConnectBtn){
+      binomoConnectBtn.style.display='block';
+      if(e&&e.regionBlocked){
+        binomoConnectBtn.textContent='⛔ BINOMO BLOQUEADA NA REGIÃO';
+        binomoConnectBtn.title='A restrição vem da própria Binomo, não do MEGA IA.';
+      }else{
+        binomoConnectBtn.textContent='🔐 CONECTAR BINOMO';
+        binomoConnectBtn.title='';
+      }
+    }
     if(binomoLogoutBtn) binomoLogoutBtn.style.display='none';
   }finally{
     iqLoginInProgress=false;
