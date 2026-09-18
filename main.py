@@ -25,10 +25,10 @@ except Exception:
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.21"
-PWA_VERSION = "v88"
+APP_VERSION = "3.23"
+PWA_VERSION = "v90"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -79,6 +79,23 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_SEND_TIMEOUT = float(os.getenv("TELEGRAM_SEND_TIMEOUT", "15"))
 telegram_sent_cache: Dict[str, float] = {}
+
+# cTrader Open API — OAuth 2.0 somente leitura (scope=accounts).
+# Client Secret e tokens permanecem somente no servidor.
+CTRADER_CLIENT_ID = os.getenv("CTRADER_CLIENT_ID", "").strip()
+CTRADER_CLIENT_SECRET = os.getenv("CTRADER_CLIENT_SECRET", "").strip()
+CTRADER_REDIRECT_URI = os.getenv(
+    "CTRADER_REDIRECT_URI",
+    "https://iq-signal-m1-api.onrender.com/ctrader/callback",
+).strip()
+CTRADER_AUTHORIZE_URL = "https://id.ctrader.com/my/settings/openapi/grantingaccess/"
+CTRADER_TOKEN_URL = "https://openapi.ctrader.com/apps/token"
+CTRADER_SCOPE = "accounts"
+CTRADER_SESSION_COOKIE = "mega_ctrader_session"
+CTRADER_OAUTH_STATE_COOKIE = "mega_ctrader_oauth_state"
+CTRADER_SESSION_TTL = max(300, int(os.getenv("CTRADER_SESSION_TTL", "2628000")))
+ctrader_sessions: Dict[str, Dict[str, Any]] = {}
+ctrader_oauth_states: Dict[str, float] = {}
 
 TD_URL = "https://api.twelvedata.com/time_series"
 TD_WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
@@ -185,6 +202,18 @@ results: Dict[str, Any] = {}
 # Cada sinal confirmado entra aqui e é avaliado na vela original.
 accounting_pending: Dict[str, Dict[str, Any]] = {}
 accounting_results: Dict[str, Dict[str, Any]] = {}
+
+# MEGA IA 3.22 — aprendizado adaptativo por cliente/ativo.
+# O histórico continua persistido no navegador; a cada abertura do app ele é
+# sincronizado com o servidor, então um restart/deploy do Render não apaga o
+# aprendizado do aparelho. O motor só começa a filtrar após amostra mínima.
+ADAPTIVE_LEARNING_ENABLED = os.getenv("ADAPTIVE_LEARNING_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
+ADAPTIVE_MIN_SYMBOL_SAMPLES = max(12, int(os.getenv("ADAPTIVE_MIN_SYMBOL_SAMPLES", "20")))
+ADAPTIVE_MIN_GROUP_SAMPLES = max(5, int(os.getenv("ADAPTIVE_MIN_GROUP_SAMPLES", "8")))
+ADAPTIVE_BASE_CONFIDENCE = float(os.getenv("ADAPTIVE_BASE_CONFIDENCE", "68"))
+adaptive_learning_store: Dict[str, Dict[str, Any]] = {}
+adaptive_learning_guard = threading.RLock()
+
 radar_cache: Dict[str, Any] = {}
 pre_signal_cache: Dict[str, Any] = {}
 chart_pre_signal_lock: Dict[str, Dict[str, Any]] = {}
@@ -831,6 +860,11 @@ class IQAutoOrderBody(BaseModel):
 
 class IQAutoOrderResultBody(BaseModel):
     order_id: str
+
+
+class AdaptiveLearningSyncBody(BaseModel):
+    enabled: bool = True
+    history: list[dict[str, Any]] = []
 
 
 class TelegramSignalBody(BaseModel):
@@ -6985,6 +7019,280 @@ def entry_window(interval, entry_mode="BIRTH"):
     return entry - timedelta(seconds=35), entry, entry + step
 
 
+def _adaptive_client_id(request: Request | None) -> str:
+    if request is None:
+        return "default"
+    raw = str(request.headers.get("X-Mega-Learning-ID") or "").strip()
+    raw = re.sub(r"[^A-Za-z0-9_.-]", "", raw)[:96]
+    return raw if len(raw) >= 8 else "default"
+
+
+def _adaptive_result_score(result: Any) -> float:
+    """Peso do resultado com foco em WIN de primeira.
+
+    WIN direto vale 1.0; recuperações valem menos. Assim o aprendizado não
+    considera uma estratégia cheia de G1/G2 tão boa quanto uma que acerta direto.
+    """
+    r = str(result or "").upper().strip()
+    if r == "WIN":
+        return 1.0
+    if r == "WIN G1":
+        return 0.55
+    if r == "WIN G2":
+        return 0.25
+    if r in ("LOSS", "LOSS G2"):
+        return 0.0
+    return -1.0
+
+
+def _adaptive_timestamp(value: Any):
+    try:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=BR_TZ)
+        return dt.astimezone(BR_TZ)
+    except Exception:
+        return None
+
+
+def _adaptive_hour_bucket(value: Any = None) -> str:
+    dt = _adaptive_timestamp(value) if value else now().astimezone(BR_TZ)
+    if dt is None:
+        dt = now().astimezone(BR_TZ)
+    start = (int(dt.hour) // 3) * 3
+    end = (start + 2) % 24
+    return f"{start:02d}:00–{end:02d}:59"
+
+
+def _adaptive_clean_history(history: Any) -> list[dict[str, Any]]:
+    if not isinstance(history, list):
+        return []
+    cutoff = now().astimezone(BR_TZ) - timedelta(days=15)
+    out = []
+    seen = set()
+    for raw in history[-2500:]:
+        if not isinstance(raw, dict):
+            continue
+        score = _adaptive_result_score(raw.get("result"))
+        if score < 0:
+            continue
+        dt = _adaptive_timestamp(raw.get("timestamp") or raw.get("entry_time"))
+        if dt is None or dt < cutoff:
+            continue
+        symbol = str(raw.get("symbol") or "").upper().strip()
+        market = str(raw.get("market") or "OPEN").upper().strip()
+        interval = str(raw.get("interval") or "1min").strip()
+        direction = str(raw.get("direction") or "").upper().strip()
+        if symbol not in SYMBOLS or market not in VALID_MARKETS or interval not in INTERVALS:
+            continue
+        if direction not in ("CALL", "PUT"):
+            continue
+        key = str(raw.get("op_key") or raw.get("key") or "").strip()
+        if not key:
+            key = f"{market}|{symbol}|{interval}|{direction}|{int(dt.timestamp())}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "key": key,
+            "timestamp": dt.isoformat(),
+            "symbol": symbol,
+            "market": market,
+            "interval": interval,
+            "direction": direction,
+            "result": str(raw.get("result") or "").upper().strip(),
+            "score": score,
+            "confidence": round(float(raw.get("confidence") or 0.0), 2),
+            "risk": str(raw.get("risk") or "").upper().strip(),
+            "strategy": str(raw.get("strategy") or "").strip()[:180],
+            "engine": str(raw.get("engine") or "").upper().strip()[:64],
+            "entry_mode": str(raw.get("entry_mode") or "").upper().strip()[:32],
+            "hour_bucket": _adaptive_hour_bucket(dt.isoformat()),
+        })
+    out.sort(key=lambda x: x["timestamp"])
+    return out[-2000:]
+
+
+def _adaptive_stats(rows: list[dict[str, Any]]) -> Dict[str, Any]:
+    n = len(rows)
+    if not n:
+        return {"samples": 0, "wins": 0, "losses": 0, "quality": 0.0, "final_accuracy": 0.0, "direct_win_rate": 0.0}
+    wins = sum(1 for x in rows if str(x.get("result") or "").startswith("WIN"))
+    losses = sum(1 for x in rows if str(x.get("result") or "").startswith("LOSS"))
+    direct = sum(1 for x in rows if str(x.get("result") or "") == "WIN")
+    quality = 100.0 * sum(float(x.get("score") or 0.0) for x in rows) / n
+    return {
+        "samples": n,
+        "wins": wins,
+        "losses": losses,
+        "quality": round(quality, 2),
+        "final_accuracy": round(100.0 * wins / n, 2),
+        "direct_win_rate": round(100.0 * direct / n, 2),
+    }
+
+
+def _adaptive_profile_for_candidate(request: Request | None, payload: Dict[str, Any], engine: str = "") -> Dict[str, Any]:
+    client_id = _adaptive_client_id(request)
+    with adaptive_learning_guard:
+        state = dict(adaptive_learning_store.get(client_id) or {})
+        history = list(state.get("history") or [])
+    enabled = bool(ADAPTIVE_LEARNING_ENABLED and state.get("enabled", True))
+    symbol = str(payload.get("symbol") or "").upper()
+    market = str(payload.get("market") or "OPEN").upper()
+    interval = str(payload.get("interval") or "1min")
+    direction = str(payload.get("direction") or "").upper()
+    strategy = str(payload.get("strategy") or "")
+    engine = str(engine or payload.get("selected_engine") or payload.get("mode") or "").upper()
+    hour_bucket = _adaptive_hour_bucket(payload.get("entry_time"))
+
+    base_rows = [x for x in history if x.get("market") == market and x.get("symbol") == symbol]
+    overall = _adaptive_stats(base_rows)
+    interval_stats = _adaptive_stats([x for x in base_rows if x.get("interval") == interval])
+    direction_stats = _adaptive_stats([x for x in base_rows if x.get("direction") == direction])
+    hour_stats = _adaptive_stats([x for x in base_rows if x.get("hour_bucket") == hour_bucket])
+    engine_stats = _adaptive_stats([x for x in base_rows if engine and str(x.get("engine") or "").upper() == engine])
+    strategy_stats = _adaptive_stats([x for x in base_rows if strategy and str(x.get("strategy") or "") == strategy])
+
+    active = enabled and overall["samples"] >= ADAPTIVE_MIN_SYMBOL_SAMPLES
+    adjustment = 0.0
+    notes = []
+
+    def add_adjustment(stats, good_min, bad_max, good_delta, bad_delta, label, min_samples):
+        nonlocal adjustment
+        if stats["samples"] < min_samples:
+            return
+        q = stats["quality"]
+        if q >= good_min:
+            adjustment += good_delta
+            notes.append(f"{label} forte {q:.0f}%")
+        elif q <= bad_max:
+            adjustment += bad_delta
+            notes.append(f"{label} fraco {q:.0f}%")
+
+    if active:
+        add_adjustment(overall, 72, 48, 1.5, -2.5, "ativo", ADAPTIVE_MIN_SYMBOL_SAMPLES)
+        add_adjustment(interval_stats, 72, 46, 1.0, -2.0, "timeframe", max(8, ADAPTIVE_MIN_GROUP_SAMPLES))
+        add_adjustment(direction_stats, 74, 45, 1.0, -2.0, "direção", max(8, ADAPTIVE_MIN_GROUP_SAMPLES))
+        add_adjustment(hour_stats, 76, 44, 1.0, -3.0, "horário", ADAPTIVE_MIN_GROUP_SAMPLES)
+        add_adjustment(engine_stats, 74, 45, 0.75, -1.5, "motor", ADAPTIVE_MIN_GROUP_SAMPLES)
+        add_adjustment(strategy_stats, 78, 44, 1.5, -3.0, "estratégia", ADAPTIVE_MIN_GROUP_SAMPLES)
+
+    adjustment = max(-8.0, min(4.0, adjustment))
+    required_conf = ADAPTIVE_BASE_CONFIDENCE
+    if active:
+        # Desempenho fraco torna o filtro mais exigente; desempenho forte pode
+        # aliviar no máximo 2 pontos, sem transformar histórico em garantia.
+        required_conf += max(0.0, -adjustment)
+        required_conf -= min(2.0, max(0.0, adjustment) * 0.5)
+    required_conf = round(max(66.0, min(80.0, required_conf)), 1)
+
+    hard_block = False
+    hard_reason = ""
+    if active:
+        if hour_stats["samples"] >= 10 and hour_stats["losses"] >= 5 and hour_stats["quality"] <= 35:
+            hard_block = True
+            hard_reason = f"faixa {hour_bucket} teve qualidade {hour_stats['quality']:.0f}% em {hour_stats['samples']} operações"
+        elif strategy_stats["samples"] >= 10 and strategy_stats["losses"] >= 5 and strategy_stats["quality"] <= 30:
+            hard_block = True
+            hard_reason = f"estratégia teve qualidade {strategy_stats['quality']:.0f}% em {strategy_stats['samples']} operações"
+
+    confidence = float(payload.get("confidence") or 0.0)
+    confidence_block = bool(active and confidence < required_conf)
+    blocked = bool(hard_block or confidence_block)
+    if hard_block:
+        decision_reason = hard_reason
+    elif confidence_block:
+        decision_reason = f"confiança {confidence:.1f}% abaixo do mínimo adaptativo {required_conf:.1f}%"
+    elif not enabled:
+        decision_reason = "aprendizado desligado"
+    elif not active:
+        decision_reason = f"coletando histórico ({overall['samples']}/{ADAPTIVE_MIN_SYMBOL_SAMPLES})"
+    else:
+        decision_reason = "perfil adaptativo aprovado" + ((" • " + "; ".join(notes[:3])) if notes else "")
+
+    return {
+        "enabled": enabled,
+        "active": active,
+        "blocked": blocked,
+        "reason": decision_reason,
+        "samples": overall["samples"],
+        "quality": overall["quality"],
+        "final_accuracy": overall["final_accuracy"],
+        "direct_win_rate": overall["direct_win_rate"],
+        "required_confidence": required_conf,
+        "adjustment": round(adjustment, 2),
+        "hour_bucket": hour_bucket,
+        "hour": hour_stats,
+        "direction": direction_stats,
+        "strategy": strategy_stats,
+        "engine": engine_stats,
+        "interval": interval_stats,
+    }
+
+
+def _apply_adaptive_gate(request: Request | None, payload: Dict[str, Any], engine: str = "") -> Dict[str, Any]:
+    decision = _adaptive_profile_for_candidate(request, payload, engine)
+    payload["adaptive_learning"] = decision
+    if payload.get("direction") not in ("CALL", "PUT"):
+        return decision
+    if decision.get("blocked"):
+        payload.update(
+            direction="NEUTRO",
+            entry_time=None,
+            announce_time=None,
+            expiry_time=None,
+            status="🧠 APRENDIZADO AUTOMÁTICO • SINAL FILTRADO",
+            reason=f"Filtro adaptativo: {decision.get('reason')}",
+            risk="HIGH",
+        )
+    return decision
+
+
+@app.post("/adaptive-learning/sync")
+async def adaptive_learning_sync(request: Request, body: AdaptiveLearningSyncBody):
+    client_id = _adaptive_client_id(request)
+    clean = _adaptive_clean_history(body.history)
+    state = {
+        "enabled": bool(body.enabled),
+        "history": clean,
+        "updated_at": iso(now()),
+    }
+    with adaptive_learning_guard:
+        adaptive_learning_store[client_id] = state
+
+    by_symbol = {}
+    for sym in SYMBOLS:
+        rows = [x for x in clean if x.get("symbol") == sym]
+        if rows:
+            by_symbol[sym] = _adaptive_stats(rows)
+    return {
+        "ok": True,
+        "enabled": bool(ADAPTIVE_LEARNING_ENABLED and body.enabled),
+        "observations": len(clean),
+        "min_symbol_samples": ADAPTIVE_MIN_SYMBOL_SAMPLES,
+        "by_symbol": by_symbol,
+        "updated_at": state["updated_at"],
+    }
+
+
+@app.get("/adaptive-learning/status")
+async def adaptive_learning_status(request: Request, symbol: str = "BTC/USD", market: str = "OPEN", interval: str = "1min", engine: str = "GRAPH_AI"):
+    probe = {
+        "symbol": symbol,
+        "market": market,
+        "interval": interval,
+        "direction": "CALL",
+        "strategy": "",
+        "confidence": 100,
+    }
+    return _adaptive_profile_for_candidate(request, probe, engine)
+
+
 def neutral_signal(symbol, interval, market, status, reason, *, confidence=0, source_state="UNAVAILABLE"):
     return {
         "symbol": symbol,
@@ -7438,6 +7746,16 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "expiry_time": iso(expiry),
                     "reference_candle": reference_candle,
                 })
+
+                # 3.22: o histórico recente pode tornar o filtro mais seletivo.
+                # Só atua depois da amostra mínima e nunca altera candles/regras
+                # originais do motor; apenas barra setups estatisticamente fracos.
+                adaptive_decision = _apply_adaptive_gate(request, base, engine)
+                if adaptive_decision.get("blocked"):
+                    release_state["active_signal"] = None
+                    cache[key] = (time.time(), base)
+                    return base
+
                 release_state[fingerprint_key] = signal_fingerprint
                 if engine == "GRAPH_AI":
                     release_state["last_graph_signal_ts"] = time.time()
@@ -7749,6 +8067,168 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     return base
 
 
+
+def _ctrader_configured() -> bool:
+    return bool(CTRADER_CLIENT_ID and CTRADER_CLIENT_SECRET and CTRADER_REDIRECT_URI)
+
+
+def _ctrader_prune_state() -> None:
+    now_ts = time.time()
+    for key, exp in list(ctrader_oauth_states.items()):
+        if exp <= now_ts:
+            ctrader_oauth_states.pop(key, None)
+    for key, item in list(ctrader_sessions.items()):
+        if float(item.get("expires_at") or 0) <= now_ts:
+            ctrader_sessions.pop(key, None)
+
+
+def _ctrader_session_from_request(request: Request):
+    _ctrader_prune_state()
+    session_id = str(request.cookies.get(CTRADER_SESSION_COOKIE) or "").strip()
+    if not session_id:
+        return None, None
+    item = ctrader_sessions.get(session_id)
+    if not item:
+        return session_id, None
+    return session_id, item
+
+
+async def _ctrader_exchange_authorization_code(code: str) -> Dict[str, Any]:
+    params = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": CTRADER_REDIRECT_URI,
+        "client_id": CTRADER_CLIENT_ID,
+        "client_secret": CTRADER_CLIENT_SECRET,
+    }
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        response = await client.get(
+            CTRADER_TOKEN_URL,
+            params=params,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+        )
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    if response.status_code != 200:
+        detail = str(data.get("description") or data.get("errorCode") or response.text or f"HTTP {response.status_code}")
+        raise RuntimeError(detail[:260])
+    if data.get("errorCode"):
+        raise RuntimeError(str(data.get("description") or data.get("errorCode"))[:260])
+    if not data.get("accessToken"):
+        raise RuntimeError("cTrader não retornou accessToken.")
+    return data
+
+
+@app.get("/ctrader/login")
+async def ctrader_login():
+    """Inicia OAuth oficial da cTrader com acesso somente leitura."""
+    if not _ctrader_configured():
+        raise HTTPException(503, "Configure CTRADER_CLIENT_ID e CTRADER_CLIENT_SECRET no Render.")
+    _ctrader_prune_state()
+    state = secrets.token_urlsafe(24)
+    ctrader_oauth_states[state] = time.time() + 600
+    params = {
+        "client_id": CTRADER_CLIENT_ID,
+        "redirect_uri": CTRADER_REDIRECT_URI,
+        "scope": CTRADER_SCOPE,
+        "product": "web",
+        "state": state,
+    }
+    url = CTRADER_AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
+    response = RedirectResponse(url=url, status_code=302)
+    response.set_cookie(
+        CTRADER_OAUTH_STATE_COOKIE,
+        state,
+        max_age=600,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+    )
+    return response
+
+
+@app.get("/ctrader/callback")
+async def ctrader_callback(request: Request, code: str = "", state: str = "", error: str = "", error_description: str = ""):
+    """Recebe o code da cTrader e o troca imediatamente pelo token de acesso."""
+    if error:
+        msg = urllib.parse.quote(str(error_description or error)[:160])
+        return RedirectResponse(url=f"/?ctrader=error&message={msg}", status_code=302)
+    code = str(code or "").strip()
+    if not code:
+        return RedirectResponse(url="/?ctrader=error&message=code_nao_recebido", status_code=302)
+
+    cookie_state = str(request.cookies.get(CTRADER_OAUTH_STATE_COOKIE) or "").strip()
+    returned_state = str(state or "").strip()
+    # A documentação atual da cTrader não exige `state`, mas quando ele vier
+    # de volta nós validamos para proteger o fluxo contra troca indevida.
+    if returned_state:
+        valid_until = ctrader_oauth_states.get(returned_state, 0)
+        if not cookie_state or returned_state != cookie_state or valid_until < time.time():
+            return RedirectResponse(url="/?ctrader=error&message=estado_oauth_invalido", status_code=302)
+
+    try:
+        token_data = await _ctrader_exchange_authorization_code(code)
+    except Exception as exc:
+        msg = urllib.parse.quote(str(exc)[:180])
+        return RedirectResponse(url=f"/?ctrader=error&message={msg}", status_code=302)
+
+    expires_in = max(300, int(token_data.get("expiresIn") or CTRADER_SESSION_TTL))
+    session_id = secrets.token_urlsafe(32)
+    ctrader_sessions[session_id] = {
+        "access_token": str(token_data.get("accessToken") or ""),
+        "refresh_token": str(token_data.get("refreshToken") or ""),
+        "token_type": str(token_data.get("tokenType") or "bearer"),
+        "created_at": time.time(),
+        "expires_at": time.time() + expires_in,
+        "scope": CTRADER_SCOPE,
+    }
+    if returned_state:
+        ctrader_oauth_states.pop(returned_state, None)
+    elif cookie_state:
+        ctrader_oauth_states.pop(cookie_state, None)
+
+    response = RedirectResponse(url="/?ctrader=connected", status_code=302)
+    response.set_cookie(
+        CTRADER_SESSION_COOKIE,
+        session_id,
+        max_age=min(expires_in, CTRADER_SESSION_TTL),
+        httponly=True,
+        secure=True,
+        samesite="lax",
+    )
+    response.delete_cookie(CTRADER_OAUTH_STATE_COOKIE)
+    return response
+
+
+@app.get("/ctrader/status")
+async def ctrader_status(request: Request):
+    session_id, item = _ctrader_session_from_request(request)
+    expires_in = max(0, int(float(item.get("expires_at") or 0) - time.time())) if item else 0
+    return {
+        "ok": True,
+        "configured": _ctrader_configured(),
+        "connected": bool(item and item.get("access_token") and expires_in > 0),
+        "scope": (item.get("scope") if item else CTRADER_SCOPE),
+        "read_only": True,
+        "expires_in_seconds": expires_in,
+        "redirect_uri": CTRADER_REDIRECT_URI,
+        "server_session": bool(session_id and item),
+    }
+
+
+@app.post("/ctrader/logout")
+async def ctrader_logout(request: Request):
+    session_id = str(request.cookies.get(CTRADER_SESSION_COOKIE) or "").strip()
+    if session_id:
+        ctrader_sessions.pop(session_id, None)
+    response = Response(content=json.dumps({"ok": True, "connected": False}), media_type="application/json")
+    response.delete_cookie(CTRADER_SESSION_COOKIE)
+    response.delete_cookie(CTRADER_OAUTH_STATE_COOKIE)
+    return response
+
+
 @app.get("/health")
 async def health():
     now_ts = time.time()
@@ -7767,6 +8247,12 @@ async def health():
         "iq_option": {
             "library": bool(IQ_Option is not None),
             "sessions": len(iq_sessions),
+        },
+        "ctrader": {
+            "configured": _ctrader_configured(),
+            "sessions": len(ctrader_sessions),
+            "scope": CTRADER_SCOPE,
+            "read_only": True,
         },
         "binomo_crypto_idx": {
             "auth_enabled": bool(BINOMO_AUTH_WS_ENABLED),
@@ -10185,7 +10671,20 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
+                "strategy": str(tech.get("strategy") or ""),
             }
+            if item.get("direction") in ("CALL", "PUT"):
+                radar_probe = {
+                    "symbol": sym, "market": market, "interval": interval,
+                    "direction": item.get("direction"), "confidence": item.get("confidence"),
+                    "strategy": item.get("strategy"), "selected_engine": engine,
+                }
+                radar_learning = _adaptive_profile_for_candidate(request, radar_probe, engine)
+                item["adaptive_learning"] = radar_learning
+                if radar_learning.get("blocked"):
+                    item["direction"] = "NEUTRO"
+                    item["clickable"] = False
+                    item["status"] = "🧠 APRENDIZADO • FILTRADO • " + str(radar_learning.get("reason") or "perfil fraco")[:100]
         else:
             item = {
                 "symbol": sym + suffix,
@@ -11084,7 +11583,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • Crypto IDX teste público • Gráfico fluido</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • cTrader Open API • Aprendizado automático • Gráfico fluido</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -11110,6 +11609,9 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
     <button id="btcOnlyBtn" type="button" style="font-weight:1000">₿ SÓ BTC/USD • OFF</button>
     <div id="btcOnlyNote" class="label" style="display:none;grid-column:1/-1">Modo BTC/USD ativo • painel, gráfico, pré-alerta e radar focados somente neste ativo.</div>
+
+    <button id="adaptiveLearningBtn" type="button" style="font-weight:1000">🧠 APRENDIZADO • ON</button>
+    <div id="adaptiveLearningNote" class="label" style="grid-column:1/-1">Coletando resultados por ativo • o filtro só muda sinais depois de amostra suficiente.</div>
 
     <select id="interval">
       <option>1min</option>
@@ -11470,6 +11972,24 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         A senha não é salva no navegador.
       </div>
 
+      <div class="card" style="margin-top:14px;border-color:#38bdf8">
+        <div style="font-weight:1000">📡 cTrader OPEN API • FONTE AUTORIZADA</div>
+        <div class="label" style="margin-top:6px;line-height:1.5">
+          Conexão oficial em modo <b>somente leitura</b> (scope accounts). O MEGA IA não recebe sua senha cTrader
+          e não solicita permissão para executar ordens.
+        </div>
+        <div id="ctraderAccountStatus" class="card" style="margin-top:10px">
+          ⚪ cTrader • verificando configuração...
+        </div>
+        <button id="ctraderConnectBtn" type="button"
+                style="width:100%;margin-top:10px;font-weight:1000;border-color:#38bdf8">🔐 CONECTAR cTrader • SOMENTE LEITURA</button>
+        <button id="ctraderLogoutBtn" type="button"
+                style="width:100%;margin-top:8px;display:none">🚪 DESCONECTAR cTrader</button>
+        <div class="label" style="margin-top:9px;line-height:1.5">
+          Client Secret e tokens ficam apenas no servidor Render. Após um deploy/reinício do servidor, pode ser necessário autorizar novamente.
+        </div>
+      </div>
+
       <div class="card" style="margin-top:14px;border-color:#f0b90b">
         <div style="font-weight:1000">📊 BINOMO • FONTE CRYPTO IDX</div>
         <div class="label" style="margin-top:6px;line-height:1.5">
@@ -11654,6 +12174,13 @@ const forceModeDesc=document.getElementById('forceModeDesc');
 const voiceBtn=document.getElementById('voiceBtn');
 const btcOnlyBtn=document.getElementById('btcOnlyBtn');
 const btcOnlyNote=document.getElementById('btcOnlyNote');
+const adaptiveLearningBtn=document.getElementById('adaptiveLearningBtn');
+const adaptiveLearningNote=document.getElementById('adaptiveLearningNote');
+let adaptiveLearningEnabled=true;
+try{
+  adaptiveLearningEnabled=localStorage.getItem('mega_adaptive_learning')!=='OFF';
+}catch(_){}
+let adaptiveLearningSummary=null;
 let btcOnlyEnabled=false;
 try{
   btcOnlyEnabled=localStorage.getItem('mega_btc_only_mode')==='ON';
@@ -11739,6 +12266,9 @@ const iqPassword=document.getElementById('iqPassword');
 const iqConnectBtn=document.getElementById('iqConnectBtn');
 const iqLogoutBtn=document.getElementById('iqLogoutBtn');
 const iqAccountStatus=document.getElementById('iqAccountStatus');
+const ctraderAccountStatus=document.getElementById('ctraderAccountStatus');
+const ctraderConnectBtn=document.getElementById('ctraderConnectBtn');
+const ctraderLogoutBtn=document.getElementById('ctraderLogoutBtn');
 const binomoEmail=document.getElementById('binomoEmail');
 const binomoPassword=document.getElementById('binomoPassword');
 const binomoConnectBtn=document.getElementById('binomoConnectBtn');
@@ -11880,6 +12410,7 @@ const RESULT_MAX_PENDING_AGE_MS=30*60*1000;
 
 const RESULT_STATS_KEY='mega_result_stats_v33741';
 const PENDING_QUEUE_KEY='mega_pending_trade_queue_v33450';
+const LEARNING_ID_KEY='mega_adaptive_learning_id_v1';
 const RESULT_MARKETS=['OPEN','IQ_OTC'];
 
 function emptyResultBucket(){
@@ -12023,6 +12554,84 @@ function savePersistentResults(){
   }catch(_){ }
 }
 
+function adaptiveLearningId(){
+  try{
+    let id=localStorage.getItem(LEARNING_ID_KEY)||'';
+    if(!id){
+      if(window.crypto && typeof crypto.randomUUID==='function') id=crypto.randomUUID();
+      else id='mega-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,12);
+      localStorage.setItem(LEARNING_ID_KEY,id);
+    }
+    return id;
+  }catch(_){
+    return 'mega-local-default';
+  }
+}
+
+function adaptiveLearningHistory(){
+  const all=[];
+  RESULT_MARKETS.forEach(m=>{
+    const b=persistentResults[m]||emptyResultBucket();
+    pruneHistory(b).forEach(h=>all.push({...h,market:resultMarket(h.market||m)}));
+  });
+  all.sort((a,b)=>Date.parse(String(a.timestamp||''))-Date.parse(String(b.timestamp||'')));
+  return all.slice(-2000);
+}
+
+function renderAdaptiveLearningState(){
+  if(adaptiveLearningBtn){
+    adaptiveLearningBtn.textContent=adaptiveLearningEnabled?'🧠 APRENDIZADO • ON':'🧠 APRENDIZADO • OFF';
+    adaptiveLearningBtn.style.background=adaptiveLearningEnabled?'#0b7a3d':'#7d1d1d';
+    adaptiveLearningBtn.style.color='#fff';
+    adaptiveLearningBtn.style.borderColor=adaptiveLearningEnabled?'#16c56b':'#ff5252';
+  }
+  if(!adaptiveLearningNote) return;
+  if(!adaptiveLearningEnabled){
+    adaptiveLearningNote.textContent='Aprendizado desligado • nenhum filtro adaptativo será aplicado.';
+    return;
+  }
+  const sym=(S&&S.value)||'BTC/USD';
+  const row=adaptiveLearningSummary && adaptiveLearningSummary.by_symbol ? adaptiveLearningSummary.by_symbol[sym] : null;
+  const minN=Number(adaptiveLearningSummary&&adaptiveLearningSummary.min_symbol_samples||20);
+  if(row){
+    const n=Number(row.samples||0);
+    const q=Number(row.quality||0).toFixed(1);
+    const direct=Number(row.direct_win_rate||0).toFixed(1);
+    adaptiveLearningNote.textContent=n>=minN
+      ? `Perfil ${sym} ATIVO • ${n} operações • qualidade ${q}% • WIN direto ${direct}% • filtros adaptativos liberados.`
+      : `Perfil ${sym}: coletando ${n}/${minN} operações • qualidade ${q}% • ainda sem alterar sinais.`;
+  }else{
+    adaptiveLearningNote.textContent=`Coletando resultados de ${sym} • o filtro só atua depois de ${minN} operações.`;
+  }
+}
+
+let adaptiveSyncBusy=false;
+async function syncAdaptiveLearning(showStatus=false){
+  if(adaptiveSyncBusy) return adaptiveLearningSummary;
+  adaptiveSyncBusy=true;
+  try{
+    const d=await post('/adaptive-learning/sync',{
+      enabled:!!adaptiveLearningEnabled,
+      history:adaptiveLearningHistory()
+    });
+    adaptiveLearningSummary=d||null;
+    renderAdaptiveLearningState();
+    if(showStatus && statusBox){
+      const n=Number(d&&d.observations||0);
+      statusBox.textContent=adaptiveLearningEnabled
+        ? `🧠 APRENDIZADO SINCRONIZADO • ${n} operações recentes`
+        : '🧠 APRENDIZADO AUTOMÁTICO DESLIGADO';
+    }
+    return d;
+  }catch(e){
+    if(adaptiveLearningNote) adaptiveLearningNote.textContent='⚠️ Aprendizado aguardando sincronização com o servidor.';
+    return null;
+  }finally{
+    adaptiveSyncBusy=false;
+  }
+}
+
+
 function pruneHistory(bucket){
   if(!bucket) return [];
   const cutoff=Date.now()-(15*24*60*60*1000);
@@ -12130,8 +12739,8 @@ function renderHistoryAnalysis(items){
     </div>
 
     <div class="card" style="margin-top:10px;padding:10px">
-      <div style="font-weight:900">🔎 Filtros candidatos para reduzir LOSS (ainda NÃO aplicados)</div>
-      <div class="label" style="margin-top:5px">Só aparecem grupos com amostra mínima de ${minGroup} operações e desempenho pelo menos 6 p.p. abaixo da média geral.</div>
+      <div style="font-weight:900">🧠 Aprendizado automático • padrões usados pelo filtro</div>
+      <div class="label" style="margin-top:5px">Estes grupos ajudam o filtro adaptativo. A aplicação automática só começa quando o ativo atinge a amostra mínima e usa limites extras para não reagir a poucos resultados.</div>
       ${candidateRows}
       <div class="label" style="margin-top:8px">${confText}</div>
     </div>
@@ -12142,7 +12751,7 @@ function renderHistoryAnalysis(items){
       ${symbolRows}
     </div>
 
-    <div class="label" style="margin-top:9px;line-height:1.45">${enough?'A amostra já permite procurar concentrações, mas elas são padrões observados — não prova de causa nem garantia para sinais futuros.':'Amostra ainda pequena. Evite criar filtros antes de acumular pelo menos 30 operações.'}</div>`;
+    <div class="label" style="margin-top:9px;line-height:1.45">${enough?'O aprendizado usa somente padrões estatísticos recentes e filtros conservadores; isso não garante resultado futuro.':'Amostra ainda pequena. O aprendizado continua coletando dados sem alterar sinais até atingir o mínimo necessário.'}</div>`;
 }
 
 function renderHistory(){
@@ -12257,6 +12866,8 @@ function registerPersistentResult(t,x){
   if(changed){
     savePersistentResults();
     paintPersistentResults();
+    // Recalcula o perfil logo após cada operação finalizada.
+    setTimeout(()=>{ syncAdaptiveLearning(false); },80);
   }
   return changed;
 }
@@ -12451,6 +13062,7 @@ async function resetResultsNow(){
     }catch(_){}
     savePersistentResults();
     paintPersistentResults();
+    await syncAdaptiveLearning(false);
     if(typeof resultEl!=='undefined' && resultEl) resultEl.textContent='--';
     alert('Resultados zerados com sucesso.');
   }catch(e){
@@ -12874,6 +13486,7 @@ function iqSessionToken(){
 function authHeaders(extra={}){
   const h={...extra};
   try{
+    h['X-Mega-Learning-ID']=adaptiveLearningId();
     const iqSession=localStorage.getItem('mega_iq_session')||'';
     if(iqSession){
       h['X-IQ-Session']=iqSession;
@@ -13908,6 +14521,7 @@ function showTab(which){
 
   if(account){
     refreshAccountStatus();
+    refreshCTraderStatus();
   }
 }
 
@@ -13984,6 +14598,53 @@ async function refreshAccountStatus(){
   }
   syncBroker(b);
   await updateMarketNote();
+}
+
+async function refreshCTraderStatus(){
+  if(!ctraderAccountStatus) return null;
+  try{
+    const d=await get('/ctrader/status?t='+Date.now());
+    if(!d.configured){
+      ctraderAccountStatus.textContent='🔴 cTrader • faltam CTRADER_CLIENT_ID/CTRADER_CLIENT_SECRET no Render';
+      if(ctraderConnectBtn) ctraderConnectBtn.style.display='block';
+      if(ctraderLogoutBtn) ctraderLogoutBtn.style.display='none';
+      return d;
+    }
+    if(d.connected){
+      const days=Math.max(0,Number(d.expires_in_seconds||0))/86400;
+      ctraderAccountStatus.textContent='🟢 cTrader CONECTADA • SOMENTE LEITURA • token '+(days>=1?days.toFixed(1)+' dias':Math.ceil(days*24)+' h');
+      if(ctraderConnectBtn) ctraderConnectBtn.style.display='none';
+      if(ctraderLogoutBtn) ctraderLogoutBtn.style.display='block';
+    }else{
+      ctraderAccountStatus.textContent='⚪ cTrader configurada • toque em CONECTAR para autorizar acesso somente leitura';
+      if(ctraderConnectBtn) ctraderConnectBtn.style.display='block';
+      if(ctraderLogoutBtn) ctraderLogoutBtn.style.display='none';
+    }
+    return d;
+  }catch(e){
+    ctraderAccountStatus.textContent='🔴 Não foi possível verificar a sessão cTrader agora.';
+    if(ctraderConnectBtn) ctraderConnectBtn.style.display='block';
+    if(ctraderLogoutBtn) ctraderLogoutBtn.style.display='none';
+    return null;
+  }
+}
+
+if(ctraderConnectBtn){
+  ctraderConnectBtn.onclick=()=>{
+    ctraderAccountStatus.textContent='🟡 Abrindo autorização oficial da cTrader...';
+    window.location.href='/ctrader/login';
+  };
+}
+
+if(ctraderLogoutBtn){
+  ctraderLogoutBtn.onclick=async()=>{
+    ctraderLogoutBtn.disabled=true;
+    try{
+      await fetch('/ctrader/logout',{method:'POST',credentials:'include',cache:'no-store'});
+    }catch(_){ }
+    ctraderLogoutBtn.disabled=false;
+    await refreshCTraderStatus();
+  };
 }
 
 async function refreshBinomoStatus(){
@@ -14617,7 +15278,15 @@ async function sig(announce=false){
       : 'Preparando entrada';
 
     statusBox.textContent=cur.status||'MONITORANDO';
-    risk.textContent='Risco: '+(cur.risk||'--');
+    const learn=cur&&cur.adaptive_learning;
+    if(learn && learn.enabled){
+      const learnTxt=learn.active
+        ? ` • Aprendizado: ATIVO ${Number(learn.samples||0)} ops • mínimo ${Number(learn.required_confidence||0).toFixed(0)}%`
+        : ` • Aprendizado: coletando ${Number(learn.samples||0)}/${Number((adaptiveLearningSummary&&adaptiveLearningSummary.min_symbol_samples)||20)}`;
+      risk.textContent='Risco: '+(cur.risk||'--')+learnTxt;
+    }else{
+      risk.textContent='Risco: '+(cur.risk||'--');
+    }
     if(dataFeedText){
       const src=String(cur.feed_label||cur.feed_source||'MULTIFONTE').replaceAll('_',' ');
       const fb=cur.feed_fallback===true?' • FALLBACK ATIVO':'';
@@ -15196,6 +15865,19 @@ async function resultCheck(){
   }
 }
 
+if(adaptiveLearningBtn){
+  adaptiveLearningBtn.onclick=async()=>{
+    adaptiveLearningEnabled=!adaptiveLearningEnabled;
+    try{localStorage.setItem('mega_adaptive_learning',adaptiveLearningEnabled?'ON':'OFF');}catch(_){}
+    renderAdaptiveLearningState();
+    await syncAdaptiveLearning(true);
+    // Limpa cache visual para a próxima análise já respeitar o novo estado.
+    cur=null;
+    lastSignalVoice='';
+    if(appEnabled) await Promise.allSettled([sig(false),rad()]);
+  };
+}
+
 if(btcOnlyBtn){
   btcOnlyBtn.onclick=async()=>{
     if(!btcOnlyEnabled && S && S.value && S.value!=='BTC/USD'){
@@ -15247,6 +15929,7 @@ marketMode.onchange=async()=>{
 
 S.onchange=()=>{
   try{localStorage.setItem('mega_symbol',S.value)}catch(_){}
+  renderAdaptiveLearningState();
 
   lastSignalVoice='';
   lastChartSignalVoice='';
@@ -15302,6 +15985,7 @@ async function bootApp(){
   applyAppPowerState();
   applyRobotPowerState();
   applyVoiceState();
+  renderAdaptiveLearningState();
 
   const safe=(name,fn)=>
     Promise.resolve()
@@ -15317,8 +16001,12 @@ async function bootApp(){
   safe('clock',clk);
   safe('license',lic);
   safe('account',refreshAccountStatus);
+  safe('ctrader',refreshCTraderStatus);
   safe('binomo',refreshBinomoStatus);
   safe('market-status',updateMarketNote);
+
+  // Reidrata o aprendizado do navegador antes de pedir o primeiro sinal.
+  await safe('learning',()=>syncAdaptiveLearning(false));
 
   if(market.value!=='OPEN'){
     await new Promise(r=>setTimeout(r,700));
@@ -15352,6 +16040,7 @@ setInterval(()=>{
 
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) perf(); },5000);
 setInterval(()=>{ if(!iqLoginInProgress) refreshBinomoStatus(); },10000);
+setInterval(()=>{ if(!iqLoginInProgress) refreshCTraderStatus(); },60000);
 // Radar automático: OPEN varre oportunidades e OTC lista somente ativos IQ disponíveis.
 // Um ativo é processado por ciclo. Na IA Gráfica o radar usa somente H1/H4 já
 // existentes em cache e nunca abre chamadas extras de timeframe alto. O ciclo de
