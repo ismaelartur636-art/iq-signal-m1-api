@@ -27,8 +27,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.26"
-PWA_VERSION = "v93"
+APP_VERSION = "3.27"
+PWA_VERSION = "v94"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -12486,10 +12486,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
           <div id="winG2" class="big call">0</div>
         </div>
 
-        <div class="card">
-          <div class="label">LOSS DIRETO</div>
-          <div id="lossDirect" class="big put">0</div>
-        </div>
 
         <div class="card">
           <div class="label">LOSS G2</div>
@@ -12508,7 +12504,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
 
       <div class="label" style="margin-top:10px;line-height:1.5">
-        WIN DIRETO e LOSS DIRETO mostram o que aconteceu na primeira vela.
+        WIN DIRETO mostra as operações que venceram na primeira vela.
         No placar principal, WIN G1 e WIN G2 contam como WIN; LOSS só é contado se perder até o G2.
         Cada operação é contabilizada uma única vez e o histórico fica salvo neste aparelho.
       </div>
@@ -12943,7 +12939,6 @@ const historyAnalysis=document.getElementById('historyAnalysis');
 const winDirect=document.getElementById('winDirect');
 const winG1=document.getElementById('winG1');
 const winG2=document.getElementById('winG2');
-const lossDirect=document.getElementById('lossDirect');
 const lossG2=document.getElementById('lossG2');
 const resetResultsBtn=document.getElementById('resetResultsBtn');
 const galeLastResult=document.getElementById('galeLastResult');
@@ -13729,7 +13724,6 @@ function paintPersistentResults(){
   if(winDirect) winDirect.textContent=String(b.win_direct);
   if(winG1) winG1.textContent=String(b.win_g1);
   if(winG2) winG2.textContent=String(b.win_g2);
-  if(lossDirect) lossDirect.textContent=String(b.loss_direct);
   if(lossG2) lossG2.textContent=String(b.loss_g2);
   renderMomentStudy();
   if(historyTab && historyTab.classList.contains('active')) renderHistory();
