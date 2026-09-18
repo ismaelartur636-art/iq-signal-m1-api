@@ -27,8 +27,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.15"
-PWA_VERSION = "v87"
+APP_VERSION = "3.16"
+PWA_VERSION = "v88"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -82,7 +82,7 @@ telegram_sent_cache: Dict[str, float] = {}
 
 TD_URL = "https://api.twelvedata.com/time_series"
 TD_WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
-# MEGA IA 3.15 — Crypto IDX da Binomo + trava por ativo + multifuente/multibroker.
+# MEGA IA 3.16 — Crypto IDX da Binomo + stream público de cotações + multifuente/multibroker.
 # Nenhuma destas fontes públicas é usada para fingir OTC da IQ Option.
 BINANCE_KLINES_URLS = [
     "https://api.binance.com/api/v3/klines",
@@ -104,12 +104,19 @@ BINOMO_CANDLES_URL = os.getenv("BINOMO_CANDLES_URL", "").strip()
 BINOMO_CANDLES_TOKEN = os.getenv("BINOMO_CANDLES_TOKEN", "").strip()
 BINOMO_FEED_TIMEOUT = float(os.getenv("BINOMO_FEED_TIMEOUT", "12"))
 BINOMO_EXTRA_HEADERS_JSON = os.getenv("BINOMO_EXTRA_HEADERS_JSON", "").strip()
+# Stream de cotações do Crypto IDX. É um endpoint não documentado da Binomo;
+# por isso fica isolado, com diagnóstico e fallback, e nunca é usado para
+# inventar preços quando estiver indisponível. Não usa SSID, senha ou login.
+BINOMO_QUOTE_WS_ENABLED = os.getenv("BINOMO_QUOTE_WS_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
+BINOMO_QUOTE_WS_URL = os.getenv("BINOMO_QUOTE_WS_URL", "wss://as.binomo.com/").strip() or "wss://as.binomo.com/"
+BINOMO_QUOTE_WS_FRESH_SECONDS = float(os.getenv("BINOMO_QUOTE_WS_FRESH_SECONDS", "20"))
+BINOMO_QUOTE_WS_RECONNECT_SECONDS = float(os.getenv("BINOMO_QUOTE_WS_RECONNECT_SECONDS", "5"))
 MULTIFEED_ENABLED = os.getenv("MULTIFEED_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
 PUBLIC_FEED_TIMEOUT = float(os.getenv("PUBLIC_FEED_TIMEOUT", "12"))
 PUBLIC_FEED_STALE_MAX_AGE = float(os.getenv("PUBLIC_FEED_STALE_MAX_AGE", "240"))
 PUBLIC_FEED_USER_AGENT = os.getenv(
     "PUBLIC_FEED_USER_AGENT",
-    "Mozilla/5.0 (compatible; MEGA-IA/3.15; +https://render.com)"
+    "Mozilla/5.0 (compatible; MEGA-IA/3.16; +https://render.com)"
 ).strip()
 OAI_URL = "https://api.openai.com/v1/responses"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -215,6 +222,20 @@ td_ws_prev_day_volume = {}  # SYMBOL -> (timestamp, day_volume)
 public_feed_cache: Dict[str, Any] = {}
 public_feed_locks: Dict[str, asyncio.Lock] = {}
 market_feed_status: Dict[str, Dict[str, Any]] = {}
+
+# BINOMO QUOTE STREAM — recebe somente a cotação real do Z-CRY/IDX e agrega
+# localmente em candles. O histórico começa a ser formado após o deploy; a IA
+# só usa esse stream quando já houver candles suficientes, mas o gráfico pode
+# mostrar as primeiras velas imediatamente.
+binomo_quote_ws_lock = threading.RLock()
+binomo_quote_ws_stop = threading.Event()
+binomo_quote_ws_thread = None
+binomo_quote_ws_app = None
+binomo_quote_ws_connected = False
+binomo_quote_ws_last_message_at = 0.0
+binomo_quote_ws_last_tick_at = 0.0
+binomo_quote_ws_last_error = ""
+binomo_quote_ws_bars: Dict[str, list] = {}
 
 BINANCE_SYMBOLS = {
     "BTC/USD": "BTCUSDT",
@@ -510,6 +531,179 @@ def _td_merge_rest_ws(rest_rows, ws_rows, interval: str):
     return [merged[b] for b in sorted(set(order)) if b in merged][-220:]
 
 
+def _binomo_quote_ws_update(price: float, when_utc: datetime):
+    """Agrega um tick real do Z-CRY/IDX em candles do app."""
+    global binomo_quote_ws_last_message_at, binomo_quote_ws_last_tick_at
+    try:
+        px = float(price)
+        if px <= 0:
+            return
+        ts = int(when_utc.astimezone(UTC).timestamp())
+    except Exception:
+        return
+
+    with binomo_quote_ws_lock:
+        binomo_quote_ws_last_message_at = time.time()
+        binomo_quote_ws_last_tick_at = time.time()
+        for interval_name, seconds in INTERVALS.items():
+            bucket = int(ts // int(seconds) * int(seconds))
+            key = f"{BINOMO_CRYPTO_IDX_SYMBOL}|{interval_name}"
+            rows = list(binomo_quote_ws_bars.get(key) or [])
+            dt_text = datetime.fromtimestamp(bucket, tz=UTC).isoformat()
+            if rows and int(rows[-1].get("_bucket", -1)) == bucket:
+                row = dict(rows[-1])
+                row["high"] = max(float(row.get("high", px)), px)
+                row["low"] = min(float(row.get("low", px)), px)
+                row["close"] = px
+                row["datetime"] = dt_text
+                row["feed_source"] = "BINOMO_CRYPTO_IDX_WS"
+                row["source_symbol"] = BINOMO_CRYPTO_IDX_RIC
+                rows[-1] = row
+            else:
+                rows.append({
+                    "datetime": dt_text,
+                    "open": px,
+                    "high": px,
+                    "low": px,
+                    "close": px,
+                    "volume": 0.0,
+                    "feed_source": "BINOMO_CRYPTO_IDX_WS",
+                    "source_symbol": BINOMO_CRYPTO_IDX_RIC,
+                    "_bucket": bucket,
+                })
+            binomo_quote_ws_bars[key] = rows[-240:]
+
+
+def _binomo_quote_ws_rows(interval: str, n: int = 80):
+    key = f"{BINOMO_CRYPTO_IDX_SYMBOL}|{interval}"
+    with binomo_quote_ws_lock:
+        rows = [dict(x) for x in (binomo_quote_ws_bars.get(key) or [])]
+        last_tick = float(binomo_quote_ws_last_tick_at or 0)
+        connected = bool(binomo_quote_ws_connected)
+    if not rows:
+        return []
+    # Não entrega stream abandonado como se ainda estivesse online.
+    if not connected and (not last_tick or time.time() - last_tick > max(60.0, BINOMO_QUOTE_WS_FRESH_SECONDS * 3)):
+        return []
+    out = []
+    for row in rows[-max(1, int(n)):]:
+        row.pop("_bucket", None)
+        out.append(row)
+    return out
+
+
+def _binomo_quote_ws_extract(message):
+    """Extrai (preço, horário) do formato observado no stream as.binomo.com."""
+    try:
+        payload = json.loads(message) if isinstance(message, str) else message
+    except Exception:
+        return []
+    found = []
+    blocks = []
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            blocks.extend(data)
+        else:
+            blocks.append(payload)
+    elif isinstance(payload, list):
+        blocks.extend(payload)
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        assets = block.get("assets")
+        if not isinstance(assets, list):
+            continue
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            raw_price = asset.get("rate")
+            raw_time = asset.get("created_at") or asset.get("createdAt") or asset.get("timestamp") or asset.get("time")
+            if raw_price is None or raw_time is None:
+                continue
+            try:
+                px = float(raw_price)
+                dt = _binomo_parse_timestamp(raw_time).astimezone(UTC)
+            except Exception:
+                continue
+            found.append((px, dt))
+    return found
+
+
+def _binomo_quote_ws_run():
+    global binomo_quote_ws_app, binomo_quote_ws_connected
+    global binomo_quote_ws_last_message_at, binomo_quote_ws_last_error
+    if websocket is None:
+        binomo_quote_ws_last_error = "websocket-client não instalado"
+        return
+
+    while not binomo_quote_ws_stop.is_set():
+        try:
+            def on_open(ws):
+                global binomo_quote_ws_connected, binomo_quote_ws_last_error
+                binomo_quote_ws_connected = True
+                binomo_quote_ws_last_error = ""
+                ws.send(f"subscribe:{BINOMO_CRYPTO_IDX_RIC}")
+                print(f"[BINOMO IDX WS] inscrito em {BINOMO_CRYPTO_IDX_RIC}", flush=True)
+
+            def on_message(ws, message):
+                global binomo_quote_ws_last_message_at
+                binomo_quote_ws_last_message_at = time.time()
+                for px, dt in _binomo_quote_ws_extract(message):
+                    _binomo_quote_ws_update(px, dt)
+
+            def on_error(ws, error):
+                global binomo_quote_ws_last_error
+                binomo_quote_ws_last_error = str(error)[:220]
+
+            def on_close(ws, status_code, close_msg):
+                global binomo_quote_ws_connected, binomo_quote_ws_last_error
+                binomo_quote_ws_connected = False
+                if close_msg:
+                    binomo_quote_ws_last_error = f"close {status_code}: {close_msg}"[:220]
+
+            app_ws = websocket.WebSocketApp(
+                BINOMO_QUOTE_WS_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            binomo_quote_ws_app = app_ws
+            app_ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as exc:
+            binomo_quote_ws_last_error = str(exc)[:220]
+        finally:
+            binomo_quote_ws_connected = False
+            binomo_quote_ws_app = None
+        if not binomo_quote_ws_stop.wait(max(1.0, BINOMO_QUOTE_WS_RECONNECT_SECONDS)):
+            continue
+
+
+def ensure_binomo_quote_ws_started():
+    global binomo_quote_ws_thread
+    if not BINOMO_QUOTE_WS_ENABLED or websocket is None:
+        return False
+    with binomo_quote_ws_lock:
+        if binomo_quote_ws_thread and binomo_quote_ws_thread.is_alive():
+            return True
+        binomo_quote_ws_stop.clear()
+        binomo_quote_ws_thread = threading.Thread(target=_binomo_quote_ws_run, name="binomo-crypto-idx-ws", daemon=True)
+        binomo_quote_ws_thread.start()
+        return True
+
+
+def _binomo_quote_ws_stop_now():
+    binomo_quote_ws_stop.set()
+    app_ws = binomo_quote_ws_app
+    try:
+        if app_ws:
+            app_ws.close()
+    except Exception:
+        pass
+
+
 @app.on_event("startup")
 async def _start_twelve_data_websocket():
     if ensure_td_ws_started():
@@ -517,11 +711,16 @@ async def _start_twelve_data_websocket():
     elif TD_WS_ENABLED:
         reason = "chave ausente" if not TD_KEY else "websocket-client indisponível"
         print(f"[TD WS] não iniciado: {reason}", flush=True)
+    if ensure_binomo_quote_ws_started():
+        print(f"[BINOMO IDX WS] stream iniciado • {BINOMO_CRYPTO_IDX_RIC}", flush=True)
+    elif BINOMO_QUOTE_WS_ENABLED:
+        print("[BINOMO IDX WS] não iniciado: websocket-client indisponível", flush=True)
 
 
 @app.on_event("shutdown")
 async def _stop_twelve_data_websocket():
     _td_ws_stop_now()
+    _binomo_quote_ws_stop_now()
 
 # IQ OPTION — implementação reconstruída do zero.
 # O login é feito somente pelo painel; não há credenciais IQ no Render.
@@ -3934,6 +4133,8 @@ def _feed_source_from_rows(rows) -> str:
         return "BINANCE_PUBLIC"
     if src.startswith("YAHOO"):
         return "YAHOO_PUBLIC"
+    if src.startswith("BINOMO_CRYPTO_IDX_WS"):
+        return "BINOMO_CRYPTO_IDX_WS"
     if src.startswith("BINOMO"):
         return "BINOMO_CRYPTO_IDX"
     if "OTC" in src or src.startswith("IQ_OPTION"):
@@ -3949,6 +4150,7 @@ def _feed_source_label(source: str) -> str:
         "BINANCE_PUBLIC": "BINANCE PÚBLICA",
         "YAHOO_PUBLIC": "YAHOO PÚBLICO",
         "BINOMO_CRYPTO_IDX": "BINOMO • CRYPTO IDX",
+        "BINOMO_CRYPTO_IDX_WS": "BINOMO • CRYPTO IDX • AO VIVO",
         "IQ_OPTION_OPEN": "IQ OPTION • ABERTO",
         "IQ_OPTION_OTC": "IQ OPTION • OTC",
     }
@@ -4308,6 +4510,11 @@ async def _binomo_crypto_idx_candles(symbol: str, interval: str, n: int = 80):
     if str(symbol).upper() != BINOMO_CRYPTO_IDX_SYMBOL:
         raise RuntimeError("Feed Binomo reservado ao Crypto IDX.")
     errors = []
+    live_rows = _binomo_quote_ws_rows(interval, n) if BINOMO_QUOTE_WS_ENABLED else []
+    if len(live_rows) >= min(20, int(n)):
+        return _tag_feed_rows(live_rows[-int(n):], "BINOMO_CRYPTO_IDX_WS", BINOMO_CRYPTO_IDX_RIC)
+    if live_rows:
+        errors.append(f"stream ao vivo aquecendo histórico ({len(live_rows)}/20 candles)")
     if BINOMO_DIRECT_REST_ENABLED:
         try:
             rows = await _binomo_direct_rest_candles(symbol, interval, n)
@@ -7948,7 +8155,13 @@ async def binomo_feed_status():
         (time.time() - float(v.get("last_success_ts", 0) or 0)) < 300
         for v in active.values() if isinstance(v, dict)
     )
-    connector_ready = bool(BINOMO_DIRECT_REST_ENABLED or BINOMO_CANDLES_URL)
+    with binomo_quote_ws_lock:
+        ws_connected = bool(binomo_quote_ws_connected)
+        ws_last_tick_age = (round(max(0.0, time.time() - binomo_quote_ws_last_tick_at), 1) if binomo_quote_ws_last_tick_at else None)
+        ws_last_error = binomo_quote_ws_last_error
+        ws_counts = {k: len(v) for k, v in binomo_quote_ws_bars.items() if k.startswith(BINOMO_CRYPTO_IDX_SYMBOL + "|")}
+    connector_ready = bool(BINOMO_QUOTE_WS_ENABLED or BINOMO_DIRECT_REST_ENABLED or BINOMO_CANDLES_URL)
+    recent_success = recent_success or (ws_connected and ws_last_tick_age is not None and ws_last_tick_age <= BINOMO_QUOTE_WS_FRESH_SECONDS)
     return {
         "ok": True,
         "configured": connector_ready,
@@ -7956,14 +8169,20 @@ async def binomo_feed_status():
         "asset": BINOMO_CRYPTO_IDX_SYMBOL,
         "ric": BINOMO_CRYPTO_IDX_RIC,
         "mode": "BINOMO_ONLY",
+        "quote_ws_enabled": bool(BINOMO_QUOTE_WS_ENABLED),
+        "quote_ws_connected": ws_connected,
+        "quote_ws_url": BINOMO_QUOTE_WS_URL,
+        "quote_ws_last_tick_age_seconds": ws_last_tick_age,
+        "quote_ws_last_error": ws_last_error,
+        "quote_ws_candles": ws_counts,
         "direct_rest_enabled": bool(BINOMO_DIRECT_REST_ENABLED),
         "bridge_configured": bool(BINOMO_CANDLES_URL),
         "status": ("ONLINE" if recent_success else "PRONTO PARA TESTE" if connector_ready else "AGUARDANDO FONTE BINOMO"),
         "active_series": active,
         "message": (
-            "Crypto IDX recebendo candles reais da Binomo."
+            "Crypto IDX recebendo cotações reais da Binomo e montando candles ao vivo."
             if recent_success else
-            "Conector Binomo pronto; selecione Crypto IDX para testar a rota direta."
+            "Conector Binomo pronto; aguardando a primeira cotação do Crypto IDX."
             if connector_ready else
             "Configure um conector Binomo. O app não substitui Crypto IDX por Binance/Twelve/Yahoo."
         ),
@@ -8018,9 +8237,12 @@ async def feed_status():
             "forex_order": (["TWELVE_DATA", "YAHOO_PUBLIC"] if TD_KEY else ["YAHOO_PUBLIC"]),
             "crypto_idx_order": ["BINOMO_ONLY"],
             "binomo_crypto_idx": {
-                "configured": bool(BINOMO_DIRECT_REST_ENABLED or BINOMO_CANDLES_URL),
+                "configured": bool(BINOMO_QUOTE_WS_ENABLED or BINOMO_DIRECT_REST_ENABLED or BINOMO_CANDLES_URL),
                 "ric": BINOMO_CRYPTO_IDX_RIC,
                 "source": "BINOMO_ONLY",
+                "quote_ws_enabled": bool(BINOMO_QUOTE_WS_ENABLED),
+                "quote_ws_connected": bool(binomo_quote_ws_connected),
+                "quote_ws_last_tick_age_seconds": (round(max(0.0, time.time() - binomo_quote_ws_last_tick_at), 1) if binomo_quote_ws_last_tick_at else None),
                 "direct_rest_enabled": bool(BINOMO_DIRECT_REST_ENABLED),
                 "bridge_configured": bool(BINOMO_CANDLES_URL),
             },
@@ -8049,6 +8271,31 @@ async def candles_endpoint(
         raise HTTPException(400, "Crypto IDX não pode ser espelhado pela IQ Option; use o feed Binomo.")
 
     n = max(20, min(int(n), 150))
+
+    # Crypto IDX: o stream de cotações pode começar sem histórico. Para o gráfico
+    # entregamos as primeiras velas imediatamente; o motor de sinais continua
+    # exigindo histórico suficiente antes de liberar qualquer entrada.
+    if symbol == BINOMO_CRYPTO_IDX_SYMBOL and market == "OPEN" and not mirror_iq:
+        live_rows = _binomo_quote_ws_rows(interval, n)
+        if live_rows:
+            return {
+                "ok": True,
+                "symbol": symbol,
+                "interval": interval,
+                "market": market,
+                "candles": live_rows,
+                "status": ("OK" if len(live_rows) >= 20 else "AQUECENDO HISTÓRICO"),
+                "message": (
+                    "Crypto IDX ao vivo. Histórico suficiente para análise."
+                    if len(live_rows) >= 20 else
+                    f"Crypto IDX ao vivo. Formando histórico: {len(live_rows)}/20 candles para liberar análise."
+                ),
+                "feed_source": "BINOMO_CRYPTO_IDX_WS",
+                "feed_label": _feed_source_label("BINOMO_CRYPTO_IDX_WS"),
+                "feed_fallback": False,
+                "source_symbol": BINOMO_CRYPTO_IDX_RIC,
+                "warming_up": len(live_rows) < 20,
+            }
 
     # Espelho do gráfico da IQ Option: sem sessão IQ, o gráfico fica OFFLINE.
     if mirror_iq:
@@ -8139,10 +8386,12 @@ async def candles_endpoint(
         stale = []
 
         if market == "OPEN":
+            if symbol == BINOMO_CRYPTO_IDX_SYMBOL:
+                stale = _binomo_quote_ws_rows(interval, n)
             item = public_feed_cache.get(f"{symbol}|{interval}")
             if item:
                 stale = item[1][-n:]
-            else:
+            elif not stale:
                 item = td_candle_cache.get(f"{symbol}|{interval}")
                 if item:
                     stale = item[1][-n:]
