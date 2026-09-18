@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.32"
-PWA_VERSION = "v99"
+APP_VERSION = "3.33"
+PWA_VERSION = "v100"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -8816,21 +8816,23 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
     to_ms = int(time.time() * 1000)
     count = max(20, min(int(n), 150))
 
-    min_lookback = {
-        "1min": 3 * 24 * 3600,
-        "5min": 7 * 24 * 3600,
-        "15min": 14 * 24 * 3600,
-        "30min": 30 * 24 * 3600,
-        "1h": 60 * 24 * 3600,
-        "4h": 180 * 24 * 3600,
-    }.get(interval, 7 * 24 * 3600)
-    multiplier = 10 if interval == "1min" else (6 if interval in ("5min", "15min") else 4)
-    lookback_seconds = max(seconds * count * multiplier, min_lookback)
-    from_ms = max(0, to_ms - int(lookback_seconds * 1000))
+    # MEGA IA 3.33 — buscar a CAUDA do mercado primeiro.
+    # A janela anterior era muito ampla; em alguns backends/brokers o limite de
+    # registros podia devolver um bloco antigo mesmo com toTimestamp atual.
+    # Agora pedimos uma janela curta terminando em AGORA e NÃO enviamos `count`
+    # na primeira tentativa. Depois recortamos localmente os últimos N candles.
+    # Isso preserva a barra mais recente e evita aceitar histórico velho como live.
+    buffer_bars = {
+        "1min": 30,
+        "5min": 24,
+        "15min": 16,
+        "30min": 12,
+        "1h": 72,   # cobre fim de semana sem abrir uma janela enorme
+        "4h": 18,
+    }.get(interval, 20)
+    primary_window_seconds = max(seconds * (count + buffer_bars), seconds * 30)
+    from_ms = max(0, to_ms - int(primary_window_seconds * 1000))
 
-    # MEGA IA 3.32 — compatibilidade do enum no JSON da Open API.
-    # O formato protobuf/JSON normalmente usa o nome do enum ("M1"), porém
-    # alguns parsers também aceitam o número (1). Tentamos ambos.
     attempts = [
         ("name", _ctrader_period_name(interval)),
         ("number", _ctrader_period(interval)),
@@ -8839,11 +8841,33 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
     bars = []
     attempt_debug = []
 
+    def _bars_debug(rows):
+        rows = rows if isinstance(rows, list) else []
+        stamps = []
+        for b in rows:
+            if not isinstance(b, dict):
+                continue
+            try:
+                m = int(b.get("utcTimestampInMinutes") or 0)
+                if m > 0:
+                    stamps.append(m * 60)
+            except Exception:
+                pass
+        latest = max(stamps) if stamps else 0
+        earliest = min(stamps) if stamps else 0
+        return {
+            "bars": len(rows),
+            "earliest_utc": datetime.fromtimestamp(earliest, tz=UTC).isoformat() if earliest else None,
+            "latest_utc": datetime.fromtimestamp(latest, tz=UTC).isoformat() if latest else None,
+            "latest_age_seconds": round(max(0.0, time.time() - latest), 1) if latest else None,
+        }
+
     ws = _ctrader_open_socket(is_live)
     try:
         _ctrader_application_auth(ws)
         _ctrader_account_auth(ws, token, account_id)
 
+        # 1) Janela curta e recente, sem count. É a tentativa preferida.
         for fmt, period_value in attempts:
             payload = {
                 "ctidTraderAccountId": account_id,
@@ -8851,31 +8875,73 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
                 "toTimestamp": to_ms,
                 "period": period_value,
                 "symbolId": symbol_id,
-                "count": count,
             }
             try:
                 body = _ctrader_send_wait(
                     ws, 2137, payload, 2138,
                     timeout=max(CTRADER_DATA_TIMEOUT, 15),
                 )
-                bars = body.get("trendbar") or body.get("trendbars") or []
-                attempt_debug.append({
+                candidate = body.get("trendbar") or body.get("trendbars") or []
+                dbg = _bars_debug(candidate)
+                dbg.update({
+                    "mode": "recent_window_no_count",
                     "format": fmt,
                     "period": str(period_value),
-                    "bars": len(bars) if isinstance(bars, list) else 0,
                     "response_period": body.get("period"),
                     "response_symbol_id": body.get("symbolId"),
                     "has_more": body.get("hasMore"),
-                    "keys": sorted(str(k) for k in body.keys())[:20],
                 })
-                if bars:
+                attempt_debug.append(dbg)
+                if candidate:
+                    bars = candidate
                     break
             except Exception as exc:
                 attempt_debug.append({
+                    "mode": "recent_window_no_count",
                     "format": fmt,
                     "period": str(period_value),
                     "error": str(exc)[:180],
                 })
+
+        # 2) Só se a janela curta não trouxer nada, amplia progressivamente.
+        # Ainda sem `count`, para não correr o risco de receber o início da janela.
+        if not bars:
+            for factor in (4, 12):
+                expanded_from_ms = max(0, to_ms - int(primary_window_seconds * factor * 1000))
+                period_value = _ctrader_period_name(interval)
+                payload = {
+                    "ctidTraderAccountId": account_id,
+                    "fromTimestamp": expanded_from_ms,
+                    "toTimestamp": to_ms,
+                    "period": period_value,
+                    "symbolId": symbol_id,
+                }
+                try:
+                    body = _ctrader_send_wait(
+                        ws, 2137, payload, 2138,
+                        timeout=max(CTRADER_DATA_TIMEOUT, 15),
+                    )
+                    candidate = body.get("trendbar") or body.get("trendbars") or []
+                    dbg = _bars_debug(candidate)
+                    dbg.update({
+                        "mode": f"expanded_x{factor}",
+                        "format": "name",
+                        "period": str(period_value),
+                        "from_ms": expanded_from_ms,
+                        "has_more": body.get("hasMore"),
+                    })
+                    attempt_debug.append(dbg)
+                    if candidate:
+                        bars = candidate
+                        from_ms = expanded_from_ms
+                        break
+                except Exception as exc:
+                    attempt_debug.append({
+                        "mode": f"expanded_x{factor}",
+                        "format": "name",
+                        "period": str(period_value),
+                        "error": str(exc)[:180],
+                    })
     finally:
         try:
             ws.close()
@@ -8892,8 +8958,8 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
         "interval": interval,
         "from_ms": from_ms,
         "to_ms": to_ms,
-        "count": count,
-        "attempts": attempt_debug[-4:],
+        "requested_bars": count,
+        "attempts": attempt_debug[-6:],
     }
 
     rows = []
@@ -8924,6 +8990,15 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
             continue
 
     rows.sort(key=lambda x: str(x.get("datetime") or ""))
+    if rows:
+        try:
+            latest_dt = parse_dt(str(rows[-1].get("datetime") or ""))
+            latest_age = max(0.0, (datetime.now(tz=UTC) - latest_dt.astimezone(UTC)).total_seconds())
+            item["last_trendbar_debug"]["parsed_rows"] = len(rows)
+            item["last_trendbar_debug"]["latest_candle_utc"] = latest_dt.astimezone(UTC).isoformat()
+            item["last_trendbar_debug"]["latest_age_seconds"] = round(latest_age, 1)
+        except Exception:
+            pass
     if not rows:
         details = "; ".join(
             f"{x.get('format')}={x.get('bars', 0)}"
