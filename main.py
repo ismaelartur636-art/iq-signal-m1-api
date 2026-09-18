@@ -27,7 +27,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse
 
-APP_VERSION = "3.19"
+APP_VERSION = "3.20"
 PWA_VERSION = "v88"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -7802,20 +7802,20 @@ async def mega_ia_icon_192():
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = {
-        "id": "/mega-ia-trader-v64",
+        "id": "/mega-ia-trader-v76",
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v64",
+        "start_url": "/?pwa=v76",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=66", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=66", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=66", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=76", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=76", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=76", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -10820,9 +10820,9 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=66">
-<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=66">
-<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=66">
+<link rel="manifest" href="/manifest.webmanifest?v=76">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=76">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=76">
 <meta name="theme-color" content="#07182b">
 <meta name="application-name" content="Mega IA Trader">
 <meta name="apple-mobile-web-app-title" content="Mega IA Trader">
@@ -10978,7 +10978,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • Modo BTC/USD exclusivo</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • BTC/USD • Gráfico fluido</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -11682,6 +11682,20 @@ const clock=document.getElementById('clock');
 const expiryCountdown=document.getElementById('expiryCountdown');
 const chartCanvas=document.getElementById('priceChart');
 const chartCtx=chartCanvas.getContext('2d');
+
+// Gráfico fluido: a câmera acompanha o preço sem prender a vela no canto/centro.
+// A animação só roda quando há mudança real nos candles, reduzindo trabalho no celular.
+let chartRenderData=[];
+let chartAnimationFrame=0;
+let chartLastFingerprint='';
+let chartLastCandleKey='';
+let chartScrollShift=0;
+let chartDisplayLo=null;
+let chartDisplayHi=null;
+let chartDisplayLastClose=null;
+let chartTargetLastClose=null;
+let chartLastFrameAt=0;
+
 
 // Restaura preferências somente depois que todos os elementos/estados existem.
 try{
@@ -13141,207 +13155,265 @@ function resizeChart(){
   chartCanvas.height=Math.max(1,r.height*d);
   chartCtx.setTransform(d,0,0,d,0,0);
 
-  if(chartData.length) drawChart(chartData);
+  if(chartData.length) drawChart(chartData,true);
 }
 
-function drawChart(a){
+function drawChart(a,force=false){
+  const data=Array.isArray(a)?a:[];
   const w=chartCanvas.clientWidth;
   const h=chartCanvas.clientHeight;
 
-  chartCtx.clearRect(0,0,w,h);
-
-  if(!a.length) return;
-
-  const pad={l:55,r:12,t:18,b:28};
-  const cw=w-pad.l-pad.r;
-  const ch=h-pad.t-pad.b;
-
-  /*
-    VELA ATUAL SEMPRE NO CENTRO:
-    - a última vela recebida é considerada a vela atual/em formação;
-    - ela fica fixa exatamente no meio horizontal do gráfico;
-    - candles antigos caminham somente para a esquerda;
-    - a metade direita fica livre para o movimento futuro.
-  */
-  const currentIndex=a.length-1;
-  const centerX=pad.l+(cw/2);
-
-  // Quantidade aproximada de candles históricos visíveis na metade esquerda.
-  // Em telas pequenas mantém boa leitura sem tirar a vela atual do centro.
-  const visiblePast=Math.max(18,Math.min(36,a.length-1));
-  const candleSpacing=(cw/2)/Math.max(1,visiblePast);
-  const candleWidth=Math.max(2,Math.min(8,candleSpacing*.68));
-
-  // Escala vertical considera principalmente os candles que realmente aparecem.
-  const firstVisible=Math.max(0,currentIndex-visiblePast);
-  const visible=a.slice(firstVisible);
-
-  let lo=Math.min(...visible.map(c=>Number(c.low)));
-  let hi=Math.max(...visible.map(c=>Number(c.high)));
-  const extra=(hi-lo)*.08||1;
-
-  lo-=extra;
-  hi+=extra;
-
-  const px=i=>centerX-((currentIndex-i)*candleSpacing);
-  const py=v=>pad.t+(hi-v)/(hi-lo)*ch;
-
-  chartCtx.strokeStyle='#19304a';
-  chartCtx.lineWidth=1;
-  chartCtx.font='11px Arial';
-  chartCtx.fillStyle='#8190a8';
-
-  // Linhas horizontais de preço
-  for(let j=0;j<5;j++){
-    const y=pad.t+j*ch/4;
-    chartCtx.beginPath();
-    chartCtx.moveTo(pad.l,y);
-    chartCtx.lineTo(w-pad.r,y);
-    chartCtx.stroke();
-
-    const v=hi-(hi-lo)*j/4;
-    chartCtx.fillText(v.toFixed(5),4,y+4);
+  if(!data.length){
+    if(chartAnimationFrame){
+      cancelAnimationFrame(chartAnimationFrame);
+      chartAnimationFrame=0;
+    }
+    chartRenderData=[];
+    chartLastFingerprint='';
+    chartLastCandleKey='';
+    chartDisplayLo=null;
+    chartDisplayHi=null;
+    chartDisplayLastClose=null;
+    chartTargetLastClose=null;
+    chartCtx.clearRect(0,0,w,h);
+    return;
   }
 
-  // Linha vertical fixa indicando onde SEMPRE fica a vela atual.
-  chartCtx.save();
-  chartCtx.strokeStyle='#6b86a8';
-  chartCtx.lineWidth=1;
-  chartCtx.setLineDash([5,5]);
-  chartCtx.beginPath();
-  chartCtx.moveTo(centerX,pad.t);
-  chartCtx.lineTo(centerX,h-pad.b);
-  chartCtx.stroke();
-  chartCtx.setLineDash([]);
+  const last=data[data.length-1]||{};
+  const preKey=chartPreSignal&&chartPreSignal.active
+    ? String(chartPreSignal.direction||'')+'|'+String(chartPreSignal.entry_time||'')
+    : '';
+  const curKey=cur&&cur.direction&&cur.direction!=='NEUTRO'
+    ? String(cur.direction)+'|'+String(cur.reference_candle||'')
+    : '';
+  const fingerprint=[
+    data.length,
+    candleTimeKey(last),
+    Number(last.open||0),Number(last.high||0),Number(last.low||0),Number(last.close||0),
+    preKey,curKey,w,h
+  ].join('|');
 
-  chartCtx.font='bold 10px Arial';
-  chartCtx.textAlign='center';
-  chartCtx.fillStyle='#a8bbd3';
-  chartCtx.fillText('VELA ATUAL',centerX,pad.t+11);
-  chartCtx.restore();
+  // Sem mudança real, não redesenha o canvas inteiro a cada polling.
+  if(!force && fingerprint===chartLastFingerprint) return;
+  chartLastFingerprint=fingerprint;
+  chartRenderData=data;
 
-  // Desenha somente candles que cabem dentro da área visível.
-  a.forEach((c,i)=>{
-    const x=px(i);
+  const newLastKey=candleTimeKey(last);
+  const isNewCandle=!!chartLastCandleKey && newLastKey!==chartLastCandleKey;
+  chartLastCandleKey=newLastKey;
 
-    if(x < pad.l-candleWidth || x > w-pad.r+candleWidth){
-      return;
-    }
+  const pad={l:54,r:16,t:18,b:30};
+  const cw=Math.max(1,w-pad.l-pad.r);
+  const ch=Math.max(1,h-pad.t-pad.b);
 
-    const o=Number(c.open);
-    const cl=Number(c.close);
-    const hh=Number(c.high);
-    const ll=Number(c.low);
-    const up=cl>=o;
+  // Usa a maior parte da tela para candles e deixa uma folga real depois da vela atual.
+  const visibleCount=Math.max(22,Math.min(46,Math.floor(cw/8.5)));
+  const usableWidth=cw*.80;
+  const spacing=Math.max(5.2,usableWidth/Math.max(1,visibleCount-1));
+  const latestX=pad.l+cw*.78;
 
-    chartCtx.strokeStyle=up?'#45ff9b':'#ff5c7a';
-    chartCtx.fillStyle=up?'#45ff9b':'#ff5c7a';
-
-    chartCtx.beginPath();
-    chartCtx.moveTo(x,py(hh));
-    chartCtx.lineTo(x,py(ll));
-    chartCtx.stroke();
-
-    const top=py(Math.max(o,cl));
-    const bot=py(Math.min(o,cl));
-
-    chartCtx.fillRect(
-      x-candleWidth/2,
-      top,
-      candleWidth,
-      Math.max(1,bot-top)
-    );
-
-    // Horários espaçados para não sobrepor texto.
-    const relative=currentIndex-i;
-    const labelEvery=Math.max(4,Math.round(visiblePast/5));
-
-    if(relative%labelEvery===0){
-      chartCtx.fillStyle='#8190a8';
-      chartCtx.font='10px Arial';
-      chartCtx.textAlign='center';
-      chartCtx.fillText(
-        new Date(c.datetime).toLocaleTimeString(
-          'pt-BR',
-          {hour:'2-digit',minute:'2-digit'}
-        ),
-        x,
-        h-7
-      );
-    }
-  });
-
-  // Reforça visualmente a vela atual no centro, sem mover a posição dela.
-  const current=a[currentIndex];
-  if(current){
-    const currentClose=Number(current.close);
-
-    chartCtx.save();
-    chartCtx.fillStyle='#d7e7fb';
-    chartCtx.font='bold 10px Arial';
-    chartCtx.textAlign='left';
-    chartCtx.fillText(
-      Number.isFinite(currentClose) ? currentClose.toFixed(5) : '',
-      Math.min(w-pad.r-48,centerX+7),
-      Math.max(pad.t+22,Math.min(h-pad.b-5,py(currentClose)-6))
-    );
-    chartCtx.restore();
+  if(isNewCandle){
+    // A nova vela nasce à direita e desliza suavemente para a posição de acompanhamento.
+    chartScrollShift=Math.min(spacing,Math.max(5,spacing));
   }
 
-  // BOLINHA = SINAL DE ENTRADA — MERCADO ABERTO E OTC:
-  // aparece somente após 3 leituras consecutivas na mesma direção;
-  // a confirmação ocorre dentro dos últimos 20s da vela atual;
-  // depois de uma bolinha, outra só pode ser liberada após 3 minutos.
-  if(chartPreSignal && chartPreSignal.active &&
-     (chartPreSignal.direction==='CALL' || chartPreSignal.direction==='PUT')){
+  const currentIndex=data.length-1;
+  const firstVisible=Math.max(0,currentIndex-visibleCount+1);
+  const visible=data.slice(firstVisible,currentIndex+1);
 
-    const idx=currentIndex;
-    const x=px(idx);
-    const dir=chartPreSignal.direction;
-    const v=dir==='CALL'
-      ? Number(a[idx].low)
-      : Number(a[idx].high);
+  let targetLo=Math.min(...visible.map(c=>Number(c.low)).filter(Number.isFinite));
+  let targetHi=Math.max(...visible.map(c=>Number(c.high)).filter(Number.isFinite));
+  if(!Number.isFinite(targetLo)||!Number.isFinite(targetHi)) return;
+  if(targetHi<=targetLo){
+    targetHi=targetLo+1;
+  }
+  const range=targetHi-targetLo;
+  const verticalMargin=range*.12 || Math.max(Math.abs(targetHi)*.0005,1e-6);
+  targetLo-=verticalMargin;
+  targetHi+=verticalMargin;
 
+  if(chartDisplayLo===null||chartDisplayHi===null||force){
+    chartDisplayLo=targetLo;
+    chartDisplayHi=targetHi;
+  }
+
+  const rawLastClose=Number(last.close);
+  if(chartDisplayLastClose===null||!Number.isFinite(chartDisplayLastClose)||isNewCandle||force){
+    const seed=Number(last.open);
+    chartDisplayLastClose=Number.isFinite(seed)?seed:rawLastClose;
+  }
+  chartTargetLastClose=Number.isFinite(rawLastClose)?rawLastClose:chartDisplayLastClose;
+
+  if(chartAnimationFrame){
+    cancelAnimationFrame(chartAnimationFrame);
+    chartAnimationFrame=0;
+  }
+  chartLastFrameAt=performance.now();
+
+  function renderFrame(ts){
+    const dt=Math.max(1,Math.min(50,ts-chartLastFrameAt||16));
+    chartLastFrameAt=ts;
+
+    // Interpolação dependente do tempo: suave em aparelhos rápidos ou lentos.
+    const scaleEase=1-Math.pow(.78,dt/16.67);
+    const priceEase=1-Math.pow(.70,dt/16.67);
+    const scrollEase=1-Math.pow(.72,dt/16.67);
+
+    chartDisplayLo += (targetLo-chartDisplayLo)*scaleEase;
+    chartDisplayHi += (targetHi-chartDisplayHi)*scaleEase;
+    if(Number.isFinite(chartTargetLastClose)){
+      chartDisplayLastClose += (chartTargetLastClose-chartDisplayLastClose)*priceEase;
+    }
+    chartScrollShift += (0-chartScrollShift)*scrollEase;
+
+    const lo=chartDisplayLo;
+    const hi=chartDisplayHi;
+    const safeRange=Math.max(1e-12,hi-lo);
+    const px=i=>latestX-((currentIndex-i)*spacing)+chartScrollShift;
+    const py=v=>pad.t+(hi-v)/safeRange*ch;
+
+    chartCtx.clearRect(0,0,w,h);
+    chartCtx.strokeStyle='#19304a';
+    chartCtx.lineWidth=1;
+    chartCtx.font='11px Arial';
+    chartCtx.fillStyle='#8190a8';
+
+    // Grade e preços. A escala anda suavemente, sem saltar a cada atualização.
+    for(let j=0;j<5;j++){
+      const y=pad.t+j*ch/4;
+      chartCtx.beginPath();
+      chartCtx.moveTo(pad.l,y);
+      chartCtx.lineTo(w-pad.r,y);
+      chartCtx.stroke();
+      const v=hi-safeRange*j/4;
+      const decimals=Math.abs(v)>=1000?2:Math.abs(v)>=10?3:5;
+      chartCtx.fillText(v.toFixed(decimals),4,y+4);
+    }
+
+    // Área de acompanhamento da vela atual: fica perto da direita, mas nunca colada no canto.
     chartCtx.save();
-    chartCtx.fillStyle=dir==='CALL'?'#45ff9b':'#ff5c7a';
-    chartCtx.strokeStyle='#07111f';
-    chartCtx.lineWidth=2;
-
+    chartCtx.strokeStyle='#506a87';
+    chartCtx.globalAlpha=.55;
+    chartCtx.setLineDash([4,6]);
     chartCtx.beginPath();
-    chartCtx.arc(x,py(v),7,0,Math.PI*2);
-    chartCtx.fill();
+    chartCtx.moveTo(latestX,pad.t);
+    chartCtx.lineTo(latestX,h-pad.b);
     chartCtx.stroke();
-
-    chartCtx.font='bold 12px Arial';
-    chartCtx.textAlign='left';
-    chartCtx.fillStyle=dir==='CALL'?'#45ff9b':'#ff5c7a';
-    chartCtx.fillText(dir,x+10,py(v)-9);
-
     chartCtx.restore();
 
-  }else if(cur && cur.direction && cur.direction!=='NEUTRO' && cur.reference_candle){
-    // Mantém o marcador do sinal confirmado quando não há pré-sinal de 20s.
-    const idx=a.findIndex(c=>c.datetime===cur.reference_candle);
+    const candleWidth=Math.max(2.4,Math.min(8.5,spacing*.62));
+    const labelEvery=Math.max(4,Math.round(visibleCount/6));
 
-    if(idx>=0){
-      const x=px(idx);
+    // Só desenha o trecho realmente visível; evita percorrer 120 candles a cada quadro.
+    for(let i=firstVisible;i<=currentIndex;i++){
+      const c=data[i];
+      const x=px(i);
+      if(x<pad.l-candleWidth||x>w-pad.r+candleWidth) continue;
 
-      if(x>=pad.l && x<=w-pad.r){
-        const v=cur.direction==='CALL'
-          ? Number(a[idx].low)
-          : Number(a[idx].high);
+      const o=Number(c.open);
+      let cl=Number(c.close);
+      let hh=Number(c.high);
+      let ll=Number(c.low);
+      if(i===currentIndex && Number.isFinite(chartDisplayLastClose)){
+        cl=chartDisplayLastClose;
+        hh=Math.max(hh,o,cl);
+        ll=Math.min(ll,o,cl);
+      }
+      if(![o,cl,hh,ll].every(Number.isFinite)) continue;
 
-        chartCtx.fillStyle=cur.direction==='CALL'?'#45ff9b':'#ff5c7a';
-        chartCtx.beginPath();
-        chartCtx.arc(x,py(v),6,0,Math.PI*2);
-        chartCtx.fill();
+      const up=cl>=o;
+      chartCtx.strokeStyle=up?'#45ff9b':'#ff5c7a';
+      chartCtx.fillStyle=up?'#45ff9b':'#ff5c7a';
+      chartCtx.beginPath();
+      chartCtx.moveTo(x,py(hh));
+      chartCtx.lineTo(x,py(ll));
+      chartCtx.stroke();
 
-        chartCtx.font='bold 12px Arial';
-        chartCtx.textAlign='left';
-        chartCtx.fillText(cur.direction,x+8,py(v)-8);
+      const top=py(Math.max(o,cl));
+      const bot=py(Math.min(o,cl));
+      chartCtx.fillRect(x-candleWidth/2,top,candleWidth,Math.max(1,bot-top));
+
+      const relative=currentIndex-i;
+      if(relative%labelEvery===0){
+        chartCtx.fillStyle='#8190a8';
+        chartCtx.font='10px Arial';
+        chartCtx.textAlign='center';
+        const d=new Date(c.datetime);
+        if(!Number.isNaN(d.getTime())){
+          chartCtx.fillText(d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}),x,h-8);
+        }
       }
     }
+
+    // Etiqueta de preço atual no lado direito da vela, com espaço para respirar.
+    const current=data[currentIndex];
+    if(current && Number.isFinite(chartDisplayLastClose)){
+      const y=Math.max(pad.t+12,Math.min(h-pad.b-6,py(chartDisplayLastClose)));
+      chartCtx.save();
+      chartCtx.font='bold 10px Arial';
+      chartCtx.textAlign='left';
+      chartCtx.fillStyle='#d7e7fb';
+      const decimals=Math.abs(chartDisplayLastClose)>=1000?2:Math.abs(chartDisplayLastClose)>=10?3:5;
+      chartCtx.fillText(chartDisplayLastClose.toFixed(decimals),Math.min(w-pad.r-58,latestX+9),y-5);
+      chartCtx.restore();
+    }
+
+    // BOLINHA = sinal de entrada.
+    if(chartPreSignal && chartPreSignal.active &&
+       (chartPreSignal.direction==='CALL'||chartPreSignal.direction==='PUT')){
+      const idx=currentIndex;
+      const x=px(idx);
+      const dir=chartPreSignal.direction;
+      const v=dir==='CALL'?Number(data[idx].low):Number(data[idx].high);
+      if(Number.isFinite(v)){
+        chartCtx.save();
+        chartCtx.fillStyle=dir==='CALL'?'#45ff9b':'#ff5c7a';
+        chartCtx.strokeStyle='#07111f';
+        chartCtx.lineWidth=2;
+        chartCtx.beginPath();
+        chartCtx.arc(x,py(v),7,0,Math.PI*2);
+        chartCtx.fill();
+        chartCtx.stroke();
+        chartCtx.font='bold 12px Arial';
+        chartCtx.textAlign='left';
+        chartCtx.fillText(dir,x+10,py(v)-9);
+        chartCtx.restore();
+      }
+    }else if(cur && cur.direction && cur.direction!=='NEUTRO' && cur.reference_candle){
+      const idx=data.findIndex(c=>c.datetime===cur.reference_candle);
+      if(idx>=0){
+        const x=px(idx);
+        if(x>=pad.l&&x<=w-pad.r){
+          const v=cur.direction==='CALL'?Number(data[idx].low):Number(data[idx].high);
+          if(Number.isFinite(v)){
+            chartCtx.fillStyle=cur.direction==='CALL'?'#45ff9b':'#ff5c7a';
+            chartCtx.beginPath();
+            chartCtx.arc(x,py(v),6,0,Math.PI*2);
+            chartCtx.fill();
+            chartCtx.font='bold 12px Arial';
+            chartCtx.textAlign='left';
+            chartCtx.fillText(cur.direction,x+8,py(v)-8);
+          }
+        }
+      }
+    }
+
+    const scaleMoving=Math.abs(targetLo-chartDisplayLo)>safeRange*.001 || Math.abs(targetHi-chartDisplayHi)>safeRange*.001;
+    const priceMoving=Number.isFinite(chartTargetLastClose) && Math.abs(chartTargetLastClose-chartDisplayLastClose)>safeRange*.0004;
+    const scrollMoving=Math.abs(chartScrollShift)>.15;
+
+    if(scaleMoving||priceMoving||scrollMoving){
+      chartAnimationFrame=requestAnimationFrame(renderFrame);
+    }else{
+      chartDisplayLo=targetLo;
+      chartDisplayHi=targetHi;
+      chartDisplayLastClose=chartTargetLastClose;
+      chartScrollShift=0;
+      chartAnimationFrame=0;
+    }
   }
+
+  chartAnimationFrame=requestAnimationFrame(renderFrame);
 }
 
 function candleTimeKey(c){
@@ -15128,9 +15200,10 @@ bootApp().catch(err=>{
 
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) sig(false); },5000);
 
+// Candles são buscados em ritmo leve; o canvas faz a transição suave entre atualizações.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress && chartTab.classList.contains('active')) loadChart();
-},2000);
+},2500);
 
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) perf(); },5000);
 setInterval(()=>{ if(!iqLoginInProgress) refreshBinomoStatus(); },10000);
