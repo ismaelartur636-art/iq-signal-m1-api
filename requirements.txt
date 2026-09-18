@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 httpx
+numpy
 scikit-learn
 xgboost
 requests>=2.28
