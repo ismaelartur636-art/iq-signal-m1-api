@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.30"
-PWA_VERSION = "v97"
+APP_VERSION = "3.31"
+PWA_VERSION = "v98"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -8796,16 +8796,29 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
     to_ms = int(time.time() * 1000)
     count = max(20, min(int(n), 150))
 
-    # A documentação da cTrader permite pedir `count` para trás a partir de
-    # toTimestamp sem obrigar fromTimestamp. Isso evita rejeição por janelas
-    # históricas excessivas. Se o broker não devolver barras assim, fazemos uma
-    # segunda tentativa com uma janela proporcional ao timeframe.
+    # MEGA IA 3.31 — envia fromTimestamp + toTimestamp já na primeira chamada.
+    # Embora o campo seja opcional na referência protobuf, o fluxo oficial de
+    # trendbars usa a janela completa e alguns backends/brokers são mais
+    # consistentes assim. A folga absorve fins de semana e períodos sem ticks.
+    min_lookback = {
+        "1min": 24 * 3600,
+        "5min": 3 * 24 * 3600,
+        "15min": 7 * 24 * 3600,
+        "30min": 10 * 24 * 3600,
+        "1h": 30 * 24 * 3600,
+        "4h": 120 * 24 * 3600,
+    }.get(interval, 7 * 24 * 3600)
+    multiplier = 8 if interval == "1min" else (4 if interval in ("5min", "15min") else 3)
+    lookback_seconds = max(seconds * count * multiplier, min_lookback)
+    from_ms = max(0, to_ms - int(lookback_seconds * 1000))
+
     ws = _ctrader_open_socket(is_live)
     try:
         _ctrader_application_auth(ws)
         _ctrader_account_auth(ws, token, account_id)
         request_payload = {
             "ctidTraderAccountId": account_id,
+            "fromTimestamp": from_ms,
             "toTimestamp": to_ms,
             "period": _ctrader_period(interval),
             "symbolId": symbol_id,
@@ -8815,13 +8828,6 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
             ws, 2137, request_payload, 2138,
             timeout=max(CTRADER_DATA_TIMEOUT, 15),
         )
-        if not (body.get("trendbar") or []):
-            lookback_seconds = max(seconds * count * 4, 12 * 3600)
-            request_payload["fromTimestamp"] = to_ms - int(lookback_seconds * 1000)
-            body = _ctrader_send_wait(
-                ws, 2137, request_payload, 2138,
-                timeout=max(CTRADER_DATA_TIMEOUT, 15),
-            )
     finally:
         try:
             ws.close()
@@ -8871,12 +8877,22 @@ async def _ctrader_candles(item: Dict[str, Any], symbol: str, interval: str, n: 
             timeout=max(CTRADER_DATA_TIMEOUT * 4, 35),
         )
         ctrader_last_error = ""
+        item["last_candle_error"] = ""
+        item["last_candle_success"] = iso(now())
+        item["last_candle_symbol"] = str(symbol)
+        item["last_candle_interval"] = str(interval)
         return rows
     except asyncio.TimeoutError:
         ctrader_last_error = "cTrader demorou demais para responder aos candles."
+        item["last_candle_error"] = ctrader_last_error
+        item["last_candle_symbol"] = str(symbol)
+        item["last_candle_interval"] = str(interval)
         raise RuntimeError(ctrader_last_error)
     except Exception as exc:
         ctrader_last_error = str(exc)[:240]
+        item["last_candle_error"] = ctrader_last_error
+        item["last_candle_symbol"] = str(symbol)
+        item["last_candle_interval"] = str(interval)
         raise
 
 
@@ -9013,7 +9029,10 @@ async def ctrader_status(request: Request):
         "primary_for_open": True,
         "symbols_cached": len((item or {}).get("symbols_map") or {}),
         "accounts_cached": len((item or {}).get("accounts") or []),
-        "last_data_error": ctrader_last_error[:180],
+        "last_data_error": str((item or {}).get("last_candle_error") or ctrader_last_error)[:180],
+        "last_candle_symbol": (item or {}).get("last_candle_symbol"),
+        "last_candle_interval": (item or {}).get("last_candle_interval"),
+        "last_candle_success": (item or {}).get("last_candle_success"),
     }
 
 
@@ -15321,7 +15340,7 @@ async function loadChart(){
 
     let chartSourceLabel='MERCADO ABERTO • '+String(d.feed_label||d.feed_source||'MULTIFONTE').replaceAll('_',' ');
     if(openMode && ctraderConnected && String(d.feed_source||'').toUpperCase()!=='CTRADER_OPEN' && S.value!=='CRYPTO IDX')
-      chartSourceLabel='⚠️ '+chartSourceLabel+' • cTrader não forneceu este ativo';
+      chartSourceLabel='⚠️ '+chartSourceLabel+' • cTrader conectada, candles indisponíveis';
     if(useIqMirror && !openMode) chartSourceLabel='IQ OPTION • OTC';
     else if(!openMode) chartSourceLabel=brokerName()+' • OTC';
 
