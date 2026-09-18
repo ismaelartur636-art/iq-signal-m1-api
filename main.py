@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.31"
-PWA_VERSION = "v98"
+APP_VERSION = "3.32"
+PWA_VERSION = "v99"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -8767,15 +8767,35 @@ def _ctrader_period(interval: str) -> int:
     return periods[interval]
 
 
+def _ctrader_period_name(interval: str) -> str:
+    periods = {"1min": "M1", "5min": "M5", "15min": "M15", "30min": "M30", "1h": "H1", "4h": "H4"}
+    if interval not in periods:
+        raise RuntimeError("Intervalo não suportado pela fonte cTrader.")
+    return periods[interval]
+
+
 def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, n: int) -> list:
     catalog = _ctrader_refresh_catalog_blocking(item, False)
     symbol_map = catalog.get("symbols_map") or {}
     entry = symbol_map.get(str(symbol or "").upper())
     if not entry:
-        # Tenta também casar pelo nome bruto, útil para símbolos com sufixos.
         target = str(symbol or "").strip().upper()
+        target_compact = re.sub(r"[^A-Z0-9]", "", target)
         for cand in symbol_map.values():
-            if str(cand.get("raw_symbol") or "").strip().upper() == target:
+            if not isinstance(cand, dict):
+                continue
+            display = str(cand.get("symbol") or "").strip().upper()
+            raw = str(cand.get("raw_symbol") or "").strip().upper()
+            display_compact = re.sub(r"[^A-Z0-9]", "", display)
+            raw_compact = re.sub(r"[^A-Z0-9]", "", raw)
+            if target in (display, raw) or (
+                target_compact and (
+                    target_compact == display_compact
+                    or target_compact == raw_compact
+                    or raw_compact.startswith(target_compact)
+                    or display_compact.startswith(target_compact)
+                )
+            ):
                 entry = cand
                 break
     if not entry:
@@ -8796,46 +8816,88 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
     to_ms = int(time.time() * 1000)
     count = max(20, min(int(n), 150))
 
-    # MEGA IA 3.31 — envia fromTimestamp + toTimestamp já na primeira chamada.
-    # Embora o campo seja opcional na referência protobuf, o fluxo oficial de
-    # trendbars usa a janela completa e alguns backends/brokers são mais
-    # consistentes assim. A folga absorve fins de semana e períodos sem ticks.
     min_lookback = {
-        "1min": 24 * 3600,
-        "5min": 3 * 24 * 3600,
-        "15min": 7 * 24 * 3600,
-        "30min": 10 * 24 * 3600,
-        "1h": 30 * 24 * 3600,
-        "4h": 120 * 24 * 3600,
+        "1min": 3 * 24 * 3600,
+        "5min": 7 * 24 * 3600,
+        "15min": 14 * 24 * 3600,
+        "30min": 30 * 24 * 3600,
+        "1h": 60 * 24 * 3600,
+        "4h": 180 * 24 * 3600,
     }.get(interval, 7 * 24 * 3600)
-    multiplier = 8 if interval == "1min" else (4 if interval in ("5min", "15min") else 3)
+    multiplier = 10 if interval == "1min" else (6 if interval in ("5min", "15min") else 4)
     lookback_seconds = max(seconds * count * multiplier, min_lookback)
     from_ms = max(0, to_ms - int(lookback_seconds * 1000))
+
+    # MEGA IA 3.32 — compatibilidade do enum no JSON da Open API.
+    # O formato protobuf/JSON normalmente usa o nome do enum ("M1"), porém
+    # alguns parsers também aceitam o número (1). Tentamos ambos.
+    attempts = [
+        ("name", _ctrader_period_name(interval)),
+        ("number", _ctrader_period(interval)),
+    ]
+    body = {}
+    bars = []
+    attempt_debug = []
 
     ws = _ctrader_open_socket(is_live)
     try:
         _ctrader_application_auth(ws)
         _ctrader_account_auth(ws, token, account_id)
-        request_payload = {
-            "ctidTraderAccountId": account_id,
-            "fromTimestamp": from_ms,
-            "toTimestamp": to_ms,
-            "period": _ctrader_period(interval),
-            "symbolId": symbol_id,
-            "count": count,
-        }
-        body = _ctrader_send_wait(
-            ws, 2137, request_payload, 2138,
-            timeout=max(CTRADER_DATA_TIMEOUT, 15),
-        )
+
+        for fmt, period_value in attempts:
+            payload = {
+                "ctidTraderAccountId": account_id,
+                "fromTimestamp": from_ms,
+                "toTimestamp": to_ms,
+                "period": period_value,
+                "symbolId": symbol_id,
+                "count": count,
+            }
+            try:
+                body = _ctrader_send_wait(
+                    ws, 2137, payload, 2138,
+                    timeout=max(CTRADER_DATA_TIMEOUT, 15),
+                )
+                bars = body.get("trendbar") or body.get("trendbars") or []
+                attempt_debug.append({
+                    "format": fmt,
+                    "period": str(period_value),
+                    "bars": len(bars) if isinstance(bars, list) else 0,
+                    "response_period": body.get("period"),
+                    "response_symbol_id": body.get("symbolId"),
+                    "has_more": body.get("hasMore"),
+                    "keys": sorted(str(k) for k in body.keys())[:20],
+                })
+                if bars:
+                    break
+            except Exception as exc:
+                attempt_debug.append({
+                    "format": fmt,
+                    "period": str(period_value),
+                    "error": str(exc)[:180],
+                })
     finally:
         try:
             ws.close()
         except Exception:
             pass
 
+    item["last_trendbar_debug"] = {
+        "at": iso(now()),
+        "symbol": str(symbol),
+        "raw_symbol": str(entry.get("raw_symbol") or symbol),
+        "symbol_id": symbol_id,
+        "account_id": account_id,
+        "is_live": is_live,
+        "interval": interval,
+        "from_ms": from_ms,
+        "to_ms": to_ms,
+        "count": count,
+        "attempts": attempt_debug[-4:],
+    }
+
     rows = []
-    for bar in body.get("trendbar") or []:
+    for bar in bars if isinstance(bars, list) else []:
         if not isinstance(bar, dict):
             continue
         try:
@@ -8860,9 +8922,19 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
             })
         except Exception:
             continue
+
     rows.sort(key=lambda x: str(x.get("datetime") or ""))
     if not rows:
-        raise RuntimeError("cTrader retornou zero candles para este ativo/período.")
+        details = "; ".join(
+            f"{x.get('format')}={x.get('bars', 0)}"
+            + (f" erro:{x.get('error')}" if x.get("error") else "")
+            for x in attempt_debug[-2:]
+        )
+        raise RuntimeError(
+            f"cTrader retornou zero candles para {entry.get('raw_symbol') or symbol} "
+            f"{_ctrader_period_name(interval)} (symbolId={symbol_id}, "
+            f"{'live' if is_live else 'demo'}). {details}"[:420]
+        )
 
     with ctrader_data_guard:
         item.setdefault("candle_cache", {})[cache_key] = (time.time(), list(rows))
@@ -9033,6 +9105,7 @@ async def ctrader_status(request: Request):
         "last_candle_symbol": (item or {}).get("last_candle_symbol"),
         "last_candle_interval": (item or {}).get("last_candle_interval"),
         "last_candle_success": (item or {}).get("last_candle_success"),
+        "last_trendbar_debug": dict((item or {}).get("last_trendbar_debug") or {}),
     }
 
 
