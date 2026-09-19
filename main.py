@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.44"
-PWA_VERSION = "v111"
+APP_VERSION = "3.45"
+PWA_VERSION = "v112"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -316,7 +316,7 @@ PRE_SIGNAL_BATCH = 1
 # sem tape de ticks no backend, usa micro-amostras sucessivas da vela atual e
 # NUNCA finge que snapshots são ticks reais.
 MOMENT_EA_ENABLED = os.getenv("MOMENT_EA_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
-MOMENT_EA_WINDOW_SECONDS = max(10, min(45, int(os.getenv("MOMENT_EA_WINDOW_SECONDS", "30"))))
+MOMENT_EA_WINDOW_SECONDS = max(10, min(45, int(os.getenv("MOMENT_EA_WINDOW_SECONDS", "35"))))
 MOMENT_EA_CONFIRM_SCORE = max(55.0, min(90.0, float(os.getenv("MOMENT_EA_CONFIRM_SCORE", "58"))))
 MOMENT_EA_VETO_SCORE = max(60.0, min(95.0, float(os.getenv("MOMENT_EA_VETO_SCORE", "72"))))
 MOMENT_EA_MIN_TICKS = max(6, int(os.getenv("MOMENT_EA_MIN_TICKS", "12")))
@@ -7540,7 +7540,7 @@ def entry_window(interval, entry_mode="BIRTH"):
     """Agenda entradas sempre em abertura de candle para manter a apuração exata.
 
     BIRTH: tenta liberar na vela que acabou de nascer (janela de até 10 s).
-    MIDDLE: sinal é preparado na metade do candle e entra na PRÓXIMA abertura.
+    MIDDLE: sinal final é preparado para sair 30 s antes e entra na PRÓXIMA abertura.
     CLOSE: preserva a regra anterior de antecedência mínima de 35 s.
     """
     mode = normalize_entry_mode(entry_mode)
@@ -7556,11 +7556,11 @@ def entry_window(interval, entry_mode="BIRTH"):
         return announce, entry, entry + step
 
     if mode == "MIDDLE":
-        # O sinal pode ser estudado no meio, mas a entrada continua alinhada à
-        # abertura seguinte. Assim WIN/LOSS usa um candle inteiro e não uma
-        # aproximação de meia vela.
+        # A análise continua usando a vela atual, mas o sinal final é programado
+        # para 30 segundos antes da abertura da vela de entrada. Isso dá tempo
+        # para o usuário se preparar sem mudar a vela usada na apuração.
         entry = current + step
-        announce = current + timedelta(seconds=INTERVALS[interval] / 2)
+        announce = entry - timedelta(seconds=30)
         if announce <= now():
             announce = now()
         return announce, entry, entry + step
@@ -12199,8 +12199,10 @@ async def chart_pre_signal(
             "status": "AGUARDANDO 3 MINUTOS ENTRE SINAIS",
         }
 
-    # Antes dos 20 segundos não existe marcação.
-    if seconds_to_entry > 20:
+    # 3.45: começa a confirmação 35 s antes. Como são 3 leituras consecutivas
+    # no gráfico (poll ~2,5 s), a marca CALL/PUT fica pronta perto de 30 s
+    # antes da abertura da vela de entrada, em vez de aparecer só nos 10–15 s finais.
+    if seconds_to_entry > 35:
         chart_pre_signal_candidate.pop(lock_key, None)
         return {
             "ok": True,
@@ -14916,7 +14918,7 @@ function paintEntryModeNote(){
   if(mode==='BIRTH'){
     entryModeNote.textContent='🟢 NASCIMENTO: analisa apenas candles fechados e tenta liberar nos primeiros 10 s da vela nova.';
   }else if(mode==='MIDDLE'){
-    entryModeNote.textContent='🟡 MEIO: prepara o sinal na metade do candle, mas entra na próxima abertura para manter WIN/LOSS exato.';
+    entryModeNote.textContent='🟡 MEIO: analisa a vela atual e libera o sinal final cerca de 30 s antes da próxima abertura; a entrada continua na próxima vela.';
   }else{
     entryModeNote.textContent='🔵 FECHAMENTO: mantém o agendamento anterior, com entrada na abertura de uma vela seguinte.';
   }
@@ -17243,7 +17245,7 @@ async function sig(announce=false){
       const k=cur.symbol+'|'+cur.interval+'|'+cur.entry_time+'|'+cur.direction;
 
       if(k!==lastSignalVoice){
-        // A voz principal do sinal é disparada no cronômetro, 35 segundos
+        // A voz principal do sinal é disparada no cronômetro, 30 segundos
         // antes da entrada. Aqui apenas marcamos que é um novo sinal.
         lastSignalVoice=k;
       }
@@ -17661,7 +17663,7 @@ function cd(){
     expiryCountdown.textContent='⏱ EXPIRAÇÃO: --:--';
   }
 
-  if(n<=35 && n>0 && !thirtyFive){
+  if(n<=30 && n>0 && !thirtyFive){
     thirtyFive=true;
     if(voiceEnabled){
       const ativoFalado=spokenAssetName(cur.symbol || (S&&S.value) || '');
@@ -18016,7 +18018,7 @@ setInterval(()=>{ if(!iqLoginInProgress) refreshCTraderStatus(); },60000);
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress) rad();
 },30000);
-// Pré-alerta atualizado a cada 10 s; no SMART a EA Vela Atual mede micro-momento/ticks e alimenta a confirmação final.
+// Pré-alerta atualizado a cada 5 s; no SMART a EA Vela Atual mede micro-momento/ticks e alimenta a confirmação final.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress && selectedRobotEngine()!=='OFF') loadPreSignals();
 },5000);
