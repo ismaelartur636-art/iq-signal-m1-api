@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.34"
-PWA_VERSION = "v101"
+APP_VERSION = "3.35"
+PWA_VERSION = "v102"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -88,6 +88,9 @@ external_ai_runtime: Dict[str, Any] = {
 GEMINI_RPM_BUDGET = max(1, int(os.getenv("GEMINI_RPM_BUDGET", "4")))
 GEMINI_DAILY_BUDGET = max(1, int(os.getenv("GEMINI_DAILY_BUDGET", "45")))
 GEMINI_PREFILTER_MIN = float(os.getenv("GEMINI_PREFILTER_MIN", "64"))
+# 3.35: triagem da IA principal um pouco menos rígida que antes.
+# A saída final continua protegida por confiança, risco, XGBoost e gate de price action.
+SMART_PREFILTER_MIN = float(os.getenv("SMART_PREFILTER_MIN", "62"))
 GEMINI_QUOTA_TZ = ZoneInfo("America/Los_Angeles")
 _gemini_quota_lock = threading.RLock()
 _gemini_quota_state = {
@@ -6567,8 +6570,6 @@ def _gemini_candidate_prefilter(cs, interval="1min"):
     ctx = _pure_ai_price_context(cs)
     if not ctx.get("ready"):
         return False, 0.0, "contexto insuficiente", ctx
-    if ctx.get("choppy"):
-        return False, 35.0, "mercado lateral/alternado", ctx
 
     efficiency = float(ctx.get("efficiency", 0.0) or 0.0)
     avg_body = float(ctx.get("avg_body_ratio", 0.0) or 0.0)
@@ -6595,8 +6596,14 @@ def _gemini_candidate_prefilter(cs, interval="1min"):
     if breakout:
         score += 9.0
 
+    # 3.35: lateralização deixa de ser bloqueio automático na PRIMEIRA triagem.
+    # Ela recebe penalidade e só chega à IA externa se o restante do contexto for forte.
+    # O gate final ainda bloqueia lateralização comum e só aceita exceções claras.
+    if ctx.get("choppy"):
+        score -= 8.0
+
     score = clamp(score, 0, 100)
-    threshold = float(GEMINI_PREFILTER_MIN) + (2.0 if interval == "1min" else 0.0)
+    threshold = float(SMART_PREFILTER_MIN)
     reasons = []
     if efficiency >= 0.22:
         reasons.append("estrutura direcional")
@@ -6608,6 +6615,8 @@ def _gemini_candidate_prefilter(cs, interval="1min"):
         reasons.append("rejeição")
     if breakout:
         reasons.append("rompimento")
+    if ctx.get("choppy"):
+        reasons.append("alternância com penalidade")
     reason = ", ".join(reasons[:3]) or "sem vantagem local forte"
     return score >= threshold, round(score, 1), reason, ctx
 
@@ -6618,8 +6627,6 @@ def _pure_ai_direction_gate(direction, setup, ctx):
     setup = str(setup or "NONE").upper()
     if direction not in ("CALL", "PUT") or not ctx.get("ready"):
         return False, "contexto de preço insuficiente"
-    if ctx.get("choppy"):
-        return False, "mercado alternando/lateral, sem eficiência direcional suficiente"
 
     call = direction == "CALL"
     bull = int(ctx.get("bull_count_6", 0))
@@ -6633,6 +6640,23 @@ def _pure_ai_direction_gate(direction, setup, ctx):
     last_close = float(ctx.get("last_close", 0.0) or 0.0)
     prior_high = float(ctx.get("prior_high_6", last_close) or last_close)
     prior_low = float(ctx.get("prior_low_6", last_close) or last_close)
+
+    # 3.35: mercado alternado continua protegido, mas não é mais um bloqueio absoluto.
+    # Só passa quando a própria IA classifica um rompimento/rejeição bem definido
+    # e o último candle fechado mostra força compatível com a direção.
+    if ctx.get("choppy"):
+        strong_breakout = bool(
+            setup == "BREAKOUT" and body >= 0.55 and
+            ((call and last_close >= prior_high and close_pos >= 0.72) or
+             ((not call) and last_close <= prior_low and close_pos <= 0.28))
+        )
+        strong_rejection = bool(
+            setup in ("REVERSAL", "REJECTION") and
+            ((call and lower >= 0.42 and close_pos >= 0.62) or
+             ((not call) and upper >= 0.42 and close_pos <= 0.38))
+        )
+        if not (strong_breakout or strong_rejection):
+            return False, "mercado alternando/lateral; sem rompimento ou rejeição excepcionalmente claros"
 
     if setup == "TREND":
         ok = (net > 0 and bull >= 4 and not ctx.get("last_bearish")) if call else (net < 0 and bear >= 4 and not ctx.get("last_bullish"))
@@ -9259,6 +9283,7 @@ async def health():
             "role": "FALLBACK",
             "quota_guard": _gemini_quota_snapshot(),
             "prefilter_min": GEMINI_PREFILTER_MIN,
+            "smart_prefilter_min": SMART_PREFILTER_MIN,
         },
         "telegram": {
             "configured": bool(TELEGRAM_BOT_TOKEN),
