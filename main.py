@@ -220,24 +220,24 @@ def heiken_ashi_arrows_strategy(cs, timeframe="1min", market="OPEN"):
 
 # ===== FIM RENKO HASHI PRO =====
 
-# ===== ROBÔ PAVIO 70% + ENGOLFO 70% (duas estratégias independentes) =====
-def wick_engulf_70_strategy(cs, timeframe="1min", market="OPEN"):
-    """Libera a primeira condição válida no último candle FECHADO.
+# ===== FRACTAL PRO (adaptado, limpo e sem repaint) =====
+def fractal_pro_strategy(cs, timeframe="1min", market="OPEN"):
+    """Adaptação do script Fractal Pro para o MEGA IA.
 
-    Estratégia 1 — Pavio 70% do corpo:
-      se o maior pavio tiver tamanho >= 70% do corpo da vela, a próxima vela
-      entra no sentido CONTRÁRIO à cor da vela que acabou de fechar.
+    Mantém a lógica útil do script original:
+      • microtendência EMA 11;
+      • macrotendência EMA 100;
+      • médias rápidas EMA 3 / EMA 13 sobre HLC3;
+      • máxima/mínima de 11 candles como resistência/suporte;
+      • padrões de reversão e padrão Fractal Pro UP/DOWN.
 
-    Estratégia 2 — Engolfo 70%:
-      se o corpo atual cobrir >= 70% do corpo anterior e as cores forem opostas,
-      entra na direção do candle de engolfo.
-
-    Se as duas condições ocorrerem no mesmo fechamento, PAVIO_70 tem prioridade,
-    pois foi definida como a primeira estratégia. Usa somente candles fechados.
+    Melhoria principal: somente candles FECHADOS podem confirmar sinal. O trecho
+    ZigZag/pivô do script original não é usado para entrada porque pode reposicionar
+    pivôs enquanto o preço evolui. Assim, o sinal confirmado não repinta.
     """
     rows = list(cs or [])
     tf_label = {"1min": "M1", "5min": "M5", "15min": "M15", "30min": "M30"}.get(timeframe, timeframe)
-    name = f"ROBÔ PAVIO 70% + ENGOLFO 70% {tf_label}"
+    name = f"FRACTAL PRO {tf_label}"
 
     def neutral(reason, diagnostics=None, confidence=0.0):
         out = {
@@ -247,130 +247,217 @@ def wick_engulf_70_strategy(cs, timeframe="1min", market="OPEN"):
             "confirmed": False,
             "risk": "HIGH",
             "strategy": name,
-            "engine": "PRICE70",
-            "provider": "LOCAL_PRICE_ACTION_70",
+            "engine": "PRICE70",  # ID interno mantido para compatibilidade do painel.
+            "provider": "LOCAL_FRACTAL_PRO",
             "reason": reason,
             "non_repaint": True,
             "closed_candles_only": True,
             "external_ai_disabled": True,
             "gale_signal": False,
-            "first_trigger_wins": True,
+            "fractal_pro_adapted": True,
         }
         if diagnostics is not None:
             out["diagnostics"] = diagnostics
         return out
 
-    if len(rows) < 2:
-        return neutral(f"Aguardando candles fechados suficientes ({len(rows)}/2).")
+    if len(rows) < 105:
+        return neutral(f"Aguardando histórico fechado suficiente para o Fractal Pro ({len(rows)}/105).")
 
     try:
-        last = rows[-1]
-        prev = rows[-2]
-        o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"])
-        po = float(prev["open"]); pc = float(prev["close"])
+        opens = [float(x["open"]) for x in rows]
+        highs = [float(x["high"]) for x in rows]
+        lows = [float(x["low"]) for x in rows]
+        closes = [float(x["close"]) for x in rows]
     except Exception:
-        return neutral("Dados OHLC inválidos para a leitura de pavio/engolfo.")
+        return neutral("Dados OHLC inválidos para a leitura do Fractal Pro.")
 
-    body = abs(c - o)
+    hlc3 = [(h + l + c) / 3.0 for h, l, c in zip(highs, lows, closes)]
+
+    def ema_full(values, period):
+        if len(values) < period:
+            return []
+        k = 2.0 / (period + 1.0)
+        seed = sum(values[:period]) / float(period)
+        out = [None] * (period - 1) + [seed]
+        cur = seed
+        for value in values[period:]:
+            cur = float(value) * k + cur * (1.0 - k)
+            out.append(cur)
+        return out
+
+    e11 = ema_full(closes, 11)
+    e100 = ema_full(closes, 100)
+    e3 = ema_full(hlc3, 3)
+    e13 = ema_full(hlc3, 13)
+    if not e11 or not e100 or not e3 or not e13:
+        return neutral("Histórico insuficiente para as médias do Fractal Pro.")
+
+    o, h, l, c = opens[-1], highs[-1], lows[-1], closes[-1]
+    po, ph, pl, pc = opens[-2], highs[-2], lows[-2], closes[-2]
     eps = 1e-12
-    upper_wick = max(0.0, h - max(o, c))
-    lower_wick = max(0.0, min(o, c) - l)
-    max_wick = max(upper_wick, lower_wick)
-    wick_to_body = (max_wick / body) if body > eps else 0.0
-    candle_color = "BULL" if c > o else ("BEAR" if c < o else "DOJI")
+    body = abs(c - o)
+    rng = max(h - l, eps)
+    body_ratio = body / rng
+
+    ema11_now, ema11_prev = e11[-1], e11[-2]
+    ema100_now = e100[-1]
+    ema3_now, ema3_prev = e3[-1], e3[-2]
+    ema13_now, ema13_prev = e13[-1], e13[-2]
+
+    # Linhas Max/Min do script original, usando as 11 velas anteriores para
+    # não transformar a própria vela gatilho em suporte/resistência.
+    prior_highs = highs[-12:-1]
+    prior_lows = lows[-12:-1]
+    resistance = max(prior_highs) if prior_highs else ph
+    support = min(prior_lows) if prior_lows else pl
+    channel = max(resistance - support, eps)
+
+    # TA/TB do script original: direção + posição e inclinação da EMA 11.
+    ta = bool(c > pc and c > ema11_now and ema11_now > ema11_prev)
+    tb = bool(c < pc and c < ema11_now and ema11_now < ema11_prev)
+
+    # ENC/ENV: cruzamento EMA 3 x EMA 13 em HLC3.
+    enc = bool(ema3_prev <= ema13_prev and ema3_now > ema13_now)
+    env = bool(ema3_prev >= ema13_prev and ema3_now < ema13_now)
+    fast_bull = bool(ema3_now > ema13_now)
+    fast_bear = bool(ema3_now < ema13_now)
+
+    # Padrões desenhados pelo script original. O contexto close[2] foi mantido,
+    # mas a execução só ocorre após o fechamento da vela atual.
+    c2 = closes[-3]
+    bull_reversal = bool(pc < po and c > o and c > ph and c2 >= o)
+    bear_reversal = bool(pc > po and c < o and c < pl and c2 <= o)
+
+    # Padrão FRACTAL PRO UP/DOWN original.
+    bull_fractal = bool(c > pc and pc > opens[-3] and closes[-4] > closes[-3])
+    bear_fractal = bool(c < pc and pc < opens[-3] and closes[-4] < closes[-3])
+
+    # Qualidade mínima da vela: evita dojis/velas quase sem corpo virarem entrada.
+    body_ok = body_ratio >= 0.22
+
+    call_trigger = bool(body_ok and (bull_reversal or bull_fractal))
+    put_trigger = bool(body_ok and (bear_reversal or bear_fractal))
+
+    call_score = 0.0
+    put_score = 0.0
+    call_reasons = []
+    put_reasons = []
+
+    if bull_reversal:
+        call_score += 38; call_reasons.append("padrão de reversão comprador do Fractal Pro")
+    if bull_fractal:
+        call_score += 32; call_reasons.append("padrão Fractal Pro UP")
+    if bear_reversal:
+        put_score += 38; put_reasons.append("padrão de reversão vendedor do Fractal Pro")
+    if bear_fractal:
+        put_score += 32; put_reasons.append("padrão Fractal Pro DOWN")
+
+    if ta:
+        call_score += 20; call_reasons.append("microtendência EMA 11 de alta")
+    if tb:
+        put_score += 20; put_reasons.append("microtendência EMA 11 de baixa")
+
+    if fast_bull:
+        call_score += 12; call_reasons.append("EMA 3 acima da EMA 13")
+    if fast_bear:
+        put_score += 12; put_reasons.append("EMA 3 abaixo da EMA 13")
+    if enc:
+        call_score += 8; call_reasons.append("cruzamento comprador EMA 3/13")
+    if env:
+        put_score += 8; put_reasons.append("cruzamento vendedor EMA 3/13")
+
+    if c > ema100_now:
+        call_score += 10; call_reasons.append("macro EMA 100 favorável")
+    elif c < ema100_now:
+        put_score += 10; put_reasons.append("macro EMA 100 favorável")
+
+    # Suporte/resistência de 11 períodos: breakout ou rejeição em região útil.
+    if c > resistance:
+        call_score += 10; call_reasons.append("rompimento da máxima de 11 períodos")
+    elif (c - support) / channel <= 0.22:
+        call_score += 5; call_reasons.append("próximo ao suporte de 11 períodos")
+    if c < support:
+        put_score += 10; put_reasons.append("rompimento da mínima de 11 períodos")
+    elif (resistance - c) / channel <= 0.22:
+        put_score += 5; put_reasons.append("próximo à resistência de 11 períodos")
 
     diagnostics = {
-        "setup_priority": ["PAVIO_70", "ENGOLFO_70"],
-        "candle_color": candle_color,
-        "body": body,
-        "upper_wick": upper_wick,
-        "lower_wick": lower_wick,
-        "max_wick_to_body": round(wick_to_body, 4),
-        "wick_threshold": 0.70,
+        "ema11": round(ema11_now, 8),
+        "ema100": round(ema100_now, 8),
+        "ema3_hlc3": round(ema3_now, 8),
+        "ema13_hlc3": round(ema13_now, 8),
+        "micro_up": ta,
+        "micro_down": tb,
+        "cross_up": enc,
+        "cross_down": env,
+        "bull_reversal": bull_reversal,
+        "bear_reversal": bear_reversal,
+        "bull_fractal": bull_fractal,
+        "bear_fractal": bear_fractal,
+        "body_ratio": round(body_ratio, 4),
+        "resistance_11": round(resistance, 8),
+        "support_11": round(support, 8),
+        "call_score": round(call_score, 1),
+        "put_score": round(put_score, 1),
+        "zigzag_entry_disabled": True,
     }
 
-    # Estratégia 1 tem prioridade quando as duas aparecem no mesmo fechamento.
-    if body > eps and candle_color != "DOJI" and wick_to_body >= 0.70:
-        direction = "PUT" if candle_color == "BULL" else "CALL"
-        confidence = _clamp(72.0 + min(16.0, max(0.0, wick_to_body - 0.70) * 20.0), 72.0, 88.0)
-        diagnostics.update({
-            "trigger": "PAVIO_70",
-            "trigger_ratio": round(wick_to_body, 4),
-            "next_candle_rule": "OPPOSITE_TO_CLOSED_CANDLE_COLOR",
-        })
-        return {
-            "available": True,
-            "direction": direction,
-            "confidence": round(confidence, 1),
-            "confirmed": True,
-            "risk": "MEDIUM",
-            "strategy": name,
-            "engine": "PRICE70",
-            "provider": "LOCAL_PRICE_ACTION_70",
-            "reason": (
-                f"PAVIO 70% acionado no último candle fechado: maior pavio = "
-                f"{wick_to_body*100:.0f}% do corpo. Próxima vela entra {direction}, "
-                f"contrária à cor do candle fechado."
-            ),
-            "non_repaint": True,
-            "closed_candles_only": True,
-            "external_ai_disabled": True,
-            "gale_signal": False,
-            "first_trigger_wins": True,
-            "setup": "PAVIO_70",
-            "diagnostics": diagnostics,
-        }
+    # Um padrão do próprio Fractal Pro é obrigatório. Médias e níveis confirmam
+    # e aumentam a confiança, mas não criam sinal sozinhos.
+    min_score = 48.0
+    if call_trigger and put_trigger:
+        if abs(call_score - put_score) < 8.0:
+            return neutral("Fractal Pro detectou sinais conflitantes no mesmo fechamento; aguardando nova vela.", diagnostics, max(call_score, put_score))
+        direction = "CALL" if call_score > put_score else "PUT"
+    elif call_trigger:
+        direction = "CALL"
+    elif put_trigger:
+        direction = "PUT"
+    else:
+        return neutral(
+            "Fractal Pro monitorando: aguardando padrão UP/DOWN ou reversão confirmado em vela fechada.",
+            diagnostics,
+            min(69.0, max(call_score, put_score)),
+        )
 
-    prev_body = abs(pc - po)
-    prev_low, prev_high = min(po, pc), max(po, pc)
-    cur_low, cur_high = min(o, c), max(o, c)
-    overlap = max(0.0, min(cur_high, prev_high) - max(cur_low, prev_low))
-    engulf_ratio = (overlap / prev_body) if prev_body > eps else 0.0
-    bullish_engulf = bool(c > o and pc < po and engulf_ratio >= 0.70)
-    bearish_engulf = bool(c < o and pc > po and engulf_ratio >= 0.70)
-    diagnostics.update({
-        "previous_body": prev_body,
-        "engulf_overlap": overlap,
-        "engulf_ratio": round(engulf_ratio, 4),
-        "engulf_threshold": 0.70,
-    })
+    score = call_score if direction == "CALL" else put_score
+    reasons = call_reasons if direction == "CALL" else put_reasons
+    if score < min_score:
+        return neutral(
+            f"Padrão {direction} encontrado, mas a confirmação do Fractal Pro ainda está fraca ({score:.0f}/{min_score:.0f}).",
+            diagnostics,
+            min(69.0, score),
+        )
 
-    if bullish_engulf or bearish_engulf:
-        direction = "CALL" if bullish_engulf else "PUT"
-        confidence = _clamp(74.0 + min(16.0, max(0.0, engulf_ratio - 0.70) * 30.0), 74.0, 90.0)
-        diagnostics.update({"trigger": "ENGOLFO_70", "trigger_ratio": round(engulf_ratio, 4)})
-        return {
-            "available": True,
-            "direction": direction,
-            "confidence": round(confidence, 1),
-            "confirmed": True,
-            "risk": "MEDIUM",
-            "strategy": name,
-            "engine": "PRICE70",
-            "provider": "LOCAL_PRICE_ACTION_70",
-            "reason": (
-                f"ENGOLFO 70% acionado no último candle fechado: o corpo atual cobriu "
-                f"{engulf_ratio*100:.0f}% do corpo anterior. Próxima vela entra {direction}."
-            ),
-            "non_repaint": True,
-            "closed_candles_only": True,
-            "external_ai_disabled": True,
-            "gale_signal": False,
-            "first_trigger_wins": True,
-            "setup": "ENGOLFO_70",
-            "diagnostics": diagnostics,
-        }
-
-    return neutral(
-        "Monitorando: ainda não apareceu pavio >= 70% do corpo nem engolfo >= 70% da vela anterior no último candle fechado.",
-        diagnostics=diagnostics,
-        confidence=max(0.0, min(69.0, max(wick_to_body, engulf_ratio) * 100.0)),
+    confidence = _clamp(62.0 + (score - min_score) * 0.62, 68.0, 94.0)
+    setup = (
+        "REVERSAL_UP" if direction == "CALL" and bull_reversal else
+        "FRACTAL_UP" if direction == "CALL" else
+        "REVERSAL_DOWN" if bear_reversal else "FRACTAL_DOWN"
     )
+    return {
+        "available": True,
+        "direction": direction,
+        "confidence": round(confidence, 1),
+        "confirmed": True,
+        "risk": "LOW" if confidence >= 84.0 else "MEDIUM",
+        "strategy": name,
+        "engine": "PRICE70",
+        "provider": "LOCAL_FRACTAL_PRO",
+        "reason": f"{direction} confirmado pelo Fractal Pro: " + "; ".join(reasons[:5]) + ". Entrada na próxima vela.",
+        "non_repaint": True,
+        "closed_candles_only": True,
+        "external_ai_disabled": True,
+        "gale_signal": False,
+        "fractal_pro_adapted": True,
+        "setup": setup,
+        "diagnostics": diagnostics,
+    }
 
-# ===== FIM ROBÔ PAVIO 70% + ENGOLFO 70% =====
+# ===== FIM FRACTAL PRO =====
 
-APP_VERSION = "3.54"
-PWA_VERSION = "v121"
+APP_VERSION = "3.55"
+PWA_VERSION = "v122"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -8761,7 +8848,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
-    # Pavio/Engolfo 70% sempre entra na vela imediatamente seguinte ao candle gatilho.
+    # Fractal Pro sempre entra na vela imediatamente seguinte ao candle gatilho.
     # Portanto este motor força o modo BIRTH e ignora MIDDLE/CLOSE.
     if engine == "PRICE70":
         entry_mode = "BIRTH"
@@ -8827,25 +8914,25 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     symbol, interval, request_n, "OPEN", None, request=request
                 )
         elif engine == "PRICE70":
-            # Robô Pavio/Engolfo 70%: OPEN usa o roteador multifuente; OTC usa IQ Option real.
+            # Fractal Pro: OPEN usa o roteador multifuente; OTC usa IQ Option real.
             if market == "IQ_OTC":
                 if not iq_state:
                     out = neutral_signal(
                         symbol, interval, market,
-                        "ROBÔ PAVIO + ENGOLFO • IQ OPTION OFFLINE",
+                        "FRACTAL PRO • IQ OPTION OFFLINE",
                         "Conecte a IQ Option para este robô analisar OTC real.",
                         source_state="WAITING",
                     )
                     out.update({
-                        "strategy": "ROBÔ PAVIO 70% + ENGOLFO 70%", "mode": "PRICE_ACTION_70",
+                        "strategy": "FRACTAL PRO", "mode": "FRACTAL_PRO",
                         "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
-                        "first_trigger_wins": True, "gale_signal": False,
+                        "fractal_pro_adapted": True, "gale_signal": False,
                     })
                     cache[key] = (time.time(), out)
                     return out
-                raw = await iq_ea_candles(iq_state, symbol, interval, 90, regular_market=False)
+                raw = await iq_ea_candles(iq_state, symbol, interval, 130, regular_market=False)
             else:
-                raw = await candles(symbol, interval, 90, "OPEN", None, request=request)
+                raw = await candles(symbol, interval, 130, "OPEN", None, request=request)
         elif engine == "RUBIK":
             # Robô Rubik Adaptado: OPEN usa o roteador cTrader/multifuente; OTC usa IQ Option real.
             if market == "IQ_OTC":
@@ -8893,7 +8980,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         status = (
             ("EA XGBOOST • FONTE EM ESPERA" if market == "OPEN" else "EA XGBOOST • IQ OPTION EM ESPERA")
             if engine == "EA"
-            else (("ROBÔ PAVIO + ENGOLFO • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ PAVIO + ENGOLFO • IQ OPTION EM ESPERA")
+            else (("FRACTAL PRO • FONTE EM ESPERA" if market == "OPEN" else "FRACTAL PRO • IQ OPTION EM ESPERA")
                   if engine == "PRICE70"
                   else (("ROBÔ RUBIK • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION EM ESPERA")
                   if engine == "RUBIK"
@@ -8912,7 +8999,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         status = (
             ("EA XGBOOST • FONTE RECONECTANDO" if market == "OPEN" else "EA XGBOOST • IQ OPTION RECONECTANDO")
             if engine == "EA"
-            else (("ROBÔ PAVIO + ENGOLFO • FONTE RECONECTANDO" if market == "OPEN" else "ROBÔ PAVIO + ENGOLFO • IQ OPTION RECONECTANDO")
+            else (("FRACTAL PRO • FONTE RECONECTANDO" if market == "OPEN" else "FRACTAL PRO • IQ OPTION RECONECTANDO")
                   if engine == "PRICE70"
                   else (("ROBÔ RUBIK • FONTE RECONECTANDO" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION RECONECTANDO")
                   if engine == "RUBIK"
@@ -8968,8 +9055,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "EA RENKO HASHI PRO + XGBOOST"
             engine_mode = "EA_XGBOOST_AUTONOMOUS"
         elif engine == "PRICE70":
-            engine_title = "ROBÔ PAVIO 70% + ENGOLFO 70%"
-            engine_mode = "PRICE_ACTION_70"
+            engine_title = "FRACTAL PRO"
+            engine_mode = "FRACTAL_PRO"
         elif engine == "RUBIK":
             engine_title = "ROBÔ RUBIK ADAPTADO"
             engine_mode = "RUBIK_ADAPTED"
@@ -8995,7 +9082,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
-                    else ({"dual_confirmation": True, "inputs": ["RENKO_HASHI_PRO", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"first_trigger_wins": True, "inputs": ["PAVIO_70", "ENGOLFO_70"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "PRICE70" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})))
+                    else ({"dual_confirmation": True, "inputs": ["RENKO_HASHI_PRO", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"fractal_pro_adapted": True, "inputs": ["EMA11_MICRO_TREND", "EMA100_MACRO", "EMA3_13_HLC3", "FRACTAL_PATTERN", "REVERSAL_PATTERN", "DONCHIAN_11"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "PRICE70" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})))
                 ),
                 "legacy_ai_disabled": engine != "SMART",
                 "legacy_technical_strategies_disabled": True,
@@ -9007,7 +9094,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine == "RUBIK" else (closed[-90:] if len(closed) > 90 else closed)))
+            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine == "RUBIK" else (closed[-130:] if len(closed) > 130 else closed)))
             if engine == "SMART":
                 moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
                 analysis = await openai_direct_signal(
@@ -9018,7 +9105,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     engine_closed, symbol, interval, market=market
                 )
             elif engine == "PRICE70":
-                analysis = wick_engulf_70_strategy(engine_closed, interval, market=market)
+                analysis = fractal_pro_strategy(engine_closed, interval, market=market)
             elif engine == "RUBIK":
                 analysis = rubik_adapted_strategy(engine_closed, interval, market=market)
             elif engine == "FORCE":
@@ -9071,12 +9158,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
             "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "PRICE70") and analysis.get("confirmed")),
-            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RENKO_HASHI_PRO" if engine == "EA" else ("LOCAL_PRICE_ACTION_70" if engine == "PRICE70" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else "DISABLED")))),
+            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RENKO_HASHI_PRO" if engine == "EA" else ("LOCAL_FRACTAL_PRO" if engine == "PRICE70" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else "DISABLED")))),
             "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
                 else (analysis.get("strategy", "EA RENKO HASHI PRO + XGBOOST") if engine == "EA"
-                      else (analysis.get("strategy", "ROBÔ PAVIO 70% + ENGOLFO 70%") if engine == "PRICE70"
+                      else (analysis.get("strategy", "FRACTAL PRO") if engine == "PRICE70"
                       else (analysis.get("strategy", "ROBÔ RUBIK ADAPTADO") if engine == "RUBIK"
                             else (analysis.get("strategy", "EA Força do Movimento") if engine == "FORCE"
                                   else analysis.get("strategy", f"{engine_title} {tf_label}")))))
@@ -9188,7 +9275,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 )
                 base.update({
                     "direction": direction_now,
-                    "status": (smart_status if engine == "SMART" else ("SINAL DUPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL PAVIO/ENGOLFO 70% LIBERADO" if engine == "PRICE70" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))))),
+                    "status": (smart_status if engine == "SMART" else ("SINAL DUPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL FRACTAL PRO LIBERADO" if engine == "PRICE70" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -12394,12 +12481,12 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = feed_src
                     data["feed_label"] = _feed_source_label(feed_src)
                     data["feed_fallback"] = bool(feed_info.get("fallback"))
-                    data["feed_message"] = "Robô Pavio/Engolfo 70% usando candles fechados do mercado aberto via roteador multifuente."
+                    data["feed_message"] = "Fractal Pro usando candles fechados do mercado aberto via roteador multifuente."
                 else:
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                    data["feed_message"] = "Robô Pavio/Engolfo 70% usando candles OTC reais da sessão IQ Option."
+                    data["feed_message"] = "Fractal Pro usando candles OTC reais da sessão IQ Option."
             elif engine == "RUBIK":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -12860,7 +12947,7 @@ async def pre_signals(
     if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "PRICE70") and not iq_state:
         return {
             "ok": True,
-            "message": ("EA Dupla OTC aguardando conexão com a IQ Option." if engine == "EA" else ("Robô Pavio/Engolfo 70% OTC aguardando conexão com a IQ Option." if engine == "PRICE70" else "Robô Rubik Adaptado OTC aguardando conexão com a IQ Option.")),
+            "message": ("EA Dupla OTC aguardando conexão com a IQ Option." if engine == "EA" else ("Fractal Pro OTC aguardando conexão com a IQ Option." if engine == "PRICE70" else "Robô Rubik Adaptado OTC aguardando conexão com a IQ Option.")),
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -12920,7 +13007,7 @@ async def pre_signals(
     for symbol in batch:
         key = f"{group_key}|{symbol}"
         try:
-            pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (120 if engine == "RUBIK" else 90))
+            pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (130 if engine == "PRICE70" else (120 if engine == "RUBIK" else 90)))
             if engine in ("EA", "RUBIK", "PRICE70") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
@@ -12947,13 +13034,13 @@ async def pre_signals(
                 )
             elif engine == "PRICE70":
                 price70_rows = raw[:-1] if len(raw) > 1 else raw
-                price70_preview = wick_engulf_70_strategy(price70_rows, interval, market=requested_market)
+                price70_preview = fractal_pro_strategy(price70_rows, interval, market=requested_market)
                 preview = (
                     {
                         "direction": price70_preview.get("direction"),
                         "confidence": price70_preview.get("confidence", 0),
-                        "strategy": price70_preview.get("strategy", "ROBÔ PAVIO 70% + ENGOLFO 70%"),
-                        "reason": price70_preview.get("reason", "Pavio/Engolfo 70% monitorando."),
+                        "strategy": price70_preview.get("strategy", "FRACTAL PRO"),
+                        "reason": price70_preview.get("reason", "Fractal Pro monitorando."),
                     }
                     if price70_preview.get("confirmed") and price70_preview.get("direction") in ("CALL", "PUT")
                     else None
@@ -13363,10 +13450,10 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         elif engine == "PRICE70":
             if market == "IQ_OTC":
                 if not iq_state:
-                    raise RuntimeError("Conecte a IQ Option para o Robô Pavio/Engolfo 70% analisar OTC.")
-                raw = await iq_ea_candles(iq_state, sym, interval, 90, regular_market=False)
+                    raise RuntimeError("Conecte a IQ Option para o Fractal Pro analisar OTC.")
+                raw = await iq_ea_candles(iq_state, sym, interval, 130, regular_market=False)
             else:
-                raw = await candles(sym, interval, 90, "OPEN", None, request=request)
+                raw = await candles(sym, interval, 130, "OPEN", None, request=request)
         elif engine == "RUBIK":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -13395,10 +13482,10 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     else f"{engine_label} • MONITORANDO • {why}"
                 )
             elif engine == "PRICE70":
-                tech = wick_engulf_70_strategy(closed, interval, market=market)
-                engine_label = "ROBÔ PAVIO 70% + ENGOLFO 70%"
+                tech = fractal_pro_strategy(closed, interval, market=market)
+                engine_label = "FRACTAL PRO"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why = str(tech.get("reason") or "Pavio/Engolfo monitorando").replace("\n", " ")[:88]
+                why = str(tech.get("reason") or "Fractal Pro monitorando").replace("\n", " ")[:88]
                 status_text = (
                     f"{engine_label} • OPORTUNIDADE ENCONTRADA"
                     if direction != "NEUTRO"
@@ -14482,10 +14569,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   <div class="robot-mode-card" id="price70ModeCard">
-    <img src="__MEGA_IMAGE__" alt="Robô Pavio e Engolfo 70%">
+    <img src="__MEGA_IMAGE__" alt="Fractal Pro">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">🕯️ ROBÔ PAVIO + ENGOLFO 70%</div>
-      <div class="robot-mode-desc" id="price70ModeDesc">2 estratégias independentes • a primeira que acontecer libera o sinal • pavio 70% do corpo ou engolfo 70% da vela anterior • próxima vela.</div>
+      <div class="robot-mode-title">🧭 FRACTAL PRO</div>
+      <div class="robot-mode-desc" id="price70ModeDesc">Script Fractal Pro melhorado • EMA 11 + EMA 100 + EMA 3/13 + suporte/resistência 11 • padrões em vela fechada • sem repaint • próxima vela.</div>
     </div>
     <button id="price70PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -15928,7 +16015,7 @@ function normalizeEngineKey(value){
   if(e==='SMART' || e==='AI' || e==='IA') return 'SMART';
   if(e==='EA' || e==='EA_AUTONOMOUS_IQ' || e==='EA_XGBOOST' || e==='EA_XGBOOST_AUTONOMOUS') return 'EA';
   if(e==='FORCE' || e==='EA_FORCE_MOVEMENT') return 'FORCE';
-  if(e==='PRICE70' || e==='PRICE_ACTION_70') return 'PRICE70';
+  if(e==='PRICE70' || e==='FRACTAL_PRO' || e==='PRICE_ACTION_70') return 'PRICE70';
   if(e==='RUBIK' || e==='RUBIK_ADAPTED') return 'RUBIK';
   return '';
 }
@@ -15945,7 +16032,7 @@ function momentStudyEngineName(key){
     EA:'⚡ EA RENKO HASHI PRO + XGBOOST',
     RUBIK:'🧩 ROBÔ RUBIK ADAPTADO',
     FORCE:'💥 EA FORÇA DO MOVIMENTO',
-    PRICE70:'🕯️ ROBÔ PAVIO + ENGOLFO 70%'
+    PRICE70:'🧭 FRACTAL PRO'
   };
   return names[String(key||'').toUpperCase()]||String(key||'MOTOR');
 }
@@ -16236,7 +16323,7 @@ function rememberPendingTrade(sig){
   if(!sig.expiry_time || !sig.entry_time) return;
 
   const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
-  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='PRICE70'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('PRICE_ACTION_70'));
+  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='PRICE70'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('FRACTAL_PRO'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
     // EA Dupla e EA Força são apurados na primeira vela; outros motores preservam G1/G2.
@@ -16253,7 +16340,7 @@ function rememberPendingTrade(sig){
     confidence:Number(sig.confidence||0),
     risk:String(sig.risk||''),
     strategy:String(sig.strategy||''),
-    engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('PRICE_ACTION_70')?'PRICE70':String(sig.selected_engine||sig.mode||'')))),
+    engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('FRACTAL_PRO')?'PRICE70':String(sig.selected_engine||sig.mode||'')))),
     entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH')),
     value_stake:currentValueStake(),
     value_payout:currentValuePayout(),
@@ -18317,14 +18404,14 @@ function applyRobotPowerState(){
     ? 'ONLINE: OPEN multifuente para qualquer corretora Forex • OTC pela IQ Option • configuração protegida • sem Gale.'
     : 'OFFLINE: EA Força do Movimento pausado • configuração protegida.';
   if(price70ModeDesc) price70ModeDesc.textContent=price70Enabled
-    ? 'ONLINE: duas estratégias independentes • a primeira que aparecer em candle fechado libera a próxima vela • OPEN/OTC.'
-    : 'OFFLINE: Robô Pavio + Engolfo 70% pausado.';
+    ? 'ONLINE: Fractal Pro melhorado • padrões + EMA 11/100 + EMA 3/13 + suporte/resistência 11 • sem repaint • OPEN/OTC.'
+    : 'OFFLINE: Fractal Pro pausado.';
 
   const engine=selectedRobotEngine();
   if(engine==='PRICE70'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔ PAVIO + ENGOLFO 70% ONLINE • PRIMEIRO GATILHO LIBERA • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🕯️ Pavio 70% ou Engolfo 70% • a primeira condição válida libera o sinal.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar Pavio/Engolfo 70% ativo • candles fechados • OPEN/OTC</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='FRACTAL PRO ONLINE • SEM REPAINT • VELA FECHADA • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧭 Fractal Pro • padrão confirmado + tendência/médias + suporte/resistência • somente vela fechada.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar Fractal Pro ativo • candles fechados • OPEN/OTC</div>';
     rad();
   }else if(engine==='FORCE'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA FORÇA DO MOVIMENTO ONLINE • CONFIGURAÇÃO PROTEGIDA • FOCO EM WIN DIRETO';
@@ -18353,7 +18440,7 @@ function applyRobotPowerState(){
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial, Robô Pavio/Engolfo, Robô Rubik e EAs estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial, Fractal Pro, Robô Rubik e EAs estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -18482,7 +18569,7 @@ async function setPrice70Power(enabled){
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled) speak(price70Enabled ? 'Robô Pavio e Engolfo 70 por cento online.' : 'Robô Pavio e Engolfo 70 por cento offline.');
+  if(voiceEnabled) speak(price70Enabled ? 'Fractal Pro online.' : 'Fractal Pro offline.');
 }
 
 if(robotPowerBtn) robotPowerBtn.onclick=()=>{ setRobotPower(!robotEnabled); };
@@ -18716,7 +18803,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':(selectedRobotEngine()==='PRICE70'?'ROBÔ PAVIO/ENGOLFO 70%':(selectedRobotEngine()==='RUBIK'?'ROBÔ RUBIK':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':'IA GRÁFICA'))))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
+    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':(selectedRobotEngine()==='PRICE70'?'ROBÔ FRACTAL PRO':(selectedRobotEngine()==='RUBIK'?'ROBÔ RUBIK':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':'IA GRÁFICA'))))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
     await sig(true);
   }finally{
     radarAutoBusy=false;
