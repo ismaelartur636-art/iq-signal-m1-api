@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.49"
-PWA_VERSION = "v116"
+APP_VERSION = "3.50"
+PWA_VERSION = "v117"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -6632,22 +6632,27 @@ def rubik_adapted_strategy(cs, timeframe="1min", market="OPEN"):
     """Estratégia própria inspirada no material educacional público da RubikTrade.
 
     NÃO é o algoritmo proprietário da RubikTrade. A adaptação para opções binárias
-    usa somente candles fechados e exige confluência de Heikin-Ashi, tendência por
-    EMA 9/21, RSI 14 e MACD 12/26/9 para a próxima vela.
+    usa somente candles fechados. Na v3.50 o robô ficou menos preso: a tendência
+    EMA 9/21 continua obrigatória e bastam mais 2 confirmações entre Heikin-Ashi,
+    RSI 14 e MACD 12/26/9 (3 de 4 no total) para liberar a próxima vela.
     """
     rows = list(cs or [])
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
     name = f"ROBÔ RUBIK ADAPTADO {tf_label}"
 
-    def neutral(reason, confidence=0.0):
-        return {
+    def neutral(reason, confidence=0.0, diagnostics=None):
+        out = {
             "available": True,
             "direction": "NEUTRO", "confidence": round(float(confidence or 0), 1),
             "confirmed": False, "risk": "HIGH", "strategy": name,
             "engine": "RUBIK_ADAPTED", "provider": "LOCAL_RUBIK_ADAPTED",
             "reason": reason, "rubik_inspired": True,
             "external_ai_disabled": True, "gale_signal": False, "non_repaint": True,
+            "confirmation_rule": "EMA + 2_DE_3",
         }
+        if diagnostics:
+            out["diagnostics"] = diagnostics
+        return out
 
     if len(rows) < 60:
         return neutral(f"Aguardando histórico fechado suficiente ({len(rows)}/60).")
@@ -6665,17 +6670,21 @@ def rubik_adapted_strategy(cs, timeframe="1min", market="OPEN"):
     lower_wick = (min(last_ha["open"], last_ha["close"]) - last_ha["low"]) / hrange
     upper_wick = (last_ha["high"] - max(last_ha["open"], last_ha["close"])) / hrange
 
+    # v3.50: Heikin-Ashi continua confirmando direção, mas sem exigir duas velas
+    # perfeitas e pavio quase zero. Isso aumenta oportunidades sem usar candle aberto.
+    prev_ha_call = prev_ha["close"] > prev_ha["open"]
+    prev_ha_put = prev_ha["close"] < prev_ha["open"]
     ha_call = bool(
         last_ha["close"] > last_ha["open"]
-        and prev_ha["close"] > prev_ha["open"]
-        and hbody >= 0.42
-        and lower_wick <= 0.18
+        and hbody >= 0.28
+        and lower_wick <= 0.38
+        and (prev_ha_call or last_ha["close"] >= prev_ha["close"])
     )
     ha_put = bool(
         last_ha["close"] < last_ha["open"]
-        and prev_ha["close"] < prev_ha["open"]
-        and hbody >= 0.42
-        and upper_wick <= 0.18
+        and hbody >= 0.28
+        and upper_wick <= 0.38
+        and (prev_ha_put or last_ha["close"] <= prev_ha["close"])
     )
 
     e9 = ema(closes, 9)
@@ -6684,52 +6693,104 @@ def rubik_adapted_strategy(cs, timeframe="1min", market="OPEN"):
     prev_e21 = ema(closes[:-1], 21)
     if None in (e9, e21, prev_e9, prev_e21):
         return neutral("Médias de tendência ainda sem dados suficientes.")
-    ema_call = bool(e9 > e21 and prev_e9 >= prev_e21 and closes[-1] >= e9)
-    ema_put = bool(e9 < e21 and prev_e9 <= prev_e21 and closes[-1] <= e9)
+
+    # EMA é a âncora obrigatória. Aceita pullback até a EMA 21 em vez de exigir
+    # fechamento sempre além da EMA 9 e alinhamento perfeito na vela anterior.
+    ema_call = bool(e9 > e21 and closes[-1] >= e21)
+    ema_put = bool(e9 < e21 and closes[-1] <= e21)
 
     r14 = rsi(closes, 14)
     r14_prev = rsi(closes[:-1], 14)
     if r14 is None or r14_prev is None:
         return neutral("RSI 14 ainda sem dados suficientes.")
-    rsi_call = bool((50.0 <= r14 <= 72.0 and r14 >= r14_prev) or (r14_prev <= 36.0 and r14 >= r14_prev + 2.0))
-    rsi_put = bool((28.0 <= r14 <= 50.0 and r14 <= r14_prev) or (r14_prev >= 64.0 and r14 <= r14_prev - 2.0))
+
+    # Faixas um pouco mais abertas para captar continuidade e retomada.
+    rsi_call = bool(
+        (47.0 <= r14 <= 75.0 and r14 > r14_prev)
+        or (r14_prev <= 40.0 and r14 >= r14_prev + 1.0)
+    )
+    rsi_put = bool(
+        (25.0 <= r14 <= 53.0 and r14 < r14_prev)
+        or (r14_prev >= 60.0 and r14 <= r14_prev - 1.0)
+    )
 
     macd = _rubik_macd_snapshot(closes)
     if not macd:
         return neutral("MACD ainda sem histórico suficiente.")
-    macd_call = bool(macd["line"] > macd["signal"] and macd["hist"] > 0)
-    macd_put = bool(macd["line"] < macd["signal"] and macd["hist"] < 0)
 
-    call_ok = ha_call and ema_call and rsi_call and macd_call
-    put_ok = ha_put and ema_put and rsi_put and macd_put
+    # Não exige que o histograma já esteja completamente do lado da operação:
+    # também aceita melhora consistente na mesma direção.
+    macd_call = bool(
+        macd["line"] > macd["signal"]
+        or (macd["hist"] > macd["prev_hist"] and macd["line"] > macd["prev_line"])
+    )
+    macd_put = bool(
+        macd["line"] < macd["signal"]
+        or (macd["hist"] < macd["prev_hist"] and macd["line"] < macd["prev_line"])
+    )
+
+    call_votes = int(ha_call) + int(ema_call) + int(rsi_call) + int(macd_call)
+    put_votes = int(ha_put) + int(ema_put) + int(rsi_put) + int(macd_put)
+
+    # Regra principal: EMA tem que concordar e, além dela, pelo menos 2 dos
+    # outros 3 motores precisam apontar o mesmo lado. Um único componente pode
+    # ficar neutro/discordar sem travar toda a EA.
+    call_ok = bool(ema_call and call_votes >= 3 and put_votes <= 1)
+    put_ok = bool(ema_put and put_votes >= 3 and call_votes <= 1)
+
+    diagnostics = {
+        "ha_call": bool(ha_call), "ha_put": bool(ha_put),
+        "ema_call": bool(ema_call), "ema_put": bool(ema_put),
+        "rsi_call": bool(rsi_call), "rsi_put": bool(rsi_put),
+        "macd_call": bool(macd_call), "macd_put": bool(macd_put),
+        "call_votes": call_votes, "put_votes": put_votes,
+        "rsi_14": round(float(r14), 2),
+        "confirmation_rule": "EMA + 2_DE_3",
+    }
+
     if call_ok == put_ok:
         ha_dir = "CALL" if ha_call else ("PUT" if ha_put else "NEUTRO")
         ema_dir = "CALL" if ema_call else ("PUT" if ema_put else "NEUTRO")
         rsi_dir = "CALL" if rsi_call else ("PUT" if rsi_put else "NEUTRO")
         macd_dir = "CALL" if macd_call else ("PUT" if macd_put else "NEUTRO")
         return neutral(
-            f"Aguardando confluência completa • HA {ha_dir} • EMA {ema_dir} • "
-            f"RSI {rsi_dir} ({r14:.1f}) • MACD {macd_dir}.",
-            58.0,
+            f"Aguardando 3 de 4 confirmações com EMA obrigatória • HA {ha_dir} • "
+            f"EMA {ema_dir} • RSI {rsi_dir} ({r14:.1f}) • MACD {macd_dir} • "
+            f"votos CALL {call_votes}/4 x PUT {put_votes}/4.",
+            56.0 + 3.0 * max(call_votes, put_votes),
+            diagnostics,
         )
 
     direction = "CALL" if call_ok else "PUT"
+    votes = call_votes if direction == "CALL" else put_votes
     breakout = (
         closes[-1] > max(highs[-6:-1]) if direction == "CALL"
         else closes[-1] < min(lows[-6:-1])
     )
     trend_sep = abs(float(e9) - float(e21)) / max(abs(closes[-1]), 1e-12) * 10000.0
     hist_strength = abs(float(macd["hist"])) / max(abs(closes[-1]), 1e-12) * 100000.0
+    base_conf = 69.0 if votes == 3 else 76.0
     confidence = clamp(
-        72.0 + min(7.0, hbody * 7.0) + min(5.0, trend_sep * 0.45)
-        + min(5.0, hist_strength * 0.22) + (4.0 if breakout else 0.0),
-        72.0, 93.0,
+        base_conf + min(6.0, hbody * 5.0) + min(4.0, trend_sep * 0.35)
+        + min(4.0, hist_strength * 0.16) + (3.0 if breakout else 0.0),
+        69.0, 92.0,
     )
-    risk = "LOW" if breakout and hbody >= 0.58 else "MEDIUM"
+    risk = "LOW" if votes == 4 and breakout and hbody >= 0.52 else "MEDIUM"
+    confirmation_text = "4/4" if votes == 4 else "3/4"
     reason = (
-        f"Confluência {direction}: Heikin-Ashi forte + EMA 9/21 + RSI 14 {r14:.1f} + "
-        f"MACD 12/26/9 confirmados" + (" + rompimento recente." if breakout else ".")
+        f"Rubik {direction} liberado com {confirmation_text} confirmações: EMA 9/21 obrigatória + "
+        f"{votes-1} confirmações entre Heikin-Ashi, RSI 14 e MACD 12/26/9"
+        + (" + rompimento recente." if breakout else ".")
     )
+    diagnostics.update({
+        "heikin_ashi": "CALL" if ha_call else ("PUT" if ha_put else "NEUTRO"),
+        "ema_9": round(float(e9), 8),
+        "ema_21": round(float(e21), 8),
+        "macd": round(float(macd["line"]), 8),
+        "macd_signal": round(float(macd["signal"]), 8),
+        "breakout": bool(breakout),
+        "votes_used": votes,
+    })
     return {
         "available": True,
         "direction": direction,
@@ -6744,15 +6805,8 @@ def rubik_adapted_strategy(cs, timeframe="1min", market="OPEN"):
         "external_ai_disabled": True,
         "gale_signal": False,
         "non_repaint": True,
-        "diagnostics": {
-            "heikin_ashi": direction,
-            "ema_9": round(float(e9), 8),
-            "ema_21": round(float(e21), 8),
-            "rsi_14": round(float(r14), 2),
-            "macd": round(float(macd["line"]), 8),
-            "macd_signal": round(float(macd["signal"]), 8),
-            "breakout": bool(breakout),
-        },
+        "confirmation_rule": "EMA + 2_DE_3",
+        "diagnostics": diagnostics,
     }
 
 
@@ -13982,7 +14036,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Robô Rubik Adaptado">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧩 ROBÔ RUBIK ADAPTADO</div>
-      <div class="robot-mode-desc" id="rubikModeDesc">Heikin-Ashi + EMA 9/21 + RSI 14 + MACD 12/26/9 • OPEN + OTC IQ • próxima vela • sem repaint.</div>
+      <div class="robot-mode-desc" id="rubikModeDesc">Heikin-Ashi + EMA 9/21 + RSI 14 + MACD 12/26/9 • EMA obrigatória + 2 de 3 confirmações • OPEN + OTC IQ • próxima vela.</div>
     </div>
     <button id="rubikPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -17792,7 +17846,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: RSI 14 + Value Chart + XGBoost • sinal somente com tripla confirmação • OPEN/OTC.'
     : 'OFFLINE: EA RSI + Value Chart + XGBoost pausada.';
   if(rubikModeDesc) rubikModeDesc.textContent=rubikEnabled
-    ? 'ONLINE: Heikin-Ashi + EMA 9/21 + RSI 14 + MACD • OPEN/OTC • próxima vela.'
+    ? 'ONLINE: Rubik mais ativo • EMA 9/21 obrigatória + 2 de 3 entre Heikin-Ashi, RSI e MACD • OPEN/OTC.'
     : 'OFFLINE: Robô Rubik Adaptado pausado.';
   if(forceModeDesc) forceModeDesc.textContent=forceEnabled
     ? 'ONLINE: OPEN multifuente para qualquer corretora Forex • OTC pela IQ Option • configuração protegida • sem Gale.'
@@ -17805,7 +17859,7 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar do EA Força do Movimento ativo • OPEN multifuente / OTC pela IQ Option</div>';
     rad();
   }else if(engine==='RUBIK'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔ RUBIK ADAPTADO ONLINE • HEIKIN-ASHI + EMA + RSI + MACD • OPEN + OTC';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔ RUBIK ADAPTADO ONLINE • MODO MAIS ATIVO • EMA + 2 DE 3 CONFIRMAÇÕES • OPEN + OTC';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧩 Robô Rubik Adaptado selecionado • sinal somente com confluência completa.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Robô Rubik ativo • Heikin-Ashi + EMA 9/21 + RSI 14 + MACD • OPEN/OTC</div>';
     rad();
