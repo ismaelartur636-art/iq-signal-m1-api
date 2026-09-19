@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.39"
-PWA_VERSION = "v106"
+APP_VERSION = "3.40"
+PWA_VERSION = "v107"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -310,7 +310,7 @@ CHART_SIGNAL_CONFIRM_MAX_GAP = 6
 PRE_SIGNAL_TTL = 75
 PRE_SIGNAL_BATCH = 1
 
-# MEGA IA 3.39 — EA invisível de confirmação da vela em formação.
+# MEGA IA 3.40 — EA invisível de gatilho + confirmação da vela em formação.
 # Ela acompanha o pré-alerta e mede força/micro-momento nos últimos segundos.
 # Quando existe feed de trades reais (Binance), usa trades/ticks reais. Em fontes
 # sem tape de ticks no backend, usa micro-amostras sucessivas da vela atual e
@@ -7036,8 +7036,8 @@ def _pure_ai_candle_pattern_filter(cs, expected_direction="NEUTRO"):
     }
 
 
-async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
-    """IA PURA com três gatilhos independentes no mercado aberto.
+async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=None):
+    """IA PURA com gatilhos independentes + micro-momento real da vela atual.
 
     Gatilhos independentes:
       1) padrão de vela forte em OHLC fechado;
@@ -7072,7 +7072,24 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
     new_candle = bool(last_candle and last_candle != live.get("datetime"))
     min_gap = 12.0
     heartbeat = float(INTERVALS.get(interval, 60))
-    should_call = last_call <= 0 or new_candle
+
+    # 3.40: um micro-momento REAL confirmado nos segundos finais pode pedir
+    # uma nova revisão da Luna mesmo dentro da mesma vela fechada. Antes a IA
+    # só reavaliava na troca de candle e podia perder exatamente o pré-alerta.
+    moment_hint = dict(moment_hint or {})
+    moment_direction = str(moment_hint.get("direction") or "NEUTRO").upper()
+    moment_score = float(moment_hint.get("score") or 0.0)
+    moment_entry = str(moment_hint.get("entry_time") or "")
+    moment_fp = ""
+    if (
+        moment_hint.get("confirmed")
+        and moment_hint.get("tick_ready")
+        and moment_direction in ("CALL", "PUT")
+        and moment_score >= MOMENT_EA_CONFIRM_SCORE
+    ):
+        moment_fp = f"{moment_direction}|{moment_entry}|{int(moment_score)}"
+    moment_changed = bool(moment_fp and moment_fp != str(st.get("moment_fingerprint") or ""))
+    should_call = last_call <= 0 or new_candle or moment_changed
 
     st.update({
         "candle_time": live.get("datetime"),
@@ -7080,6 +7097,8 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
         "volume": volume,
         "last_scan": now_ts,
     })
+    if moment_fp:
+        st["moment_fingerprint"] = moment_fp
 
     if not should_call and st.get("last_result"):
         cached = dict(st["last_result"])
@@ -7172,6 +7191,26 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN"):
         local_triggers.append({
             "direction": "PUT", "confidence": 84.0, "provider": "H1_REGION_TRIGGER",
             "setup": "REJECTION", "reason": "Preço tocou resistência H1 validada por pivôs recorrentes.",
+        })
+
+    # GATILHO 3.40 — EA Vela Atual. Diferente da 3.39, o tick/momento forte
+    # também pode INICIAR a revisão da IA, não apenas vetar um sinal que já existia.
+    # Ainda não libera entrada sozinho: Luna + XGBoost + gate final continuam.
+    if (
+        moment_hint.get("confirmed")
+        and moment_hint.get("tick_ready")
+        and moment_direction in ("CALL", "PUT")
+        and moment_score >= MOMENT_EA_CONFIRM_SCORE
+    ):
+        local_triggers.append({
+            "direction": moment_direction,
+            "confidence": round(max(82.0, min(92.0, 76.0 + (moment_score - 60.0) * 0.55)), 1),
+            "provider": "EA_VELA_TICK_TRIGGER",
+            "setup": "TREND",
+            "reason": (
+                f"EA Vela Atual detectou micro-momento real {moment_direction} "
+                f"com força {moment_score:.0f}% em {int(moment_hint.get('ticks') or 0)} ticks."
+            ),
         })
 
     local_dirs = {x["direction"] for x in local_triggers}
@@ -7271,6 +7310,8 @@ CAMADA ESTATÍSTICA XGBOOST (não copie cegamente; use como evidência quantitat
 {json.dumps(xgb_signal, ensure_ascii=False)}
 CONTEXTO LOCAL FORTE, se houver:
 {json.dumps(local_trigger_hint, ensure_ascii=False)}
+MICRO-MOMENTO AO VIVO DA EA VELA ATUAL, se confirmado por ticks reais (use como evidência adicional, nunca cegamente):
+{json.dumps(moment_hint if moment_fp else {}, ensure_ascii=False)}
 
 Retorne SOMENTE JSON válido:
 {{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"setup":"TREND|REVERSAL|BREAKOUT|REJECTION|NONE","reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
@@ -7374,6 +7415,7 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             "h1_filter": h1_filter,
             "candle_pattern_filter": candle_pattern_filter,
             "local_trigger_hint": local_trigger_hint,
+            "moment_ea_hint": moment_hint if moment_fp else {},
             "xgboost": xgb_signal,
             "ensemble": {
                 "xgb_ready": xgb_ready,
@@ -8126,7 +8168,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # decisão independente do Robô Principal.
             engine_closed = (closed[-220:] if engine == "SMART" else (closed[-90:] if len(closed) > 90 else closed))
             if engine == "SMART":
-                analysis = await openai_direct_signal(symbol, interval, engine_closed, market)
+                moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
+                analysis = await openai_direct_signal(
+                    symbol, interval, engine_closed, market, moment_hint=moment_hint
+                )
             elif engine in ("EA", "FORCE"):
                 if engine == "FORCE" and market == "OPEN":
                     # Multibroker OPEN: HTFs vêm do roteador público, sem login da IQ.
@@ -9348,7 +9393,7 @@ async def health():
         },
         "moment_ea": {
             "enabled": bool(MOMENT_EA_ENABLED),
-            "role": "CONFIRMACAO DA VELA EM FORMACAO",
+            "role": "GATILHO + CONFIRMACAO DA VELA EM FORMACAO",
             "window_seconds": MOMENT_EA_WINDOW_SECONDS,
             "confirm_score": MOMENT_EA_CONFIRM_SCORE,
             "veto_score": MOMENT_EA_VETO_SCORE,
@@ -11594,7 +11639,12 @@ def _moment_ea_gate_for_signal(market: str, symbol: str, interval: str, directio
     confirmed = bool(source.get("confirmed") and source_direction == direction)
     return {
         "available": True,
-        "required": bool(tick_ready and active_window),
+        # Tick tape só vira trava obrigatória quando há direção/força realmente
+        # decisivas. Tape neutro ou fraco continua como contexto e não zera sinais.
+        "required": bool(
+            tick_ready and active_window and source_direction in ("CALL", "PUT")
+            and score >= MOMENT_EA_CONFIRM_SCORE
+        ),
         "confirmed": confirmed,
         "hard_veto": hard_veto,
         "direction": source_direction,
@@ -11607,6 +11657,28 @@ def _moment_ea_gate_for_signal(market: str, symbol: str, interval: str, directio
         "entry_time": wanted_entry,
         "reason": str(source.get("reason") or "")[:220],
     }
+
+
+def _moment_ea_context_for_ai(market: str, symbol: str, interval: str) -> Dict[str, Any]:
+    """Entrega à IA somente um micro-momento recente e confirmado por ticks reais."""
+    _moment_ea_prune()
+    key = _moment_ea_key(market, symbol, interval)
+    with moment_ea_guard:
+        state = dict(moment_ea_state.get(key) or {})
+    if not state:
+        return {}
+    age = max(0.0, time.time() - float(state.get("updated_at") or 0.0))
+    direction = str(state.get("direction") or "NEUTRO").upper()
+    if (
+        age > 75.0
+        or not state.get("confirmed")
+        or not state.get("tick_ready")
+        or direction not in ("CALL", "PUT")
+        or float(state.get("score") or 0.0) < MOMENT_EA_CONFIRM_SCORE
+    ):
+        return {}
+    state["age_seconds"] = round(age, 1)
+    return state
 
 
 async def _moment_ea_confirm_live_candle(
@@ -11630,7 +11702,9 @@ async def _moment_ea_confirm_live_candle(
         "window_seconds": MOMENT_EA_WINDOW_SECONDS,
         "reason": "EA Vela Atual aguardando janela final.",
     }
-    if not MOMENT_EA_ENABLED or direction not in ("CALL", "PUT") or not raw:
+    requested_direction = str(direction or "").upper()
+    auto_mode = requested_direction not in ("CALL", "PUT")
+    if not MOMENT_EA_ENABLED or not raw:
         return base
 
     try:
@@ -11691,8 +11765,9 @@ async def _moment_ea_confirm_live_candle(
         signed_force = 0.46 * pressure + 0.27 * price_component + 0.17 * candle_signed + 0.10 * close_component
         bias = "CALL" if signed_force >= 0.08 else ("PUT" if signed_force <= -0.08 else "NEUTRO")
         score = max(0.0, min(100.0, 50.0 + abs(signed_force) * 50.0))
-        wanted_sign = 1 if direction == "CALL" else -1
-        reversal = bool((tail_pressure * wanted_sign) <= -0.38 and len(tail) >= 4)
+        wanted_direction = bias if auto_mode else requested_direction
+        wanted_sign = 1 if wanted_direction == "CALL" else (-1 if wanted_direction == "PUT" else 0)
+        reversal = bool(wanted_sign and (tail_pressure * wanted_sign) <= -0.38 and len(tail) >= 4)
         detail.append(f"ticks reais {tick_count}")
         detail.append(f"pressão {pressure*100:+.0f}%")
         detail.append(f"velocidade {velocity:.1f}/s")
@@ -11713,18 +11788,26 @@ async def _moment_ea_confirm_live_candle(
         detail.append(f"micro-amostras {tick_count}")
         detail.append("sem tape real de ticks")
 
-    aligned = bias == direction
-    confirmed = bool(in_final_window and tick_ready and aligned and score >= MOMENT_EA_CONFIRM_SCORE and not reversal)
+    aligned = (bias in ("CALL", "PUT")) if auto_mode else (bias == requested_direction)
+    confirmed = bool(
+        in_final_window and tick_ready and bias in ("CALL", "PUT")
+        and aligned and score >= MOMENT_EA_CONFIRM_SCORE and not reversal
+    )
+    target_direction = bias if auto_mode else requested_direction
     if not in_final_window:
         reason = f"EA Vela Atual coletando momento; confirmação forte nos últimos {MOMENT_EA_WINDOW_SECONDS}s."
     elif confirmed:
-        reason = f"EA Vela Atual confirmou {direction}: " + ", ".join(detail[:3]) + "."
+        reason = f"EA Vela Atual confirmou {target_direction}: " + ", ".join(detail[:3]) + "."
     elif tick_ready and reversal:
-        reason = f"EA Vela Atual bloqueou {direction}: reversão forte nos ticks finais."
-    elif tick_ready and bias in ("CALL", "PUT") and not aligned:
+        reason = f"EA Vela Atual bloqueou {target_direction}: reversão forte nos ticks finais."
+    elif tick_ready and (not auto_mode) and bias in ("CALL", "PUT") and not aligned:
         reason = f"EA Vela Atual divergiu do pré-alerta: micro-momento {bias} com força {score:.0f}%."
     elif tick_ready:
-        reason = f"EA Vela Atual ainda sem força suficiente ({score:.0f}%) para confirmar {direction}."
+        reason = (
+            f"EA Vela Atual ainda sem força suficiente ({score:.0f}%) para confirmar direção."
+            if auto_mode else
+            f"EA Vela Atual ainda sem força suficiente ({score:.0f}%) para confirmar {requested_direction}."
+        )
     else:
         reason = "EA Vela Atual monitorando corpo/direção; tape real de ticks não disponível nesta fonte."
 
@@ -11740,6 +11823,8 @@ async def _moment_ea_confirm_live_candle(
         "velocity": round(float(velocity), 2),
         "reversal": reversal,
         "aligned_with_prealert": aligned,
+        "requested_direction": requested_direction,
+        "auto_mode": auto_mode,
         "feed_source": feed_src,
         "reason": reason,
     }
@@ -11875,23 +11960,43 @@ async def pre_signals(
             )
 
             preview = _pre_signal_from_live_candle(raw, interval, market, symbol)
+            moment_ea = None
+
+            # 3.40: no SMART a EA Vela Atual varre os ticks MESMO quando o antigo
+            # pré-sinal técnico ainda não apareceu. Um micro-momento forte cria
+            # somente um CANDIDATO; o sinal final ainda depende de Luna + XGBoost.
+            if engine == "SMART":
+                try:
+                    requested_direction = preview["direction"] if preview else "AUTO"
+                    moment_ea = await _moment_ea_confirm_live_candle(
+                        raw, symbol, interval, market, requested_direction,
+                        seconds_to_entry, entry_dt,
+                    )
+                    if (
+                        not preview
+                        and moment_ea.get("confirmed")
+                        and moment_ea.get("tick_ready")
+                        and moment_ea.get("direction") in ("CALL", "PUT")
+                    ):
+                        mscore = float(moment_ea.get("score") or 0.0)
+                        preview = {
+                            "direction": moment_ea["direction"],
+                            "confidence": round(max(74.0, min(88.0, 70.0 + max(0.0, mscore - 60.0) * 0.45)), 1),
+                            "strategy": "EA VELA ATUAL + LUNA + XGBOOST",
+                            "reason": (
+                                f"Ticks reais detectaram micro-momento {moment_ea['direction']} "
+                                f"com força {mscore:.0f}%; candidato enviado para confirmação da IA."
+                            ),
+                        }
+                except Exception as exc:
+                    moment_ea = {
+                        "enabled": True, "active": seconds_to_entry <= MOMENT_EA_WINDOW_SECONDS,
+                        "confirmed": False, "direction": "NEUTRO", "score": 0.0,
+                        "tick_ready": False, "tick_source": "ERROR", "ticks": 0,
+                        "reason": f"EA Vela Atual indisponível: {str(exc)[:140]}",
+                    }
 
             if preview:
-                moment_ea = None
-                if engine == "SMART":
-                    try:
-                        moment_ea = await _moment_ea_confirm_live_candle(
-                            raw, symbol, interval, market, preview["direction"],
-                            seconds_to_entry, entry_dt,
-                        )
-                    except Exception as exc:
-                        moment_ea = {
-                            "enabled": True, "active": seconds_to_entry <= MOMENT_EA_WINDOW_SECONDS,
-                            "confirmed": False, "direction": "NEUTRO", "score": 0.0,
-                            "tick_ready": False, "tick_source": "ERROR", "ticks": 0,
-                            "reason": f"EA Vela Atual indisponível: {str(exc)[:140]}",
-                        }
-
                 status = "PRÉ-SINAL • AGUARDANDO FECHAMENTO"
                 if moment_ea:
                     if moment_ea.get("confirmed"):
