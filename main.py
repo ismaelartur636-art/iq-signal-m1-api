@@ -220,48 +220,45 @@ def heiken_ashi_arrows_strategy(cs, timeframe="1min", market="OPEN"):
 
 # ===== FIM RENKO HASHI PRO =====
 
-# ===== FRACTAL PRO (adaptado, limpo e sem repaint) =====
-def fractal_pro_strategy(cs, timeframe="1min", market="OPEN"):
-    """Adaptação do script Fractal Pro para o MEGA IA.
+# ===== SCALPER PA (Price Action + MACD + CCI + RSI, sem repaint) =====
+def scalper_pa_strategy(cs, timeframe="1min", market="OPEN"):
+    """Motor SCALPER PA adaptado para opções binárias.
 
-    Mantém a lógica útil do script original:
-      • microtendência EMA 11;
-      • macrotendência EMA 100;
-      • médias rápidas EMA 3 / EMA 13 sobre HLC3;
-      • máxima/mínima de 11 candles como resistência/suporte;
-      • padrões de reversão e padrão Fractal Pro UP/DOWN.
-
-    Melhoria principal: somente candles FECHADOS podem confirmar sinal. O trecho
-    ZigZag/pivô do script original não é usado para entrada porque pode reposicionar
-    pivôs enquanto o preço evolui. Assim, o sinal confirmado não repinta.
+    Regras principais:
+      • usa somente candles FECHADOS;
+      • Price Action: engolfo ou candle de força;
+      • MACD mais rápido no M1 (8/17/6) e padrão 12/26/9 nos demais TFs;
+      • CCI 14 e RSI 14 como confirmações;
+      • pontuação por confluência, sem exigir os quatro filtros simultaneamente;
+      • CALL/PUT com expiração de 1 vela, sem SL/TP/trailing/lote do EA Forex.
     """
     rows = list(cs or [])
     tf_label = {"1min": "M1", "5min": "M5", "15min": "M15", "30min": "M30"}.get(timeframe, timeframe)
-    name = f"FRACTAL PRO {tf_label}"
+    name = f"SCALPER PA {tf_label}"
 
     def neutral(reason, diagnostics=None, confidence=0.0):
-        out = {
+        result = {
             "available": True,
             "direction": "NEUTRO",
             "confidence": round(float(confidence or 0.0), 1),
             "confirmed": False,
             "risk": "HIGH",
             "strategy": name,
-            "engine": "PRICE70",  # ID interno mantido para compatibilidade do painel.
-            "provider": "LOCAL_FRACTAL_PRO",
+            "engine": "SCALPER",
+            "provider": "LOCAL_SCALPER_PA",
             "reason": reason,
             "non_repaint": True,
             "closed_candles_only": True,
             "external_ai_disabled": True,
             "gale_signal": False,
-            "fractal_pro_adapted": True,
+            "scalper_pa_adapted": True,
         }
         if diagnostics is not None:
-            out["diagnostics"] = diagnostics
-        return out
+            result["diagnostics"] = diagnostics
+        return result
 
-    if len(rows) < 105:
-        return neutral(f"Aguardando histórico fechado suficiente para o Fractal Pro ({len(rows)}/105).")
+    if len(rows) < 45:
+        return neutral(f"Aguardando histórico fechado suficiente para o Scalper PA ({len(rows)}/45).")
 
     try:
         opens = [float(x["open"]) for x in rows]
@@ -269,172 +266,194 @@ def fractal_pro_strategy(cs, timeframe="1min", market="OPEN"):
         lows = [float(x["low"]) for x in rows]
         closes = [float(x["close"]) for x in rows]
     except Exception:
-        return neutral("Dados OHLC inválidos para a leitura do Fractal Pro.")
-
-    hlc3 = [(h + l + c) / 3.0 for h, l, c in zip(highs, lows, closes)]
+        return neutral("Dados OHLC inválidos para a leitura do Scalper PA.")
 
     def ema_full(values, period):
         if len(values) < period:
             return []
         k = 2.0 / (period + 1.0)
-        seed = sum(values[:period]) / float(period)
-        out = [None] * (period - 1) + [seed]
-        cur = seed
+        cur = sum(values[:period]) / float(period)
+        result = [None] * (period - 1) + [cur]
         for value in values[period:]:
             cur = float(value) * k + cur * (1.0 - k)
-            out.append(cur)
-        return out
+            result.append(cur)
+        return result
 
-    e11 = ema_full(closes, 11)
-    e100 = ema_full(closes, 100)
-    e3 = ema_full(hlc3, 3)
-    e13 = ema_full(hlc3, 13)
-    if not e11 or not e100 or not e3 or not e13:
-        return neutral("Histórico insuficiente para as médias do Fractal Pro.")
+    def rsi_last(values, period=14):
+        if len(values) < period + 1:
+            return None
+        gains, losses = [], []
+        for i in range(len(values) - period, len(values)):
+            diff = values[i] - values[i - 1]
+            gains.append(max(diff, 0.0))
+            losses.append(max(-diff, 0.0))
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+        if avg_loss <= 1e-12:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
 
-    o, h, l, c = opens[-1], highs[-1], lows[-1], closes[-1]
-    po, ph, pl, pc = opens[-2], highs[-2], lows[-2], closes[-2]
-    eps = 1e-12
-    body = abs(c - o)
-    rng = max(h - l, eps)
-    body_ratio = body / rng
+    def cci_last(highs_, lows_, closes_, period=14):
+        if len(closes_) < period:
+            return None
+        typical = [(h + l + c) / 3.0 for h, l, c in zip(highs_, lows_, closes_)]
+        sample = typical[-period:]
+        mean = sum(sample) / period
+        dev = sum(abs(x - mean) for x in sample) / period
+        if dev <= 1e-12:
+            return 0.0
+        return (sample[-1] - mean) / (0.015 * dev)
 
-    ema11_now, ema11_prev = e11[-1], e11[-2]
-    ema100_now = e100[-1]
-    ema3_now, ema3_prev = e3[-1], e3[-2]
-    ema13_now, ema13_prev = e13[-1], e13[-2]
+    # MACD mais ágil no M1 para reduzir atraso; demais timeframes preservam 12/26/9.
+    if timeframe == "1min":
+        macd_fast, macd_slow, macd_signal_period = 8, 17, 6
+    else:
+        macd_fast, macd_slow, macd_signal_period = 12, 26, 9
 
-    # Linhas Max/Min do script original, usando as 11 velas anteriores para
-    # não transformar a própria vela gatilho em suporte/resistência.
-    prior_highs = highs[-12:-1]
-    prior_lows = lows[-12:-1]
-    resistance = max(prior_highs) if prior_highs else ph
-    support = min(prior_lows) if prior_lows else pl
-    channel = max(resistance - support, eps)
+    ef = ema_full(closes, macd_fast)
+    es = ema_full(closes, macd_slow)
+    start = max(macd_fast, macd_slow) - 1
+    macd_line = []
+    for i in range(start, len(closes)):
+        if i < len(ef) and i < len(es) and ef[i] is not None and es[i] is not None:
+            macd_line.append(float(ef[i]) - float(es[i]))
+    sig_line = ema_full(macd_line, macd_signal_period)
+    valid_sig = [(m, s) for m, s in zip(macd_line, sig_line) if s is not None]
+    if len(valid_sig) < 2:
+        return neutral("Histórico insuficiente para calcular o MACD do Scalper PA.")
 
-    # TA/TB do script original: direção + posição e inclinação da EMA 11.
-    ta = bool(c > pc and c > ema11_now and ema11_now > ema11_prev)
-    tb = bool(c < pc and c < ema11_now and ema11_now < ema11_prev)
+    macd_prev, signal_prev = valid_sig[-2]
+    macd_now, signal_now = valid_sig[-1]
+    hist_prev = macd_prev - signal_prev
+    hist_now = macd_now - signal_now
+    macd_buy = macd_now > signal_now
+    macd_sell = macd_now < signal_now
+    cross_up = macd_prev <= signal_prev and macd_now > signal_now
+    cross_down = macd_prev >= signal_prev and macd_now < signal_now
 
-    # ENC/ENV: cruzamento EMA 3 x EMA 13 em HLC3.
-    enc = bool(ema3_prev <= ema13_prev and ema3_now > ema13_now)
-    env = bool(ema3_prev >= ema13_prev and ema3_now < ema13_now)
-    fast_bull = bool(ema3_now > ema13_now)
-    fast_bear = bool(ema3_now < ema13_now)
+    cci_now = cci_last(highs, lows, closes, 14)
+    rsi_now = rsi_last(closes, 14)
+    if cci_now is None or rsi_now is None:
+        return neutral("Histórico insuficiente para CCI/RSI do Scalper PA.")
 
-    # Padrões desenhados pelo script original. O contexto close[2] foi mantido,
-    # mas a execução só ocorre após o fechamento da vela atual.
-    c2 = closes[-3]
-    bull_reversal = bool(pc < po and c > o and c > ph and c2 >= o)
-    bear_reversal = bool(pc > po and c < o and c < pl and c2 <= o)
+    o1, h1, l1, c1 = opens[-1], highs[-1], lows[-1], closes[-1]
+    o2, c2 = opens[-2], closes[-2]
+    rng = max(h1 - l1, 1e-12)
+    body_ratio = abs(c1 - o1) / rng
 
-    # Padrão FRACTAL PRO UP/DOWN original.
-    bull_fractal = bool(c > pc and pc > opens[-3] and closes[-4] > closes[-3])
-    bear_fractal = bool(c < pc and pc < opens[-3] and closes[-4] < closes[-3])
-
-    # Qualidade mínima da vela: evita dojis/velas quase sem corpo virarem entrada.
-    body_ok = body_ratio >= 0.22
-
-    call_trigger = bool(body_ok and (bull_reversal or bull_fractal))
-    put_trigger = bool(body_ok and (bear_reversal or bear_fractal))
+    bull_engulf = bool(c1 > o1 and c2 < o2 and c1 > o2 and o1 < c2)
+    bear_engulf = bool(c1 < o1 and c2 > o2 and c1 < o2 and o1 > c2)
+    bull_force = bool(c1 > o1 and body_ratio >= 0.55)
+    bear_force = bool(c1 < o1 and body_ratio >= 0.55)
+    bull_pa = bull_engulf or bull_force
+    bear_pa = bear_engulf or bear_force
 
     call_score = 0.0
     put_score = 0.0
-    call_reasons = []
-    put_reasons = []
+    call_reasons, put_reasons = [], []
+    call_families, put_families = set(), set()
 
-    if bull_reversal:
-        call_score += 38; call_reasons.append("padrão de reversão comprador do Fractal Pro")
-    if bull_fractal:
-        call_score += 32; call_reasons.append("padrão Fractal Pro UP")
-    if bear_reversal:
-        put_score += 38; put_reasons.append("padrão de reversão vendedor do Fractal Pro")
-    if bear_fractal:
-        put_score += 32; put_reasons.append("padrão Fractal Pro DOWN")
+    if bull_pa:
+        call_score += 36.0 if bull_engulf else 28.0
+        call_reasons.append("engolfo comprador" if bull_engulf else "candle de força comprador")
+        call_families.add("PA")
+    if bear_pa:
+        put_score += 36.0 if bear_engulf else 28.0
+        put_reasons.append("engolfo vendedor" if bear_engulf else "candle de força vendedor")
+        put_families.add("PA")
 
-    if ta:
-        call_score += 20; call_reasons.append("microtendência EMA 11 de alta")
-    if tb:
-        put_score += 20; put_reasons.append("microtendência EMA 11 de baixa")
+    if macd_buy:
+        call_score += 22.0
+        call_reasons.append("MACD comprador")
+        call_families.add("MACD")
+        if cross_up:
+            call_score += 6.0
+            call_reasons.append("cruzamento MACD para cima")
+        if hist_now > hist_prev:
+            call_score += 4.0
+            call_reasons.append("histograma MACD ganhando força")
+    if macd_sell:
+        put_score += 22.0
+        put_reasons.append("MACD vendedor")
+        put_families.add("MACD")
+        if cross_down:
+            put_score += 6.0
+            put_reasons.append("cruzamento MACD para baixo")
+        if hist_now < hist_prev:
+            put_score += 4.0
+            put_reasons.append("histograma MACD ganhando força")
 
-    if fast_bull:
-        call_score += 12; call_reasons.append("EMA 3 acima da EMA 13")
-    if fast_bear:
-        put_score += 12; put_reasons.append("EMA 3 abaixo da EMA 13")
-    if enc:
-        call_score += 8; call_reasons.append("cruzamento comprador EMA 3/13")
-    if env:
-        put_score += 8; put_reasons.append("cruzamento vendedor EMA 3/13")
+    if cci_now > 0:
+        call_score += 17.0
+        call_reasons.append("CCI acima de zero")
+        call_families.add("CCI")
+        if cci_now >= 100:
+            call_score += 3.0
+    elif cci_now < 0:
+        put_score += 17.0
+        put_reasons.append("CCI abaixo de zero")
+        put_families.add("CCI")
+        if cci_now <= -100:
+            put_score += 3.0
 
-    if c > ema100_now:
-        call_score += 10; call_reasons.append("macro EMA 100 favorável")
-    elif c < ema100_now:
-        put_score += 10; put_reasons.append("macro EMA 100 favorável")
+    if 50.0 < rsi_now < 70.0:
+        call_score += 17.0
+        call_reasons.append("RSI comprador sem sobrecompra")
+        call_families.add("RSI")
+        if 52.0 <= rsi_now <= 66.0:
+            call_score += 3.0
+    elif 30.0 < rsi_now < 50.0:
+        put_score += 17.0
+        put_reasons.append("RSI vendedor sem sobrevenda")
+        put_families.add("RSI")
+        if 34.0 <= rsi_now <= 48.0:
+            put_score += 3.0
 
-    # Suporte/resistência de 11 períodos: breakout ou rejeição em região útil.
-    if c > resistance:
-        call_score += 10; call_reasons.append("rompimento da máxima de 11 períodos")
-    elif (c - support) / channel <= 0.22:
-        call_score += 5; call_reasons.append("próximo ao suporte de 11 períodos")
-    if c < support:
-        put_score += 10; put_reasons.append("rompimento da mínima de 11 períodos")
-    elif (resistance - c) / channel <= 0.22:
-        put_score += 5; put_reasons.append("próximo à resistência de 11 períodos")
+    # Evita perseguir movimento já excessivamente esticado.
+    if rsi_now >= 75.0:
+        call_score -= 20.0
+    if rsi_now <= 25.0:
+        put_score -= 20.0
 
     diagnostics = {
-        "ema11": round(ema11_now, 8),
-        "ema100": round(ema100_now, 8),
-        "ema3_hlc3": round(ema3_now, 8),
-        "ema13_hlc3": round(ema13_now, 8),
-        "micro_up": ta,
-        "micro_down": tb,
-        "cross_up": enc,
-        "cross_down": env,
-        "bull_reversal": bull_reversal,
-        "bear_reversal": bear_reversal,
-        "bull_fractal": bull_fractal,
-        "bear_fractal": bear_fractal,
+        "macd_fast": macd_fast,
+        "macd_slow": macd_slow,
+        "macd_signal_period": macd_signal_period,
+        "macd": round(macd_now, 8),
+        "macd_signal": round(signal_now, 8),
+        "macd_hist": round(hist_now, 8),
+        "cci14": round(cci_now, 2),
+        "rsi14": round(rsi_now, 2),
         "body_ratio": round(body_ratio, 4),
-        "resistance_11": round(resistance, 8),
-        "support_11": round(support, 8),
+        "bull_engulf": bull_engulf,
+        "bear_engulf": bear_engulf,
+        "bull_force": bull_force,
+        "bear_force": bear_force,
         "call_score": round(call_score, 1),
         "put_score": round(put_score, 1),
-        "zigzag_entry_disabled": True,
+        "call_confirmations": len(call_families),
+        "put_confirmations": len(put_families),
     }
 
-    # Um padrão do próprio Fractal Pro é obrigatório. Médias e níveis confirmam
-    # e aumentam a confiança, mas não criam sinal sozinhos.
-    min_score = 48.0
-    if call_trigger and put_trigger:
-        if abs(call_score - put_score) < 8.0:
-            return neutral("Fractal Pro detectou sinais conflitantes no mesmo fechamento; aguardando nova vela.", diagnostics, max(call_score, put_score))
-        direction = "CALL" if call_score > put_score else "PUT"
-    elif call_trigger:
-        direction = "CALL"
-    elif put_trigger:
-        direction = "PUT"
+    min_score = 58.0
+    min_edge = 10.0
+    call_ok = call_score >= min_score and len(call_families) >= 2 and (call_score - put_score) >= min_edge
+    put_ok = put_score >= min_score and len(put_families) >= 2 and (put_score - call_score) >= min_edge
+
+    if call_ok and not put_ok:
+        direction, score, reasons = "CALL", call_score, call_reasons
+    elif put_ok and not call_ok:
+        direction, score, reasons = "PUT", put_score, put_reasons
     else:
-        return neutral(
-            "Fractal Pro monitorando: aguardando padrão UP/DOWN ou reversão confirmado em vela fechada.",
-            diagnostics,
-            min(69.0, max(call_score, put_score)),
-        )
+        best = max(call_score, put_score)
+        if abs(call_score - put_score) < min_edge and best >= min_score:
+            reason = "Scalper PA encontrou forças conflitantes; aguardando novo candle fechado."
+        else:
+            reason = f"Scalper PA monitorando confluência (CALL {call_score:.0f} / PUT {put_score:.0f}; mínimo {min_score:.0f})."
+        return neutral(reason, diagnostics, min(69.0, max(0.0, best)))
 
-    score = call_score if direction == "CALL" else put_score
-    reasons = call_reasons if direction == "CALL" else put_reasons
-    if score < min_score:
-        return neutral(
-            f"Padrão {direction} encontrado, mas a confirmação do Fractal Pro ainda está fraca ({score:.0f}/{min_score:.0f}).",
-            diagnostics,
-            min(69.0, score),
-        )
-
-    confidence = _clamp(62.0 + (score - min_score) * 0.62, 68.0, 94.0)
-    setup = (
-        "REVERSAL_UP" if direction == "CALL" and bull_reversal else
-        "FRACTAL_UP" if direction == "CALL" else
-        "REVERSAL_DOWN" if bear_reversal else "FRACTAL_DOWN"
-    )
+    confidence = max(70.0, min(94.0, 70.0 + (score - min_score) * 0.58))
     return {
         "available": True,
         "direction": direction,
@@ -442,22 +461,22 @@ def fractal_pro_strategy(cs, timeframe="1min", market="OPEN"):
         "confirmed": True,
         "risk": "LOW" if confidence >= 84.0 else "MEDIUM",
         "strategy": name,
-        "engine": "PRICE70",
-        "provider": "LOCAL_FRACTAL_PRO",
-        "reason": f"{direction} confirmado pelo Fractal Pro: " + "; ".join(reasons[:5]) + ". Entrada na próxima vela.",
+        "engine": "SCALPER",
+        "provider": "LOCAL_SCALPER_PA",
+        "reason": f"{direction} confirmado pelo Scalper PA: " + "; ".join(reasons[:6]) + ". Entrada na próxima vela.",
         "non_repaint": True,
         "closed_candles_only": True,
         "external_ai_disabled": True,
         "gale_signal": False,
-        "fractal_pro_adapted": True,
-        "setup": setup,
+        "scalper_pa_adapted": True,
+        "expiry_candles": 1,
         "diagnostics": diagnostics,
     }
 
-# ===== FIM FRACTAL PRO =====
+# ===== FIM SCALPER PA =====
 
-APP_VERSION = "3.55"
-PWA_VERSION = "v122"
+APP_VERSION = "3.56"
+PWA_VERSION = "v123"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -8848,13 +8867,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
-    # Fractal Pro sempre entra na vela imediatamente seguinte ao candle gatilho.
+    # Scalper PA sempre entra na vela imediatamente seguinte ao candle gatilho.
     # Portanto este motor força o modo BIRTH e ignora MIDDLE/CLOSE.
-    if engine == "PRICE70":
+    if engine == "SCALPER":
         entry_mode = "BIRTH"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "PRICE70"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "SCALPER"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
@@ -8913,20 +8932,20 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 raw = await candles(
                     symbol, interval, request_n, "OPEN", None, request=request
                 )
-        elif engine == "PRICE70":
-            # Fractal Pro: OPEN usa o roteador multifuente; OTC usa IQ Option real.
+        elif engine == "SCALPER":
+            # Scalper PA: OPEN usa o roteador multifuente; OTC usa IQ Option real.
             if market == "IQ_OTC":
                 if not iq_state:
                     out = neutral_signal(
                         symbol, interval, market,
-                        "FRACTAL PRO • IQ OPTION OFFLINE",
+                        "SCALPER PA • IQ OPTION OFFLINE",
                         "Conecte a IQ Option para este robô analisar OTC real.",
                         source_state="WAITING",
                     )
                     out.update({
-                        "strategy": "FRACTAL PRO", "mode": "FRACTAL_PRO",
+                        "strategy": "SCALPER PA", "mode": "SCALPER_PA",
                         "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
-                        "fractal_pro_adapted": True, "gale_signal": False,
+                        "scalper_pa_adapted": True, "gale_signal": False,
                     })
                     cache[key] = (time.time(), out)
                     return out
@@ -8980,8 +8999,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         status = (
             ("EA XGBOOST • FONTE EM ESPERA" if market == "OPEN" else "EA XGBOOST • IQ OPTION EM ESPERA")
             if engine == "EA"
-            else (("FRACTAL PRO • FONTE EM ESPERA" if market == "OPEN" else "FRACTAL PRO • IQ OPTION EM ESPERA")
-                  if engine == "PRICE70"
+            else (("SCALPER PA • FONTE EM ESPERA" if market == "OPEN" else "SCALPER PA • IQ OPTION EM ESPERA")
+                  if engine == "SCALPER"
                   else (("ROBÔ RUBIK • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION EM ESPERA")
                   if engine == "RUBIK"
                   else ("EA FORÇA DO MOVIMENTO • IQ OPTION EM ESPERA"
@@ -8999,8 +9018,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         status = (
             ("EA XGBOOST • FONTE RECONECTANDO" if market == "OPEN" else "EA XGBOOST • IQ OPTION RECONECTANDO")
             if engine == "EA"
-            else (("FRACTAL PRO • FONTE RECONECTANDO" if market == "OPEN" else "FRACTAL PRO • IQ OPTION RECONECTANDO")
-                  if engine == "PRICE70"
+            else (("SCALPER PA • FONTE RECONECTANDO" if market == "OPEN" else "SCALPER PA • IQ OPTION RECONECTANDO")
+                  if engine == "SCALPER"
                   else (("ROBÔ RUBIK • FONTE RECONECTANDO" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION RECONECTANDO")
                   if engine == "RUBIK"
                   else ("EA FORÇA DO MOVIMENTO • IQ OPTION RECONECTANDO"
@@ -9054,9 +9073,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "EA":
             engine_title = "EA RENKO HASHI PRO + XGBOOST"
             engine_mode = "EA_XGBOOST_AUTONOMOUS"
-        elif engine == "PRICE70":
-            engine_title = "FRACTAL PRO"
-            engine_mode = "FRACTAL_PRO"
+        elif engine == "SCALPER":
+            engine_title = "SCALPER PA"
+            engine_mode = "SCALPER_PA"
         elif engine == "RUBIK":
             engine_title = "ROBÔ RUBIK ADAPTADO"
             engine_mode = "RUBIK_ADAPTED"
@@ -9067,7 +9086,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "PRICE70"):
+        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "SCALPER"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -9082,7 +9101,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
-                    else ({"dual_confirmation": True, "inputs": ["RENKO_HASHI_PRO", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"fractal_pro_adapted": True, "inputs": ["EMA11_MICRO_TREND", "EMA100_MACRO", "EMA3_13_HLC3", "FRACTAL_PATTERN", "REVERSAL_PATTERN", "DONCHIAN_11"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "PRICE70" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})))
+                    else ({"dual_confirmation": True, "inputs": ["RENKO_HASHI_PRO", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"scalper_pa_adapted": True, "inputs": ["PRICE_ACTION", "MACD", "CCI_14", "RSI_14"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"], "closed_candles_only": True} if engine == "SCALPER" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})))
                 ),
                 "legacy_ai_disabled": engine != "SMART",
                 "legacy_technical_strategies_disabled": True,
@@ -9104,8 +9123,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis = await ea_xgboost_strategy(
                     engine_closed, symbol, interval, market=market
                 )
-            elif engine == "PRICE70":
-                analysis = fractal_pro_strategy(engine_closed, interval, market=market)
+            elif engine == "SCALPER":
+                analysis = scalper_pa_strategy(engine_closed, interval, market=market)
             elif engine == "RUBIK":
                 analysis = rubik_adapted_strategy(engine_closed, interval, market=market)
             elif engine == "FORCE":
@@ -9157,13 +9176,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "PRICE70") and analysis.get("confirmed")),
-            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RENKO_HASHI_PRO" if engine == "EA" else ("LOCAL_FRACTAL_PRO" if engine == "PRICE70" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else "DISABLED")))),
+            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "SCALPER") and analysis.get("confirmed")),
+            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RENKO_HASHI_PRO" if engine == "EA" else ("LOCAL_SCALPER_PA" if engine == "SCALPER" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else "DISABLED")))),
             "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
                 else (analysis.get("strategy", "EA RENKO HASHI PRO + XGBOOST") if engine == "EA"
-                      else (analysis.get("strategy", "FRACTAL PRO") if engine == "PRICE70"
+                      else (analysis.get("strategy", "SCALPER PA") if engine == "SCALPER"
                       else (analysis.get("strategy", "ROBÔ RUBIK ADAPTADO") if engine == "RUBIK"
                             else (analysis.get("strategy", "EA Força do Movimento") if engine == "FORCE"
                                   else analysis.get("strategy", f"{engine_title} {tf_label}")))))
@@ -9241,7 +9260,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             fingerprint_key = (
                 "pure_ai_fingerprint" if engine == "SMART"
                 else ("ea_fingerprint" if engine == "EA"
-                      else ("price70_fingerprint" if engine == "PRICE70"
+                      else ("scalper_fingerprint" if engine == "SCALPER"
                       else ("rubik_fingerprint" if engine == "RUBIK"
                             else ("force_fingerprint" if engine == "FORCE" else "graph_ai_fingerprint"))))
             )
@@ -9275,7 +9294,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 )
                 base.update({
                     "direction": direction_now,
-                    "status": (smart_status if engine == "SMART" else ("SINAL DUPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL FRACTAL PRO LIBERADO" if engine == "PRICE70" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))))),
+                    "status": (smart_status if engine == "SMART" else ("SINAL DUPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL SCALPER PA LIBERADO" if engine == "SCALPER" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -9295,7 +9314,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA Renko Hashi Pro + XGBoost, a entrada exige a dupla confirmação.
                 # O aprendizado adaptativo extra permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("EA", "RUBIK", "PRICE70"):
+                if engine not in ("EA", "RUBIK", "SCALPER"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -12435,11 +12454,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "PRICE70"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK ou PRICE70.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "SCALPER"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK ou SCALPER.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("EA", "FORCE", "RUBIK", "PRICE70"):
+    if engine in ("EA", "FORCE", "RUBIK", "SCALPER"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -12474,19 +12493,19 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
                     data["feed_message"] = "EA Dupla usando candles OTC reais da sessão IQ Option."
-            elif engine == "PRICE70":
+            elif engine == "SCALPER":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
                     feed_src = str(feed_info.get("source") or "MULTIFEED")
                     data["feed_source"] = feed_src
                     data["feed_label"] = _feed_source_label(feed_src)
                     data["feed_fallback"] = bool(feed_info.get("fallback"))
-                    data["feed_message"] = "Fractal Pro usando candles fechados do mercado aberto via roteador multifuente."
+                    data["feed_message"] = "Scalper PA usando candles fechados do mercado aberto via roteador multifuente."
                 else:
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                    data["feed_message"] = "Fractal Pro usando candles OTC reais da sessão IQ Option."
+                    data["feed_message"] = "Scalper PA usando candles OTC reais da sessão IQ Option."
             elif engine == "RUBIK":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -12924,7 +12943,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "PRICE70"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "SCALPER"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -12941,13 +12960,13 @@ async def pre_signals(
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "PRICE70")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "SCALPER")
     if fallback_twelve:
         market = "OPEN"
-    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "PRICE70") and not iq_state:
+    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "SCALPER") and not iq_state:
         return {
             "ok": True,
-            "message": ("EA Dupla OTC aguardando conexão com a IQ Option." if engine == "EA" else ("Fractal Pro OTC aguardando conexão com a IQ Option." if engine == "PRICE70" else "Robô Rubik Adaptado OTC aguardando conexão com a IQ Option.")),
+            "message": ("EA Dupla OTC aguardando conexão com a IQ Option." if engine == "EA" else ("Scalper PA OTC aguardando conexão com a IQ Option." if engine == "SCALPER" else "Robô Rubik Adaptado OTC aguardando conexão com a IQ Option.")),
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -13007,8 +13026,8 @@ async def pre_signals(
     for symbol in batch:
         key = f"{group_key}|{symbol}"
         try:
-            pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (130 if engine == "PRICE70" else (120 if engine == "RUBIK" else 90)))
-            if engine in ("EA", "RUBIK", "PRICE70") and requested_market == "IQ_OTC":
+            pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (130 if engine == "SCALPER" else (120 if engine == "RUBIK" else 90)))
+            if engine in ("EA", "RUBIK", "SCALPER") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
                 )
@@ -13032,17 +13051,17 @@ async def pre_signals(
                     if xgb_preview.get("confirmed") and xgb_preview.get("direction") in ("CALL", "PUT")
                     else None
                 )
-            elif engine == "PRICE70":
-                price70_rows = raw[:-1] if len(raw) > 1 else raw
-                price70_preview = fractal_pro_strategy(price70_rows, interval, market=requested_market)
+            elif engine == "SCALPER":
+                scalper_rows = raw[:-1] if len(raw) > 1 else raw
+                scalper_preview = scalper_pa_strategy(scalper_rows, interval, market=requested_market)
                 preview = (
                     {
-                        "direction": price70_preview.get("direction"),
-                        "confidence": price70_preview.get("confidence", 0),
-                        "strategy": price70_preview.get("strategy", "FRACTAL PRO"),
-                        "reason": price70_preview.get("reason", "Fractal Pro monitorando."),
+                        "direction": scalper_preview.get("direction"),
+                        "confidence": scalper_preview.get("confidence", 0),
+                        "strategy": scalper_preview.get("strategy", "SCALPER PA"),
+                        "reason": scalper_preview.get("reason", "Scalper PA monitorando."),
                     }
-                    if price70_preview.get("confirmed") and price70_preview.get("direction") in ("CALL", "PUT")
+                    if scalper_preview.get("confirmed") and scalper_preview.get("direction") in ("CALL", "PUT")
                     else None
                 )
             elif engine == "RUBIK":
@@ -13383,12 +13402,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "PRICE70"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK ou PRICE70.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "SCALPER"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK ou SCALPER.")
 
     requested_market = market
-    iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine in ("EA", "PRICE70") and requested_market == "IQ_OTC")) else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "PRICE70")
+    iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine in ("EA", "SCALPER") and requested_market == "IQ_OTC")) else None
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "SCALPER")
     if fallback_twelve:
         market = "OPEN"
 
@@ -13447,10 +13466,10 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 )
             else:
                 raw = await candles(sym, interval, radar_n, "OPEN", None, request=request)
-        elif engine == "PRICE70":
+        elif engine == "SCALPER":
             if market == "IQ_OTC":
                 if not iq_state:
-                    raise RuntimeError("Conecte a IQ Option para o Fractal Pro analisar OTC.")
+                    raise RuntimeError("Conecte a IQ Option para o Scalper PA analisar OTC.")
                 raw = await iq_ea_candles(iq_state, sym, interval, 130, regular_market=False)
             else:
                 raw = await candles(sym, interval, 130, "OPEN", None, request=request)
@@ -13481,11 +13500,11 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     if direction != "NEUTRO"
                     else f"{engine_label} • MONITORANDO • {why}"
                 )
-            elif engine == "PRICE70":
-                tech = fractal_pro_strategy(closed, interval, market=market)
-                engine_label = "FRACTAL PRO"
+            elif engine == "SCALPER":
+                tech = scalper_pa_strategy(closed, interval, market=market)
+                engine_label = "SCALPER PA"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why = str(tech.get("reason") or "Fractal Pro monitorando").replace("\n", " ")[:88]
+                why = str(tech.get("reason") or "Scalper PA monitorando").replace("\n", " ")[:88]
                 status_text = (
                     f"{engine_label} • OPORTUNIDADE ENCONTRADA"
                     if direction != "NEUTRO"
@@ -13556,12 +13575,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if (engine in ("EA", "RUBIK", "PRICE70") or (engine == "FORCE" and market == "IQ_OTC"))
+                    status_text if (engine in ("EA", "RUBIK", "SCALPER") or (engine == "FORCE" and market == "IQ_OTC"))
                     else (((_feed_source_label(_feed_source_from_rows(raw)) + " • " + status_text) if market == "OPEN" else status_text))
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "PRICE70") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
+                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "SCALPER") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
@@ -13617,7 +13636,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "PRICE70") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
+            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "SCALPER") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -14326,7 +14345,7 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=76">
+<link rel="manifest" href="/manifest.webmanifest?v=123">
 <link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=76">
 <link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=76">
 <meta name="theme-color" content="#07182b">
@@ -14396,7 +14415,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .robot-mode-copy{min-width:150px}
 .robot-mode-title{font-weight:900;font-size:13px;letter-spacing:.4px}
 .robot-mode-desc{font-size:11px;color:#9fb2ca;margin-top:3px;max-width:245px}
-#robotPowerBtn,#aiPowerBtn,#eaPowerBtn,#rubikPowerBtn,#forcePowerBtn,#price70PowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+#robotPowerBtn,#aiPowerBtn,#eaPowerBtn,#rubikPowerBtn,#forcePowerBtn,#scalperPowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
 
 .daily-engine-board{margin-top:14px;border-color:#1c82c9;background:linear-gradient(180deg,#0b1b2e,#071321);box-shadow:0 0 24px #00aaff22}
 .daily-engine-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
@@ -14568,13 +14587,13 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="rubikPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
-  <div class="robot-mode-card" id="price70ModeCard">
-    <img src="__MEGA_IMAGE__" alt="Fractal Pro">
+  <div class="robot-mode-card" id="scalperModeCard">
+    <img src="__MEGA_IMAGE__" alt="Scalper PA">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">🧭 FRACTAL PRO</div>
-      <div class="robot-mode-desc" id="price70ModeDesc">Script Fractal Pro melhorado • EMA 11 + EMA 100 + EMA 3/13 + suporte/resistência 11 • padrões em vela fechada • sem repaint • próxima vela.</div>
+      <div class="robot-mode-title">🧭 SCALPER PA</div>
+      <div class="robot-mode-desc" id="scalperModeDesc">Price Action + MACD + CCI + RSI • M1 com MACD 8/17/6 • pontuação por confluência • vela fechada • sem repaint • próxima vela.</div>
     </div>
-    <button id="price70PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+    <button id="scalperPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
   <div class="robot-mode-card" id="forceModeCard">
@@ -15134,8 +15153,8 @@ const rubikPowerBtn=document.getElementById('rubikPowerBtn');
 const rubikModeDesc=document.getElementById('rubikModeDesc');
 const forcePowerBtn=document.getElementById('forcePowerBtn');
 const forceModeDesc=document.getElementById('forceModeDesc');
-const price70PowerBtn=document.getElementById('price70PowerBtn');
-const price70ModeDesc=document.getElementById('price70ModeDesc');
+const scalperPowerBtn=document.getElementById('scalperPowerBtn');
+const scalperModeDesc=document.getElementById('scalperModeDesc');
 const voiceBtn=document.getElementById('voiceBtn');
 const btcOnlyBtn=document.getElementById('btcOnlyBtn');
 const btcOnlyNote=document.getElementById('btcOnlyNote');
@@ -15157,22 +15176,22 @@ let aiEnabled=false;
 let eaEnabled=false;
 let rubikEnabled=false;
 let forceEnabled=false;
-let price70Enabled=false;
+let scalperEnabled=false;
 try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
   aiEnabled=localStorage.getItem('mega_ai_power')==='ONLINE';
   eaEnabled=localStorage.getItem('mega_ea_power')==='ONLINE';
   rubikEnabled=localStorage.getItem('mega_rubik_power')==='ONLINE';
   forceEnabled=localStorage.getItem('mega_force_power')==='ONLINE';
-  price70Enabled=localStorage.getItem('mega_price70_power')==='ONLINE';
-  if(price70Enabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
-  else if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; price70Enabled=false; }
-  else if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; price70Enabled=false; }
+  scalperEnabled=localStorage.getItem('mega_scalper_power')==='ONLINE';
+  if(scalperEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
+  else if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; scalperEnabled=false; }
+  else if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; scalperEnabled=false; }
   else if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; }
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
-  if(price70Enabled) return 'PRICE70';
+  if(scalperEnabled) return 'SCALPER';
   if(forceEnabled) return 'FORCE';
   if(rubikEnabled) return 'RUBIK';
   if(eaEnabled) return 'EA';
@@ -16015,7 +16034,7 @@ function normalizeEngineKey(value){
   if(e==='SMART' || e==='AI' || e==='IA') return 'SMART';
   if(e==='EA' || e==='EA_AUTONOMOUS_IQ' || e==='EA_XGBOOST' || e==='EA_XGBOOST_AUTONOMOUS') return 'EA';
   if(e==='FORCE' || e==='EA_FORCE_MOVEMENT') return 'FORCE';
-  if(e==='PRICE70' || e==='FRACTAL_PRO' || e==='PRICE_ACTION_70') return 'PRICE70';
+  if(e==='SCALPER' || e==='SCALPER_PA') return 'SCALPER';
   if(e==='RUBIK' || e==='RUBIK_ADAPTED') return 'RUBIK';
   return '';
 }
@@ -16032,7 +16051,7 @@ function momentStudyEngineName(key){
     EA:'⚡ EA RENKO HASHI PRO + XGBOOST',
     RUBIK:'🧩 ROBÔ RUBIK ADAPTADO',
     FORCE:'💥 EA FORÇA DO MOVIMENTO',
-    PRICE70:'🧭 FRACTAL PRO'
+    SCALPER:'🧭 SCALPER PA'
   };
   return names[String(key||'').toUpperCase()]||String(key||'MOTOR');
 }
@@ -16323,7 +16342,7 @@ function rememberPendingTrade(sig){
   if(!sig.expiry_time || !sig.entry_time) return;
 
   const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
-  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='PRICE70'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('FRACTAL_PRO'));
+  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='SCALPER'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('SCALPER_PA'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
     // EA Dupla e EA Força são apurados na primeira vela; outros motores preservam G1/G2.
@@ -16340,7 +16359,7 @@ function rememberPendingTrade(sig){
     confidence:Number(sig.confidence||0),
     risk:String(sig.risk||''),
     strategy:String(sig.strategy||''),
-    engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('FRACTAL_PRO')?'PRICE70':String(sig.selected_engine||sig.mode||'')))),
+    engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('SCALPER_PA')?'SCALPER':String(sig.selected_engine||sig.mode||'')))),
     entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH')),
     value_stake:currentValueStake(),
     value_payout:currentValuePayout(),
@@ -18381,11 +18400,11 @@ function applyRobotPowerState(){
     forcePowerBtn.style.color='#fff';
     forcePowerBtn.style.borderColor=forceEnabled?'#16c56b':'#ff5252';
   }
-  if(price70PowerBtn){
-    price70PowerBtn.textContent=price70Enabled?'🟢 ONLINE':'🔴 OFFLINE';
-    price70PowerBtn.style.background=price70Enabled?'#0b7a3d':'#7d1d1d';
-    price70PowerBtn.style.color='#fff';
-    price70PowerBtn.style.borderColor=price70Enabled?'#16c56b':'#ff5252';
+  if(scalperPowerBtn){
+    scalperPowerBtn.textContent=scalperEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    scalperPowerBtn.style.background=scalperEnabled?'#0b7a3d':'#7d1d1d';
+    scalperPowerBtn.style.color='#fff';
+    scalperPowerBtn.style.borderColor=scalperEnabled?'#16c56b':'#ff5252';
   }
 
   if(robotModeDesc) robotModeDesc.textContent=robotEnabled
@@ -18403,15 +18422,15 @@ function applyRobotPowerState(){
   if(forceModeDesc) forceModeDesc.textContent=forceEnabled
     ? 'ONLINE: OPEN multifuente para qualquer corretora Forex • OTC pela IQ Option • configuração protegida • sem Gale.'
     : 'OFFLINE: EA Força do Movimento pausado • configuração protegida.';
-  if(price70ModeDesc) price70ModeDesc.textContent=price70Enabled
-    ? 'ONLINE: Fractal Pro melhorado • padrões + EMA 11/100 + EMA 3/13 + suporte/resistência 11 • sem repaint • OPEN/OTC.'
-    : 'OFFLINE: Fractal Pro pausado.';
+  if(scalperModeDesc) scalperModeDesc.textContent=scalperEnabled
+    ? 'ONLINE: Scalper PA • Price Action + MACD + CCI + RSI • M1 mais rápido • pontuação por confluência • sem repaint • OPEN/OTC.'
+    : 'OFFLINE: Scalper PA pausado.';
 
   const engine=selectedRobotEngine();
-  if(engine==='PRICE70'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='FRACTAL PRO ONLINE • SEM REPAINT • VELA FECHADA • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧭 Fractal Pro • padrão confirmado + tendência/médias + suporte/resistência • somente vela fechada.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar Fractal Pro ativo • candles fechados • OPEN/OTC</div>';
+  if(engine==='SCALPER'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='SCALPER PA ONLINE • SEM REPAINT • VELA FECHADA • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Scalper PA • Price Action + MACD + CCI + RSI por pontuação • somente vela fechada.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar Scalper PA ativo • PA + MACD + CCI + RSI • candles fechados • OPEN/OTC</div>';
     rad();
   }else if(engine==='FORCE'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA FORÇA DO MOVIMENTO ONLINE • CONFIGURAÇÃO PROTEGIDA • FOCO EM WIN DIRETO';
@@ -18440,7 +18459,7 @@ function applyRobotPowerState(){
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial, Fractal Pro, Robô Rubik e EAs estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial, Scalper PA, Robô Rubik e EAs estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -18460,14 +18479,14 @@ function resetEngineVisualState(){
 
 async function setRobotPower(enabled){
   robotEnabled=!!enabled;
-  if(robotEnabled){ aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; price70Enabled=false; }
+  if(robotEnabled){ aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; scalperEnabled=false; }
   try{
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
-    localStorage.setItem('mega_price70_power', price70Enabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_scalper_power', scalperEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -18479,14 +18498,14 @@ async function setRobotPower(enabled){
 
 async function setAiPower(enabled){
   aiEnabled=!!enabled;
-  if(aiEnabled){ robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; price70Enabled=false; }
+  if(aiEnabled){ robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; scalperEnabled=false; }
   try{
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
-    localStorage.setItem('mega_price70_power', price70Enabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_scalper_power', scalperEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -18498,14 +18517,14 @@ async function setAiPower(enabled){
 
 async function setEaPower(enabled){
   eaEnabled=!!enabled;
-  if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; price70Enabled=false; }
+  if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; scalperEnabled=false; }
   try{
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
-    localStorage.setItem('mega_price70_power', price70Enabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_scalper_power', scalperEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -18517,14 +18536,14 @@ async function setEaPower(enabled){
 
 async function setRubikPower(enabled){
   rubikEnabled=!!enabled;
-  if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; price70Enabled=false; }
+  if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; scalperEnabled=false; }
   try{
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
-    localStorage.setItem('mega_price70_power', price70Enabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_scalper_power', scalperEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -18536,10 +18555,10 @@ async function setRubikPower(enabled){
 
 async function setForcePower(enabled){
   forceEnabled=!!enabled;
-  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; price70Enabled=false; }
+  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; scalperEnabled=false; }
   try{
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
-    localStorage.setItem('mega_price70_power', price70Enabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_scalper_power', scalperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
@@ -18553,11 +18572,11 @@ async function setForcePower(enabled){
   if(voiceEnabled) speak(forceEnabled ? 'EA Força do Movimento online.' : 'EA Força do Movimento offline.');
 }
 
-async function setPrice70Power(enabled){
-  price70Enabled=!!enabled;
-  if(price70Enabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
+async function setScalperPower(enabled){
+  scalperEnabled=!!enabled;
+  if(scalperEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
   try{
-    localStorage.setItem('mega_price70_power', price70Enabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_scalper_power', scalperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
@@ -18569,7 +18588,7 @@ async function setPrice70Power(enabled){
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled) speak(price70Enabled ? 'Fractal Pro online.' : 'Fractal Pro offline.');
+  if(voiceEnabled) speak(scalperEnabled ? 'Scalper PA online.' : 'Scalper PA offline.');
 }
 
 if(robotPowerBtn) robotPowerBtn.onclick=()=>{ setRobotPower(!robotEnabled); };
@@ -18577,7 +18596,7 @@ if(aiPowerBtn) aiPowerBtn.onclick=()=>{ setAiPower(!aiEnabled); };
 if(eaPowerBtn) eaPowerBtn.onclick=()=>{ setEaPower(!eaEnabled); };
 if(rubikPowerBtn) rubikPowerBtn.onclick=()=>{ setRubikPower(!rubikEnabled); };
 if(forcePowerBtn) forcePowerBtn.onclick=()=>{ setForcePower(!forceEnabled); };
-if(price70PowerBtn) price70PowerBtn.onclick=()=>{ setPrice70Power(!price70Enabled); };
+if(scalperPowerBtn) scalperPowerBtn.onclick=()=>{ setScalperPower(!scalperEnabled); };
 
 async function sig(announce=false){
   if(!appEnabled) return;
@@ -18803,7 +18822,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':(selectedRobotEngine()==='PRICE70'?'ROBÔ FRACTAL PRO':(selectedRobotEngine()==='RUBIK'?'ROBÔ RUBIK':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':'IA GRÁFICA'))))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
+    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':(selectedRobotEngine()==='SCALPER'?'ROBÔ SCALPER PA':(selectedRobotEngine()==='RUBIK'?'ROBÔ RUBIK':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':'IA GRÁFICA'))))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
     await sig(true);
   }finally{
     radarAutoBusy=false;
