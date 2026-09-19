@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.41"
-PWA_VERSION = "v108"
+APP_VERSION = "3.42"
+PWA_VERSION = "v109"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -15705,7 +15705,7 @@ function drawChart(a,force=false){
     ? String(chartPreSignal.direction||'')+'|'+String(chartPreSignal.entry_time||'')
     : '';
   const curKey=cur&&cur.direction&&cur.direction!=='NEUTRO'
-    ? String(cur.direction)+'|'+String(cur.reference_candle||'')
+    ? String(cur.direction)+'|'+String(cur.entry_time||'')+'|'+String(cur.reference_candle||'')
     : '';
   const fingerprint=[
     data.length,
@@ -15879,44 +15879,100 @@ function drawChart(a,force=false){
       chartCtx.restore();
     }
 
-    // BOLINHA = sinal de entrada.
-    if(chartPreSignal && chartPreSignal.active &&
-       (chartPreSignal.direction==='CALL'||chartPreSignal.direction==='PUT')){
-      const idx=currentIndex;
-      const x=px(idx);
-      const dir=chartPreSignal.direction;
-      const v=dir==='CALL'?Number(data[idx].low):Number(data[idx].high);
-      if(Number.isFinite(v)){
-        chartCtx.save();
-        chartCtx.fillStyle=dir==='CALL'?'#45ff9b':'#ff5c7a';
-        chartCtx.strokeStyle='#07111f';
-        chartCtx.lineWidth=2;
-        chartCtx.beginPath();
-        chartCtx.arc(x,py(v),7,0,Math.PI*2);
-        chartCtx.fill();
-        chartCtx.stroke();
-        chartCtx.font='bold 12px Arial';
-        chartCtx.textAlign='left';
-        chartCtx.fillText(dir,x+10,py(v)-9);
-        chartCtx.restore();
-      }
-    }else if(cur && cur.direction && cur.direction!=='NEUTRO' && cur.reference_candle){
-      const idx=data.findIndex(c=>c.datetime===cur.reference_candle);
-      if(idx>=0){
-        const x=px(idx);
-        if(x>=pad.l&&x<=w-pad.r){
-          const v=cur.direction==='CALL'?Number(data[idx].low):Number(data[idx].high);
-          if(Number.isFinite(v)){
-            chartCtx.fillStyle=cur.direction==='CALL'?'#45ff9b':'#ff5c7a';
-            chartCtx.beginPath();
-            chartCtx.arc(x,py(v),6,0,Math.PI*2);
-            chartCtx.fill();
-            chartCtx.font='bold 12px Arial';
-            chartCtx.textAlign='left';
-            chartCtx.fillText(cur.direction,x+8,py(v)-8);
+    // 3.42 — CALL/PUT é desenhado na VELA REAL DE ENTRADA, não na vela usada
+    // para fazer a análise. Em MIDDLE a entrada é na próxima abertura; enquanto
+    // essa vela ainda não nasceu, reservamos o próximo slot à direita. Assim a
+    // bolinha, o nome CALL/PUT e o relógio sempre apontam para o mesmo candle.
+    function resolveEntryMarker(sig){
+      if(!sig) return null;
+      const dir=String(sig.direction||'').toUpperCase();
+      if(dir!=='CALL'&&dir!=='PUT') return null;
+
+      const stepMs=Math.max(1000,intervalSecondsValue(interval.value)*1000);
+      const entryMs=Date.parse(String(sig.entry_time||''));
+      let idx=-1;
+      let future=false;
+
+      if(Number.isFinite(entryMs)){
+        let best=-1;
+        let bestDiff=Infinity;
+        for(let i=0;i<data.length;i++){
+          const t=Date.parse(String((data[i]&&data[i].datetime)||''));
+          if(!Number.isFinite(t)) continue;
+          const diff=Math.abs(t-entryMs);
+          if(diff<bestDiff){ bestDiff=diff; best=i; }
+        }
+        // Candle já existe: cola a marca nele.
+        if(best>=0 && bestDiff<=Math.max(2000,stepMs*.20)){
+          idx=best;
+        }else{
+          // Candle de entrada ainda não nasceu: calcula quantos slots à direita.
+          const lastMs=Date.parse(String((data[currentIndex]&&data[currentIndex].datetime)||''));
+          if(Number.isFinite(lastMs) && entryMs>lastMs+stepMs*.20){
+            const steps=Math.max(1,Math.round((entryMs-lastMs)/stepMs));
+            idx=currentIndex+steps;
+            future=true;
           }
         }
       }
+
+      // Compatibilidade com sinais antigos sem entry_time.
+      if(idx<0 && sig.reference_candle){
+        idx=data.findIndex(c=>String(c.datetime||'')===String(sig.reference_candle||''));
+      }
+      if(idx<0) idx=currentIndex;
+      if(idx>currentIndex) future=true;
+
+      const x=px(idx);
+      let v=Number(chartDisplayLastClose);
+      if(!future && data[idx]){
+        v=dir==='CALL'?Number(data[idx].low):Number(data[idx].high);
+      }
+      if(!Number.isFinite(v)) v=Number(data[currentIndex]&&data[currentIndex].close);
+      if(!Number.isFinite(v)) return null;
+      return {dir,idx,x,v,future};
+    }
+
+    function paintEntryMarker(marker,large){
+      if(!marker) return;
+      const x=marker.x;
+      const y=py(marker.v);
+      // O próximo slot fica dentro da folga direita do gráfico.
+      if(x<pad.l-10 || x>w-pad.r+10) return;
+      chartCtx.save();
+      if(marker.future){
+        chartCtx.strokeStyle=marker.dir==='CALL'?'#45ff9b':'#ff5c7a';
+        chartCtx.globalAlpha=.45;
+        chartCtx.setLineDash([3,5]);
+        chartCtx.beginPath();
+        chartCtx.moveTo(x,pad.t+4);
+        chartCtx.lineTo(x,h-pad.b);
+        chartCtx.stroke();
+        chartCtx.setLineDash([]);
+        chartCtx.globalAlpha=1;
+      }
+      chartCtx.fillStyle=marker.dir==='CALL'?'#45ff9b':'#ff5c7a';
+      chartCtx.strokeStyle='#07111f';
+      chartCtx.lineWidth=2;
+      chartCtx.beginPath();
+      chartCtx.arc(x,y,large?7:6,0,Math.PI*2);
+      chartCtx.fill();
+      chartCtx.stroke();
+      chartCtx.font='bold 12px Arial';
+      chartCtx.textAlign='left';
+      chartCtx.fillText(marker.dir,x+9,y-8);
+      if(marker.future){
+        chartCtx.font='bold 9px Arial';
+        chartCtx.fillText('ENTRADA',x+9,y+6);
+      }
+      chartCtx.restore();
+    }
+
+    if(chartPreSignal && chartPreSignal.active &&
+       (chartPreSignal.direction==='CALL'||chartPreSignal.direction==='PUT')){
+      paintEntryMarker(resolveEntryMarker(chartPreSignal),true);
+    }else if(cur && cur.direction && cur.direction!=='NEUTRO'){
+      paintEntryMarker(resolveEntryMarker(cur),false);
     }
 
     const scaleMoving=Math.abs(targetLo-chartDisplayLo)>safeRange*.001 || Math.abs(targetHi-chartDisplayHi)>safeRange*.001;
