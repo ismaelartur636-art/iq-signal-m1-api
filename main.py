@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.48"
-PWA_VERSION = "v115"
+APP_VERSION = "3.49"
+PWA_VERSION = "v116"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -6579,6 +6579,183 @@ def _ea_rsi_value_confirmation(rows):
     return base
 
 
+def _rubik_heikin_ashi(rows):
+    """Heikin-Ashi calculado somente com candles fechados."""
+    out = []
+    prev_open = prev_close = None
+    for row in list(rows or []):
+        try:
+            o = float(row["open"]); h = float(row["high"])
+            l = float(row["low"]); c = float(row["close"])
+        except Exception:
+            continue
+        ha_close = (o + h + l + c) / 4.0
+        ha_open = ((o + c) / 2.0) if prev_open is None else ((prev_open + prev_close) / 2.0)
+        ha_high = max(h, ha_open, ha_close)
+        ha_low = min(l, ha_open, ha_close)
+        out.append({"open": ha_open, "high": ha_high, "low": ha_low, "close": ha_close})
+        prev_open, prev_close = ha_open, ha_close
+    return out
+
+
+def _rubik_macd_snapshot(values, fast=12, slow=26, signal=9):
+    vals = [float(x) for x in list(values or [])]
+    if len(vals) < slow + signal + 2:
+        return None
+    macd_vals = []
+    for end in range(slow, len(vals) + 1):
+        part = vals[:end]
+        ef = ema(part, fast)
+        es = ema(part, slow)
+        if ef is None or es is None:
+            continue
+        macd_vals.append(float(ef - es))
+    if len(macd_vals) < signal + 1:
+        return None
+    sig = ema(macd_vals, signal)
+    prev_sig = ema(macd_vals[:-1], signal)
+    if sig is None or prev_sig is None:
+        return None
+    line = float(macd_vals[-1])
+    prev_line = float(macd_vals[-2])
+    return {
+        "line": line,
+        "signal": float(sig),
+        "hist": line - float(sig),
+        "prev_line": prev_line,
+        "prev_signal": float(prev_sig),
+        "prev_hist": prev_line - float(prev_sig),
+    }
+
+
+def rubik_adapted_strategy(cs, timeframe="1min", market="OPEN"):
+    """Estratégia própria inspirada no material educacional público da RubikTrade.
+
+    NÃO é o algoritmo proprietário da RubikTrade. A adaptação para opções binárias
+    usa somente candles fechados e exige confluência de Heikin-Ashi, tendência por
+    EMA 9/21, RSI 14 e MACD 12/26/9 para a próxima vela.
+    """
+    rows = list(cs or [])
+    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
+    name = f"ROBÔ RUBIK ADAPTADO {tf_label}"
+
+    def neutral(reason, confidence=0.0):
+        return {
+            "available": True,
+            "direction": "NEUTRO", "confidence": round(float(confidence or 0), 1),
+            "confirmed": False, "risk": "HIGH", "strategy": name,
+            "engine": "RUBIK_ADAPTED", "provider": "LOCAL_RUBIK_ADAPTED",
+            "reason": reason, "rubik_inspired": True,
+            "external_ai_disabled": True, "gale_signal": False, "non_repaint": True,
+        }
+
+    if len(rows) < 60:
+        return neutral(f"Aguardando histórico fechado suficiente ({len(rows)}/60).")
+
+    closes = [float(x["close"]) for x in rows]
+    highs = [float(x["high"]) for x in rows]
+    lows = [float(x["low"]) for x in rows]
+    ha = _rubik_heikin_ashi(rows)
+    if len(ha) < 3:
+        return neutral("Heikin-Ashi ainda sem histórico suficiente.")
+
+    last_ha, prev_ha = ha[-1], ha[-2]
+    hrange = max(1e-12, last_ha["high"] - last_ha["low"])
+    hbody = abs(last_ha["close"] - last_ha["open"]) / hrange
+    lower_wick = (min(last_ha["open"], last_ha["close"]) - last_ha["low"]) / hrange
+    upper_wick = (last_ha["high"] - max(last_ha["open"], last_ha["close"])) / hrange
+
+    ha_call = bool(
+        last_ha["close"] > last_ha["open"]
+        and prev_ha["close"] > prev_ha["open"]
+        and hbody >= 0.42
+        and lower_wick <= 0.18
+    )
+    ha_put = bool(
+        last_ha["close"] < last_ha["open"]
+        and prev_ha["close"] < prev_ha["open"]
+        and hbody >= 0.42
+        and upper_wick <= 0.18
+    )
+
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+    prev_e9 = ema(closes[:-1], 9)
+    prev_e21 = ema(closes[:-1], 21)
+    if None in (e9, e21, prev_e9, prev_e21):
+        return neutral("Médias de tendência ainda sem dados suficientes.")
+    ema_call = bool(e9 > e21 and prev_e9 >= prev_e21 and closes[-1] >= e9)
+    ema_put = bool(e9 < e21 and prev_e9 <= prev_e21 and closes[-1] <= e9)
+
+    r14 = rsi(closes, 14)
+    r14_prev = rsi(closes[:-1], 14)
+    if r14 is None or r14_prev is None:
+        return neutral("RSI 14 ainda sem dados suficientes.")
+    rsi_call = bool((50.0 <= r14 <= 72.0 and r14 >= r14_prev) or (r14_prev <= 36.0 and r14 >= r14_prev + 2.0))
+    rsi_put = bool((28.0 <= r14 <= 50.0 and r14 <= r14_prev) or (r14_prev >= 64.0 and r14 <= r14_prev - 2.0))
+
+    macd = _rubik_macd_snapshot(closes)
+    if not macd:
+        return neutral("MACD ainda sem histórico suficiente.")
+    macd_call = bool(macd["line"] > macd["signal"] and macd["hist"] > 0)
+    macd_put = bool(macd["line"] < macd["signal"] and macd["hist"] < 0)
+
+    call_ok = ha_call and ema_call and rsi_call and macd_call
+    put_ok = ha_put and ema_put and rsi_put and macd_put
+    if call_ok == put_ok:
+        ha_dir = "CALL" if ha_call else ("PUT" if ha_put else "NEUTRO")
+        ema_dir = "CALL" if ema_call else ("PUT" if ema_put else "NEUTRO")
+        rsi_dir = "CALL" if rsi_call else ("PUT" if rsi_put else "NEUTRO")
+        macd_dir = "CALL" if macd_call else ("PUT" if macd_put else "NEUTRO")
+        return neutral(
+            f"Aguardando confluência completa • HA {ha_dir} • EMA {ema_dir} • "
+            f"RSI {rsi_dir} ({r14:.1f}) • MACD {macd_dir}.",
+            58.0,
+        )
+
+    direction = "CALL" if call_ok else "PUT"
+    breakout = (
+        closes[-1] > max(highs[-6:-1]) if direction == "CALL"
+        else closes[-1] < min(lows[-6:-1])
+    )
+    trend_sep = abs(float(e9) - float(e21)) / max(abs(closes[-1]), 1e-12) * 10000.0
+    hist_strength = abs(float(macd["hist"])) / max(abs(closes[-1]), 1e-12) * 100000.0
+    confidence = clamp(
+        72.0 + min(7.0, hbody * 7.0) + min(5.0, trend_sep * 0.45)
+        + min(5.0, hist_strength * 0.22) + (4.0 if breakout else 0.0),
+        72.0, 93.0,
+    )
+    risk = "LOW" if breakout and hbody >= 0.58 else "MEDIUM"
+    reason = (
+        f"Confluência {direction}: Heikin-Ashi forte + EMA 9/21 + RSI 14 {r14:.1f} + "
+        f"MACD 12/26/9 confirmados" + (" + rompimento recente." if breakout else ".")
+    )
+    return {
+        "available": True,
+        "direction": direction,
+        "confidence": round(float(confidence), 1),
+        "confirmed": True,
+        "risk": risk,
+        "strategy": name,
+        "engine": "RUBIK_ADAPTED",
+        "provider": "LOCAL_RUBIK_ADAPTED",
+        "reason": reason,
+        "rubik_inspired": True,
+        "external_ai_disabled": True,
+        "gale_signal": False,
+        "non_repaint": True,
+        "diagnostics": {
+            "heikin_ashi": direction,
+            "ema_9": round(float(e9), 8),
+            "ema_21": round(float(e21), 8),
+            "rsi_14": round(float(r14), 2),
+            "macd": round(float(macd["line"]), 8),
+            "macd_signal": round(float(macd["signal"]), 8),
+            "breakout": bool(breakout),
+        },
+    }
+
+
 async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
     """EA tripla confirmação — XGBoost + RSI 14 + Value Chart.
 
@@ -8251,7 +8428,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     entry_mode = normalize_entry_mode(entry_mode)
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
@@ -8310,6 +8487,26 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 raw = await candles(
                     symbol, interval, request_n, "OPEN", None, request=request
                 )
+        elif engine == "RUBIK":
+            # Robô Rubik Adaptado: OPEN usa o roteador cTrader/multifuente; OTC usa IQ Option real.
+            if market == "IQ_OTC":
+                if not iq_state:
+                    out = neutral_signal(
+                        symbol, interval, market,
+                        "ROBÔ RUBIK • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para o Robô Rubik Adaptado analisar OTC real.",
+                        source_state="WAITING",
+                    )
+                    out.update({
+                        "strategy": "ROBÔ RUBIK ADAPTADO", "mode": "RUBIK_ADAPTED",
+                        "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
+                        "rubik_inspired": True, "gale_signal": False,
+                    })
+                    cache[key] = (time.time(), out)
+                    return out
+                raw = await iq_ea_candles(iq_state, symbol, interval, 120, regular_market=False)
+            else:
+                raw = await candles(symbol, interval, 120, "OPEN", None, request=request)
         elif engine == "FORCE" and market == "IQ_OTC":
             if not iq_state:
                 out = neutral_signal(
@@ -8337,13 +8534,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         status = (
             ("EA XGBOOST • FONTE EM ESPERA" if market == "OPEN" else "EA XGBOOST • IQ OPTION EM ESPERA")
             if engine == "EA"
-            else ("EA FORÇA DO MOVIMENTO • IQ OPTION EM ESPERA"
+            else (("ROBÔ RUBIK • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION EM ESPERA")
+                  if engine == "RUBIK"
+                  else ("EA FORÇA DO MOVIMENTO • IQ OPTION EM ESPERA"
                   if engine == "FORCE" and market == "IQ_OTC"
                   else (
                       "MOTOR MULTIFONTE • TENTANDO FALLBACK"
                       if market == "OPEN" and exc.status_code in (429, 503)
                       else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL")
-                  ))
+                  )))
         )
         out = neutral_signal(symbol, interval, market, status, exc.detail, source_state="DEGRADED")
         cache[key] = (time.time(), out)
@@ -8352,9 +8551,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         status = (
             ("EA XGBOOST • FONTE RECONECTANDO" if market == "OPEN" else "EA XGBOOST • IQ OPTION RECONECTANDO")
             if engine == "EA"
-            else ("EA FORÇA DO MOVIMENTO • IQ OPTION RECONECTANDO"
+            else (("ROBÔ RUBIK • FONTE RECONECTANDO" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION RECONECTANDO")
+                  if engine == "RUBIK"
+                  else ("EA FORÇA DO MOVIMENTO • IQ OPTION RECONECTANDO"
                   if engine == "FORCE" and market == "IQ_OTC"
-                  else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL"))
+                  else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL")))
         )
         out = neutral_signal(symbol, interval, market, status, str(exc), source_state="DEGRADED")
         cache[key] = (time.time(), out)
@@ -8403,6 +8604,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "EA":
             engine_title = "EA RSI + VALUE CHART + XGBOOST"
             engine_mode = "EA_XGBOOST_AUTONOMOUS"
+        elif engine == "RUBIK":
+            engine_title = "ROBÔ RUBIK ADAPTADO"
+            engine_mode = "RUBIK_ADAPTED"
         elif engine == "FORCE":
             engine_title = "EA FORÇA DO MOVIMENTO"
             engine_mode = "EA_FORCE_MOVEMENT"
@@ -8410,7 +8614,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "FORCE"):
+        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -8425,7 +8629,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
-                    else ({"triple_confirmation": True, "inputs": ["RSI_14", "VALUE_CHART", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})
+                    else ({"triple_confirmation": True, "inputs": ["RSI_14", "VALUE_CHART", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]}))
                 ),
                 "legacy_ai_disabled": engine != "SMART",
                 "legacy_technical_strategies_disabled": True,
@@ -8437,7 +8641,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-90:] if len(closed) > 90 else closed))
+            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine == "RUBIK" else (closed[-90:] if len(closed) > 90 else closed)))
             if engine == "SMART":
                 moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
                 analysis = await openai_direct_signal(
@@ -8447,6 +8651,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis = await ea_xgboost_strategy(
                     engine_closed, symbol, interval, market=market
                 )
+            elif engine == "RUBIK":
+                analysis = rubik_adapted_strategy(engine_closed, interval, market=market)
             elif engine == "FORCE":
                 if market == "OPEN":
                     # Multibroker OPEN: HTFs vêm do roteador público, sem login da IQ.
@@ -8496,14 +8702,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA") and analysis.get("confirmed")),
-            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RSI_VALUE_CHART" if engine == "EA" else "DISABLED")),
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE") else "HIGH").upper(),
+            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK") and analysis.get("confirmed")),
+            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RSI_VALUE_CHART" if engine == "EA" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else "DISABLED"))),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
                 else (analysis.get("strategy", "EA RSI + VALUE CHART + XGBOOST") if engine == "EA"
-                      else (analysis.get("strategy", "EA Força do Movimento") if engine == "FORCE"
-                            else analysis.get("strategy", f"{engine_title} {tf_label}")))
+                      else (analysis.get("strategy", "ROBÔ RUBIK ADAPTADO") if engine == "RUBIK"
+                            else (analysis.get("strategy", "EA Força do Movimento") if engine == "FORCE"
+                                  else analysis.get("strategy", f"{engine_title} {tf_label}"))))
             ),
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
@@ -8578,7 +8785,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             fingerprint_key = (
                 "pure_ai_fingerprint" if engine == "SMART"
                 else ("ea_fingerprint" if engine == "EA"
-                      else ("force_fingerprint" if engine == "FORCE" else "graph_ai_fingerprint"))
+                      else ("rubik_fingerprint" if engine == "RUBIK"
+                            else ("force_fingerprint" if engine == "FORCE" else "graph_ai_fingerprint")))
             )
             if release_state.get(fingerprint_key) != signal_fingerprint:
                 # v3.6: SOMENTE a IA GRÁFICA tem intervalo mínimo de 4 minutos
@@ -8610,7 +8818,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 )
                 base.update({
                     "direction": direction_now,
-                    "status": (smart_status if engine == "SMART" else ("SINAL TRIPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))),
+                    "status": (smart_status if engine == "SMART" else ("SINAL TRIPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO")))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -8630,7 +8838,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine != "EA":
+                if engine not in ("EA", "RUBIK"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -11689,11 +11897,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA ou FORCE.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE ou RUBIK.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("EA", "FORCE"):
+    if engine in ("EA", "FORCE", "RUBIK"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -11728,6 +11936,19 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
                     data["feed_message"] = "EA Tripla usando candles OTC reais da sessão IQ Option."
+            elif engine == "RUBIK":
+                if requested_market == "OPEN":
+                    feed_info = _current_open_feed_info(symbol, interval)
+                    feed_src = str(feed_info.get("source") or "MULTIFEED")
+                    data["feed_source"] = feed_src
+                    data["feed_label"] = _feed_source_label(feed_src)
+                    data["feed_fallback"] = bool(feed_info.get("fallback"))
+                    data["feed_message"] = "Robô Rubik Adaptado usando candles do mercado aberto via roteador cTrader/multifuente."
+                else:
+                    data["feed_source"] = "IQ_OPTION_OTC"
+                    data["feed_label"] = _feed_source_label(data["feed_source"])
+                    data["feed_fallback"] = False
+                    data["feed_message"] = "Robô Rubik Adaptado usando candles OTC reais da sessão IQ Option."
             elif engine == "FORCE" and requested_market == "IQ_OTC":
                 data["feed_source"] = "IQ_OPTION_OTC"
                 data["feed_label"] = _feed_source_label(data["feed_source"])
@@ -12152,7 +12373,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -12169,13 +12390,13 @@ async def pre_signals(
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK")
     if fallback_twelve:
         market = "OPEN"
-    if requested_market == "IQ_OTC" and engine == "EA" and not iq_state:
+    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK") and not iq_state:
         return {
             "ok": True,
-            "message": "EA Tripla OTC aguardando conexão com a IQ Option.",
+            "message": ("EA Tripla OTC aguardando conexão com a IQ Option." if engine == "EA" else "Robô Rubik Adaptado OTC aguardando conexão com a IQ Option."),
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -12235,8 +12456,8 @@ async def pre_signals(
     for symbol in batch:
         key = f"{group_key}|{symbol}"
         try:
-            pre_n = max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else 90
-            if engine == "EA" and requested_market == "IQ_OTC":
+            pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (120 if engine == "RUBIK" else 90))
+            if engine in ("EA", "RUBIK") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
                 )
@@ -12258,6 +12479,19 @@ async def pre_signals(
                         "reason": xgb_preview.get("reason", "XGBoost monitorando."),
                     }
                     if xgb_preview.get("confirmed") and xgb_preview.get("direction") in ("CALL", "PUT")
+                    else None
+                )
+            elif engine == "RUBIK":
+                rubik_rows = raw[:-1] if len(raw) > 1 else raw
+                rubik_preview = rubik_adapted_strategy(rubik_rows, interval, market=requested_market)
+                preview = (
+                    {
+                        "direction": rubik_preview.get("direction"),
+                        "confidence": rubik_preview.get("confidence", 0),
+                        "strategy": rubik_preview.get("strategy", "ROBÔ RUBIK ADAPTADO"),
+                        "reason": rubik_preview.get("reason", "Robô Rubik monitorando."),
+                    }
+                    if rubik_preview.get("confirmed") and rubik_preview.get("direction") in ("CALL", "PUT")
                     else None
                 )
             else:
@@ -12585,12 +12819,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA ou FORCE.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE ou RUBIK.")
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK")
     if fallback_twelve:
         market = "OPEN"
 
@@ -12649,6 +12883,13 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 )
             else:
                 raw = await candles(sym, interval, radar_n, "OPEN", None, request=request)
+        elif engine == "RUBIK":
+            if market == "IQ_OTC":
+                if not iq_state:
+                    raise RuntimeError("Conecte a IQ Option para o Robô Rubik Adaptado analisar OTC.")
+                raw = await iq_ea_candles(iq_state, sym, interval, 120, regular_market=False)
+            else:
+                raw = await candles(sym, interval, 120, "OPEN", None, request=request)
         elif engine == "FORCE" and market == "IQ_OTC":
             if not iq_state:
                 raise RuntimeError("Conecte a IQ Option para usar este motor no OTC.")
@@ -12664,6 +12905,16 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 engine_label = "EA RSI + VALUE CHART + XGBOOST"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why = str(tech.get("reason") or "XGBoost monitorando").replace("\n", " ")[:88]
+                status_text = (
+                    f"{engine_label} • OPORTUNIDADE ENCONTRADA"
+                    if direction != "NEUTRO"
+                    else f"{engine_label} • MONITORANDO • {why}"
+                )
+            elif engine == "RUBIK":
+                tech = rubik_adapted_strategy(closed, interval, market=market)
+                engine_label = "ROBÔ RUBIK ADAPTADO"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "Robô Rubik monitorando").replace("\n", " ")[:88]
                 status_text = (
                     f"{engine_label} • OPORTUNIDADE ENCONTRADA"
                     if direction != "NEUTRO"
@@ -12724,18 +12975,18 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if (engine == "EA" or (engine == "FORCE" and market == "IQ_OTC"))
+                    status_text if (engine in ("EA", "RUBIK") or (engine == "FORCE" and market == "IQ_OTC"))
                     else (((_feed_source_label(_feed_source_from_rows(raw)) + " • " + status_text) if market == "OPEN" else status_text))
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine == "EA" else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
+                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
                 "strategy": str(tech.get("strategy") or ""),
             }
-            if item.get("direction") in ("CALL", "PUT"):
+            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK"):
                 radar_probe = {
                     "symbol": sym, "market": market, "interval": interval,
                     "direction": item.get("direction"), "confidence": item.get("confidence"),
@@ -12762,6 +13013,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         low = detail.lower()
         if engine == "EA":
             source_status = "EA XGBOOST • FONTE EM ESPERA" if market == "OPEN" else "IQ OPTION OTC • FONTE EM ESPERA"
+        elif engine == "RUBIK":
+            source_status = "ROBÔ RUBIK • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION OTC EM ESPERA"
         elif engine == "FORCE" and market == "IQ_OTC":
             source_status = "IQ OPTION • FONTE EM ESPERA"
         elif market == "OPEN":
@@ -12783,7 +13036,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine == "EA" else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
+            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -13157,7 +13410,7 @@ async def result(
     engine = str(engine or "").upper()
     # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
-    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE")
+    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK")
 
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
@@ -13562,7 +13815,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .robot-mode-copy{min-width:150px}
 .robot-mode-title{font-weight:900;font-size:13px;letter-spacing:.4px}
 .robot-mode-desc{font-size:11px;color:#9fb2ca;margin-top:3px;max-width:245px}
-#robotPowerBtn,#aiPowerBtn,#eaPowerBtn,#forcePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+#robotPowerBtn,#aiPowerBtn,#eaPowerBtn,#rubikPowerBtn,#forcePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
 
 .daily-engine-board{margin-top:14px;border-color:#1c82c9;background:linear-gradient(180deg,#0b1b2e,#071321);box-shadow:0 0 24px #00aaff22}
 .daily-engine-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
@@ -13723,6 +13976,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-desc" id="eaModeDesc">RSI 14 + Value Chart + XGBoost • OPEN + OTC IQ • sinal somente quando os 3 concordam.</div>
     </div>
     <button id="eaPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
+  <div class="robot-mode-card" id="rubikModeCard">
+    <img src="__MEGA_IMAGE__" alt="Robô Rubik Adaptado">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">🧩 ROBÔ RUBIK ADAPTADO</div>
+      <div class="robot-mode-desc" id="rubikModeDesc">Heikin-Ashi + EMA 9/21 + RSI 14 + MACD 12/26/9 • OPEN + OTC IQ • próxima vela • sem repaint.</div>
+    </div>
+    <button id="rubikPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
   <div class="robot-mode-card" id="forceModeCard">
@@ -14278,6 +14540,8 @@ const aiPowerBtn=document.getElementById('aiPowerBtn');
 const aiModeDesc=document.getElementById('aiModeDesc');
 const eaPowerBtn=document.getElementById('eaPowerBtn');
 const eaModeDesc=document.getElementById('eaModeDesc');
+const rubikPowerBtn=document.getElementById('rubikPowerBtn');
+const rubikModeDesc=document.getElementById('rubikModeDesc');
 const forcePowerBtn=document.getElementById('forcePowerBtn');
 const forceModeDesc=document.getElementById('forceModeDesc');
 const voiceBtn=document.getElementById('voiceBtn');
@@ -14299,18 +14563,22 @@ try{
 let robotEnabled=true;
 let aiEnabled=false;
 let eaEnabled=false;
+let rubikEnabled=false;
 let forceEnabled=false;
 try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
   aiEnabled=localStorage.getItem('mega_ai_power')==='ONLINE';
   eaEnabled=localStorage.getItem('mega_ea_power')==='ONLINE';
+  rubikEnabled=localStorage.getItem('mega_rubik_power')==='ONLINE';
   forceEnabled=localStorage.getItem('mega_force_power')==='ONLINE';
-  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; }
-  else if(eaEnabled){ robotEnabled=false; aiEnabled=false; }
+  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; }
+  else if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; }
+  else if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; }
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
   if(forceEnabled) return 'FORCE';
+  if(rubikEnabled) return 'RUBIK';
   if(eaEnabled) return 'EA';
   if(aiEnabled) return 'SMART';
   if(robotEnabled) return 'GRAPH_AI';
@@ -15164,6 +15432,7 @@ function momentStudyEngineName(key){
     GRAPH_AI:'🧠 IA GRÁFICA',
     SMART:'🤖 INTELIGÊNCIA ARTIFICIAL',
     EA:'⚡ EA RSI + VALUE CHART + XGBOOST',
+    RUBIK:'🧩 ROBÔ RUBIK ADAPTADO',
     FORCE:'💥 EA FORÇA DO MOVIMENTO'
   };
   return names[String(key||'').toUpperCase()]||String(key||'MOTOR');
@@ -17500,6 +17769,12 @@ function applyRobotPowerState(){
     eaPowerBtn.style.color='#fff';
     eaPowerBtn.style.borderColor=eaEnabled?'#16c56b':'#ff5252';
   }
+  if(rubikPowerBtn){
+    rubikPowerBtn.textContent=rubikEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    rubikPowerBtn.style.background=rubikEnabled?'#0b7a3d':'#7d1d1d';
+    rubikPowerBtn.style.color='#fff';
+    rubikPowerBtn.style.borderColor=rubikEnabled?'#16c56b':'#ff5252';
+  }
   if(forcePowerBtn){
     forcePowerBtn.textContent=forceEnabled?'🟢 ONLINE':'🔴 OFFLINE';
     forcePowerBtn.style.background=forceEnabled?'#0b7a3d':'#7d1d1d';
@@ -17516,6 +17791,9 @@ function applyRobotPowerState(){
   if(eaModeDesc) eaModeDesc.textContent=eaEnabled
     ? 'ONLINE: RSI 14 + Value Chart + XGBoost • sinal somente com tripla confirmação • OPEN/OTC.'
     : 'OFFLINE: EA RSI + Value Chart + XGBoost pausada.';
+  if(rubikModeDesc) rubikModeDesc.textContent=rubikEnabled
+    ? 'ONLINE: Heikin-Ashi + EMA 9/21 + RSI 14 + MACD • OPEN/OTC • próxima vela.'
+    : 'OFFLINE: Robô Rubik Adaptado pausado.';
   if(forceModeDesc) forceModeDesc.textContent=forceEnabled
     ? 'ONLINE: OPEN multifuente para qualquer corretora Forex • OTC pela IQ Option • configuração protegida • sem Gale.'
     : 'OFFLINE: EA Força do Movimento pausado • configuração protegida.';
@@ -17525,6 +17803,11 @@ function applyRobotPowerState(){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA FORÇA DO MOVIMENTO ONLINE • CONFIGURAÇÃO PROTEGIDA • FOCO EM WIN DIRETO';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">💥 EA Força do Movimento selecionado • parâmetros não exibidos.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar do EA Força do Movimento ativo • OPEN multifuente / OTC pela IQ Option</div>';
+    rad();
+  }else if(engine==='RUBIK'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔ RUBIK ADAPTADO ONLINE • HEIKIN-ASHI + EMA + RSI + MACD • OPEN + OTC';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧩 Robô Rubik Adaptado selecionado • sinal somente com confluência completa.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar Robô Rubik ativo • Heikin-Ashi + EMA 9/21 + RSI 14 + MACD • OPEN/OTC</div>';
     rad();
   }else if(engine==='EA'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA TRIPLA CONFIRMAÇÃO ONLINE • RSI + VALUE CHART + XGBOOST • OPEN + OTC';
@@ -17543,7 +17826,7 @@ function applyRobotPowerState(){
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial e EAs estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial, Robô Rubik e EAs estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -17563,11 +17846,12 @@ function resetEngineVisualState(){
 
 async function setRobotPower(enabled){
   robotEnabled=!!enabled;
-  if(robotEnabled){ aiEnabled=false; eaEnabled=false; forceEnabled=false; }
+  if(robotEnabled){ aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
   try{
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
@@ -17580,11 +17864,12 @@ async function setRobotPower(enabled){
 
 async function setAiPower(enabled){
   aiEnabled=!!enabled;
-  if(aiEnabled){ robotEnabled=false; eaEnabled=false; forceEnabled=false; }
+  if(aiEnabled){ robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
   try{
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
@@ -17597,11 +17882,12 @@ async function setAiPower(enabled){
 
 async function setEaPower(enabled){
   eaEnabled=!!enabled;
-  if(eaEnabled){ robotEnabled=false; aiEnabled=false; forceEnabled=false; }
+  if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; }
   try{
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
@@ -17612,14 +17898,33 @@ async function setEaPower(enabled){
   if(voiceEnabled) speak(eaEnabled ? 'EA online.' : 'EA offline.');
 }
 
+async function setRubikPower(enabled){
+  rubikEnabled=!!enabled;
+  if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; }
+  try{
+    localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(rubikEnabled ? 'Robô Rubik Adaptado online.' : 'Robô Rubik Adaptado offline.');
+}
+
 async function setForcePower(enabled){
   forceEnabled=!!enabled;
-  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; }
+  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; }
   try{
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -17632,6 +17937,7 @@ async function setForcePower(enabled){
 if(robotPowerBtn) robotPowerBtn.onclick=()=>{ setRobotPower(!robotEnabled); };
 if(aiPowerBtn) aiPowerBtn.onclick=()=>{ setAiPower(!aiEnabled); };
 if(eaPowerBtn) eaPowerBtn.onclick=()=>{ setEaPower(!eaEnabled); };
+if(rubikPowerBtn) rubikPowerBtn.onclick=()=>{ setRubikPower(!rubikEnabled); };
 if(forcePowerBtn) forcePowerBtn.onclick=()=>{ setForcePower(!forceEnabled); };
 
 async function sig(announce=false){
@@ -17858,7 +18164,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':'IA GRÁFICA'))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
+    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':(selectedRobotEngine()==='RUBIK'?'ROBÔ RUBIK':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':'IA GRÁFICA')))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
     await sig(true);
   }finally{
     radarAutoBusy=false;
