@@ -14591,6 +14591,20 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
 
+  <div id="chartTab" class="tab">
+    <div class="card">
+      <div class="chartmeta">
+        <b>📈 Gráfico em tempo real</b>
+        <span class="chartbadge" id="chartInfo">--</span>
+      </div>
+      <div class="chartbox"><canvas id="priceChart"></canvas></div>
+      <div class="label" style="margin-top:8px">
+        O gráfico acompanha o mercado, par e período selecionados e atualiza automaticamente com a vela atual.
+      </div>
+    </div>
+  </div>
+
+
   <div id="resultsTab" class="tab">
     <div class="card">
       <h2 style="margin-top:0">🎯 Resultados até Gale 2</h2>
