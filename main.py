@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.38"
-PWA_VERSION = "v105"
+APP_VERSION = "3.39"
+PWA_VERSION = "v106"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -309,6 +309,20 @@ CHART_SIGNAL_CONFIRM_READS = 3
 CHART_SIGNAL_CONFIRM_MAX_GAP = 6
 PRE_SIGNAL_TTL = 75
 PRE_SIGNAL_BATCH = 1
+
+# MEGA IA 3.39 — EA invisível de confirmação da vela em formação.
+# Ela acompanha o pré-alerta e mede força/micro-momento nos últimos segundos.
+# Quando existe feed de trades reais (Binance), usa trades/ticks reais. Em fontes
+# sem tape de ticks no backend, usa micro-amostras sucessivas da vela atual e
+# NUNCA finge que snapshots são ticks reais.
+MOMENT_EA_ENABLED = os.getenv("MOMENT_EA_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
+MOMENT_EA_WINDOW_SECONDS = max(10, min(45, int(os.getenv("MOMENT_EA_WINDOW_SECONDS", "20"))))
+MOMENT_EA_CONFIRM_SCORE = max(55.0, min(90.0, float(os.getenv("MOMENT_EA_CONFIRM_SCORE", "64"))))
+MOMENT_EA_VETO_SCORE = max(60.0, min(95.0, float(os.getenv("MOMENT_EA_VETO_SCORE", "72"))))
+MOMENT_EA_MIN_TICKS = max(6, int(os.getenv("MOMENT_EA_MIN_TICKS", "12")))
+moment_ea_state: Dict[str, Any] = {}
+moment_ea_confirmations: Dict[str, Any] = {}
+moment_ea_guard = threading.RLock()
 
 td_sem = asyncio.Semaphore(1)
 td_candle_cache: Dict[str, Any] = {}
@@ -8212,6 +8226,41 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         if analysis.get("confirmed") and analysis.get("direction") in ("CALL", "PUT"):
             direction_now = analysis["direction"]
             reference_candle = engine_closed[-1].get("datetime") if engine_closed else None
+
+            # MEGA IA 3.39 — confirmação invisível da vela em formação.
+            # Quando houve tape REAL de ticks durante o pré-alerta para esta mesma
+            # entrada, ele vira uma confirmação adicional. Sem tape real, a EA é
+            # apenas contexto e não bloqueia o ensemble Luna + XGBoost.
+            moment_gate = {"available": False, "required": False, "confirmed": False}
+            if engine == "SMART":
+                try:
+                    _, moment_entry, _ = entry_window(interval, entry_mode)
+                    moment_gate = _moment_ea_gate_for_signal(
+                        market, symbol, interval, direction_now, moment_entry
+                    )
+                except Exception:
+                    moment_gate = {"available": False, "required": False, "confirmed": False}
+                base["moment_ea"] = moment_gate
+                if moment_gate.get("hard_veto"):
+                    base["status"] = "EA VELA ATUAL • MOMENTO CONTRÁRIO • ENTRADA BLOQUEADA"
+                    base["reason"] = (
+                        f"A IA principal apontou {direction_now}, mas os ticks finais mostraram "
+                        f"força contrária {moment_gate.get('direction')} ({float(moment_gate.get('score') or 0):.0f}%)."
+                    )
+                    base["risk"] = "HIGH"
+                    release_state["active_signal"] = None
+                    cache[key] = (time.time(), base)
+                    return base
+                if moment_gate.get("required") and not moment_gate.get("confirmed"):
+                    base["status"] = "EA VELA ATUAL • AGUARDANDO CONFIRMAÇÃO DE MOMENTO"
+                    base["reason"] = (
+                        str(moment_gate.get("reason") or "Ticks reais ainda não confirmaram a direção da entrada.")[:280]
+                    )
+                    base["risk"] = "HIGH"
+                    release_state["active_signal"] = None
+                    cache[key] = (time.time(), base)
+                    return base
+
             signal_fingerprint = f"{engine}|{direction_now}|{reference_candle}"
             fingerprint_key = (
                 "pure_ai_fingerprint" if engine == "SMART"
@@ -8242,15 +8291,25 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         return base
 
                 announce, entry, expiry = entry_window(interval, entry_mode)
+                smart_status = (
+                    "FALLBACK LOCAL • BLOQUEADO PARA ENTRADA" if analysis.get("fallback")
+                    else ("SINAL IA + EA VELA CONFIRMADO" if (engine == "SMART" and moment_gate.get("confirmed")) else "SINAL IA PURA LIBERADO")
+                )
                 base.update({
                     "direction": direction_now,
-                    "status": (("FALLBACK LOCAL • BLOQUEADO PARA ENTRADA" if analysis.get("fallback") else "SINAL IA PURA LIBERADO") if engine == "SMART" else ("SINAL EA AUTÔNOMA IQ LIBERADO" if engine == "EA" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))),
+                    "status": (smart_status if engine == "SMART" else ("SINAL EA AUTÔNOMA IQ LIBERADO" if engine == "EA" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
                     "expiry_time": iso(expiry),
                     "reference_candle": reference_candle,
                 })
+
+                if engine == "SMART" and moment_gate.get("confirmed"):
+                    base["reason"] = (str(base.get("reason") or "") +
+                        f" • EA Vela Atual confirmou o micro-momento ({float(moment_gate.get('score') or 0):.0f}%, "
+                        f"{int(moment_gate.get('ticks') or 0)} ticks).")[:360]
+                    base.setdefault("technical", {})["moment_ea"] = moment_gate
 
                 # 3.22: o histórico recente pode tornar o filtro mais seletivo.
                 # Só atua depois da amostra mínima e nunca altera candles/regras
@@ -9286,6 +9345,17 @@ async def health():
             "sessions": len(binomo_sessions),
             "authenticated_ws_connected": _binomo_any_authenticated_ws_connected(),
             "public_ws_enabled": bool(BINOMO_QUOTE_WS_ENABLED),
+        },
+        "moment_ea": {
+            "enabled": bool(MOMENT_EA_ENABLED),
+            "role": "CONFIRMACAO DA VELA EM FORMACAO",
+            "window_seconds": MOMENT_EA_WINDOW_SECONDS,
+            "confirm_score": MOMENT_EA_CONFIRM_SCORE,
+            "veto_score": MOMENT_EA_VETO_SCORE,
+            "min_real_ticks": MOMENT_EA_MIN_TICKS,
+            "real_tick_source": "BINANCE_AGG_TRADES para BTC/ETH/LTC; demais fontes usam micro-amostras sem fingir ticks",
+            "tracked": len(moment_ea_state),
+            "confirmed": len(moment_ea_confirmations),
         },
         "xgboost": {
             "configured": bool(XGB_ENABLED),
@@ -11396,6 +11466,286 @@ async def ai_analysis(request: Request, symbol: str = "EUR/USD", interval: str =
     return {k: data.get(k) for k in public_keys}
 
 
+
+
+def _moment_ea_key(market: str, symbol: str, interval: str) -> str:
+    return f"{str(market or 'OPEN').upper()}|{str(symbol or '').upper()}|{interval}"
+
+
+def _moment_ea_prune() -> None:
+    cutoff = time.time() - 180.0
+    with moment_ea_guard:
+        for store in (moment_ea_state, moment_ea_confirmations):
+            stale = []
+            for key, item in list(store.items()):
+                ts = float((item or {}).get("updated_at") or 0.0) if isinstance(item, dict) else 0.0
+                if ts and ts < cutoff:
+                    stale.append(key)
+            for key in stale:
+                store.pop(key, None)
+
+
+async def _binance_recent_agg_trades(symbol: str, window_seconds: int = 20, limit: int = 1000) -> list:
+    """Retorna trades agregados reais recentes da Binance para cripto mapeada.
+
+    São eventos de negócio reais (aggTrades), usados apenas como confirmação de
+    micro-momento da vela atual. Nunca substituem o OHLCV principal do sinal.
+    """
+    pair = BINANCE_SYMBOLS.get(str(symbol or "").upper())
+    if not pair:
+        return []
+    urls = [u.replace("/klines", "/aggTrades") for u in BINANCE_KLINES_URLS]
+    cutoff_ms = int((time.time() - max(5, int(window_seconds))) * 1000)
+    last_error = ""
+    for url in urls:
+        try:
+            async with httpx.AsyncClient(timeout=min(PUBLIC_FEED_TIMEOUT, 8.0), follow_redirects=True) as client:
+                r = await client.get(url, params={"symbol": pair, "limit": max(50, min(int(limit), 1000))})
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list):
+                continue
+            out = []
+            for x in data:
+                if not isinstance(x, dict):
+                    continue
+                try:
+                    ts = int(x.get("T") or 0)
+                    if ts < cutoff_ms:
+                        continue
+                    price = float(x.get("p") or 0)
+                    qty = float(x.get("q") or 0)
+                    if price <= 0 or qty <= 0:
+                        continue
+                    out.append({
+                        "ts": ts / 1000.0,
+                        "price": price,
+                        "qty": qty,
+                        # m=True => comprador foi maker => agressão vendedora.
+                        "side": "SELL" if bool(x.get("m")) else "BUY",
+                    })
+                except Exception:
+                    continue
+            if out:
+                return out
+        except Exception as exc:
+            last_error = str(exc)[:160]
+    return []
+
+
+def _moment_ea_add_snapshot(market: str, symbol: str, interval: str, price: float, entry_time: str) -> list:
+    key = _moment_ea_key(market, symbol, interval)
+    now_ts = time.time()
+    with moment_ea_guard:
+        st = moment_ea_state.setdefault(key, {"snapshots": []})
+        if st.get("entry_time") != entry_time:
+            st.clear()
+            st.update({"entry_time": entry_time, "snapshots": []})
+        snaps = list(st.get("snapshots") or [])
+        if price > 0:
+            if not snaps or now_ts - float(snaps[-1][0]) >= 1.0:
+                snaps.append((now_ts, float(price)))
+        cutoff = now_ts - 70.0
+        snaps = [x for x in snaps if float(x[0]) >= cutoff][-90:]
+        st["snapshots"] = snaps
+        st["updated_at"] = now_ts
+        return list(snaps)
+
+
+def _moment_ea_store(market: str, symbol: str, interval: str, payload: Dict[str, Any]) -> None:
+    key = _moment_ea_key(market, symbol, interval)
+    data = dict(payload or {})
+    data["updated_at"] = time.time()
+    with moment_ea_guard:
+        moment_ea_state[key] = {**(moment_ea_state.get(key) or {}), **data}
+        if data.get("confirmed") and data.get("direction") in ("CALL", "PUT"):
+            moment_ea_confirmations[key] = dict(data)
+
+
+def _moment_ea_gate_for_signal(market: str, symbol: str, interval: str, direction: str, entry_dt: datetime) -> Dict[str, Any]:
+    """Consulta a confirmação feita durante o pré-alerta para o sinal final.
+
+    Se houve tape de ticks reais para a MESMA entrada, a confirmação passa a ser
+    obrigatória. Em fontes sem ticks reais, a EA é apenas contexto e nunca finge
+    que snapshots equivalem a ticks.
+    """
+    _moment_ea_prune()
+    key = _moment_ea_key(market, symbol, interval)
+    with moment_ea_guard:
+        state = dict(moment_ea_state.get(key) or {})
+        conf = dict(moment_ea_confirmations.get(key) or {})
+    wanted_entry = iso(entry_dt)
+
+    def same_entry(item):
+        try:
+            return abs((parse_dt(str(item.get("entry_time") or "")) - entry_dt).total_seconds()) <= 20
+        except Exception:
+            return False
+
+    source = conf if conf and same_entry(conf) else state if state and same_entry(state) else {}
+    if not source:
+        return {"available": False, "required": False, "confirmed": False, "reason": "EA Vela Atual sem leitura válida para esta entrada."}
+
+    tick_ready = bool(source.get("tick_ready"))
+    active_window = bool(source.get("active"))
+    source_direction = str(source.get("direction") or "NEUTRO").upper()
+    score = float(source.get("score") or 0.0)
+    hard_veto = bool(tick_ready and source_direction in ("CALL", "PUT") and source_direction != direction and score >= MOMENT_EA_VETO_SCORE)
+    confirmed = bool(source.get("confirmed") and source_direction == direction)
+    return {
+        "available": True,
+        "required": bool(tick_ready and active_window),
+        "confirmed": confirmed,
+        "hard_veto": hard_veto,
+        "direction": source_direction,
+        "score": round(score, 1),
+        "tick_ready": tick_ready,
+        "tick_source": source.get("tick_source"),
+        "ticks": int(source.get("ticks") or 0),
+        "pressure": source.get("pressure"),
+        "velocity": source.get("velocity"),
+        "entry_time": wanted_entry,
+        "reason": str(source.get("reason") or "")[:220],
+    }
+
+
+async def _moment_ea_confirm_live_candle(
+    raw, symbol: str, interval: str, market: str, direction: str,
+    seconds_to_entry: int, entry_dt: datetime,
+) -> Dict[str, Any]:
+    """EA invisível que confirma a vela do pré-alerta pelo micro-momento atual."""
+    base = {
+        "enabled": bool(MOMENT_EA_ENABLED),
+        "active": False,
+        "confirmed": False,
+        "direction": "NEUTRO",
+        "score": 0.0,
+        "tick_ready": False,
+        "tick_source": "NONE",
+        "ticks": 0,
+        "pressure": 0.0,
+        "velocity": 0.0,
+        "seconds_to_entry": int(max(0, seconds_to_entry)),
+        "entry_time": iso(entry_dt),
+        "window_seconds": MOMENT_EA_WINDOW_SECONDS,
+        "reason": "EA Vela Atual aguardando janela final.",
+    }
+    if not MOMENT_EA_ENABLED or direction not in ("CALL", "PUT") or not raw:
+        return base
+
+    try:
+        live = raw[-1]
+        op = float(live.get("open") or 0.0)
+        hi = float(live.get("high") or 0.0)
+        lo = float(live.get("low") or 0.0)
+        cl = float(live.get("close") or 0.0)
+        rng = max(hi - lo, 1e-12)
+        candle_signed = max(-1.0, min(1.0, (cl - op) / rng))
+        close_position = max(0.0, min(1.0, (cl - lo) / rng))
+    except Exception:
+        return base
+
+    snaps = _moment_ea_add_snapshot(market, symbol, interval, cl, iso(entry_dt))
+    in_final_window = int(seconds_to_entry) <= MOMENT_EA_WINDOW_SECONDS
+    base["active"] = bool(in_final_window)
+
+    # Binance: tape real de negócios agregados, ideal para BTC/ETH/LTC.
+    trades = []
+    feed_src = _feed_source_from_rows(raw)
+    if market == "OPEN" and str(symbol).upper() in BINANCE_SYMBOLS:
+        # Usa tape da Binance mesmo quando o OHLC principal veio da cTrader; a
+        # confirmação é só micro-momento e fica explicitamente identificada.
+        trades = await _binance_recent_agg_trades(symbol, MOMENT_EA_WINDOW_SECONDS, 1000)
+
+    signed_force = 0.0
+    score = 50.0
+    bias = "NEUTRO"
+    tick_ready = False
+    tick_source = "SNAPSHOT_CANDLE"
+    tick_count = 0
+    pressure = 0.0
+    velocity = 0.0
+    reversal = False
+    detail = []
+
+    if len(trades) >= MOMENT_EA_MIN_TICKS:
+        tick_ready = True
+        tick_source = "BINANCE_AGG_TRADES"
+        tick_count = len(trades)
+        buy_notional = sum(float(t["price"]) * float(t["qty"]) for t in trades if t["side"] == "BUY")
+        sell_notional = sum(float(t["price"]) * float(t["qty"]) for t in trades if t["side"] == "SELL")
+        total_notional = max(buy_notional + sell_notional, 1e-12)
+        pressure = (buy_notional - sell_notional) / total_notional
+        first_px = float(trades[0]["price"])
+        last_px = float(trades[-1]["price"])
+        change_bps = ((last_px / max(first_px, 1e-12)) - 1.0) * 10000.0
+        duration = max(float(trades[-1]["ts"]) - float(trades[0]["ts"]), 1.0)
+        velocity = tick_count / duration
+        recent_cut = float(trades[-1]["ts"]) - min(5.0, MOMENT_EA_WINDOW_SECONDS / 3)
+        tail = [t for t in trades if float(t["ts"]) >= recent_cut]
+        tail_buy = sum(float(t["price"]) * float(t["qty"]) for t in tail if t["side"] == "BUY")
+        tail_sell = sum(float(t["price"]) * float(t["qty"]) for t in tail if t["side"] == "SELL")
+        tail_pressure = (tail_buy - tail_sell) / max(tail_buy + tail_sell, 1e-12) if tail else 0.0
+        price_component = max(-1.0, min(1.0, change_bps / 7.0))
+        close_component = max(-1.0, min(1.0, (close_position - 0.5) * 2.0))
+        signed_force = 0.46 * pressure + 0.27 * price_component + 0.17 * candle_signed + 0.10 * close_component
+        bias = "CALL" if signed_force >= 0.08 else ("PUT" if signed_force <= -0.08 else "NEUTRO")
+        score = max(0.0, min(100.0, 50.0 + abs(signed_force) * 50.0))
+        wanted_sign = 1 if direction == "CALL" else -1
+        reversal = bool((tail_pressure * wanted_sign) <= -0.38 and len(tail) >= 4)
+        detail.append(f"ticks reais {tick_count}")
+        detail.append(f"pressão {pressure*100:+.0f}%")
+        detail.append(f"velocidade {velocity:.1f}/s")
+    else:
+        # Sem tape real disponível: usa a evolução observada nas chamadas do
+        # pré-alerta apenas como CONTEXTO. Não marca tick_ready e não vira trava.
+        tick_count = len(snaps)
+        if len(snaps) >= 2:
+            first_px = float(snaps[0][1]); last_px = float(snaps[-1][1])
+            snap_move = (last_px - first_px) / max(abs(first_px), 1e-12)
+            snap_component = max(-1.0, min(1.0, snap_move * 5000.0))
+        else:
+            snap_component = 0.0
+        close_component = max(-1.0, min(1.0, (close_position - 0.5) * 2.0))
+        signed_force = 0.60 * candle_signed + 0.25 * snap_component + 0.15 * close_component
+        bias = "CALL" if signed_force >= 0.12 else ("PUT" if signed_force <= -0.12 else "NEUTRO")
+        score = max(0.0, min(100.0, 50.0 + abs(signed_force) * 38.0))
+        detail.append(f"micro-amostras {tick_count}")
+        detail.append("sem tape real de ticks")
+
+    aligned = bias == direction
+    confirmed = bool(in_final_window and tick_ready and aligned and score >= MOMENT_EA_CONFIRM_SCORE and not reversal)
+    if not in_final_window:
+        reason = f"EA Vela Atual coletando momento; confirmação forte nos últimos {MOMENT_EA_WINDOW_SECONDS}s."
+    elif confirmed:
+        reason = f"EA Vela Atual confirmou {direction}: " + ", ".join(detail[:3]) + "."
+    elif tick_ready and reversal:
+        reason = f"EA Vela Atual bloqueou {direction}: reversão forte nos ticks finais."
+    elif tick_ready and bias in ("CALL", "PUT") and not aligned:
+        reason = f"EA Vela Atual divergiu do pré-alerta: micro-momento {bias} com força {score:.0f}%."
+    elif tick_ready:
+        reason = f"EA Vela Atual ainda sem força suficiente ({score:.0f}%) para confirmar {direction}."
+    else:
+        reason = "EA Vela Atual monitorando corpo/direção; tape real de ticks não disponível nesta fonte."
+
+    out = {
+        **base,
+        "confirmed": confirmed,
+        "direction": bias,
+        "score": round(score, 1),
+        "tick_ready": tick_ready,
+        "tick_source": tick_source,
+        "ticks": int(tick_count),
+        "pressure": round(float(pressure), 4),
+        "velocity": round(float(velocity), 2),
+        "reversal": reversal,
+        "aligned_with_prealert": aligned,
+        "feed_source": feed_src,
+        "reason": reason,
+    }
+    _moment_ea_store(market, symbol, interval, out)
+    return out
+
 def _pre_signal_from_live_candle(raw, interval: str, market: str = "OPEN", symbol: str | None = None):
     """
     Pré-sinal NÃO confirmado.
@@ -11435,8 +11785,12 @@ async def pre_signals(
     market: str = "OPEN",
     limit: int = 4,
     symbol: str | None = None,
+    engine: str = "GRAPH_AI",
 ):
     market = (market or "OPEN").upper()
+    engine = str(engine or "GRAPH_AI").upper()
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE"):
+        engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
     if interval not in INTERVALS or market not in VALID_MARKETS:
@@ -11523,6 +11877,30 @@ async def pre_signals(
             preview = _pre_signal_from_live_candle(raw, interval, market, symbol)
 
             if preview:
+                moment_ea = None
+                if engine == "SMART":
+                    try:
+                        moment_ea = await _moment_ea_confirm_live_candle(
+                            raw, symbol, interval, market, preview["direction"],
+                            seconds_to_entry, entry_dt,
+                        )
+                    except Exception as exc:
+                        moment_ea = {
+                            "enabled": True, "active": seconds_to_entry <= MOMENT_EA_WINDOW_SECONDS,
+                            "confirmed": False, "direction": "NEUTRO", "score": 0.0,
+                            "tick_ready": False, "tick_source": "ERROR", "ticks": 0,
+                            "reason": f"EA Vela Atual indisponível: {str(exc)[:140]}",
+                        }
+
+                status = "PRÉ-SINAL • AGUARDANDO FECHAMENTO"
+                if moment_ea:
+                    if moment_ea.get("confirmed"):
+                        status = "PRÉ-SINAL • EA VELA ATUAL CONFIRMOU"
+                    elif moment_ea.get("active"):
+                        status = "PRÉ-SINAL • EA VELA ATUAL ANALISANDO"
+                    else:
+                        status = "PRÉ-SINAL • EA VELA ATUAL COLETANDO"
+
                 pre_signal_cache[key] = {
                     "symbol": symbol,
                     "direction": preview["direction"],
@@ -11532,7 +11910,9 @@ async def pre_signals(
                     "entry_time": iso(entry_dt),
                     "seconds_to_entry": seconds_to_entry,
                     "updated_at": time.time(),
-                    "status": "PRÉ-SINAL • AGUARDANDO FECHAMENTO",
+                    "status": status,
+                    "engine": engine,
+                    "moment_ea": moment_ea,
                 }
             else:
                 pre_signal_cache.pop(key, None)
@@ -11575,7 +11955,8 @@ async def pre_signals(
         "ok": True,
         "message": (
             "Pré-sinais calculados com a vela em formação. "
-            "O CALL/PUT só é confirmado no fechamento."
+            "Na Inteligência Artificial, a EA Vela Atual mede força/micro-momento antes da entrada; "
+            "o CALL/PUT final ainda passa por Luna + XGBoost + filtros de risco."
         ),
         "items": items[:limit],
         "seconds_to_entry": seconds_to_entry,
@@ -13475,6 +13856,7 @@ const preSignals=document.getElementById('preSignals');
 const preSignalStatus=document.getElementById('preSignalStatus');
 let preSignalBusy=false;
 let lastPreAlertVoiceKey='';
+let lastMomentEaVoiceKey='';
 let iqLoginInProgress=false; // pausa temporariamente as consultas durante o login da IQ Option
 const heroBox=document.getElementById('heroBox');
 const entryArrow=document.getElementById('entryArrow');
@@ -14386,6 +14768,7 @@ if(entryMode){
   paintEntryModeNote();
   entryMode.onchange=()=>{
     lastPreAlertVoiceKey='';
+    lastMomentEaVoiceKey='';
     try{localStorage.setItem('mega_entry_mode',entryMode.value||'BIRTH')}catch(_){}
     lastSignalVoice='';
     lastCountdownSignalKey='';
@@ -16916,7 +17299,7 @@ async function loadPreSignals(){
   try{
     const lim=preSignalLimit ? Math.max(1,Math.min(4,Number(preSignalLimit.value||1))) : 1;
     const sym=(S&&S.value) ? S.value : '';
-    const url=`/pre-signals?market=${encodeURIComponent(market.value)}&interval=${encodeURIComponent(interval.value)}&limit=${encodeURIComponent(lim)}&symbol=${encodeURIComponent(sym)}`;
+    const url=`/pre-signals?market=${encodeURIComponent(market.value)}&interval=${encodeURIComponent(interval.value)}&limit=${encodeURIComponent(lim)}&symbol=${encodeURIComponent(sym)}&engine=${encodeURIComponent(engine)}`;
     const data=await get(url);
     const items=Array.isArray(data&&data.items)?data.items:[];
     const remain=Math.max(0,Number((data&&data.seconds_to_entry)||0));
@@ -16941,10 +17324,25 @@ async function loadPreSignals(){
         const conf=Math.round(Number(item.confidence||0));
         const secs=Math.max(0,Number(item.seconds_to_entry||0));
         const when=item.entry_time?ft(item.entry_time):'--:--';
+        const mea=item&&item.moment_ea?item.moment_ea:null;
+        let momentLine='';
+        if(mea){
+          const mscore=Math.round(Number(mea.score||0));
+          const mticks=Math.max(0,Number(mea.ticks||0));
+          if(mea.confirmed){
+            momentLine=`<br><small>⚡ EA VELA ATUAL: CONFIRMOU ${d} • força ${mscore}% • ${mticks} ticks</small>`;
+          }else if(mea.active && mea.tick_ready){
+            momentLine=`<br><small>⚡ EA VELA ATUAL: analisando ticks • força ${mscore}% • ${mticks} ticks</small>`;
+          }else if(mea.active){
+            momentLine=`<br><small>⚡ EA VELA ATUAL: analisando força/corpo • aguardando confirmação</small>`;
+          }else{
+            momentLine=`<br><small>⚡ EA VELA ATUAL: coletando micro-momento</small>`;
+          }
+        }
         return `<div class="${d==='CALL'?'radar-call':'radar-put'}" style="border:1px solid rgba(255,193,7,.65)">
           <b>🔔 PRÉ-ALERTA • ${icon} ${item.symbol||sym} ${d}</b><br>
           <span>Possível entrada às ${when} • em ${Math.ceil(secs)}s</span><br>
-          <small>Confiança preliminar ${conf}% • AGUARDE CONFIRMAÇÃO FINAL</small>
+          <small>Confiança preliminar ${conf}% • AGUARDE CONFIRMAÇÃO FINAL</small>${momentLine}
         </div>`;
       }).join('');
     }
@@ -16960,7 +17358,19 @@ async function loadPreSignals(){
         if(voiceEnabled){
           const lado=String(best.direction||'').toUpperCase()==='CALL'?'compra':'venda';
           const ativoFalado=spokenAssetName(best.symbol||sym);
-          speak('Pré alerta. Possível entrada de '+lado+' no ativo '+ativoFalado+' em aproximadamente um minuto. Aguarde a confirmação final.');
+          speak('Pré alerta. Possível entrada de '+lado+' no ativo '+ativoFalado+'. A EA da vela começou a analisar a força do momento.');
+        }
+      }
+      const mea=best&&best.moment_ea?best.moment_ea:null;
+      if(mea && mea.confirmed){
+        const mkey=['MOMENT',best.symbol,best.direction,best.entry_time].join('|');
+        if(mkey!==lastMomentEaVoiceKey){
+          lastMomentEaVoiceKey=mkey;
+          if(voiceEnabled){
+            const lado=String(best.direction||'').toUpperCase()==='CALL'?'compra':'venda';
+            const ativoFalado=spokenAssetName(best.symbol||sym);
+            speak('EA da vela confirmou força de '+lado+' no ativo '+ativoFalado+'. Aguardando confirmação final da inteligência artificial.');
+          }
         }
       }
     }
@@ -17393,7 +17803,7 @@ setInterval(()=>{ if(!iqLoginInProgress) refreshCTraderStatus(); },60000);
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress) rad();
 },30000);
-// Pré-alerta atualizado a cada 10 s no último minuto antes da próxima abertura; não confirma nem executa a entrada.
+// Pré-alerta atualizado a cada 10 s; no SMART a EA Vela Atual mede micro-momento/ticks e alimenta a confirmação final.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress && selectedRobotEngine()!=='OFF') loadPreSignals();
 },10000);
