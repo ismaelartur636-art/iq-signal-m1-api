@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.36"
-PWA_VERSION = "v103"
+APP_VERSION = "3.37"
+PWA_VERSION = "v104"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -7284,16 +7284,16 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         xgb_confidence = float(xgb_signal.get("confidence") or 0.0)
         xgb_agrees = bool(direction in ("CALL", "PUT") and xgb_direction == direction)
 
-        # v3.36 — ajuste leve de frequência sem retirar as confirmações principais.
-        # LOW continua seletivo em 80%. MEDIUM cai para 82%. HIGH deixa de ser
-        # bloqueio absoluto, mas só pode passar em 86%+ e com XGBoost + price action.
-        low_min = max(float(OAI_MIN), 80.0 if interval == "1min" else 80.0)
+        # v3.37 — ajuste pequeno adicional de frequência. Mantém o ensemble,
+        # XGBoost e o gate final; reduz apenas os pisos de confiança.
+        # LOW 78%, MEDIUM 80% e HIGH 84% (HIGH ainda exige XGBoost pronto).
+        low_min = max(float(OAI_MIN), 78.0 if interval == "1min" else 78.0)
         if risk == "LOW":
             required_conf = low_min
         elif risk == "MEDIUM":
-            required_conf = max(low_min + 2.0, 82.0)
+            required_conf = max(low_min + 2.0, 80.0)
         else:
-            required_conf = max(low_min + 6.0, 86.0)
+            required_conf = max(low_min + 6.0, 84.0)
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
 
         blocked_reason = None
