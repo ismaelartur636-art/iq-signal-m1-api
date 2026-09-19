@@ -41,9 +41,187 @@ except Exception:
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from statistics import median
 
-APP_VERSION = "3.50"
-PWA_VERSION = "v117"
+# ===== HEIKEN ASHI ARROWS PRO (motor interno, sem arquivo extra) =====
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _heiken_ashi(rows):
+    out = []
+    prev_open = None
+    prev_close = None
+    for row in list(rows or []):
+        try:
+            o = float(row["open"])
+            h = float(row["high"])
+            l = float(row["low"])
+            c = float(row["close"])
+        except Exception:
+            continue
+        ha_close = (o + h + l + c) / 4.0
+        ha_open = (o + c) / 2.0 if prev_open is None else (prev_open + prev_close) / 2.0
+        ha_high = max(h, ha_open, ha_close)
+        ha_low = min(l, ha_open, ha_close)
+        out.append({
+            "open": ha_open,
+            "high": ha_high,
+            "low": ha_low,
+            "close": ha_close,
+        })
+        prev_open, prev_close = ha_open, ha_close
+    return out
+
+
+def heiken_ashi_arrows_strategy(cs, timeframe="1min", market="OPEN"):
+    rows = list(cs or [])
+    tf_label = {"1min": "M1", "5min": "M5", "15min": "M15", "30min": "M30"}.get(timeframe, timeframe)
+    name = f"HEIKEN ASHI ARROWS PRO {tf_label}"
+
+    def neutral(reason, confidence=0.0, diagnostics=None):
+        out = {
+            "available": True,
+            "direction": "NEUTRO",
+            "confidence": round(float(confidence or 0), 1),
+            "confirmed": False,
+            "risk": "HIGH",
+            "strategy": name,
+            "engine": "HEIKEN",
+            "provider": "LOCAL_HEIKEN_ASHI_PRO",
+            "reason": reason,
+            "non_repaint": True,
+            "closed_candles_only": True,
+            "external_ai_disabled": True,
+            "gale_signal": False,
+        }
+        if diagnostics:
+            out["diagnostics"] = diagnostics
+        return out
+
+    if len(rows) < 18:
+        return neutral(f"Aguardando candles fechados suficientes ({len(rows)}/18).")
+
+    ha = _heiken_ashi(rows)
+    if len(ha) != len(rows) or len(ha) < 3:
+        return neutral("Heiken-Ashi ainda sem historico suficiente.")
+
+    # Reconstroi os sinais cronologicamente, igual ao indicador MT4 PRO.
+    # Nao repete CALL/CALL ou PUT/PUT: o lado so muda quando aparece uma
+    # confirmacao forte no sentido contrario. Isso remove o 'ct' global do MQ4
+    # original e deixa o historico deterministico.
+    last_direction = None
+    last_signal = None
+
+    for i in range(1, len(rows)):
+        row = rows[i]
+        hrow = ha[i]
+        ha_range = max(hrow["high"] - hrow["low"], 1e-12)
+        ha_body = abs(hrow["close"] - hrow["open"]) / ha_range
+        lower_wick = (min(hrow["open"], hrow["close"]) - hrow["low"]) / ha_range
+        upper_wick = (hrow["high"] - max(hrow["open"], hrow["close"])) / ha_range
+        real_range = max(float(row["high"]) - float(row["low"]), 1e-12)
+        history_ranges = [
+            max(float(x["high"]) - float(x["low"]), 1e-12)
+            for x in rows[max(0, i-12):i]
+        ]
+        avg_range = median(history_ranges) if history_ranges else real_range
+        range_ratio = real_range / max(avg_range, 1e-12)
+        real_bull = float(row["close"]) > float(row["open"])
+        real_bear = float(row["close"]) < float(row["open"])
+        bull = bool(
+            hrow["close"] > hrow["open"]
+            and real_bull
+            and ha_body >= 0.32
+            and lower_wick <= 0.40
+            and range_ratio >= 0.60
+        )
+        bear = bool(
+            hrow["close"] < hrow["open"]
+            and real_bear
+            and ha_body >= 0.32
+            and upper_wick <= 0.40
+            and range_ratio >= 0.60
+        )
+
+        direction = None
+        opposite_wick = None
+        if bull and not bear and last_direction != "CALL":
+            direction = "CALL"
+            opposite_wick = lower_wick
+        elif bear and not bull and last_direction != "PUT":
+            direction = "PUT"
+            opposite_wick = upper_wick
+
+        if direction:
+            last_direction = direction
+            confidence = 70.0
+            confidence += min(10.0, max(0.0, (ha_body - 0.32) * 24.0))
+            confidence += min(7.0, max(0.0, (range_ratio - 0.60) * 8.0))
+            confidence += min(5.0, max(0.0, (0.40 - opposite_wick) * 12.0))
+            confidence = _clamp(confidence, 70.0, 92.0)
+            last_signal = {
+                "index": i,
+                "direction": direction,
+                "confidence": confidence,
+                "ha_body_ratio": ha_body,
+                "lower_wick_ratio": lower_wick,
+                "upper_wick_ratio": upper_wick,
+                "range_vs_median": range_ratio,
+            }
+
+    last = rows[-1]
+    last_ha = ha[-1]
+    last_range = max(last_ha["high"] - last_ha["low"], 1e-12)
+    current_diag = {
+        "ha_body_ratio": round(abs(last_ha["close"] - last_ha["open"]) / last_range, 4),
+        "ha_color": "BULL" if last_ha["close"] > last_ha["open"] else ("BEAR" if last_ha["close"] < last_ha["open"] else "DOJI"),
+        "real_candle": "BULL" if float(last["close"]) > float(last["open"]) else ("BEAR" if float(last["close"]) < float(last["open"]) else "DOJI"),
+        "last_locked_direction": last_direction or "NONE",
+    }
+
+    # So libera entrada quando a NOVA seta nasceu exatamente no ultimo candle fechado.
+    if not last_signal or last_signal["index"] != len(rows) - 1:
+        return neutral(
+            "Heiken Ashi PRO monitorando: nenhuma nova troca de direcao forte no ultimo candle fechado.",
+            confidence=min(68.0, 45.0 + current_diag["ha_body_ratio"] * 20.0),
+            diagnostics=current_diag,
+        )
+
+    direction = last_signal["direction"]
+    confidence = last_signal["confidence"]
+    diagnostics = {
+        **current_diag,
+        "signal": direction,
+        "lower_wick_ratio": round(last_signal["lower_wick_ratio"], 4),
+        "upper_wick_ratio": round(last_signal["upper_wick_ratio"], 4),
+        "range_vs_median": round(last_signal["range_vs_median"], 4),
+        "direction_change_confirmed": True,
+    }
+    return {
+        "available": True,
+        "direction": direction,
+        "confidence": round(confidence, 1),
+        "confirmed": True,
+        "risk": "LOW" if confidence >= 84.0 else "MEDIUM",
+        "strategy": name,
+        "engine": "HEIKEN",
+        "provider": "LOCAL_HEIKEN_ASHI_PRO",
+        "reason": (
+            f"{direction} confirmado no ultimo candle fechado pelo Heiken Ashi PRO: "
+            f"mudanca de direcao, corpo forte, pavio contrario controlado e amplitude valida."
+        ),
+        "non_repaint": True,
+        "closed_candles_only": True,
+        "external_ai_disabled": True,
+        "gale_signal": False,
+        "diagnostics": diagnostics,
+    }
+
+# ===== FIM HEIKEN ASHI ARROWS PRO =====
+
+APP_VERSION = "3.51"
+PWA_VERSION = "v118"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -11941,6 +12119,87 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
     }
 
 
+
+@app.get("/indicator-heiken")
+async def indicator_heiken(
+    request: Request,
+    symbol: str = "EUR/USD",
+    interval: str = "1min",
+    market: str = "OPEN",
+):
+    market = (market or "OPEN").upper()
+    if not _symbol_allowed(symbol, market) or interval not in INTERVALS or market not in VALID_MARKETS:
+        raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
+
+    iq_state = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
+    if market == "IQ_OTC" and not iq_state:
+        return {
+            "ok": True,
+            "available": False,
+            "direction": "NEUTRO",
+            "confidence": 0,
+            "confirmed": False,
+            "risk": "HIGH",
+            "strategy": f"HEIKEN ASHI ARROWS PRO {interval}",
+            "reason": "Conecte a IQ Option para analisar o OTC real.",
+            "status": "HEIKEN ASHI PRO • IQ OPTION OFFLINE",
+            "non_repaint": True,
+            "closed_candles_only": True,
+            "market": market,
+            "symbol": symbol,
+            "interval": interval,
+        }
+
+    try:
+        if market == "IQ_OTC":
+            raw = await iq_ea_candles(iq_state, symbol, interval, 100, regular_market=False)
+            feed_source = "IQ_OPTION_OTC"
+            feed_label = "IQ Option OTC"
+        else:
+            raw = await candles(symbol, interval, 100, "OPEN", None, request=request)
+            info = _current_open_feed_info(symbol, interval)
+            feed_source = str(info.get("source") or _feed_source_from_rows(raw) or "MULTIFEED")
+            feed_label = _feed_source_label(feed_source)
+
+        # O último item da fonte pode ser a vela ainda em formação.
+        # O indicador usa SOMENTE candles fechados para não repintar.
+        closed = list(raw[:-1] if len(raw) > 1 else raw)
+        analysis = heiken_ashi_arrows_strategy(closed, interval, market=market)
+        return {
+            "ok": True,
+            **analysis,
+            "status": (
+                f"HEIKEN ASHI PRO • {analysis.get('direction')} CONFIRMADO"
+                if analysis.get("confirmed") and analysis.get("direction") in ("CALL", "PUT")
+                else "HEIKEN ASHI PRO • MONITORANDO"
+            ),
+            "market": market,
+            "symbol": symbol,
+            "interval": interval,
+            "feed_source": feed_source,
+            "feed_label": feed_label,
+            "updated_at": iso(now()),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return {
+            "ok": False,
+            "available": False,
+            "direction": "NEUTRO",
+            "confidence": 0,
+            "confirmed": False,
+            "risk": "HIGH",
+            "strategy": f"HEIKEN ASHI ARROWS PRO {interval}",
+            "reason": str(exc)[:220],
+            "status": "HEIKEN ASHI PRO • FONTE EM ESPERA",
+            "non_repaint": True,
+            "closed_candles_only": True,
+            "market": market,
+            "symbol": symbol,
+            "interval": interval,
+        }
+
 @app.get("/signal-ai")
 async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH"):
     requested_market = (market or "OPEN").upper()
@@ -14053,6 +14312,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="tabs">
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
     <button class="tabbtn" id="tabChart">📈 Gráfico</button>
+    <button class="tabbtn" id="tabIndicator">🧭 Indicador</button>
     <button class="tabbtn" id="tabResults">🎯 Resultados</button>
     <button class="tabbtn" id="tabValues">💰 Valores</button>
     <button class="tabbtn" id="tabHistory">🗓️ Histórico 15 dias</button>
@@ -14141,6 +14401,42 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </div>
   </div>
 
+
+  <div id="indicatorTab" class="tab">
+    <div class="card" style="max-width:760px;margin:0 auto">
+      <div style="display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap">
+        <div>
+          <div class="label">🧭 INDICADOR</div>
+          <div style="font-size:22px;font-weight:1000;margin-top:4px">HEIKEN ASHI ARROWS PRO</div>
+          <div style="opacity:.78;margin-top:5px;line-height:1.45">Somente este indicador nesta aba • candles fechados • não repinta • sem RSI, MACD, médias ou IA externa.</div>
+        </div>
+        <button id="heikenIndicatorPowerBtn" type="button" style="font-weight:1000;min-width:150px">🟢 ONLINE</button>
+      </div>
+
+      <div class="grid" style="margin-top:14px">
+        <div class="card signal" style="grid-column:auto">
+          <div class="label">SINAL</div>
+          <div id="heikenIndicatorDirection" class="big neutral">MONITORANDO</div>
+          <div id="heikenIndicatorConfidence">Confiança: --</div>
+        </div>
+        <div class="card">
+          <div class="label">STATUS</div>
+          <div id="heikenIndicatorStatus" style="font-weight:900;margin-top:8px">Aguardando leitura...</div>
+          <div id="heikenIndicatorRisk" style="margin-top:7px">Risco: --</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <div class="label">LEITURA</div>
+        <div id="heikenIndicatorReason" style="font-weight:800;line-height:1.5;margin-top:7px">O indicador está monitorando o último candle fechado.</div>
+        <div id="heikenIndicatorFeed" style="font-size:12px;opacity:.72;margin-top:8px">Fonte: --</div>
+      </div>
+
+      <div class="label" style="margin-top:12px;line-height:1.5">
+        Regra PRO: troca de direção Heiken-Ashi + corpo mínimo + pavio contrário controlado + amplitude mínima da vela. A seta só é confirmada depois do fechamento da vela.
+      </div>
+    </div>
+  </div>
 
   <div id="chartTab" class="tab">
     <div class="card">
@@ -14659,6 +14955,17 @@ const valuesTab=document.getElementById('valuesTab');
 const historyTab=document.getElementById('historyTab');
 const compatibilityTab=document.getElementById('compatibilityTab');
 const telegramTab=document.getElementById('telegramTab');
+const indicatorTab=document.getElementById('indicatorTab');
+const tabIndicator=document.getElementById('tabIndicator');
+const heikenIndicatorPowerBtn=document.getElementById('heikenIndicatorPowerBtn');
+const heikenIndicatorDirection=document.getElementById('heikenIndicatorDirection');
+const heikenIndicatorConfidence=document.getElementById('heikenIndicatorConfidence');
+const heikenIndicatorStatus=document.getElementById('heikenIndicatorStatus');
+const heikenIndicatorRisk=document.getElementById('heikenIndicatorRisk');
+const heikenIndicatorReason=document.getElementById('heikenIndicatorReason');
+const heikenIndicatorFeed=document.getElementById('heikenIndicatorFeed');
+let heikenIndicatorEnabled=true;
+try{ heikenIndicatorEnabled=localStorage.getItem('mega_heiken_indicator_power')!=='OFFLINE'; }catch(_){}
 const tabResults=document.getElementById('tabResults');
 const tabValues=document.getElementById('tabValues');
 const tabHistory=document.getElementById('tabHistory');
@@ -17158,9 +17465,59 @@ if(telegramFindBtn) telegramFindBtn.onclick=findTelegramGroups;
 if(telegramTestBtn) telegramTestBtn.onclick=testTelegram;
 loadTelegramSettings();
 
+function paintHeikenIndicatorPower(){
+  if(!heikenIndicatorPowerBtn) return;
+  heikenIndicatorPowerBtn.textContent=heikenIndicatorEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+  heikenIndicatorPowerBtn.style.background=heikenIndicatorEnabled?'#0b7a3d':'#7d1d1d';
+  heikenIndicatorPowerBtn.style.color='#fff';
+  heikenIndicatorPowerBtn.style.borderColor=heikenIndicatorEnabled?'#16c56b':'#ff5252';
+  if(!heikenIndicatorEnabled){
+    if(heikenIndicatorDirection){ heikenIndicatorDirection.textContent='OFFLINE'; heikenIndicatorDirection.className='big neutral'; }
+    if(heikenIndicatorConfidence) heikenIndicatorConfidence.textContent='Confiança: --';
+    if(heikenIndicatorStatus) heikenIndicatorStatus.textContent='Indicador pausado.';
+    if(heikenIndicatorRisk) heikenIndicatorRisk.textContent='Risco: --';
+    if(heikenIndicatorReason) heikenIndicatorReason.textContent='Coloque o indicador ONLINE para voltar a analisar.';
+  }
+}
+
+async function loadHeikenIndicator(){
+  if(!heikenIndicatorEnabled || !heikenIndicatorStatus) return;
+  const sym=(S&&S.value)||'EUR/USD';
+  const tf=(interval&&interval.value)||'1min';
+  const mk=(market&&market.value)||'OPEN';
+  heikenIndicatorStatus.textContent='HEIKEN ASHI PRO • ANALISANDO CANDLE FECHADO...';
+  try{
+    const d=await get('/indicator-heiken?symbol='+encodeURIComponent(sym)+'&interval='+encodeURIComponent(tf)+'&market='+encodeURIComponent(mk)+'&t='+Date.now());
+    const dir=String(d.direction||'NEUTRO').toUpperCase();
+    if(heikenIndicatorDirection){
+      heikenIndicatorDirection.textContent=dir;
+      heikenIndicatorDirection.className='big '+(dir==='CALL'?'call':(dir==='PUT'?'put':'neutral'));
+    }
+    if(heikenIndicatorConfidence) heikenIndicatorConfidence.textContent='Confiança: '+Number(d.confidence||0).toFixed(1)+'%';
+    if(heikenIndicatorStatus) heikenIndicatorStatus.textContent=d.status||'HEIKEN ASHI PRO • MONITORANDO';
+    if(heikenIndicatorRisk) heikenIndicatorRisk.textContent='Risco: '+String(d.risk||'--');
+    if(heikenIndicatorReason) heikenIndicatorReason.textContent=d.reason||'Aguardando nova troca de direção confirmada.';
+    if(heikenIndicatorFeed) heikenIndicatorFeed.textContent='Fonte: '+String(d.feed_label||d.feed_source||'--')+' • '+sym+' • '+tf;
+  }catch(e){
+    if(heikenIndicatorStatus) heikenIndicatorStatus.textContent='HEIKEN ASHI PRO • FONTE EM ESPERA';
+    if(heikenIndicatorReason) heikenIndicatorReason.textContent='Não foi possível concluir a leitura agora.';
+  }
+}
+
+if(heikenIndicatorPowerBtn){
+  heikenIndicatorPowerBtn.onclick=()=>{
+    heikenIndicatorEnabled=!heikenIndicatorEnabled;
+    try{localStorage.setItem('mega_heiken_indicator_power',heikenIndicatorEnabled?'ONLINE':'OFFLINE')}catch(_){}
+    paintHeikenIndicatorPower();
+    if(heikenIndicatorEnabled) loadHeikenIndicator();
+  };
+}
+paintHeikenIndicatorPower();
+
 function showTab(which){
   const main=which==='main';
   const chart=which==='chart';
+  const indicator=which==='indicator';
   const results=which==='results';
   const values=which==='values';
   const history=which==='history';
@@ -17170,6 +17527,7 @@ function showTab(which){
 
   mainTab.classList.toggle('active',main);
   chartTab.classList.toggle('active',chart);
+  indicatorTab.classList.toggle('active',indicator);
   resultsTab.classList.toggle('active',results);
   valuesTab.classList.toggle('active',values);
   historyTab.classList.toggle('active',history);
@@ -17179,12 +17537,17 @@ function showTab(which){
 
   tabMain.classList.toggle('active',main);
   tabChart.classList.toggle('active',chart);
+  tabIndicator.classList.toggle('active',indicator);
   tabResults.classList.toggle('active',results);
   tabValues.classList.toggle('active',values);
   tabHistory.classList.toggle('active',history);
   tabCompatibility.classList.toggle('active',compatibility);
   tabTelegram.classList.toggle('active',telegram);
   tabAccount.classList.toggle('active',account);
+
+  if(indicator){
+    loadHeikenIndicator();
+  }
 
   if(chart){
     loadChart();
@@ -17219,6 +17582,7 @@ function showTab(which){
 
 tabMain.onclick=()=>showTab('main');
 tabChart.onclick=()=>showTab('chart');
+tabIndicator.onclick=()=>showTab('indicator');
 tabResults.onclick=()=>showTab('results');
 tabValues.onclick=()=>showTab('values');
 tabHistory.onclick=()=>showTab('history');
@@ -18832,6 +19196,7 @@ bootApp().catch(err=>{
 });
 
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) sig(false); },5000);
+setInterval(()=>{ if(appEnabled && !iqLoginInProgress && indicatorTab && indicatorTab.classList.contains('active')) loadHeikenIndicator(); },5000);
 
 // Candles são buscados em ritmo leve; o canvas faz a transição suave entre atualizações.
 setInterval(()=>{
