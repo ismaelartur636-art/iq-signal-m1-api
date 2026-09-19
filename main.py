@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.42"
-PWA_VERSION = "v109"
+APP_VERSION = "3.43"
+PWA_VERSION = "v110"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -90,7 +90,7 @@ GEMINI_DAILY_BUDGET = max(1, int(os.getenv("GEMINI_DAILY_BUDGET", "45")))
 GEMINI_PREFILTER_MIN = float(os.getenv("GEMINI_PREFILTER_MIN", "64"))
 # 3.35: triagem da IA principal um pouco menos rígida que antes.
 # A saída final continua protegida por confiança, risco, XGBoost e gate de price action.
-SMART_PREFILTER_MIN = float(os.getenv("SMART_PREFILTER_MIN", "62"))
+SMART_PREFILTER_MIN = float(os.getenv("SMART_PREFILTER_MIN", "58"))
 GEMINI_QUOTA_TZ = ZoneInfo("America/Los_Angeles")
 _gemini_quota_lock = threading.RLock()
 _gemini_quota_state = {
@@ -316,8 +316,8 @@ PRE_SIGNAL_BATCH = 1
 # sem tape de ticks no backend, usa micro-amostras sucessivas da vela atual e
 # NUNCA finge que snapshots são ticks reais.
 MOMENT_EA_ENABLED = os.getenv("MOMENT_EA_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
-MOMENT_EA_WINDOW_SECONDS = max(10, min(45, int(os.getenv("MOMENT_EA_WINDOW_SECONDS", "20"))))
-MOMENT_EA_CONFIRM_SCORE = max(55.0, min(90.0, float(os.getenv("MOMENT_EA_CONFIRM_SCORE", "64"))))
+MOMENT_EA_WINDOW_SECONDS = max(10, min(45, int(os.getenv("MOMENT_EA_WINDOW_SECONDS", "30"))))
+MOMENT_EA_CONFIRM_SCORE = max(55.0, min(90.0, float(os.getenv("MOMENT_EA_CONFIRM_SCORE", "60"))))
 MOMENT_EA_VETO_SCORE = max(60.0, min(95.0, float(os.getenv("MOMENT_EA_VETO_SCORE", "72"))))
 MOMENT_EA_MIN_TICKS = max(6, int(os.getenv("MOMENT_EA_MIN_TICKS", "12")))
 moment_ea_state: Dict[str, Any] = {}
@@ -7288,7 +7288,7 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
 
     prompt = f"""Você é a inteligência artificial autônoma da MEGA IA, especializada em prever SOMENTE a direção da PRÓXIMA vela completa.
 Ativo: {symbol}. Timeframe: {interval}. Mercado: {market}.
-OBJETIVO PRINCIPAL: aumentar WIN DIRETO e reduzir dependência de Gale. Prefira ficar NEUTRO a liberar uma entrada fraca.
+OBJETIVO PRINCIPAL: aumentar WIN DIRETO e reduzir dependência de Gale. Não use NEUTRO por excesso de cautela: quando houver duas evidências coerentes de price action e nenhuma contradição forte, escolha CALL ou PUT; use NEUTRO quando o contexto estiver realmente ambíguo.
 Este é o MODO IA PURA: NÃO use RSI, MACD, Bollinger, médias móveis, ATR, estocástico, ADX, score técnico ou qualquer indicador calculado pelo aplicativo.
 Use SOMENTE os candles OHLCV FECHADOS fornecidos. Não há candle em formação nesta entrada.
 
@@ -7302,7 +7302,7 @@ REGRAS DE QUALIDADE:
 - Região H1 e padrão de vela são motores independentes e NÃO precisam concordar com esta análise.
 - Para M1 seja especialmente rigoroso.
 - Gale, recuperação e resultados anteriores NÃO podem influenciar a decisão.
-- Só marque risk LOW ou MEDIUM quando houver vantagem clara. Em dúvida: HIGH + NEUTRO.
+- Marque risk LOW ou MEDIUM quando houver vantagem razoável e coerente. Use HIGH + NEUTRO quando houver conflito real, lateralização forte ou ausência de direção.
 
 Classifique o setup como TREND, REVERSAL, BREAKOUT, REJECTION ou NONE.
 
@@ -7339,22 +7339,20 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         xgb_confidence = float(xgb_signal.get("confidence") or 0.0)
         xgb_agrees = bool(direction in ("CALL", "PUT") and xgb_direction == direction)
 
-        # v3.41 — frequência maior sem abandonar a análise cruzada.
-        # Em M1 a confiança bruta deixa de ser o gargalo principal: CALL/PUT só
-        # passa se a IA confirmar, XGBoost estiver validado e na mesma direção,
-        # o gate de price action aprovar e a qualidade combinada alcançar o piso.
-        # A EA Vela Atual pode reduzir levemente o piso quando há ticks reais fortes
-        # alinhados, mas nunca substitui Luna/XGBoost.
-        low_min = max(float(OAI_MIN), 72.0 if interval == "1min" else 72.0)
+        # v3.43 — modo equilibrado: mais frequência sem abrir mão da análise cruzada.
+        # A confiança bruta deixa de ser uma trava excessiva. O sinal ainda precisa
+        # de direção da Luna, concordância estatística do XGBoost (ou concordância
+        # suave + ticks reais fortes), price action e qualidade combinada.
+        low_min = max(float(OAI_MIN), 70.0 if interval == "1min" else 70.0)
         if risk == "LOW":
             required_conf = low_min
-            quality_min = 66.0
+            quality_min = 63.0
         elif risk == "MEDIUM":
-            required_conf = max(low_min + 1.0, 73.0)
-            quality_min = 67.0
+            required_conf = max(low_min + 1.0, 71.0)
+            quality_min = 64.0
         else:
-            required_conf = max(low_min + 6.0, 78.0)
-            quality_min = 70.0
+            required_conf = max(low_min + 6.0, 76.0)
+            quality_min = 68.0
 
         moment_aligned = bool(
             moment_hint.get("confirmed")
@@ -7384,19 +7382,32 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             analysis_quality += moment_bonus
         analysis_quality = round(max(0.0, min(100.0, analysis_quality)), 1)
 
+        # Quando a EA Vela Atual confirma ticks reais fortes na mesma direção,
+        # aceitamos um XGBoost "quase confirmado" apenas em LOW/MEDIUM. Ele ainda
+        # precisa apontar o MESMO lado, manter validação temporal >=50% e vantagem
+        # probabilística >=55%. HIGH continua exigindo o XGBoost plenamente confirmado.
+        xgb_soft_confirmed = bool(
+            risk in ("LOW", "MEDIUM")
+            and moment_aligned
+            and xgb_ready
+            and xgb_agrees
+            and xgb_confidence >= 55.0
+            and xgb_validation >= 50.0
+        )
+
         blocked_reason = None
         if direction in ("CALL", "PUT"):
             if not confirmed:
                 blocked_reason = "IA não confirmou a própria leitura"
             elif confidence < required_conf:
                 blocked_reason = f"confiança {confidence:.0f}% abaixo do mínimo seletivo {required_conf:.0f}%"
-            elif xgb_ready and not xgb_confirmed:
+            elif xgb_ready and not xgb_confirmed and not xgb_soft_confirmed:
                 blocked_reason = "XGBoost sem vantagem estatística/validação suficiente"
-            elif xgb_ready and xgb_confirmed and not xgb_agrees:
+            elif xgb_ready and not xgb_agrees:
                 blocked_reason = f"IA e XGBoost discordaram ({direction} x {xgb_direction})"
             elif not xgb_ready and risk in ("MEDIUM", "HIGH"):
                 blocked_reason = "risco médio/alto exige XGBoost pronto"
-            elif risk == "HIGH" and (xgb_confidence < 64.0 or xgb_validation < 54.0):
+            elif risk == "HIGH" and (not xgb_confirmed or xgb_confidence < 64.0 or xgb_validation < 54.0):
                 blocked_reason = "risco alto exige XGBoost forte e validação temporal maior"
             elif analysis_quality < quality_min:
                 blocked_reason = f"qualidade combinada {analysis_quality:.0f}% abaixo do mínimo {quality_min:.0f}%"
@@ -7438,6 +7449,7 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
                 "xgb_ready": xgb_ready,
                 "xgb_confirmed": xgb_confirmed,
                 "xgb_agrees": xgb_agrees,
+                "xgb_soft_confirmed": bool(xgb_soft_confirmed),
                 "xgb_confidence": round(xgb_confidence, 1),
                 "xgb_validation_accuracy": round(xgb_validation, 1),
                 "analysis_quality": analysis_quality,
