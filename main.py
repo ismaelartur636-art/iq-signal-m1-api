@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.47"
-PWA_VERSION = "v114"
+APP_VERSION = "3.48"
+PWA_VERSION = "v115"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -73,9 +73,14 @@ XGB_MIN_TRAIN_SAMPLES = max(60, int(os.getenv("XGB_MIN_TRAIN_SAMPLES", "80")))
 XGB_RETRAIN_SECONDS = max(120, int(os.getenv("XGB_RETRAIN_SECONDS", "900")))
 XGB_MIN_PROBABILITY = min(0.80, max(0.52, float(os.getenv("XGB_MIN_PROBABILITY", "0.60"))))
 XGB_MIN_VALIDATION_ACCURACY = min(0.80, max(0.50, float(os.getenv("XGB_MIN_VALIDATION_ACCURACY", "0.52"))))
-# EA XGBoost Autônoma: somente o modelo estatístico decide CALL/PUT.
+# EA de confirmação tripla: XGBoost + RSI + Value Chart precisam apontar o mesmo lado.
 EA_XGB_MIN_PROBABILITY = min(0.85, max(0.52, float(os.getenv("EA_XGB_MIN_PROBABILITY", "0.60"))))
 EA_XGB_MIN_VALIDATION_ACCURACY = min(0.80, max(0.50, float(os.getenv("EA_XGB_MIN_VALIDATION_ACCURACY", "0.52"))))
+EA_RSI_PERIOD = max(5, int(os.getenv("EA_RSI_PERIOD", "14")))
+EA_RSI_OVERSOLD = max(5.0, min(45.0, float(os.getenv("EA_RSI_OVERSOLD", "30"))))
+EA_RSI_OVERBOUGHT = max(55.0, min(95.0, float(os.getenv("EA_RSI_OVERBOUGHT", "70"))))
+EA_VALUE_CHART_PERIOD = max(3, int(os.getenv("EA_VALUE_CHART_PERIOD", "5")))
+EA_VALUE_CHART_EXTREME = max(4.0, min(12.0, float(os.getenv("EA_VALUE_CHART_EXTREME", "8"))))
 xgb_model_cache: Dict[str, Dict[str, Any]] = {}
 xgb_model_guard = threading.RLock()
 
@@ -6481,25 +6486,119 @@ def _xgb_train_or_predict(rows, symbol, interval, model_scope="OPEN"):
     return base
 
 
-async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
-    """EA XGBoost Autônoma — XGBoost puro para OPEN e IQ OTC.
+def _value_chart_close(rows, period=5):
+    """Value Chart clássico simplificado em unidade dinâmica de volatilidade.
 
-    Nenhuma IA externa, indicador técnico, price action manual ou aprendizado
-    adaptativo participa da decisão. O modelo usa somente features numéricas
-    derivadas de candles fechados e validação temporal sem embaralhar o futuro.
+    Floating axis = média do preço mediano (H+L)/2.
+    Dynamic Volatility Unit = média do range (H-L) * 0.20.
+    Retorna o valor do fechamento da última vela fechada.
+    """
+    rows = list(rows or [])
+    if len(rows) < period:
+        return None
+    block = rows[-period:]
+    try:
+        axis = sum((float(x["high"]) + float(x["low"])) / 2.0 for x in block) / period
+        avg_range = sum(max(float(x["high"]) - float(x["low"]), 0.0) for x in block) / period
+        dvu = avg_range * 0.20
+        if dvu <= 1e-12:
+            return None
+        return (float(block[-1]["close"]) - axis) / dvu
+    except Exception:
+        return None
+
+
+def _ea_rsi_value_confirmation(rows):
+    """Direção do RSI 14 + Value Chart usando somente candles fechados.
+
+    CALL: RSI toca/registra sobrevenda e vira para cima; Value Chart toca a
+    região extrema negativa e também vira para cima.
+    PUT: espelho na sobrecompra/região extrema positiva.
+    """
+    rows = list(rows or [])
+    need = max(EA_RSI_PERIOD + 2, EA_VALUE_CHART_PERIOD + 2)
+    base = {
+        "ready": False,
+        "direction": "NEUTRO",
+        "rsi": None,
+        "rsi_prev": None,
+        "value_chart": None,
+        "value_chart_prev": None,
+        "rsi_direction": "NEUTRO",
+        "value_direction": "NEUTRO",
+        "reason": "Aguardando candles fechados para RSI e Value Chart.",
+    }
+    if len(rows) < need:
+        return base
+
+    closes = [float(x["close"]) for x in rows]
+    r_now = rsi(closes, EA_RSI_PERIOD)
+    r_prev = rsi(closes[:-1], EA_RSI_PERIOD)
+    v_now = _value_chart_close(rows, EA_VALUE_CHART_PERIOD)
+    v_prev = _value_chart_close(rows[:-1], EA_VALUE_CHART_PERIOD)
+    if None in (r_now, r_prev, v_now, v_prev):
+        return base
+
+    r_call = min(float(r_prev), float(r_now)) <= EA_RSI_OVERSOLD and float(r_now) > float(r_prev)
+    r_put = max(float(r_prev), float(r_now)) >= EA_RSI_OVERBOUGHT and float(r_now) < float(r_prev)
+    v_call = min(float(v_prev), float(v_now)) <= -EA_VALUE_CHART_EXTREME and float(v_now) > float(v_prev)
+    v_put = max(float(v_prev), float(v_now)) >= EA_VALUE_CHART_EXTREME and float(v_now) < float(v_prev)
+
+    r_dir = "CALL" if r_call else "PUT" if r_put else "NEUTRO"
+    v_dir = "CALL" if v_call else "PUT" if v_put else "NEUTRO"
+    direction = r_dir if r_dir == v_dir and r_dir in ("CALL", "PUT") else "NEUTRO"
+
+    if direction in ("CALL", "PUT"):
+        reason = (
+            f"RSI {r_now:.1f} e Value Chart {v_now:.2f} confirmaram {direction} "
+            "na mesma região de excesso."
+        )
+    elif r_dir == "NEUTRO" and v_dir == "NEUTRO":
+        reason = f"RSI {r_now:.1f} e Value Chart {v_now:.2f} ainda sem região/direção comum."
+    elif r_dir != v_dir:
+        reason = f"RSI aponta {r_dir}, mas Value Chart aponta {v_dir}."
+    else:
+        reason = f"RSI {r_dir} e Value Chart {v_dir} ainda não fecharam a mesma direção."
+
+    base.update({
+        "ready": True,
+        "direction": direction,
+        "rsi": round(float(r_now), 2),
+        "rsi_prev": round(float(r_prev), 2),
+        "value_chart": round(float(v_now), 3),
+        "value_chart_prev": round(float(v_prev), 3),
+        "rsi_direction": r_dir,
+        "value_direction": v_dir,
+        "reason": reason,
+        "rsi_period": EA_RSI_PERIOD,
+        "rsi_oversold": EA_RSI_OVERSOLD,
+        "rsi_overbought": EA_RSI_OVERBOUGHT,
+        "value_chart_period": EA_VALUE_CHART_PERIOD,
+        "value_chart_extreme": EA_VALUE_CHART_EXTREME,
+    })
+    return base
+
+
+async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
+    """EA tripla confirmação — XGBoost + RSI 14 + Value Chart.
+
+    Usa somente candles fechados. CALL/PUT só é liberado quando os três motores
+    apontam o mesmo lado. OPEN e IQ OTC continuam com modelos XGBoost separados.
     """
     rows = list(cs or [])
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"EA XGBOOST AUTÔNOMA {tf_label}"
+    name = f"EA RSI + VALUE CHART + XGBOOST {tf_label}"
     if len(rows) < XGB_MIN_CANDLES:
         return {
             "available": bool(XGBOOST_OK and XGB_ENABLED),
             "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
-            "risk": "HIGH", "strategy": name, "engine": "EA_XGBOOST",
-            "provider": "XGBOOST_LOCAL",
-            "reason": f"XGBoost coletando candles ({len(rows)}/{XGB_MIN_CANDLES}).",
-            "xgboost_only": True, "indicators_disabled": True,
+            "risk": "HIGH", "strategy": name, "engine": "EA_XGB_RSI_VALUE",
+            "provider": "XGBOOST_RSI_VALUE_CHART",
+            "reason": f"Coletando candles para o XGBoost ({len(rows)}/{XGB_MIN_CANDLES}).",
+            "triple_confirmation": True,
         }
+
+    indicators = _ea_rsi_value_confirmation(rows)
     try:
         xgb = await asyncio.to_thread(
             _xgb_train_or_predict, rows, symbol, timeframe, f"EA_{str(market or 'OPEN').upper()}"
@@ -6508,18 +6607,25 @@ async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
         return {
             "available": False, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "strategy": name,
-            "engine": "EA_XGBOOST", "provider": "XGBOOST_LOCAL",
+            "engine": "EA_XGB_RSI_VALUE", "provider": "XGBOOST_RSI_VALUE_CHART",
             "reason": f"XGBoost indisponível: {str(exc)[:180]}",
-            "xgboost_only": True, "indicators_disabled": True,
+            "triple_confirmation": True, "indicator_confirmation": indicators,
         }
 
     confidence = float(xgb.get("confidence") or 0.0)
     validation = float(xgb.get("validation_accuracy") or 0.0)
-    direction = str(xgb.get("direction") or "NEUTRO").upper()
+    xgb_direction = str(xgb.get("direction") or "NEUTRO").upper()
     ready = bool(xgb.get("available") and xgb.get("ready"))
     strong = confidence >= (EA_XGB_MIN_PROBABILITY * 100.0)
     valid = validation >= (EA_XGB_MIN_VALIDATION_ACCURACY * 100.0)
-    confirmed = bool(ready and strong and valid and direction in ("CALL", "PUT"))
+    xgb_confirmed = bool(ready and strong and valid and xgb_direction in ("CALL", "PUT"))
+    indicator_direction = str(indicators.get("direction") or "NEUTRO").upper()
+    confirmed = bool(
+        xgb_confirmed
+        and indicators.get("ready")
+        and indicator_direction == xgb_direction
+        and indicator_direction in ("CALL", "PUT")
+    )
 
     if not ready:
         reason = str(xgb.get("reason") or "Modelo XGBoost ainda não está pronto.")
@@ -6527,10 +6633,24 @@ async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
         reason = f"XGBoost aguardando validação temporal melhor ({validation:.1f}%)."
     elif not strong:
         reason = f"XGBoost sem vantagem suficiente ({confidence:.1f}%)."
+    elif not indicators.get("ready"):
+        reason = str(indicators.get("reason") or "RSI/Value Chart ainda não estão prontos.")
+    elif indicator_direction == "NEUTRO":
+        reason = (
+            f"XGBoost aponta {xgb_direction} {confidence:.1f}%, mas RSI/Value Chart não concordaram: "
+            f"{indicators.get('reason')}"
+        )
+    elif indicator_direction != xgb_direction:
+        reason = (
+            f"Sem sinal: XGBoost aponta {xgb_direction}, enquanto RSI + Value Chart apontam "
+            f"{indicator_direction}."
+        )
     else:
         reason = (
-            f"XGBoost puro confirmou {direction} {confidence:.1f}% • "
-            f"validação temporal {validation:.1f}% • {int(xgb.get('samples') or 0)} amostras."
+            f"TRIPLA CONFIRMAÇÃO {xgb_direction}: XGBoost {confidence:.1f}% • "
+            f"RSI {float(indicators.get('rsi') or 0):.1f} • "
+            f"Value Chart {float(indicators.get('value_chart') or 0):.2f} • "
+            f"validação XGBoost {validation:.1f}%."
         )
 
     risk = "HIGH"
@@ -6540,18 +6660,18 @@ async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
     return {
         "available": bool(xgb.get("available")),
         "ready": ready,
-        "direction": direction if confirmed else "NEUTRO",
-        "raw_direction": direction,
+        "direction": xgb_direction if confirmed else "NEUTRO",
+        "raw_direction": xgb_direction,
         "confidence": round(confidence, 1),
         "confirmed": confirmed,
         "risk": risk,
         "strategy": name,
-        "engine": "EA_XGBOOST",
-        "provider": "XGBOOST_LOCAL",
-        "reason": reason,
+        "engine": "EA_XGB_RSI_VALUE",
+        "provider": "XGBOOST_RSI_VALUE_CHART",
+        "reason": reason[:360],
         "xgboost": xgb,
-        "xgboost_only": True,
-        "indicators_disabled": True,
+        "indicator_confirmation": indicators,
+        "triple_confirmation": True,
         "external_ai_disabled": True,
         "gale_signal": False,
         "non_repaint": True,
@@ -8165,7 +8285,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     try:
         if engine == "EA":
-            # EA XGBoost Autônoma: OPEN usa o roteador normal (cTrader/multifuente);
+            # EA RSI + Value Chart + XGBoost: OPEN usa o roteador normal (cTrader/multifuente);
             # OTC usa exclusivamente candles reais da sessão IQ Option.
             request_n = max(170, XGB_MIN_CANDLES + 30)
             if market == "IQ_OTC":
@@ -8173,13 +8293,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     out = neutral_signal(
                         symbol, interval, market,
                         "EA XGBOOST • IQ OPTION OFFLINE",
-                        "Conecte a IQ Option para a EA XGBoost analisar candles OTC reais.",
+                        "Conecte a IQ Option para a EA Tripla analisar candles OTC reais.",
                         source_state="WAITING",
                     )
                     out.update({
-                        "strategy": "EA XGBOOST AUTÔNOMA", "mode": "EA_XGBOOST_AUTONOMOUS",
+                        "strategy": "EA RSI + VALUE CHART + XGBOOST", "mode": "EA_XGBOOST_AUTONOMOUS",
                         "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
-                        "xgboost_only": True, "gale_signal": False,
+                        "triple_confirmation": True, "gale_signal": False,
                     })
                     cache[key] = (time.time(), out)
                     return out
@@ -8281,7 +8401,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "INTELIGÊNCIA ARTIFICIAL"
             engine_mode = "PURE_AI"
         elif engine == "EA":
-            engine_title = "EA XGBOOST AUTÔNOMA"
+            engine_title = "EA RSI + VALUE CHART + XGBOOST"
             engine_mode = "EA_XGBOOST_AUTONOMOUS"
         elif engine == "FORCE":
             engine_title = "EA FORÇA DO MOVIMENTO"
@@ -8305,7 +8425,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
-                    else ({"xgboost_only": True, "external_ai_disabled": True, "indicators_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})
+                    else ({"triple_confirmation": True, "inputs": ["RSI_14", "VALUE_CHART", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})
                 ),
                 "legacy_ai_disabled": engine != "SMART",
                 "legacy_technical_strategies_disabled": True,
@@ -8377,11 +8497,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
             "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA") and analysis.get("confirmed")),
-            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_LOCAL" if engine == "EA" else "DISABLED")),
+            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RSI_VALUE_CHART" if engine == "EA" else "DISABLED")),
             "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
-                else (analysis.get("strategy", "EA XGBOOST AUTÔNOMA") if engine == "EA"
+                else (analysis.get("strategy", "EA RSI + VALUE CHART + XGBOOST") if engine == "EA"
                       else (analysis.get("strategy", "EA Força do Movimento") if engine == "FORCE"
                             else analysis.get("strategy", f"{engine_title} {tf_label}")))
             ),
@@ -8490,7 +8610,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 )
                 base.update({
                     "direction": direction_now,
-                    "status": (smart_status if engine == "SMART" else ("SINAL XGBOOST AUTÔNOMO LIBERADO" if engine == "EA" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))),
+                    "status": (smart_status if engine == "SMART" else ("SINAL TRIPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -8507,7 +8627,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # 3.22: o histórico recente pode tornar o filtro mais seletivo.
                 # Só atua depois da amostra mínima e nunca altera candles/regras
                 # originais do motor; apenas barra setups estatisticamente fracos.
-                # Na EA XGBoost Autônoma, somente o XGBoost decide a entrada.
+                # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
                 if engine != "EA":
@@ -11461,11 +11581,11 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
             "reason": "Mais flexível em cenários mistos, desde que o preço não esteja excessivamente lateral e a IA externa esteja disponível."
         },
         {
-            "key":"EA","name":"EA XGBOOST AUTÔNOMA","score":autonomous,
+            "key":"EA","name":"EA RSI + VALUE CHART + XGBOOST","score":autonomous,
             "supported":True,"operational":bool(market=="OPEN" or iq_ready),
-            "reason": ("XGBoost puro usa candles do mercado aberto e não exige login da IQ Option."
+            "reason": ("RSI + Value Chart + XGBoost usam candles do mercado aberto e não exigem login da IQ Option."
                        if market=="OPEN" else
-                       "XGBoost puro usa candles OTC reais; no OTC exige conexão ativa com a IQ Option.")
+                       "RSI + Value Chart + XGBoost usam candles OTC reais; no OTC exigem conexão ativa com a IQ Option.")
         },
         {
             "key":"FORCE","name":"EA FORÇA DO MOVIMENTO","score":force,
@@ -11602,12 +11722,12 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = feed_src
                     data["feed_label"] = _feed_source_label(feed_src)
                     data["feed_fallback"] = bool(feed_info.get("fallback"))
-                    data["feed_message"] = "EA XGBoost usando candles do mercado aberto via roteador cTrader/multifuente."
+                    data["feed_message"] = "EA Tripla usando candles do mercado aberto via roteador cTrader/multifuente."
                 else:
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                    data["feed_message"] = "EA XGBoost usando candles OTC reais da sessão IQ Option."
+                    data["feed_message"] = "EA Tripla usando candles OTC reais da sessão IQ Option."
             elif engine == "FORCE" and requested_market == "IQ_OTC":
                 data["feed_source"] = "IQ_OPTION_OTC"
                 data["feed_label"] = _feed_source_label(data["feed_source"])
@@ -12055,7 +12175,7 @@ async def pre_signals(
     if requested_market == "IQ_OTC" and engine == "EA" and not iq_state:
         return {
             "ok": True,
-            "message": "EA XGBoost OTC aguardando conexão com a IQ Option.",
+            "message": "EA Tripla OTC aguardando conexão com a IQ Option.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -12134,7 +12254,7 @@ async def pre_signals(
                     {
                         "direction": xgb_preview.get("direction"),
                         "confidence": xgb_preview.get("confidence", 0),
-                        "strategy": xgb_preview.get("strategy", "EA XGBOOST AUTÔNOMA"),
+                        "strategy": xgb_preview.get("strategy", "EA RSI + VALUE CHART + XGBOOST"),
                         "reason": xgb_preview.get("reason", "XGBoost monitorando."),
                     }
                     if xgb_preview.get("confirmed") and xgb_preview.get("direction") in ("CALL", "PUT")
@@ -12523,7 +12643,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             radar_n = max(170, XGB_MIN_CANDLES + 30)
             if market == "IQ_OTC":
                 if not iq_state:
-                    raise RuntimeError("Conecte a IQ Option para a EA XGBoost analisar OTC.")
+                    raise RuntimeError("Conecte a IQ Option para a EA Tripla analisar OTC.")
                 raw = await iq_ea_candles(
                     iq_state, sym, interval, radar_n, regular_market=False
                 )
@@ -12541,7 +12661,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             closed = raw[:-1] if len(raw) > 1 else raw
             if engine == "EA":
                 tech = await ea_xgboost_strategy(closed, sym, interval, market=market)
-                engine_label = "EA XGBOOST AUTÔNOMA"
+                engine_label = "EA RSI + VALUE CHART + XGBOOST"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why = str(tech.get("reason") or "XGBoost monitorando").replace("\n", " ")[:88]
                 status_text = (
@@ -13026,7 +13146,7 @@ async def result(
     - LOSS/empate no G1 => aguarda G2.
     - WIN no G2 => WIN G2; caso contrário => LOSS G2.
 
-    ``direct_only=true`` fecha somente a primeira vela. EA XGBoost e EA Força
+    ``direct_only=true`` fecha somente a primeira vela. EA Tripla e EA Força
     usam esse modo; os demais motores podem acompanhar G1/G2.
     """
     if not expiry_time:
@@ -13035,7 +13155,7 @@ async def result(
     market = (market or "OPEN").upper()
     direction = (direction or "CALL").upper()
     engine = str(engine or "").upper()
-    # EA XGBoost usa multifuente no OPEN e IQ somente no OTC.
+    # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
     ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE")
 
@@ -13073,7 +13193,7 @@ async def result(
         }
 
     # Apura na mesma família de fonte do sinal:
-    # EA XGBoost OPEN -> cache/roteador multifuente; EA/FORCE OTC -> IQ Option.
+    # EA Tripla OPEN -> cache/roteador multifuente; EA/FORCE OTC -> IQ Option.
     # Os outros motores preservam a apuração existente.
     cs = (
         []
@@ -13599,8 +13719,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="robot-mode-card" id="eaModeCard">
     <img src="__MEGA_IMAGE__" alt="EA para opções binárias">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">⚡ EA XGBOOST AUTÔNOMA</div>
-      <div class="robot-mode-desc" id="eaModeDesc">XGBoost puro • Mercado Aberto + OTC IQ • sem Luna/Gemini/indicadores • decisão estatística da próxima vela.</div>
+      <div class="robot-mode-title">⚡ EA RSI + VALUE CHART + XGBOOST</div>
+      <div class="robot-mode-desc" id="eaModeDesc">RSI 14 + Value Chart + XGBoost • OPEN + OTC IQ • sinal somente quando os 3 concordam.</div>
     </div>
     <button id="eaPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -15043,7 +15163,7 @@ function momentStudyEngineName(key){
   const names={
     GRAPH_AI:'🧠 IA GRÁFICA',
     SMART:'🤖 INTELIGÊNCIA ARTIFICIAL',
-    EA:'⚡ EA XGBOOST AUTÔNOMA',
+    EA:'⚡ EA RSI + VALUE CHART + XGBOOST',
     FORCE:'💥 EA FORÇA DO MOVIMENTO'
   };
   return names[String(key||'').toUpperCase()]||String(key||'MOTOR');
@@ -15338,7 +15458,7 @@ function rememberPendingTrade(sig){
   const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
-    // EA XGBoost e EA Força são apurados na primeira vela; outros motores preservam G1/G2.
+    // EA Tripla e EA Força são apurados na primeira vela; outros motores preservam G1/G2.
     direct_only:isDirectEa,
     market:signalResultMarket(sig),
     requested_market:sig.requested_market || (market&&market.value) || 'OPEN',
@@ -17394,8 +17514,8 @@ function applyRobotPowerState(){
     ? 'ONLINE: IA pura analisando somente candles e contexto de preço, sem indicadores.'
     : 'OFFLINE: análise inteligente pausada.';
   if(eaModeDesc) eaModeDesc.textContent=eaEnabled
-    ? 'ONLINE: XGBoost puro • OPEN via cTrader/multifuente • OTC pela IQ Option • sem IA externa.'
-    : 'OFFLINE: EA XGBoost Autônoma pausada.';
+    ? 'ONLINE: RSI 14 + Value Chart + XGBoost • sinal somente com tripla confirmação • OPEN/OTC.'
+    : 'OFFLINE: EA RSI + Value Chart + XGBoost pausada.';
   if(forceModeDesc) forceModeDesc.textContent=forceEnabled
     ? 'ONLINE: OPEN multifuente para qualquer corretora Forex • OTC pela IQ Option • configuração protegida • sem Gale.'
     : 'OFFLINE: EA Força do Movimento pausado • configuração protegida.';
@@ -17407,9 +17527,9 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar do EA Força do Movimento ativo • OPEN multifuente / OTC pela IQ Option</div>';
     rad();
   }else if(engine==='EA'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA XGBOOST AUTÔNOMA ONLINE • XGBOOST PURO • OPEN + OTC';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ EA XGBoost Autônoma selecionada • somente XGBoost decide CALL/PUT.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar EA XGBoost ativo • OPEN multifuente / OTC IQ Option</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA TRIPLA CONFIRMAÇÃO ONLINE • RSI + VALUE CHART + XGBOOST • OPEN + OTC';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ EA Tripla selecionada • CALL/PUT só quando RSI + Value Chart + XGBoost concordarem.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar EA Tripla ativo • RSI + Value Chart + XGBoost • OPEN/OTC</div>';
     rad();
   }else if(engine==='SMART'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='INTELIGÊNCIA ARTIFICIAL ONLINE • IA PURA ANALISANDO CANDLES';
