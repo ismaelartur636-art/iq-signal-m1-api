@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.56"
-PWA_VERSION = "v122"
+APP_VERSION = "3.58"
+PWA_VERSION = "v124"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -14909,19 +14909,39 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
   <div id="valuesTab" class="tab">
     <div class="card">
-      <h2 style="margin-top:0">💰 Placar de valores</h2>
-      <div class="label">ESCOLHA O VALOR DA ENTRADA • LUCRO/PREJUÍZO ACUMULADO</div>
+      <h2 style="margin-top:0">💰 Finanças • progressão entre sinais</h2>
+      <div class="label">SEM GALE NA MESMA OPERAÇÃO • LOSS ACEITO • PROGRESSÃO SOMENTE NO PRÓXIMO SINAL</div>
 
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+      <div class="label" style="margin-top:12px">ESCOLHA OU DIGITE O VALOR INICIAL DA SEQUÊNCIA</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
         <button class="valueStakeBtn" data-value="5" type="button" style="font-weight:1000">R$ 5</button>
         <button class="valueStakeBtn" data-value="10" type="button" style="font-weight:1000">R$ 10</button>
+        <button class="valueStakeBtn" data-value="15" type="button" style="font-weight:1000">R$ 15</button>
         <button class="valueStakeBtn" data-value="20" type="button" style="font-weight:1000">R$ 20</button>
+        <button class="valueStakeBtn" data-value="50" type="button" style="font-weight:1000">R$ 50</button>
+      </div>
+      <div class="card" style="margin-top:10px;padding:10px">
+        <div class="label">VALOR PERSONALIZADO</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+          <span style="font-weight:1000">R$</span>
+          <input id="valueCustomStake" type="number" inputmode="decimal" min="1" step="0.01" placeholder="Ex.: 35,00" style="flex:1;min-width:130px;font-size:18px;font-weight:900">
+          <button id="applyCustomStakeBtn" type="button" style="font-weight:1000;min-height:44px">USAR VALOR</button>
+        </div>
+        <div id="valueCustomStakeStatus" class="label" style="margin-top:6px">Digite qualquer valor e toque em USAR VALOR.</div>
       </div>
 
       <div class="grid" style="margin-top:12px">
         <div class="card">
-          <div class="label">VALOR DA ENTRADA</div>
+          <div class="label">VALOR INICIAL</div>
+          <div id="valueBaseStakeDisplay" class="big">R$ 5,00</div>
+        </div>
+        <div class="card">
+          <div class="label">PRÓXIMA ENTRADA</div>
           <div id="valueStakeDisplay" class="big">R$ 5,00</div>
+        </div>
+        <div class="card">
+          <div class="label">LOSS SEGUIDOS</div>
+          <div id="valueLossStreak" class="big">0</div>
         </div>
         <div class="card">
           <div class="label">RETORNO NO WIN</div>
@@ -14941,13 +14961,13 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
       <div class="grid" style="margin-top:12px">
         <div class="card"><div class="label">WIN COM VALOR</div><div id="valueWins" class="big call">0</div></div>
-        <div class="card"><div class="label">LOSS COM VALOR</div><div id="valueLosses" class="big put">0</div></div>
+        <div class="card"><div class="label">LOSS ACEITO</div><div id="valueLosses" class="big put">0</div></div>
       </div>
 
-      <button id="resetValuesBtn" type="button" style="width:100%;margin-top:12px;font-weight:900;border-color:#ff5252">🗑️ ZERAR PLACAR DE VALORES</button>
+      <button id="resetValuesBtn" type="button" style="width:100%;margin-top:12px;font-weight:900;border-color:#ff5252">🗑️ ZERAR FINANÇAS</button>
       <div class="label" style="margin-top:10px;line-height:1.5">
-        No XGBoost autônomo, WIN soma o payout líquido da entrada e LOSS desconta o valor da entrada.
-        Em sequências com Gale, o cálculo usa o multiplicador configurado no painel como estimativa.
+        Você pode usar os atalhos ou digitar qualquer valor inicial. Exemplo com R$ 15: LOSS → próximo sinal R$ 30; novo LOSS → R$ 60.
+        Ao sair WIN, a próxima entrada volta ao valor inicial escolhido. Não existe G1/G2 dentro desta sequência financeira.
       </div>
     </div>
   </div>
@@ -15408,6 +15428,9 @@ const galeLastResult=document.getElementById('galeLastResult');
 const galeStageStatus=document.getElementById('galeStageStatus');
 const valueStakeDisplay=document.getElementById('valueStakeDisplay');
 const valuePayout=document.getElementById('valuePayout');
+const valueCustomStake=document.getElementById('valueCustomStake');
+const applyCustomStakeBtn=document.getElementById('applyCustomStakeBtn');
+const valueCustomStakeStatus=document.getElementById('valueCustomStakeStatus');
 const valueProfit=document.getElementById('valueProfit');
 const valueLast=document.getElementById('valueLast');
 const valueWins=document.getElementById('valueWins');
@@ -15576,7 +15599,7 @@ const LEARNING_ID_KEY='mega_adaptive_learning_id_v1';
 const VALUE_SCORE_KEY='mega_value_score_v1';
 const RESULT_MARKETS=['OPEN','IQ_OTC'];
 
-let valueScore={stake:5,payout:85,profit:0,wins:0,losses:0,processed:{},last:''};
+let valueScore={baseStake:5,nextStake:5,payout:85,profit:0,wins:0,losses:0,lossStreak:0,processed:{},last:''};
 
 function brMoney(v){
   const n=Number(v||0);
@@ -15588,12 +15611,17 @@ function loadValueScore(){
     const raw=localStorage.getItem(VALUE_SCORE_KEY);
     if(raw){
       const x=JSON.parse(raw)||{};
+      const legacyStake=Math.max(1,Number(x.stake||5));
+      const base=Math.max(1,Number(x.baseStake||x.base_stake||legacyStake||5));
+      const next=Math.max(1,Number(x.nextStake||x.next_stake||legacyStake||base));
       valueScore={
-        stake:[5,10,20].includes(Number(x.stake))?Number(x.stake):Math.max(1,Number(x.stake||5)),
+        baseStake:base,
+        nextStake:next,
         payout:Math.max(1,Math.min(100,Number(x.payout||85))),
         profit:Number(x.profit||0),
         wins:Math.max(0,Number(x.wins||0)),
         losses:Math.max(0,Number(x.losses||0)),
+        lossStreak:Math.max(0,Number(x.lossStreak||x.loss_streak||0)),
         processed:(x.processed&&typeof x.processed==='object')?{...x.processed}:{},
         last:String(x.last||'')
       };
@@ -15605,8 +15633,12 @@ function saveValueScore(){
   try{ localStorage.setItem(VALUE_SCORE_KEY,JSON.stringify(valueScore)); }catch(_){ }
 }
 
+function currentValueBaseStake(){
+  return Math.max(1,Number(valueScore.baseStake||5));
+}
+
 function currentValueStake(){
-  return Math.max(1,Number(valueScore.stake||5));
+  return Math.max(1,Number(valueScore.nextStake||currentValueBaseStake()));
 }
 
 function currentValuePayout(){
@@ -15619,7 +15651,9 @@ function currentGaleMultiplier(){
 }
 
 function renderValueScore(){
+  if(typeof valueBaseStakeDisplay!=='undefined' && valueBaseStakeDisplay) valueBaseStakeDisplay.textContent=brMoney(currentValueBaseStake());
   if(valueStakeDisplay) valueStakeDisplay.textContent=brMoney(currentValueStake());
+  if(typeof valueLossStreak!=='undefined' && valueLossStreak) valueLossStreak.textContent=String(Math.max(0,Number(valueScore.lossStreak||0)));
   if(valuePayout) valuePayout.value=String(Math.round(currentValuePayout()));
   if(valueProfit){
     valueProfit.textContent=brMoney(valueScore.profit);
@@ -15629,23 +15663,19 @@ function renderValueScore(){
   if(valueLosses) valueLosses.textContent=String(Math.max(0,Number(valueScore.losses||0)));
   if(valueLast) valueLast.textContent=valueScore.last||'Aguardando resultado.';
   valueStakeBtns.forEach(btn=>{
-    const on=Number(btn.dataset.value||0)===Number(valueScore.stake||0);
+    const on=Number(btn.dataset.value||0)===Number(currentValueBaseStake());
     btn.style.background=on?'#0b7a3d':'';
     btn.style.borderColor=on?'#31e981':'';
     btn.style.color=on?'#fff':'';
   });
 }
 
-function valueResultDelta(result,stake,payout,galeMultiplier){
+function valueResultDelta(result,stake,payout){
   const r=String(result||'').toUpperCase();
   const s=Math.max(1,Number(stake||5));
   const p=Math.max(0,Math.min(1,Number(payout||85)/100));
-  const g=Math.max(1,Number(galeMultiplier||2));
   if(r==='WIN') return s*p;
   if(r==='LOSS') return -s;
-  if(r==='WIN G1') return -s + (s*g*p);
-  if(r==='WIN G2') return -s - (s*g) + (s*g*g*p);
-  if(r==='LOSS G2') return -s - (s*g) - (s*g*g);
   return 0;
 }
 
@@ -15654,29 +15684,42 @@ function applyValueResult(t,result,opKey){
   valueScore.processed=valueScore.processed||{};
   if(valueScore.processed[opKey]) return false;
   const r=String(result||'').toUpperCase();
-  if(!['WIN','LOSS','WIN G1','WIN G2','LOSS G2'].includes(r)) return false;
+  if(!['WIN','LOSS'].includes(r)) return false;
   const stake=Math.max(1,Number(t.value_stake||currentValueStake()));
   const payout=Math.max(1,Math.min(100,Number(t.value_payout||currentValuePayout())));
-  const gm=Math.max(1,Number(t.value_gale_multiplier||currentGaleMultiplier()));
-  const delta=valueResultDelta(r,stake,payout,gm);
+  const delta=valueResultDelta(r,stake,payout);
   valueScore.profit=Number((Number(valueScore.profit||0)+delta).toFixed(2));
-  if(r.startsWith('WIN')) valueScore.wins=Number(valueScore.wins||0)+1;
-  else valueScore.losses=Number(valueScore.losses||0)+1;
-  valueScore.processed[opKey]={result:r,delta:Number(delta.toFixed(2)),at:Date.now()};
+
+  if(r==='WIN'){
+    valueScore.wins=Number(valueScore.wins||0)+1;
+    valueScore.lossStreak=0;
+    valueScore.nextStake=currentValueBaseStake();
+  }else{
+    valueScore.losses=Number(valueScore.losses||0)+1;
+    valueScore.lossStreak=Number(valueScore.lossStreak||0)+1;
+    valueScore.nextStake=Number((stake*2).toFixed(2));
+  }
+
+  valueScore.processed[opKey]={result:r,stake:Number(stake.toFixed(2)),delta:Number(delta.toFixed(2)),nextStake:Number(currentValueStake().toFixed(2)),at:Date.now()};
   const keys=Object.keys(valueScore.processed);
   if(keys.length>1500){
     keys.sort((a,b)=>Number(valueScore.processed[a]?.at||0)-Number(valueScore.processed[b]?.at||0));
     keys.slice(0,keys.length-1500).forEach(k=>delete valueScore.processed[k]);
   }
-  valueScore.last=`${r} • ${delta>=0?'+':''}${brMoney(delta)} • acumulado ${brMoney(valueScore.profit)}`;
+
+  if(r==='WIN'){
+    valueScore.last=`WIN • +${brMoney(delta)} • próxima entrada volta para ${brMoney(currentValueStake())} • acumulado ${brMoney(valueScore.profit)}`;
+  }else{
+    valueScore.last=`LOSS aceito • ${brMoney(delta)} • próximo sinal ${brMoney(currentValueStake())} • acumulado ${brMoney(valueScore.profit)}`;
+  }
+
   saveValueScore();
   renderValueScore();
   if(voiceEnabled){
-    const spoken=Math.abs(valueScore.profit).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2});
-    if(r.startsWith('WIN')){
-      speak((valueScore.profit<0?'Seu resultado acumulado está em menos ':'Você tem um lucro de ')+spoken+' reais.');
+    if(r==='WIN'){
+      speak('Win. A próxima entrada volta para '+currentValueStake().toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2})+' reais.');
     }else{
-      speak((valueScore.profit<0?'Seu resultado acumulado diminuiu para menos ':'Seu lucro diminuiu para ')+spoken+' reais. Mas tenha calma e vamos recuperar.');
+      speak('Loss aceito. Não haverá Gale. No próximo sinal a entrada será de '+currentValueStake().toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2})+' reais.');
     }
   }
   return true;
@@ -16083,10 +16126,14 @@ function registerPersistentResult(t,x){
 
   // LOSS da primeira vela é apenas diagnóstico: mostra quantas operações
   // precisaram de Gale. WIN direto é contado somente no resultado FINAL.
-  if(entryResult==='LOSS' && !b.entry_keys.includes(entryKey)){
+  if((entryResult==='WIN' || entryResult==='LOSS') && !b.entry_keys.includes(entryKey)){
     b.entry_keys.push(entryKey);
     if(b.entry_keys.length>1500) b.entry_keys=b.entry_keys.slice(-1500);
-    b.loss_direct++;
+    if(entryResult==='LOSS') b.loss_direct++;
+    // Finanças v3.58: valor inicial digitável + progressão entre SINAIS NOVOS.
+    // O resultado da primeira entrada encerra financeiramente aquela operação;
+    // G1/G2, caso existam em outros módulos, não alteram este placar.
+    applyValueResult(t,entryResult,opKey+'|FIN_ENTRY');
     changed=true;
   }
 
@@ -16101,7 +16148,6 @@ function registerPersistentResult(t,x){
       changed=true;
       newFinal=true;
     }
-    if(newFinal) applyValueResult(t,r,opKey);
 
     // Histórico detalhado: exatamente uma linha para a mesma operação.
     const historyExists=(b.history||[]).some(h=>h && (h.op_key===opKey || h.key===key));
@@ -16354,14 +16400,44 @@ if(resetResultsBtn) resetResultsBtn.onclick=resetResultsNow;
 loadPersistentResults();
 loadValueScore();
 renderValueScore();
+if(valueCustomStake) valueCustomStake.value=currentValueBaseStake().toFixed(2);
+
+function setFinanceBaseStake(chosen,source='manual'){
+  const n=Number(chosen);
+  if(!Number.isFinite(n) || n<1){
+    if(valueCustomStakeStatus) valueCustomStakeStatus.textContent='Digite um valor válido a partir de R$ 1,00.';
+    return false;
+  }
+  const fixed=Number(n.toFixed(2));
+  valueScore.baseStake=fixed;
+  valueScore.nextStake=fixed;
+  valueScore.lossStreak=0;
+  valueScore.last='Nova sequência iniciada em '+brMoney(fixed)+'.';
+  if(valueCustomStake) valueCustomStake.value=fixed.toFixed(2);
+  if(valueCustomStakeStatus) valueCustomStakeStatus.textContent='Valor inicial definido em '+brMoney(fixed)+'.';
+  saveValueScore();
+  renderValueScore();
+  return true;
+}
 
 valueStakeBtns.forEach(btn=>{
   btn.onclick=()=>{
-    valueScore.stake=Math.max(1,Number(btn.dataset.value||5));
-    saveValueScore();
-    renderValueScore();
+    setFinanceBaseStake(Number(btn.dataset.value||5),'atalho');
   };
 });
+if(applyCustomStakeBtn){
+  applyCustomStakeBtn.onclick=()=>{
+    setFinanceBaseStake(valueCustomStake ? valueCustomStake.value : '');
+  };
+}
+if(valueCustomStake){
+  valueCustomStake.addEventListener('keydown',e=>{
+    if(e.key==='Enter'){
+      e.preventDefault();
+      setFinanceBaseStake(valueCustomStake.value);
+    }
+  });
+}
 if(valuePayout){
   valuePayout.onchange=()=>{
     valueScore.payout=Math.max(1,Math.min(100,Number(valuePayout.value||85)));
@@ -16372,9 +16448,9 @@ if(valuePayout){
 if(resetValuesBtn){
   resetValuesBtn.onclick=()=>{
     if(!confirm('Zerar o lucro/prejuízo e o placar de valores?')) return;
-    const stake=currentValueStake();
+    const baseStake=currentValueBaseStake();
     const payout=currentValuePayout();
-    valueScore={stake,payout,profit:0,wins:0,losses:0,processed:{},last:'Placar de valores zerado.'};
+    valueScore={baseStake,nextStake:baseStake,payout,profit:0,wins:0,losses:0,lossStreak:0,processed:{},last:'Finanças zeradas. Próxima entrada '+brMoney(baseStake)+'.'};
     saveValueScore();
     renderValueScore();
   };
@@ -16518,8 +16594,7 @@ function rememberPendingTrade(sig){
     engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('BIGRISE')?'BIGRISE':(engineKey.includes('LARRY')?'LARRY':String(sig.selected_engine||sig.mode||''))))),
     entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH')),
     value_stake:currentValueStake(),
-    value_payout:currentValuePayout(),
-    value_gale_multiplier:currentGaleMultiplier()
+    value_payout:currentValuePayout()
   });
 }
 
@@ -16576,8 +16651,7 @@ function rememberChartSignal(pre){
     entry_time:pre.entry_time,
     expiry_time:expiryIso,
     value_stake:currentValueStake(),
-    value_payout:currentValuePayout(),
-    value_gale_multiplier:currentGaleMultiplier()
+    value_payout:currentValuePayout()
   });
 }
 
