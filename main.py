@@ -41,442 +41,9 @@ except Exception:
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
-from statistics import median
 
-# ===== RENKO HASHI PRO (núcleo Heiken-Ashi não repintável, sem arquivo extra) =====
-def _clamp(v, lo, hi):
-    return max(lo, min(hi, v))
-
-
-def _heiken_ashi(rows):
-    out = []
-    prev_open = None
-    prev_close = None
-    for row in list(rows or []):
-        try:
-            o = float(row["open"])
-            h = float(row["high"])
-            l = float(row["low"])
-            c = float(row["close"])
-        except Exception:
-            continue
-        ha_close = (o + h + l + c) / 4.0
-        ha_open = (o + c) / 2.0 if prev_open is None else (prev_open + prev_close) / 2.0
-        ha_high = max(h, ha_open, ha_close)
-        ha_low = min(l, ha_open, ha_close)
-        out.append({
-            "open": ha_open,
-            "high": ha_high,
-            "low": ha_low,
-            "close": ha_close,
-        })
-        prev_open, prev_close = ha_open, ha_close
-    return out
-
-
-def heiken_ashi_arrows_strategy(cs, timeframe="1min", market="OPEN"):
-    rows = list(cs or [])
-    tf_label = {"1min": "M1", "5min": "M5", "15min": "M15", "30min": "M30"}.get(timeframe, timeframe)
-    name = f"RENKO HASHI PRO {tf_label}"
-
-    def neutral(reason, confidence=0.0, diagnostics=None):
-        out = {
-            "available": True,
-            "direction": "NEUTRO",
-            "confidence": round(float(confidence or 0), 1),
-            "confirmed": False,
-            "risk": "HIGH",
-            "strategy": name,
-            "engine": "HEIKEN",
-            "provider": "LOCAL_RENKO_HASHI_PRO",
-            "reason": reason,
-            "non_repaint": True,
-            "closed_candles_only": True,
-            "external_ai_disabled": True,
-            "gale_signal": False,
-        }
-        if diagnostics:
-            out["diagnostics"] = diagnostics
-        return out
-
-    if len(rows) < 18:
-        return neutral(f"Aguardando candles fechados suficientes ({len(rows)}/18).")
-
-    ha = _heiken_ashi(rows)
-    if len(ha) != len(rows) or len(ha) < 3:
-        return neutral("Heiken-Ashi ainda sem historico suficiente.")
-
-    # Reconstroi os sinais cronologicamente, igual ao indicador MT4 PRO.
-    # Nao repete CALL/CALL ou PUT/PUT: o lado so muda quando aparece uma
-    # confirmacao forte no sentido contrario. Isso remove o 'ct' global do MQ4
-    # original e deixa o historico deterministico.
-    last_direction = None
-    last_signal = None
-
-    for i in range(1, len(rows)):
-        row = rows[i]
-        hrow = ha[i]
-        ha_range = max(hrow["high"] - hrow["low"], 1e-12)
-        ha_body = abs(hrow["close"] - hrow["open"]) / ha_range
-        lower_wick = (min(hrow["open"], hrow["close"]) - hrow["low"]) / ha_range
-        upper_wick = (hrow["high"] - max(hrow["open"], hrow["close"])) / ha_range
-        real_range = max(float(row["high"]) - float(row["low"]), 1e-12)
-        history_ranges = [
-            max(float(x["high"]) - float(x["low"]), 1e-12)
-            for x in rows[max(0, i-12):i]
-        ]
-        avg_range = median(history_ranges) if history_ranges else real_range
-        range_ratio = real_range / max(avg_range, 1e-12)
-        real_bull = float(row["close"]) > float(row["open"])
-        real_bear = float(row["close"]) < float(row["open"])
-        bull = bool(
-            hrow["close"] > hrow["open"]
-            and real_bull
-            and ha_body >= 0.32
-            and lower_wick <= 0.40
-            and range_ratio >= 0.60
-        )
-        bear = bool(
-            hrow["close"] < hrow["open"]
-            and real_bear
-            and ha_body >= 0.32
-            and upper_wick <= 0.40
-            and range_ratio >= 0.60
-        )
-
-        direction = None
-        opposite_wick = None
-        if bull and not bear and last_direction != "CALL":
-            direction = "CALL"
-            opposite_wick = lower_wick
-        elif bear and not bull and last_direction != "PUT":
-            direction = "PUT"
-            opposite_wick = upper_wick
-
-        if direction:
-            last_direction = direction
-            confidence = 70.0
-            confidence += min(10.0, max(0.0, (ha_body - 0.32) * 24.0))
-            confidence += min(7.0, max(0.0, (range_ratio - 0.60) * 8.0))
-            confidence += min(5.0, max(0.0, (0.40 - opposite_wick) * 12.0))
-            confidence = _clamp(confidence, 70.0, 92.0)
-            last_signal = {
-                "index": i,
-                "direction": direction,
-                "confidence": confidence,
-                "ha_body_ratio": ha_body,
-                "lower_wick_ratio": lower_wick,
-                "upper_wick_ratio": upper_wick,
-                "range_vs_median": range_ratio,
-            }
-
-    last = rows[-1]
-    last_ha = ha[-1]
-    last_range = max(last_ha["high"] - last_ha["low"], 1e-12)
-    current_diag = {
-        "ha_body_ratio": round(abs(last_ha["close"] - last_ha["open"]) / last_range, 4),
-        "ha_color": "BULL" if last_ha["close"] > last_ha["open"] else ("BEAR" if last_ha["close"] < last_ha["open"] else "DOJI"),
-        "real_candle": "BULL" if float(last["close"]) > float(last["open"]) else ("BEAR" if float(last["close"]) < float(last["open"]) else "DOJI"),
-        "last_locked_direction": last_direction or "NONE",
-    }
-
-    # So libera entrada quando a NOVA seta nasceu exatamente no ultimo candle fechado.
-    if not last_signal or last_signal["index"] != len(rows) - 1:
-        return neutral(
-            "Renko Hashi Pro monitorando: nenhuma nova troca de direcao forte no ultimo candle fechado.",
-            confidence=min(68.0, 45.0 + current_diag["ha_body_ratio"] * 20.0),
-            diagnostics=current_diag,
-        )
-
-    direction = last_signal["direction"]
-    confidence = last_signal["confidence"]
-    diagnostics = {
-        **current_diag,
-        "signal": direction,
-        "lower_wick_ratio": round(last_signal["lower_wick_ratio"], 4),
-        "upper_wick_ratio": round(last_signal["upper_wick_ratio"], 4),
-        "range_vs_median": round(last_signal["range_vs_median"], 4),
-        "direction_change_confirmed": True,
-    }
-    return {
-        "available": True,
-        "direction": direction,
-        "confidence": round(confidence, 1),
-        "confirmed": True,
-        "risk": "LOW" if confidence >= 84.0 else "MEDIUM",
-        "strategy": name,
-        "engine": "HEIKEN",
-        "provider": "LOCAL_RENKO_HASHI_PRO",
-        "reason": (
-            f"{direction} confirmado no ultimo candle fechado pelo Renko Hashi Pro: "
-            f"mudanca de direcao, corpo forte, pavio contrario controlado e amplitude valida."
-        ),
-        "non_repaint": True,
-        "closed_candles_only": True,
-        "external_ai_disabled": True,
-        "gale_signal": False,
-        "diagnostics": diagnostics,
-    }
-
-# ===== FIM RENKO HASHI PRO =====
-
-# ===== SCALPER PA (Price Action + MACD + CCI + RSI, sem repaint) =====
-def scalper_pa_strategy(cs, timeframe="1min", market="OPEN"):
-    """Motor SCALPER PA adaptado para opções binárias.
-
-    Regras principais:
-      • usa somente candles FECHADOS;
-      • Price Action: engolfo ou candle de força;
-      • MACD mais rápido no M1 (8/17/6) e padrão 12/26/9 nos demais TFs;
-      • CCI 14 e RSI 14 como confirmações;
-      • pontuação por confluência, sem exigir os quatro filtros simultaneamente;
-      • CALL/PUT com expiração de 1 vela, sem SL/TP/trailing/lote do EA Forex.
-    """
-    rows = list(cs or [])
-    tf_label = {"1min": "M1", "5min": "M5", "15min": "M15", "30min": "M30"}.get(timeframe, timeframe)
-    name = f"SCALPER PA {tf_label}"
-
-    def neutral(reason, diagnostics=None, confidence=0.0):
-        result = {
-            "available": True,
-            "direction": "NEUTRO",
-            "confidence": round(float(confidence or 0.0), 1),
-            "confirmed": False,
-            "risk": "HIGH",
-            "strategy": name,
-            "engine": "SCALPER",
-            "provider": "LOCAL_SCALPER_PA",
-            "reason": reason,
-            "non_repaint": True,
-            "closed_candles_only": True,
-            "external_ai_disabled": True,
-            "gale_signal": False,
-            "scalper_pa_adapted": True,
-        }
-        if diagnostics is not None:
-            result["diagnostics"] = diagnostics
-        return result
-
-    if len(rows) < 45:
-        return neutral(f"Aguardando histórico fechado suficiente para o Scalper PA ({len(rows)}/45).")
-
-    try:
-        opens = [float(x["open"]) for x in rows]
-        highs = [float(x["high"]) for x in rows]
-        lows = [float(x["low"]) for x in rows]
-        closes = [float(x["close"]) for x in rows]
-    except Exception:
-        return neutral("Dados OHLC inválidos para a leitura do Scalper PA.")
-
-    def ema_full(values, period):
-        if len(values) < period:
-            return []
-        k = 2.0 / (period + 1.0)
-        cur = sum(values[:period]) / float(period)
-        result = [None] * (period - 1) + [cur]
-        for value in values[period:]:
-            cur = float(value) * k + cur * (1.0 - k)
-            result.append(cur)
-        return result
-
-    def rsi_last(values, period=14):
-        if len(values) < period + 1:
-            return None
-        gains, losses = [], []
-        for i in range(len(values) - period, len(values)):
-            diff = values[i] - values[i - 1]
-            gains.append(max(diff, 0.0))
-            losses.append(max(-diff, 0.0))
-        avg_gain = sum(gains) / period
-        avg_loss = sum(losses) / period
-        if avg_loss <= 1e-12:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return 100.0 - (100.0 / (1.0 + rs))
-
-    def cci_last(highs_, lows_, closes_, period=14):
-        if len(closes_) < period:
-            return None
-        typical = [(h + l + c) / 3.0 for h, l, c in zip(highs_, lows_, closes_)]
-        sample = typical[-period:]
-        mean = sum(sample) / period
-        dev = sum(abs(x - mean) for x in sample) / period
-        if dev <= 1e-12:
-            return 0.0
-        return (sample[-1] - mean) / (0.015 * dev)
-
-    # MACD mais ágil no M1 para reduzir atraso; demais timeframes preservam 12/26/9.
-    if timeframe == "1min":
-        macd_fast, macd_slow, macd_signal_period = 8, 17, 6
-    else:
-        macd_fast, macd_slow, macd_signal_period = 12, 26, 9
-
-    ef = ema_full(closes, macd_fast)
-    es = ema_full(closes, macd_slow)
-    start = max(macd_fast, macd_slow) - 1
-    macd_line = []
-    for i in range(start, len(closes)):
-        if i < len(ef) and i < len(es) and ef[i] is not None and es[i] is not None:
-            macd_line.append(float(ef[i]) - float(es[i]))
-    sig_line = ema_full(macd_line, macd_signal_period)
-    valid_sig = [(m, s) for m, s in zip(macd_line, sig_line) if s is not None]
-    if len(valid_sig) < 2:
-        return neutral("Histórico insuficiente para calcular o MACD do Scalper PA.")
-
-    macd_prev, signal_prev = valid_sig[-2]
-    macd_now, signal_now = valid_sig[-1]
-    hist_prev = macd_prev - signal_prev
-    hist_now = macd_now - signal_now
-    macd_buy = macd_now > signal_now
-    macd_sell = macd_now < signal_now
-    cross_up = macd_prev <= signal_prev and macd_now > signal_now
-    cross_down = macd_prev >= signal_prev and macd_now < signal_now
-
-    cci_now = cci_last(highs, lows, closes, 14)
-    rsi_now = rsi_last(closes, 14)
-    if cci_now is None or rsi_now is None:
-        return neutral("Histórico insuficiente para CCI/RSI do Scalper PA.")
-
-    o1, h1, l1, c1 = opens[-1], highs[-1], lows[-1], closes[-1]
-    o2, c2 = opens[-2], closes[-2]
-    rng = max(h1 - l1, 1e-12)
-    body_ratio = abs(c1 - o1) / rng
-
-    bull_engulf = bool(c1 > o1 and c2 < o2 and c1 > o2 and o1 < c2)
-    bear_engulf = bool(c1 < o1 and c2 > o2 and c1 < o2 and o1 > c2)
-    bull_force = bool(c1 > o1 and body_ratio >= 0.55)
-    bear_force = bool(c1 < o1 and body_ratio >= 0.55)
-    bull_pa = bull_engulf or bull_force
-    bear_pa = bear_engulf or bear_force
-
-    call_score = 0.0
-    put_score = 0.0
-    call_reasons, put_reasons = [], []
-    call_families, put_families = set(), set()
-
-    if bull_pa:
-        call_score += 36.0 if bull_engulf else 28.0
-        call_reasons.append("engolfo comprador" if bull_engulf else "candle de força comprador")
-        call_families.add("PA")
-    if bear_pa:
-        put_score += 36.0 if bear_engulf else 28.0
-        put_reasons.append("engolfo vendedor" if bear_engulf else "candle de força vendedor")
-        put_families.add("PA")
-
-    if macd_buy:
-        call_score += 22.0
-        call_reasons.append("MACD comprador")
-        call_families.add("MACD")
-        if cross_up:
-            call_score += 6.0
-            call_reasons.append("cruzamento MACD para cima")
-        if hist_now > hist_prev:
-            call_score += 4.0
-            call_reasons.append("histograma MACD ganhando força")
-    if macd_sell:
-        put_score += 22.0
-        put_reasons.append("MACD vendedor")
-        put_families.add("MACD")
-        if cross_down:
-            put_score += 6.0
-            put_reasons.append("cruzamento MACD para baixo")
-        if hist_now < hist_prev:
-            put_score += 4.0
-            put_reasons.append("histograma MACD ganhando força")
-
-    if cci_now > 0:
-        call_score += 17.0
-        call_reasons.append("CCI acima de zero")
-        call_families.add("CCI")
-        if cci_now >= 100:
-            call_score += 3.0
-    elif cci_now < 0:
-        put_score += 17.0
-        put_reasons.append("CCI abaixo de zero")
-        put_families.add("CCI")
-        if cci_now <= -100:
-            put_score += 3.0
-
-    if 50.0 < rsi_now < 70.0:
-        call_score += 17.0
-        call_reasons.append("RSI comprador sem sobrecompra")
-        call_families.add("RSI")
-        if 52.0 <= rsi_now <= 66.0:
-            call_score += 3.0
-    elif 30.0 < rsi_now < 50.0:
-        put_score += 17.0
-        put_reasons.append("RSI vendedor sem sobrevenda")
-        put_families.add("RSI")
-        if 34.0 <= rsi_now <= 48.0:
-            put_score += 3.0
-
-    # Evita perseguir movimento já excessivamente esticado.
-    if rsi_now >= 75.0:
-        call_score -= 20.0
-    if rsi_now <= 25.0:
-        put_score -= 20.0
-
-    diagnostics = {
-        "macd_fast": macd_fast,
-        "macd_slow": macd_slow,
-        "macd_signal_period": macd_signal_period,
-        "macd": round(macd_now, 8),
-        "macd_signal": round(signal_now, 8),
-        "macd_hist": round(hist_now, 8),
-        "cci14": round(cci_now, 2),
-        "rsi14": round(rsi_now, 2),
-        "body_ratio": round(body_ratio, 4),
-        "bull_engulf": bull_engulf,
-        "bear_engulf": bear_engulf,
-        "bull_force": bull_force,
-        "bear_force": bear_force,
-        "call_score": round(call_score, 1),
-        "put_score": round(put_score, 1),
-        "call_confirmations": len(call_families),
-        "put_confirmations": len(put_families),
-    }
-
-    min_score = 58.0
-    min_edge = 10.0
-    call_ok = call_score >= min_score and len(call_families) >= 2 and (call_score - put_score) >= min_edge
-    put_ok = put_score >= min_score and len(put_families) >= 2 and (put_score - call_score) >= min_edge
-
-    if call_ok and not put_ok:
-        direction, score, reasons = "CALL", call_score, call_reasons
-    elif put_ok and not call_ok:
-        direction, score, reasons = "PUT", put_score, put_reasons
-    else:
-        best = max(call_score, put_score)
-        if abs(call_score - put_score) < min_edge and best >= min_score:
-            reason = "Scalper PA encontrou forças conflitantes; aguardando novo candle fechado."
-        else:
-            reason = f"Scalper PA monitorando confluência (CALL {call_score:.0f} / PUT {put_score:.0f}; mínimo {min_score:.0f})."
-        return neutral(reason, diagnostics, min(69.0, max(0.0, best)))
-
-    confidence = max(70.0, min(94.0, 70.0 + (score - min_score) * 0.58))
-    return {
-        "available": True,
-        "direction": direction,
-        "confidence": round(confidence, 1),
-        "confirmed": True,
-        "risk": "LOW" if confidence >= 84.0 else "MEDIUM",
-        "strategy": name,
-        "engine": "SCALPER",
-        "provider": "LOCAL_SCALPER_PA",
-        "reason": f"{direction} confirmado pelo Scalper PA: " + "; ".join(reasons[:6]) + ". Entrada na próxima vela.",
-        "non_repaint": True,
-        "closed_candles_only": True,
-        "external_ai_disabled": True,
-        "gale_signal": False,
-        "scalper_pa_adapted": True,
-        "expiry_candles": 1,
-        "diagnostics": diagnostics,
-    }
-
-# ===== FIM SCALPER PA =====
-
-APP_VERSION = "3.56"
-PWA_VERSION = "v123"
+APP_VERSION = "3.51"
+PWA_VERSION = "v118"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -506,9 +73,14 @@ XGB_MIN_TRAIN_SAMPLES = max(60, int(os.getenv("XGB_MIN_TRAIN_SAMPLES", "80")))
 XGB_RETRAIN_SECONDS = max(120, int(os.getenv("XGB_RETRAIN_SECONDS", "900")))
 XGB_MIN_PROBABILITY = min(0.80, max(0.52, float(os.getenv("XGB_MIN_PROBABILITY", "0.60"))))
 XGB_MIN_VALIDATION_ACCURACY = min(0.80, max(0.50, float(os.getenv("XGB_MIN_VALIDATION_ACCURACY", "0.52"))))
-# EA de confirmação dupla: XGBoost + Renko Hashi Pro precisam apontar o mesmo lado.
+# EA de confirmação tripla: XGBoost + RSI + Value Chart precisam apontar o mesmo lado.
 EA_XGB_MIN_PROBABILITY = min(0.85, max(0.52, float(os.getenv("EA_XGB_MIN_PROBABILITY", "0.60"))))
 EA_XGB_MIN_VALIDATION_ACCURACY = min(0.80, max(0.50, float(os.getenv("EA_XGB_MIN_VALIDATION_ACCURACY", "0.52"))))
+EA_RSI_PERIOD = max(5, int(os.getenv("EA_RSI_PERIOD", "14")))
+EA_RSI_OVERSOLD = max(5.0, min(45.0, float(os.getenv("EA_RSI_OVERSOLD", "30"))))
+EA_RSI_OVERBOUGHT = max(55.0, min(95.0, float(os.getenv("EA_RSI_OVERBOUGHT", "70"))))
+EA_VALUE_CHART_PERIOD = max(3, int(os.getenv("EA_VALUE_CHART_PERIOD", "5")))
+EA_VALUE_CHART_EXTREME = max(4.0, min(12.0, float(os.getenv("EA_VALUE_CHART_EXTREME", "8"))))
 xgb_model_cache: Dict[str, Dict[str, Any]] = {}
 xgb_model_guard = threading.RLock()
 
@@ -659,6 +231,23 @@ SYMBOLS = [
 ]
 OTC_SYMBOLS = [s for s in SYMBOLS if s != BINOMO_CRYPTO_IDX_SYMBOL]
 
+# MEGA IA 3.51 — BIGRISE • FORÇA USD + BTC/USD
+# Adaptação do BigRise EA.mq4 para opções binárias. O motor ignora toda a
+# lógica de grid/lote/OrderSend do EA original e reaproveita somente a leitura
+# simultânea de força do USD nos cinco pares. Usa apenas candles FECHADOS.
+BIGRISE_PAIRS = ("EUR/USD", "GBP/USD", "AUD/USD", "USD/CAD", "USD/CHF")
+BIGRISE_BTC_SYMBOL = "BTC/USD"
+BIGRISE_SIGNAL_SYMBOLS = BIGRISE_PAIRS + (BIGRISE_BTC_SYMBOL,)
+BIGRISE_FETCH_SYMBOLS = BIGRISE_SIGNAL_SYMBOLS
+BIGRISE_MIN_ATR_BODY = max(0.10, min(1.50, float(os.getenv("BIGRISE_MIN_ATR_BODY", "0.22"))))
+BIGRISE_MIN_BODY_RATIO = max(0.20, min(0.90, float(os.getenv("BIGRISE_MIN_BODY_RATIO", "0.42"))))
+# BTC/USD não disputa força bruta com os pares Forex. A cesta USD funciona como
+# filtro macro e o próprio BTC precisa confirmar direção, tendência e força.
+BIGRISE_BTC_MIN_ATR_BODY = max(0.10, min(2.00, float(os.getenv("BIGRISE_BTC_MIN_ATR_BODY", "0.25"))))
+BIGRISE_BTC_MIN_BODY_RATIO = max(0.20, min(0.90, float(os.getenv("BIGRISE_BTC_MIN_BODY_RATIO", "0.45"))))
+BIGRISE_BTC_MIN_BASKET_AVG = max(0.05, min(1.00, float(os.getenv("BIGRISE_BTC_MIN_BASKET_AVG", "0.16"))))
+BIGRISE_CACHE_TTL = max(2.0, min(30.0, float(os.getenv("BIGRISE_CACHE_TTL", "8"))))
+
 OTC_BASE = {
     "EUR/USD": "EURUSD-OTC", "GBP/USD": "GBPUSD-OTC", "USD/JPY": "USDJPY-OTC",
     "AUD/USD": "AUDUSD-OTC", "USD/CAD": "USDCAD-OTC", "USD/CHF": "USDCHF-OTC",
@@ -698,6 +287,7 @@ def _ctrader_canonical_symbol_name(raw_name: str) -> str:
     return upper
 
 cache: Dict[str, Any] = {}
+bigrise_basket_cache: Dict[str, Any] = {}
 # Controle anti-repetição de sinais.
 # Mantém o mesmo sinal até a expiração e exige um novo setup antes de liberar outro
 # sinal na mesma direção.
@@ -4350,6 +3940,383 @@ def ea_movement_force_strategy(cs, timeframe="1min", m5=None, h1=None, market="O
     }
 
 
+
+def bigrise_usd_strength_strategy(basket_rows, selected_symbol, timeframe="1min", source_map=None):
+    """BIGRISE • FORÇA USD — adaptação não-repaint do BigRise EA.mq4.
+
+    Regra central preservada do EA original:
+      • EUR/USD, GBP/USD e AUD/USD na mesma direção;
+      • USD/CAD e USD/CHF na direção inversa;
+      • somente a vela fechada (shift 1 no MQL4);
+      • entre os cinco pares Forex, libera apenas o ativo de maior força.
+
+    Extensão BTC/USD:
+      • a cesta 5/5 do USD funciona como filtro de contexto;
+      • BTC/USD não compete em pontos com Forex;
+      • o próprio BTC precisa confirmar a direção esperada com vela de força,
+        EMA 9/21 e deslocamento normalizado pelo ATR, sempre em candle fechado.
+
+    Grid, martingale, lote, hedge, OrderSend e recuperação do EA original não
+    participam desta estratégia.
+    """
+    selected_symbol = str(selected_symbol or "").strip().upper()
+    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
+    name = f"BIGRISE • FORÇA USD {tf_label}"
+    source_map = dict(source_map or {})
+
+    def neutral(reason, confidence=0.0, **extra):
+        payload = {
+            "direction": "NEUTRO",
+            "confidence": round(float(confidence or 0.0), 1),
+            "confirmed": False,
+            "risk": "HIGH",
+            "strategy": name,
+            "engine": "BIGRISE_USD_BASKET",
+            "reason": str(reason),
+            "non_repaint": True,
+            "direct_win_only": True,
+            "gale_signal": False,
+            "basket_pairs": list(BIGRISE_PAIRS),
+            "supported_symbols": list(BIGRISE_SIGNAL_SYMBOLS),
+            "btc_filter_enabled": True,
+        }
+        payload.update(extra)
+        return payload
+
+    if selected_symbol not in BIGRISE_SIGNAL_SYMBOLS:
+        return neutral(
+            "Este motor opera EUR/USD, GBP/USD, AUD/USD, USD/CAD, USD/CHF e BTC/USD.",
+            0,
+        )
+
+    rows_by_pair = {}
+    for sym in BIGRISE_PAIRS:
+        rows = list((basket_rows or {}).get(sym) or [])
+        if len(rows) < 20:
+            return neutral(f"Aguardando histórico fechado suficiente da cesta USD ({sym}).")
+        rows_by_pair[sym] = rows
+
+    # Evita misturar candles de horários diferentes entre fontes.
+    timestamps = []
+    for sym, rows in rows_by_pair.items():
+        try:
+            timestamps.append(parse_dt(str(rows[-1].get("datetime"))))
+        except Exception:
+            return neutral(f"Horário da última vela de {sym} não pôde ser validado.")
+    if timestamps:
+        spread = (max(timestamps) - min(timestamps)).total_seconds()
+        allowed = max(10.0, float(INTERVALS.get(timeframe, 60)) * 0.65)
+        if spread > allowed:
+            return neutral(
+                "As cinco fontes ainda não fecharam a mesma vela; aguardando sincronização da cesta USD.",
+                20,
+                basket_time_spread_seconds=round(spread, 1),
+            )
+
+    direction_sign = {}
+    strengths = {}
+    body_ratios = {}
+    last_times = {}
+    for sym, rows in rows_by_pair.items():
+        last = rows[-1]
+        o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"])
+        body = abs(c - o)
+        rng = max(h - l, 1e-12)
+        atr14 = atr(rows, 14)
+        if atr14 is None or atr14 <= 0:
+            return neutral(f"ATR ainda indisponível para normalizar a força de {sym}.")
+        direction_sign[sym] = 1 if c > o else (-1 if c < o else 0)
+        strengths[sym] = body / max(float(atr14), 1e-12)
+        body_ratios[sym] = body / rng
+        last_times[sym] = last.get("datetime")
+
+    # USD fraco: XXX/USD sobe e USD/XXX cai. USD forte: comportamento inverso.
+    usd_weak = (
+        direction_sign["EUR/USD"] > 0 and
+        direction_sign["GBP/USD"] > 0 and
+        direction_sign["AUD/USD"] > 0 and
+        direction_sign["USD/CAD"] < 0 and
+        direction_sign["USD/CHF"] < 0
+    )
+    usd_strong = (
+        direction_sign["EUR/USD"] < 0 and
+        direction_sign["GBP/USD"] < 0 and
+        direction_sign["AUD/USD"] < 0 and
+        direction_sign["USD/CAD"] > 0 and
+        direction_sign["USD/CHF"] > 0
+    )
+
+    if not (usd_weak or usd_strong):
+        agreeing = 0
+        weak_expected = {"EUR/USD":1, "GBP/USD":1, "AUD/USD":1, "USD/CAD":-1, "USD/CHF":-1}
+        strong_expected = {k:-v for k,v in weak_expected.items()}
+        weak_count = sum(1 for k,v in weak_expected.items() if direction_sign.get(k) == v)
+        strong_count = sum(1 for k,v in strong_expected.items() if direction_sign.get(k) == v)
+        agreeing = max(weak_count, strong_count)
+        return neutral(
+            f"Cesta USD sem confirmação total: {agreeing}/5 pares apontam o mesmo fluxo. O BIGRISE exige 5/5.",
+            clamp(25 + agreeing * 8, 25, 62),
+            basket_bias="MIXED",
+            basket_agreement=agreeing,
+            basket_strength={k:round(v, 4) for k,v in strengths.items()},
+        )
+
+    bias = "USD_WEAK" if usd_weak else "USD_STRONG"
+    strongest_symbol = max(BIGRISE_PAIRS, key=lambda s: strengths[s])
+    strongest_strength = float(strengths[strongest_symbol])
+    avg_strength = sum(float(strengths[s]) for s in BIGRISE_PAIRS) / len(BIGRISE_PAIRS)
+    strongest_body_ratio = float(body_ratios[strongest_symbol])
+
+    # BTC/USD: usa a cesta 5/5 como filtro do dólar e exige confirmação própria.
+    # Como BTC tem escala/volatilidade muito diferente de Forex, ele não entra na
+    # disputa de "maior corpo" dos cinco pares; sua força é normalizada pelo ATR.
+    if selected_symbol == BIGRISE_BTC_SYMBOL:
+        btc_rows = list((basket_rows or {}).get(BIGRISE_BTC_SYMBOL) or [])
+        if len(btc_rows) < 30:
+            return neutral(
+                "Cesta USD confirmou, mas o histórico fechado de BTC/USD ainda é insuficiente.",
+                45, basket_bias=bias, strongest_symbol=strongest_symbol,
+            )
+        try:
+            btc_time = parse_dt(str(btc_rows[-1].get("datetime")))
+            basket_time = max(timestamps) if timestamps else btc_time
+            btc_spread = abs((btc_time - basket_time).total_seconds())
+            allowed_btc_spread = max(15.0, float(INTERVALS.get(timeframe, 60)) * 0.85)
+            if btc_spread > allowed_btc_spread:
+                return neutral(
+                    "BTC/USD ainda não fechou a mesma janela da cesta USD; aguardando sincronização.",
+                    42, basket_bias=bias, btc_time_spread_seconds=round(btc_spread, 1),
+                )
+        except Exception:
+            return neutral("Horário da última vela fechada de BTC/USD não pôde ser validado.", 35)
+
+        btc_last = btc_rows[-1]
+        bo = float(btc_last["open"]); bh = float(btc_last["high"]); bl = float(btc_last["low"]); bc = float(btc_last["close"])
+        btc_body = abs(bc - bo)
+        btc_range = max(bh - bl, 1e-12)
+        btc_atr = atr(btc_rows, 14)
+        btc_closes = [float(x["close"]) for x in btc_rows]
+        btc_ema9 = ema(btc_closes, 9)
+        btc_ema21 = ema(btc_closes, 21)
+        if btc_atr is None or btc_atr <= 0 or btc_ema9 is None or btc_ema21 is None:
+            return neutral("BTC/USD ainda não tem ATR/EMA suficientes para confirmação fechada.", 45, basket_bias=bias)
+
+        btc_strength = btc_body / max(float(btc_atr), 1e-12)
+        btc_body_ratio = btc_body / btc_range
+        btc_sign = 1 if bc > bo else (-1 if bc < bo else 0)
+        expected_sign = 1 if usd_weak else -1
+        expected_direction = "CALL" if expected_sign > 0 else "PUT"
+        trend_ok = (btc_ema9 > btc_ema21 and bc >= btc_ema9) if expected_sign > 0 else (btc_ema9 < btc_ema21 and bc <= btc_ema9)
+        trend_sep_atr = abs(float(btc_ema9) - float(btc_ema21)) / max(float(btc_atr), 1e-12)
+
+        if avg_strength < BIGRISE_BTC_MIN_BASKET_AVG:
+            return neutral(
+                "A cesta USD fechou 5/5, porém a força média do movimento ainda está fraca para filtrar BTC/USD.",
+                55, basket_bias=bias, average_normalized_strength=round(avg_strength, 4),
+                strongest_symbol=strongest_symbol,
+            )
+        if btc_sign != expected_sign:
+            return neutral(
+                f"Cesta USD sugere {expected_direction} em BTC/USD, mas a última vela fechada do BTC ainda não confirmou essa direção.",
+                58, basket_bias=bias, btc_expected=expected_direction,
+                btc_normalized_strength=round(btc_strength, 4), btc_body_ratio=round(btc_body_ratio, 4),
+            )
+        if not trend_ok:
+            return neutral(
+                f"BTC/USD confirmou a vela {expected_direction}, mas a tendência EMA 9/21 ainda não está alinhada.",
+                60, basket_bias=bias, btc_expected=expected_direction,
+                btc_ema9=round(float(btc_ema9), 6), btc_ema21=round(float(btc_ema21), 6),
+            )
+        if btc_strength < BIGRISE_BTC_MIN_ATR_BODY:
+            return neutral(
+                "BTC/USD está na direção esperada, porém a vela fechada ainda é pequena em relação ao ATR.",
+                61, basket_bias=bias, btc_expected=expected_direction,
+                btc_normalized_strength=round(btc_strength, 4),
+            )
+        if btc_body_ratio < BIGRISE_BTC_MIN_BODY_RATIO:
+            return neutral(
+                "BTC/USD está alinhado, porém a vela fechada ainda tem pavios demais para uma entrada limpa.",
+                62, basket_bias=bias, btc_expected=expected_direction,
+                btc_normalized_strength=round(btc_strength, 4), btc_body_ratio=round(btc_body_ratio, 4),
+            )
+
+        confidence = clamp(
+            73.0
+            + min(8.0, avg_strength * 12.0)
+            + min(8.0, btc_strength * 14.0)
+            + min(3.0, max(0.0, btc_body_ratio - BIGRISE_BTC_MIN_BODY_RATIO) * 10.0)
+            + min(2.0, trend_sep_atr * 3.0),
+            73.0, 94.0,
+        )
+        risk = "LOW" if (btc_strength >= 0.55 and btc_body_ratio >= 0.62 and trend_sep_atr >= 0.15 and avg_strength >= 0.24) else "MEDIUM"
+        bias_text = "fraqueza sincronizada do dólar" if usd_weak else "força sincronizada do dólar"
+        reason = (
+            f"BIGRISE confirmou {bias_text} nos 5 pares e BTC/USD confirmou {expected_direction} com vela fechada, "
+            f"EMA 9/21 alinhada e força de {btc_strength:.2f} ATR. Entrada somente na próxima janela."
+        )
+        return {
+            "direction": expected_direction,
+            "confidence": round(float(confidence), 1),
+            "confirmed": True,
+            "risk": risk,
+            "strategy": name + " • BTC",
+            "engine": "BIGRISE_USD_BASKET",
+            "reason": reason,
+            "non_repaint": True,
+            "direct_win_only": True,
+            "gale_signal": False,
+            "basket_bias": bias,
+            "basket_agreement": 5,
+            "strongest_symbol": strongest_symbol,
+            "average_normalized_strength": round(avg_strength, 4),
+            "btc_expected": expected_direction,
+            "btc_normalized_strength": round(btc_strength, 4),
+            "btc_body_ratio": round(btc_body_ratio, 4),
+            "btc_ema9": round(float(btc_ema9), 6),
+            "btc_ema21": round(float(btc_ema21), 6),
+            "btc_trend_separation_atr": round(float(trend_sep_atr), 4),
+            "basket_strength": {k:round(v, 4) for k,v in strengths.items()},
+            "basket_last_times": last_times,
+            "basket_sources": source_map,
+            "basket_pairs": list(BIGRISE_PAIRS),
+            "supported_symbols": list(BIGRISE_SIGNAL_SYMBOLS),
+            "btc_filter_enabled": True,
+        }
+
+    if strongest_strength < BIGRISE_MIN_ATR_BODY:
+        return neutral(
+            "Os cinco pares concordaram, mas o deslocamento dominante ainda é pequeno em relação à volatilidade normal.",
+            55,
+            basket_bias=bias,
+            strongest_symbol=strongest_symbol,
+            normalized_strength=round(strongest_strength, 4),
+        )
+
+    if strongest_body_ratio < BIGRISE_MIN_BODY_RATIO:
+        return neutral(
+            f"{strongest_symbol} foi o mais forte da cesta, porém a vela fechou com corpo pouco dominante.",
+            58,
+            basket_bias=bias,
+            strongest_symbol=strongest_symbol,
+            normalized_strength=round(strongest_strength, 4),
+            body_ratio=round(strongest_body_ratio, 4),
+        )
+
+    if selected_symbol != strongest_symbol:
+        return neutral(
+            f"Cesta confirmou {('fraqueza' if usd_weak else 'força')} do USD, mas o ativo dominante agora é {strongest_symbol}. O sinal fica reservado a ele.",
+            clamp(58 + strongest_strength * 12, 58, 72),
+            basket_bias=bias,
+            strongest_symbol=strongest_symbol,
+            normalized_strength=round(strongest_strength, 4),
+            basket_strength={k:round(v, 4) for k,v in strengths.items()},
+        )
+
+    if usd_weak:
+        signal_map = {
+            "EUR/USD":"CALL", "GBP/USD":"CALL", "AUD/USD":"CALL",
+            "USD/CAD":"PUT", "USD/CHF":"PUT",
+        }
+    else:
+        signal_map = {
+            "EUR/USD":"PUT", "GBP/USD":"PUT", "AUD/USD":"PUT",
+            "USD/CAD":"CALL", "USD/CHF":"CALL",
+        }
+    direction = signal_map[selected_symbol]
+
+    confidence = clamp(
+        72.0
+        + min(12.0, strongest_strength * 18.0)
+        + min(6.0, avg_strength * 12.0)
+        + min(4.0, max(0.0, strongest_body_ratio - BIGRISE_MIN_BODY_RATIO) * 10.0),
+        72.0, 94.0,
+    )
+    risk = "LOW" if strongest_strength >= 0.65 and avg_strength >= 0.28 and strongest_body_ratio >= 0.62 else "MEDIUM"
+    bias_text = "fraqueza sincronizada do dólar" if usd_weak else "força sincronizada do dólar"
+    reason = (
+        f"BIGRISE confirmou {bias_text} nos 5 pares. {selected_symbol} apresentou o maior corpo normalizado "
+        f"da cesta ({strongest_strength:.2f} ATR) e fechou com corpo dominante; entrada {direction} somente na próxima janela."
+    )
+
+    return {
+        "direction": direction,
+        "confidence": round(float(confidence), 1),
+        "confirmed": True,
+        "risk": risk,
+        "strategy": name,
+        "engine": "BIGRISE_USD_BASKET",
+        "reason": reason,
+        "non_repaint": True,
+        "direct_win_only": True,
+        "gale_signal": False,
+        "basket_bias": bias,
+        "basket_agreement": 5,
+        "strongest_symbol": strongest_symbol,
+        "normalized_strength": round(strongest_strength, 4),
+        "average_normalized_strength": round(avg_strength, 4),
+        "body_ratio": round(strongest_body_ratio, 4),
+        "basket_strength": {k:round(v, 4) for k,v in strengths.items()},
+        "basket_last_times": last_times,
+        "basket_sources": source_map,
+        "basket_pairs": list(BIGRISE_PAIRS),
+        "supported_symbols": list(BIGRISE_SIGNAL_SYMBOLS),
+        "btc_filter_enabled": True,
+    }
+
+
+async def _bigrise_open_basket(interval: str, request: Request | None = None, n: int = 60):
+    """Carrega a cesta de cinco pares USD + BTC/USD com cTrader como fonte preferencial.
+
+    Quando a sessão cTrader não possui um par, usa Yahoo público para este motor
+    de cesta. Isso evita multiplicar requisições Twelve Data e mantém a leitura
+    simultânea leve. O snapshot é compartilhado entre painel e radar por poucos
+    segundos, pois todos os ativos usam exatamente a mesma cesta fechada.
+    """
+    session_id = "PUBLIC"
+    ctrader_item = None
+    if request is not None:
+        try:
+            session_id, ctrader_item = _ctrader_session_from_request(request)
+            session_id = session_id or "PUBLIC"
+        except Exception:
+            session_id, ctrader_item = "PUBLIC", None
+
+    key = f"{session_id}|{interval}"
+    cached = bigrise_basket_cache.get(key)
+    if cached and time.time() - float(cached.get("ts", 0)) < BIGRISE_CACHE_TTL:
+        return cached
+
+    async def fetch_pair(sym: str):
+        errors = []
+        if ctrader_item and _ctrader_symbol_supported(ctrader_item, sym):
+            try:
+                rows = await _ctrader_candles(ctrader_item, sym, interval, n)
+                if len(rows) >= 20:
+                    return sym, list(rows), "CTRADER_OPEN"
+            except Exception as exc:
+                errors.append("cTrader: " + str(exc)[:120])
+        try:
+            rows = await _yahoo_public_candles(sym, interval, n)
+            if len(rows) >= 20:
+                return sym, list(rows), "YAHOO_PUBLIC"
+        except Exception as exc:
+            errors.append("Yahoo: " + str(exc)[:120])
+        try:
+            rows = await candles(sym, interval, n, "OPEN", None, request=request)
+            if len(rows) >= 20:
+                return sym, list(rows), _feed_source_from_rows(rows)
+        except Exception as exc:
+            errors.append("multifuente: " + str(exc)[:120])
+        raise RuntimeError(f"{sym}: " + " | ".join(errors[-3:]))
+
+    results = await asyncio.gather(*(fetch_pair(sym) for sym in BIGRISE_FETCH_SYMBOLS))
+    rows_map = {sym: rows for sym, rows, _ in results}
+    sources = {sym: source for sym, _, source in results}
+    payload = {"ts": time.time(), "rows": rows_map, "sources": sources}
+    bigrise_basket_cache[key] = payload
+    return payload
+
+
 def ea_binary_strategy(cs, timeframe="1min", m5=None, h1=None, market="OPEN"):
     """EA AUTÔNOMA IQ — leitura seletiva para a próxima vela.
 
@@ -6914,56 +6881,97 @@ def _xgb_train_or_predict(rows, symbol, interval, model_scope="OPEN"):
     return base
 
 
-def _ea_renko_confirmation(rows, timeframe="1min", market="OPEN"):
-    """Confirmação do Renko Hashi Pro usando somente candles fechados.
+def _value_chart_close(rows, period=5):
+    """Value Chart clássico simplificado em unidade dinâmica de volatilidade.
 
-    A EA não usa RSI neste motor. O Renko Hashi Pro reutiliza o núcleo
-    não-repaint do indicador e mantém a última direção travada até surgir
-    uma troca forte contrária. A confirmação final é feita junto do XGBoost.
+    Floating axis = média do preço mediano (H+L)/2.
+    Dynamic Volatility Unit = média do range (H-L) * 0.20.
+    Retorna o valor do fechamento da última vela fechada.
     """
     rows = list(rows or [])
+    if len(rows) < period:
+        return None
+    block = rows[-period:]
+    try:
+        axis = sum((float(x["high"]) + float(x["low"])) / 2.0 for x in block) / period
+        avg_range = sum(max(float(x["high"]) - float(x["low"]), 0.0) for x in block) / period
+        dvu = avg_range * 0.20
+        if dvu <= 1e-12:
+            return None
+        return (float(block[-1]["close"]) - axis) / dvu
+    except Exception:
+        return None
+
+
+def _ea_rsi_value_confirmation(rows):
+    """Direção do RSI 14 + Value Chart usando somente candles fechados.
+
+    CALL: RSI toca/registra sobrevenda e vira para cima; Value Chart toca a
+    região extrema negativa e também vira para cima.
+    PUT: espelho na sobrecompra/região extrema positiva.
+    """
+    rows = list(rows or [])
+    need = max(EA_RSI_PERIOD + 2, EA_VALUE_CHART_PERIOD + 2)
     base = {
         "ready": False,
         "direction": "NEUTRO",
-        "renko_direction": "NEUTRO",
-        "renko_fresh_signal": False,
-        "renko_confidence": 0.0,
-        "reason": "Aguardando candles fechados para o Renko Hashi Pro.",
+        "rsi": None,
+        "rsi_prev": None,
+        "value_chart": None,
+        "value_chart_prev": None,
+        "rsi_direction": "NEUTRO",
+        "value_direction": "NEUTRO",
+        "reason": "Aguardando candles fechados para RSI e Value Chart.",
     }
-    if len(rows) < 18:
+    if len(rows) < need:
         return base
 
-    renko = heiken_ashi_arrows_strategy(rows, timeframe, market=market)
-    renko_fresh = bool(renko.get("confirmed") and renko.get("direction") in ("CALL", "PUT"))
-    renko_dir = str(renko.get("direction") or "NEUTRO").upper()
-    if renko_dir not in ("CALL", "PUT"):
-        diag = renko.get("diagnostics") or {}
-        locked = str(diag.get("last_locked_direction") or "NEUTRO").upper()
-        if locked in ("CALL", "PUT"):
-            renko_dir = locked
+    closes = [float(x["close"]) for x in rows]
+    r_now = rsi(closes, EA_RSI_PERIOD)
+    r_prev = rsi(closes[:-1], EA_RSI_PERIOD)
+    v_now = _value_chart_close(rows, EA_VALUE_CHART_PERIOD)
+    v_prev = _value_chart_close(rows[:-1], EA_VALUE_CHART_PERIOD)
+    if None in (r_now, r_prev, v_now, v_prev):
+        return base
 
-    renko_conf = float(renko.get("confidence") or 0.0)
-    if renko_dir in ("CALL", "PUT"):
-        freshness = "nova seta" if renko_fresh else "direção travada"
-        reason = f"Renko Hashi Pro ({freshness}) confirma {renko_dir}."
+    r_call = min(float(r_prev), float(r_now)) <= EA_RSI_OVERSOLD and float(r_now) > float(r_prev)
+    r_put = max(float(r_prev), float(r_now)) >= EA_RSI_OVERBOUGHT and float(r_now) < float(r_prev)
+    v_call = min(float(v_prev), float(v_now)) <= -EA_VALUE_CHART_EXTREME and float(v_now) > float(v_prev)
+    v_put = max(float(v_prev), float(v_now)) >= EA_VALUE_CHART_EXTREME and float(v_now) < float(v_prev)
+
+    r_dir = "CALL" if r_call else "PUT" if r_put else "NEUTRO"
+    v_dir = "CALL" if v_call else "PUT" if v_put else "NEUTRO"
+    direction = r_dir if r_dir == v_dir and r_dir in ("CALL", "PUT") else "NEUTRO"
+
+    if direction in ("CALL", "PUT"):
+        reason = (
+            f"RSI {r_now:.1f} e Value Chart {v_now:.2f} confirmaram {direction} "
+            "na mesma região de excesso."
+        )
+    elif r_dir == "NEUTRO" and v_dir == "NEUTRO":
+        reason = f"RSI {r_now:.1f} e Value Chart {v_now:.2f} ainda sem região/direção comum."
+    elif r_dir != v_dir:
+        reason = f"RSI aponta {r_dir}, mas Value Chart aponta {v_dir}."
     else:
-        reason = str(renko.get("reason") or "Renko Hashi Pro ainda está neutro.")
+        reason = f"RSI {r_dir} e Value Chart {v_dir} ainda não fecharam a mesma direção."
 
     base.update({
         "ready": True,
-        "direction": renko_dir if renko_dir in ("CALL", "PUT") else "NEUTRO",
-        "renko_direction": renko_dir,
-        "renko_fresh_signal": renko_fresh,
-        "renko_confidence": round(renko_conf, 1),
-        "renko": renko,
+        "direction": direction,
+        "rsi": round(float(r_now), 2),
+        "rsi_prev": round(float(r_prev), 2),
+        "value_chart": round(float(v_now), 3),
+        "value_chart_prev": round(float(v_prev), 3),
+        "rsi_direction": r_dir,
+        "value_direction": v_dir,
         "reason": reason,
+        "rsi_period": EA_RSI_PERIOD,
+        "rsi_oversold": EA_RSI_OVERSOLD,
+        "rsi_overbought": EA_RSI_OVERBOUGHT,
+        "value_chart_period": EA_VALUE_CHART_PERIOD,
+        "value_chart_extreme": EA_VALUE_CHART_EXTREME,
     })
     return base
-
-
-# Compatibilidade interna com versões anteriores; não usa RSI.
-def _ea_rsi_renko_confirmation(rows, timeframe="1min", market="OPEN"):
-    return _ea_renko_confirmation(rows, timeframe, market)
 
 
 def _rubik_heikin_ashi(rows):
@@ -7019,27 +7027,22 @@ def rubik_adapted_strategy(cs, timeframe="1min", market="OPEN"):
     """Estratégia própria inspirada no material educacional público da RubikTrade.
 
     NÃO é o algoritmo proprietário da RubikTrade. A adaptação para opções binárias
-    usa somente candles fechados. Na v3.50 o robô ficou menos preso: a tendência
-    EMA 9/21 continua obrigatória e bastam mais 2 confirmações entre Heikin-Ashi,
-    RSI 14 e MACD 12/26/9 (3 de 4 no total) para liberar a próxima vela.
+    usa somente candles fechados e exige confluência de Heikin-Ashi, tendência por
+    EMA 9/21, RSI 14 e MACD 12/26/9 para a próxima vela.
     """
     rows = list(cs or [])
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
     name = f"ROBÔ RUBIK ADAPTADO {tf_label}"
 
-    def neutral(reason, confidence=0.0, diagnostics=None):
-        out = {
+    def neutral(reason, confidence=0.0):
+        return {
             "available": True,
             "direction": "NEUTRO", "confidence": round(float(confidence or 0), 1),
             "confirmed": False, "risk": "HIGH", "strategy": name,
             "engine": "RUBIK_ADAPTED", "provider": "LOCAL_RUBIK_ADAPTED",
             "reason": reason, "rubik_inspired": True,
             "external_ai_disabled": True, "gale_signal": False, "non_repaint": True,
-            "confirmation_rule": "EMA + 2_DE_3",
         }
-        if diagnostics:
-            out["diagnostics"] = diagnostics
-        return out
 
     if len(rows) < 60:
         return neutral(f"Aguardando histórico fechado suficiente ({len(rows)}/60).")
@@ -7057,21 +7060,17 @@ def rubik_adapted_strategy(cs, timeframe="1min", market="OPEN"):
     lower_wick = (min(last_ha["open"], last_ha["close"]) - last_ha["low"]) / hrange
     upper_wick = (last_ha["high"] - max(last_ha["open"], last_ha["close"])) / hrange
 
-    # v3.50: Heikin-Ashi continua confirmando direção, mas sem exigir duas velas
-    # perfeitas e pavio quase zero. Isso aumenta oportunidades sem usar candle aberto.
-    prev_ha_call = prev_ha["close"] > prev_ha["open"]
-    prev_ha_put = prev_ha["close"] < prev_ha["open"]
     ha_call = bool(
         last_ha["close"] > last_ha["open"]
-        and hbody >= 0.28
-        and lower_wick <= 0.38
-        and (prev_ha_call or last_ha["close"] >= prev_ha["close"])
+        and prev_ha["close"] > prev_ha["open"]
+        and hbody >= 0.42
+        and lower_wick <= 0.18
     )
     ha_put = bool(
         last_ha["close"] < last_ha["open"]
-        and hbody >= 0.28
-        and upper_wick <= 0.38
-        and (prev_ha_put or last_ha["close"] <= prev_ha["close"])
+        and prev_ha["close"] < prev_ha["open"]
+        and hbody >= 0.42
+        and upper_wick <= 0.18
     )
 
     e9 = ema(closes, 9)
@@ -7080,104 +7079,52 @@ def rubik_adapted_strategy(cs, timeframe="1min", market="OPEN"):
     prev_e21 = ema(closes[:-1], 21)
     if None in (e9, e21, prev_e9, prev_e21):
         return neutral("Médias de tendência ainda sem dados suficientes.")
-
-    # EMA é a âncora obrigatória. Aceita pullback até a EMA 21 em vez de exigir
-    # fechamento sempre além da EMA 9 e alinhamento perfeito na vela anterior.
-    ema_call = bool(e9 > e21 and closes[-1] >= e21)
-    ema_put = bool(e9 < e21 and closes[-1] <= e21)
+    ema_call = bool(e9 > e21 and prev_e9 >= prev_e21 and closes[-1] >= e9)
+    ema_put = bool(e9 < e21 and prev_e9 <= prev_e21 and closes[-1] <= e9)
 
     r14 = rsi(closes, 14)
     r14_prev = rsi(closes[:-1], 14)
     if r14 is None or r14_prev is None:
         return neutral("RSI 14 ainda sem dados suficientes.")
-
-    # Faixas um pouco mais abertas para captar continuidade e retomada.
-    rsi_call = bool(
-        (47.0 <= r14 <= 75.0 and r14 > r14_prev)
-        or (r14_prev <= 40.0 and r14 >= r14_prev + 1.0)
-    )
-    rsi_put = bool(
-        (25.0 <= r14 <= 53.0 and r14 < r14_prev)
-        or (r14_prev >= 60.0 and r14 <= r14_prev - 1.0)
-    )
+    rsi_call = bool((50.0 <= r14 <= 72.0 and r14 >= r14_prev) or (r14_prev <= 36.0 and r14 >= r14_prev + 2.0))
+    rsi_put = bool((28.0 <= r14 <= 50.0 and r14 <= r14_prev) or (r14_prev >= 64.0 and r14 <= r14_prev - 2.0))
 
     macd = _rubik_macd_snapshot(closes)
     if not macd:
         return neutral("MACD ainda sem histórico suficiente.")
+    macd_call = bool(macd["line"] > macd["signal"] and macd["hist"] > 0)
+    macd_put = bool(macd["line"] < macd["signal"] and macd["hist"] < 0)
 
-    # Não exige que o histograma já esteja completamente do lado da operação:
-    # também aceita melhora consistente na mesma direção.
-    macd_call = bool(
-        macd["line"] > macd["signal"]
-        or (macd["hist"] > macd["prev_hist"] and macd["line"] > macd["prev_line"])
-    )
-    macd_put = bool(
-        macd["line"] < macd["signal"]
-        or (macd["hist"] < macd["prev_hist"] and macd["line"] < macd["prev_line"])
-    )
-
-    call_votes = int(ha_call) + int(ema_call) + int(rsi_call) + int(macd_call)
-    put_votes = int(ha_put) + int(ema_put) + int(rsi_put) + int(macd_put)
-
-    # Regra principal: EMA tem que concordar e, além dela, pelo menos 2 dos
-    # outros 3 motores precisam apontar o mesmo lado. Um único componente pode
-    # ficar neutro/discordar sem travar toda a EA.
-    call_ok = bool(ema_call and call_votes >= 3 and put_votes <= 1)
-    put_ok = bool(ema_put and put_votes >= 3 and call_votes <= 1)
-
-    diagnostics = {
-        "ha_call": bool(ha_call), "ha_put": bool(ha_put),
-        "ema_call": bool(ema_call), "ema_put": bool(ema_put),
-        "rsi_call": bool(rsi_call), "rsi_put": bool(rsi_put),
-        "macd_call": bool(macd_call), "macd_put": bool(macd_put),
-        "call_votes": call_votes, "put_votes": put_votes,
-        "rsi_14": round(float(r14), 2),
-        "confirmation_rule": "EMA + 2_DE_3",
-    }
-
+    call_ok = ha_call and ema_call and rsi_call and macd_call
+    put_ok = ha_put and ema_put and rsi_put and macd_put
     if call_ok == put_ok:
         ha_dir = "CALL" if ha_call else ("PUT" if ha_put else "NEUTRO")
         ema_dir = "CALL" if ema_call else ("PUT" if ema_put else "NEUTRO")
         rsi_dir = "CALL" if rsi_call else ("PUT" if rsi_put else "NEUTRO")
         macd_dir = "CALL" if macd_call else ("PUT" if macd_put else "NEUTRO")
         return neutral(
-            f"Aguardando 3 de 4 confirmações com EMA obrigatória • HA {ha_dir} • "
-            f"EMA {ema_dir} • RSI {rsi_dir} ({r14:.1f}) • MACD {macd_dir} • "
-            f"votos CALL {call_votes}/4 x PUT {put_votes}/4.",
-            56.0 + 3.0 * max(call_votes, put_votes),
-            diagnostics,
+            f"Aguardando confluência completa • HA {ha_dir} • EMA {ema_dir} • "
+            f"RSI {rsi_dir} ({r14:.1f}) • MACD {macd_dir}.",
+            58.0,
         )
 
     direction = "CALL" if call_ok else "PUT"
-    votes = call_votes if direction == "CALL" else put_votes
     breakout = (
         closes[-1] > max(highs[-6:-1]) if direction == "CALL"
         else closes[-1] < min(lows[-6:-1])
     )
     trend_sep = abs(float(e9) - float(e21)) / max(abs(closes[-1]), 1e-12) * 10000.0
     hist_strength = abs(float(macd["hist"])) / max(abs(closes[-1]), 1e-12) * 100000.0
-    base_conf = 69.0 if votes == 3 else 76.0
     confidence = clamp(
-        base_conf + min(6.0, hbody * 5.0) + min(4.0, trend_sep * 0.35)
-        + min(4.0, hist_strength * 0.16) + (3.0 if breakout else 0.0),
-        69.0, 92.0,
+        72.0 + min(7.0, hbody * 7.0) + min(5.0, trend_sep * 0.45)
+        + min(5.0, hist_strength * 0.22) + (4.0 if breakout else 0.0),
+        72.0, 93.0,
     )
-    risk = "LOW" if votes == 4 and breakout and hbody >= 0.52 else "MEDIUM"
-    confirmation_text = "4/4" if votes == 4 else "3/4"
+    risk = "LOW" if breakout and hbody >= 0.58 else "MEDIUM"
     reason = (
-        f"Rubik {direction} liberado com {confirmation_text} confirmações: EMA 9/21 obrigatória + "
-        f"{votes-1} confirmações entre Heikin-Ashi, RSI 14 e MACD 12/26/9"
-        + (" + rompimento recente." if breakout else ".")
+        f"Confluência {direction}: Heikin-Ashi forte + EMA 9/21 + RSI 14 {r14:.1f} + "
+        f"MACD 12/26/9 confirmados" + (" + rompimento recente." if breakout else ".")
     )
-    diagnostics.update({
-        "heikin_ashi": "CALL" if ha_call else ("PUT" if ha_put else "NEUTRO"),
-        "ema_9": round(float(e9), 8),
-        "ema_21": round(float(e21), 8),
-        "macd": round(float(macd["line"]), 8),
-        "macd_signal": round(float(macd["signal"]), 8),
-        "breakout": bool(breakout),
-        "votes_used": votes,
-    })
     return {
         "available": True,
         "direction": direction,
@@ -7192,31 +7139,38 @@ def rubik_adapted_strategy(cs, timeframe="1min", market="OPEN"):
         "external_ai_disabled": True,
         "gale_signal": False,
         "non_repaint": True,
-        "confirmation_rule": "EMA + 2_DE_3",
-        "diagnostics": diagnostics,
+        "diagnostics": {
+            "heikin_ashi": direction,
+            "ema_9": round(float(e9), 8),
+            "ema_21": round(float(e21), 8),
+            "rsi_14": round(float(r14), 2),
+            "macd": round(float(macd["line"]), 8),
+            "macd_signal": round(float(macd["signal"]), 8),
+            "breakout": bool(breakout),
+        },
     }
 
 
 async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
-    """EA dupla confirmação — XGBoost + Renko Hashi Pro.
+    """EA tripla confirmação — XGBoost + RSI 14 + Value Chart.
 
-    Usa somente candles fechados. CALL/PUT só é liberado quando XGBoost e
-    Renko Hashi Pro apontam o mesmo lado. OPEN e IQ OTC continuam com modelos separados.
+    Usa somente candles fechados. CALL/PUT só é liberado quando os três motores
+    apontam o mesmo lado. OPEN e IQ OTC continuam com modelos XGBoost separados.
     """
     rows = list(cs or [])
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"EA RENKO HASHI PRO + XGBOOST {tf_label}"
+    name = f"EA RSI + VALUE CHART + XGBOOST {tf_label}"
     if len(rows) < XGB_MIN_CANDLES:
         return {
             "available": bool(XGBOOST_OK and XGB_ENABLED),
             "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
-            "risk": "HIGH", "strategy": name, "engine": "EA_XGB_RENKO",
-            "provider": "XGBOOST_RENKO_HASHI_PRO",
+            "risk": "HIGH", "strategy": name, "engine": "EA_XGB_RSI_VALUE",
+            "provider": "XGBOOST_RSI_VALUE_CHART",
             "reason": f"Coletando candles para o XGBoost ({len(rows)}/{XGB_MIN_CANDLES}).",
-            "dual_confirmation": True,
+            "triple_confirmation": True,
         }
 
-    indicators = _ea_renko_confirmation(rows, timeframe, market)
+    indicators = _ea_rsi_value_confirmation(rows)
     try:
         xgb = await asyncio.to_thread(
             _xgb_train_or_predict, rows, symbol, timeframe, f"EA_{str(market or 'OPEN').upper()}"
@@ -7225,9 +7179,9 @@ async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
         return {
             "available": False, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "strategy": name,
-            "engine": "EA_XGB_RENKO", "provider": "XGBOOST_RENKO_HASHI_PRO",
+            "engine": "EA_XGB_RSI_VALUE", "provider": "XGBOOST_RSI_VALUE_CHART",
             "reason": f"XGBoost indisponível: {str(exc)[:180]}",
-            "dual_confirmation": True, "indicator_confirmation": indicators,
+            "triple_confirmation": True, "indicator_confirmation": indicators,
         }
 
     confidence = float(xgb.get("confidence") or 0.0)
@@ -7252,22 +7206,22 @@ async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
     elif not strong:
         reason = f"XGBoost sem vantagem suficiente ({confidence:.1f}%)."
     elif not indicators.get("ready"):
-        reason = str(indicators.get("reason") or "Renko Hashi Pro ainda não está pronto.")
+        reason = str(indicators.get("reason") or "RSI/Value Chart ainda não estão prontos.")
     elif indicator_direction == "NEUTRO":
         reason = (
-            f"XGBoost aponta {xgb_direction} {confidence:.1f}%, mas o Renko Hashi Pro ainda não confirmou: "
+            f"XGBoost aponta {xgb_direction} {confidence:.1f}%, mas RSI/Value Chart não concordaram: "
             f"{indicators.get('reason')}"
         )
     elif indicator_direction != xgb_direction:
         reason = (
-            f"Sem sinal: XGBoost aponta {xgb_direction}, enquanto Renko Hashi Pro aponta "
+            f"Sem sinal: XGBoost aponta {xgb_direction}, enquanto RSI + Value Chart apontam "
             f"{indicator_direction}."
         )
     else:
         reason = (
-            f"DUPLA CONFIRMAÇÃO {xgb_direction}: XGBoost {confidence:.1f}% • "
-            
-            f"Renko Hashi Pro {str(indicators.get('renko_direction') or 'NEUTRO')} • "
+            f"TRIPLA CONFIRMAÇÃO {xgb_direction}: XGBoost {confidence:.1f}% • "
+            f"RSI {float(indicators.get('rsi') or 0):.1f} • "
+            f"Value Chart {float(indicators.get('value_chart') or 0):.2f} • "
             f"validação XGBoost {validation:.1f}%."
         )
 
@@ -7284,12 +7238,12 @@ async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
         "confirmed": confirmed,
         "risk": risk,
         "strategy": name,
-        "engine": "EA_XGB_RENKO",
-        "provider": "XGBOOST_RENKO_HASHI_PRO",
+        "engine": "EA_XGB_RSI_VALUE",
+        "provider": "XGBOOST_RSI_VALUE_CHART",
         "reason": reason[:360],
         "xgboost": xgb,
         "indicator_confirmation": indicators,
-        "dual_confirmation": True,
+        "triple_confirmation": True,
         "external_ai_disabled": True,
         "gale_signal": False,
         "non_repaint": True,
@@ -8867,13 +8821,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
-    # Scalper PA sempre entra na vela imediatamente seguinte ao candle gatilho.
-    # Portanto este motor força o modo BIRTH e ignora MIDDLE/CLOSE.
-    if engine == "SCALPER":
-        entry_mode = "BIRTH"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "SCALPER"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
@@ -8905,9 +8855,41 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     if key in cache and time.time() - cache[key][0] < 1:
         return cache[key][1]
 
+    bigrise_pack = None
     try:
-        if engine == "EA":
-            # EA Renko Hashi Pro + XGBoost: OPEN usa o roteador normal (cTrader/multifuente);
+        if engine == "BIGRISE":
+            if market != "OPEN":
+                out = neutral_signal(
+                    symbol, interval, market,
+                    "BIGRISE • SOMENTE MERCADO ABERTO",
+                    "O BIGRISE usa a cesta sincronizada de 5 pares USD e também pode filtrar BTC/USD no mercado aberto.",
+                    source_state="READY",
+                )
+                out.update({
+                    "strategy": "BIGRISE • FORÇA USD", "mode": "BIGRISE_USD_BASKET",
+                    "selected_engine": engine, "non_repaint": True, "direct_win_only": True,
+                    "gale_signal": False,
+                })
+                cache[key] = (time.time(), out)
+                return out
+            if symbol not in BIGRISE_SIGNAL_SYMBOLS:
+                out = neutral_signal(
+                    symbol, interval, market,
+                    "BIGRISE • ATIVO NÃO SUPORTADO",
+                    "Este motor opera EUR/USD, GBP/USD, AUD/USD, USD/CAD, USD/CHF e BTC/USD.",
+                    source_state="READY",
+                )
+                out.update({
+                    "strategy": "BIGRISE • FORÇA USD", "mode": "BIGRISE_USD_BASKET",
+                    "selected_engine": engine, "non_repaint": True, "direct_win_only": True,
+                    "gale_signal": False,
+                })
+                cache[key] = (time.time(), out)
+                return out
+            bigrise_pack = await _bigrise_open_basket(interval, request=request, n=60)
+            raw = list((bigrise_pack.get("rows") or {}).get(symbol) or [])
+        elif engine == "EA":
+            # EA RSI + Value Chart + XGBoost: OPEN usa o roteador normal (cTrader/multifuente);
             # OTC usa exclusivamente candles reais da sessão IQ Option.
             request_n = max(170, XGB_MIN_CANDLES + 30)
             if market == "IQ_OTC":
@@ -8915,13 +8897,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     out = neutral_signal(
                         symbol, interval, market,
                         "EA XGBOOST • IQ OPTION OFFLINE",
-                        "Conecte a IQ Option para a EA Dupla analisar candles OTC reais.",
+                        "Conecte a IQ Option para a EA Tripla analisar candles OTC reais.",
                         source_state="WAITING",
                     )
                     out.update({
-                        "strategy": "EA RENKO HASHI PRO + XGBOOST", "mode": "EA_XGBOOST_AUTONOMOUS",
+                        "strategy": "EA RSI + VALUE CHART + XGBOOST", "mode": "EA_XGBOOST_AUTONOMOUS",
                         "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
-                        "dual_confirmation": True, "gale_signal": False,
+                        "triple_confirmation": True, "gale_signal": False,
                     })
                     cache[key] = (time.time(), out)
                     return out
@@ -8932,26 +8914,6 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 raw = await candles(
                     symbol, interval, request_n, "OPEN", None, request=request
                 )
-        elif engine == "SCALPER":
-            # Scalper PA: OPEN usa o roteador multifuente; OTC usa IQ Option real.
-            if market == "IQ_OTC":
-                if not iq_state:
-                    out = neutral_signal(
-                        symbol, interval, market,
-                        "SCALPER PA • IQ OPTION OFFLINE",
-                        "Conecte a IQ Option para este robô analisar OTC real.",
-                        source_state="WAITING",
-                    )
-                    out.update({
-                        "strategy": "SCALPER PA", "mode": "SCALPER_PA",
-                        "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
-                        "scalper_pa_adapted": True, "gale_signal": False,
-                    })
-                    cache[key] = (time.time(), out)
-                    return out
-                raw = await iq_ea_candles(iq_state, symbol, interval, 130, regular_market=False)
-            else:
-                raw = await candles(symbol, interval, 130, "OPEN", None, request=request)
         elif engine == "RUBIK":
             # Robô Rubik Adaptado: OPEN usa o roteador cTrader/multifuente; OTC usa IQ Option real.
             if market == "IQ_OTC":
@@ -8999,9 +8961,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         status = (
             ("EA XGBOOST • FONTE EM ESPERA" if market == "OPEN" else "EA XGBOOST • IQ OPTION EM ESPERA")
             if engine == "EA"
-            else (("SCALPER PA • FONTE EM ESPERA" if market == "OPEN" else "SCALPER PA • IQ OPTION EM ESPERA")
-                  if engine == "SCALPER"
-                  else (("ROBÔ RUBIK • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION EM ESPERA")
+            else (("ROBÔ RUBIK • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION EM ESPERA")
                   if engine == "RUBIK"
                   else ("EA FORÇA DO MOVIMENTO • IQ OPTION EM ESPERA"
                   if engine == "FORCE" and market == "IQ_OTC"
@@ -9009,8 +8969,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                       "MOTOR MULTIFONTE • TENTANDO FALLBACK"
                       if market == "OPEN" and exc.status_code in (429, 503)
                       else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL")
-                  ))))
+                  )))
         )
+        if engine == "BIGRISE":
+            status = "BIGRISE • CESTA USD EM ESPERA"
         out = neutral_signal(symbol, interval, market, status, exc.detail, source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
@@ -9018,14 +8980,14 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         status = (
             ("EA XGBOOST • FONTE RECONECTANDO" if market == "OPEN" else "EA XGBOOST • IQ OPTION RECONECTANDO")
             if engine == "EA"
-            else (("SCALPER PA • FONTE RECONECTANDO" if market == "OPEN" else "SCALPER PA • IQ OPTION RECONECTANDO")
-                  if engine == "SCALPER"
-                  else (("ROBÔ RUBIK • FONTE RECONECTANDO" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION RECONECTANDO")
+            else (("ROBÔ RUBIK • FONTE RECONECTANDO" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION RECONECTANDO")
                   if engine == "RUBIK"
                   else ("EA FORÇA DO MOVIMENTO • IQ OPTION RECONECTANDO"
                   if engine == "FORCE" and market == "IQ_OTC"
-                  else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL"))))
+                  else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL")))
         )
+        if engine == "BIGRISE":
+            status = "BIGRISE • FONTES DA CESTA RECONECTANDO"
         out = neutral_signal(symbol, interval, market, status, str(exc), source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
@@ -9071,22 +9033,22 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "INTELIGÊNCIA ARTIFICIAL"
             engine_mode = "PURE_AI"
         elif engine == "EA":
-            engine_title = "EA RENKO HASHI PRO + XGBOOST"
+            engine_title = "EA RSI + VALUE CHART + XGBOOST"
             engine_mode = "EA_XGBOOST_AUTONOMOUS"
-        elif engine == "SCALPER":
-            engine_title = "SCALPER PA"
-            engine_mode = "SCALPER_PA"
         elif engine == "RUBIK":
             engine_title = "ROBÔ RUBIK ADAPTADO"
             engine_mode = "RUBIK_ADAPTED"
         elif engine == "FORCE":
             engine_title = "EA FORÇA DO MOVIMENTO"
             engine_mode = "EA_FORCE_MOVEMENT"
+        elif engine == "BIGRISE":
+            engine_title = "BIGRISE • FORÇA USD"
+            engine_mode = "BIGRISE_USD_BASKET"
         else:
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "SCALPER"):
+        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -9101,7 +9063,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
-                    else ({"dual_confirmation": True, "inputs": ["RENKO_HASHI_PRO", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"scalper_pa_adapted": True, "inputs": ["PRICE_ACTION", "MACD", "CCI_14", "RSI_14"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"], "closed_candles_only": True} if engine == "SCALPER" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})))
+                    else ({"triple_confirmation": True, "inputs": ["RSI_14", "VALUE_CHART", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]}))
                 ),
                 "legacy_ai_disabled": engine != "SMART",
                 "legacy_technical_strategies_disabled": True,
@@ -9113,7 +9075,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine == "RUBIK" else (closed[-130:] if len(closed) > 130 else closed)))
+            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine == "RUBIK" else (closed[-60:] if engine == "BIGRISE" else (closed[-90:] if len(closed) > 90 else closed))))
             if engine == "SMART":
                 moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
                 analysis = await openai_direct_signal(
@@ -9123,10 +9085,16 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis = await ea_xgboost_strategy(
                     engine_closed, symbol, interval, market=market
                 )
-            elif engine == "SCALPER":
-                analysis = scalper_pa_strategy(engine_closed, interval, market=market)
             elif engine == "RUBIK":
                 analysis = rubik_adapted_strategy(engine_closed, interval, market=market)
+            elif engine == "BIGRISE":
+                basket_closed = {}
+                for basket_symbol, basket_raw in ((bigrise_pack or {}).get("rows") or {}).items():
+                    basket_closed[basket_symbol] = list(basket_raw[:-1] if len(basket_raw) > 1 else basket_raw)
+                analysis = bigrise_usd_strength_strategy(
+                    basket_closed, symbol, timeframe=interval,
+                    source_map=((bigrise_pack or {}).get("sources") or {}),
+                )
             elif engine == "FORCE":
                 if market == "OPEN":
                     # Multibroker OPEN: HTFs vêm do roteador público, sem login da IQ.
@@ -9176,16 +9144,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "SCALPER") and analysis.get("confirmed")),
-            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RENKO_HASHI_PRO" if engine == "EA" else ("LOCAL_SCALPER_PA" if engine == "SCALPER" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else "DISABLED")))),
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK") else "HIGH").upper(),
+            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE") and analysis.get("confirmed")),
+            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RSI_VALUE_CHART" if engine == "EA" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else ("LOCAL_BIGRISE_BASKET" if engine == "BIGRISE" else "DISABLED")))),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
-                else (analysis.get("strategy", "EA RENKO HASHI PRO + XGBOOST") if engine == "EA"
-                      else (analysis.get("strategy", "SCALPER PA") if engine == "SCALPER"
+                else (analysis.get("strategy", "EA RSI + VALUE CHART + XGBOOST") if engine == "EA"
                       else (analysis.get("strategy", "ROBÔ RUBIK ADAPTADO") if engine == "RUBIK"
                             else (analysis.get("strategy", "EA Força do Movimento") if engine == "FORCE"
-                                  else analysis.get("strategy", f"{engine_title} {tf_label}")))))
+                                  else analysis.get("strategy", f"{engine_title} {tf_label}"))))
             ),
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
@@ -9260,9 +9227,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             fingerprint_key = (
                 "pure_ai_fingerprint" if engine == "SMART"
                 else ("ea_fingerprint" if engine == "EA"
-                      else ("scalper_fingerprint" if engine == "SCALPER"
                       else ("rubik_fingerprint" if engine == "RUBIK"
-                            else ("force_fingerprint" if engine == "FORCE" else "graph_ai_fingerprint"))))
+                            else ("force_fingerprint" if engine == "FORCE"
+                                  else ("bigrise_fingerprint" if engine == "BIGRISE" else "graph_ai_fingerprint"))))
             )
             if release_state.get(fingerprint_key) != signal_fingerprint:
                 # v3.6: SOMENTE a IA GRÁFICA tem intervalo mínimo de 4 minutos
@@ -9294,7 +9261,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 )
                 base.update({
                     "direction": direction_now,
-                    "status": (smart_status if engine == "SMART" else ("SINAL DUPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL SCALPER PA LIBERADO" if engine == "SCALPER" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))))),
+                    "status": (smart_status if engine == "SMART" else ("SINAL TRIPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else ("SINAL BIGRISE • FORÇA USD LIBERADO" if engine == "BIGRISE" else "SINAL IA GRÁFICA LIBERADO"))))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -9311,10 +9278,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # 3.22: o histórico recente pode tornar o filtro mais seletivo.
                 # Só atua depois da amostra mínima e nunca altera candles/regras
                 # originais do motor; apenas barra setups estatisticamente fracos.
-                # Na EA Renko Hashi Pro + XGBoost, a entrada exige a dupla confirmação.
-                # O aprendizado adaptativo extra permanece disponível para os outros motores.
+                # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
+                # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("EA", "RUBIK", "SCALPER"):
+                if engine not in ("EA", "RUBIK", "BIGRISE"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -12265,11 +12232,11 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
             "reason": "Mais flexível em cenários mistos, desde que o preço não esteja excessivamente lateral e a IA externa esteja disponível."
         },
         {
-            "key":"EA","name":"EA RENKO HASHI PRO + XGBOOST","score":autonomous,
+            "key":"EA","name":"EA RSI + VALUE CHART + XGBOOST","score":autonomous,
             "supported":True,"operational":bool(market=="OPEN" or iq_ready),
-            "reason": ("Renko Hashi Pro + XGBoost usam candles do mercado aberto e não exigem login da IQ Option."
+            "reason": ("RSI + Value Chart + XGBoost usam candles do mercado aberto e não exigem login da IQ Option."
                        if market=="OPEN" else
-                       "Renko Hashi Pro + XGBoost usam candles OTC reais; no OTC exigem conexão ativa com a IQ Option.")
+                       "RSI + Value Chart + XGBoost usam candles OTC reais; no OTC exigem conexão ativa com a IQ Option.")
         },
         {
             "key":"FORCE","name":"EA FORÇA DO MOVIMENTO","score":force,
@@ -12363,87 +12330,6 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
     }
 
 
-
-@app.get("/indicator-heiken")
-async def indicator_heiken(
-    request: Request,
-    symbol: str = "EUR/USD",
-    interval: str = "1min",
-    market: str = "OPEN",
-):
-    market = (market or "OPEN").upper()
-    if not _symbol_allowed(symbol, market) or interval not in INTERVALS or market not in VALID_MARKETS:
-        raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
-
-    iq_state = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
-    if market == "IQ_OTC" and not iq_state:
-        return {
-            "ok": True,
-            "available": False,
-            "direction": "NEUTRO",
-            "confidence": 0,
-            "confirmed": False,
-            "risk": "HIGH",
-            "strategy": f"RENKO HASHI PRO {interval}",
-            "reason": "Conecte a IQ Option para analisar o OTC real.",
-            "status": "RENKO HASHI PRO • IQ OPTION OFFLINE",
-            "non_repaint": True,
-            "closed_candles_only": True,
-            "market": market,
-            "symbol": symbol,
-            "interval": interval,
-        }
-
-    try:
-        if market == "IQ_OTC":
-            raw = await iq_ea_candles(iq_state, symbol, interval, 100, regular_market=False)
-            feed_source = "IQ_OPTION_OTC"
-            feed_label = "IQ Option OTC"
-        else:
-            raw = await candles(symbol, interval, 100, "OPEN", None, request=request)
-            info = _current_open_feed_info(symbol, interval)
-            feed_source = str(info.get("source") or _feed_source_from_rows(raw) or "MULTIFEED")
-            feed_label = _feed_source_label(feed_source)
-
-        # O último item da fonte pode ser a vela ainda em formação.
-        # O indicador usa SOMENTE candles fechados para não repintar.
-        closed = list(raw[:-1] if len(raw) > 1 else raw)
-        analysis = heiken_ashi_arrows_strategy(closed, interval, market=market)
-        return {
-            "ok": True,
-            **analysis,
-            "status": (
-                f"RENKO HASHI PRO • {analysis.get('direction')} CONFIRMADO"
-                if analysis.get("confirmed") and analysis.get("direction") in ("CALL", "PUT")
-                else "RENKO HASHI PRO • MONITORANDO"
-            ),
-            "market": market,
-            "symbol": symbol,
-            "interval": interval,
-            "feed_source": feed_source,
-            "feed_label": feed_label,
-            "updated_at": iso(now()),
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        return {
-            "ok": False,
-            "available": False,
-            "direction": "NEUTRO",
-            "confidence": 0,
-            "confirmed": False,
-            "risk": "HIGH",
-            "strategy": f"RENKO HASHI PRO {interval}",
-            "reason": str(exc)[:220],
-            "status": "RENKO HASHI PRO • FONTE EM ESPERA",
-            "non_repaint": True,
-            "closed_candles_only": True,
-            "market": market,
-            "symbol": symbol,
-            "interval": interval,
-        }
-
 @app.get("/signal-ai")
 async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH"):
     requested_market = (market or "OPEN").upper()
@@ -12454,11 +12340,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "SCALPER"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK ou SCALPER.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK ou BIGRISE.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("EA", "FORCE", "RUBIK", "SCALPER"):
+    if engine in ("EA", "FORCE", "RUBIK", "BIGRISE"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -12487,25 +12373,12 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = feed_src
                     data["feed_label"] = _feed_source_label(feed_src)
                     data["feed_fallback"] = bool(feed_info.get("fallback"))
-                    data["feed_message"] = "EA Dupla usando candles do mercado aberto via roteador cTrader/multifuente."
+                    data["feed_message"] = "EA Tripla usando candles do mercado aberto via roteador cTrader/multifuente."
                 else:
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                    data["feed_message"] = "EA Dupla usando candles OTC reais da sessão IQ Option."
-            elif engine == "SCALPER":
-                if requested_market == "OPEN":
-                    feed_info = _current_open_feed_info(symbol, interval)
-                    feed_src = str(feed_info.get("source") or "MULTIFEED")
-                    data["feed_source"] = feed_src
-                    data["feed_label"] = _feed_source_label(feed_src)
-                    data["feed_fallback"] = bool(feed_info.get("fallback"))
-                    data["feed_message"] = "Scalper PA usando candles fechados do mercado aberto via roteador multifuente."
-                else:
-                    data["feed_source"] = "IQ_OPTION_OTC"
-                    data["feed_label"] = _feed_source_label(data["feed_source"])
-                    data["feed_fallback"] = False
-                    data["feed_message"] = "Scalper PA usando candles OTC reais da sessão IQ Option."
+                    data["feed_message"] = "EA Tripla usando candles OTC reais da sessão IQ Option."
             elif engine == "RUBIK":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -12524,6 +12397,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                 data["feed_label"] = _feed_source_label(data["feed_source"])
                 data["feed_fallback"] = False
                 data["feed_message"] = "EA Força do Movimento lendo candles OTC diretamente da IQ Option."
+            elif engine == "BIGRISE":
+                data["feed_source"] = "BIGRISE_USD_BASKET"
+                data["feed_label"] = "Cesta USD 5/5 + BTC"
+                data["feed_fallback"] = False
+                data["feed_message"] = "BIGRISE sincroniza cinco pares USD fechados e, no BTC/USD, exige confirmação própria de vela, EMA 9/21 e ATR; cTrader é preferida e Yahoo público é fallback."
             elif requested_market == "OPEN":
                 feed_info = _current_open_feed_info(symbol, interval)
                 feed_src = str(feed_info.get("source") or _feed_source_from_rows([]) or "MULTIFEED")
@@ -12943,7 +12821,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "SCALPER"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -12954,19 +12832,27 @@ async def pre_signals(
         if not _symbol_allowed(symbol, market):
             raise HTTPException(400, "Ativo inválido para pré-alerta.")
 
+    if engine == "BIGRISE":
+        return {
+            "ok": True,
+            "message": "BIGRISE usa candles fechados da cesta USD e do BTC/USD; não antecipa sinal na vela em formação para evitar repaint.",
+            "items": [],
+            "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
+        }
+
     requested_market = market
     iq_state = (
         _iq_session_state(request, required=False)
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "SCALPER")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE")
     if fallback_twelve:
         market = "OPEN"
-    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "SCALPER") and not iq_state:
+    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK") and not iq_state:
         return {
             "ok": True,
-            "message": ("EA Dupla OTC aguardando conexão com a IQ Option." if engine == "EA" else ("Scalper PA OTC aguardando conexão com a IQ Option." if engine == "SCALPER" else "Robô Rubik Adaptado OTC aguardando conexão com a IQ Option.")),
+            "message": ("EA Tripla OTC aguardando conexão com a IQ Option." if engine == "EA" else "Robô Rubik Adaptado OTC aguardando conexão com a IQ Option."),
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -13026,8 +12912,8 @@ async def pre_signals(
     for symbol in batch:
         key = f"{group_key}|{symbol}"
         try:
-            pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (130 if engine == "SCALPER" else (120 if engine == "RUBIK" else 90)))
-            if engine in ("EA", "RUBIK", "SCALPER") and requested_market == "IQ_OTC":
+            pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (120 if engine == "RUBIK" else 90))
+            if engine in ("EA", "RUBIK") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
                 )
@@ -13045,23 +12931,10 @@ async def pre_signals(
                     {
                         "direction": xgb_preview.get("direction"),
                         "confidence": xgb_preview.get("confidence", 0),
-                        "strategy": xgb_preview.get("strategy", "EA RENKO HASHI PRO + XGBOOST"),
+                        "strategy": xgb_preview.get("strategy", "EA RSI + VALUE CHART + XGBOOST"),
                         "reason": xgb_preview.get("reason", "XGBoost monitorando."),
                     }
                     if xgb_preview.get("confirmed") and xgb_preview.get("direction") in ("CALL", "PUT")
-                    else None
-                )
-            elif engine == "SCALPER":
-                scalper_rows = raw[:-1] if len(raw) > 1 else raw
-                scalper_preview = scalper_pa_strategy(scalper_rows, interval, market=requested_market)
-                preview = (
-                    {
-                        "direction": scalper_preview.get("direction"),
-                        "confidence": scalper_preview.get("confidence", 0),
-                        "strategy": scalper_preview.get("strategy", "SCALPER PA"),
-                        "reason": scalper_preview.get("reason", "Scalper PA monitorando."),
-                    }
-                    if scalper_preview.get("confirmed") and scalper_preview.get("direction") in ("CALL", "PUT")
                     else None
                 )
             elif engine == "RUBIK":
@@ -13402,12 +13275,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "SCALPER"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK ou SCALPER.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK ou BIGRISE.")
 
     requested_market = market
-    iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine in ("EA", "SCALPER") and requested_market == "IQ_OTC")) else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "SCALPER")
+    iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE")
     if fallback_twelve:
         market = "OPEN"
 
@@ -13460,19 +13333,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             radar_n = max(170, XGB_MIN_CANDLES + 30)
             if market == "IQ_OTC":
                 if not iq_state:
-                    raise RuntimeError("Conecte a IQ Option para a EA Dupla analisar OTC.")
+                    raise RuntimeError("Conecte a IQ Option para a EA Tripla analisar OTC.")
                 raw = await iq_ea_candles(
                     iq_state, sym, interval, radar_n, regular_market=False
                 )
             else:
                 raw = await candles(sym, interval, radar_n, "OPEN", None, request=request)
-        elif engine == "SCALPER":
-            if market == "IQ_OTC":
-                if not iq_state:
-                    raise RuntimeError("Conecte a IQ Option para o Scalper PA analisar OTC.")
-                raw = await iq_ea_candles(iq_state, sym, interval, 130, regular_market=False)
-            else:
-                raw = await candles(sym, interval, 130, "OPEN", None, request=request)
         elif engine == "RUBIK":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -13492,19 +13358,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             closed = raw[:-1] if len(raw) > 1 else raw
             if engine == "EA":
                 tech = await ea_xgboost_strategy(closed, sym, interval, market=market)
-                engine_label = "EA RENKO HASHI PRO + XGBOOST"
+                engine_label = "EA RSI + VALUE CHART + XGBOOST"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why = str(tech.get("reason") or "XGBoost monitorando").replace("\n", " ")[:88]
-                status_text = (
-                    f"{engine_label} • OPORTUNIDADE ENCONTRADA"
-                    if direction != "NEUTRO"
-                    else f"{engine_label} • MONITORANDO • {why}"
-                )
-            elif engine == "SCALPER":
-                tech = scalper_pa_strategy(closed, interval, market=market)
-                engine_label = "SCALPER PA"
-                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why = str(tech.get("reason") or "Scalper PA monitorando").replace("\n", " ")[:88]
                 status_text = (
                     f"{engine_label} • OPORTUNIDADE ENCONTRADA"
                     if direction != "NEUTRO"
@@ -13575,12 +13431,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if (engine in ("EA", "RUBIK", "SCALPER") or (engine == "FORCE" and market == "IQ_OTC"))
+                    status_text if (engine in ("EA", "RUBIK") or (engine == "FORCE" and market == "IQ_OTC"))
                     else (((_feed_source_label(_feed_source_from_rows(raw)) + " • " + status_text) if market == "OPEN" else status_text))
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "SCALPER") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
+                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
@@ -13636,7 +13492,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "SCALPER") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
+            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -13999,7 +13855,7 @@ async def result(
     - LOSS/empate no G1 => aguarda G2.
     - WIN no G2 => WIN G2; caso contrário => LOSS G2.
 
-    ``direct_only=true`` fecha somente a primeira vela. EA Dupla e EA Força
+    ``direct_only=true`` fecha somente a primeira vela. EA Tripla, EA Força e BIGRISE
     usam esse modo; os demais motores podem acompanhar G1/G2.
     """
     if not expiry_time:
@@ -14008,7 +13864,7 @@ async def result(
     market = (market or "OPEN").upper()
     direction = (direction or "CALL").upper()
     engine = str(engine or "").upper()
-    # EA Dupla usa multifuente no OPEN e IQ somente no OTC.
+    # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
     ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK")
 
@@ -14046,7 +13902,7 @@ async def result(
         }
 
     # Apura na mesma família de fonte do sinal:
-    # EA Dupla OPEN -> cache/roteador multifuente; EA/FORCE OTC -> IQ Option.
+    # EA Tripla OPEN -> cache/roteador multifuente; EA/FORCE OTC -> IQ Option.
     # Os outros motores preservam a apuração existente.
     cs = (
         []
@@ -14345,7 +14201,7 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=123">
+<link rel="manifest" href="/manifest.webmanifest?v=76">
 <link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=76">
 <link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=76">
 <meta name="theme-color" content="#07182b">
@@ -14415,7 +14271,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .robot-mode-copy{min-width:150px}
 .robot-mode-title{font-weight:900;font-size:13px;letter-spacing:.4px}
 .robot-mode-desc{font-size:11px;color:#9fb2ca;margin-top:3px;max-width:245px}
-#robotPowerBtn,#aiPowerBtn,#eaPowerBtn,#rubikPowerBtn,#forcePowerBtn,#scalperPowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+#robotPowerBtn,#aiPowerBtn,#eaPowerBtn,#rubikPowerBtn,#forcePowerBtn,#bigrisePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
 
 .daily-engine-board{margin-top:14px;border-color:#1c82c9;background:linear-gradient(180deg,#0b1b2e,#071321);box-shadow:0 0 24px #00aaff22}
 .daily-engine-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
@@ -14572,8 +14428,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="robot-mode-card" id="eaModeCard">
     <img src="__MEGA_IMAGE__" alt="EA para opções binárias">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">⚡ EA RENKO HASHI PRO + XGBOOST</div>
-      <div class="robot-mode-desc" id="eaModeDesc">Renko Hashi Pro + XGBoost • OPEN + OTC IQ • sinal somente quando os 2 concordam.</div>
+      <div class="robot-mode-title">⚡ EA RSI + VALUE CHART + XGBOOST</div>
+      <div class="robot-mode-desc" id="eaModeDesc">RSI 14 + Value Chart + XGBoost • OPEN + OTC IQ • sinal somente quando os 3 concordam.</div>
     </div>
     <button id="eaPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -14582,18 +14438,9 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Robô Rubik Adaptado">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧩 ROBÔ RUBIK ADAPTADO</div>
-      <div class="robot-mode-desc" id="rubikModeDesc">Heikin-Ashi + EMA 9/21 + RSI 14 + MACD 12/26/9 • EMA obrigatória + 2 de 3 confirmações • OPEN + OTC IQ • próxima vela.</div>
+      <div class="robot-mode-desc" id="rubikModeDesc">Heikin-Ashi + EMA 9/21 + RSI 14 + MACD 12/26/9 • OPEN + OTC IQ • próxima vela • sem repaint.</div>
     </div>
     <button id="rubikPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-  <div class="robot-mode-card" id="scalperModeCard">
-    <img src="__MEGA_IMAGE__" alt="Scalper PA">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🧭 SCALPER PA</div>
-      <div class="robot-mode-desc" id="scalperModeDesc">Price Action + MACD + CCI + RSI • M1 com MACD 8/17/6 • pontuação por confluência • vela fechada • sem repaint • próxima vela.</div>
-    </div>
-    <button id="scalperPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
   <div class="robot-mode-card" id="forceModeCard">
@@ -14603,6 +14450,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-desc" id="forceModeDesc">Configuração protegida • leitura de força do movimento • candles fechados • sem Gale.</div>
     </div>
     <button id="forcePowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
+  <div class="robot-mode-card" id="bigriseModeCard">
+    <img src="__MEGA_IMAGE__" alt="BigRise Força USD">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">🌐 BIGRISE • FORÇA USD</div>
+      <div class="robot-mode-desc" id="bigriseModeDesc">5 pares USD + BTC/USD • força normalizada • tendência BTC • candle fechado • OPEN • sem grid e sem Gale.</div>
+    </div>
+    <button id="bigrisePowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
   <div class="tabs">
@@ -15153,8 +15009,8 @@ const rubikPowerBtn=document.getElementById('rubikPowerBtn');
 const rubikModeDesc=document.getElementById('rubikModeDesc');
 const forcePowerBtn=document.getElementById('forcePowerBtn');
 const forceModeDesc=document.getElementById('forceModeDesc');
-const scalperPowerBtn=document.getElementById('scalperPowerBtn');
-const scalperModeDesc=document.getElementById('scalperModeDesc');
+const bigrisePowerBtn=document.getElementById('bigrisePowerBtn');
+const bigriseModeDesc=document.getElementById('bigriseModeDesc');
 const voiceBtn=document.getElementById('voiceBtn');
 const btcOnlyBtn=document.getElementById('btcOnlyBtn');
 const btcOnlyNote=document.getElementById('btcOnlyNote');
@@ -15176,22 +15032,22 @@ let aiEnabled=false;
 let eaEnabled=false;
 let rubikEnabled=false;
 let forceEnabled=false;
-let scalperEnabled=false;
+let bigriseEnabled=false;
 try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
   aiEnabled=localStorage.getItem('mega_ai_power')==='ONLINE';
   eaEnabled=localStorage.getItem('mega_ea_power')==='ONLINE';
   rubikEnabled=localStorage.getItem('mega_rubik_power')==='ONLINE';
   forceEnabled=localStorage.getItem('mega_force_power')==='ONLINE';
-  scalperEnabled=localStorage.getItem('mega_scalper_power')==='ONLINE';
-  if(scalperEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
-  else if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; scalperEnabled=false; }
-  else if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; scalperEnabled=false; }
-  else if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; }
+  bigriseEnabled=localStorage.getItem('mega_bigrise_power')==='ONLINE';
+  if(bigriseEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
+  else if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; }
+  else if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; bigriseEnabled=false; }
+  else if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; bigriseEnabled=false; }
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
-  if(scalperEnabled) return 'SCALPER';
+  if(bigriseEnabled) return 'BIGRISE';
   if(forceEnabled) return 'FORCE';
   if(rubikEnabled) return 'RUBIK';
   if(eaEnabled) return 'EA';
@@ -16034,8 +15890,7 @@ function normalizeEngineKey(value){
   if(e==='SMART' || e==='AI' || e==='IA') return 'SMART';
   if(e==='EA' || e==='EA_AUTONOMOUS_IQ' || e==='EA_XGBOOST' || e==='EA_XGBOOST_AUTONOMOUS') return 'EA';
   if(e==='FORCE' || e==='EA_FORCE_MOVEMENT') return 'FORCE';
-  if(e==='SCALPER' || e==='SCALPER_PA') return 'SCALPER';
-  if(e==='RUBIK' || e==='RUBIK_ADAPTED') return 'RUBIK';
+  if(e==='BIGRISE' || e==='BIGRISE_USD_BASKET') return 'BIGRISE';
   return '';
 }
 
@@ -16048,10 +15903,10 @@ function momentStudyEngineName(key){
   const names={
     GRAPH_AI:'🧠 IA GRÁFICA',
     SMART:'🤖 INTELIGÊNCIA ARTIFICIAL',
-    EA:'⚡ EA RENKO HASHI PRO + XGBOOST',
+    EA:'⚡ EA RSI + VALUE CHART + XGBOOST',
     RUBIK:'🧩 ROBÔ RUBIK ADAPTADO',
     FORCE:'💥 EA FORÇA DO MOVIMENTO',
-    SCALPER:'🧭 SCALPER PA'
+    BIGRISE:'🌐 BIGRISE • FORÇA USD'
   };
   return names[String(key||'').toUpperCase()]||String(key||'MOTOR');
 }
@@ -16342,10 +16197,10 @@ function rememberPendingTrade(sig){
   if(!sig.expiry_time || !sig.entry_time) return;
 
   const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
-  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='SCALPER'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('SCALPER_PA'));
+  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
-    // EA Dupla e EA Força são apurados na primeira vela; outros motores preservam G1/G2.
+    // EA Tripla e EA Força são apurados na primeira vela; outros motores preservam G1/G2.
     direct_only:isDirectEa,
     market:signalResultMarket(sig),
     requested_market:sig.requested_market || (market&&market.value) || 'OPEN',
@@ -16359,7 +16214,7 @@ function rememberPendingTrade(sig){
     confidence:Number(sig.confidence||0),
     risk:String(sig.risk||''),
     strategy:String(sig.strategy||''),
-    engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('SCALPER_PA')?'SCALPER':String(sig.selected_engine||sig.mode||'')))),
+    engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('BIGRISE')?'BIGRISE':String(sig.selected_engine||sig.mode||'')))),
     entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH')),
     value_stake:currentValueStake(),
     value_payout:currentValuePayout(),
@@ -17750,7 +17605,6 @@ function showTab(which){
   tabTelegram.classList.toggle('active',telegram);
   tabAccount.classList.toggle('active',account);
 
-
   if(chart){
     loadChart();
     setTimeout(resizeChart,50);
@@ -18400,11 +18254,12 @@ function applyRobotPowerState(){
     forcePowerBtn.style.color='#fff';
     forcePowerBtn.style.borderColor=forceEnabled?'#16c56b':'#ff5252';
   }
-  if(scalperPowerBtn){
-    scalperPowerBtn.textContent=scalperEnabled?'🟢 ONLINE':'🔴 OFFLINE';
-    scalperPowerBtn.style.background=scalperEnabled?'#0b7a3d':'#7d1d1d';
-    scalperPowerBtn.style.color='#fff';
-    scalperPowerBtn.style.borderColor=scalperEnabled?'#16c56b':'#ff5252';
+
+  if(bigrisePowerBtn){
+    bigrisePowerBtn.textContent=bigriseEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    bigrisePowerBtn.style.background=bigriseEnabled?'#0b7a3d':'#7d1d1d';
+    bigrisePowerBtn.style.color='#fff';
+    bigrisePowerBtn.style.borderColor=bigriseEnabled?'#16c56b':'#ff5252';
   }
 
   if(robotModeDesc) robotModeDesc.textContent=robotEnabled
@@ -18414,23 +18269,23 @@ function applyRobotPowerState(){
     ? 'ONLINE: IA pura analisando somente candles e contexto de preço, sem indicadores.'
     : 'OFFLINE: análise inteligente pausada.';
   if(eaModeDesc) eaModeDesc.textContent=eaEnabled
-    ? 'ONLINE: Renko Hashi Pro + XGBoost • sinal somente com dupla confirmação • OPEN/OTC.'
-    : 'OFFLINE: EA Renko Hashi Pro + XGBoost pausada.';
+    ? 'ONLINE: RSI 14 + Value Chart + XGBoost • sinal somente com tripla confirmação • OPEN/OTC.'
+    : 'OFFLINE: EA RSI + Value Chart + XGBoost pausada.';
   if(rubikModeDesc) rubikModeDesc.textContent=rubikEnabled
-    ? 'ONLINE: Rubik mais ativo • EMA 9/21 obrigatória + 2 de 3 entre Heikin-Ashi, RSI e MACD • OPEN/OTC.'
+    ? 'ONLINE: Heikin-Ashi + EMA 9/21 + RSI 14 + MACD • OPEN/OTC • próxima vela.'
     : 'OFFLINE: Robô Rubik Adaptado pausado.';
   if(forceModeDesc) forceModeDesc.textContent=forceEnabled
     ? 'ONLINE: OPEN multifuente para qualquer corretora Forex • OTC pela IQ Option • configuração protegida • sem Gale.'
     : 'OFFLINE: EA Força do Movimento pausado • configuração protegida.';
-  if(scalperModeDesc) scalperModeDesc.textContent=scalperEnabled
-    ? 'ONLINE: Scalper PA • Price Action + MACD + CCI + RSI • M1 mais rápido • pontuação por confluência • sem repaint • OPEN/OTC.'
-    : 'OFFLINE: Scalper PA pausado.';
+  if(bigriseModeDesc) bigriseModeDesc.textContent=bigriseEnabled
+    ? 'ONLINE: cesta USD 5/5 + BTC/USD • BTC confirma vela + EMA 9/21 + ATR • candle fechado • somente OPEN • sem grid/Gale.'
+    : 'OFFLINE: BIGRISE • Força USD pausado.';
 
   const engine=selectedRobotEngine();
-  if(engine==='SCALPER'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='SCALPER PA ONLINE • SEM REPAINT • VELA FECHADA • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Scalper PA • Price Action + MACD + CCI + RSI por pontuação • somente vela fechada.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar Scalper PA ativo • PA + MACD + CCI + RSI • candles fechados • OPEN/OTC</div>';
+  if(engine==='BIGRISE'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='BIGRISE • FORÇA USD ONLINE • CESTA 5/5 + BTC/USD • CANDLES FECHADOS';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🌐 BIGRISE selecionado • cesta USD 5/5 + BTC/USD com confirmação própria • sem pré-sinal para não repintar.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar BIGRISE ativo • procurando o par dominante da cesta USD e confirmação em BTC/USD</div>';
     rad();
   }else if(engine==='FORCE'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA FORÇA DO MOVIMENTO ONLINE • CONFIGURAÇÃO PROTEGIDA • FOCO EM WIN DIRETO';
@@ -18438,14 +18293,14 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar do EA Força do Movimento ativo • OPEN multifuente / OTC pela IQ Option</div>';
     rad();
   }else if(engine==='RUBIK'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔ RUBIK ADAPTADO ONLINE • MODO MAIS ATIVO • EMA + 2 DE 3 CONFIRMAÇÕES • OPEN + OTC';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔ RUBIK ADAPTADO ONLINE • HEIKIN-ASHI + EMA + RSI + MACD • OPEN + OTC';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧩 Robô Rubik Adaptado selecionado • sinal somente com confluência completa.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Robô Rubik ativo • Heikin-Ashi + EMA 9/21 + RSI 14 + MACD • OPEN/OTC</div>';
     rad();
   }else if(engine==='EA'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA DUPLA CONFIRMAÇÃO ONLINE • RENKO HASHI PRO + XGBOOST • OPEN + OTC';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ EA Dupla selecionada • CALL/PUT só quando Renko Hashi Pro + XGBoost concordarem.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar EA Dupla ativo • Renko Hashi Pro + XGBoost • OPEN/OTC</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA TRIPLA CONFIRMAÇÃO ONLINE • RSI + VALUE CHART + XGBOOST • OPEN + OTC';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ EA Tripla selecionada • CALL/PUT só quando RSI + Value Chart + XGBoost concordarem.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar EA Tripla ativo • RSI + Value Chart + XGBoost • OPEN/OTC</div>';
     rad();
   }else if(engine==='SMART'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='INTELIGÊNCIA ARTIFICIAL ONLINE • IA PURA ANALISANDO CANDLES';
@@ -18459,7 +18314,7 @@ function applyRobotPowerState(){
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial, Scalper PA, Robô Rubik e EAs estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial, Robô Rubik, BIGRISE e EAs estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -18479,14 +18334,14 @@ function resetEngineVisualState(){
 
 async function setRobotPower(enabled){
   robotEnabled=!!enabled;
-  if(robotEnabled){ aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; scalperEnabled=false; }
+  if(robotEnabled){ aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; }
   try{
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
-    localStorage.setItem('mega_scalper_power', scalperEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -18498,14 +18353,14 @@ async function setRobotPower(enabled){
 
 async function setAiPower(enabled){
   aiEnabled=!!enabled;
-  if(aiEnabled){ robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; scalperEnabled=false; }
+  if(aiEnabled){ robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; }
   try{
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
-    localStorage.setItem('mega_scalper_power', scalperEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -18517,14 +18372,14 @@ async function setAiPower(enabled){
 
 async function setEaPower(enabled){
   eaEnabled=!!enabled;
-  if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; scalperEnabled=false; }
+  if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; }
   try{
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
-    localStorage.setItem('mega_scalper_power', scalperEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -18536,14 +18391,14 @@ async function setEaPower(enabled){
 
 async function setRubikPower(enabled){
   rubikEnabled=!!enabled;
-  if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; scalperEnabled=false; }
+  if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; bigriseEnabled=false; }
   try{
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
-    localStorage.setItem('mega_scalper_power', scalperEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -18555,10 +18410,10 @@ async function setRubikPower(enabled){
 
 async function setForcePower(enabled){
   forceEnabled=!!enabled;
-  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; scalperEnabled=false; }
+  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; }
   try{
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
-    localStorage.setItem('mega_scalper_power', scalperEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
@@ -18572,11 +18427,11 @@ async function setForcePower(enabled){
   if(voiceEnabled) speak(forceEnabled ? 'EA Força do Movimento online.' : 'EA Força do Movimento offline.');
 }
 
-async function setScalperPower(enabled){
-  scalperEnabled=!!enabled;
-  if(scalperEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
+async function setBigrisePower(enabled){
+  bigriseEnabled=!!enabled;
+  if(bigriseEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
   try{
-    localStorage.setItem('mega_scalper_power', scalperEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
@@ -18588,7 +18443,7 @@ async function setScalperPower(enabled){
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled) speak(scalperEnabled ? 'Scalper PA online.' : 'Scalper PA offline.');
+  if(voiceEnabled) speak(bigriseEnabled ? 'Big Rise força do dólar online.' : 'Big Rise força do dólar offline.');
 }
 
 if(robotPowerBtn) robotPowerBtn.onclick=()=>{ setRobotPower(!robotEnabled); };
@@ -18596,7 +18451,7 @@ if(aiPowerBtn) aiPowerBtn.onclick=()=>{ setAiPower(!aiEnabled); };
 if(eaPowerBtn) eaPowerBtn.onclick=()=>{ setEaPower(!eaEnabled); };
 if(rubikPowerBtn) rubikPowerBtn.onclick=()=>{ setRubikPower(!rubikEnabled); };
 if(forcePowerBtn) forcePowerBtn.onclick=()=>{ setForcePower(!forceEnabled); };
-if(scalperPowerBtn) scalperPowerBtn.onclick=()=>{ setScalperPower(!scalperEnabled); };
+if(bigrisePowerBtn) bigrisePowerBtn.onclick=()=>{ setBigrisePower(!bigriseEnabled); };
 
 async function sig(announce=false){
   if(!appEnabled) return;
@@ -18822,7 +18677,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':(selectedRobotEngine()==='SCALPER'?'ROBÔ SCALPER PA':(selectedRobotEngine()==='RUBIK'?'ROBÔ RUBIK':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':'IA GRÁFICA'))))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
+    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':(selectedRobotEngine()==='RUBIK'?'ROBÔ RUBIK':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':(selectedRobotEngine()==='BIGRISE'?'BIGRISE • FORÇA USD':'IA GRÁFICA'))))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
     await sig(true);
   }finally{
     radarAutoBusy=false;
@@ -18940,7 +18795,7 @@ async function loadPreSignals(){
   const engine=selectedRobotEngine();
   if(engine==='OFF'){
     if(preSignalStatus) preSignalStatus.textContent='Pré-alerta aguardando um motor ficar ONLINE.';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔕 Coloque um dos robôs/IA ONLINE para usar o pré-alerta.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔕 Coloque IA Gráfica, Inteligência Artificial ou EA ONLINE para usar o pré-alerta.</div>';
     return;
   }
 
