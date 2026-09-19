@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.53"
-PWA_VERSION = "v119"
+APP_VERSION = "3.54"
+PWA_VERSION = "v120"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -241,15 +241,22 @@ SYMBOLS = [
 ]
 OTC_SYMBOLS = [s for s in SYMBOLS if s != BINOMO_CRYPTO_IDX_SYMBOL]
 
-# MEGA IA 3.53 — BTC FORCE: motor exclusivo de BTC/USD, sem cesta Forex.
+# MEGA IA 3.54 — BTC FORCE FILTERED: exclusivo BTC/USD, com filtros anti-loss e cooldown.
 BIGRISE_BTC_SYMBOL = "BTC/USD"  # chave interna antiga preservada para compatibilidade do painel
 BTC_FORCE_ATR_PERIOD = max(5, min(30, int(os.getenv("BTC_FORCE_ATR_PERIOD", "14"))))
 BTC_FORCE_EMA_FAST = max(3, min(20, int(os.getenv("BTC_FORCE_EMA_FAST", "5"))))
 BTC_FORCE_EMA_SLOW = max(BTC_FORCE_EMA_FAST + 2, min(50, int(os.getenv("BTC_FORCE_EMA_SLOW", "13"))))
-BTC_FORCE_MIN_BODY_ATR = max(0.08, min(1.20, float(os.getenv("BTC_FORCE_MIN_BODY_ATR", "0.20"))))
-BTC_FORCE_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("BTC_FORCE_MIN_BODY_RATIO", "0.43"))))
-BTC_FORCE_MIN_CLOSE_POS = max(0.55, min(0.90, float(os.getenv("BTC_FORCE_MIN_CLOSE_POS", "0.66"))))
-BTC_FORCE_MAX_RANGE_ATR = max(1.50, min(6.00, float(os.getenv("BTC_FORCE_MAX_RANGE_ATR", "3.20"))))
+BTC_FORCE_MACD_FAST = max(3, min(20, int(os.getenv("BTC_FORCE_MACD_FAST", "6"))))
+BTC_FORCE_MACD_SLOW = max(BTC_FORCE_MACD_FAST + 2, min(40, int(os.getenv("BTC_FORCE_MACD_SLOW", "13"))))
+BTC_FORCE_MACD_SIGNAL = max(3, min(15, int(os.getenv("BTC_FORCE_MACD_SIGNAL", "5"))))
+BTC_FORCE_MIN_BODY_ATR = max(0.08, min(1.20, float(os.getenv("BTC_FORCE_MIN_BODY_ATR", "0.28"))))
+BTC_FORCE_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("BTC_FORCE_MIN_BODY_RATIO", "0.50"))))
+BTC_FORCE_MIN_CLOSE_POS = max(0.55, min(0.90, float(os.getenv("BTC_FORCE_MIN_CLOSE_POS", "0.70"))))
+BTC_FORCE_MAX_RANGE_ATR = max(1.20, min(6.00, float(os.getenv("BTC_FORCE_MAX_RANGE_ATR", "2.60"))))
+BTC_FORCE_MIN_TREND_SEP_ATR = max(0.00, min(0.40, float(os.getenv("BTC_FORCE_MIN_TREND_SEP_ATR", "0.025"))))
+BTC_FORCE_MIN_EFFICIENCY = max(0.10, min(0.90, float(os.getenv("BTC_FORCE_MIN_EFFICIENCY", "0.38"))))
+BTC_FORCE_MIN_CONFIDENCE = max(65.0, min(95.0, float(os.getenv("BTC_FORCE_MIN_CONFIDENCE", "76"))))
+BTC_FORCE_SIGNAL_COOLDOWN_SECONDS = max(180, min(900, int(os.getenv("BTC_FORCE_SIGNAL_COOLDOWN_SECONDS", "240"))))
 
 OTC_BASE = {
     "EUR/USD": "EURUSD-OTC", "GBP/USD": "GBPUSD-OTC", "USD/JPY": "USDJPY-OTC",
@@ -6879,28 +6886,30 @@ async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
 
 
 def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN"):
-    """BTC FORCE — força própria do BTC/USD para a PRÓXIMA vela, sem outros pares.
+    """BTC FORCE FILTERED — força própria do BTC/USD para a próxima vela.
 
-    Usa somente candles fechados. A última vela fechada precisa mostrar corpo
-    relevante em relação ao ATR, pouco pavio contra a direção e contexto curto
-    do próprio BTC. Não usa cesta USD, não usa Forex, não usa Gale e não repinta.
+    Usa somente candles FECHADOS e exige concordância entre força da vela,
+    EMA 5/13, MACD curto 6/13/5 e eficiência direcional. Não depende de Forex,
+    não usa Gale e não repinta. O cooldown de 4 minutos é aplicado na liberação.
     """
     rows = list(cs or [])
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"BTC FORCE {tf_label}"
-    need = max(32, BTC_FORCE_EMA_SLOW + BTC_FORCE_ATR_PERIOD + 6)
+    name = f"BTC FORCE FILTERED {tf_label}"
+    need = max(42, BTC_FORCE_EMA_SLOW + BTC_FORCE_ATR_PERIOD + 10, BTC_FORCE_MACD_SLOW + BTC_FORCE_MACD_SIGNAL + 6)
     if len(rows) < need:
         return {
             "available": True, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "strategy": name,
-            "engine": "BTC_FORCE", "provider": "LOCAL_BTC_FORCE",
+            "engine": "BTC_FORCE", "provider": "LOCAL_BTC_FORCE_FILTERED",
             "reason": f"Coletando candles fechados do BTC/USD ({len(rows)}/{need}).",
             "non_repaint": True, "direct_win_only": True, "gale_signal": False,
-            "btc_only": True,
+            "btc_only": True, "filtered_mode": True,
         }
 
     last = rows[-1]
+    prev = rows[-2]
     o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"])
+    po = float(prev["open"]); ph = float(prev["high"]); pl = float(prev["low"]); pc = float(prev["close"])
     rng = max(h - l, 1e-12)
     body = abs(c - o)
     body_ratio = body / rng
@@ -6911,27 +6920,31 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN"):
         return {
             "available": True, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "strategy": name,
-            "engine": "BTC_FORCE", "provider": "LOCAL_BTC_FORCE",
+            "engine": "BTC_FORCE", "provider": "LOCAL_BTC_FORCE_FILTERED",
             "reason": "ATR do BTC/USD ainda indisponível para medir força.",
             "non_repaint": True, "direct_win_only": True, "gale_signal": False,
-            "btc_only": True,
+            "btc_only": True, "filtered_mode": True,
         }
 
     closes = [float(x["close"]) for x in rows]
     efast = ema(closes, BTC_FORCE_EMA_FAST)
     eslow = ema(closes, BTC_FORCE_EMA_SLOW)
-    if efast is None or eslow is None:
+    efast_prev = ema(closes[:-1], BTC_FORCE_EMA_FAST)
+    eslow_prev = ema(closes[:-1], BTC_FORCE_EMA_SLOW)
+    macd = _macd_snapshot(closes, BTC_FORCE_MACD_FAST, BTC_FORCE_MACD_SLOW, BTC_FORCE_MACD_SIGNAL)
+    if efast is None or eslow is None or efast_prev is None or eslow_prev is None or not macd:
         return {
             "available": True, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "strategy": name,
-            "engine": "BTC_FORCE", "provider": "LOCAL_BTC_FORCE",
-            "reason": "Histórico do BTC/USD ainda insuficiente para direção curta.",
+            "engine": "BTC_FORCE", "provider": "LOCAL_BTC_FORCE_FILTERED",
+            "reason": "Histórico do BTC/USD ainda insuficiente para EMA/MACD.",
             "non_repaint": True, "direct_win_only": True, "gale_signal": False,
-            "btc_only": True,
+            "btc_only": True, "filtered_mode": True,
         }
 
     body_atr = body / max(float(a), 1e-12)
     range_atr = rng / max(float(a), 1e-12)
+    prev_body_atr = abs(pc - po) / max(float(a), 1e-12)
     bullish = c > o
     bearish = c < o
     call_close_ok = close_pos >= BTC_FORCE_MIN_CLOSE_POS
@@ -6940,36 +6953,61 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN"):
     force_ok = body_atr >= BTC_FORCE_MIN_BODY_ATR
     not_exhausted = range_atr <= BTC_FORCE_MAX_RANGE_ATR
 
-    # Movimento curto do próprio BTC: não depende de nenhum outro ativo.
-    prev3 = closes[-4:-1]
-    drift3 = (prev3[-1] - prev3[0]) if len(prev3) >= 2 else 0.0
-    call_context = (efast >= eslow) or (drift3 >= -0.12 * float(a))
-    put_context = (efast <= eslow) or (drift3 <= 0.12 * float(a))
+    # Tendência: agora é obrigatória, não apenas contexto permissivo.
+    trend_sep = abs(float(efast) - float(eslow)) / max(float(a), 1e-12)
+    call_trend_ok = (efast > eslow and c >= efast and efast > efast_prev and trend_sep >= BTC_FORCE_MIN_TREND_SEP_ATR)
+    put_trend_ok = (efast < eslow and c <= efast and efast < efast_prev and trend_sep >= BTC_FORCE_MIN_TREND_SEP_ATR)
 
-    call_ok = bullish and body_ok and force_ok and call_close_ok and not_exhausted and call_context
-    put_ok = bearish and body_ok and force_ok and put_close_ok and not_exhausted and put_context
-    direction = "CALL" if call_ok else ("PUT" if put_ok else "NEUTRO")
+    # MACD curto 6/13/5: histograma precisa confirmar e não estar perdendo força.
+    mh = float(macd.get("hist") or 0.0)
+    mh_prev = float(macd.get("hist_prev") or 0.0)
+    call_macd_ok = mh > 0 and (bool(macd.get("cross_up")) or bool(macd.get("hist_improving_up")) or mh >= mh_prev)
+    put_macd_ok = mh < 0 and (bool(macd.get("cross_down")) or bool(macd.get("hist_improving_down")) or mh <= mh_prev)
+
+    # Eficiência direcional em 7 fechamentos: barra mercado picotado/lateral.
+    eff_closes = closes[-7:]
+    eff_path = sum(abs(eff_closes[i] - eff_closes[i-1]) for i in range(1, len(eff_closes)))
+    eff_net = eff_closes[-1] - eff_closes[0]
+    efficiency = abs(eff_net) / max(eff_path, 1e-12)
+    call_eff_ok = efficiency >= BTC_FORCE_MIN_EFFICIENCY and eff_net > 0
+    put_eff_ok = efficiency >= BTC_FORCE_MIN_EFFICIENCY and eff_net < 0
+
+    # Evita comprar/vender logo depois de uma vela contrária muito forte.
+    prev_strong_bear = pc < po and prev_body_atr >= 0.55
+    prev_strong_bull = pc > po and prev_body_atr >= 0.55
+    call_prev_ok = not prev_strong_bear
+    put_prev_ok = not prev_strong_bull
+
+    raw_call = bullish and body_ok and force_ok and call_close_ok and not_exhausted and call_trend_ok and call_macd_ok and call_eff_ok and call_prev_ok
+    raw_put = bearish and body_ok and force_ok and put_close_ok and not_exhausted and put_trend_ok and put_macd_ok and put_eff_ok and put_prev_ok
+    provisional = "CALL" if raw_call else ("PUT" if raw_put else "NEUTRO")
 
     confidence = 0.0
-    if direction != "NEUTRO":
-        confidence = 66.0
-        confidence += min(10.0, max(0.0, body_atr - BTC_FORCE_MIN_BODY_ATR) * 18.0)
-        confidence += min(8.0, max(0.0, body_ratio - BTC_FORCE_MIN_BODY_RATIO) * 18.0)
-        edge = close_pos if direction == "CALL" else (1.0 - close_pos)
-        confidence += min(6.0, max(0.0, edge - BTC_FORCE_MIN_CLOSE_POS) * 18.0)
-        trend_sep = abs(float(efast) - float(eslow)) / max(float(a), 1e-12)
-        confidence += min(5.0, trend_sep * 9.0)
-        confidence = clamp(confidence, 66.0, 93.0)
+    if provisional != "NEUTRO":
+        confidence = 68.0
+        confidence += min(8.0, max(0.0, body_atr - BTC_FORCE_MIN_BODY_ATR) * 16.0)
+        confidence += min(7.0, max(0.0, body_ratio - BTC_FORCE_MIN_BODY_RATIO) * 16.0)
+        edge = close_pos if provisional == "CALL" else (1.0 - close_pos)
+        confidence += min(5.0, max(0.0, edge - BTC_FORCE_MIN_CLOSE_POS) * 16.0)
+        confidence += min(5.0, trend_sep * 12.0)
+        confidence += min(4.0, max(0.0, efficiency - BTC_FORCE_MIN_EFFICIENCY) * 12.0)
+        confidence += 3.0 if ((provisional == "CALL" and macd.get("cross_up")) or (provisional == "PUT" and macd.get("cross_down"))) else 1.5
+        confidence = clamp(confidence, 68.0, 95.0)
+
+    quality_ok = provisional != "NEUTRO" and confidence >= BTC_FORCE_MIN_CONFIDENCE
+    direction = provisional if quality_ok else "NEUTRO"
 
     if direction == "CALL":
         reason = (
-            f"BTC ganhou força compradora na vela fechada: corpo {body_ratio*100:.0f}% da vela, "
-            f"força {body_atr:.2f} ATR e fechamento perto da máxima. CALL preparada para a próxima vela."
+            f"BTC FORCE filtrado: força compradora {body_atr:.2f} ATR, corpo {body_ratio*100:.0f}%, "
+            f"EMA {BTC_FORCE_EMA_FAST}/{BTC_FORCE_EMA_SLOW} alinhada, MACD positivo e eficiência {efficiency:.2f}. "
+            "CALL preparada para a próxima vela."
         )
     elif direction == "PUT":
         reason = (
-            f"BTC ganhou força vendedora na vela fechada: corpo {body_ratio*100:.0f}% da vela, "
-            f"força {body_atr:.2f} ATR e fechamento perto da mínima. PUT preparada para a próxima vela."
+            f"BTC FORCE filtrado: força vendedora {body_atr:.2f} ATR, corpo {body_ratio*100:.0f}%, "
+            f"EMA {BTC_FORCE_EMA_FAST}/{BTC_FORCE_EMA_SLOW} alinhada, MACD negativo e eficiência {efficiency:.2f}. "
+            "PUT preparada para a próxima vela."
         )
     else:
         blockers = []
@@ -6978,26 +7016,35 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN"):
         if bullish and not call_close_ok: blockers.append("compra fechou longe da máxima")
         if bearish and not put_close_ok: blockers.append("venda fechou longe da mínima")
         if not not_exhausted: blockers.append("vela esticada demais")
-        if bullish and not call_context: blockers.append("contexto curto ainda não confirma compra")
-        if bearish and not put_context: blockers.append("contexto curto ainda não confirma venda")
+        if bullish and not call_trend_ok: blockers.append("EMA 5/13 não confirma compra")
+        if bearish and not put_trend_ok: blockers.append("EMA 5/13 não confirma venda")
+        if bullish and not call_macd_ok: blockers.append("MACD ainda não confirma compra")
+        if bearish and not put_macd_ok: blockers.append("MACD ainda não confirma venda")
+        if bullish and not call_eff_ok: blockers.append("movimento comprador está lateral/picotado")
+        if bearish and not put_eff_ok: blockers.append("movimento vendedor está lateral/picotado")
+        if bullish and not call_prev_ok: blockers.append("vela anterior vendedora ainda foi forte")
+        if bearish and not put_prev_ok: blockers.append("vela anterior compradora ainda foi forte")
+        if provisional != "NEUTRO" and not quality_ok: blockers.append(f"qualidade {confidence:.0f}% abaixo de {BTC_FORCE_MIN_CONFIDENCE:.0f}%")
         if not bullish and not bearish: blockers.append("vela sem direção")
-        reason = "BTC FORCE monitorando: " + (", ".join(blockers) if blockers else "aguardando vela de força limpa") + "."
+        reason = "BTC FORCE filtrado: " + (", ".join(blockers) if blockers else "aguardando confluência limpa") + "."
 
     return {
         "available": True,
         "direction": direction,
         "confidence": round(float(confidence), 1),
         "confirmed": direction in ("CALL", "PUT"),
-        "risk": ("LOW" if confidence >= 80 else ("MEDIUM" if direction != "NEUTRO" else "HIGH")),
+        "risk": ("LOW" if confidence >= 84 else ("MEDIUM" if direction != "NEUTRO" else "HIGH")),
         "strategy": name,
         "engine": "BTC_FORCE",
-        "provider": "LOCAL_BTC_FORCE",
-        "reason": reason[:360],
+        "provider": "LOCAL_BTC_FORCE_FILTERED",
+        "reason": reason[:420],
         "non_repaint": True,
         "direct_win_only": True,
         "gale_signal": False,
         "btc_only": True,
         "next_candle_entry": True,
+        "filtered_mode": True,
+        "signal_cooldown_seconds": BTC_FORCE_SIGNAL_COOLDOWN_SECONDS,
         "diagnostics": {
             "atr": round(float(a), 10),
             "body_atr": round(body_atr, 4),
@@ -7006,10 +7053,13 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN"):
             "range_atr": round(range_atr, 4),
             "ema_fast": round(float(efast), 8),
             "ema_slow": round(float(eslow), 8),
-            "drift3_atr": round(drift3 / max(float(a), 1e-12), 4),
+            "ema_separation_atr": round(trend_sep, 4),
+            "macd_hist": round(mh, 10),
+            "macd_hist_prev": round(mh_prev, 10),
+            "directional_efficiency": round(efficiency, 4),
+            "min_confidence": round(BTC_FORCE_MIN_CONFIDENCE, 1),
         },
     }
-
 
 def larry_breakout_strategy(cs, timeframe="1min", market="OPEN"):
     """LARRY BREAKOUT — adaptação do Larry FX para CALL/PUT sem Grid/Martingale.
@@ -8944,8 +8994,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "EA FORÇA DO MOVIMENTO"
             engine_mode = "EA_FORCE_MOVEMENT"
         elif engine == "BIGRISE":
-            engine_title = "BTC FORCE"
-            engine_mode = "BTC_FORCE_NEXT_CANDLE"
+            engine_title = "BTC FORCE FILTERED"
+            engine_mode = "BTC_FORCE_NEXT_CANDLE_FILTERED"
         else:
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
@@ -9043,7 +9093,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
             "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY") and analysis.get("confirmed")),
-            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RSI_VALUE_CHART" if engine == "EA" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else ("LOCAL_LARRY_BREAKOUT" if engine == "LARRY" else ("LOCAL_BTC_FORCE" if engine == "BIGRISE" else "DISABLED"))))),
+            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RSI_VALUE_CHART" if engine == "EA" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else ("LOCAL_LARRY_BREAKOUT" if engine == "LARRY" else ("LOCAL_BTC_FORCE_FILTERED" if engine == "BIGRISE" else "DISABLED"))))),
             "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
@@ -9132,8 +9182,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                                         else ("btc_force_fingerprint" if engine == "BIGRISE" else "graph_ai_fingerprint")))))
             )
             if release_state.get(fingerprint_key) != signal_fingerprint:
-                # v3.6: SOMENTE a IA GRÁFICA tem intervalo mínimo de 4 minutos
-                # entre sinais liberados. Os demais motores mantêm seu comportamento.
+                # Intervalo mínimo entre sinais: IA Gráfica e BTC FORCE usam 4 minutos.
                 if engine == "GRAPH_AI":
                     graph_gap_seconds = 240
                     last_graph_signal_ts = float(release_state.get("last_graph_signal_ts", 0.0) or 0.0)
@@ -9154,6 +9203,25 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key] = (time.time(), base)
                         return base
 
+                if engine == "BIGRISE":
+                    btc_gap_seconds = BTC_FORCE_SIGNAL_COOLDOWN_SECONDS
+                    last_btc_signal_ts = float(release_state.get("last_btc_force_signal_ts", 0.0) or 0.0)
+                    btc_remaining = max(
+                        0,
+                        int(btc_gap_seconds - (time.time() - last_btc_signal_ts))
+                    ) if last_btc_signal_ts else 0
+                    if btc_remaining > 0:
+                        base["status"] = "ONLINE • BTC FORCE • INTERVALO DE 4 MINUTOS"
+                        base["reason"] = (
+                            f"Nova oportunidade encontrada, mas o BTC FORCE aguarda mais {btc_remaining}s "
+                            "para manter no mínimo 4 minutos entre sinais."
+                        )
+                        base["btc_force_signal_gap_seconds"] = btc_gap_seconds
+                        base["btc_force_signal_gap_remaining"] = btc_remaining
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
+
                 announce, entry, expiry = entry_window(interval, entry_mode)
                 smart_status = (
                     "FALLBACK LOCAL • BLOQUEADO PARA ENTRADA" if analysis.get("fallback")
@@ -9161,7 +9229,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 )
                 base.update({
                     "direction": direction_now,
-                    "status": (smart_status if engine == "SMART" else ("SINAL TRIPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL LARRY BREAKOUT LIBERADO" if engine == "LARRY" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else ("SINAL BTC FORCE LIBERADO" if engine == "BIGRISE" else "SINAL IA GRÁFICA LIBERADO")))))),
+                    "status": (smart_status if engine == "SMART" else ("SINAL TRIPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL LARRY BREAKOUT LIBERADO" if engine == "LARRY" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else ("SINAL BTC FORCE FILTRADO LIBERADO" if engine == "BIGRISE" else "SINAL IA GRÁFICA LIBERADO")))))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -9193,6 +9261,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     release_state["last_graph_signal_ts"] = time.time()
                     base["graph_signal_gap_seconds"] = 240
                     base["graph_signal_gap_remaining"] = 0
+                if engine == "BIGRISE":
+                    release_state["last_btc_force_signal_ts"] = time.time()
+                    base["btc_force_signal_gap_seconds"] = BTC_FORCE_SIGNAL_COOLDOWN_SECONDS
+                    base["btc_force_signal_gap_remaining"] = 0
 
                 # Só as IAs entram no ciclo com Gale. EAs continuam com sua
                 # regra própria de entrada direta/sem Gale. Fallback local da IA
