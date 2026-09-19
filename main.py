@@ -220,8 +220,157 @@ def heiken_ashi_arrows_strategy(cs, timeframe="1min", market="OPEN"):
 
 # ===== FIM RENKO HASHI PRO =====
 
-APP_VERSION = "3.53"
-PWA_VERSION = "v120"
+# ===== ROBÔ PAVIO 70% + ENGOLFO 70% (duas estratégias independentes) =====
+def wick_engulf_70_strategy(cs, timeframe="1min", market="OPEN"):
+    """Libera a primeira condição válida no último candle FECHADO.
+
+    Estratégia 1 — Pavio 70% do corpo:
+      se o maior pavio tiver tamanho >= 70% do corpo da vela, a próxima vela
+      entra no sentido CONTRÁRIO à cor da vela que acabou de fechar.
+
+    Estratégia 2 — Engolfo 70%:
+      se o corpo atual cobrir >= 70% do corpo anterior e as cores forem opostas,
+      entra na direção do candle de engolfo.
+
+    Se as duas condições ocorrerem no mesmo fechamento, PAVIO_70 tem prioridade,
+    pois foi definida como a primeira estratégia. Usa somente candles fechados.
+    """
+    rows = list(cs or [])
+    tf_label = {"1min": "M1", "5min": "M5", "15min": "M15", "30min": "M30"}.get(timeframe, timeframe)
+    name = f"ROBÔ PAVIO 70% + ENGOLFO 70% {tf_label}"
+
+    def neutral(reason, diagnostics=None, confidence=0.0):
+        out = {
+            "available": True,
+            "direction": "NEUTRO",
+            "confidence": round(float(confidence or 0.0), 1),
+            "confirmed": False,
+            "risk": "HIGH",
+            "strategy": name,
+            "engine": "PRICE70",
+            "provider": "LOCAL_PRICE_ACTION_70",
+            "reason": reason,
+            "non_repaint": True,
+            "closed_candles_only": True,
+            "external_ai_disabled": True,
+            "gale_signal": False,
+            "first_trigger_wins": True,
+        }
+        if diagnostics is not None:
+            out["diagnostics"] = diagnostics
+        return out
+
+    if len(rows) < 2:
+        return neutral(f"Aguardando candles fechados suficientes ({len(rows)}/2).")
+
+    try:
+        last = rows[-1]
+        prev = rows[-2]
+        o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"])
+        po = float(prev["open"]); pc = float(prev["close"])
+    except Exception:
+        return neutral("Dados OHLC inválidos para a leitura de pavio/engolfo.")
+
+    body = abs(c - o)
+    eps = 1e-12
+    upper_wick = max(0.0, h - max(o, c))
+    lower_wick = max(0.0, min(o, c) - l)
+    max_wick = max(upper_wick, lower_wick)
+    wick_to_body = (max_wick / body) if body > eps else 0.0
+    candle_color = "BULL" if c > o else ("BEAR" if c < o else "DOJI")
+
+    diagnostics = {
+        "setup_priority": ["PAVIO_70", "ENGOLFO_70"],
+        "candle_color": candle_color,
+        "body": body,
+        "upper_wick": upper_wick,
+        "lower_wick": lower_wick,
+        "max_wick_to_body": round(wick_to_body, 4),
+        "wick_threshold": 0.70,
+    }
+
+    # Estratégia 1 tem prioridade quando as duas aparecem no mesmo fechamento.
+    if body > eps and candle_color != "DOJI" and wick_to_body >= 0.70:
+        direction = "PUT" if candle_color == "BULL" else "CALL"
+        confidence = _clamp(72.0 + min(16.0, max(0.0, wick_to_body - 0.70) * 20.0), 72.0, 88.0)
+        diagnostics.update({
+            "trigger": "PAVIO_70",
+            "trigger_ratio": round(wick_to_body, 4),
+            "next_candle_rule": "OPPOSITE_TO_CLOSED_CANDLE_COLOR",
+        })
+        return {
+            "available": True,
+            "direction": direction,
+            "confidence": round(confidence, 1),
+            "confirmed": True,
+            "risk": "MEDIUM",
+            "strategy": name,
+            "engine": "PRICE70",
+            "provider": "LOCAL_PRICE_ACTION_70",
+            "reason": (
+                f"PAVIO 70% acionado no último candle fechado: maior pavio = "
+                f"{wick_to_body*100:.0f}% do corpo. Próxima vela entra {direction}, "
+                f"contrária à cor do candle fechado."
+            ),
+            "non_repaint": True,
+            "closed_candles_only": True,
+            "external_ai_disabled": True,
+            "gale_signal": False,
+            "first_trigger_wins": True,
+            "setup": "PAVIO_70",
+            "diagnostics": diagnostics,
+        }
+
+    prev_body = abs(pc - po)
+    prev_low, prev_high = min(po, pc), max(po, pc)
+    cur_low, cur_high = min(o, c), max(o, c)
+    overlap = max(0.0, min(cur_high, prev_high) - max(cur_low, prev_low))
+    engulf_ratio = (overlap / prev_body) if prev_body > eps else 0.0
+    bullish_engulf = bool(c > o and pc < po and engulf_ratio >= 0.70)
+    bearish_engulf = bool(c < o and pc > po and engulf_ratio >= 0.70)
+    diagnostics.update({
+        "previous_body": prev_body,
+        "engulf_overlap": overlap,
+        "engulf_ratio": round(engulf_ratio, 4),
+        "engulf_threshold": 0.70,
+    })
+
+    if bullish_engulf or bearish_engulf:
+        direction = "CALL" if bullish_engulf else "PUT"
+        confidence = _clamp(74.0 + min(16.0, max(0.0, engulf_ratio - 0.70) * 30.0), 74.0, 90.0)
+        diagnostics.update({"trigger": "ENGOLFO_70", "trigger_ratio": round(engulf_ratio, 4)})
+        return {
+            "available": True,
+            "direction": direction,
+            "confidence": round(confidence, 1),
+            "confirmed": True,
+            "risk": "MEDIUM",
+            "strategy": name,
+            "engine": "PRICE70",
+            "provider": "LOCAL_PRICE_ACTION_70",
+            "reason": (
+                f"ENGOLFO 70% acionado no último candle fechado: o corpo atual cobriu "
+                f"{engulf_ratio*100:.0f}% do corpo anterior. Próxima vela entra {direction}."
+            ),
+            "non_repaint": True,
+            "closed_candles_only": True,
+            "external_ai_disabled": True,
+            "gale_signal": False,
+            "first_trigger_wins": True,
+            "setup": "ENGOLFO_70",
+            "diagnostics": diagnostics,
+        }
+
+    return neutral(
+        "Monitorando: ainda não apareceu pavio >= 70% do corpo nem engolfo >= 70% da vela anterior no último candle fechado.",
+        diagnostics=diagnostics,
+        confidence=max(0.0, min(69.0, max(wick_to_body, engulf_ratio) * 100.0)),
+    )
+
+# ===== FIM ROBÔ PAVIO 70% + ENGOLFO 70% =====
+
+APP_VERSION = "3.54"
+PWA_VERSION = "v121"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -8612,9 +8761,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
+    # Pavio/Engolfo 70% sempre entra na vela imediatamente seguinte ao candle gatilho.
+    # Portanto este motor força o modo BIRTH e ignora MIDDLE/CLOSE.
+    if engine == "PRICE70":
+        entry_mode = "BIRTH"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "PRICE70"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
@@ -8673,6 +8826,26 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 raw = await candles(
                     symbol, interval, request_n, "OPEN", None, request=request
                 )
+        elif engine == "PRICE70":
+            # Robô Pavio/Engolfo 70%: OPEN usa o roteador multifuente; OTC usa IQ Option real.
+            if market == "IQ_OTC":
+                if not iq_state:
+                    out = neutral_signal(
+                        symbol, interval, market,
+                        "ROBÔ PAVIO + ENGOLFO • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para este robô analisar OTC real.",
+                        source_state="WAITING",
+                    )
+                    out.update({
+                        "strategy": "ROBÔ PAVIO 70% + ENGOLFO 70%", "mode": "PRICE_ACTION_70",
+                        "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
+                        "first_trigger_wins": True, "gale_signal": False,
+                    })
+                    cache[key] = (time.time(), out)
+                    return out
+                raw = await iq_ea_candles(iq_state, symbol, interval, 90, regular_market=False)
+            else:
+                raw = await candles(symbol, interval, 90, "OPEN", None, request=request)
         elif engine == "RUBIK":
             # Robô Rubik Adaptado: OPEN usa o roteador cTrader/multifuente; OTC usa IQ Option real.
             if market == "IQ_OTC":
@@ -8720,7 +8893,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         status = (
             ("EA XGBOOST • FONTE EM ESPERA" if market == "OPEN" else "EA XGBOOST • IQ OPTION EM ESPERA")
             if engine == "EA"
-            else (("ROBÔ RUBIK • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION EM ESPERA")
+            else (("ROBÔ PAVIO + ENGOLFO • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ PAVIO + ENGOLFO • IQ OPTION EM ESPERA")
+                  if engine == "PRICE70"
+                  else (("ROBÔ RUBIK • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION EM ESPERA")
                   if engine == "RUBIK"
                   else ("EA FORÇA DO MOVIMENTO • IQ OPTION EM ESPERA"
                   if engine == "FORCE" and market == "IQ_OTC"
@@ -8728,7 +8903,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                       "MOTOR MULTIFONTE • TENTANDO FALLBACK"
                       if market == "OPEN" and exc.status_code in (429, 503)
                       else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL")
-                  )))
+                  ))))
         )
         out = neutral_signal(symbol, interval, market, status, exc.detail, source_state="DEGRADED")
         cache[key] = (time.time(), out)
@@ -8737,11 +8912,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         status = (
             ("EA XGBOOST • FONTE RECONECTANDO" if market == "OPEN" else "EA XGBOOST • IQ OPTION RECONECTANDO")
             if engine == "EA"
-            else (("ROBÔ RUBIK • FONTE RECONECTANDO" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION RECONECTANDO")
+            else (("ROBÔ PAVIO + ENGOLFO • FONTE RECONECTANDO" if market == "OPEN" else "ROBÔ PAVIO + ENGOLFO • IQ OPTION RECONECTANDO")
+                  if engine == "PRICE70"
+                  else (("ROBÔ RUBIK • FONTE RECONECTANDO" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION RECONECTANDO")
                   if engine == "RUBIK"
                   else ("EA FORÇA DO MOVIMENTO • IQ OPTION RECONECTANDO"
                   if engine == "FORCE" and market == "IQ_OTC"
-                  else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL")))
+                  else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL"))))
         )
         out = neutral_signal(symbol, interval, market, status, str(exc), source_state="DEGRADED")
         cache[key] = (time.time(), out)
@@ -8790,6 +8967,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "EA":
             engine_title = "EA RENKO HASHI PRO + XGBOOST"
             engine_mode = "EA_XGBOOST_AUTONOMOUS"
+        elif engine == "PRICE70":
+            engine_title = "ROBÔ PAVIO 70% + ENGOLFO 70%"
+            engine_mode = "PRICE_ACTION_70"
         elif engine == "RUBIK":
             engine_title = "ROBÔ RUBIK ADAPTADO"
             engine_mode = "RUBIK_ADAPTED"
@@ -8800,7 +8980,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK"):
+        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "PRICE70"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -8815,7 +8995,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
-                    else ({"dual_confirmation": True, "inputs": ["RENKO_HASHI_PRO", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]}))
+                    else ({"dual_confirmation": True, "inputs": ["RENKO_HASHI_PRO", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"first_trigger_wins": True, "inputs": ["PAVIO_70", "ENGOLFO_70"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "PRICE70" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})))
                 ),
                 "legacy_ai_disabled": engine != "SMART",
                 "legacy_technical_strategies_disabled": True,
@@ -8837,6 +9017,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis = await ea_xgboost_strategy(
                     engine_closed, symbol, interval, market=market
                 )
+            elif engine == "PRICE70":
+                analysis = wick_engulf_70_strategy(engine_closed, interval, market=market)
             elif engine == "RUBIK":
                 analysis = rubik_adapted_strategy(engine_closed, interval, market=market)
             elif engine == "FORCE":
@@ -8888,15 +9070,16 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK") and analysis.get("confirmed")),
-            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RENKO_HASHI_PRO" if engine == "EA" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else "DISABLED"))),
+            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "PRICE70") and analysis.get("confirmed")),
+            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RENKO_HASHI_PRO" if engine == "EA" else ("LOCAL_PRICE_ACTION_70" if engine == "PRICE70" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else "DISABLED")))),
             "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
                 else (analysis.get("strategy", "EA RENKO HASHI PRO + XGBOOST") if engine == "EA"
+                      else (analysis.get("strategy", "ROBÔ PAVIO 70% + ENGOLFO 70%") if engine == "PRICE70"
                       else (analysis.get("strategy", "ROBÔ RUBIK ADAPTADO") if engine == "RUBIK"
                             else (analysis.get("strategy", "EA Força do Movimento") if engine == "FORCE"
-                                  else analysis.get("strategy", f"{engine_title} {tf_label}"))))
+                                  else analysis.get("strategy", f"{engine_title} {tf_label}")))))
             ),
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
@@ -8971,8 +9154,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             fingerprint_key = (
                 "pure_ai_fingerprint" if engine == "SMART"
                 else ("ea_fingerprint" if engine == "EA"
+                      else ("price70_fingerprint" if engine == "PRICE70"
                       else ("rubik_fingerprint" if engine == "RUBIK"
-                            else ("force_fingerprint" if engine == "FORCE" else "graph_ai_fingerprint")))
+                            else ("force_fingerprint" if engine == "FORCE" else "graph_ai_fingerprint"))))
             )
             if release_state.get(fingerprint_key) != signal_fingerprint:
                 # v3.6: SOMENTE a IA GRÁFICA tem intervalo mínimo de 4 minutos
@@ -9004,7 +9188,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 )
                 base.update({
                     "direction": direction_now,
-                    "status": (smart_status if engine == "SMART" else ("SINAL DUPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO")))),
+                    "status": (smart_status if engine == "SMART" else ("SINAL DUPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL PAVIO/ENGOLFO 70% LIBERADO" if engine == "PRICE70" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -9024,7 +9208,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA Renko Hashi Pro + XGBoost, a entrada exige a dupla confirmação.
                 # O aprendizado adaptativo extra permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("EA", "RUBIK"):
+                if engine not in ("EA", "RUBIK", "PRICE70"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -12164,11 +12348,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE ou RUBIK.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "PRICE70"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK ou PRICE70.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("EA", "FORCE", "RUBIK"):
+    if engine in ("EA", "FORCE", "RUBIK", "PRICE70"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -12203,6 +12387,19 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
                     data["feed_message"] = "EA Dupla usando candles OTC reais da sessão IQ Option."
+            elif engine == "PRICE70":
+                if requested_market == "OPEN":
+                    feed_info = _current_open_feed_info(symbol, interval)
+                    feed_src = str(feed_info.get("source") or "MULTIFEED")
+                    data["feed_source"] = feed_src
+                    data["feed_label"] = _feed_source_label(feed_src)
+                    data["feed_fallback"] = bool(feed_info.get("fallback"))
+                    data["feed_message"] = "Robô Pavio/Engolfo 70% usando candles fechados do mercado aberto via roteador multifuente."
+                else:
+                    data["feed_source"] = "IQ_OPTION_OTC"
+                    data["feed_label"] = _feed_source_label(data["feed_source"])
+                    data["feed_fallback"] = False
+                    data["feed_message"] = "Robô Pavio/Engolfo 70% usando candles OTC reais da sessão IQ Option."
             elif engine == "RUBIK":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -12640,7 +12837,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "PRICE70"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -12657,13 +12854,13 @@ async def pre_signals(
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "PRICE70")
     if fallback_twelve:
         market = "OPEN"
-    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK") and not iq_state:
+    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "PRICE70") and not iq_state:
         return {
             "ok": True,
-            "message": ("EA Dupla OTC aguardando conexão com a IQ Option." if engine == "EA" else "Robô Rubik Adaptado OTC aguardando conexão com a IQ Option."),
+            "message": ("EA Dupla OTC aguardando conexão com a IQ Option." if engine == "EA" else ("Robô Pavio/Engolfo 70% OTC aguardando conexão com a IQ Option." if engine == "PRICE70" else "Robô Rubik Adaptado OTC aguardando conexão com a IQ Option.")),
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -12724,7 +12921,7 @@ async def pre_signals(
         key = f"{group_key}|{symbol}"
         try:
             pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (120 if engine == "RUBIK" else 90))
-            if engine in ("EA", "RUBIK") and requested_market == "IQ_OTC":
+            if engine in ("EA", "RUBIK", "PRICE70") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
                 )
@@ -12746,6 +12943,19 @@ async def pre_signals(
                         "reason": xgb_preview.get("reason", "XGBoost monitorando."),
                     }
                     if xgb_preview.get("confirmed") and xgb_preview.get("direction") in ("CALL", "PUT")
+                    else None
+                )
+            elif engine == "PRICE70":
+                price70_rows = raw[:-1] if len(raw) > 1 else raw
+                price70_preview = wick_engulf_70_strategy(price70_rows, interval, market=requested_market)
+                preview = (
+                    {
+                        "direction": price70_preview.get("direction"),
+                        "confidence": price70_preview.get("confidence", 0),
+                        "strategy": price70_preview.get("strategy", "ROBÔ PAVIO 70% + ENGOLFO 70%"),
+                        "reason": price70_preview.get("reason", "Pavio/Engolfo 70% monitorando."),
+                    }
+                    if price70_preview.get("confirmed") and price70_preview.get("direction") in ("CALL", "PUT")
                     else None
                 )
             elif engine == "RUBIK":
@@ -13086,12 +13296,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE ou RUBIK.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "PRICE70"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK ou PRICE70.")
 
     requested_market = market
-    iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK")
+    iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine in ("EA", "PRICE70") and requested_market == "IQ_OTC")) else None
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "PRICE70")
     if fallback_twelve:
         market = "OPEN"
 
@@ -13150,6 +13360,13 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 )
             else:
                 raw = await candles(sym, interval, radar_n, "OPEN", None, request=request)
+        elif engine == "PRICE70":
+            if market == "IQ_OTC":
+                if not iq_state:
+                    raise RuntimeError("Conecte a IQ Option para o Robô Pavio/Engolfo 70% analisar OTC.")
+                raw = await iq_ea_candles(iq_state, sym, interval, 90, regular_market=False)
+            else:
+                raw = await candles(sym, interval, 90, "OPEN", None, request=request)
         elif engine == "RUBIK":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -13172,6 +13389,16 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 engine_label = "EA RENKO HASHI PRO + XGBOOST"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why = str(tech.get("reason") or "XGBoost monitorando").replace("\n", " ")[:88]
+                status_text = (
+                    f"{engine_label} • OPORTUNIDADE ENCONTRADA"
+                    if direction != "NEUTRO"
+                    else f"{engine_label} • MONITORANDO • {why}"
+                )
+            elif engine == "PRICE70":
+                tech = wick_engulf_70_strategy(closed, interval, market=market)
+                engine_label = "ROBÔ PAVIO 70% + ENGOLFO 70%"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "Pavio/Engolfo monitorando").replace("\n", " ")[:88]
                 status_text = (
                     f"{engine_label} • OPORTUNIDADE ENCONTRADA"
                     if direction != "NEUTRO"
@@ -13242,12 +13469,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if (engine in ("EA", "RUBIK") or (engine == "FORCE" and market == "IQ_OTC"))
+                    status_text if (engine in ("EA", "RUBIK", "PRICE70") or (engine == "FORCE" and market == "IQ_OTC"))
                     else (((_feed_source_label(_feed_source_from_rows(raw)) + " • " + status_text) if market == "OPEN" else status_text))
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
+                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "PRICE70") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
@@ -13303,7 +13530,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
+            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "PRICE70") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -14082,7 +14309,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .robot-mode-copy{min-width:150px}
 .robot-mode-title{font-weight:900;font-size:13px;letter-spacing:.4px}
 .robot-mode-desc{font-size:11px;color:#9fb2ca;margin-top:3px;max-width:245px}
-#robotPowerBtn,#aiPowerBtn,#eaPowerBtn,#rubikPowerBtn,#forcePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+#robotPowerBtn,#aiPowerBtn,#eaPowerBtn,#rubikPowerBtn,#forcePowerBtn,#price70PowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
 
 .daily-engine-board{margin-top:14px;border-color:#1c82c9;background:linear-gradient(180deg,#0b1b2e,#071321);box-shadow:0 0 24px #00aaff22}
 .daily-engine-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
@@ -14254,6 +14481,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="rubikPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
+  <div class="robot-mode-card" id="price70ModeCard">
+    <img src="__MEGA_IMAGE__" alt="Robô Pavio e Engolfo 70%">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">🕯️ ROBÔ PAVIO + ENGOLFO 70%</div>
+      <div class="robot-mode-desc" id="price70ModeDesc">2 estratégias independentes • a primeira que acontecer libera o sinal • pavio 70% do corpo ou engolfo 70% da vela anterior • próxima vela.</div>
+    </div>
+    <button id="price70PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
   <div class="robot-mode-card" id="forceModeCard">
     <img src="__MEGA_IMAGE__" alt="EA Força do Movimento">
     <div class="robot-mode-copy">
@@ -14266,7 +14502,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="tabs">
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
     <button class="tabbtn" id="tabChart">📈 Gráfico</button>
-    <button class="tabbtn" id="tabIndicator">🧭 Indicador</button>
     <button class="tabbtn" id="tabResults">🎯 Resultados</button>
     <button class="tabbtn" id="tabValues">💰 Valores</button>
     <button class="tabbtn" id="tabHistory">🗓️ Histórico 15 dias</button>
@@ -14351,56 +14586,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="label" style="margin-top:10px;line-height:1.45">
         O percentual abaixo é um <b>índice de compatibilidade com o momento atual</b>, calculado antes das entradas.
         Não é taxa de acerto, não usa WIN/LOSS anterior e o estudo não abre nenhuma operação.
-      </div>
-    </div>
-  </div>
-
-
-  <div id="indicatorTab" class="tab">
-    <div class="card" style="max-width:760px;margin:0 auto">
-      <div style="display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap">
-        <div>
-          <div class="label">🧭 INDICADOR</div>
-          <div style="font-size:22px;font-weight:1000;margin-top:4px">RENKO HASHI PRO</div>
-          <div style="opacity:.78;margin-top:5px;line-height:1.45">Somente este indicador nesta aba • candles fechados • não repinta • sem RSI, MACD, médias ou IA externa.</div>
-        </div>
-        <button id="heikenIndicatorPowerBtn" type="button" style="font-weight:1000;min-width:150px">🟢 ONLINE</button>
-      </div>
-
-      <div class="grid" style="margin-top:14px">
-        <div class="card signal" style="grid-column:auto">
-          <div class="label">SINAL</div>
-          <div id="heikenIndicatorDirection" class="big neutral">MONITORANDO</div>
-          <div id="heikenIndicatorConfidence">Confiança: --</div>
-        </div>
-        <div class="card">
-          <div class="label">STATUS</div>
-          <div id="heikenIndicatorStatus" style="font-weight:900;margin-top:8px">Aguardando leitura...</div>
-          <div id="heikenIndicatorRisk" style="margin-top:7px">Risco: --</div>
-        </div>
-      </div>
-
-      <div class="card" style="margin-top:12px">
-        <div class="label">LEITURA</div>
-        <div id="heikenIndicatorReason" style="font-weight:800;line-height:1.5;margin-top:7px">O indicador está monitorando o último candle fechado.</div>
-        <div id="heikenIndicatorFeed" style="font-size:12px;opacity:.72;margin-top:8px">Fonte: --</div>
-      </div>
-
-      <div class="label" style="margin-top:12px;line-height:1.5">
-        Regra PRO: direção suavizada pelo núcleo Heiken-Ashi + corpo mínimo + pavio contrário controlado + amplitude mínima. A seta do Renko Hashi Pro só é confirmada depois do fechamento da vela.
-      </div>
-    </div>
-  </div>
-
-  <div id="chartTab" class="tab">
-    <div class="card">
-      <div class="chartmeta">
-        <b>📈 Gráfico em tempo real</b>
-        <span class="chartbadge" id="chartInfo">--</span>
-      </div>
-      <div class="chartbox"><canvas id="priceChart"></canvas></div>
-      <div class="label" style="margin-top:8px">
-        O gráfico acompanha o mercado, par e período selecionados e atualiza automaticamente com a vela atual.
       </div>
     </div>
   </div>
@@ -14848,6 +15033,8 @@ const rubikPowerBtn=document.getElementById('rubikPowerBtn');
 const rubikModeDesc=document.getElementById('rubikModeDesc');
 const forcePowerBtn=document.getElementById('forcePowerBtn');
 const forceModeDesc=document.getElementById('forceModeDesc');
+const price70PowerBtn=document.getElementById('price70PowerBtn');
+const price70ModeDesc=document.getElementById('price70ModeDesc');
 const voiceBtn=document.getElementById('voiceBtn');
 const btcOnlyBtn=document.getElementById('btcOnlyBtn');
 const btcOnlyNote=document.getElementById('btcOnlyNote');
@@ -14869,18 +15056,22 @@ let aiEnabled=false;
 let eaEnabled=false;
 let rubikEnabled=false;
 let forceEnabled=false;
+let price70Enabled=false;
 try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
   aiEnabled=localStorage.getItem('mega_ai_power')==='ONLINE';
   eaEnabled=localStorage.getItem('mega_ea_power')==='ONLINE';
   rubikEnabled=localStorage.getItem('mega_rubik_power')==='ONLINE';
   forceEnabled=localStorage.getItem('mega_force_power')==='ONLINE';
-  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; }
-  else if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; }
+  price70Enabled=localStorage.getItem('mega_price70_power')==='ONLINE';
+  if(price70Enabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
+  else if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; price70Enabled=false; }
+  else if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; price70Enabled=false; }
   else if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; }
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
+  if(price70Enabled) return 'PRICE70';
   if(forceEnabled) return 'FORCE';
   if(rubikEnabled) return 'RUBIK';
   if(eaEnabled) return 'EA';
@@ -14909,17 +15100,6 @@ const valuesTab=document.getElementById('valuesTab');
 const historyTab=document.getElementById('historyTab');
 const compatibilityTab=document.getElementById('compatibilityTab');
 const telegramTab=document.getElementById('telegramTab');
-const indicatorTab=document.getElementById('indicatorTab');
-const tabIndicator=document.getElementById('tabIndicator');
-const heikenIndicatorPowerBtn=document.getElementById('heikenIndicatorPowerBtn');
-const heikenIndicatorDirection=document.getElementById('heikenIndicatorDirection');
-const heikenIndicatorConfidence=document.getElementById('heikenIndicatorConfidence');
-const heikenIndicatorStatus=document.getElementById('heikenIndicatorStatus');
-const heikenIndicatorRisk=document.getElementById('heikenIndicatorRisk');
-const heikenIndicatorReason=document.getElementById('heikenIndicatorReason');
-const heikenIndicatorFeed=document.getElementById('heikenIndicatorFeed');
-let heikenIndicatorEnabled=true;
-try{ heikenIndicatorEnabled=localStorage.getItem('mega_heiken_indicator_power')!=='OFFLINE'; }catch(_){}
 const tabResults=document.getElementById('tabResults');
 const tabValues=document.getElementById('tabValues');
 const tabHistory=document.getElementById('tabHistory');
@@ -15734,6 +15914,8 @@ function normalizeEngineKey(value){
   if(e==='SMART' || e==='AI' || e==='IA') return 'SMART';
   if(e==='EA' || e==='EA_AUTONOMOUS_IQ' || e==='EA_XGBOOST' || e==='EA_XGBOOST_AUTONOMOUS') return 'EA';
   if(e==='FORCE' || e==='EA_FORCE_MOVEMENT') return 'FORCE';
+  if(e==='PRICE70' || e==='PRICE_ACTION_70') return 'PRICE70';
+  if(e==='RUBIK' || e==='RUBIK_ADAPTED') return 'RUBIK';
   return '';
 }
 
@@ -15748,7 +15930,8 @@ function momentStudyEngineName(key){
     SMART:'🤖 INTELIGÊNCIA ARTIFICIAL',
     EA:'⚡ EA RENKO HASHI PRO + XGBOOST',
     RUBIK:'🧩 ROBÔ RUBIK ADAPTADO',
-    FORCE:'💥 EA FORÇA DO MOVIMENTO'
+    FORCE:'💥 EA FORÇA DO MOVIMENTO',
+    PRICE70:'🕯️ ROBÔ PAVIO + ENGOLFO 70%'
   };
   return names[String(key||'').toUpperCase()]||String(key||'MOTOR');
 }
@@ -16039,7 +16222,7 @@ function rememberPendingTrade(sig){
   if(!sig.expiry_time || !sig.entry_time) return;
 
   const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
-  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE'));
+  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='PRICE70'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('PRICE_ACTION_70'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
     // EA Dupla e EA Força são apurados na primeira vela; outros motores preservam G1/G2.
@@ -16056,7 +16239,7 @@ function rememberPendingTrade(sig){
     confidence:Number(sig.confidence||0),
     risk:String(sig.risk||''),
     strategy:String(sig.strategy||''),
-    engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':String(sig.selected_engine||sig.mode||''))),
+    engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('PRICE_ACTION_70')?'PRICE70':String(sig.selected_engine||sig.mode||'')))),
     entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH')),
     value_stake:currentValueStake(),
     value_payout:currentValuePayout(),
@@ -17419,59 +17602,9 @@ if(telegramFindBtn) telegramFindBtn.onclick=findTelegramGroups;
 if(telegramTestBtn) telegramTestBtn.onclick=testTelegram;
 loadTelegramSettings();
 
-function paintHeikenIndicatorPower(){
-  if(!heikenIndicatorPowerBtn) return;
-  heikenIndicatorPowerBtn.textContent=heikenIndicatorEnabled?'🟢 ONLINE':'🔴 OFFLINE';
-  heikenIndicatorPowerBtn.style.background=heikenIndicatorEnabled?'#0b7a3d':'#7d1d1d';
-  heikenIndicatorPowerBtn.style.color='#fff';
-  heikenIndicatorPowerBtn.style.borderColor=heikenIndicatorEnabled?'#16c56b':'#ff5252';
-  if(!heikenIndicatorEnabled){
-    if(heikenIndicatorDirection){ heikenIndicatorDirection.textContent='OFFLINE'; heikenIndicatorDirection.className='big neutral'; }
-    if(heikenIndicatorConfidence) heikenIndicatorConfidence.textContent='Confiança: --';
-    if(heikenIndicatorStatus) heikenIndicatorStatus.textContent='Indicador pausado.';
-    if(heikenIndicatorRisk) heikenIndicatorRisk.textContent='Risco: --';
-    if(heikenIndicatorReason) heikenIndicatorReason.textContent='Coloque o indicador ONLINE para voltar a analisar.';
-  }
-}
-
-async function loadHeikenIndicator(){
-  if(!heikenIndicatorEnabled || !heikenIndicatorStatus) return;
-  const sym=(S&&S.value)||'EUR/USD';
-  const tf=(interval&&interval.value)||'1min';
-  const mk=(market&&market.value)||'OPEN';
-  heikenIndicatorStatus.textContent='RENKO HASHI PRO • ANALISANDO CANDLE FECHADO...';
-  try{
-    const d=await get('/indicator-heiken?symbol='+encodeURIComponent(sym)+'&interval='+encodeURIComponent(tf)+'&market='+encodeURIComponent(mk)+'&t='+Date.now());
-    const dir=String(d.direction||'NEUTRO').toUpperCase();
-    if(heikenIndicatorDirection){
-      heikenIndicatorDirection.textContent=dir;
-      heikenIndicatorDirection.className='big '+(dir==='CALL'?'call':(dir==='PUT'?'put':'neutral'));
-    }
-    if(heikenIndicatorConfidence) heikenIndicatorConfidence.textContent='Confiança: '+Number(d.confidence||0).toFixed(1)+'%';
-    if(heikenIndicatorStatus) heikenIndicatorStatus.textContent=d.status||'RENKO HASHI PRO • MONITORANDO';
-    if(heikenIndicatorRisk) heikenIndicatorRisk.textContent='Risco: '+String(d.risk||'--');
-    if(heikenIndicatorReason) heikenIndicatorReason.textContent=d.reason||'Aguardando nova troca de direção confirmada.';
-    if(heikenIndicatorFeed) heikenIndicatorFeed.textContent='Fonte: '+String(d.feed_label||d.feed_source||'--')+' • '+sym+' • '+tf;
-  }catch(e){
-    if(heikenIndicatorStatus) heikenIndicatorStatus.textContent='RENKO HASHI PRO • FONTE EM ESPERA';
-    if(heikenIndicatorReason) heikenIndicatorReason.textContent='Não foi possível concluir a leitura agora.';
-  }
-}
-
-if(heikenIndicatorPowerBtn){
-  heikenIndicatorPowerBtn.onclick=()=>{
-    heikenIndicatorEnabled=!heikenIndicatorEnabled;
-    try{localStorage.setItem('mega_heiken_indicator_power',heikenIndicatorEnabled?'ONLINE':'OFFLINE')}catch(_){}
-    paintHeikenIndicatorPower();
-    if(heikenIndicatorEnabled) loadHeikenIndicator();
-  };
-}
-paintHeikenIndicatorPower();
-
 function showTab(which){
   const main=which==='main';
   const chart=which==='chart';
-  const indicator=which==='indicator';
   const results=which==='results';
   const values=which==='values';
   const history=which==='history';
@@ -17481,7 +17614,6 @@ function showTab(which){
 
   mainTab.classList.toggle('active',main);
   chartTab.classList.toggle('active',chart);
-  indicatorTab.classList.toggle('active',indicator);
   resultsTab.classList.toggle('active',results);
   valuesTab.classList.toggle('active',values);
   historyTab.classList.toggle('active',history);
@@ -17491,7 +17623,6 @@ function showTab(which){
 
   tabMain.classList.toggle('active',main);
   tabChart.classList.toggle('active',chart);
-  tabIndicator.classList.toggle('active',indicator);
   tabResults.classList.toggle('active',results);
   tabValues.classList.toggle('active',values);
   tabHistory.classList.toggle('active',history);
@@ -17499,9 +17630,6 @@ function showTab(which){
   tabTelegram.classList.toggle('active',telegram);
   tabAccount.classList.toggle('active',account);
 
-  if(indicator){
-    loadHeikenIndicator();
-  }
 
   if(chart){
     loadChart();
@@ -17536,7 +17664,6 @@ function showTab(which){
 
 tabMain.onclick=()=>showTab('main');
 tabChart.onclick=()=>showTab('chart');
-tabIndicator.onclick=()=>showTab('indicator');
 tabResults.onclick=()=>showTab('results');
 tabValues.onclick=()=>showTab('values');
 tabHistory.onclick=()=>showTab('history');
@@ -18153,6 +18280,12 @@ function applyRobotPowerState(){
     forcePowerBtn.style.color='#fff';
     forcePowerBtn.style.borderColor=forceEnabled?'#16c56b':'#ff5252';
   }
+  if(price70PowerBtn){
+    price70PowerBtn.textContent=price70Enabled?'🟢 ONLINE':'🔴 OFFLINE';
+    price70PowerBtn.style.background=price70Enabled?'#0b7a3d':'#7d1d1d';
+    price70PowerBtn.style.color='#fff';
+    price70PowerBtn.style.borderColor=price70Enabled?'#16c56b':'#ff5252';
+  }
 
   if(robotModeDesc) robotModeDesc.textContent=robotEnabled
     ? 'ONLINE: IA Gráfica lendo padrões, H1, Dow H4 e LTA/LTB sem RSI.'
@@ -18169,9 +18302,17 @@ function applyRobotPowerState(){
   if(forceModeDesc) forceModeDesc.textContent=forceEnabled
     ? 'ONLINE: OPEN multifuente para qualquer corretora Forex • OTC pela IQ Option • configuração protegida • sem Gale.'
     : 'OFFLINE: EA Força do Movimento pausado • configuração protegida.';
+  if(price70ModeDesc) price70ModeDesc.textContent=price70Enabled
+    ? 'ONLINE: duas estratégias independentes • a primeira que aparecer em candle fechado libera a próxima vela • OPEN/OTC.'
+    : 'OFFLINE: Robô Pavio + Engolfo 70% pausado.';
 
   const engine=selectedRobotEngine();
-  if(engine==='FORCE'){
+  if(engine==='PRICE70'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBÔ PAVIO + ENGOLFO 70% ONLINE • PRIMEIRO GATILHO LIBERA • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🕯️ Pavio 70% ou Engolfo 70% • a primeira condição válida libera o sinal.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar Pavio/Engolfo 70% ativo • candles fechados • OPEN/OTC</div>';
+    rad();
+  }else if(engine==='FORCE'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA FORÇA DO MOVIMENTO ONLINE • CONFIGURAÇÃO PROTEGIDA • FOCO EM WIN DIRETO';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">💥 EA Força do Movimento selecionado • parâmetros não exibidos.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar do EA Força do Movimento ativo • OPEN multifuente / OTC pela IQ Option</div>';
@@ -18198,7 +18339,7 @@ function applyRobotPowerState(){
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial, Robô Rubik e EAs estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial, Robô Pavio/Engolfo, Robô Rubik e EAs estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -18218,13 +18359,14 @@ function resetEngineVisualState(){
 
 async function setRobotPower(enabled){
   robotEnabled=!!enabled;
-  if(robotEnabled){ aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
+  if(robotEnabled){ aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; price70Enabled=false; }
   try{
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_price70_power', price70Enabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -18236,13 +18378,14 @@ async function setRobotPower(enabled){
 
 async function setAiPower(enabled){
   aiEnabled=!!enabled;
-  if(aiEnabled){ robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
+  if(aiEnabled){ robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; price70Enabled=false; }
   try{
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_price70_power', price70Enabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -18254,13 +18397,14 @@ async function setAiPower(enabled){
 
 async function setEaPower(enabled){
   eaEnabled=!!enabled;
-  if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; }
+  if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; price70Enabled=false; }
   try{
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_price70_power', price70Enabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -18272,13 +18416,14 @@ async function setEaPower(enabled){
 
 async function setRubikPower(enabled){
   rubikEnabled=!!enabled;
-  if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; }
+  if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; price70Enabled=false; }
   try{
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_price70_power', price70Enabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -18290,9 +18435,10 @@ async function setRubikPower(enabled){
 
 async function setForcePower(enabled){
   forceEnabled=!!enabled;
-  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; }
+  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; price70Enabled=false; }
   try{
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_price70_power', price70Enabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
@@ -18306,11 +18452,31 @@ async function setForcePower(enabled){
   if(voiceEnabled) speak(forceEnabled ? 'EA Força do Movimento online.' : 'EA Força do Movimento offline.');
 }
 
+async function setPrice70Power(enabled){
+  price70Enabled=!!enabled;
+  if(price70Enabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; }
+  try{
+    localStorage.setItem('mega_price70_power', price70Enabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(price70Enabled ? 'Robô Pavio e Engolfo 70 por cento online.' : 'Robô Pavio e Engolfo 70 por cento offline.');
+}
+
 if(robotPowerBtn) robotPowerBtn.onclick=()=>{ setRobotPower(!robotEnabled); };
 if(aiPowerBtn) aiPowerBtn.onclick=()=>{ setAiPower(!aiEnabled); };
 if(eaPowerBtn) eaPowerBtn.onclick=()=>{ setEaPower(!eaEnabled); };
 if(rubikPowerBtn) rubikPowerBtn.onclick=()=>{ setRubikPower(!rubikEnabled); };
 if(forcePowerBtn) forcePowerBtn.onclick=()=>{ setForcePower(!forceEnabled); };
+if(price70PowerBtn) price70PowerBtn.onclick=()=>{ setPrice70Power(!price70Enabled); };
 
 async function sig(announce=false){
   if(!appEnabled) return;
@@ -18536,7 +18702,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':(selectedRobotEngine()==='RUBIK'?'ROBÔ RUBIK':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':'IA GRÁFICA')))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
+    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='EA'?'EA':(selectedRobotEngine()==='PRICE70'?'ROBÔ PAVIO/ENGOLFO 70%':(selectedRobotEngine()==='RUBIK'?'ROBÔ RUBIK':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':'IA GRÁFICA'))))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
     await sig(true);
   }finally{
     radarAutoBusy=false;
@@ -18654,7 +18820,7 @@ async function loadPreSignals(){
   const engine=selectedRobotEngine();
   if(engine==='OFF'){
     if(preSignalStatus) preSignalStatus.textContent='Pré-alerta aguardando um motor ficar ONLINE.';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔕 Coloque IA Gráfica, Inteligência Artificial ou EA ONLINE para usar o pré-alerta.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔕 Coloque um dos robôs/IA ONLINE para usar o pré-alerta.</div>';
     return;
   }
 
@@ -19150,7 +19316,6 @@ bootApp().catch(err=>{
 });
 
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) sig(false); },5000);
-setInterval(()=>{ if(appEnabled && !iqLoginInProgress && indicatorTab && indicatorTab.classList.contains('active')) loadHeikenIndicator(); },5000);
 
 // Candles são buscados em ritmo leve; o canvas faz a transição suave entre atualizações.
 setInterval(()=>{
