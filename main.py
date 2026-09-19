@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.43"
-PWA_VERSION = "v110"
+APP_VERSION = "3.44"
+PWA_VERSION = "v111"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -90,7 +90,7 @@ GEMINI_DAILY_BUDGET = max(1, int(os.getenv("GEMINI_DAILY_BUDGET", "45")))
 GEMINI_PREFILTER_MIN = float(os.getenv("GEMINI_PREFILTER_MIN", "64"))
 # 3.35: triagem da IA principal um pouco menos rígida que antes.
 # A saída final continua protegida por confiança, risco, XGBoost e gate de price action.
-SMART_PREFILTER_MIN = float(os.getenv("SMART_PREFILTER_MIN", "58"))
+SMART_PREFILTER_MIN = float(os.getenv("SMART_PREFILTER_MIN", "55"))
 GEMINI_QUOTA_TZ = ZoneInfo("America/Los_Angeles")
 _gemini_quota_lock = threading.RLock()
 _gemini_quota_state = {
@@ -317,7 +317,7 @@ PRE_SIGNAL_BATCH = 1
 # NUNCA finge que snapshots são ticks reais.
 MOMENT_EA_ENABLED = os.getenv("MOMENT_EA_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
 MOMENT_EA_WINDOW_SECONDS = max(10, min(45, int(os.getenv("MOMENT_EA_WINDOW_SECONDS", "30"))))
-MOMENT_EA_CONFIRM_SCORE = max(55.0, min(90.0, float(os.getenv("MOMENT_EA_CONFIRM_SCORE", "60"))))
+MOMENT_EA_CONFIRM_SCORE = max(55.0, min(90.0, float(os.getenv("MOMENT_EA_CONFIRM_SCORE", "58"))))
 MOMENT_EA_VETO_SCORE = max(60.0, min(95.0, float(os.getenv("MOMENT_EA_VETO_SCORE", "72"))))
 MOMENT_EA_MIN_TICKS = max(6, int(os.getenv("MOMENT_EA_MIN_TICKS", "12")))
 moment_ea_state: Dict[str, Any] = {}
@@ -7296,7 +7296,7 @@ Avalie price action de curto prazo: sequência de altas/baixas, corpos, pavios, 
 A previsão é para UMA vela à frente, não para a tendência geral.
 
 REGRAS DE QUALIDADE:
-- Se houver alternância frequente, corpos pequenos, pavios dos dois lados, compressão ou direção pouco clara: NEUTRO.
+- Se houver alternância frequente, corpos pequenos, pavios dos dois lados, compressão ou direção pouco clara: prefira NEUTRO. EXCEÇÃO: se o micro-momento ao vivo da EA Vela Atual e o XGBoost apontarem o MESMO lado com força razoável, avalie CALL/PUT pela continuidade curta em vez de neutralizar automaticamente.
 - Não persiga movimento já esticado sem nova confirmação.
 - CALL/PUT exige pelo menos duas evidências independentes de price action para a próxima vela.
 - Região H1 e padrão de vela são motores independentes e NÃO precisam concordar com esta análise.
@@ -7343,15 +7343,18 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         # A confiança bruta deixa de ser uma trava excessiva. O sinal ainda precisa
         # de direção da Luna, concordância estatística do XGBoost (ou concordância
         # suave + ticks reais fortes), price action e qualidade combinada.
-        low_min = max(float(OAI_MIN), 70.0 if interval == "1min" else 70.0)
+        # 3.44 — mais frequência, mas preservando análise cruzada.
+        # A confiança bruta deixa de bloquear sozinha setups em que Luna,
+        # XGBoost e a EA Vela Atual convergem. HIGH continua mais seletivo.
+        low_min = 68.0 if interval == "1min" else 68.0
         if risk == "LOW":
             required_conf = low_min
             quality_min = 63.0
         elif risk == "MEDIUM":
-            required_conf = max(low_min + 1.0, 71.0)
+            required_conf = 69.0
             quality_min = 64.0
         else:
-            required_conf = max(low_min + 6.0, 76.0)
+            required_conf = 74.0
             quality_min = 68.0
 
         moment_aligned = bool(
@@ -7361,10 +7364,27 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             and float(moment_hint.get("score") or 0.0) >= MOMENT_EA_CONFIRM_SCORE
         )
         if moment_aligned:
-            required_conf = max(float(OAI_MIN), required_conf - 2.0)
-            quality_min = max(64.0, quality_min - 3.0)
+            required_conf = max(66.0, required_conf - 2.0)
+            quality_min = max(60.0, quality_min - 3.0)
 
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
+
+        # 3.44: alternância leve não veta automaticamente quando as três camadas
+        # independentes apontam o mesmo lado. O override NÃO vale para HIGH e
+        # NÃO ignora discordância do XGBoost.
+        gate_override = False
+        if (
+            not gate_ok
+            and risk in ("LOW", "MEDIUM")
+            and moment_aligned
+            and xgb_ready
+            and xgb_agrees
+            and xgb_confidence >= 53.0
+            and "alternando/lateral" in str(gate_reason or "").lower()
+        ):
+            gate_ok = True
+            gate_override = True
+            gate_reason = "alternância leve aceita por alinhamento Luna + XGBoost + EA Vela Atual"
 
         xgb_validation = float(xgb_signal.get("validation_accuracy") or 0.0)
         # Score de qualidade: a confiança da IA pesa mais, mas a estatística do
@@ -7391,8 +7411,8 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             and moment_aligned
             and xgb_ready
             and xgb_agrees
-            and xgb_confidence >= 55.0
-            and xgb_validation >= 50.0
+            and xgb_confidence >= 53.0
+            and xgb_validation >= 49.0
         )
 
         blocked_reason = None
@@ -7455,6 +7475,7 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
                 "analysis_quality": analysis_quality,
                 "quality_min": quality_min,
                 "moment_aligned": bool(moment_aligned),
+                "gate_override": bool(gate_override),
                 "required_confidence": round(required_conf, 1),
                 "openai_primary": bool(OAI_KEY),
                 "gemini_fallback": bool(GEMINI_KEY),
@@ -17998,7 +18019,7 @@ setInterval(()=>{
 // Pré-alerta atualizado a cada 10 s; no SMART a EA Vela Atual mede micro-momento/ticks e alimenta a confirmação final.
 setInterval(()=>{
   if(appEnabled && !iqLoginInProgress && selectedRobotEngine()!=='OFF') loadPreSignals();
-},10000);
+},5000);
 
 // Com o app ligado, acompanha o resultado das operações abertas.
 setInterval(()=>{ if(appEnabled && !iqLoginInProgress) resultCheck(); },5000);
