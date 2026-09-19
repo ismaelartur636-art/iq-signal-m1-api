@@ -43,7 +43,7 @@ from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from statistics import median
 
-# ===== HEIKEN ASHI ARROWS PRO (motor interno, sem arquivo extra) =====
+# ===== RENKO HASHI PRO (núcleo Heiken-Ashi não repintável, sem arquivo extra) =====
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -77,7 +77,7 @@ def _heiken_ashi(rows):
 def heiken_ashi_arrows_strategy(cs, timeframe="1min", market="OPEN"):
     rows = list(cs or [])
     tf_label = {"1min": "M1", "5min": "M5", "15min": "M15", "30min": "M30"}.get(timeframe, timeframe)
-    name = f"HEIKEN ASHI ARROWS PRO {tf_label}"
+    name = f"RENKO HASHI PRO {tf_label}"
 
     def neutral(reason, confidence=0.0, diagnostics=None):
         out = {
@@ -88,7 +88,7 @@ def heiken_ashi_arrows_strategy(cs, timeframe="1min", market="OPEN"):
             "risk": "HIGH",
             "strategy": name,
             "engine": "HEIKEN",
-            "provider": "LOCAL_HEIKEN_ASHI_PRO",
+            "provider": "LOCAL_RENKO_HASHI_PRO",
             "reason": reason,
             "non_repaint": True,
             "closed_candles_only": True,
@@ -183,7 +183,7 @@ def heiken_ashi_arrows_strategy(cs, timeframe="1min", market="OPEN"):
     # So libera entrada quando a NOVA seta nasceu exatamente no ultimo candle fechado.
     if not last_signal or last_signal["index"] != len(rows) - 1:
         return neutral(
-            "Heiken Ashi PRO monitorando: nenhuma nova troca de direcao forte no ultimo candle fechado.",
+            "Renko Hashi Pro monitorando: nenhuma nova troca de direcao forte no ultimo candle fechado.",
             confidence=min(68.0, 45.0 + current_diag["ha_body_ratio"] * 20.0),
             diagnostics=current_diag,
         )
@@ -206,9 +206,9 @@ def heiken_ashi_arrows_strategy(cs, timeframe="1min", market="OPEN"):
         "risk": "LOW" if confidence >= 84.0 else "MEDIUM",
         "strategy": name,
         "engine": "HEIKEN",
-        "provider": "LOCAL_HEIKEN_ASHI_PRO",
+        "provider": "LOCAL_RENKO_HASHI_PRO",
         "reason": (
-            f"{direction} confirmado no ultimo candle fechado pelo Heiken Ashi PRO: "
+            f"{direction} confirmado no ultimo candle fechado pelo Renko Hashi Pro: "
             f"mudanca de direcao, corpo forte, pavio contrario controlado e amplitude valida."
         ),
         "non_repaint": True,
@@ -218,10 +218,10 @@ def heiken_ashi_arrows_strategy(cs, timeframe="1min", market="OPEN"):
         "diagnostics": diagnostics,
     }
 
-# ===== FIM HEIKEN ASHI ARROWS PRO =====
+# ===== FIM RENKO HASHI PRO =====
 
-APP_VERSION = "3.51"
-PWA_VERSION = "v118"
+APP_VERSION = "3.53"
+PWA_VERSION = "v120"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -251,14 +251,9 @@ XGB_MIN_TRAIN_SAMPLES = max(60, int(os.getenv("XGB_MIN_TRAIN_SAMPLES", "80")))
 XGB_RETRAIN_SECONDS = max(120, int(os.getenv("XGB_RETRAIN_SECONDS", "900")))
 XGB_MIN_PROBABILITY = min(0.80, max(0.52, float(os.getenv("XGB_MIN_PROBABILITY", "0.60"))))
 XGB_MIN_VALIDATION_ACCURACY = min(0.80, max(0.50, float(os.getenv("XGB_MIN_VALIDATION_ACCURACY", "0.52"))))
-# EA de confirmação tripla: XGBoost + RSI + Value Chart precisam apontar o mesmo lado.
+# EA de confirmação dupla: XGBoost + Renko Hashi Pro precisam apontar o mesmo lado.
 EA_XGB_MIN_PROBABILITY = min(0.85, max(0.52, float(os.getenv("EA_XGB_MIN_PROBABILITY", "0.60"))))
 EA_XGB_MIN_VALIDATION_ACCURACY = min(0.80, max(0.50, float(os.getenv("EA_XGB_MIN_VALIDATION_ACCURACY", "0.52"))))
-EA_RSI_PERIOD = max(5, int(os.getenv("EA_RSI_PERIOD", "14")))
-EA_RSI_OVERSOLD = max(5.0, min(45.0, float(os.getenv("EA_RSI_OVERSOLD", "30"))))
-EA_RSI_OVERBOUGHT = max(55.0, min(95.0, float(os.getenv("EA_RSI_OVERBOUGHT", "70"))))
-EA_VALUE_CHART_PERIOD = max(3, int(os.getenv("EA_VALUE_CHART_PERIOD", "5")))
-EA_VALUE_CHART_EXTREME = max(4.0, min(12.0, float(os.getenv("EA_VALUE_CHART_EXTREME", "8"))))
 xgb_model_cache: Dict[str, Dict[str, Any]] = {}
 xgb_model_guard = threading.RLock()
 
@@ -6664,97 +6659,56 @@ def _xgb_train_or_predict(rows, symbol, interval, model_scope="OPEN"):
     return base
 
 
-def _value_chart_close(rows, period=5):
-    """Value Chart clássico simplificado em unidade dinâmica de volatilidade.
+def _ea_renko_confirmation(rows, timeframe="1min", market="OPEN"):
+    """Confirmação do Renko Hashi Pro usando somente candles fechados.
 
-    Floating axis = média do preço mediano (H+L)/2.
-    Dynamic Volatility Unit = média do range (H-L) * 0.20.
-    Retorna o valor do fechamento da última vela fechada.
+    A EA não usa RSI neste motor. O Renko Hashi Pro reutiliza o núcleo
+    não-repaint do indicador e mantém a última direção travada até surgir
+    uma troca forte contrária. A confirmação final é feita junto do XGBoost.
     """
     rows = list(rows or [])
-    if len(rows) < period:
-        return None
-    block = rows[-period:]
-    try:
-        axis = sum((float(x["high"]) + float(x["low"])) / 2.0 for x in block) / period
-        avg_range = sum(max(float(x["high"]) - float(x["low"]), 0.0) for x in block) / period
-        dvu = avg_range * 0.20
-        if dvu <= 1e-12:
-            return None
-        return (float(block[-1]["close"]) - axis) / dvu
-    except Exception:
-        return None
-
-
-def _ea_rsi_value_confirmation(rows):
-    """Direção do RSI 14 + Value Chart usando somente candles fechados.
-
-    CALL: RSI toca/registra sobrevenda e vira para cima; Value Chart toca a
-    região extrema negativa e também vira para cima.
-    PUT: espelho na sobrecompra/região extrema positiva.
-    """
-    rows = list(rows or [])
-    need = max(EA_RSI_PERIOD + 2, EA_VALUE_CHART_PERIOD + 2)
     base = {
         "ready": False,
         "direction": "NEUTRO",
-        "rsi": None,
-        "rsi_prev": None,
-        "value_chart": None,
-        "value_chart_prev": None,
-        "rsi_direction": "NEUTRO",
-        "value_direction": "NEUTRO",
-        "reason": "Aguardando candles fechados para RSI e Value Chart.",
+        "renko_direction": "NEUTRO",
+        "renko_fresh_signal": False,
+        "renko_confidence": 0.0,
+        "reason": "Aguardando candles fechados para o Renko Hashi Pro.",
     }
-    if len(rows) < need:
+    if len(rows) < 18:
         return base
 
-    closes = [float(x["close"]) for x in rows]
-    r_now = rsi(closes, EA_RSI_PERIOD)
-    r_prev = rsi(closes[:-1], EA_RSI_PERIOD)
-    v_now = _value_chart_close(rows, EA_VALUE_CHART_PERIOD)
-    v_prev = _value_chart_close(rows[:-1], EA_VALUE_CHART_PERIOD)
-    if None in (r_now, r_prev, v_now, v_prev):
-        return base
+    renko = heiken_ashi_arrows_strategy(rows, timeframe, market=market)
+    renko_fresh = bool(renko.get("confirmed") and renko.get("direction") in ("CALL", "PUT"))
+    renko_dir = str(renko.get("direction") or "NEUTRO").upper()
+    if renko_dir not in ("CALL", "PUT"):
+        diag = renko.get("diagnostics") or {}
+        locked = str(diag.get("last_locked_direction") or "NEUTRO").upper()
+        if locked in ("CALL", "PUT"):
+            renko_dir = locked
 
-    r_call = min(float(r_prev), float(r_now)) <= EA_RSI_OVERSOLD and float(r_now) > float(r_prev)
-    r_put = max(float(r_prev), float(r_now)) >= EA_RSI_OVERBOUGHT and float(r_now) < float(r_prev)
-    v_call = min(float(v_prev), float(v_now)) <= -EA_VALUE_CHART_EXTREME and float(v_now) > float(v_prev)
-    v_put = max(float(v_prev), float(v_now)) >= EA_VALUE_CHART_EXTREME and float(v_now) < float(v_prev)
-
-    r_dir = "CALL" if r_call else "PUT" if r_put else "NEUTRO"
-    v_dir = "CALL" if v_call else "PUT" if v_put else "NEUTRO"
-    direction = r_dir if r_dir == v_dir and r_dir in ("CALL", "PUT") else "NEUTRO"
-
-    if direction in ("CALL", "PUT"):
-        reason = (
-            f"RSI {r_now:.1f} e Value Chart {v_now:.2f} confirmaram {direction} "
-            "na mesma região de excesso."
-        )
-    elif r_dir == "NEUTRO" and v_dir == "NEUTRO":
-        reason = f"RSI {r_now:.1f} e Value Chart {v_now:.2f} ainda sem região/direção comum."
-    elif r_dir != v_dir:
-        reason = f"RSI aponta {r_dir}, mas Value Chart aponta {v_dir}."
+    renko_conf = float(renko.get("confidence") or 0.0)
+    if renko_dir in ("CALL", "PUT"):
+        freshness = "nova seta" if renko_fresh else "direção travada"
+        reason = f"Renko Hashi Pro ({freshness}) confirma {renko_dir}."
     else:
-        reason = f"RSI {r_dir} e Value Chart {v_dir} ainda não fecharam a mesma direção."
+        reason = str(renko.get("reason") or "Renko Hashi Pro ainda está neutro.")
 
     base.update({
         "ready": True,
-        "direction": direction,
-        "rsi": round(float(r_now), 2),
-        "rsi_prev": round(float(r_prev), 2),
-        "value_chart": round(float(v_now), 3),
-        "value_chart_prev": round(float(v_prev), 3),
-        "rsi_direction": r_dir,
-        "value_direction": v_dir,
+        "direction": renko_dir if renko_dir in ("CALL", "PUT") else "NEUTRO",
+        "renko_direction": renko_dir,
+        "renko_fresh_signal": renko_fresh,
+        "renko_confidence": round(renko_conf, 1),
+        "renko": renko,
         "reason": reason,
-        "rsi_period": EA_RSI_PERIOD,
-        "rsi_oversold": EA_RSI_OVERSOLD,
-        "rsi_overbought": EA_RSI_OVERBOUGHT,
-        "value_chart_period": EA_VALUE_CHART_PERIOD,
-        "value_chart_extreme": EA_VALUE_CHART_EXTREME,
     })
     return base
+
+
+# Compatibilidade interna com versões anteriores; não usa RSI.
+def _ea_rsi_renko_confirmation(rows, timeframe="1min", market="OPEN"):
+    return _ea_renko_confirmation(rows, timeframe, market)
 
 
 def _rubik_heikin_ashi(rows):
@@ -6989,25 +6943,25 @@ def rubik_adapted_strategy(cs, timeframe="1min", market="OPEN"):
 
 
 async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
-    """EA tripla confirmação — XGBoost + RSI 14 + Value Chart.
+    """EA dupla confirmação — XGBoost + Renko Hashi Pro.
 
-    Usa somente candles fechados. CALL/PUT só é liberado quando os três motores
-    apontam o mesmo lado. OPEN e IQ OTC continuam com modelos XGBoost separados.
+    Usa somente candles fechados. CALL/PUT só é liberado quando XGBoost e
+    Renko Hashi Pro apontam o mesmo lado. OPEN e IQ OTC continuam com modelos separados.
     """
     rows = list(cs or [])
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"EA RSI + VALUE CHART + XGBOOST {tf_label}"
+    name = f"EA RENKO HASHI PRO + XGBOOST {tf_label}"
     if len(rows) < XGB_MIN_CANDLES:
         return {
             "available": bool(XGBOOST_OK and XGB_ENABLED),
             "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
-            "risk": "HIGH", "strategy": name, "engine": "EA_XGB_RSI_VALUE",
-            "provider": "XGBOOST_RSI_VALUE_CHART",
+            "risk": "HIGH", "strategy": name, "engine": "EA_XGB_RENKO",
+            "provider": "XGBOOST_RENKO_HASHI_PRO",
             "reason": f"Coletando candles para o XGBoost ({len(rows)}/{XGB_MIN_CANDLES}).",
-            "triple_confirmation": True,
+            "dual_confirmation": True,
         }
 
-    indicators = _ea_rsi_value_confirmation(rows)
+    indicators = _ea_renko_confirmation(rows, timeframe, market)
     try:
         xgb = await asyncio.to_thread(
             _xgb_train_or_predict, rows, symbol, timeframe, f"EA_{str(market or 'OPEN').upper()}"
@@ -7016,9 +6970,9 @@ async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
         return {
             "available": False, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "strategy": name,
-            "engine": "EA_XGB_RSI_VALUE", "provider": "XGBOOST_RSI_VALUE_CHART",
+            "engine": "EA_XGB_RENKO", "provider": "XGBOOST_RENKO_HASHI_PRO",
             "reason": f"XGBoost indisponível: {str(exc)[:180]}",
-            "triple_confirmation": True, "indicator_confirmation": indicators,
+            "dual_confirmation": True, "indicator_confirmation": indicators,
         }
 
     confidence = float(xgb.get("confidence") or 0.0)
@@ -7043,22 +6997,22 @@ async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
     elif not strong:
         reason = f"XGBoost sem vantagem suficiente ({confidence:.1f}%)."
     elif not indicators.get("ready"):
-        reason = str(indicators.get("reason") or "RSI/Value Chart ainda não estão prontos.")
+        reason = str(indicators.get("reason") or "Renko Hashi Pro ainda não está pronto.")
     elif indicator_direction == "NEUTRO":
         reason = (
-            f"XGBoost aponta {xgb_direction} {confidence:.1f}%, mas RSI/Value Chart não concordaram: "
+            f"XGBoost aponta {xgb_direction} {confidence:.1f}%, mas o Renko Hashi Pro ainda não confirmou: "
             f"{indicators.get('reason')}"
         )
     elif indicator_direction != xgb_direction:
         reason = (
-            f"Sem sinal: XGBoost aponta {xgb_direction}, enquanto RSI + Value Chart apontam "
+            f"Sem sinal: XGBoost aponta {xgb_direction}, enquanto Renko Hashi Pro aponta "
             f"{indicator_direction}."
         )
     else:
         reason = (
-            f"TRIPLA CONFIRMAÇÃO {xgb_direction}: XGBoost {confidence:.1f}% • "
-            f"RSI {float(indicators.get('rsi') or 0):.1f} • "
-            f"Value Chart {float(indicators.get('value_chart') or 0):.2f} • "
+            f"DUPLA CONFIRMAÇÃO {xgb_direction}: XGBoost {confidence:.1f}% • "
+            
+            f"Renko Hashi Pro {str(indicators.get('renko_direction') or 'NEUTRO')} • "
             f"validação XGBoost {validation:.1f}%."
         )
 
@@ -7075,12 +7029,12 @@ async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
         "confirmed": confirmed,
         "risk": risk,
         "strategy": name,
-        "engine": "EA_XGB_RSI_VALUE",
-        "provider": "XGBOOST_RSI_VALUE_CHART",
+        "engine": "EA_XGB_RENKO",
+        "provider": "XGBOOST_RENKO_HASHI_PRO",
         "reason": reason[:360],
         "xgboost": xgb,
         "indicator_confirmation": indicators,
-        "triple_confirmation": True,
+        "dual_confirmation": True,
         "external_ai_disabled": True,
         "gale_signal": False,
         "non_repaint": True,
@@ -8694,7 +8648,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     try:
         if engine == "EA":
-            # EA RSI + Value Chart + XGBoost: OPEN usa o roteador normal (cTrader/multifuente);
+            # EA Renko Hashi Pro + XGBoost: OPEN usa o roteador normal (cTrader/multifuente);
             # OTC usa exclusivamente candles reais da sessão IQ Option.
             request_n = max(170, XGB_MIN_CANDLES + 30)
             if market == "IQ_OTC":
@@ -8702,13 +8656,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     out = neutral_signal(
                         symbol, interval, market,
                         "EA XGBOOST • IQ OPTION OFFLINE",
-                        "Conecte a IQ Option para a EA Tripla analisar candles OTC reais.",
+                        "Conecte a IQ Option para a EA Dupla analisar candles OTC reais.",
                         source_state="WAITING",
                     )
                     out.update({
-                        "strategy": "EA RSI + VALUE CHART + XGBOOST", "mode": "EA_XGBOOST_AUTONOMOUS",
+                        "strategy": "EA RENKO HASHI PRO + XGBOOST", "mode": "EA_XGBOOST_AUTONOMOUS",
                         "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
-                        "triple_confirmation": True, "gale_signal": False,
+                        "dual_confirmation": True, "gale_signal": False,
                     })
                     cache[key] = (time.time(), out)
                     return out
@@ -8834,7 +8788,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "INTELIGÊNCIA ARTIFICIAL"
             engine_mode = "PURE_AI"
         elif engine == "EA":
-            engine_title = "EA RSI + VALUE CHART + XGBOOST"
+            engine_title = "EA RENKO HASHI PRO + XGBOOST"
             engine_mode = "EA_XGBOOST_AUTONOMOUS"
         elif engine == "RUBIK":
             engine_title = "ROBÔ RUBIK ADAPTADO"
@@ -8861,7 +8815,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
-                    else ({"triple_confirmation": True, "inputs": ["RSI_14", "VALUE_CHART", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]}))
+                    else ({"dual_confirmation": True, "inputs": ["RENKO_HASHI_PRO", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]}))
                 ),
                 "legacy_ai_disabled": engine != "SMART",
                 "legacy_technical_strategies_disabled": True,
@@ -8935,11 +8889,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
             "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK") and analysis.get("confirmed")),
-            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RSI_VALUE_CHART" if engine == "EA" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else "DISABLED"))),
+            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RENKO_HASHI_PRO" if engine == "EA" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else "DISABLED"))),
             "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
-                else (analysis.get("strategy", "EA RSI + VALUE CHART + XGBOOST") if engine == "EA"
+                else (analysis.get("strategy", "EA RENKO HASHI PRO + XGBOOST") if engine == "EA"
                       else (analysis.get("strategy", "ROBÔ RUBIK ADAPTADO") if engine == "RUBIK"
                             else (analysis.get("strategy", "EA Força do Movimento") if engine == "FORCE"
                                   else analysis.get("strategy", f"{engine_title} {tf_label}"))))
@@ -9050,7 +9004,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 )
                 base.update({
                     "direction": direction_now,
-                    "status": (smart_status if engine == "SMART" else ("SINAL TRIPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO")))),
+                    "status": (smart_status if engine == "SMART" else ("SINAL DUPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO")))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -9067,8 +9021,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # 3.22: o histórico recente pode tornar o filtro mais seletivo.
                 # Só atua depois da amostra mínima e nunca altera candles/regras
                 # originais do motor; apenas barra setups estatisticamente fracos.
-                # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
-                # O aprendizado adaptativo permanece disponível para os outros motores.
+                # Na EA Renko Hashi Pro + XGBoost, a entrada exige a dupla confirmação.
+                # O aprendizado adaptativo extra permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
                 if engine not in ("EA", "RUBIK"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
@@ -12021,11 +11975,11 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
             "reason": "Mais flexível em cenários mistos, desde que o preço não esteja excessivamente lateral e a IA externa esteja disponível."
         },
         {
-            "key":"EA","name":"EA RSI + VALUE CHART + XGBOOST","score":autonomous,
+            "key":"EA","name":"EA RENKO HASHI PRO + XGBOOST","score":autonomous,
             "supported":True,"operational":bool(market=="OPEN" or iq_ready),
-            "reason": ("RSI + Value Chart + XGBoost usam candles do mercado aberto e não exigem login da IQ Option."
+            "reason": ("Renko Hashi Pro + XGBoost usam candles do mercado aberto e não exigem login da IQ Option."
                        if market=="OPEN" else
-                       "RSI + Value Chart + XGBoost usam candles OTC reais; no OTC exigem conexão ativa com a IQ Option.")
+                       "Renko Hashi Pro + XGBoost usam candles OTC reais; no OTC exigem conexão ativa com a IQ Option.")
         },
         {
             "key":"FORCE","name":"EA FORÇA DO MOVIMENTO","score":force,
@@ -12140,9 +12094,9 @@ async def indicator_heiken(
             "confidence": 0,
             "confirmed": False,
             "risk": "HIGH",
-            "strategy": f"HEIKEN ASHI ARROWS PRO {interval}",
+            "strategy": f"RENKO HASHI PRO {interval}",
             "reason": "Conecte a IQ Option para analisar o OTC real.",
-            "status": "HEIKEN ASHI PRO • IQ OPTION OFFLINE",
+            "status": "RENKO HASHI PRO • IQ OPTION OFFLINE",
             "non_repaint": True,
             "closed_candles_only": True,
             "market": market,
@@ -12169,9 +12123,9 @@ async def indicator_heiken(
             "ok": True,
             **analysis,
             "status": (
-                f"HEIKEN ASHI PRO • {analysis.get('direction')} CONFIRMADO"
+                f"RENKO HASHI PRO • {analysis.get('direction')} CONFIRMADO"
                 if analysis.get("confirmed") and analysis.get("direction") in ("CALL", "PUT")
-                else "HEIKEN ASHI PRO • MONITORANDO"
+                else "RENKO HASHI PRO • MONITORANDO"
             ),
             "market": market,
             "symbol": symbol,
@@ -12190,9 +12144,9 @@ async def indicator_heiken(
             "confidence": 0,
             "confirmed": False,
             "risk": "HIGH",
-            "strategy": f"HEIKEN ASHI ARROWS PRO {interval}",
+            "strategy": f"RENKO HASHI PRO {interval}",
             "reason": str(exc)[:220],
-            "status": "HEIKEN ASHI PRO • FONTE EM ESPERA",
+            "status": "RENKO HASHI PRO • FONTE EM ESPERA",
             "non_repaint": True,
             "closed_candles_only": True,
             "market": market,
@@ -12243,12 +12197,12 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = feed_src
                     data["feed_label"] = _feed_source_label(feed_src)
                     data["feed_fallback"] = bool(feed_info.get("fallback"))
-                    data["feed_message"] = "EA Tripla usando candles do mercado aberto via roteador cTrader/multifuente."
+                    data["feed_message"] = "EA Dupla usando candles do mercado aberto via roteador cTrader/multifuente."
                 else:
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                    data["feed_message"] = "EA Tripla usando candles OTC reais da sessão IQ Option."
+                    data["feed_message"] = "EA Dupla usando candles OTC reais da sessão IQ Option."
             elif engine == "RUBIK":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -12709,7 +12663,7 @@ async def pre_signals(
     if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK") and not iq_state:
         return {
             "ok": True,
-            "message": ("EA Tripla OTC aguardando conexão com a IQ Option." if engine == "EA" else "Robô Rubik Adaptado OTC aguardando conexão com a IQ Option."),
+            "message": ("EA Dupla OTC aguardando conexão com a IQ Option." if engine == "EA" else "Robô Rubik Adaptado OTC aguardando conexão com a IQ Option."),
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -12788,7 +12742,7 @@ async def pre_signals(
                     {
                         "direction": xgb_preview.get("direction"),
                         "confidence": xgb_preview.get("confidence", 0),
-                        "strategy": xgb_preview.get("strategy", "EA RSI + VALUE CHART + XGBOOST"),
+                        "strategy": xgb_preview.get("strategy", "EA RENKO HASHI PRO + XGBOOST"),
                         "reason": xgb_preview.get("reason", "XGBoost monitorando."),
                     }
                     if xgb_preview.get("confirmed") and xgb_preview.get("direction") in ("CALL", "PUT")
@@ -13190,7 +13144,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             radar_n = max(170, XGB_MIN_CANDLES + 30)
             if market == "IQ_OTC":
                 if not iq_state:
-                    raise RuntimeError("Conecte a IQ Option para a EA Tripla analisar OTC.")
+                    raise RuntimeError("Conecte a IQ Option para a EA Dupla analisar OTC.")
                 raw = await iq_ea_candles(
                     iq_state, sym, interval, radar_n, regular_market=False
                 )
@@ -13215,7 +13169,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             closed = raw[:-1] if len(raw) > 1 else raw
             if engine == "EA":
                 tech = await ea_xgboost_strategy(closed, sym, interval, market=market)
-                engine_label = "EA RSI + VALUE CHART + XGBOOST"
+                engine_label = "EA RENKO HASHI PRO + XGBOOST"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why = str(tech.get("reason") or "XGBoost monitorando").replace("\n", " ")[:88]
                 status_text = (
@@ -13712,7 +13666,7 @@ async def result(
     - LOSS/empate no G1 => aguarda G2.
     - WIN no G2 => WIN G2; caso contrário => LOSS G2.
 
-    ``direct_only=true`` fecha somente a primeira vela. EA Tripla e EA Força
+    ``direct_only=true`` fecha somente a primeira vela. EA Dupla e EA Força
     usam esse modo; os demais motores podem acompanhar G1/G2.
     """
     if not expiry_time:
@@ -13721,7 +13675,7 @@ async def result(
     market = (market or "OPEN").upper()
     direction = (direction or "CALL").upper()
     engine = str(engine or "").upper()
-    # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
+    # EA Dupla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
     ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK")
 
@@ -13759,7 +13713,7 @@ async def result(
         }
 
     # Apura na mesma família de fonte do sinal:
-    # EA Tripla OPEN -> cache/roteador multifuente; EA/FORCE OTC -> IQ Option.
+    # EA Dupla OPEN -> cache/roteador multifuente; EA/FORCE OTC -> IQ Option.
     # Os outros motores preservam a apuração existente.
     cs = (
         []
@@ -14285,8 +14239,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="robot-mode-card" id="eaModeCard">
     <img src="__MEGA_IMAGE__" alt="EA para opções binárias">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">⚡ EA RSI + VALUE CHART + XGBOOST</div>
-      <div class="robot-mode-desc" id="eaModeDesc">RSI 14 + Value Chart + XGBoost • OPEN + OTC IQ • sinal somente quando os 3 concordam.</div>
+      <div class="robot-mode-title">⚡ EA RENKO HASHI PRO + XGBOOST</div>
+      <div class="robot-mode-desc" id="eaModeDesc">Renko Hashi Pro + XGBoost • OPEN + OTC IQ • sinal somente quando os 2 concordam.</div>
     </div>
     <button id="eaPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -14407,7 +14361,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div style="display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap">
         <div>
           <div class="label">🧭 INDICADOR</div>
-          <div style="font-size:22px;font-weight:1000;margin-top:4px">HEIKEN ASHI ARROWS PRO</div>
+          <div style="font-size:22px;font-weight:1000;margin-top:4px">RENKO HASHI PRO</div>
           <div style="opacity:.78;margin-top:5px;line-height:1.45">Somente este indicador nesta aba • candles fechados • não repinta • sem RSI, MACD, médias ou IA externa.</div>
         </div>
         <button id="heikenIndicatorPowerBtn" type="button" style="font-weight:1000;min-width:150px">🟢 ONLINE</button>
@@ -14433,7 +14387,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
 
       <div class="label" style="margin-top:12px;line-height:1.5">
-        Regra PRO: troca de direção Heiken-Ashi + corpo mínimo + pavio contrário controlado + amplitude mínima da vela. A seta só é confirmada depois do fechamento da vela.
+        Regra PRO: direção suavizada pelo núcleo Heiken-Ashi + corpo mínimo + pavio contrário controlado + amplitude mínima. A seta do Renko Hashi Pro só é confirmada depois do fechamento da vela.
       </div>
     </div>
   </div>
@@ -15792,7 +15746,7 @@ function momentStudyEngineName(key){
   const names={
     GRAPH_AI:'🧠 IA GRÁFICA',
     SMART:'🤖 INTELIGÊNCIA ARTIFICIAL',
-    EA:'⚡ EA RSI + VALUE CHART + XGBOOST',
+    EA:'⚡ EA RENKO HASHI PRO + XGBOOST',
     RUBIK:'🧩 ROBÔ RUBIK ADAPTADO',
     FORCE:'💥 EA FORÇA DO MOVIMENTO'
   };
@@ -16088,7 +16042,7 @@ function rememberPendingTrade(sig){
   const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
-    // EA Tripla e EA Força são apurados na primeira vela; outros motores preservam G1/G2.
+    // EA Dupla e EA Força são apurados na primeira vela; outros motores preservam G1/G2.
     direct_only:isDirectEa,
     market:signalResultMarket(sig),
     requested_market:sig.requested_market || (market&&market.value) || 'OPEN',
@@ -17485,7 +17439,7 @@ async function loadHeikenIndicator(){
   const sym=(S&&S.value)||'EUR/USD';
   const tf=(interval&&interval.value)||'1min';
   const mk=(market&&market.value)||'OPEN';
-  heikenIndicatorStatus.textContent='HEIKEN ASHI PRO • ANALISANDO CANDLE FECHADO...';
+  heikenIndicatorStatus.textContent='RENKO HASHI PRO • ANALISANDO CANDLE FECHADO...';
   try{
     const d=await get('/indicator-heiken?symbol='+encodeURIComponent(sym)+'&interval='+encodeURIComponent(tf)+'&market='+encodeURIComponent(mk)+'&t='+Date.now());
     const dir=String(d.direction||'NEUTRO').toUpperCase();
@@ -17494,12 +17448,12 @@ async function loadHeikenIndicator(){
       heikenIndicatorDirection.className='big '+(dir==='CALL'?'call':(dir==='PUT'?'put':'neutral'));
     }
     if(heikenIndicatorConfidence) heikenIndicatorConfidence.textContent='Confiança: '+Number(d.confidence||0).toFixed(1)+'%';
-    if(heikenIndicatorStatus) heikenIndicatorStatus.textContent=d.status||'HEIKEN ASHI PRO • MONITORANDO';
+    if(heikenIndicatorStatus) heikenIndicatorStatus.textContent=d.status||'RENKO HASHI PRO • MONITORANDO';
     if(heikenIndicatorRisk) heikenIndicatorRisk.textContent='Risco: '+String(d.risk||'--');
     if(heikenIndicatorReason) heikenIndicatorReason.textContent=d.reason||'Aguardando nova troca de direção confirmada.';
     if(heikenIndicatorFeed) heikenIndicatorFeed.textContent='Fonte: '+String(d.feed_label||d.feed_source||'--')+' • '+sym+' • '+tf;
   }catch(e){
-    if(heikenIndicatorStatus) heikenIndicatorStatus.textContent='HEIKEN ASHI PRO • FONTE EM ESPERA';
+    if(heikenIndicatorStatus) heikenIndicatorStatus.textContent='RENKO HASHI PRO • FONTE EM ESPERA';
     if(heikenIndicatorReason) heikenIndicatorReason.textContent='Não foi possível concluir a leitura agora.';
   }
 }
@@ -18207,8 +18161,8 @@ function applyRobotPowerState(){
     ? 'ONLINE: IA pura analisando somente candles e contexto de preço, sem indicadores.'
     : 'OFFLINE: análise inteligente pausada.';
   if(eaModeDesc) eaModeDesc.textContent=eaEnabled
-    ? 'ONLINE: RSI 14 + Value Chart + XGBoost • sinal somente com tripla confirmação • OPEN/OTC.'
-    : 'OFFLINE: EA RSI + Value Chart + XGBoost pausada.';
+    ? 'ONLINE: Renko Hashi Pro + XGBoost • sinal somente com dupla confirmação • OPEN/OTC.'
+    : 'OFFLINE: EA Renko Hashi Pro + XGBoost pausada.';
   if(rubikModeDesc) rubikModeDesc.textContent=rubikEnabled
     ? 'ONLINE: Rubik mais ativo • EMA 9/21 obrigatória + 2 de 3 entre Heikin-Ashi, RSI e MACD • OPEN/OTC.'
     : 'OFFLINE: Robô Rubik Adaptado pausado.';
@@ -18228,9 +18182,9 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar Robô Rubik ativo • Heikin-Ashi + EMA 9/21 + RSI 14 + MACD • OPEN/OTC</div>';
     rad();
   }else if(engine==='EA'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA TRIPLA CONFIRMAÇÃO ONLINE • RSI + VALUE CHART + XGBOOST • OPEN + OTC';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ EA Tripla selecionada • CALL/PUT só quando RSI + Value Chart + XGBoost concordarem.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar EA Tripla ativo • RSI + Value Chart + XGBoost • OPEN/OTC</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA DUPLA CONFIRMAÇÃO ONLINE • RENKO HASHI PRO + XGBOOST • OPEN + OTC';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ EA Dupla selecionada • CALL/PUT só quando Renko Hashi Pro + XGBoost concordarem.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar EA Dupla ativo • Renko Hashi Pro + XGBoost • OPEN/OTC</div>';
     rad();
   }else if(engine==='SMART'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='INTELIGÊNCIA ARTIFICIAL ONLINE • IA PURA ANALISANDO CANDLES';
