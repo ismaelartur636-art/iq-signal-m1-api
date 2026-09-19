@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.45"
+APP_VERSION = "3.46"
 PWA_VERSION = "v112"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -9548,20 +9548,20 @@ async def mega_ia_icon_192():
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = {
-        "id": "/mega-ia-trader-v76",
+        "id": "/mega-ia-trader-v92",
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v76",
+        "start_url": "/?pwa=v92",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=76", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=76", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=76", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=92", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=92", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=92", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -13231,9 +13231,9 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=76">
-<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=76">
-<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=76">
+<link rel="manifest" href="/manifest.webmanifest?v=92">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=92">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=92">
 <meta name="theme-color" content="#07182b">
 <meta name="application-name" content="Mega IA Trader">
 <meta name="apple-mobile-web-app-title" content="Mega IA Trader">
@@ -13477,6 +13477,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
     <button class="tabbtn" id="tabChart">📈 Gráfico</button>
     <button class="tabbtn" id="tabResults">🎯 Resultados</button>
+    <button class="tabbtn" id="tabValues">💰 Placar R$</button>
     <button class="tabbtn" id="tabHistory">🗓️ Histórico 15 dias</button>
     <button class="tabbtn" id="tabCompatibility">🧪 Compatibilidade</button>
     <button class="tabbtn" id="tabTelegram">✈️ Telegram</button>
@@ -13620,6 +13621,69 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         WIN DIRETO mostra as operações que venceram na primeira vela.
         No placar principal, WIN G1 e WIN G2 contam como WIN; LOSS só é contado se perder até o G2.
         Cada operação é contabilizada uma única vez e o histórico fica salvo neste aparelho.
+      </div>
+    </div>
+  </div>
+
+  <div id="valuesTab" class="tab">
+    <div class="card">
+      <h2 style="margin-top:0">💰 Placar de valores</h2>
+      <div class="label">ESCOLHA O VALOR BASE DA ENTRADA</div>
+
+      <div id="valueStakeButtons" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px">
+        <button type="button" data-value-stake="5" style="font-weight:1000">R$ 5</button>
+        <button type="button" data-value-stake="10" style="font-weight:1000">R$ 10</button>
+        <button type="button" data-value-stake="20" style="font-weight:1000">R$ 20</button>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px;align-items:end">
+        <div>
+          <div class="label">PAYOUT / RETORNO (%)</div>
+          <input id="valuePayout" type="number" min="1" max="100" step="1" value="80"
+                 style="width:100%;box-sizing:border-box;margin-top:5px">
+        </div>
+        <div class="card" style="padding:10px">
+          <div class="label">ENTRADA SELECIONADA</div>
+          <div id="valueStakeSelected" class="big" style="font-size:22px">R$ 5,00</div>
+        </div>
+      </div>
+
+      <div class="grid" style="margin-top:12px">
+        <div class="card score-card score-win">
+          <div class="label">💵 LUCRO ACUMULADO</div>
+          <div id="valueProfit" class="big call">R$ 0,00</div>
+        </div>
+        <div class="card">
+          <div class="label">✅ GANHOS SOMADOS</div>
+          <div id="valueWon" class="big call">R$ 0,00</div>
+        </div>
+        <div class="card">
+          <div class="label">❌ PERDAS SOMADAS</div>
+          <div id="valueLost" class="big put">R$ 0,00</div>
+        </div>
+        <div class="card">
+          <div class="label">📊 OPERAÇÕES</div>
+          <div id="valueOps" class="big">0</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <div class="label">ÚLTIMO RESULTADO EM VALOR</div>
+        <div id="valueLastResult" class="big">--</div>
+        <div id="valueLastDetail" style="margin-top:7px">Aguardando a próxima operação finalizada.</div>
+      </div>
+
+      <div id="valueGaleNote" class="label" style="margin-top:10px;line-height:1.5">
+        WIN direto soma o payout da entrada. Em G1/G2, o cálculo considera as entradas anteriores e o multiplicador configurado na aba Corretora.
+      </div>
+
+      <button id="resetValueScoreBtn" type="button" style="width:100%;margin-top:12px;font-weight:900;border-color:#ffb74d">
+        🧹 ZERAR PLACAR DE VALORES
+      </button>
+
+      <div class="label" style="margin-top:10px;line-height:1.5">
+        Este placar é uma simulação local baseada no resultado dos sinais, no valor escolhido e no payout informado.
+        Ele não altera nem representa automaticamente o saldo real da corretora.
       </div>
     </div>
   </div>
@@ -13908,8 +13972,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 (function(){
   try{
     const u=new URL(window.location.href);
-    if(u.searchParams.get('pwa')!=='v91'){
-      u.searchParams.set('pwa','v91');
+    if(u.searchParams.get('pwa')!=='v92'){
+      u.searchParams.set('pwa','v92');
       window.history.replaceState({},'',u.pathname+u.search+u.hash);
     }
   }catch(_){}
@@ -14026,10 +14090,12 @@ const mainTab=document.getElementById('mainTab');
 const chartTab=document.getElementById('chartTab');
 const accountTab=document.getElementById('accountTab');
 const resultsTab=document.getElementById('resultsTab');
+const valuesTab=document.getElementById('valuesTab');
 const historyTab=document.getElementById('historyTab');
 const compatibilityTab=document.getElementById('compatibilityTab');
 const telegramTab=document.getElementById('telegramTab');
 const tabResults=document.getElementById('tabResults');
+const tabValues=document.getElementById('tabValues');
 const tabHistory=document.getElementById('tabHistory');
 const tabCompatibility=document.getElementById('tabCompatibility');
 const tabTelegram=document.getElementById('tabTelegram');
@@ -14057,6 +14123,16 @@ const lossG2=document.getElementById('lossG2');
 const resetResultsBtn=document.getElementById('resetResultsBtn');
 const galeLastResult=document.getElementById('galeLastResult');
 const galeStageStatus=document.getElementById('galeStageStatus');
+const valuePayout=document.getElementById('valuePayout');
+const valueStakeSelected=document.getElementById('valueStakeSelected');
+const valueProfit=document.getElementById('valueProfit');
+const valueWon=document.getElementById('valueWon');
+const valueLost=document.getElementById('valueLost');
+const valueOps=document.getElementById('valueOps');
+const valueLastResult=document.getElementById('valueLastResult');
+const valueLastDetail=document.getElementById('valueLastDetail');
+const valueGaleNote=document.getElementById('valueGaleNote');
+const resetValueScoreBtn=document.getElementById('resetValueScoreBtn');
 const tabMain=document.getElementById('tabMain');
 const tabChart=document.getElementById('tabChart');
 const tabAccount=document.getElementById('tabAccount');
@@ -14999,6 +15075,7 @@ function rememberPendingTrade(sig){
   if(!sig) return;
   if(sig.direction!=='CALL' && sig.direction!=='PUT') return;
   if(!sig.expiry_time || !sig.entry_time) return;
+  const valueCfg=valueScoreSettings();
 
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
@@ -15017,7 +15094,10 @@ function rememberPendingTrade(sig){
     risk:String(sig.risk||''),
     strategy:String(sig.strategy||''),
     engine:String(sig.selected_engine||sig.mode||''),
-    entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH'))
+    entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH')),
+    value_stake:valueCfg.stake,
+    value_payout:valueCfg.payout,
+    value_gale_multiplier:valueCfg.multiplier
   });
 }
 
@@ -15061,6 +15141,7 @@ function rememberChartSignal(pre){
 
   const expiryMs=entryMs+(intervalSecondsValue(interval.value)*1000);
   const expiryIso=new Date(expiryMs).toISOString();
+  const valueCfg=valueScoreSettings();
 
   enqueuePendingTrade({
     source:'CHART_20S',
@@ -15072,7 +15153,10 @@ function rememberChartSignal(pre){
     interval:interval.value,
     direction:pre.direction,
     entry_time:pre.entry_time,
-    expiry_time:expiryIso
+    expiry_time:expiryIso,
+    value_stake:valueCfg.stake,
+    value_payout:valueCfg.payout,
+    value_gale_multiplier:valueCfg.multiplier
   });
 }
 
@@ -15459,6 +15543,7 @@ if(autoTradeGaleMultiplier){
     autoTradeGaleMultiplier.value=String(cfg.multiplier);
     try{ localStorage.setItem('mega_auto_trade_gale_multiplier',String(cfg.multiplier)); }catch(_){}
     updateAutoTradePreview();
+    renderValueScore();
   };
 }
 
@@ -16373,10 +16458,231 @@ if(telegramFindBtn) telegramFindBtn.onclick=findTelegramGroups;
 if(telegramTestBtn) telegramTestBtn.onclick=testTelegram;
 loadTelegramSettings();
 
+const VALUE_SCORE_KEY='mega_value_score_v1';
+const VALUE_STAKE_KEY='mega_value_stake_v1';
+const VALUE_PAYOUT_KEY='mega_value_payout_v1';
+let valueStake=5;
+let valuePayoutPct=80;
+let valueScore={
+  profit:0,
+  won_value:0,
+  lost_value:0,
+  wins:0,
+  losses:0,
+  last_delta:0,
+  last_result:'--',
+  last_stake:5,
+  processed_keys:[]
+};
+
+function moneyBR(v){
+  const n=Number(v||0);
+  try{
+    return new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(Number.isFinite(n)?n:0);
+  }catch(_){
+    return 'R$ '+(Number.isFinite(n)?n:0).toFixed(2).replace('.',',');
+  }
+}
+
+function moneySignedBR(v){
+  const n=Number(v||0);
+  if(!Number.isFinite(n) || Math.abs(n)<0.005) return moneyBR(0);
+  return (n>0?'+':'-')+moneyBR(Math.abs(n));
+}
+
+function moneySpeech(v){
+  const n=Number(v||0);
+  const safe=Number.isFinite(n)?n:0;
+  const abs=Math.abs(safe);
+  let reais=Math.floor(abs+1e-9);
+  let cents=Math.round((abs-reais)*100);
+  if(cents>=100){ reais+=1; cents=0; }
+  const parts=[];
+  if(safe<0) parts.push('menos');
+  parts.push(String(reais),reais===1?'real':'reais');
+  if(cents){
+    parts.push('e',String(cents),cents===1?'centavo':'centavos');
+  }
+  return parts.join(' ');
+}
+
+function loadValueScore(){
+  try{
+    const s=Number(localStorage.getItem(VALUE_STAKE_KEY)||5);
+    valueStake=[5,10,20].includes(s)?s:5;
+    const p=Number(localStorage.getItem(VALUE_PAYOUT_KEY)||80);
+    valuePayoutPct=Number.isFinite(p)?Math.max(1,Math.min(100,p)):80;
+    const raw=localStorage.getItem(VALUE_SCORE_KEY);
+    if(raw){
+      const d=JSON.parse(raw)||{};
+      valueScore={
+        profit:Number(d.profit||0),
+        won_value:Number(d.won_value||0),
+        lost_value:Number(d.lost_value||0),
+        wins:Math.max(0,Number(d.wins||0)),
+        losses:Math.max(0,Number(d.losses||0)),
+        last_delta:Number(d.last_delta||0),
+        last_result:String(d.last_result||'--'),
+        last_stake:Number(d.last_stake||valueStake),
+        processed_keys:Array.isArray(d.processed_keys)?d.processed_keys.slice(-1200):[]
+      };
+    }
+  }catch(_){ }
+}
+
+function saveValueScore(){
+  try{
+    localStorage.setItem(VALUE_STAKE_KEY,String(valueStake));
+    localStorage.setItem(VALUE_PAYOUT_KEY,String(valuePayoutPct));
+    localStorage.setItem(VALUE_SCORE_KEY,JSON.stringify({...valueScore,processed_keys:(valueScore.processed_keys||[]).slice(-1200)}));
+  }catch(_){ }
+}
+
+function valueScoreSettings(){
+  let multiplier=2;
+  try{
+    const a=autoTradeSettings();
+    multiplier=Number(a&&a.multiplier||2);
+  }catch(_){ }
+  if(!Number.isFinite(multiplier)) multiplier=2;
+  multiplier=Math.max(1,Math.min(5,multiplier));
+  return {
+    stake:[5,10,20].includes(Number(valueStake))?Number(valueStake):5,
+    payout:Math.max(1,Math.min(100,Number(valuePayoutPct)||80)),
+    multiplier
+  };
+}
+
+function renderValueScore(){
+  if(valuePayout) valuePayout.value=String(Math.round(valuePayoutPct));
+  if(valueStakeSelected) valueStakeSelected.textContent=moneyBR(valueStake);
+  if(valueProfit){
+    valueProfit.textContent=moneyBR(valueScore.profit);
+    valueProfit.className='big '+(Number(valueScore.profit)>=0?'call':'put');
+  }
+  if(valueWon) valueWon.textContent=moneyBR(valueScore.won_value);
+  if(valueLost) valueLost.textContent=moneyBR(valueScore.lost_value);
+  if(valueOps) valueOps.textContent=String(Number(valueScore.wins||0)+Number(valueScore.losses||0));
+  if(valueLastResult){
+    const r=String(valueScore.last_result||'--').toUpperCase();
+    const win=r.startsWith('WIN');
+    valueLastResult.textContent=(r==='--'?'--':r+' • '+moneySignedBR(valueScore.last_delta));
+    valueLastResult.className='big '+(r==='--'?'':(win?'call':'put'));
+  }
+  if(valueLastDetail){
+    const r=String(valueScore.last_result||'--').toUpperCase();
+    valueLastDetail.textContent=r==='--'
+      ? 'Aguardando a próxima operação finalizada.'
+      : `Entrada base ${moneyBR(valueScore.last_stake)} • lucro acumulado ${moneyBR(valueScore.profit)}.`;
+  }
+  document.querySelectorAll('[data-value-stake]').forEach(btn=>{
+    const active=Number(btn.getAttribute('data-value-stake'))===Number(valueStake);
+    btn.style.background=active?'#0b7a3d':'#132234';
+    btn.style.borderColor=active?'#19d27c':'#2b5273';
+    btn.style.color='#fff';
+  });
+  if(valueGaleNote){
+    const cfg=valueScoreSettings();
+    valueGaleNote.textContent=`WIN direto soma ${cfg.payout.toFixed(0)}% da entrada. Em G1/G2, o cálculo desconta as entradas anteriores e usa multiplicador ${cfg.multiplier.toFixed(1)}x da aba Corretora.`;
+  }
+}
+
+function valueResultCalculation(t,x){
+  if(!t || !x) return null;
+  const r=String(x.result||'').toUpperCase();
+  const finalAllowed=['WIN','WIN G1','WIN G2','LOSS G2'].includes(r) || (t.direct_only && r==='LOSS');
+  if(!finalAllowed) return null;
+
+  const fallback=valueScoreSettings();
+  const stakeRaw=Number(t.value_stake);
+  const payoutRaw=Number(t.value_payout);
+  const multRaw=Number(t.value_gale_multiplier);
+  const stake=[5,10,20].includes(stakeRaw)?stakeRaw:fallback.stake;
+  const payout=Math.max(0.01,Math.min(1,(Number.isFinite(payoutRaw)?payoutRaw:fallback.payout)/100));
+  const multiplier=Math.max(1,Math.min(5,Number.isFinite(multRaw)?multRaw:fallback.multiplier));
+  const g1=stake*multiplier;
+  const g2=g1*multiplier;
+  let delta=0;
+
+  if(r==='WIN') delta=stake*payout;
+  else if(r==='LOSS') delta=-stake;
+  else if(r==='WIN G1') delta=-stake+(g1*payout);
+  else if(r==='WIN G2') delta=-stake-g1+(g2*payout);
+  else if(r==='LOSS G2') delta=-(stake+g1+g2);
+
+  return {result:r,stake,payout_pct:payout*100,multiplier,delta:Number(delta.toFixed(2))};
+}
+
+function applyValueScoreResult(t,x){
+  const calc=valueResultCalculation(t,x);
+  if(!calc) return null;
+  const baseKey=resultOperationKey(t)||resultTradeKey(t);
+  if(!baseKey) return null;
+  const key=baseKey+'|VALUE';
+  if((valueScore.processed_keys||[]).includes(key)) return null;
+
+  valueScore.processed_keys=valueScore.processed_keys||[];
+  valueScore.processed_keys.push(key);
+  if(valueScore.processed_keys.length>1200) valueScore.processed_keys=valueScore.processed_keys.slice(-1200);
+  valueScore.profit=Number((Number(valueScore.profit||0)+calc.delta).toFixed(2));
+  if(calc.delta>=0) valueScore.won_value=Number((Number(valueScore.won_value||0)+calc.delta).toFixed(2));
+  else valueScore.lost_value=Number((Number(valueScore.lost_value||0)+Math.abs(calc.delta)).toFixed(2));
+  if(calc.result.startsWith('WIN')) valueScore.wins=Number(valueScore.wins||0)+1;
+  else valueScore.losses=Number(valueScore.losses||0)+1;
+  valueScore.last_delta=calc.delta;
+  valueScore.last_result=calc.result;
+  valueScore.last_stake=calc.stake;
+  saveValueScore();
+  renderValueScore();
+
+  if(voiceEnabled){
+    if(calc.result.startsWith('WIN')){
+      const ganho=calc.delta>=0?calc.delta:0;
+      speak('Win. Você ganhou '+moneySpeech(ganho)+' nesta operação. Seu lucro acumulado é '+moneySpeech(valueScore.profit)+'.');
+    }else{
+      speak('Loss. Seu resultado acumulado diminuiu para '+moneySpeech(valueScore.profit)+'. Tenha calma e mantenha o gerenciamento.');
+    }
+  }
+  return calc;
+}
+
+loadValueScore();
+renderValueScore();
+
+document.querySelectorAll('[data-value-stake]').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    const v=Number(btn.getAttribute('data-value-stake'));
+    if(![5,10,20].includes(v)) return;
+    valueStake=v;
+    saveValueScore();
+    renderValueScore();
+  });
+});
+
+if(valuePayout){
+  valuePayout.addEventListener('change',()=>{
+    const p=Number(valuePayout.value||80);
+    valuePayoutPct=Number.isFinite(p)?Math.max(1,Math.min(100,p)):80;
+    valuePayout.value=String(Math.round(valuePayoutPct));
+    saveValueScore();
+    renderValueScore();
+  });
+}
+
+if(resetValueScoreBtn){
+  resetValueScoreBtn.addEventListener('click',()=>{
+    if(!confirm('Zerar somente o placar de valores? O placar de WIN/LOSS será mantido.')) return;
+    valueScore={profit:0,won_value:0,lost_value:0,wins:0,losses:0,last_delta:0,last_result:'--',last_stake:valueStake,processed_keys:[]};
+    saveValueScore();
+    renderValueScore();
+  });
+}
+
 function showTab(which){
   const main=which==='main';
   const chart=which==='chart';
   const results=which==='results';
+  const values=which==='values';
   const history=which==='history';
   const compatibility=which==='compatibility';
   const telegram=which==='telegram';
@@ -16385,6 +16691,7 @@ function showTab(which){
   mainTab.classList.toggle('active',main);
   chartTab.classList.toggle('active',chart);
   resultsTab.classList.toggle('active',results);
+  valuesTab.classList.toggle('active',values);
   historyTab.classList.toggle('active',history);
   compatibilityTab.classList.toggle('active',compatibility);
   telegramTab.classList.toggle('active',telegram);
@@ -16393,6 +16700,7 @@ function showTab(which){
   tabMain.classList.toggle('active',main);
   tabChart.classList.toggle('active',chart);
   tabResults.classList.toggle('active',results);
+  tabValues.classList.toggle('active',values);
   tabHistory.classList.toggle('active',history);
   tabCompatibility.classList.toggle('active',compatibility);
   tabTelegram.classList.toggle('active',telegram);
@@ -16405,6 +16713,10 @@ function showTab(which){
 
   if(results){
     perf();
+  }
+
+  if(values){
+    renderValueScore();
   }
 
   if(history){
@@ -16428,6 +16740,7 @@ function showTab(which){
 tabMain.onclick=()=>showTab('main');
 tabChart.onclick=()=>showTab('chart');
 tabResults.onclick=()=>showTab('results');
+tabValues.onclick=()=>showTab('values');
 tabHistory.onclick=()=>showTab('history');
 tabCompatibility.onclick=()=>showTab('compatibility');
 tabTelegram.onclick=()=>showTab('telegram');
@@ -17796,6 +18109,10 @@ async function resultCheck(){
 
       const k=t.symbol+'|'+t.direction+'|'+t.expiry_time;
 
+      // Placar financeiro: contabiliza cada operação finalizada uma única vez
+      // e fala o lucro/queda somente se a voz estiver online.
+      applyValueScoreResult(t,x);
+
       // Resultado visual: dinheiro sobe no WIN e desce no LOSS.
       // Sem aviso de voz, conforme configuração do painel.
       if(k!==moneyFxKey){
@@ -17956,6 +18273,7 @@ async function bootApp(){
   applyRobotPowerState();
   applyVoiceState();
   renderAdaptiveLearningState();
+  renderValueScore();
 
   const safe=(name,fn)=>
     Promise.resolve()
