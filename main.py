@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.55"
-PWA_VERSION = "v121"
+APP_VERSION = "3.56"
+PWA_VERSION = "v122"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -241,7 +241,7 @@ SYMBOLS = [
 ]
 OTC_SYMBOLS = [s for s in SYMBOLS if s != BINOMO_CRYPTO_IDX_SYMBOL]
 
-# MEGA IA 3.55 — BTC FORCE ESTRUTURAL: vela de força + região forte/LTA/LTB.
+# MEGA IA 3.56 — BTC FORCE DOM: vela de força + região forte/LTA/LTB + profundidade de mercado.
 BIGRISE_BTC_SYMBOL = "BTC/USD"  # chave interna antiga preservada para compatibilidade do painel
 BTC_FORCE_ATR_PERIOD = max(5, min(30, int(os.getenv("BTC_FORCE_ATR_PERIOD", "14"))))
 BTC_FORCE_MIN_BODY_ATR = max(0.08, min(1.20, float(os.getenv("BTC_FORCE_MIN_BODY_ATR", "0.20"))))
@@ -249,6 +249,15 @@ BTC_FORCE_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("BTC_FORCE_MIN_BO
 BTC_FORCE_MIN_CLOSE_POS = max(0.55, min(0.90, float(os.getenv("BTC_FORCE_MIN_CLOSE_POS", "0.66"))))
 BTC_FORCE_MAX_RANGE_ATR = max(1.50, min(6.00, float(os.getenv("BTC_FORCE_MAX_RANGE_ATR", "3.20"))))
 BTC_FORCE_SIGNAL_COOLDOWN_SECONDS = max(180, min(900, int(os.getenv("BTC_FORCE_SIGNAL_COOLDOWN_SECONDS", "240"))))
+# DOM/Level II: confirmação adicional do fluxo. cTrader é preferida quando conectada;
+# Binance COIN-M BTCUSD_PERP é fallback público 24/7 para o BTC/USD.
+BTC_DOM_ENABLED = os.getenv("BTC_DOM_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
+BTC_DOM_MIN_SIDE_SHARE = max(0.51, min(0.75, float(os.getenv("BTC_DOM_MIN_SIDE_SHARE", "0.56"))))
+BTC_DOM_CACHE_TTL = max(2.0, min(30.0, float(os.getenv("BTC_DOM_CACHE_TTL", "6"))))
+BTC_DOM_BAND_PCT = max(0.0005, min(0.01, float(os.getenv("BTC_DOM_BAND_PCT", "0.0035"))))
+BTC_DOM_BINANCE_SYMBOL = os.getenv("BTC_DOM_BINANCE_SYMBOL", "BTCUSD_PERP").strip() or "BTCUSD_PERP"
+BTC_DOM_BINANCE_URL = os.getenv("BTC_DOM_BINANCE_URL", "https://dapi.binance.com/dapi/v1/depth").strip() or "https://dapi.binance.com/dapi/v1/depth"
+btc_dom_cache: Dict[str, Any] = {}
 
 OTC_BASE = {
     "EUR/USD": "EURUSD-OTC", "GBP/USD": "GBPUSD-OTC", "USD/JPY": "USDJPY-OTC",
@@ -4840,6 +4849,227 @@ def _current_open_feed_info(symbol: str, interval: str) -> Dict[str, Any]:
     return info
 
 
+def _depth_metrics(bids, asks, source: str, *, reference_price=None) -> Dict[str, Any]:
+    """Resume um livro de ofertas em pressão relativa perto do preço atual."""
+    clean_bids = []
+    clean_asks = []
+    for row in bids or []:
+        try:
+            price, qty = float(row[0]), float(row[1])
+            if price > 0 and qty > 0:
+                clean_bids.append((price, qty))
+        except Exception:
+            continue
+    for row in asks or []:
+        try:
+            price, qty = float(row[0]), float(row[1])
+            if price > 0 and qty > 0:
+                clean_asks.append((price, qty))
+        except Exception:
+            continue
+    if not clean_bids or not clean_asks:
+        return {"available": False, "source": source, "reason": "DOM sem bids/asks suficientes."}
+
+    best_bid = max(x[0] for x in clean_bids)
+    best_ask = min(x[0] for x in clean_asks)
+    mid = float(reference_price or ((best_bid + best_ask) / 2.0))
+    if mid <= 0:
+        mid = (best_bid + best_ask) / 2.0
+    band = max(mid * BTC_DOM_BAND_PCT, abs(best_ask - best_bid) * 4.0, 1e-9)
+
+    near_bids = [(p, q) for p, q in clean_bids if 0 <= mid - p <= band] or clean_bids[:50]
+    near_asks = [(p, q) for p, q in clean_asks if 0 <= p - mid <= band] or clean_asks[:50]
+
+    def weighted(rows):
+        total = 0.0
+        for price, qty in rows:
+            dist = abs(price - mid)
+            proximity = max(0.15, 1.0 - min(1.0, dist / max(band, 1e-12)))
+            total += qty * proximity
+        return total
+
+    bid_liq = weighted(near_bids)
+    ask_liq = weighted(near_asks)
+    total = bid_liq + ask_liq
+    if total <= 0:
+        return {"available": False, "source": source, "reason": "DOM sem liquidez mensurável."}
+    bid_share = bid_liq / total
+    ask_share = ask_liq / total
+    imbalance = (bid_liq - ask_liq) / total
+    bid_wall = max(near_bids, key=lambda x: x[1], default=(0.0, 0.0))
+    ask_wall = max(near_asks, key=lambda x: x[1], default=(0.0, 0.0))
+    spread_pct = max(0.0, (best_ask - best_bid) / max(mid, 1e-12))
+    direction = "CALL" if bid_share >= BTC_DOM_MIN_SIDE_SHARE else ("PUT" if ask_share >= BTC_DOM_MIN_SIDE_SHARE else "NEUTRO")
+    return {
+        "available": True,
+        "source": source,
+        "direction": direction,
+        "mid": round(mid, 8),
+        "best_bid": round(best_bid, 8),
+        "best_ask": round(best_ask, 8),
+        "spread_pct": round(spread_pct, 7),
+        "bid_liquidity": round(bid_liq, 4),
+        "ask_liquidity": round(ask_liq, 4),
+        "bid_share": round(bid_share, 4),
+        "ask_share": round(ask_share, 4),
+        "imbalance": round(imbalance, 4),
+        "bid_wall_price": round(float(bid_wall[0]), 8),
+        "bid_wall_size": round(float(bid_wall[1]), 4),
+        "ask_wall_price": round(float(ask_wall[0]), 8),
+        "ask_wall_size": round(float(ask_wall[1]), 4),
+        "band_pct": BTC_DOM_BAND_PCT,
+        "threshold_share": BTC_DOM_MIN_SIDE_SHARE,
+    }
+
+
+def _ctrader_depth_snapshot_blocking(item: Dict[str, Any], symbol: str = "BTC/USD") -> Dict[str, Any]:
+    """Obtém um snapshot curto de Level II pela Open API cTrader."""
+    catalog = _ctrader_refresh_catalog_blocking(item, False)
+    symbol_map = catalog.get("symbols_map") or {}
+    entry = symbol_map.get(str(symbol or "").upper())
+    if not entry:
+        target = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
+        for candidate in symbol_map.values():
+            raw = re.sub(r"[^A-Z0-9]", "", str(candidate.get("raw_symbol") or candidate.get("symbol") or "").upper())
+            if target and (raw == target or raw.startswith(target) or target.startswith(raw)):
+                entry = candidate
+                break
+    if not entry:
+        raise RuntimeError("BTC/USD não encontrado na conta cTrader para DOM.")
+
+    token = str(item.get("access_token") or "").strip()
+    account_id = int(entry.get("account_id") or 0)
+    symbol_id = int(entry.get("symbol_id") or 0)
+    is_live = bool(entry.get("is_live"))
+    if not token or not account_id or not symbol_id:
+        raise RuntimeError("Sessão cTrader incompleta para Level II.")
+
+    ws = _ctrader_open_socket(is_live)
+    book = {}
+    try:
+        _ctrader_application_auth(ws)
+        _ctrader_account_auth(ws, token, account_id)
+        _ctrader_send_wait(
+            ws, 2156,
+            {"ctidTraderAccountId": account_id, "symbolId": [symbol_id]},
+            2157,
+            timeout=max(CTRADER_DATA_TIMEOUT, 8),
+        )
+        try:
+            ws.settimeout(1.2)
+        except Exception:
+            pass
+        deadline = time.time() + 1.8
+        got_event = False
+        while time.time() < deadline:
+            try:
+                raw = ws.recv()
+            except Exception:
+                break
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
+            data = json.loads(raw)
+            if int(data.get("payloadType") or 0) != 2155:
+                continue
+            body = data.get("payload") or {}
+            if int(body.get("symbolId") or 0) != symbol_id:
+                continue
+            got_event = True
+            for quote_id in body.get("deletedQuotes") or []:
+                try:
+                    book.pop(int(quote_id), None)
+                except Exception:
+                    pass
+            for q in body.get("newQuotes") or []:
+                if not isinstance(q, dict):
+                    continue
+                qid = int(q.get("id") or 0)
+                size = float(q.get("size") or 0) / 100.0
+                if not qid or size <= 0:
+                    continue
+                if q.get("bid") is not None:
+                    book[qid] = ("bid", float(q.get("bid")) / 100000.0, size)
+                elif q.get("ask") is not None:
+                    book[qid] = ("ask", float(q.get("ask")) / 100000.0, size)
+            if got_event and len(book) >= 6:
+                break
+        if not book:
+            raise RuntimeError("cTrader não retornou níveis de profundidade agora.")
+        bids = [(p, q) for side, p, q in book.values() if side == "bid"]
+        asks = [(p, q) for side, p, q in book.values() if side == "ask"]
+        out = _depth_metrics(bids, asks, "CTRADER_LEVEL2")
+        out["broker"] = str(entry.get("broker") or "cTrader")
+        return out
+    finally:
+        try:
+            # best-effort unsubscribe
+            _ctrader_send_wait(
+                ws, 2158,
+                {"ctidTraderAccountId": account_id, "symbolId": [symbol_id]},
+                2159,
+                timeout=2.0,
+            )
+        except Exception:
+            pass
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+async def _binance_btc_dom_snapshot(reference_price=None) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=min(PUBLIC_FEED_TIMEOUT, 8.0), follow_redirects=True) as client:
+        response = await client.get(BTC_DOM_BINANCE_URL, params={"symbol": BTC_DOM_BINANCE_SYMBOL, "limit": 50})
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("DOM público do BTC retornou resposta inválida.")
+    out = _depth_metrics(data.get("bids") or [], data.get("asks") or [], "BINANCE_COINM_LEVEL2", reference_price=reference_price)
+    out["source_symbol"] = BTC_DOM_BINANCE_SYMBOL
+    return out
+
+
+async def _btc_dom_snapshot(request: Request | None, reference_price=None) -> Dict[str, Any]:
+    """DOM obrigatório do BTC: cTrader Level II primeiro; exchange pública como fallback 24/7."""
+    if not BTC_DOM_ENABLED:
+        return {"available": False, "source": "DISABLED", "reason": "Filtro DOM desativado."}
+    cache_key = "BTC/USD"
+    cached = btc_dom_cache.get(cache_key)
+    if cached and time.time() - float(cached[0]) < BTC_DOM_CACHE_TTL:
+        return dict(cached[1])
+
+    errors = []
+    if request is not None:
+        try:
+            _, ct_item = _ctrader_session_from_request(request)
+            if ct_item:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(_ctrader_depth_snapshot_blocking, ct_item, "BTC/USD"),
+                    timeout=max(CTRADER_DATA_TIMEOUT + 3, 12),
+                )
+                if result.get("available"):
+                    btc_dom_cache[cache_key] = (time.time(), dict(result))
+                    return result
+                errors.append(str(result.get("reason") or "cTrader DOM indisponível"))
+        except Exception as exc:
+            errors.append("cTrader: " + str(exc)[:140])
+
+    try:
+        result = await _binance_btc_dom_snapshot(reference_price=reference_price)
+        if result.get("available"):
+            if errors:
+                result["fallback_reason"] = " | ".join(errors[-2:])
+            btc_dom_cache[cache_key] = (time.time(), dict(result))
+            return result
+        errors.append(str(result.get("reason") or "Binance DOM indisponível"))
+    except Exception as exc:
+        errors.append("Binance: " + str(exc)[:140])
+
+    result = {"available": False, "source": "UNAVAILABLE", "reason": "DOM indisponível: " + " | ".join(errors[-3:])}
+    btc_dom_cache[cache_key] = (time.time(), dict(result))
+    return result
+
+
 async def _binance_public_candles(symbol: str, interval: str, n: int = 80):
     pair = BINANCE_SYMBOLS.get(symbol)
     if not pair:
@@ -6877,29 +7107,32 @@ async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
 
 
 
-def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None, h4=None):
+def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None, h4=None, dom=None):
     """BTC FORCE ESTRUTURAL — vela de força em região forte para a próxima vela.
 
     Remove os filtros extras de EMA/MACD/eficiência da v3.54. Usa somente BTC/USD
     e exige duas coisas ao mesmo tempo:
       1) vela fechada de força na direção da entrada;
-      2) preço em suporte/resistência forte (H1/H4, 2+ toques) OU LTA/LTB H4.
+      2) preço em suporte/resistência forte (H1/H4, 2+ toques) OU LTA/LTB H4;
+      3) DOM/Level II confirmando pressão no mesmo lado.
 
-    CALL: força compradora + suporte/LTA. PUT: força vendedora + resistência/LTB.
+    CALL: força compradora + suporte/LTA + DOM comprador.
+    PUT: força vendedora + resistência/LTB + DOM vendedor.
     Sem Forex, sem Gale, sem Martingale e sem repaint. O cooldown de 4 minutos
     continua sendo aplicado na liberação do sinal.
     """
     rows = list(cs or [])
     h1_rows = list(h1 or [])
     h4_rows = list(h4 or [])
+    dom_data = dict(dom or {})
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"BTC FORCE S/R + LTA/LTB {tf_label}"
+    name = f"BTC FORCE DOM + S/R + LTA/LTB {tf_label}"
     need = max(32, BTC_FORCE_ATR_PERIOD + 10)
     if len(rows) < need:
         return {
             "available": True, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "strategy": name,
-            "engine": "BTC_FORCE", "provider": "LOCAL_BTC_FORCE_STRUCTURE",
+            "engine": "BTC_FORCE", "provider": "LOCAL_BTC_FORCE_STRUCTURE_DOM",
             "reason": f"Coletando candles fechados do BTC/USD ({len(rows)}/{need}).",
             "non_repaint": True, "direct_win_only": True, "gale_signal": False,
             "btc_only": True, "structure_filter": True,
@@ -6917,7 +7150,7 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None,
         return {
             "available": True, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "strategy": name,
-            "engine": "BTC_FORCE", "provider": "LOCAL_BTC_FORCE_STRUCTURE",
+            "engine": "BTC_FORCE", "provider": "LOCAL_BTC_FORCE_STRUCTURE_DOM",
             "reason": "ATR do BTC/USD ainda indisponível para medir a vela de força.",
             "non_repaint": True, "direct_win_only": True, "gale_signal": False,
             "btc_only": True, "structure_filter": True,
@@ -6999,8 +7232,14 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None,
     # Se a vela estiver simultaneamente em estruturas opostas, evita operar no miolo apertado.
     structure_conflict = (call_structure_ok and put_structure_ok)
 
-    call_ok = bullish and body_ok and force_ok and call_close_ok and not_exhausted and call_structure_ok and not structure_conflict
-    put_ok = bearish and body_ok and force_ok and put_close_ok and not_exhausted and put_structure_ok and not structure_conflict
+    dom_available = bool(dom_data.get("available"))
+    dom_bid_share = float(dom_data.get("bid_share") or 0.0)
+    dom_ask_share = float(dom_data.get("ask_share") or 0.0)
+    call_dom_ok = dom_available and dom_bid_share >= BTC_DOM_MIN_SIDE_SHARE
+    put_dom_ok = dom_available and dom_ask_share >= BTC_DOM_MIN_SIDE_SHARE
+
+    call_ok = bullish and body_ok and force_ok and call_close_ok and not_exhausted and call_structure_ok and call_dom_ok and not structure_conflict
+    put_ok = bearish and body_ok and force_ok and put_close_ok and not_exhausted and put_structure_ok and put_dom_ok and not structure_conflict
     direction = "CALL" if call_ok else ("PUT" if put_ok else "NEUTRO")
 
     confidence = 0.0
@@ -7031,19 +7270,21 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None,
             confidence += 4.0
         elif touches >= 3:
             confidence += min(4.0, float(touches - 2) * 1.5)
-        confidence = clamp(confidence, 76.0, 94.0)
+        dom_share = dom_bid_share if direction == "CALL" else dom_ask_share
+        confidence += min(5.0, max(0.0, dom_share - BTC_DOM_MIN_SIDE_SHARE) * 25.0)
+        confidence = clamp(confidence, 76.0, 96.0)
 
     if direction == "CALL":
         extra = f" com {touches} toques" if touches else ""
         reason = (
             f"BTC fechou vela de força compradora ({body_atr:.2f} ATR; corpo {body_ratio*100:.0f}%) "
-            f"em {region_label}{extra}. CALL preparada para a próxima vela."
+            f"em {region_label}{extra}, com DOM comprador {dom_bid_share*100:.0f}%. CALL preparada para a próxima vela."
         )
     elif direction == "PUT":
         extra = f" com {touches} toques" if touches else ""
         reason = (
             f"BTC fechou vela de força vendedora ({body_atr:.2f} ATR; corpo {body_ratio*100:.0f}%) "
-            f"em {region_label}{extra}. PUT preparada para a próxima vela."
+            f"em {region_label}{extra}, com DOM vendedor {dom_ask_share*100:.0f}%. PUT preparada para a próxima vela."
         )
     else:
         blockers = []
@@ -7055,6 +7296,12 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None,
         if structure_conflict: blockers.append("conflito entre suporte/LTA e resistência/LTB")
         elif bullish and not call_structure_ok: blockers.append("compra fora de suporte forte ou LTA")
         elif bearish and not put_structure_ok: blockers.append("venda fora de resistência forte ou LTB")
+        if not dom_available:
+            blockers.append("DOM/Level II indisponível")
+        elif bullish and not call_dom_ok:
+            blockers.append(f"DOM não confirma compra ({dom_bid_share*100:.0f}% bids)")
+        elif bearish and not put_dom_ok:
+            blockers.append(f"DOM não confirma venda ({dom_ask_share*100:.0f}% asks)")
         if len(h1_rows) < 25 and len(h4_rows) < 25:
             blockers.append("aguardando regiões H1/H4")
         if not bullish and not bearish: blockers.append("vela sem direção")
@@ -7068,7 +7315,7 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None,
         "risk": ("LOW" if confidence >= 84 else ("MEDIUM" if direction != "NEUTRO" else "HIGH")),
         "strategy": name,
         "engine": "BTC_FORCE",
-        "provider": "LOCAL_BTC_FORCE_STRUCTURE",
+        "provider": "LOCAL_BTC_FORCE_STRUCTURE_DOM",
         "reason": reason[:460],
         "non_repaint": True,
         "direct_win_only": True,
@@ -7076,6 +7323,8 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None,
         "btc_only": True,
         "next_candle_entry": True,
         "structure_filter": True,
+        "dom_filter": True,
+        "dom_source": dom_data.get("source"),
         "signal_cooldown_seconds": BTC_FORCE_SIGNAL_COOLDOWN_SECONDS,
         "diagnostics": {
             "atr": round(float(a), 10),
@@ -7088,6 +7337,7 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None,
             "near_lta": near_lta,
             "near_ltb": near_ltb,
             "structure": structure_diag,
+            "dom": dom_data,
         },
     }
 
@@ -9024,7 +9274,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "EA FORÇA DO MOVIMENTO"
             engine_mode = "EA_FORCE_MOVEMENT"
         elif engine == "BIGRISE":
-            engine_title = "BTC FORCE S/R + LTA/LTB"
+            engine_title = "BTC FORCE DOM + LTA/LTB"
             engine_mode = "BTC_FORCE_STRUCTURE_NEXT_CANDLE"
         else:
             engine_title = "IA GRÁFICA"
@@ -9072,13 +9322,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "LARRY":
                 analysis = larry_breakout_strategy(engine_closed, interval, market=market)
             elif engine == "BIGRISE":
-                # BTC FORCE estrutural: somente BTC/USD, com regiões fortes H1/H4 e LTA/LTB H4.
+                # BTC FORCE DOM: somente BTC/USD, com regiões fortes H1/H4, LTA/LTB H4 e profundidade Level II.
                 h1_raw = await candles(symbol, "1h", 150, "OPEN", None, request=request)
                 h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
                 h4_all = _aggregate_closed_candles(h1_closed, 4 * 60 * 60)
                 h4_closed = h4_all[:-1] if len(h4_all) > 1 else h4_all
+                ref_price = float(engine_closed[-1].get("close") or 0.0) if engine_closed else None
+                dom_snapshot = await _btc_dom_snapshot(request, reference_price=ref_price)
                 analysis = btc_force_next_candle_strategy(
-                    engine_closed, interval, market=market, h1=h1_closed, h4=h4_closed
+                    engine_closed, interval, market=market, h1=h1_closed, h4=h4_closed, dom=dom_snapshot
                 )
             elif engine == "FORCE":
                 if market == "OPEN":
@@ -9266,7 +9518,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 )
                 base.update({
                     "direction": direction_now,
-                    "status": (smart_status if engine == "SMART" else ("SINAL TRIPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL LARRY BREAKOUT LIBERADO" if engine == "LARRY" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else ("SINAL BTC FORCE EM REGIÃO LIBERADO" if engine == "BIGRISE" else "SINAL IA GRÁFICA LIBERADO")))))),
+                    "status": (smart_status if engine == "SMART" else ("SINAL TRIPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL LARRY BREAKOUT LIBERADO" if engine == "LARRY" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else ("SINAL BTC FORCE + DOM LIBERADO" if engine == "BIGRISE" else "SINAL IA GRÁFICA LIBERADO")))))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
