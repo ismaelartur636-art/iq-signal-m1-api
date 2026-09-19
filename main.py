@@ -43,7 +43,7 @@ from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
 APP_VERSION = "3.46"
-PWA_VERSION = "v112"
+PWA_VERSION = "v113"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -73,6 +73,9 @@ XGB_MIN_TRAIN_SAMPLES = max(60, int(os.getenv("XGB_MIN_TRAIN_SAMPLES", "80")))
 XGB_RETRAIN_SECONDS = max(120, int(os.getenv("XGB_RETRAIN_SECONDS", "900")))
 XGB_MIN_PROBABILITY = min(0.80, max(0.52, float(os.getenv("XGB_MIN_PROBABILITY", "0.60"))))
 XGB_MIN_VALIDATION_ACCURACY = min(0.80, max(0.50, float(os.getenv("XGB_MIN_VALIDATION_ACCURACY", "0.52"))))
+# EA XGBoost Autônoma: somente o modelo estatístico decide CALL/PUT.
+EA_XGB_MIN_PROBABILITY = min(0.85, max(0.52, float(os.getenv("EA_XGB_MIN_PROBABILITY", "0.60"))))
+EA_XGB_MIN_VALIDATION_ACCURACY = min(0.80, max(0.50, float(os.getenv("EA_XGB_MIN_VALIDATION_ACCURACY", "0.52"))))
 xgb_model_cache: Dict[str, Dict[str, Any]] = {}
 xgb_model_guard = threading.RLock()
 
@@ -5700,7 +5703,7 @@ async def iq_ea_candles(
 ):
     """Candles da IQ Option usados exclusivamente pela EA autônoma."""
     if not state:
-        raise HTTPException(401, "EA AUTÔNOMA: conecte a IQ Option na aba Corretora.")
+        raise HTTPException(401, "IQ OPTION: conecte a corretora para carregar candles deste mercado.")
 
     market_key = "OPEN" if regular_market else "IQ_OTC"
     cache_key = f"{market_key}|{symbol}|{interval}"
@@ -6340,7 +6343,7 @@ def _xgb_feature_vector(rows, idx):
         return None
 
 
-def _xgb_train_or_predict(rows, symbol, interval):
+def _xgb_train_or_predict(rows, symbol, interval, model_scope="OPEN"):
     """Treina/valida em ordem temporal e prevê a próxima vela.
 
     O alvo de cada amostra é a direção da vela seguinte. A validação usa o bloco
@@ -6369,7 +6372,8 @@ def _xgb_train_or_predict(rows, symbol, interval):
         base["reason"] = f"XGBoost coletando candles ({len(rows)}/{XGB_MIN_CANDLES})."
         return base
 
-    model_key = f"{str(symbol).upper()}|{interval}"
+    scope = str(model_scope or "OPEN").upper()
+    model_key = f"{scope}|{str(symbol).upper()}|{interval}"
     last_key = str(rows[-1].get("datetime") or "")
     now_ts = time.time()
 
@@ -6475,6 +6479,84 @@ def _xgb_train_or_predict(rows, symbol, interval):
     else:
         base["reason"] = f"XGBoost {direction} {confidence*100:.1f}% • validação {val_acc*100:.1f}%."
     return base
+
+
+async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
+    """EA XGBoost Autônoma — XGBoost puro para OPEN e IQ OTC.
+
+    Nenhuma IA externa, indicador técnico, price action manual ou aprendizado
+    adaptativo participa da decisão. O modelo usa somente features numéricas
+    derivadas de candles fechados e validação temporal sem embaralhar o futuro.
+    """
+    rows = list(cs or [])
+    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
+    name = f"EA XGBOOST AUTÔNOMA {tf_label}"
+    if len(rows) < XGB_MIN_CANDLES:
+        return {
+            "available": bool(XGBOOST_OK and XGB_ENABLED),
+            "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
+            "risk": "HIGH", "strategy": name, "engine": "EA_XGBOOST",
+            "provider": "XGBOOST_LOCAL",
+            "reason": f"XGBoost coletando candles ({len(rows)}/{XGB_MIN_CANDLES}).",
+            "xgboost_only": True, "indicators_disabled": True,
+        }
+    try:
+        xgb = await asyncio.to_thread(
+            _xgb_train_or_predict, rows, symbol, timeframe, f"EA_{str(market or 'OPEN').upper()}"
+        )
+    except Exception as exc:
+        return {
+            "available": False, "direction": "NEUTRO", "confidence": 0.0,
+            "confirmed": False, "risk": "HIGH", "strategy": name,
+            "engine": "EA_XGBOOST", "provider": "XGBOOST_LOCAL",
+            "reason": f"XGBoost indisponível: {str(exc)[:180]}",
+            "xgboost_only": True, "indicators_disabled": True,
+        }
+
+    confidence = float(xgb.get("confidence") or 0.0)
+    validation = float(xgb.get("validation_accuracy") or 0.0)
+    direction = str(xgb.get("direction") or "NEUTRO").upper()
+    ready = bool(xgb.get("available") and xgb.get("ready"))
+    strong = confidence >= (EA_XGB_MIN_PROBABILITY * 100.0)
+    valid = validation >= (EA_XGB_MIN_VALIDATION_ACCURACY * 100.0)
+    confirmed = bool(ready and strong and valid and direction in ("CALL", "PUT"))
+
+    if not ready:
+        reason = str(xgb.get("reason") or "Modelo XGBoost ainda não está pronto.")
+    elif not valid:
+        reason = f"XGBoost aguardando validação temporal melhor ({validation:.1f}%)."
+    elif not strong:
+        reason = f"XGBoost sem vantagem suficiente ({confidence:.1f}%)."
+    else:
+        reason = (
+            f"XGBoost puro confirmou {direction} {confidence:.1f}% • "
+            f"validação temporal {validation:.1f}% • {int(xgb.get('samples') or 0)} amostras."
+        )
+
+    risk = "HIGH"
+    if confirmed:
+        risk = "LOW" if confidence >= 70.0 and validation >= 58.0 else "MEDIUM"
+
+    return {
+        "available": bool(xgb.get("available")),
+        "ready": ready,
+        "direction": direction if confirmed else "NEUTRO",
+        "raw_direction": direction,
+        "confidence": round(confidence, 1),
+        "confirmed": confirmed,
+        "risk": risk,
+        "strategy": name,
+        "engine": "EA_XGBOOST",
+        "provider": "XGBOOST_LOCAL",
+        "reason": reason,
+        "xgboost": xgb,
+        "xgboost_only": True,
+        "indicators_disabled": True,
+        "external_ai_disabled": True,
+        "gale_signal": False,
+        "non_repaint": True,
+    }
+
 
 def _pure_ai_price_context(cs):
     """Resume somente price action/OHLCV para filtrar entradas fracas da IA PURA.
@@ -7113,7 +7195,7 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
     # Camada 1: XGBoost calcula uma probabilidade independente da próxima vela.
     # O treino roda fora do event loop e o resultado nunca libera entrada sozinho.
     try:
-        xgb_signal = await asyncio.to_thread(_xgb_train_or_predict, rows, symbol, interval)
+        xgb_signal = await asyncio.to_thread(_xgb_train_or_predict, rows, symbol, interval, f"SMART_{market}")
     except Exception as exc:
         xgb_signal = {
             "available": False, "ready": False, "confirmed": False,
@@ -8082,32 +8164,49 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         return cache[key][1]
 
     try:
-        if engine == "EA" or (engine == "FORCE" and market == "IQ_OTC"):
-            # EA Autônoma continua nativa da IQ. O EA Força usa IQ somente no OTC,
-            # porque os candles OTC pertencem à própria corretora.
-            engine_label = "EA AUTÔNOMA" if engine == "EA" else "EA FORÇA DO MOVIMENTO"
-            engine_strategy = "EA AUTÔNOMA IQ" if engine == "EA" else "EA Força do Movimento"
-            engine_mode = "EA_AUTONOMOUS_IQ" if engine == "EA" else "EA_FORCE_MOVEMENT"
+        if engine == "EA":
+            # EA XGBoost Autônoma: OPEN usa o roteador normal (cTrader/multifuente);
+            # OTC usa exclusivamente candles reais da sessão IQ Option.
+            request_n = max(170, XGB_MIN_CANDLES + 30)
+            if market == "IQ_OTC":
+                if not iq_state:
+                    out = neutral_signal(
+                        symbol, interval, market,
+                        "EA XGBOOST • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para a EA XGBoost analisar candles OTC reais.",
+                        source_state="WAITING",
+                    )
+                    out.update({
+                        "strategy": "EA XGBOOST AUTÔNOMA", "mode": "EA_XGBOOST_AUTONOMOUS",
+                        "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
+                        "xgboost_only": True, "gale_signal": False,
+                    })
+                    cache[key] = (time.time(), out)
+                    return out
+                raw = await iq_ea_candles(
+                    iq_state, symbol, interval, request_n, regular_market=False
+                )
+            else:
+                raw = await candles(
+                    symbol, interval, request_n, "OPEN", None, request=request
+                )
+        elif engine == "FORCE" and market == "IQ_OTC":
             if not iq_state:
                 out = neutral_signal(
                     symbol, interval, market,
-                    f"{engine_label} • IQ OPTION OFFLINE",
-                    (f"Conecte a IQ Option na aba Corretora. {engine_label} usa candles da própria IQ Option."
-                     if engine == "EA" else
-                     "Conecte a IQ Option para usar o EA Força do Movimento no OTC. Em Mercado Aberto ele funciona sem login, pelo motor multifuente."),
+                    "EA FORÇA DO MOVIMENTO • IQ OPTION OFFLINE",
+                    "Conecte a IQ Option para usar o EA Força do Movimento no OTC.",
                     source_state="WAITING",
                 )
                 out.update({
-                    "strategy": engine_strategy, "mode": engine_mode,
-                    "selected_engine": engine, "feed_source": "IQ_OPTION",
-                    "direct_win_only": True, "gale_signal": False,
-                    "config_hidden": engine == "FORCE",
+                    "strategy": "EA Força do Movimento", "mode": "EA_FORCE_MOVEMENT",
+                    "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
+                    "config_hidden": True,
                 })
                 cache[key] = (time.time(), out)
                 return out
             raw = await iq_ea_candles(
-                iq_state, symbol, interval, 150,
-                regular_market=(market == "OPEN"),
+                iq_state, symbol, interval, 150, regular_market=False
             )
         else:
             # SMART pede histórico maior para treinar/validar o XGBoost.
@@ -8116,7 +8215,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             raw = await candles(symbol, interval, request_n, market, iq_state, request=request)
     except HTTPException as exc:
         status = (
-            "EA AUTÔNOMA • IQ OPTION EM ESPERA"
+            ("EA XGBOOST • FONTE EM ESPERA" if market == "OPEN" else "EA XGBOOST • IQ OPTION EM ESPERA")
             if engine == "EA"
             else ("EA FORÇA DO MOVIMENTO • IQ OPTION EM ESPERA"
                   if engine == "FORCE" and market == "IQ_OTC"
@@ -8131,7 +8230,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         return out
     except Exception as exc:
         status = (
-            "EA AUTÔNOMA • IQ OPTION RECONECTANDO"
+            ("EA XGBOOST • FONTE RECONECTANDO" if market == "OPEN" else "EA XGBOOST • IQ OPTION RECONECTANDO")
             if engine == "EA"
             else ("EA FORÇA DO MOVIMENTO • IQ OPTION RECONECTANDO"
                   if engine == "FORCE" and market == "IQ_OTC"
@@ -8182,8 +8281,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "INTELIGÊNCIA ARTIFICIAL"
             engine_mode = "PURE_AI"
         elif engine == "EA":
-            engine_title = "EA AUTÔNOMA IQ"
-            engine_mode = "EA_AUTONOMOUS_IQ"
+            engine_title = "EA XGBOOST AUTÔNOMA"
+            engine_mode = "EA_XGBOOST_AUTONOMOUS"
         elif engine == "FORCE":
             engine_title = "EA FORÇA DO MOVIMENTO"
             engine_mode = "EA_FORCE_MOVEMENT"
@@ -8206,7 +8305,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "technical": (
                     {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
                     if engine == "SMART"
-                    else ({"ea_autonomous_iq": True, "feed": "IQ_OPTION", "markets": ["OPEN", "IQ_OTC"], "direct_win_only": True} if engine == "EA" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})
+                    else ({"xgboost_only": True, "external_ai_disabled": True, "indicators_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})
                 ),
                 "legacy_ai_disabled": engine != "SMART",
                 "legacy_technical_strategies_disabled": True,
@@ -8218,14 +8317,18 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = (closed[-220:] if engine == "SMART" else (closed[-90:] if len(closed) > 90 else closed))
+            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-90:] if len(closed) > 90 else closed))
             if engine == "SMART":
                 moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
                 analysis = await openai_direct_signal(
                     symbol, interval, engine_closed, market, moment_hint=moment_hint
                 )
-            elif engine in ("EA", "FORCE"):
-                if engine == "FORCE" and market == "OPEN":
+            elif engine == "EA":
+                analysis = await ea_xgboost_strategy(
+                    engine_closed, symbol, interval, market=market
+                )
+            elif engine == "FORCE":
+                if market == "OPEN":
                     # Multibroker OPEN: HTFs vêm do roteador público, sem login da IQ.
                     if interval == "5min":
                         m5_raw = list(raw)
@@ -8233,28 +8336,21 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         m5_raw = await candles(symbol, "5min", 100, "OPEN", None, request=request)
                     h1_raw = await candles(symbol, "1h", 100, "OPEN", None, request=request)
                 else:
-                    regular_iq = market == "OPEN"
+                    regular_iq = False
                     if interval == "5min":
                         m5_raw = list(raw)
                     else:
                         m5_raw = await iq_ea_candles(
-                            iq_state, symbol, "5min", 100,
-                            regular_market=regular_iq,
+                            iq_state, symbol, "5min", 100, regular_market=regular_iq
                         )
                     h1_raw = await iq_ea_candles(
-                        iq_state, symbol, "1h", 100,
-                        regular_market=regular_iq,
+                        iq_state, symbol, "1h", 100, regular_market=regular_iq
                     )
                 m5_closed = m5_raw[:-1] if len(m5_raw) > 1 else m5_raw
                 h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
-                if engine == "FORCE":
-                    analysis = ea_movement_force_strategy(
-                        engine_closed, interval, m5=m5_closed, h1=h1_closed, market=market
-                    )
-                else:
-                    analysis = ea_binary_strategy(
-                        engine_closed, interval, m5=m5_closed, h1=h1_closed, market=market
-                    )
+                analysis = ea_movement_force_strategy(
+                    engine_closed, interval, m5=m5_closed, h1=h1_closed, market=market
+                )
             else:
                 analysis = await graphic_ai_strategy(symbol, interval, engine_closed, market, request=request, iq_state=iq_state)
         except Exception as exc:
@@ -8280,12 +8376,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI") and analysis.get("confirmed")),
-            "ai_provider": (analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else "DISABLED",
+            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA") and analysis.get("confirmed")),
+            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_LOCAL" if engine == "EA" else "DISABLED")),
             "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
-                else (analysis.get("strategy", "EA AUTÔNOMA IQ") if engine == "EA"
+                else (analysis.get("strategy", "EA XGBOOST AUTÔNOMA") if engine == "EA"
                       else (analysis.get("strategy", "EA Força do Movimento") if engine == "FORCE"
                             else analysis.get("strategy", f"{engine_title} {tf_label}")))
             ),
@@ -8394,7 +8490,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 )
                 base.update({
                     "direction": direction_now,
-                    "status": (smart_status if engine == "SMART" else ("SINAL EA AUTÔNOMA IQ LIBERADO" if engine == "EA" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))),
+                    "status": (smart_status if engine == "SMART" else ("SINAL XGBOOST AUTÔNOMO LIBERADO" if engine == "EA" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else "SINAL IA GRÁFICA LIBERADO"))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -8411,11 +8507,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # 3.22: o histórico recente pode tornar o filtro mais seletivo.
                 # Só atua depois da amostra mínima e nunca altera candles/regras
                 # originais do motor; apenas barra setups estatisticamente fracos.
-                adaptive_decision = _apply_adaptive_gate(request, base, engine)
-                if adaptive_decision.get("blocked"):
-                    release_state["active_signal"] = None
-                    cache[key] = (time.time(), base)
-                    return base
+                # Na EA XGBoost Autônoma, somente o XGBoost decide a entrada.
+                # O aprendizado adaptativo permanece disponível para os outros motores.
+                adaptive_decision = {"blocked": False, "active": False}
+                if engine != "EA":
+                    adaptive_decision = _apply_adaptive_gate(request, base, engine)
+                    if adaptive_decision.get("blocked"):
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
 
                 release_state[fingerprint_key] = signal_fingerprint
                 if engine == "GRAPH_AI":
@@ -9458,7 +9558,7 @@ async def health():
             "configured": bool(XGB_ENABLED),
             "available": bool(XGBOOST_OK),
             "priority": 1,
-            "role": "CAMADA ESTATISTICA",
+            "role": "CAMADA ESTATISTICA + MOTOR EA AUTONOMO",
             "cached_models": len(xgb_model_cache),
             "min_candles": XGB_MIN_CANDLES,
             "min_probability": XGB_MIN_PROBABILITY,
@@ -9548,20 +9648,20 @@ async def mega_ia_icon_192():
 @app.get("/manifest.webmanifest")
 async def manifest():
     manifest_data = {
-        "id": "/mega-ia-trader-v92",
+        "id": "/mega-ia-trader-v76",
         "name": "Mega IA Trader",
         "short_name": "Mega IA",
         "description": "Mega IA Trader",
-        "start_url": "/?pwa=v92",
+        "start_url": "/?pwa=v76",
         "scope": "/",
         "display": "standalone",
         "orientation": "portrait",
         "background_color": "#02050b",
         "theme_color": "#07182b",
         "icons": [
-            {"src": "/mega-ia-icon-192.png?v=92", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=92", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "/mega-ia-icon.png?v=92", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "/mega-ia-icon-192.png?v=76", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=76", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/mega-ia-icon.png?v=76", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     }
     return Response(
@@ -11361,9 +11461,11 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
             "reason": "Mais flexível em cenários mistos, desde que o preço não esteja excessivamente lateral e a IA externa esteja disponível."
         },
         {
-            "key":"EA","name":"EA AUTÔNOMA IQ","score":autonomous,
-            "supported":True,"operational":bool(iq_ready),
-            "reason": "Favorecida por direção consistente e alinhamento do movimento; exige conexão ativa com a IQ Option para operar."
+            "key":"EA","name":"EA XGBOOST AUTÔNOMA","score":autonomous,
+            "supported":True,"operational":bool(market=="OPEN" or iq_ready),
+            "reason": ("XGBoost puro usa candles do mercado aberto e não exige login da IQ Option."
+                       if market=="OPEN" else
+                       "XGBoost puro usa candles OTC reais; no OTC exige conexão ativa com a IQ Option.")
         },
         {
             "key":"FORCE","name":"EA FORÇA DO MOVIMENTO","score":force,
@@ -11494,14 +11596,18 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             # realmente gerou o sinal. Isto evita fechar um sinal IQ_OTC como OPEN.
             data["requested_market"] = requested_market
             if engine == "EA":
-                data["feed_source"] = "IQ_OPTION_OPEN" if requested_market == "OPEN" else "IQ_OPTION_OTC"
-                data["feed_label"] = _feed_source_label(data["feed_source"])
-                data["feed_fallback"] = False
-                data["feed_message"] = (
-                    "EA Autônoma lendo candles diretamente da IQ Option no mercado aberto."
-                    if requested_market == "OPEN"
-                    else "EA Autônoma lendo candles OTC diretamente da IQ Option."
-                )
+                if requested_market == "OPEN":
+                    feed_info = _current_open_feed_info(symbol, interval)
+                    feed_src = str(feed_info.get("source") or "MULTIFEED")
+                    data["feed_source"] = feed_src
+                    data["feed_label"] = _feed_source_label(feed_src)
+                    data["feed_fallback"] = bool(feed_info.get("fallback"))
+                    data["feed_message"] = "EA XGBoost usando candles do mercado aberto via roteador cTrader/multifuente."
+                else:
+                    data["feed_source"] = "IQ_OPTION_OTC"
+                    data["feed_label"] = _feed_source_label(data["feed_source"])
+                    data["feed_fallback"] = False
+                    data["feed_message"] = "EA XGBoost usando candles OTC reais da sessão IQ Option."
             elif engine == "FORCE" and requested_market == "IQ_OTC":
                 data["feed_source"] = "IQ_OPTION_OTC"
                 data["feed_label"] = _feed_source_label(data["feed_source"])
@@ -11943,9 +12049,16 @@ async def pre_signals(
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE")
     if fallback_twelve:
         market = "OPEN"
+    if requested_market == "IQ_OTC" and engine == "EA" and not iq_state:
+        return {
+            "ok": True,
+            "message": "EA XGBoost OTC aguardando conexão com a IQ Option.",
+            "items": [],
+            "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
+        }
 
     entry_dt = next_boundary(interval)
     seconds_to_entry = int(max(0, (entry_dt - now()).total_seconds()))
@@ -12002,16 +12115,33 @@ async def pre_signals(
     for symbol in batch:
         key = f"{group_key}|{symbol}"
         try:
-            raw = await candles(
-                symbol,
-                interval,
-                90,
-                market,
-                iq_state,
-                request=request,
-            )
+            pre_n = max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else 90
+            if engine == "EA" and requested_market == "IQ_OTC":
+                raw = await iq_ea_candles(
+                    iq_state, symbol, interval, pre_n, regular_market=False
+                )
+            else:
+                raw = await candles(
+                    symbol, interval, pre_n, market, iq_state, request=request
+                )
 
-            preview = _pre_signal_from_live_candle(raw, interval, market, symbol)
+            if engine == "EA":
+                closed_for_xgb = raw[:-1] if len(raw) > 1 else raw
+                xgb_preview = await ea_xgboost_strategy(
+                    closed_for_xgb, symbol, interval, market=requested_market
+                )
+                preview = (
+                    {
+                        "direction": xgb_preview.get("direction"),
+                        "confidence": xgb_preview.get("confidence", 0),
+                        "strategy": xgb_preview.get("strategy", "EA XGBOOST AUTÔNOMA"),
+                        "reason": xgb_preview.get("reason", "XGBoost monitorando."),
+                    }
+                    if xgb_preview.get("confirmed") and xgb_preview.get("direction") in ("CALL", "PUT")
+                    else None
+                )
+            else:
+                preview = _pre_signal_from_live_candle(raw, interval, market, symbol)
             moment_ea = None
 
             # 3.40: no SMART a EA Vela Atual varre os ticks MESMO quando o antigo
@@ -12339,7 +12469,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA ou FORCE.")
 
     requested_market = market
-    iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or engine == "EA") else None
+    iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
     fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE")
     if fallback_twelve:
         market = "OPEN"
@@ -12373,7 +12503,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     # limitador global já existente. Assim nenhum cartão depende de toque para
     # começar a ser analisado e evitamos estourar a cota da fonte de dados.
     scan_symbols = [symbol] if symbol else list(SYMBOLS)
-    if market == "OPEN" and engine not in ("EA", "FORCE"):
+    if market == "OPEN":
         ws_active = _td_ws_active_symbols()
         for row in out:
             base = str(row.get("base_symbol") or "").strip()
@@ -12389,49 +12519,55 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     cache[idx_key] = (time.time(), (idx + 1) % len(scan_symbols))
 
     try:
-        if engine == "EA" or (engine == "FORCE" and market == "IQ_OTC"):
+        if engine == "EA":
+            radar_n = max(170, XGB_MIN_CANDLES + 30)
+            if market == "IQ_OTC":
+                if not iq_state:
+                    raise RuntimeError("Conecte a IQ Option para a EA XGBoost analisar OTC.")
+                raw = await iq_ea_candles(
+                    iq_state, sym, interval, radar_n, regular_market=False
+                )
+            else:
+                raw = await candles(sym, interval, radar_n, "OPEN", None, request=request)
+        elif engine == "FORCE" and market == "IQ_OTC":
             if not iq_state:
-                raise RuntimeError("Conecte a IQ Option para usar este motor no mercado selecionado.")
+                raise RuntimeError("Conecte a IQ Option para usar este motor no OTC.")
             raw = await iq_ea_candles(
-                iq_state, sym, interval, 100,
-                regular_market=(market == "OPEN"),
+                iq_state, sym, interval, 100, regular_market=False
             )
         else:
             raw = await candles(sym, interval, (150 if engine == "SMART" else 90), market, iq_state, request=request)
         if len(raw) >= 25:
             closed = raw[:-1] if len(raw) > 1 else raw
-            if engine in ("EA", "FORCE"):
-                if engine == "FORCE" and market == "OPEN":
+            if engine == "EA":
+                tech = await ea_xgboost_strategy(closed, sym, interval, market=market)
+                engine_label = "EA XGBOOST AUTÔNOMA"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "XGBoost monitorando").replace("\n", " ")[:88]
+                status_text = (
+                    f"{engine_label} • OPORTUNIDADE ENCONTRADA"
+                    if direction != "NEUTRO"
+                    else f"{engine_label} • MONITORANDO • {why}"
+                )
+            elif engine == "FORCE":
+                if market == "OPEN":
                     if interval == "5min":
                         m5_raw = list(raw)
                     else:
                         m5_raw = await candles(sym, "5min", 90, "OPEN", None, request=request)
                     h1_raw = await candles(sym, "1h", 80, "OPEN", None, request=request)
                 else:
-                    regular_iq = market == "OPEN"
                     if interval == "5min":
                         m5_raw = list(raw)
                     else:
-                        m5_raw = await iq_ea_candles(
-                            iq_state, sym, "5min", 90,
-                            regular_market=regular_iq,
-                        )
-                    h1_raw = await iq_ea_candles(
-                        iq_state, sym, "1h", 80,
-                        regular_market=regular_iq,
-                    )
+                        m5_raw = await iq_ea_candles(iq_state, sym, "5min", 90, regular_market=False)
+                    h1_raw = await iq_ea_candles(iq_state, sym, "1h", 80, regular_market=False)
                 m5_closed = m5_raw[:-1] if len(m5_raw) > 1 else m5_raw
                 h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
-                if engine == "FORCE":
-                    tech = ea_movement_force_strategy(
-                        closed, interval, m5=m5_closed, h1=h1_closed, market=market
-                    )
-                    engine_label = "EA FORÇA DO MOVIMENTO"
-                else:
-                    tech = ea_binary_strategy(
-                        closed, interval, m5=m5_closed, h1=h1_closed, market=market
-                    )
-                    engine_label = "EA AUTÔNOMA IQ"
+                tech = ea_movement_force_strategy(
+                    closed, interval, m5=m5_closed, h1=h1_closed, market=market
+                )
+                engine_label = "EA FORÇA DO MOVIMENTO"
                 direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
                 status_text = (
                     f"{engine_label} • OPORTUNIDADE ENCONTRADA"
@@ -12473,7 +12609,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": (("IQ_OPTION_OPEN" if market == "OPEN" else "IQ_OPTION_OTC") if engine == "EA" else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
+                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine == "EA" else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
@@ -12504,7 +12640,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     except Exception as exc:
         detail = str(getattr(exc, "detail", None) or exc or "").replace("\n", " ").strip()
         low = detail.lower()
-        if engine == "EA" or (engine == "FORCE" and market == "IQ_OTC"):
+        if engine == "EA":
+            source_status = "EA XGBOOST • FONTE EM ESPERA" if market == "OPEN" else "IQ OPTION OTC • FONTE EM ESPERA"
+        elif engine == "FORCE" and market == "IQ_OTC":
             source_status = "IQ OPTION • FONTE EM ESPERA"
         elif market == "OPEN":
             if "timeout" in low or "timed out" in low:
@@ -12525,7 +12663,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (("IQ_OPTION_OPEN" if market == "OPEN" else "IQ_OPTION_OTC") if engine == "EA" else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
+            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine == "EA" else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -13231,9 +13369,9 @@ HTML_PAGE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mega IA Trader</title>
-<link rel="manifest" href="/manifest.webmanifest?v=92">
-<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=92">
-<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=92">
+<link rel="manifest" href="/manifest.webmanifest?v=76">
+<link rel="icon" type="image/png" sizes="512x512" href="/mega-ia-icon.png?v=76">
+<link rel="apple-touch-icon" sizes="192x192" href="/mega-ia-icon-192.png?v=76">
 <meta name="theme-color" content="#07182b">
 <meta name="application-name" content="Mega IA Trader">
 <meta name="apple-mobile-web-app-title" content="Mega IA Trader">
@@ -13458,8 +13596,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="robot-mode-card" id="eaModeCard">
     <img src="__MEGA_IMAGE__" alt="EA para opções binárias">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">⚡ EA AUTÔNOMA IQ</div>
-      <div class="robot-mode-desc" id="eaModeDesc">Lê candles diretamente da IQ Option • Mercado Aberto + OTC • M5/H1 • price action • foco em entrada direta.</div>
+      <div class="robot-mode-title">⚡ EA XGBOOST AUTÔNOMA</div>
+      <div class="robot-mode-desc" id="eaModeDesc">XGBoost puro • Mercado Aberto + OTC IQ • sem Luna/Gemini/indicadores • decisão estatística da próxima vela.</div>
     </div>
     <button id="eaPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -13477,7 +13615,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
     <button class="tabbtn" id="tabChart">📈 Gráfico</button>
     <button class="tabbtn" id="tabResults">🎯 Resultados</button>
-    <button class="tabbtn" id="tabValues">💰 Placar R$</button>
     <button class="tabbtn" id="tabHistory">🗓️ Histórico 15 dias</button>
     <button class="tabbtn" id="tabCompatibility">🧪 Compatibilidade</button>
     <button class="tabbtn" id="tabTelegram">✈️ Telegram</button>
@@ -13621,69 +13758,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         WIN DIRETO mostra as operações que venceram na primeira vela.
         No placar principal, WIN G1 e WIN G2 contam como WIN; LOSS só é contado se perder até o G2.
         Cada operação é contabilizada uma única vez e o histórico fica salvo neste aparelho.
-      </div>
-    </div>
-  </div>
-
-  <div id="valuesTab" class="tab">
-    <div class="card">
-      <h2 style="margin-top:0">💰 Placar de valores</h2>
-      <div class="label">ESCOLHA O VALOR BASE DA ENTRADA</div>
-
-      <div id="valueStakeButtons" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px">
-        <button type="button" data-value-stake="5" style="font-weight:1000">R$ 5</button>
-        <button type="button" data-value-stake="10" style="font-weight:1000">R$ 10</button>
-        <button type="button" data-value-stake="20" style="font-weight:1000">R$ 20</button>
-      </div>
-
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px;align-items:end">
-        <div>
-          <div class="label">PAYOUT / RETORNO (%)</div>
-          <input id="valuePayout" type="number" min="1" max="100" step="1" value="80"
-                 style="width:100%;box-sizing:border-box;margin-top:5px">
-        </div>
-        <div class="card" style="padding:10px">
-          <div class="label">ENTRADA SELECIONADA</div>
-          <div id="valueStakeSelected" class="big" style="font-size:22px">R$ 5,00</div>
-        </div>
-      </div>
-
-      <div class="grid" style="margin-top:12px">
-        <div class="card score-card score-win">
-          <div class="label">💵 LUCRO ACUMULADO</div>
-          <div id="valueProfit" class="big call">R$ 0,00</div>
-        </div>
-        <div class="card">
-          <div class="label">✅ GANHOS SOMADOS</div>
-          <div id="valueWon" class="big call">R$ 0,00</div>
-        </div>
-        <div class="card">
-          <div class="label">❌ PERDAS SOMADAS</div>
-          <div id="valueLost" class="big put">R$ 0,00</div>
-        </div>
-        <div class="card">
-          <div class="label">📊 OPERAÇÕES</div>
-          <div id="valueOps" class="big">0</div>
-        </div>
-      </div>
-
-      <div class="card" style="margin-top:12px">
-        <div class="label">ÚLTIMO RESULTADO EM VALOR</div>
-        <div id="valueLastResult" class="big">--</div>
-        <div id="valueLastDetail" style="margin-top:7px">Aguardando a próxima operação finalizada.</div>
-      </div>
-
-      <div id="valueGaleNote" class="label" style="margin-top:10px;line-height:1.5">
-        WIN direto soma o payout da entrada. Em G1/G2, o cálculo considera as entradas anteriores e o multiplicador configurado na aba Corretora.
-      </div>
-
-      <button id="resetValueScoreBtn" type="button" style="width:100%;margin-top:12px;font-weight:900;border-color:#ffb74d">
-        🧹 ZERAR PLACAR DE VALORES
-      </button>
-
-      <div class="label" style="margin-top:10px;line-height:1.5">
-        Este placar é uma simulação local baseada no resultado dos sinais, no valor escolhido e no payout informado.
-        Ele não altera nem representa automaticamente o saldo real da corretora.
       </div>
     </div>
   </div>
@@ -13972,8 +14046,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 (function(){
   try{
     const u=new URL(window.location.href);
-    if(u.searchParams.get('pwa')!=='v92'){
-      u.searchParams.set('pwa','v92');
+    if(u.searchParams.get('pwa')!=='v91'){
+      u.searchParams.set('pwa','v91');
       window.history.replaceState({},'',u.pathname+u.search+u.hash);
     }
   }catch(_){}
@@ -14090,12 +14164,10 @@ const mainTab=document.getElementById('mainTab');
 const chartTab=document.getElementById('chartTab');
 const accountTab=document.getElementById('accountTab');
 const resultsTab=document.getElementById('resultsTab');
-const valuesTab=document.getElementById('valuesTab');
 const historyTab=document.getElementById('historyTab');
 const compatibilityTab=document.getElementById('compatibilityTab');
 const telegramTab=document.getElementById('telegramTab');
 const tabResults=document.getElementById('tabResults');
-const tabValues=document.getElementById('tabValues');
 const tabHistory=document.getElementById('tabHistory');
 const tabCompatibility=document.getElementById('tabCompatibility');
 const tabTelegram=document.getElementById('tabTelegram');
@@ -14123,16 +14195,6 @@ const lossG2=document.getElementById('lossG2');
 const resetResultsBtn=document.getElementById('resetResultsBtn');
 const galeLastResult=document.getElementById('galeLastResult');
 const galeStageStatus=document.getElementById('galeStageStatus');
-const valuePayout=document.getElementById('valuePayout');
-const valueStakeSelected=document.getElementById('valueStakeSelected');
-const valueProfit=document.getElementById('valueProfit');
-const valueWon=document.getElementById('valueWon');
-const valueLost=document.getElementById('valueLost');
-const valueOps=document.getElementById('valueOps');
-const valueLastResult=document.getElementById('valueLastResult');
-const valueLastDetail=document.getElementById('valueLastDetail');
-const valueGaleNote=document.getElementById('valueGaleNote');
-const resetValueScoreBtn=document.getElementById('resetValueScoreBtn');
 const tabMain=document.getElementById('tabMain');
 const tabChart=document.getElementById('tabChart');
 const tabAccount=document.getElementById('tabAccount');
@@ -14798,7 +14860,7 @@ function normalizeEngineKey(value){
   const e=String(value||'').trim().toUpperCase();
   if(e==='GRAPH_AI' || e==='GRAPH' || e==='ROBOT') return 'GRAPH_AI';
   if(e==='SMART' || e==='AI' || e==='IA') return 'SMART';
-  if(e==='EA' || e==='EA_AUTONOMOUS_IQ') return 'EA';
+  if(e==='EA' || e==='EA_AUTONOMOUS_IQ' || e==='EA_XGBOOST' || e==='EA_XGBOOST_AUTONOMOUS') return 'EA';
   if(e==='FORCE' || e==='EA_FORCE_MOVEMENT') return 'FORCE';
   return '';
 }
@@ -14812,7 +14874,7 @@ function momentStudyEngineName(key){
   const names={
     GRAPH_AI:'🧠 IA GRÁFICA',
     SMART:'🤖 INTELIGÊNCIA ARTIFICIAL',
-    EA:'⚡ EA AUTÔNOMA IQ',
+    EA:'⚡ EA XGBOOST AUTÔNOMA',
     FORCE:'💥 EA FORÇA DO MOVIMENTO'
   };
   return names[String(key||'').toUpperCase()]||String(key||'MOTOR');
@@ -15075,7 +15137,6 @@ function rememberPendingTrade(sig){
   if(!sig) return;
   if(sig.direction!=='CALL' && sig.direction!=='PUT') return;
   if(!sig.expiry_time || !sig.entry_time) return;
-  const valueCfg=valueScoreSettings();
 
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
@@ -15094,10 +15155,7 @@ function rememberPendingTrade(sig){
     risk:String(sig.risk||''),
     strategy:String(sig.strategy||''),
     engine:String(sig.selected_engine||sig.mode||''),
-    entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH')),
-    value_stake:valueCfg.stake,
-    value_payout:valueCfg.payout,
-    value_gale_multiplier:valueCfg.multiplier
+    entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH'))
   });
 }
 
@@ -15141,7 +15199,6 @@ function rememberChartSignal(pre){
 
   const expiryMs=entryMs+(intervalSecondsValue(interval.value)*1000);
   const expiryIso=new Date(expiryMs).toISOString();
-  const valueCfg=valueScoreSettings();
 
   enqueuePendingTrade({
     source:'CHART_20S',
@@ -15153,10 +15210,7 @@ function rememberChartSignal(pre){
     interval:interval.value,
     direction:pre.direction,
     entry_time:pre.entry_time,
-    expiry_time:expiryIso,
-    value_stake:valueCfg.stake,
-    value_payout:valueCfg.payout,
-    value_gale_multiplier:valueCfg.multiplier
+    expiry_time:expiryIso
   });
 }
 
@@ -15543,7 +15597,6 @@ if(autoTradeGaleMultiplier){
     autoTradeGaleMultiplier.value=String(cfg.multiplier);
     try{ localStorage.setItem('mega_auto_trade_gale_multiplier',String(cfg.multiplier)); }catch(_){}
     updateAutoTradePreview();
-    renderValueScore();
   };
 }
 
@@ -16458,231 +16511,10 @@ if(telegramFindBtn) telegramFindBtn.onclick=findTelegramGroups;
 if(telegramTestBtn) telegramTestBtn.onclick=testTelegram;
 loadTelegramSettings();
 
-const VALUE_SCORE_KEY='mega_value_score_v1';
-const VALUE_STAKE_KEY='mega_value_stake_v1';
-const VALUE_PAYOUT_KEY='mega_value_payout_v1';
-let valueStake=5;
-let valuePayoutPct=80;
-let valueScore={
-  profit:0,
-  won_value:0,
-  lost_value:0,
-  wins:0,
-  losses:0,
-  last_delta:0,
-  last_result:'--',
-  last_stake:5,
-  processed_keys:[]
-};
-
-function moneyBR(v){
-  const n=Number(v||0);
-  try{
-    return new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(Number.isFinite(n)?n:0);
-  }catch(_){
-    return 'R$ '+(Number.isFinite(n)?n:0).toFixed(2).replace('.',',');
-  }
-}
-
-function moneySignedBR(v){
-  const n=Number(v||0);
-  if(!Number.isFinite(n) || Math.abs(n)<0.005) return moneyBR(0);
-  return (n>0?'+':'-')+moneyBR(Math.abs(n));
-}
-
-function moneySpeech(v){
-  const n=Number(v||0);
-  const safe=Number.isFinite(n)?n:0;
-  const abs=Math.abs(safe);
-  let reais=Math.floor(abs+1e-9);
-  let cents=Math.round((abs-reais)*100);
-  if(cents>=100){ reais+=1; cents=0; }
-  const parts=[];
-  if(safe<0) parts.push('menos');
-  parts.push(String(reais),reais===1?'real':'reais');
-  if(cents){
-    parts.push('e',String(cents),cents===1?'centavo':'centavos');
-  }
-  return parts.join(' ');
-}
-
-function loadValueScore(){
-  try{
-    const s=Number(localStorage.getItem(VALUE_STAKE_KEY)||5);
-    valueStake=[5,10,20].includes(s)?s:5;
-    const p=Number(localStorage.getItem(VALUE_PAYOUT_KEY)||80);
-    valuePayoutPct=Number.isFinite(p)?Math.max(1,Math.min(100,p)):80;
-    const raw=localStorage.getItem(VALUE_SCORE_KEY);
-    if(raw){
-      const d=JSON.parse(raw)||{};
-      valueScore={
-        profit:Number(d.profit||0),
-        won_value:Number(d.won_value||0),
-        lost_value:Number(d.lost_value||0),
-        wins:Math.max(0,Number(d.wins||0)),
-        losses:Math.max(0,Number(d.losses||0)),
-        last_delta:Number(d.last_delta||0),
-        last_result:String(d.last_result||'--'),
-        last_stake:Number(d.last_stake||valueStake),
-        processed_keys:Array.isArray(d.processed_keys)?d.processed_keys.slice(-1200):[]
-      };
-    }
-  }catch(_){ }
-}
-
-function saveValueScore(){
-  try{
-    localStorage.setItem(VALUE_STAKE_KEY,String(valueStake));
-    localStorage.setItem(VALUE_PAYOUT_KEY,String(valuePayoutPct));
-    localStorage.setItem(VALUE_SCORE_KEY,JSON.stringify({...valueScore,processed_keys:(valueScore.processed_keys||[]).slice(-1200)}));
-  }catch(_){ }
-}
-
-function valueScoreSettings(){
-  let multiplier=2;
-  try{
-    const a=autoTradeSettings();
-    multiplier=Number(a&&a.multiplier||2);
-  }catch(_){ }
-  if(!Number.isFinite(multiplier)) multiplier=2;
-  multiplier=Math.max(1,Math.min(5,multiplier));
-  return {
-    stake:[5,10,20].includes(Number(valueStake))?Number(valueStake):5,
-    payout:Math.max(1,Math.min(100,Number(valuePayoutPct)||80)),
-    multiplier
-  };
-}
-
-function renderValueScore(){
-  if(valuePayout) valuePayout.value=String(Math.round(valuePayoutPct));
-  if(valueStakeSelected) valueStakeSelected.textContent=moneyBR(valueStake);
-  if(valueProfit){
-    valueProfit.textContent=moneyBR(valueScore.profit);
-    valueProfit.className='big '+(Number(valueScore.profit)>=0?'call':'put');
-  }
-  if(valueWon) valueWon.textContent=moneyBR(valueScore.won_value);
-  if(valueLost) valueLost.textContent=moneyBR(valueScore.lost_value);
-  if(valueOps) valueOps.textContent=String(Number(valueScore.wins||0)+Number(valueScore.losses||0));
-  if(valueLastResult){
-    const r=String(valueScore.last_result||'--').toUpperCase();
-    const win=r.startsWith('WIN');
-    valueLastResult.textContent=(r==='--'?'--':r+' • '+moneySignedBR(valueScore.last_delta));
-    valueLastResult.className='big '+(r==='--'?'':(win?'call':'put'));
-  }
-  if(valueLastDetail){
-    const r=String(valueScore.last_result||'--').toUpperCase();
-    valueLastDetail.textContent=r==='--'
-      ? 'Aguardando a próxima operação finalizada.'
-      : `Entrada base ${moneyBR(valueScore.last_stake)} • lucro acumulado ${moneyBR(valueScore.profit)}.`;
-  }
-  document.querySelectorAll('[data-value-stake]').forEach(btn=>{
-    const active=Number(btn.getAttribute('data-value-stake'))===Number(valueStake);
-    btn.style.background=active?'#0b7a3d':'#132234';
-    btn.style.borderColor=active?'#19d27c':'#2b5273';
-    btn.style.color='#fff';
-  });
-  if(valueGaleNote){
-    const cfg=valueScoreSettings();
-    valueGaleNote.textContent=`WIN direto soma ${cfg.payout.toFixed(0)}% da entrada. Em G1/G2, o cálculo desconta as entradas anteriores e usa multiplicador ${cfg.multiplier.toFixed(1)}x da aba Corretora.`;
-  }
-}
-
-function valueResultCalculation(t,x){
-  if(!t || !x) return null;
-  const r=String(x.result||'').toUpperCase();
-  const finalAllowed=['WIN','WIN G1','WIN G2','LOSS G2'].includes(r) || (t.direct_only && r==='LOSS');
-  if(!finalAllowed) return null;
-
-  const fallback=valueScoreSettings();
-  const stakeRaw=Number(t.value_stake);
-  const payoutRaw=Number(t.value_payout);
-  const multRaw=Number(t.value_gale_multiplier);
-  const stake=[5,10,20].includes(stakeRaw)?stakeRaw:fallback.stake;
-  const payout=Math.max(0.01,Math.min(1,(Number.isFinite(payoutRaw)?payoutRaw:fallback.payout)/100));
-  const multiplier=Math.max(1,Math.min(5,Number.isFinite(multRaw)?multRaw:fallback.multiplier));
-  const g1=stake*multiplier;
-  const g2=g1*multiplier;
-  let delta=0;
-
-  if(r==='WIN') delta=stake*payout;
-  else if(r==='LOSS') delta=-stake;
-  else if(r==='WIN G1') delta=-stake+(g1*payout);
-  else if(r==='WIN G2') delta=-stake-g1+(g2*payout);
-  else if(r==='LOSS G2') delta=-(stake+g1+g2);
-
-  return {result:r,stake,payout_pct:payout*100,multiplier,delta:Number(delta.toFixed(2))};
-}
-
-function applyValueScoreResult(t,x){
-  const calc=valueResultCalculation(t,x);
-  if(!calc) return null;
-  const baseKey=resultOperationKey(t)||resultTradeKey(t);
-  if(!baseKey) return null;
-  const key=baseKey+'|VALUE';
-  if((valueScore.processed_keys||[]).includes(key)) return null;
-
-  valueScore.processed_keys=valueScore.processed_keys||[];
-  valueScore.processed_keys.push(key);
-  if(valueScore.processed_keys.length>1200) valueScore.processed_keys=valueScore.processed_keys.slice(-1200);
-  valueScore.profit=Number((Number(valueScore.profit||0)+calc.delta).toFixed(2));
-  if(calc.delta>=0) valueScore.won_value=Number((Number(valueScore.won_value||0)+calc.delta).toFixed(2));
-  else valueScore.lost_value=Number((Number(valueScore.lost_value||0)+Math.abs(calc.delta)).toFixed(2));
-  if(calc.result.startsWith('WIN')) valueScore.wins=Number(valueScore.wins||0)+1;
-  else valueScore.losses=Number(valueScore.losses||0)+1;
-  valueScore.last_delta=calc.delta;
-  valueScore.last_result=calc.result;
-  valueScore.last_stake=calc.stake;
-  saveValueScore();
-  renderValueScore();
-
-  if(voiceEnabled){
-    if(calc.result.startsWith('WIN')){
-      const ganho=calc.delta>=0?calc.delta:0;
-      speak('Win. Você ganhou '+moneySpeech(ganho)+' nesta operação. Seu lucro acumulado é '+moneySpeech(valueScore.profit)+'.');
-    }else{
-      speak('Loss. Seu resultado acumulado diminuiu para '+moneySpeech(valueScore.profit)+'. Tenha calma e mantenha o gerenciamento.');
-    }
-  }
-  return calc;
-}
-
-loadValueScore();
-renderValueScore();
-
-document.querySelectorAll('[data-value-stake]').forEach(btn=>{
-  btn.addEventListener('click',()=>{
-    const v=Number(btn.getAttribute('data-value-stake'));
-    if(![5,10,20].includes(v)) return;
-    valueStake=v;
-    saveValueScore();
-    renderValueScore();
-  });
-});
-
-if(valuePayout){
-  valuePayout.addEventListener('change',()=>{
-    const p=Number(valuePayout.value||80);
-    valuePayoutPct=Number.isFinite(p)?Math.max(1,Math.min(100,p)):80;
-    valuePayout.value=String(Math.round(valuePayoutPct));
-    saveValueScore();
-    renderValueScore();
-  });
-}
-
-if(resetValueScoreBtn){
-  resetValueScoreBtn.addEventListener('click',()=>{
-    if(!confirm('Zerar somente o placar de valores? O placar de WIN/LOSS será mantido.')) return;
-    valueScore={profit:0,won_value:0,lost_value:0,wins:0,losses:0,last_delta:0,last_result:'--',last_stake:valueStake,processed_keys:[]};
-    saveValueScore();
-    renderValueScore();
-  });
-}
-
 function showTab(which){
   const main=which==='main';
   const chart=which==='chart';
   const results=which==='results';
-  const values=which==='values';
   const history=which==='history';
   const compatibility=which==='compatibility';
   const telegram=which==='telegram';
@@ -16691,7 +16523,6 @@ function showTab(which){
   mainTab.classList.toggle('active',main);
   chartTab.classList.toggle('active',chart);
   resultsTab.classList.toggle('active',results);
-  valuesTab.classList.toggle('active',values);
   historyTab.classList.toggle('active',history);
   compatibilityTab.classList.toggle('active',compatibility);
   telegramTab.classList.toggle('active',telegram);
@@ -16700,7 +16531,6 @@ function showTab(which){
   tabMain.classList.toggle('active',main);
   tabChart.classList.toggle('active',chart);
   tabResults.classList.toggle('active',results);
-  tabValues.classList.toggle('active',values);
   tabHistory.classList.toggle('active',history);
   tabCompatibility.classList.toggle('active',compatibility);
   tabTelegram.classList.toggle('active',telegram);
@@ -16713,10 +16543,6 @@ function showTab(which){
 
   if(results){
     perf();
-  }
-
-  if(values){
-    renderValueScore();
   }
 
   if(history){
@@ -16740,7 +16566,6 @@ function showTab(which){
 tabMain.onclick=()=>showTab('main');
 tabChart.onclick=()=>showTab('chart');
 tabResults.onclick=()=>showTab('results');
-tabValues.onclick=()=>showTab('values');
 tabHistory.onclick=()=>showTab('history');
 tabCompatibility.onclick=()=>showTab('compatibility');
 tabTelegram.onclick=()=>showTab('telegram');
@@ -17357,8 +17182,8 @@ function applyRobotPowerState(){
     ? 'ONLINE: IA pura analisando somente candles e contexto de preço, sem indicadores.'
     : 'OFFLINE: análise inteligente pausada.';
   if(eaModeDesc) eaModeDesc.textContent=eaEnabled
-    ? 'ONLINE: EA Autônoma lendo a IQ Option diretamente • OPEN/OTC • foco em entrada direta.'
-    : 'OFFLINE: EA Autônoma pausada.';
+    ? 'ONLINE: XGBoost puro • OPEN via cTrader/multifuente • OTC pela IQ Option • sem IA externa.'
+    : 'OFFLINE: EA XGBoost Autônoma pausada.';
   if(forceModeDesc) forceModeDesc.textContent=forceEnabled
     ? 'ONLINE: OPEN multifuente para qualquer corretora Forex • OTC pela IQ Option • configuração protegida • sem Gale.'
     : 'OFFLINE: EA Força do Movimento pausado • configuração protegida.';
@@ -17370,9 +17195,9 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar do EA Força do Movimento ativo • OPEN multifuente / OTC pela IQ Option</div>';
     rad();
   }else if(engine==='EA'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA AUTÔNOMA IQ ONLINE • LENDO A IQ OPTION • FOCO EM WIN DIRETO';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ EA Autônoma IQ selecionada • não depende da aba Gráfico.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar da EA Autônoma IQ ativo • lendo OPEN/OTC na IQ Option</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA XGBOOST AUTÔNOMA ONLINE • XGBOOST PURO • OPEN + OTC';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ EA XGBoost Autônoma selecionada • somente XGBoost decide CALL/PUT.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar EA XGBoost ativo • OPEN multifuente / OTC IQ Option</div>';
     rad();
   }else if(engine==='SMART'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='INTELIGÊNCIA ARTIFICIAL ONLINE • IA PURA ANALISANDO CANDLES';
@@ -18109,10 +17934,6 @@ async function resultCheck(){
 
       const k=t.symbol+'|'+t.direction+'|'+t.expiry_time;
 
-      // Placar financeiro: contabiliza cada operação finalizada uma única vez
-      // e fala o lucro/queda somente se a voz estiver online.
-      applyValueScoreResult(t,x);
-
       // Resultado visual: dinheiro sobe no WIN e desce no LOSS.
       // Sem aviso de voz, conforme configuração do painel.
       if(k!==moneyFxKey){
@@ -18273,7 +18094,6 @@ async function bootApp(){
   applyRobotPowerState();
   applyVoiceState();
   renderAdaptiveLearningState();
-  renderValueScore();
 
   const safe=(name,fn)=>
     Promise.resolve()
