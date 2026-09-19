@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.35"
-PWA_VERSION = "v102"
+APP_VERSION = "3.36"
+PWA_VERSION = "v103"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -7284,24 +7284,30 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         xgb_confidence = float(xgb_signal.get("confidence") or 0.0)
         xgb_agrees = bool(direction in ("CALL", "PUT") and xgb_direction == direction)
 
-        # v3.34 — leve ajuste de frequência: M1 baixa só 2 pontos, sem remover
-        # concordância GPT + XGBoost nem o bloqueio de risco HIGH.
+        # v3.36 — ajuste leve de frequência sem retirar as confirmações principais.
+        # LOW continua seletivo em 80%. MEDIUM cai para 82%. HIGH deixa de ser
+        # bloqueio absoluto, mas só pode passar em 86%+ e com XGBoost + price action.
         low_min = max(float(OAI_MIN), 80.0 if interval == "1min" else 80.0)
-        required_conf = low_min if risk == "LOW" else max(low_min + 4.0, 86.0)
+        if risk == "LOW":
+            required_conf = low_min
+        elif risk == "MEDIUM":
+            required_conf = max(low_min + 2.0, 82.0)
+        else:
+            required_conf = max(low_min + 6.0, 86.0)
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
 
         blocked_reason = None
         if direction in ("CALL", "PUT"):
             if not confirmed:
                 blocked_reason = "IA não confirmou a própria leitura"
-            elif risk == "HIGH":
-                blocked_reason = "risco alto"
             elif confidence < required_conf:
                 blocked_reason = f"confiança {confidence:.0f}% abaixo do mínimo seletivo {required_conf:.0f}%"
             elif xgb_ready and not xgb_confirmed:
                 blocked_reason = "XGBoost sem vantagem estatística/validação suficiente"
             elif xgb_ready and xgb_confirmed and not xgb_agrees:
                 blocked_reason = f"GPT e XGBoost discordaram ({direction} x {xgb_direction})"
+            elif risk == "HIGH" and not xgb_ready:
+                blocked_reason = "risco alto exige XGBoost pronto"
             elif not gate_ok:
                 blocked_reason = gate_reason
 
