@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.40"
-PWA_VERSION = "v107"
+APP_VERSION = "3.41"
+PWA_VERSION = "v108"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -7339,25 +7339,39 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         xgb_confidence = float(xgb_signal.get("confidence") or 0.0)
         xgb_agrees = bool(direction in ("CALL", "PUT") and xgb_direction == direction)
 
-        # v3.38 — libera mais oportunidades sem reduzir o nível de análise.
-        # O corte bruto fica um pouco mais flexível, porém o sinal só passa com
-        # confirmação cruzada da IA externa + XGBoost + price action.
-        # LOW 76%, MEDIUM 78% e HIGH 82%. HIGH exige XGBoost mais forte.
-        low_min = max(float(OAI_MIN), 76.0 if interval == "1min" else 76.0)
+        # v3.41 — frequência maior sem abandonar a análise cruzada.
+        # Em M1 a confiança bruta deixa de ser o gargalo principal: CALL/PUT só
+        # passa se a IA confirmar, XGBoost estiver validado e na mesma direção,
+        # o gate de price action aprovar e a qualidade combinada alcançar o piso.
+        # A EA Vela Atual pode reduzir levemente o piso quando há ticks reais fortes
+        # alinhados, mas nunca substitui Luna/XGBoost.
+        low_min = max(float(OAI_MIN), 72.0 if interval == "1min" else 72.0)
         if risk == "LOW":
             required_conf = low_min
-            quality_min = 76.0
+            quality_min = 66.0
         elif risk == "MEDIUM":
-            required_conf = max(low_min + 2.0, 78.0)
-            quality_min = 78.0
+            required_conf = max(low_min + 1.0, 73.0)
+            quality_min = 67.0
         else:
-            required_conf = max(low_min + 6.0, 82.0)
-            quality_min = 81.0
+            required_conf = max(low_min + 6.0, 78.0)
+            quality_min = 70.0
+
+        moment_aligned = bool(
+            moment_hint.get("confirmed")
+            and moment_hint.get("tick_ready")
+            and str(moment_hint.get("direction") or "NEUTRO").upper() == direction
+            and float(moment_hint.get("score") or 0.0) >= MOMENT_EA_CONFIRM_SCORE
+        )
+        if moment_aligned:
+            required_conf = max(float(OAI_MIN), required_conf - 2.0)
+            quality_min = max(64.0, quality_min - 3.0)
+
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
 
         xgb_validation = float(xgb_signal.get("validation_accuracy") or 0.0)
         # Score de qualidade: a confiança da IA pesa mais, mas a estatística do
-        # XGBoost e sua validação temporal também entram na decisão.
+        # XGBoost e sua validação temporal também entram na decisão. A EA Vela
+        # Atual acrescenta apenas um pequeno bônus quando há tape real alinhado.
         analysis_quality = float(confidence)
         if xgb_ready:
             analysis_quality = (
@@ -7365,6 +7379,9 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
                 + float(xgb_confidence) * 0.30
                 + float(xgb_validation) * 0.10
             )
+        if moment_aligned:
+            moment_bonus = min(6.0, 3.0 + max(0.0, float(moment_hint.get("score") or 0.0) - MOMENT_EA_CONFIRM_SCORE) * 0.15)
+            analysis_quality += moment_bonus
         analysis_quality = round(max(0.0, min(100.0, analysis_quality)), 1)
 
         blocked_reason = None
@@ -7425,6 +7442,8 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
                 "xgb_validation_accuracy": round(xgb_validation, 1),
                 "analysis_quality": analysis_quality,
                 "quality_min": quality_min,
+                "moment_aligned": bool(moment_aligned),
+                "required_confidence": round(required_conf, 1),
                 "openai_primary": bool(OAI_KEY),
                 "gemini_fallback": bool(GEMINI_KEY),
             },
