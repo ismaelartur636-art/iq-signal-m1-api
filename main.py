@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.52"
+APP_VERSION = "3.53"
 PWA_VERSION = "v119"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -241,22 +241,15 @@ SYMBOLS = [
 ]
 OTC_SYMBOLS = [s for s in SYMBOLS if s != BINOMO_CRYPTO_IDX_SYMBOL]
 
-# MEGA IA 3.51 — BIGRISE • FORÇA USD + BTC/USD
-# Adaptação do BigRise EA.mq4 para opções binárias. O motor ignora toda a
-# lógica de grid/lote/OrderSend do EA original e reaproveita somente a leitura
-# simultânea de força do USD nos cinco pares. Usa apenas candles FECHADOS.
-BIGRISE_PAIRS = ("EUR/USD", "GBP/USD", "AUD/USD", "USD/CAD", "USD/CHF")
-BIGRISE_BTC_SYMBOL = "BTC/USD"
-BIGRISE_SIGNAL_SYMBOLS = BIGRISE_PAIRS + (BIGRISE_BTC_SYMBOL,)
-BIGRISE_FETCH_SYMBOLS = BIGRISE_SIGNAL_SYMBOLS
-BIGRISE_MIN_ATR_BODY = max(0.10, min(1.50, float(os.getenv("BIGRISE_MIN_ATR_BODY", "0.22"))))
-BIGRISE_MIN_BODY_RATIO = max(0.20, min(0.90, float(os.getenv("BIGRISE_MIN_BODY_RATIO", "0.42"))))
-# BTC/USD não disputa força bruta com os pares Forex. A cesta USD funciona como
-# filtro macro e o próprio BTC precisa confirmar direção, tendência e força.
-BIGRISE_BTC_MIN_ATR_BODY = max(0.10, min(2.00, float(os.getenv("BIGRISE_BTC_MIN_ATR_BODY", "0.25"))))
-BIGRISE_BTC_MIN_BODY_RATIO = max(0.20, min(0.90, float(os.getenv("BIGRISE_BTC_MIN_BODY_RATIO", "0.45"))))
-BIGRISE_BTC_MIN_BASKET_AVG = max(0.05, min(1.00, float(os.getenv("BIGRISE_BTC_MIN_BASKET_AVG", "0.16"))))
-BIGRISE_CACHE_TTL = max(2.0, min(30.0, float(os.getenv("BIGRISE_CACHE_TTL", "8"))))
+# MEGA IA 3.53 — BTC FORCE: motor exclusivo de BTC/USD, sem cesta Forex.
+BIGRISE_BTC_SYMBOL = "BTC/USD"  # chave interna antiga preservada para compatibilidade do painel
+BTC_FORCE_ATR_PERIOD = max(5, min(30, int(os.getenv("BTC_FORCE_ATR_PERIOD", "14"))))
+BTC_FORCE_EMA_FAST = max(3, min(20, int(os.getenv("BTC_FORCE_EMA_FAST", "5"))))
+BTC_FORCE_EMA_SLOW = max(BTC_FORCE_EMA_FAST + 2, min(50, int(os.getenv("BTC_FORCE_EMA_SLOW", "13"))))
+BTC_FORCE_MIN_BODY_ATR = max(0.08, min(1.20, float(os.getenv("BTC_FORCE_MIN_BODY_ATR", "0.20"))))
+BTC_FORCE_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("BTC_FORCE_MIN_BODY_RATIO", "0.43"))))
+BTC_FORCE_MIN_CLOSE_POS = max(0.55, min(0.90, float(os.getenv("BTC_FORCE_MIN_CLOSE_POS", "0.66"))))
+BTC_FORCE_MAX_RANGE_ATR = max(1.50, min(6.00, float(os.getenv("BTC_FORCE_MAX_RANGE_ATR", "3.20"))))
 
 OTC_BASE = {
     "EUR/USD": "EURUSD-OTC", "GBP/USD": "GBPUSD-OTC", "USD/JPY": "USDJPY-OTC",
@@ -297,7 +290,6 @@ def _ctrader_canonical_symbol_name(raw_name: str) -> str:
     return upper
 
 cache: Dict[str, Any] = {}
-bigrise_basket_cache: Dict[str, Any] = {}
 # Controle anti-repetição de sinais.
 # Mantém o mesmo sinal até a expiração e exige um novo setup antes de liberar outro
 # sinal na mesma direção.
@@ -3951,382 +3943,6 @@ def ea_movement_force_strategy(cs, timeframe="1min", m5=None, h1=None, market="O
 
 
 
-def bigrise_usd_strength_strategy(basket_rows, selected_symbol, timeframe="1min", source_map=None):
-    """BIGRISE • FORÇA USD — adaptação não-repaint do BigRise EA.mq4.
-
-    Regra central preservada do EA original:
-      • EUR/USD, GBP/USD e AUD/USD na mesma direção;
-      • USD/CAD e USD/CHF na direção inversa;
-      • somente a vela fechada (shift 1 no MQL4);
-      • entre os cinco pares Forex, libera apenas o ativo de maior força.
-
-    Extensão BTC/USD:
-      • a cesta 5/5 do USD funciona como filtro de contexto;
-      • BTC/USD não compete em pontos com Forex;
-      • o próprio BTC precisa confirmar a direção esperada com vela de força,
-        EMA 9/21 e deslocamento normalizado pelo ATR, sempre em candle fechado.
-
-    Grid, martingale, lote, hedge, OrderSend e recuperação do EA original não
-    participam desta estratégia.
-    """
-    selected_symbol = str(selected_symbol or "").strip().upper()
-    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"BIGRISE • FORÇA USD {tf_label}"
-    source_map = dict(source_map or {})
-
-    def neutral(reason, confidence=0.0, **extra):
-        payload = {
-            "direction": "NEUTRO",
-            "confidence": round(float(confidence or 0.0), 1),
-            "confirmed": False,
-            "risk": "HIGH",
-            "strategy": name,
-            "engine": "BIGRISE_USD_BASKET",
-            "reason": str(reason),
-            "non_repaint": True,
-            "direct_win_only": True,
-            "gale_signal": False,
-            "basket_pairs": list(BIGRISE_PAIRS),
-            "supported_symbols": list(BIGRISE_SIGNAL_SYMBOLS),
-            "btc_filter_enabled": True,
-        }
-        payload.update(extra)
-        return payload
-
-    if selected_symbol not in BIGRISE_SIGNAL_SYMBOLS:
-        return neutral(
-            "Este motor opera EUR/USD, GBP/USD, AUD/USD, USD/CAD, USD/CHF e BTC/USD.",
-            0,
-        )
-
-    rows_by_pair = {}
-    for sym in BIGRISE_PAIRS:
-        rows = list((basket_rows or {}).get(sym) or [])
-        if len(rows) < 20:
-            return neutral(f"Aguardando histórico fechado suficiente da cesta USD ({sym}).")
-        rows_by_pair[sym] = rows
-
-    # Evita misturar candles de horários diferentes entre fontes.
-    timestamps = []
-    for sym, rows in rows_by_pair.items():
-        try:
-            timestamps.append(parse_dt(str(rows[-1].get("datetime"))))
-        except Exception:
-            return neutral(f"Horário da última vela de {sym} não pôde ser validado.")
-    if timestamps:
-        spread = (max(timestamps) - min(timestamps)).total_seconds()
-        allowed = max(10.0, float(INTERVALS.get(timeframe, 60)) * 0.65)
-        if spread > allowed:
-            return neutral(
-                "As cinco fontes ainda não fecharam a mesma vela; aguardando sincronização da cesta USD.",
-                20,
-                basket_time_spread_seconds=round(spread, 1),
-            )
-
-    direction_sign = {}
-    strengths = {}
-    body_ratios = {}
-    last_times = {}
-    for sym, rows in rows_by_pair.items():
-        last = rows[-1]
-        o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"])
-        body = abs(c - o)
-        rng = max(h - l, 1e-12)
-        atr14 = atr(rows, 14)
-        if atr14 is None or atr14 <= 0:
-            return neutral(f"ATR ainda indisponível para normalizar a força de {sym}.")
-        direction_sign[sym] = 1 if c > o else (-1 if c < o else 0)
-        strengths[sym] = body / max(float(atr14), 1e-12)
-        body_ratios[sym] = body / rng
-        last_times[sym] = last.get("datetime")
-
-    # USD fraco: XXX/USD sobe e USD/XXX cai. USD forte: comportamento inverso.
-    usd_weak = (
-        direction_sign["EUR/USD"] > 0 and
-        direction_sign["GBP/USD"] > 0 and
-        direction_sign["AUD/USD"] > 0 and
-        direction_sign["USD/CAD"] < 0 and
-        direction_sign["USD/CHF"] < 0
-    )
-    usd_strong = (
-        direction_sign["EUR/USD"] < 0 and
-        direction_sign["GBP/USD"] < 0 and
-        direction_sign["AUD/USD"] < 0 and
-        direction_sign["USD/CAD"] > 0 and
-        direction_sign["USD/CHF"] > 0
-    )
-
-    if not (usd_weak or usd_strong):
-        agreeing = 0
-        weak_expected = {"EUR/USD":1, "GBP/USD":1, "AUD/USD":1, "USD/CAD":-1, "USD/CHF":-1}
-        strong_expected = {k:-v for k,v in weak_expected.items()}
-        weak_count = sum(1 for k,v in weak_expected.items() if direction_sign.get(k) == v)
-        strong_count = sum(1 for k,v in strong_expected.items() if direction_sign.get(k) == v)
-        agreeing = max(weak_count, strong_count)
-        return neutral(
-            f"Cesta USD sem confirmação total: {agreeing}/5 pares apontam o mesmo fluxo. O BIGRISE exige 5/5.",
-            clamp(25 + agreeing * 8, 25, 62),
-            basket_bias="MIXED",
-            basket_agreement=agreeing,
-            basket_strength={k:round(v, 4) for k,v in strengths.items()},
-        )
-
-    bias = "USD_WEAK" if usd_weak else "USD_STRONG"
-    strongest_symbol = max(BIGRISE_PAIRS, key=lambda s: strengths[s])
-    strongest_strength = float(strengths[strongest_symbol])
-    avg_strength = sum(float(strengths[s]) for s in BIGRISE_PAIRS) / len(BIGRISE_PAIRS)
-    strongest_body_ratio = float(body_ratios[strongest_symbol])
-
-    # BTC/USD: usa a cesta 5/5 como filtro do dólar e exige confirmação própria.
-    # Como BTC tem escala/volatilidade muito diferente de Forex, ele não entra na
-    # disputa de "maior corpo" dos cinco pares; sua força é normalizada pelo ATR.
-    if selected_symbol == BIGRISE_BTC_SYMBOL:
-        btc_rows = list((basket_rows or {}).get(BIGRISE_BTC_SYMBOL) or [])
-        if len(btc_rows) < 30:
-            return neutral(
-                "Cesta USD confirmou, mas o histórico fechado de BTC/USD ainda é insuficiente.",
-                45, basket_bias=bias, strongest_symbol=strongest_symbol,
-            )
-        try:
-            btc_time = parse_dt(str(btc_rows[-1].get("datetime")))
-            basket_time = max(timestamps) if timestamps else btc_time
-            btc_spread = abs((btc_time - basket_time).total_seconds())
-            allowed_btc_spread = max(15.0, float(INTERVALS.get(timeframe, 60)) * 0.85)
-            if btc_spread > allowed_btc_spread:
-                return neutral(
-                    "BTC/USD ainda não fechou a mesma janela da cesta USD; aguardando sincronização.",
-                    42, basket_bias=bias, btc_time_spread_seconds=round(btc_spread, 1),
-                )
-        except Exception:
-            return neutral("Horário da última vela fechada de BTC/USD não pôde ser validado.", 35)
-
-        btc_last = btc_rows[-1]
-        bo = float(btc_last["open"]); bh = float(btc_last["high"]); bl = float(btc_last["low"]); bc = float(btc_last["close"])
-        btc_body = abs(bc - bo)
-        btc_range = max(bh - bl, 1e-12)
-        btc_atr = atr(btc_rows, 14)
-        btc_closes = [float(x["close"]) for x in btc_rows]
-        btc_ema9 = ema(btc_closes, 9)
-        btc_ema21 = ema(btc_closes, 21)
-        if btc_atr is None or btc_atr <= 0 or btc_ema9 is None or btc_ema21 is None:
-            return neutral("BTC/USD ainda não tem ATR/EMA suficientes para confirmação fechada.", 45, basket_bias=bias)
-
-        btc_strength = btc_body / max(float(btc_atr), 1e-12)
-        btc_body_ratio = btc_body / btc_range
-        btc_sign = 1 if bc > bo else (-1 if bc < bo else 0)
-        expected_sign = 1 if usd_weak else -1
-        expected_direction = "CALL" if expected_sign > 0 else "PUT"
-        trend_ok = (btc_ema9 > btc_ema21 and bc >= btc_ema9) if expected_sign > 0 else (btc_ema9 < btc_ema21 and bc <= btc_ema9)
-        trend_sep_atr = abs(float(btc_ema9) - float(btc_ema21)) / max(float(btc_atr), 1e-12)
-
-        if avg_strength < BIGRISE_BTC_MIN_BASKET_AVG:
-            return neutral(
-                "A cesta USD fechou 5/5, porém a força média do movimento ainda está fraca para filtrar BTC/USD.",
-                55, basket_bias=bias, average_normalized_strength=round(avg_strength, 4),
-                strongest_symbol=strongest_symbol,
-            )
-        if btc_sign != expected_sign:
-            return neutral(
-                f"Cesta USD sugere {expected_direction} em BTC/USD, mas a última vela fechada do BTC ainda não confirmou essa direção.",
-                58, basket_bias=bias, btc_expected=expected_direction,
-                btc_normalized_strength=round(btc_strength, 4), btc_body_ratio=round(btc_body_ratio, 4),
-            )
-        if not trend_ok:
-            return neutral(
-                f"BTC/USD confirmou a vela {expected_direction}, mas a tendência EMA 9/21 ainda não está alinhada.",
-                60, basket_bias=bias, btc_expected=expected_direction,
-                btc_ema9=round(float(btc_ema9), 6), btc_ema21=round(float(btc_ema21), 6),
-            )
-        if btc_strength < BIGRISE_BTC_MIN_ATR_BODY:
-            return neutral(
-                "BTC/USD está na direção esperada, porém a vela fechada ainda é pequena em relação ao ATR.",
-                61, basket_bias=bias, btc_expected=expected_direction,
-                btc_normalized_strength=round(btc_strength, 4),
-            )
-        if btc_body_ratio < BIGRISE_BTC_MIN_BODY_RATIO:
-            return neutral(
-                "BTC/USD está alinhado, porém a vela fechada ainda tem pavios demais para uma entrada limpa.",
-                62, basket_bias=bias, btc_expected=expected_direction,
-                btc_normalized_strength=round(btc_strength, 4), btc_body_ratio=round(btc_body_ratio, 4),
-            )
-
-        confidence = clamp(
-            73.0
-            + min(8.0, avg_strength * 12.0)
-            + min(8.0, btc_strength * 14.0)
-            + min(3.0, max(0.0, btc_body_ratio - BIGRISE_BTC_MIN_BODY_RATIO) * 10.0)
-            + min(2.0, trend_sep_atr * 3.0),
-            73.0, 94.0,
-        )
-        risk = "LOW" if (btc_strength >= 0.55 and btc_body_ratio >= 0.62 and trend_sep_atr >= 0.15 and avg_strength >= 0.24) else "MEDIUM"
-        bias_text = "fraqueza sincronizada do dólar" if usd_weak else "força sincronizada do dólar"
-        reason = (
-            f"BIGRISE confirmou {bias_text} nos 5 pares e BTC/USD confirmou {expected_direction} com vela fechada, "
-            f"EMA 9/21 alinhada e força de {btc_strength:.2f} ATR. Entrada somente na próxima janela."
-        )
-        return {
-            "direction": expected_direction,
-            "confidence": round(float(confidence), 1),
-            "confirmed": True,
-            "risk": risk,
-            "strategy": name + " • BTC",
-            "engine": "BIGRISE_USD_BASKET",
-            "reason": reason,
-            "non_repaint": True,
-            "direct_win_only": True,
-            "gale_signal": False,
-            "basket_bias": bias,
-            "basket_agreement": 5,
-            "strongest_symbol": strongest_symbol,
-            "average_normalized_strength": round(avg_strength, 4),
-            "btc_expected": expected_direction,
-            "btc_normalized_strength": round(btc_strength, 4),
-            "btc_body_ratio": round(btc_body_ratio, 4),
-            "btc_ema9": round(float(btc_ema9), 6),
-            "btc_ema21": round(float(btc_ema21), 6),
-            "btc_trend_separation_atr": round(float(trend_sep_atr), 4),
-            "basket_strength": {k:round(v, 4) for k,v in strengths.items()},
-            "basket_last_times": last_times,
-            "basket_sources": source_map,
-            "basket_pairs": list(BIGRISE_PAIRS),
-            "supported_symbols": list(BIGRISE_SIGNAL_SYMBOLS),
-            "btc_filter_enabled": True,
-        }
-
-    if strongest_strength < BIGRISE_MIN_ATR_BODY:
-        return neutral(
-            "Os cinco pares concordaram, mas o deslocamento dominante ainda é pequeno em relação à volatilidade normal.",
-            55,
-            basket_bias=bias,
-            strongest_symbol=strongest_symbol,
-            normalized_strength=round(strongest_strength, 4),
-        )
-
-    if strongest_body_ratio < BIGRISE_MIN_BODY_RATIO:
-        return neutral(
-            f"{strongest_symbol} foi o mais forte da cesta, porém a vela fechou com corpo pouco dominante.",
-            58,
-            basket_bias=bias,
-            strongest_symbol=strongest_symbol,
-            normalized_strength=round(strongest_strength, 4),
-            body_ratio=round(strongest_body_ratio, 4),
-        )
-
-    if selected_symbol != strongest_symbol:
-        return neutral(
-            f"Cesta confirmou {('fraqueza' if usd_weak else 'força')} do USD, mas o ativo dominante agora é {strongest_symbol}. O sinal fica reservado a ele.",
-            clamp(58 + strongest_strength * 12, 58, 72),
-            basket_bias=bias,
-            strongest_symbol=strongest_symbol,
-            normalized_strength=round(strongest_strength, 4),
-            basket_strength={k:round(v, 4) for k,v in strengths.items()},
-        )
-
-    if usd_weak:
-        signal_map = {
-            "EUR/USD":"CALL", "GBP/USD":"CALL", "AUD/USD":"CALL",
-            "USD/CAD":"PUT", "USD/CHF":"PUT",
-        }
-    else:
-        signal_map = {
-            "EUR/USD":"PUT", "GBP/USD":"PUT", "AUD/USD":"PUT",
-            "USD/CAD":"CALL", "USD/CHF":"CALL",
-        }
-    direction = signal_map[selected_symbol]
-
-    confidence = clamp(
-        72.0
-        + min(12.0, strongest_strength * 18.0)
-        + min(6.0, avg_strength * 12.0)
-        + min(4.0, max(0.0, strongest_body_ratio - BIGRISE_MIN_BODY_RATIO) * 10.0),
-        72.0, 94.0,
-    )
-    risk = "LOW" if strongest_strength >= 0.65 and avg_strength >= 0.28 and strongest_body_ratio >= 0.62 else "MEDIUM"
-    bias_text = "fraqueza sincronizada do dólar" if usd_weak else "força sincronizada do dólar"
-    reason = (
-        f"BIGRISE confirmou {bias_text} nos 5 pares. {selected_symbol} apresentou o maior corpo normalizado "
-        f"da cesta ({strongest_strength:.2f} ATR) e fechou com corpo dominante; entrada {direction} somente na próxima janela."
-    )
-
-    return {
-        "direction": direction,
-        "confidence": round(float(confidence), 1),
-        "confirmed": True,
-        "risk": risk,
-        "strategy": name,
-        "engine": "BIGRISE_USD_BASKET",
-        "reason": reason,
-        "non_repaint": True,
-        "direct_win_only": True,
-        "gale_signal": False,
-        "basket_bias": bias,
-        "basket_agreement": 5,
-        "strongest_symbol": strongest_symbol,
-        "normalized_strength": round(strongest_strength, 4),
-        "average_normalized_strength": round(avg_strength, 4),
-        "body_ratio": round(strongest_body_ratio, 4),
-        "basket_strength": {k:round(v, 4) for k,v in strengths.items()},
-        "basket_last_times": last_times,
-        "basket_sources": source_map,
-        "basket_pairs": list(BIGRISE_PAIRS),
-        "supported_symbols": list(BIGRISE_SIGNAL_SYMBOLS),
-        "btc_filter_enabled": True,
-    }
-
-
-async def _bigrise_open_basket(interval: str, request: Request | None = None, n: int = 60):
-    """Carrega a cesta de cinco pares USD + BTC/USD com cTrader como fonte preferencial.
-
-    Quando a sessão cTrader não possui um par, usa Yahoo público para este motor
-    de cesta. Isso evita multiplicar requisições Twelve Data e mantém a leitura
-    simultânea leve. O snapshot é compartilhado entre painel e radar por poucos
-    segundos, pois todos os ativos usam exatamente a mesma cesta fechada.
-    """
-    session_id = "PUBLIC"
-    ctrader_item = None
-    if request is not None:
-        try:
-            session_id, ctrader_item = _ctrader_session_from_request(request)
-            session_id = session_id or "PUBLIC"
-        except Exception:
-            session_id, ctrader_item = "PUBLIC", None
-
-    key = f"{session_id}|{interval}"
-    cached = bigrise_basket_cache.get(key)
-    if cached and time.time() - float(cached.get("ts", 0)) < BIGRISE_CACHE_TTL:
-        return cached
-
-    async def fetch_pair(sym: str):
-        errors = []
-        if ctrader_item and _ctrader_symbol_supported(ctrader_item, sym):
-            try:
-                rows = await _ctrader_candles(ctrader_item, sym, interval, n)
-                if len(rows) >= 20:
-                    return sym, list(rows), "CTRADER_OPEN"
-            except Exception as exc:
-                errors.append("cTrader: " + str(exc)[:120])
-        try:
-            rows = await _yahoo_public_candles(sym, interval, n)
-            if len(rows) >= 20:
-                return sym, list(rows), "YAHOO_PUBLIC"
-        except Exception as exc:
-            errors.append("Yahoo: " + str(exc)[:120])
-        try:
-            rows = await candles(sym, interval, n, "OPEN", None, request=request)
-            if len(rows) >= 20:
-                return sym, list(rows), _feed_source_from_rows(rows)
-        except Exception as exc:
-            errors.append("multifuente: " + str(exc)[:120])
-        raise RuntimeError(f"{sym}: " + " | ".join(errors[-3:]))
-
-    results = await asyncio.gather(*(fetch_pair(sym) for sym in BIGRISE_FETCH_SYMBOLS))
-    rows_map = {sym: rows for sym, rows, _ in results}
-    sources = {sym: source for sym, _, source in results}
-    payload = {"ts": time.time(), "rows": rows_map, "sources": sources}
-    bigrise_basket_cache[key] = payload
-    return payload
-
-
 def ea_binary_strategy(cs, timeframe="1min", m5=None, h1=None, market="OPEN"):
     """EA AUTÔNOMA IQ — leitura seletiva para a próxima vela.
 
@@ -7261,6 +6877,140 @@ async def ea_xgboost_strategy(cs, symbol, timeframe="1min", market="OPEN"):
 
 
 
+
+def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN"):
+    """BTC FORCE — força própria do BTC/USD para a PRÓXIMA vela, sem outros pares.
+
+    Usa somente candles fechados. A última vela fechada precisa mostrar corpo
+    relevante em relação ao ATR, pouco pavio contra a direção e contexto curto
+    do próprio BTC. Não usa cesta USD, não usa Forex, não usa Gale e não repinta.
+    """
+    rows = list(cs or [])
+    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
+    name = f"BTC FORCE {tf_label}"
+    need = max(32, BTC_FORCE_EMA_SLOW + BTC_FORCE_ATR_PERIOD + 6)
+    if len(rows) < need:
+        return {
+            "available": True, "direction": "NEUTRO", "confidence": 0.0,
+            "confirmed": False, "risk": "HIGH", "strategy": name,
+            "engine": "BTC_FORCE", "provider": "LOCAL_BTC_FORCE",
+            "reason": f"Coletando candles fechados do BTC/USD ({len(rows)}/{need}).",
+            "non_repaint": True, "direct_win_only": True, "gale_signal": False,
+            "btc_only": True,
+        }
+
+    last = rows[-1]
+    o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"])
+    rng = max(h - l, 1e-12)
+    body = abs(c - o)
+    body_ratio = body / rng
+    close_pos = (c - l) / rng
+
+    a = atr(rows, BTC_FORCE_ATR_PERIOD)
+    if a is None or a <= 0:
+        return {
+            "available": True, "direction": "NEUTRO", "confidence": 0.0,
+            "confirmed": False, "risk": "HIGH", "strategy": name,
+            "engine": "BTC_FORCE", "provider": "LOCAL_BTC_FORCE",
+            "reason": "ATR do BTC/USD ainda indisponível para medir força.",
+            "non_repaint": True, "direct_win_only": True, "gale_signal": False,
+            "btc_only": True,
+        }
+
+    closes = [float(x["close"]) for x in rows]
+    efast = ema(closes, BTC_FORCE_EMA_FAST)
+    eslow = ema(closes, BTC_FORCE_EMA_SLOW)
+    if efast is None or eslow is None:
+        return {
+            "available": True, "direction": "NEUTRO", "confidence": 0.0,
+            "confirmed": False, "risk": "HIGH", "strategy": name,
+            "engine": "BTC_FORCE", "provider": "LOCAL_BTC_FORCE",
+            "reason": "Histórico do BTC/USD ainda insuficiente para direção curta.",
+            "non_repaint": True, "direct_win_only": True, "gale_signal": False,
+            "btc_only": True,
+        }
+
+    body_atr = body / max(float(a), 1e-12)
+    range_atr = rng / max(float(a), 1e-12)
+    bullish = c > o
+    bearish = c < o
+    call_close_ok = close_pos >= BTC_FORCE_MIN_CLOSE_POS
+    put_close_ok = close_pos <= (1.0 - BTC_FORCE_MIN_CLOSE_POS)
+    body_ok = body_ratio >= BTC_FORCE_MIN_BODY_RATIO
+    force_ok = body_atr >= BTC_FORCE_MIN_BODY_ATR
+    not_exhausted = range_atr <= BTC_FORCE_MAX_RANGE_ATR
+
+    # Movimento curto do próprio BTC: não depende de nenhum outro ativo.
+    prev3 = closes[-4:-1]
+    drift3 = (prev3[-1] - prev3[0]) if len(prev3) >= 2 else 0.0
+    call_context = (efast >= eslow) or (drift3 >= -0.12 * float(a))
+    put_context = (efast <= eslow) or (drift3 <= 0.12 * float(a))
+
+    call_ok = bullish and body_ok and force_ok and call_close_ok and not_exhausted and call_context
+    put_ok = bearish and body_ok and force_ok and put_close_ok and not_exhausted and put_context
+    direction = "CALL" if call_ok else ("PUT" if put_ok else "NEUTRO")
+
+    confidence = 0.0
+    if direction != "NEUTRO":
+        confidence = 66.0
+        confidence += min(10.0, max(0.0, body_atr - BTC_FORCE_MIN_BODY_ATR) * 18.0)
+        confidence += min(8.0, max(0.0, body_ratio - BTC_FORCE_MIN_BODY_RATIO) * 18.0)
+        edge = close_pos if direction == "CALL" else (1.0 - close_pos)
+        confidence += min(6.0, max(0.0, edge - BTC_FORCE_MIN_CLOSE_POS) * 18.0)
+        trend_sep = abs(float(efast) - float(eslow)) / max(float(a), 1e-12)
+        confidence += min(5.0, trend_sep * 9.0)
+        confidence = clamp(confidence, 66.0, 93.0)
+
+    if direction == "CALL":
+        reason = (
+            f"BTC ganhou força compradora na vela fechada: corpo {body_ratio*100:.0f}% da vela, "
+            f"força {body_atr:.2f} ATR e fechamento perto da máxima. CALL preparada para a próxima vela."
+        )
+    elif direction == "PUT":
+        reason = (
+            f"BTC ganhou força vendedora na vela fechada: corpo {body_ratio*100:.0f}% da vela, "
+            f"força {body_atr:.2f} ATR e fechamento perto da mínima. PUT preparada para a próxima vela."
+        )
+    else:
+        blockers = []
+        if not force_ok: blockers.append(f"força abaixo de {BTC_FORCE_MIN_BODY_ATR:.2f} ATR")
+        if not body_ok: blockers.append(f"corpo abaixo de {BTC_FORCE_MIN_BODY_RATIO*100:.0f}%")
+        if bullish and not call_close_ok: blockers.append("compra fechou longe da máxima")
+        if bearish and not put_close_ok: blockers.append("venda fechou longe da mínima")
+        if not not_exhausted: blockers.append("vela esticada demais")
+        if bullish and not call_context: blockers.append("contexto curto ainda não confirma compra")
+        if bearish and not put_context: blockers.append("contexto curto ainda não confirma venda")
+        if not bullish and not bearish: blockers.append("vela sem direção")
+        reason = "BTC FORCE monitorando: " + (", ".join(blockers) if blockers else "aguardando vela de força limpa") + "."
+
+    return {
+        "available": True,
+        "direction": direction,
+        "confidence": round(float(confidence), 1),
+        "confirmed": direction in ("CALL", "PUT"),
+        "risk": ("LOW" if confidence >= 80 else ("MEDIUM" if direction != "NEUTRO" else "HIGH")),
+        "strategy": name,
+        "engine": "BTC_FORCE",
+        "provider": "LOCAL_BTC_FORCE",
+        "reason": reason[:360],
+        "non_repaint": True,
+        "direct_win_only": True,
+        "gale_signal": False,
+        "btc_only": True,
+        "next_candle_entry": True,
+        "diagnostics": {
+            "atr": round(float(a), 10),
+            "body_atr": round(body_atr, 4),
+            "body_ratio": round(body_ratio, 4),
+            "close_position": round(close_pos, 4),
+            "range_atr": round(range_atr, 4),
+            "ema_fast": round(float(efast), 8),
+            "ema_slow": round(float(eslow), 8),
+            "drift3_atr": round(drift3 / max(float(a), 1e-12), 4),
+        },
+    }
+
+
 def larry_breakout_strategy(cs, timeframe="1min", market="OPEN"):
     """LARRY BREAKOUT — adaptação do Larry FX para CALL/PUT sem Grid/Martingale.
 
@@ -8990,33 +8740,32 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             if market != "OPEN":
                 out = neutral_signal(
                     symbol, interval, market,
-                    "BIGRISE • SOMENTE MERCADO ABERTO",
-                    "O BIGRISE usa a cesta sincronizada de 5 pares USD e também pode filtrar BTC/USD no mercado aberto.",
+                    "BTC FORCE • SOMENTE BTC/USD ABERTO",
+                    "O BTC FORCE é independente e usa somente candles reais do BTC/USD no mercado aberto.",
                     source_state="READY",
                 )
                 out.update({
-                    "strategy": "BIGRISE • FORÇA USD", "mode": "BIGRISE_USD_BASKET",
+                    "strategy": "BTC FORCE", "mode": "BTC_FORCE_NEXT_CANDLE",
                     "selected_engine": engine, "non_repaint": True, "direct_win_only": True,
-                    "gale_signal": False,
+                    "gale_signal": False, "btc_only": True,
                 })
                 cache[key] = (time.time(), out)
                 return out
-            if symbol not in BIGRISE_SIGNAL_SYMBOLS:
+            if symbol != BIGRISE_BTC_SYMBOL:
                 out = neutral_signal(
                     symbol, interval, market,
-                    "BIGRISE • ATIVO NÃO SUPORTADO",
-                    "Este motor opera EUR/USD, GBP/USD, AUD/USD, USD/CAD, USD/CHF e BTC/USD.",
+                    "BTC FORCE • SOMENTE BTC/USD",
+                    "Este motor foi criado exclusivamente para BTC/USD e não depende de nenhum par Forex.",
                     source_state="READY",
                 )
                 out.update({
-                    "strategy": "BIGRISE • FORÇA USD", "mode": "BIGRISE_USD_BASKET",
+                    "strategy": "BTC FORCE", "mode": "BTC_FORCE_NEXT_CANDLE",
                     "selected_engine": engine, "non_repaint": True, "direct_win_only": True,
-                    "gale_signal": False,
+                    "gale_signal": False, "btc_only": True,
                 })
                 cache[key] = (time.time(), out)
                 return out
-            bigrise_pack = await _bigrise_open_basket(interval, request=request, n=60)
-            raw = list((bigrise_pack.get("rows") or {}).get(symbol) or [])
+            raw = await candles(symbol, interval, 150, "OPEN", None, request=request)
         elif engine == "EA":
             # EA RSI + Value Chart + XGBoost: OPEN usa o roteador normal (cTrader/multifuente);
             # OTC usa exclusivamente candles reais da sessão IQ Option.
@@ -9122,7 +8871,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                   )))
         )
         if engine == "BIGRISE":
-            status = "BIGRISE • CESTA USD EM ESPERA"
+            status = "BTC FORCE • BTC/USD EM ESPERA"
         out = neutral_signal(symbol, interval, market, status, exc.detail, source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
@@ -9137,7 +8886,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                   else ("IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL")))
         )
         if engine == "BIGRISE":
-            status = "BIGRISE • FONTES DA CESTA RECONECTANDO"
+            status = "BTC FORCE • FONTE BTC RECONECTANDO"
         out = neutral_signal(symbol, interval, market, status, str(exc), source_state="DEGRADED")
         cache[key] = (time.time(), out)
         return out
@@ -9195,8 +8944,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "EA FORÇA DO MOVIMENTO"
             engine_mode = "EA_FORCE_MOVEMENT"
         elif engine == "BIGRISE":
-            engine_title = "BIGRISE • FORÇA USD"
-            engine_mode = "BIGRISE_USD_BASKET"
+            engine_title = "BTC FORCE"
+            engine_mode = "BTC_FORCE_NEXT_CANDLE"
         else:
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
@@ -9228,7 +8977,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY") else (closed[-60:] if engine == "BIGRISE" else (closed[-90:] if len(closed) > 90 else closed))))
+            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE") else (closed[-90:] if len(closed) > 90 else closed)))
             if engine == "SMART":
                 moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
                 analysis = await openai_direct_signal(
@@ -9243,13 +8992,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "LARRY":
                 analysis = larry_breakout_strategy(engine_closed, interval, market=market)
             elif engine == "BIGRISE":
-                basket_closed = {}
-                for basket_symbol, basket_raw in ((bigrise_pack or {}).get("rows") or {}).items():
-                    basket_closed[basket_symbol] = list(basket_raw[:-1] if len(basket_raw) > 1 else basket_raw)
-                analysis = bigrise_usd_strength_strategy(
-                    basket_closed, symbol, timeframe=interval,
-                    source_map=((bigrise_pack or {}).get("sources") or {}),
-                )
+                analysis = btc_force_next_candle_strategy(engine_closed, interval, market=market)
             elif engine == "FORCE":
                 if market == "OPEN":
                     # Multibroker OPEN: HTFs vêm do roteador público, sem login da IQ.
@@ -9300,7 +9043,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
             "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY") and analysis.get("confirmed")),
-            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RSI_VALUE_CHART" if engine == "EA" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else ("LOCAL_LARRY_BREAKOUT" if engine == "LARRY" else ("LOCAL_BIGRISE_BASKET" if engine == "BIGRISE" else "DISABLED"))))),
+            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RSI_VALUE_CHART" if engine == "EA" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else ("LOCAL_LARRY_BREAKOUT" if engine == "LARRY" else ("LOCAL_BTC_FORCE" if engine == "BIGRISE" else "DISABLED"))))),
             "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
@@ -9386,7 +9129,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                       else ("rubik_fingerprint" if engine == "RUBIK"
                             else ("larry_fingerprint" if engine == "LARRY"
                                   else ("force_fingerprint" if engine == "FORCE"
-                                        else ("bigrise_fingerprint" if engine == "BIGRISE" else "graph_ai_fingerprint")))))
+                                        else ("btc_force_fingerprint" if engine == "BIGRISE" else "graph_ai_fingerprint")))))
             )
             if release_state.get(fingerprint_key) != signal_fingerprint:
                 # v3.6: SOMENTE a IA GRÁFICA tem intervalo mínimo de 4 minutos
@@ -9418,7 +9161,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 )
                 base.update({
                     "direction": direction_now,
-                    "status": (smart_status if engine == "SMART" else ("SINAL TRIPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL LARRY BREAKOUT LIBERADO" if engine == "LARRY" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else ("SINAL BIGRISE • FORÇA USD LIBERADO" if engine == "BIGRISE" else "SINAL IA GRÁFICA LIBERADO")))))),
+                    "status": (smart_status if engine == "SMART" else ("SINAL TRIPLA CONFIRMAÇÃO LIBERADO" if engine == "EA" else ("SINAL ROBÔ RUBIK ADAPTADO LIBERADO" if engine == "RUBIK" else ("SINAL LARRY BREAKOUT LIBERADO" if engine == "LARRY" else ("SINAL EA FORÇA DO MOVIMENTO LIBERADO" if engine == "FORCE" else ("SINAL BTC FORCE LIBERADO" if engine == "BIGRISE" else "SINAL IA GRÁFICA LIBERADO")))))),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -12568,10 +12311,12 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                 data["feed_fallback"] = False
                 data["feed_message"] = "EA Força do Movimento lendo candles OTC diretamente da IQ Option."
             elif engine == "BIGRISE":
-                data["feed_source"] = "BIGRISE_USD_BASKET"
-                data["feed_label"] = "Cesta USD 5/5 + BTC"
-                data["feed_fallback"] = False
-                data["feed_message"] = "BIGRISE sincroniza cinco pares USD fechados e, no BTC/USD, exige confirmação própria de vela, EMA 9/21 e ATR; cTrader é preferida e Yahoo público é fallback."
+                feed_info = _current_open_feed_info("BTC/USD", interval)
+                feed_src = str(feed_info.get("source") or "MULTIFEED")
+                data["feed_source"] = feed_src
+                data["feed_label"] = _feed_source_label(feed_src)
+                data["feed_fallback"] = bool(feed_info.get("fallback"))
+                data["feed_message"] = "BTC FORCE usa somente candles fechados do BTC/USD via roteador multifuente; não consulta nem espera nenhum par Forex."
             elif requested_market == "OPEN":
                 feed_info = _current_open_feed_info(symbol, interval)
                 feed_src = str(feed_info.get("source") or _feed_source_from_rows([]) or "MULTIFEED")
@@ -13005,7 +12750,7 @@ async def pre_signals(
     if engine == "BIGRISE":
         return {
             "ok": True,
-            "message": "BIGRISE usa candles fechados da cesta USD e do BTC/USD; não antecipa sinal na vela em formação para evitar repaint.",
+            "message": "BTC FORCE usa somente a última vela fechada do BTC/USD e prepara CALL/PUT para a próxima vela; não depende de Forex e não antecipa a vela em formação para evitar repaint.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -14641,10 +14386,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   <div class="robot-mode-card" id="bigriseModeCard">
-    <img src="__MEGA_IMAGE__" alt="BigRise Força USD">
+    <img src="__MEGA_IMAGE__" alt="BTC Force">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">🌐 BIGRISE • FORÇA USD</div>
-      <div class="robot-mode-desc" id="bigriseModeDesc">5 pares USD + BTC/USD • força normalizada • tendência BTC • candle fechado • OPEN • sem grid e sem Gale.</div>
+      <div class="robot-mode-title">₿ BTC FORCE</div>
+      <div class="robot-mode-desc" id="bigriseModeDesc">Somente BTC/USD • força da vela fechada • CALL/PUT para a próxima vela • sem depender de Forex • sem Gale.</div>
     </div>
     <button id="bigrisePowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -16086,7 +15831,7 @@ function normalizeEngineKey(value){
   if(e==='EA' || e==='EA_AUTONOMOUS_IQ' || e==='EA_XGBOOST' || e==='EA_XGBOOST_AUTONOMOUS') return 'EA';
   if(e==='FORCE' || e==='EA_FORCE_MOVEMENT') return 'FORCE';
   if(e==='LARRY' || e==='LARRY_BREAKOUT') return 'LARRY';
-  if(e==='BIGRISE' || e==='BIGRISE_USD_BASKET') return 'BIGRISE';
+  if(e==='BIGRISE' || e==='BIGRISE_USD_BASKET' || e==='BTC_FORCE' || e==='BTC_FORCE_NEXT_CANDLE') return 'BIGRISE';
   return '';
 }
 
@@ -16101,7 +15846,7 @@ function momentStudyEngineName(key){
     SMART:'🤖 INTELIGÊNCIA ARTIFICIAL',
     LARRY:'⚡ LARRY BREAKOUT',
     FORCE:'💥 EA FORÇA DO MOVIMENTO',
-    BIGRISE:'🌐 BIGRISE • FORÇA USD'
+    BIGRISE:'₿ BTC FORCE'
   };
   return names[String(key||'').toUpperCase()]||String(key||'MOTOR');
 }
@@ -18482,14 +18227,14 @@ function applyRobotPowerState(){
     ? 'ONLINE: OPEN multifuente para qualquer corretora Forex • OTC pela IQ Option • configuração protegida • sem Gale.'
     : 'OFFLINE: EA Força do Movimento pausado • configuração protegida.';
   if(bigriseModeDesc) bigriseModeDesc.textContent=bigriseEnabled
-    ? 'ONLINE: cesta USD 5/5 + BTC/USD • BTC confirma vela + EMA 9/21 + ATR • candle fechado • somente OPEN • sem grid/Gale.'
-    : 'OFFLINE: BIGRISE • Força USD pausado.';
+    ? 'ONLINE: somente BTC/USD • força própria do BTC • entrada na próxima vela • sem depender de Forex • sem Gale.'
+    : 'OFFLINE: BTC FORCE pausado.';
 
   const engine=selectedRobotEngine();
   if(engine==='BIGRISE'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='BIGRISE • FORÇA USD ONLINE • CESTA 5/5 + BTC/USD • CANDLES FECHADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🌐 BIGRISE selecionado • cesta USD 5/5 + BTC/USD com confirmação própria • sem pré-sinal para não repintar.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar BIGRISE ativo • procurando o par dominante da cesta USD e confirmação em BTC/USD</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='BTC FORCE ONLINE • SOMENTE BTC/USD • PRÓXIMA VELA • SEM FOREX';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">₿ BTC FORCE selecionado • lê somente BTC/USD fechado e prepara a próxima vela • sem pré-sinal para não repintar.</div>';
+    if(radar) radar.innerHTML='<div>📡 BTC FORCE ativo • procurando força compradora ou vendedora somente no BTC/USD</div>';
     rad();
   }else if(engine==='LARRY'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='LARRY BREAKOUT ONLINE • ROMPIMENTO + FORÇA DE VELA • OPEN + OTC • SEM GALE';
@@ -18678,7 +18423,7 @@ async function setBigrisePower(enabled){
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled) speak(bigriseEnabled ? 'Big Rise força do dólar online.' : 'Big Rise força do dólar offline.');
+  if(voiceEnabled) speak(bigriseEnabled ? 'BTC Force online.' : 'BTC Force offline.');
 }
 
 if(robotPowerBtn) robotPowerBtn.onclick=()=>{ setRobotPower(!robotEnabled); };
@@ -18913,7 +18658,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='LARRY'?'LARRY BREAKOUT':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':(selectedRobotEngine()==='BIGRISE'?'BIGRISE • FORÇA USD':'IA GRÁFICA')))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
+    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='LARRY'?'LARRY BREAKOUT':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':(selectedRobotEngine()==='BIGRISE'?'BTC FORCE':'IA GRÁFICA')))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
     await sig(true);
   }finally{
     radarAutoBusy=false;
