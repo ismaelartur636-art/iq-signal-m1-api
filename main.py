@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.37"
-PWA_VERSION = "v104"
+APP_VERSION = "3.38"
+PWA_VERSION = "v105"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -7284,17 +7284,33 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         xgb_confidence = float(xgb_signal.get("confidence") or 0.0)
         xgb_agrees = bool(direction in ("CALL", "PUT") and xgb_direction == direction)
 
-        # v3.37 — ajuste pequeno adicional de frequência. Mantém o ensemble,
-        # XGBoost e o gate final; reduz apenas os pisos de confiança.
-        # LOW 78%, MEDIUM 80% e HIGH 84% (HIGH ainda exige XGBoost pronto).
-        low_min = max(float(OAI_MIN), 78.0 if interval == "1min" else 78.0)
+        # v3.38 — libera mais oportunidades sem reduzir o nível de análise.
+        # O corte bruto fica um pouco mais flexível, porém o sinal só passa com
+        # confirmação cruzada da IA externa + XGBoost + price action.
+        # LOW 76%, MEDIUM 78% e HIGH 82%. HIGH exige XGBoost mais forte.
+        low_min = max(float(OAI_MIN), 76.0 if interval == "1min" else 76.0)
         if risk == "LOW":
             required_conf = low_min
+            quality_min = 76.0
         elif risk == "MEDIUM":
-            required_conf = max(low_min + 2.0, 80.0)
+            required_conf = max(low_min + 2.0, 78.0)
+            quality_min = 78.0
         else:
-            required_conf = max(low_min + 6.0, 84.0)
+            required_conf = max(low_min + 6.0, 82.0)
+            quality_min = 81.0
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
+
+        xgb_validation = float(xgb_signal.get("validation_accuracy") or 0.0)
+        # Score de qualidade: a confiança da IA pesa mais, mas a estatística do
+        # XGBoost e sua validação temporal também entram na decisão.
+        analysis_quality = float(confidence)
+        if xgb_ready:
+            analysis_quality = (
+                float(confidence) * 0.60
+                + float(xgb_confidence) * 0.30
+                + float(xgb_validation) * 0.10
+            )
+        analysis_quality = round(max(0.0, min(100.0, analysis_quality)), 1)
 
         blocked_reason = None
         if direction in ("CALL", "PUT"):
@@ -7305,9 +7321,13 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             elif xgb_ready and not xgb_confirmed:
                 blocked_reason = "XGBoost sem vantagem estatística/validação suficiente"
             elif xgb_ready and xgb_confirmed and not xgb_agrees:
-                blocked_reason = f"GPT e XGBoost discordaram ({direction} x {xgb_direction})"
-            elif risk == "HIGH" and not xgb_ready:
-                blocked_reason = "risco alto exige XGBoost pronto"
+                blocked_reason = f"IA e XGBoost discordaram ({direction} x {xgb_direction})"
+            elif not xgb_ready and risk in ("MEDIUM", "HIGH"):
+                blocked_reason = "risco médio/alto exige XGBoost pronto"
+            elif risk == "HIGH" and (xgb_confidence < 64.0 or xgb_validation < 54.0):
+                blocked_reason = "risco alto exige XGBoost forte e validação temporal maior"
+            elif analysis_quality < quality_min:
+                blocked_reason = f"qualidade combinada {analysis_quality:.0f}% abaixo do mínimo {quality_min:.0f}%"
             elif not gate_ok:
                 blocked_reason = gate_reason
 
@@ -7345,6 +7365,10 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
                 "xgb_ready": xgb_ready,
                 "xgb_confirmed": xgb_confirmed,
                 "xgb_agrees": xgb_agrees,
+                "xgb_confidence": round(xgb_confidence, 1),
+                "xgb_validation_accuracy": round(xgb_validation, 1),
+                "analysis_quality": analysis_quality,
+                "quality_min": quality_min,
                 "openai_primary": bool(OAI_KEY),
                 "gemini_fallback": bool(GEMINI_KEY),
             },
@@ -7352,6 +7376,8 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             "direct_win_filter": {
                 "enabled": True,
                 "required_confidence": round(required_conf, 1),
+                "analysis_quality": analysis_quality,
+                "quality_min": quality_min,
                 "gate_ok": bool(gate_ok),
                 "blocked": bool(blocked_reason),
                 "price_context": price_ctx,
