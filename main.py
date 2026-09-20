@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.66"
+APP_VERSION = "3.67"
 PWA_VERSION = "v132"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -92,15 +92,19 @@ LARRY_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("LARRY_MIN_BODY_RATIO
 LARRY_MIN_RANGE_EXPANSION = max(0.70, min(2.00, float(os.getenv("LARRY_MIN_RANGE_EXPANSION", "0.90"))))
 LARRY_MAX_RANGE_ATR = max(1.20, min(6.00, float(os.getenv("LARRY_MAX_RANGE_ATR", "3.00"))))
 
-# MEGA IA 3.59 — adaptação do script TradingView "MR Mt4 (Ultra Fast)" / Velocity Flow.
-# A lógica de entrada foi preservada: rompimento dos 3 fechamentos anteriores,
-# DMI/ADX 14, RSI 7 em corredor e direção da vela. O cooldown original de 5
-# barras também é reproduzido. EMA 9 e SMA 21 permanecem como leitura visual.
+# MEGA IA 3.67 — Velocity Flow levemente afrouxado para aumentar a frequência
+# sem liberar sinal intrabar: rompimento de 2 fechamentos, ADX mínimo 22,
+# RSI 7 em corredor mais amplo e cooldown de 4 velas. A direção da vela
+# continua obrigatória e a entrada permanece somente após candle fechado.
 VELOCITY_DMI_PERIOD = max(5, min(30, int(os.getenv("VELOCITY_DMI_PERIOD", "14"))))
 VELOCITY_ADX_SMOOTH = max(5, min(30, int(os.getenv("VELOCITY_ADX_SMOOTH", "14"))))
-VELOCITY_ADX_MIN = max(5.0, min(60.0, float(os.getenv("VELOCITY_ADX_MIN", "25"))))
-VELOCITY_BREAKOUT_LOOKBACK = max(2, min(10, int(os.getenv("VELOCITY_BREAKOUT_LOOKBACK", "3"))))
-VELOCITY_COOLDOWN_BARS = max(1, min(20, int(os.getenv("VELOCITY_COOLDOWN_BARS", "5"))))
+VELOCITY_ADX_MIN = max(5.0, min(60.0, float(os.getenv("VELOCITY_ADX_MIN", "22"))))
+VELOCITY_BREAKOUT_LOOKBACK = max(2, min(10, int(os.getenv("VELOCITY_BREAKOUT_LOOKBACK", "2"))))
+VELOCITY_COOLDOWN_BARS = max(1, min(20, int(os.getenv("VELOCITY_COOLDOWN_BARS", "4"))))
+VELOCITY_RSI_BUY_MIN = max(20.0, min(60.0, float(os.getenv("VELOCITY_RSI_BUY_MIN", "42"))))
+VELOCITY_RSI_BUY_MAX = max(VELOCITY_RSI_BUY_MIN + 1.0, min(85.0, float(os.getenv("VELOCITY_RSI_BUY_MAX", "68"))))
+VELOCITY_RSI_SELL_MIN = max(15.0, min(55.0, float(os.getenv("VELOCITY_RSI_SELL_MIN", "32"))))
+VELOCITY_RSI_SELL_MAX = max(VELOCITY_RSI_SELL_MIN + 1.0, min(80.0, float(os.getenv("VELOCITY_RSI_SELL_MAX", "58"))))
 
 # MEGA IA 3.66 — ICT/SMC Institucional levemente afrouxado, mantendo vela confirmada.
 # O motor usa somente candles fechados. Pivôs são confirmados com barras à direita,
@@ -7585,13 +7589,13 @@ def velocity_flow_strategy(cs, timeframe="1min", market="OPEN"):
         buy = (
             c > max(prev)
             and av > VELOCITY_ADX_MIN and pdi > mdi
-            and 45.0 <= rsi7 <= 65.0
+            and VELOCITY_RSI_BUY_MIN <= rsi7 <= VELOCITY_RSI_BUY_MAX
             and c > o
         )
         sell = (
             c < min(prev)
             and av > VELOCITY_ADX_MIN and mdi > pdi
-            and 35.0 <= rsi7 <= 55.0
+            and VELOCITY_RSI_SELL_MIN <= rsi7 <= VELOCITY_RSI_SELL_MAX
             and c < o
         )
         raw_direction = "CALL" if buy else ("PUT" if sell else "NEUTRO")
@@ -7619,8 +7623,8 @@ def velocity_flow_strategy(cs, timeframe="1min", market="OPEN"):
     breakout_sell = c < lowest_close
     trend_buy = av > VELOCITY_ADX_MIN and pdi > mdi
     trend_sell = av > VELOCITY_ADX_MIN and mdi > pdi
-    rsi_buy = rsi7 is not None and 45.0 <= rsi7 <= 65.0
-    rsi_sell = rsi7 is not None and 35.0 <= rsi7 <= 55.0
+    rsi_buy = rsi7 is not None and VELOCITY_RSI_BUY_MIN <= rsi7 <= VELOCITY_RSI_BUY_MAX
+    rsi_sell = rsi7 is not None and VELOCITY_RSI_SELL_MIN <= rsi7 <= VELOCITY_RSI_SELL_MAX
     candle_buy = c > o
     candle_sell = c < o
 
@@ -7635,7 +7639,7 @@ def velocity_flow_strategy(cs, timeframe="1min", market="OPEN"):
         confidence = clamp(76.0 + strength + di_gap + breakout_bonus, 76.0, 93.0)
         reason = (
             f"{direction} confirmado: rompimento dos {VELOCITY_BREAKOUT_LOOKBACK} fechamentos anteriores, "
-            f"ADX {av:.1f} > {VELOCITY_ADX_MIN:.0f}, +DI {pdi:.1f} / -DI {mdi:.1f}, RSI7 {rsi7:.1f} e vela na direção do sinal."
+            f"ADX {av:.1f} > {VELOCITY_ADX_MIN:.0f}, +DI {pdi:.1f} / -DI {mdi:.1f}, RSI7 {rsi7:.1f} ({VELOCITY_RSI_BUY_MIN:.0f}–{VELOCITY_RSI_BUY_MAX:.0f} CALL / {VELOCITY_RSI_SELL_MIN:.0f}–{VELOCITY_RSI_SELL_MAX:.0f} PUT) e vela na direção do sinal."
         )
     else:
         confidence = 0.0
@@ -7643,12 +7647,12 @@ def velocity_flow_strategy(cs, timeframe="1min", market="OPEN"):
         if last_raw_direction != "NEUTRO" and fired_index != i:
             blockers.append(f"cooldown original de {VELOCITY_COOLDOWN_BARS} velas ainda protege contra sinais seguidos")
         else:
-            if not (breakout_buy or breakout_sell): blockers.append("sem rompimento dos 3 fechamentos anteriores")
+            if not (breakout_buy or breakout_sell): blockers.append("sem rompimento dos fechamentos anteriores")
             if av <= VELOCITY_ADX_MIN: blockers.append(f"ADX {av:.1f} abaixo de {VELOCITY_ADX_MIN:.0f}")
             if breakout_buy and not trend_buy: blockers.append("DMI não confirma compra")
             if breakout_sell and not trend_sell: blockers.append("DMI não confirma venda")
-            if breakout_buy and not rsi_buy: blockers.append(f"RSI7 {rsi7:.1f} fora de 45–65")
-            if breakout_sell and not rsi_sell: blockers.append(f"RSI7 {rsi7:.1f} fora de 35–55")
+            if breakout_buy and not rsi_buy: blockers.append(f"RSI7 {rsi7:.1f} fora de {VELOCITY_RSI_BUY_MIN:.0f}–{VELOCITY_RSI_BUY_MAX:.0f}")
+            if breakout_sell and not rsi_sell: blockers.append(f"RSI7 {rsi7:.1f} fora de {VELOCITY_RSI_SELL_MIN:.0f}–{VELOCITY_RSI_SELL_MAX:.0f}")
             if breakout_buy and not candle_buy: blockers.append("vela não fechou compradora")
             if breakout_sell and not candle_sell: blockers.append("vela não fechou vendedora")
         reason = "Velocity Flow monitorando: " + (", ".join(blockers[:5]) if blockers else "aguardando alinhamento completo") + "."
