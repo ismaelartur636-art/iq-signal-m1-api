@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.61"
-PWA_VERSION = "v127"
+APP_VERSION = "3.62"
+PWA_VERSION = "v128"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -15196,6 +15196,17 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
     </div>
 
+    <div id="velocityRobotAlert" class="card" style="display:none;margin-top:10px;border-color:#21c7ff;box-shadow:0 0 20px #21c7ff22">
+      <div style="display:flex;align-items:center;gap:12px">
+        <img src="__MEGA_IMAGE__" alt="Robô MEGA IA" style="width:70px;height:70px;border-radius:14px;object-fit:cover;border:1px solid #21c7ff">
+        <div style="min-width:0">
+          <div class="label">🤖 SINAL DO SCRIPT NO ROBÔ</div>
+          <div id="velocityRobotAlertTitle" class="big neutral" style="font-size:22px;margin-top:4px">AGUARDANDO</div>
+          <div id="velocityRobotAlertText" style="margin-top:5px;line-height:1.45;color:#c7d7e9">Quando o Velocity confirmar CALL/PUT, o MEGA IA vai anunciar aqui e por voz.</div>
+        </div>
+      </div>
+    </div>
+
     <div class="grid" style="margin-top:10px">
       <div class="card"><div class="label">ROMPIMENTO</div><div id="velocityBreakout" class="big" style="font-size:18px">AGUARDANDO</div><small>Close acima/abaixo dos 3 fechamentos anteriores</small></div>
       <div class="card"><div class="label">ADX / DMI</div><div id="velocityDmi" class="big" style="font-size:18px">--</div><small>ADX &gt; 25 e DI na direção do sinal</small></div>
@@ -15683,6 +15694,9 @@ const velocityRsi=document.getElementById('velocityRsi');
 const velocityMa=document.getElementById('velocityMa');
 const velocityReadout=document.getElementById('velocityReadout');
 const velocityReason=document.getElementById('velocityReason');
+const velocityRobotAlert=document.getElementById('velocityRobotAlert');
+const velocityRobotAlertTitle=document.getElementById('velocityRobotAlertTitle');
+const velocityRobotAlertText=document.getElementById('velocityRobotAlertText');
 const velocityOpenPanelBtn=document.getElementById('velocityOpenPanelBtn');
 const forcePowerBtn=document.getElementById('forcePowerBtn');
 const forceModeDesc=document.getElementById('forceModeDesc');
@@ -15932,6 +15946,8 @@ try{
   voiceEnabled=false;
 }
 let lastSignalVoice='';
+let lastVelocityRobotSignal='';
+let velocityRobotAlertTimer=null;
 let lastAnalysis=0;
 let thirtyFive=false;
 let five=false;
@@ -19290,6 +19306,44 @@ if(velocityOpenPanelBtn) velocityOpenPanelBtn.onclick=()=>showTab('main');
 if(forcePowerBtn) forcePowerBtn.onclick=()=>{ setForcePower(!forceEnabled); };
 if(bigrisePowerBtn) bigrisePowerBtn.onclick=()=>{ setBigrisePower(!bigriseEnabled); };
 
+function showVelocitySignalOnRobot(signal){
+  if(!signal) return;
+  const dir=String(signal.direction||'').toUpperCase();
+  if(dir!=='CALL' && dir!=='PUT') return;
+  const key=[signal.symbol||'',signal.interval||'',dir,signal.entry_time||''].join('|');
+  if(!signal.entry_time || key===lastVelocityRobotSignal) return;
+  lastVelocityRobotSignal=key;
+
+  const isCall=dir==='CALL';
+  if(velocityRobotAlert){
+    velocityRobotAlert.style.display='block';
+    velocityRobotAlert.style.borderColor=isCall?'#24d17e':'#ff6577';
+  }
+  if(velocityRobotAlertTitle){
+    velocityRobotAlertTitle.textContent=(isCall?'🟢 CALL':'🔴 PUT')+' • PRÓXIMA VELA';
+    velocityRobotAlertTitle.className='big '+(isCall?'call':'put');
+  }
+  if(velocityRobotAlertText){
+    const horario=signal.entry_time?ft(signal.entry_time):'--:--:--';
+    velocityRobotAlertText.textContent='Velocity Flow confirmou o sinal • '+String(signal.symbol||((S&&S.value)||'--'))+' • entrada '+horario+' • aguarde o cronômetro do robô.';
+  }
+
+  // O mesmo robô do painel principal também recebe o sinal.
+  showRobot();
+  analysisText.style.display='block';
+  analysisText.textContent='⚡ VELOCITY FLOW • '+dir+' CONFIRMADO • ENTRADA NA PRÓXIMA VELA';
+
+  if(voiceEnabled){
+    const ativoFalado=spokenAssetName(signal.symbol || (S&&S.value) || '');
+    speak('Velocity Flow confirmou '+(isCall?'compra':'venda')+' no ativo '+ativoFalado+'. Entrada na próxima vela.');
+  }
+
+  clearTimeout(velocityRobotAlertTimer);
+  velocityRobotAlertTimer=setTimeout(()=>{
+    if(velocityRobotAlert) velocityRobotAlert.style.display='none';
+  },45000);
+}
+
 function renderVelocityTab(data){
   if(!velocityReadout) return;
   const d=data||{};
@@ -19297,6 +19351,7 @@ function renderVelocityTab(data){
   if(!velocityEnabled){
     velocityReadout.textContent='Motor offline.';
     if(velocityReason) velocityReason.textContent='Ative o Velocity Flow para começar a analisar candles fechados.';
+    if(velocityRobotAlert) velocityRobotAlert.style.display='none';
     return;
   }
   const dir=String(d.direction||'NEUTRO').toUpperCase();
@@ -19387,6 +19442,7 @@ async function sig(announce=false){
 
     rememberPendingTrade(cur);
     if(cur.direction==='CALL' || cur.direction==='PUT'){
+      if(engine==='VELOCITY') showVelocitySignalOnRobot(cur);
       maybeSendTelegramSignal(cur);
     }
 
