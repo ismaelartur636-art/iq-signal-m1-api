@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.71"
-PWA_VERSION = "v137"
+APP_VERSION = "3.72"
+PWA_VERSION = "v138"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -13187,7 +13187,7 @@ async def macd_pullback_indicator_api(
 
     pre_dir = "NEUTRO"
     pre_score = 0
-    pre_reason = "MACD frouxo monitorando: precisa de 2/4 condições para soltar o pré-alerta."
+    pre_reason = "MACD moderado monitorando: precisa de 3/4 condições para soltar o pré-alerta."
     if live.get("available"):
         macd_now = float(live.get("macd") or 0.0)
         macd_prev = float(live.get("macd_prev") or 0.0)
@@ -13197,7 +13197,7 @@ async def macd_pullback_indicator_api(
         # PERFIL FROUXO — SOMENTE PARA O SEGUNDO INDICADOR.
         # O Velocity Flow de cima não usa este bloco e permanece intocado.
         # O sinal final do MACD também continua com as regras originais/rigorosas;
-        # aqui apenas antecipamos o aviso usando 2 de 4 evidências de formação.
+        # aqui apenas antecipamos o aviso usando 3 de 4 evidências de formação.
         zero_band = max(abs(hist_now) * 4.5, abs(hist_prev) * 4.0, abs(macd_prev) * 0.75, 1e-12)
         near_zero = abs(macd_now) <= zero_band
 
@@ -13233,7 +13233,7 @@ async def macd_pullback_indicator_api(
             pre_dir = "PUT"
             pre_score = 4
             pre_reason = "PRÉ-PUT: venda já alinhada na vela atual; confirmação final aguarda fechamento."
-        elif call_score >= 2 and call_score > put_score:
+        elif call_score >= 3 and call_score > put_score:
             pre_dir = "CALL"
             pre_score = call_score
             detalhes = []
@@ -13242,7 +13242,7 @@ async def macd_pullback_indicator_api(
             if call_zone: detalhes.append("zona favorável")
             if call_candle: detalhes.append("vela compradora")
             pre_reason = "PRÉ-CALL FROUXO: " + " + ".join(detalhes[:4]) + "."
-        elif put_score >= 2 and put_score > call_score:
+        elif put_score >= 3 and put_score > call_score:
             pre_dir = "PUT"
             pre_score = put_score
             detalhes = []
@@ -13251,7 +13251,7 @@ async def macd_pullback_indicator_api(
             if put_zone: detalhes.append("zona favorável")
             if put_candle: detalhes.append("vela vendedora")
             pre_reason = "PRÉ-PUT FROUXO: " + " + ".join(detalhes[:4]) + "."
-        elif call_score >= 2 and put_score >= 2:
+        elif call_score >= 3 and put_score >= 3:
             # Empate: usamos a inclinação conjunta MACD/histograma para desempatar.
             if call_hist and call_macd and not (put_hist and put_macd):
                 pre_dir = "CALL"
@@ -13266,6 +13266,21 @@ async def macd_pullback_indicator_api(
     last_closed = closed[-1] if closed else {}
     pre_candle = current.get("datetime") or current.get("timestamp") or current.get("time") or current.get("from") or ""
     confirmed_candle = last_closed.get("datetime") or last_closed.get("timestamp") or last_closed.get("time") or last_closed.get("from") or ""
+
+    # Horário oficial do pré-alerta: entrada na abertura da PRÓXIMA vela e
+    # expiração ao fim dela. Isso permite que o segundo indicador use o mesmo
+    # pipeline de Telegram e WIN/LOSS dos outros motores.
+    step_seconds = int(INTERVALS.get(interval, 60))
+    try:
+        live_start = parse_dt(str(pre_candle))
+    except Exception:
+        now_ts = now().timestamp()
+        live_start = datetime.fromtimestamp(
+            (int(now_ts) // step_seconds) * step_seconds, tz=UTC
+        )
+    pre_entry_dt = live_start + timedelta(seconds=step_seconds)
+    pre_expiry_dt = pre_entry_dt + timedelta(seconds=step_seconds)
+
     result.update({
         "symbol": symbol, "interval": interval, "market": requested_market,
         "feed_source": feed_source, "standalone": True,
@@ -13275,6 +13290,9 @@ async def macd_pullback_indicator_api(
         "prealert_score": int(pre_score),
         "prealert_reason": pre_reason,
         "prealert_candle": str(pre_candle),
+        "prealert_entry_time": iso(pre_entry_dt),
+        "prealert_expiry_time": iso(pre_expiry_dt),
+        "seconds_to_entry": max(0, int((pre_entry_dt - now()).total_seconds())),
         "confirmed_candle": str(confirmed_candle),
         "preview_macd": live.get("macd"),
         "preview_signal": live.get("signal"),
@@ -15517,8 +15535,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="label" style="margin-top:8px;line-height:1.45">Versão corrigida • sinal oficial em vela fechada • pré-alerta observa a vela atual • pivô só vale depois da confirmação • usa o mesmo roteador/cache de candles do app.</div>
       <div class="grid" style="margin-top:10px">
         <div class="card" style="padding:10px"><div class="label">🔔 PRÉ-ALERTA</div><div id="macdPullbackPreAlert" class="big neutral" style="font-size:16px">OFFLINE</div><small id="macdPullbackPreReason">Ative o indicador para acompanhar.</small></div>
-        <div class="card" style="padding:10px"><div class="label">🟢 PRÉ-CALL</div><div id="macdPullbackPreCall" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível compra com 2/4 condições de formação</small></div>
-        <div class="card" style="padding:10px"><div class="label">🔴 PRÉ-PUT</div><div id="macdPullbackPrePut" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível venda com 2/4 condições de formação</small></div>
+        <div class="card" style="padding:10px"><div class="label">🟢 PRÉ-CALL</div><div id="macdPullbackPreCall" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível compra com 3/4 condições de formação</small></div>
+        <div class="card" style="padding:10px"><div class="label">🔴 PRÉ-PUT</div><div id="macdPullbackPrePut" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível venda com 3/4 condições de formação</small></div>
         <div class="card" style="padding:10px"><div class="label">SINAL CONFIRMADO</div><div id="macdPullbackState" class="big neutral" style="font-size:18px">OFFLINE</div><small id="macdPullbackReason">Ative o indicador para acompanhar.</small></div>
         <div class="card" style="padding:10px"><div class="label">MACD / SIGNAL</div><div id="macdPullbackLines" class="big" style="font-size:15px">--</div><small>Cruzamento e linha zero</small></div>
         <div class="card" style="padding:10px"><div class="label">HISTOGRAMA</div><div id="macdPullbackHist" class="big" style="font-size:15px">--</div><small>Momentum positivo/negativo e aceleração</small></div>
@@ -16049,9 +16067,11 @@ let macdPullbackEnabled=false;
 let macdPullbackBusy=false;
 let lastMacdPreAlertKey='';
 let lastMacdConfirmedKey='';
+let lastMacdOfficialEntryKey='';
+let lastMacdOfficialSentAt=0;
 let lastMacdPullbackData=null;
-// 3.71 — o segundo indicador pode projetar seu PRÉ-CALL/PRÉ-PUT no painel
-// principal sem virar ordem/resultado. O Velocity de cima não usa este estado.
+// 3.72 — o segundo indicador projeta PRÉ-CALL/PRÉ-PUT no painel e, com
+// 3/4 condições, registra o sinal para Telegram + WIN/LOSS. Velocity intocado.
 let macdMainPreview=null;
 let macdMainPreviewUntil=0;
 let macdMainPreviewShowing=false;
@@ -19707,6 +19727,8 @@ function paintMacdPreAlertOnMain(mp, withArrow=true){
     symbol:String(mp.symbol||((S&&S.value)||'')),
     interval:String(mp.interval||((interval&&interval.value)||'')),
     candle:String(mp.prealert_candle||''),
+    entry_time:String(mp.prealert_entry_time||''),
+    expiry_time:String(mp.prealert_expiry_time||''),
   };
   // O endpoint é lido a cada 12 s. Mantemos o visual vivo um pouco além disso
   // para o polling normal de 5 s não apagar o pré-alerta da tela.
@@ -19716,9 +19738,11 @@ function paintMacdPreAlertOnMain(mp, withArrow=true){
   direction.textContent=isCall?'PRÉ-CALL':'PRÉ-PUT';
   direction.className='big '+(isCall?'call':'put');
   confidence.textContent='MACD frouxo • formação '+score+'/4';
-  entry.textContent='PRÓXIMA VELA • PRÉ-ALERTA';
-  countdown.textContent=isCall?'Possível COMPRA • aguardando confirmação':'Possível VENDA • aguardando confirmação';
-  statusBox.textContent='🎯 MACD PULLBACK • '+(isCall?'PRÉ-CALL':'PRÉ-PUT')+' • '+(isCall?'POSSÍVEL COMPRA':'POSSÍVEL VENDA');
+  const macdEntryTime=String(mp.prealert_entry_time||'');
+  const macdEntryLabel=macdEntryTime?ft(macdEntryTime):'--:--:--';
+  entry.textContent='ENTRADA '+macdEntryLabel+' • PRÓXIMA VELA';
+  countdown.textContent=(isCall?'Possível COMPRA':'Possível VENDA')+' • entrada '+macdEntryLabel;
+  statusBox.textContent='🎯 MACD PULLBACK • '+(isCall?'PRÉ-CALL':'PRÉ-PUT')+' • '+(isCall?'POSSÍVEL COMPRA':'POSSÍVEL VENDA')+' • '+macdEntryLabel;
   if(risk) risk.textContent='Risco: PRÉ-ALERTA • ainda não confirmado';
 
   showRobot();
@@ -19758,6 +19782,8 @@ function restoreMacdPreviewOnMain(){
     symbol:macdMainPreview.symbol,
     interval:macdMainPreview.interval,
     prealert_candle:macdMainPreview.candle,
+    prealert_entry_time:macdMainPreview.entry_time,
+    prealert_expiry_time:macdMainPreview.expiry_time,
   },false);
 }
 
@@ -19784,6 +19810,76 @@ function paintMacdConfirmedOnMain(mp){
   arrowTimer=setTimeout(()=>{
     if(!macdHasConfirmedMainSignal()) entryArrow.className='entry-arrow';
   },12000);
+  return true;
+}
+
+function macdOfficialSignalFromPreAlert(mp){
+  if(!macdPullbackEnabled || !mp || !Boolean(mp.prealert_active)) return null;
+  const dir=String(mp.prealert_direction||'').toUpperCase();
+  if(dir!=='CALL' && dir!=='PUT') return null;
+  const score=Math.max(0,Math.min(4,Number(mp.prealert_score||0)));
+  // 3.72: um pouco mais seletivo que a versão 2/4, mas ainda mais frouxo
+  // que o Velocity original.
+  if(score<3) return null;
+  const entryTime=String(mp.prealert_entry_time||'');
+  const expiryTime=String(mp.prealert_expiry_time||'');
+  if(!entryTime || !expiryTime) return null;
+  return {
+    source:'MACD_PULLBACK_PREALERT',
+    symbol:String(mp.symbol||((S&&S.value)||'')),
+    interval:String(mp.interval||((interval&&interval.value)||'1min')),
+    direction:dir,
+    confidence:Math.max(60,Math.min(95,60+score*8)),
+    entry_time:entryTime,
+    expiry_time:expiryTime,
+    requested_market:String(mp.market||((market&&market.value)||'OPEN')),
+    market:String(mp.market||((market&&market.value)||'OPEN')),
+    feed_source:String(mp.feed_source||''),
+    risk:'MEDIUM',
+    strategy:'MACD_PULLBACK_PREALERT_3_OF_4',
+    selected_engine:'MACD_PULLBACK',
+    mode:'MACD_PULLBACK',
+    entry_mode:'BIRTH',
+    auto_trade_allowed:false
+  };
+}
+
+async function publishMacdPreAlertOfficial(mp){
+  const signal=macdOfficialSignalFromPreAlert(mp);
+  if(!signal) return false;
+
+  // Máximo de um sinal oficial do MACD para o mesmo ativo/timeframe/horário
+  // de entrada. Se a leitura intrabar oscilar, não manda CALL e PUT na mesma vela.
+  const entryKey=[signal.symbol,signal.interval,signal.entry_time].join('|');
+  if(entryKey===lastMacdOfficialEntryKey) return false;
+  lastMacdOfficialEntryKey=entryKey;
+  lastMacdOfficialSentAt=Date.now();
+
+  enqueuePendingTrade({
+    source:signal.source,
+    direct_only:true,
+    market:signalResultMarket(signal),
+    requested_market:signal.requested_market,
+    feed_source:signal.feed_source,
+    feed_fallback:false,
+    symbol:signal.symbol,
+    interval:signal.interval,
+    direction:signal.direction,
+    entry_time:signal.entry_time,
+    expiry_time:signal.expiry_time,
+    confidence:signal.confidence,
+    risk:signal.risk,
+    strategy:signal.strategy,
+    engine:'MACD_PULLBACK',
+    entry_mode:'BIRTH',
+    value_stake:currentValueStake(),
+    value_payout:currentValuePayout()
+  });
+
+  await maybeSendTelegramSignal(signal);
+  if(telegramEnabled && telegramSendStatus){
+    telegramSendStatus.textContent='✅ MACD Pullback enviado: '+signal.symbol+' '+signal.direction+' • entrada '+ft(signal.entry_time);
+  }
   return true;
 }
 
@@ -19834,21 +19930,26 @@ function renderMacdPullbackIndicator(data){
   if(macdPullbackPreReason){
     const score=Number(mp.prealert_score||0);
     const vozTxt=voiceEnabled?'':' • VOZ OFFLINE';
-    macdPullbackPreReason.textContent=String(mp.prealert_reason||'Monitorando pré-alerta do MACD.')+(preActive?(' • formação '+score+'/4'+vozTxt):'');
+    const horario=(preActive&&mp.prealert_entry_time)?(' • entrada '+ft(mp.prealert_entry_time)):'';
+    macdPullbackPreReason.textContent=String(mp.prealert_reason||'Monitorando pré-alerta do MACD.')+(preActive?(' • formação '+score+'/4'+horario+vozTxt):'');
   }
   if(preActive){
     const preKey=[String(mp.symbol||((S&&S.value)||'')),String(mp.interval||((interval&&interval.value)||'')),preDir,String(mp.prealert_candle||'')].join('|');
 
-    // 3.71: além da aba do indicador, o pré-alerta do SEGUNDO indicador
-    // aparece no painel principal e na seta do robô. Continua sendo somente
-    // aviso visual/voz: não vira ordem, Telegram ou resultado automaticamente.
+    // 3.72: além da aba do indicador, o pré-alerta 3/4 do SEGUNDO indicador
+    // aparece no painel principal e na seta do robô e também entra no mesmo
+    // fluxo oficial de Telegram + WIN/LOSS. Autoentrada continua bloqueada.
     paintMacdPreAlertOnMain(mp,true);
+    // O pré-alerta 3/4 do segundo indicador agora é o sinal oficial dele:
+    // entra na fila de WIN/LOSS e no Telegram, sem acionar autoentrada.
+    publishMacdPreAlertOfficial(mp).catch(()=>{});
 
     if(preKey!==lastMacdPreAlertKey){
       lastMacdPreAlertKey=preKey;
       if(voiceEnabled){
         const ativoFalado=spokenAssetName(mp.symbol || (S&&S.value) || '');
-        speak('Pré alerta MACD Pullback. '+(preDir==='CALL'?'Possível compra':'Possível venda')+' no ativo '+ativoFalado+'.');
+        const h=mp.prealert_entry_time?ft(mp.prealert_entry_time):'';
+        speak('Pré alerta MACD Pullback. '+(preDir==='CALL'?'Possível compra':'Possível venda')+' no ativo '+ativoFalado+(h?'. Entrada às '+h:'')+'.');
       }
     }
   }else{
