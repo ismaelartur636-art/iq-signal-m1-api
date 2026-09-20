@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.80.0"
-PWA_VERSION = "v139"
+APP_VERSION = "3.81.0"
+PWA_VERSION = "v140"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -296,10 +296,11 @@ CTRADER_JSON_LIVE_URL = os.getenv("CTRADER_JSON_LIVE_URL", "wss://live.ctraderap
 CTRADER_DATA_TIMEOUT = float(os.getenv("CTRADER_DATA_TIMEOUT", "12"))
 CTRADER_SYMBOL_CACHE_TTL = max(60, int(os.getenv("CTRADER_SYMBOL_CACHE_TTL", "600")))
 CTRADER_CANDLE_CACHE_TTL = max(1.0, float(os.getenv("CTRADER_CANDLE_CACHE_TTL", "3")))
-# Quando a cTrader estiver conectada e o ativo existir na conta, ela vira a
-# fonte exclusiva do Mercado Aberto. Isso evita exibir Twelve/Binance no gráfico
-# enquanto o painel diz que cTrader é a fonte principal.
-CTRADER_STRICT_PRIMARY = os.getenv("CTRADER_STRICT_PRIMARY", "1").strip().lower() not in ("0", "false", "off", "no")
+# A cTrader continua sendo a fonte PRINCIPAL do Mercado Aberto. Se ela falhar ou
+# não conseguir completar o histórico mínimo, o roteador pode usar fallback público
+# para não deixar o radar preso em FONTE EM ESPERA. Defina CTRADER_STRICT_PRIMARY=1
+# no Render somente se quiser forçar cTrader exclusiva, sem fallback.
+CTRADER_STRICT_PRIMARY = os.getenv("CTRADER_STRICT_PRIMARY", "0").strip().lower() not in ("0", "false", "off", "no")
 ctrader_data_guard = threading.RLock()
 ctrader_symbol_union = set()
 ctrader_last_error = ""
@@ -13029,6 +13030,17 @@ def _ctrader_period_name(interval: str) -> str:
 
 
 def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, n: int) -> list:
+    """Busca candles cTrader priorizando a cauda recente e completando o histórico.
+
+    A Open API pode devolver somente as barras existentes na janela solicitada.
+    Isso é comum na reabertura de domingo: há candles frescos, porém ainda não há
+    120/150 barras desde a abertura. A versão anterior aceitava esse bloco parcial
+    e parava de ampliar a janela, fazendo o radar exibir "Fonte retornou poucos candles".
+
+    Agora mantemos as barras recentes e ampliamos a janela para trás até completar
+    o histórico pedido (incluindo candles de sexta-feira), sem substituir a cauda
+    mais nova. O sinal continua usando a vela mais recente e não cria candles falsos.
+    """
     catalog = _ctrader_refresh_catalog_blocking(item, False)
     symbol_map = catalog.get("symbols_map") or {}
     entry = symbol_map.get(str(symbol or "").upper())
@@ -13070,18 +13082,13 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
     to_ms = int(time.time() * 1000)
     count = max(20, min(int(n), 150))
 
-    # MEGA IA 3.33 — buscar a CAUDA do mercado primeiro.
-    # A janela anterior era muito ampla; em alguns backends/brokers o limite de
-    # registros podia devolver um bloco antigo mesmo com toTimestamp atual.
-    # Agora pedimos uma janela curta terminando em AGORA e NÃO enviamos `count`
-    # na primeira tentativa. Depois recortamos localmente os últimos N candles.
-    # Isso preserva a barra mais recente e evita aceitar histórico velho como live.
+    # Janela inicial curta: garante que a primeira resposta contenha a cauda atual.
     buffer_bars = {
         "1min": 30,
         "5min": 24,
         "15min": 16,
         "30min": 12,
-        "1h": 72,   # cobre fim de semana sem abrir uma janela enorme
+        "1h": 72,
         "4h": 18,
     }.get(interval, 20)
     primary_window_seconds = max(seconds * (count + buffer_bars), seconds * 30)
@@ -13091,9 +13098,8 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
         ("name", _ctrader_period_name(interval)),
         ("number", _ctrader_period(interval)),
     ]
-    body = {}
-    bars = []
     attempt_debug = []
+    bars_by_minute: Dict[int, Dict[str, Any]] = {}
 
     def _bars_debug(rows):
         rows = rows if isinstance(rows, list) else []
@@ -13116,12 +13122,27 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
             "latest_age_seconds": round(max(0.0, time.time() - latest), 1) if latest else None,
         }
 
+    def _merge_bars(rows):
+        for b in rows if isinstance(rows, list) else []:
+            if not isinstance(b, dict):
+                continue
+            try:
+                minute = int(b.get("utcTimestampInMinutes") or 0)
+            except Exception:
+                minute = 0
+            if minute > 0:
+                bars_by_minute[minute] = b
+
+    def _sorted_bars():
+        return [bars_by_minute[k] for k in sorted(bars_by_minute)]
+
     ws = _ctrader_open_socket(is_live)
     try:
         _ctrader_application_auth(ws)
         _ctrader_account_auth(ws, token, account_id)
 
-        # 1) Janela curta e recente, sem count. É a tentativa preferida.
+        # 1) Busca a janela recente. Se vier parcialmente preenchida, NÃO paramos:
+        # preservamos essas barras e depois buscamos mais histórico para trás.
         for fmt, period_value in attempts:
             payload = {
                 "ctidTraderAccountId": account_id,
@@ -13136,6 +13157,7 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
                     timeout=max(CTRADER_DATA_TIMEOUT, 15),
                 )
                 candidate = body.get("trendbar") or body.get("trendbars") or []
+                _merge_bars(candidate)
                 dbg = _bars_debug(candidate)
                 dbg.update({
                     "mode": "recent_window_no_count",
@@ -13144,10 +13166,10 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
                     "response_period": body.get("period"),
                     "response_symbol_id": body.get("symbolId"),
                     "has_more": body.get("hasMore"),
+                    "merged_total": len(bars_by_minute),
                 })
                 attempt_debug.append(dbg)
                 if candidate:
-                    bars = candidate
                     break
             except Exception as exc:
                 attempt_debug.append({
@@ -13157,10 +13179,11 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
                     "error": str(exc)[:180],
                 })
 
-        # 2) Só se a janela curta não trouxer nada, amplia progressivamente.
-        # Ainda sem `count`, para não correr o risco de receber o início da janela.
-        if not bars:
-            for factor in (4, 12):
+        # 2) Se vieram poucos candles (situação típica após fim de semana), amplia
+        # progressivamente a janela e MESCLA com a cauda recente. A versão anterior
+        # só fazia isso quando vinham ZERO candles, causando o travamento visto no radar.
+        if len(bars_by_minute) < count:
+            for factor in (4, 12, 48):
                 expanded_from_ms = max(0, to_ms - int(primary_window_seconds * factor * 1000))
                 period_value = _ctrader_period_name(interval)
                 payload = {
@@ -13173,35 +13196,92 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
                 try:
                     body = _ctrader_send_wait(
                         ws, 2137, payload, 2138,
-                        timeout=max(CTRADER_DATA_TIMEOUT, 15),
+                        timeout=max(CTRADER_DATA_TIMEOUT, 18),
                     )
                     candidate = body.get("trendbar") or body.get("trendbars") or []
+                    _merge_bars(candidate)
                     dbg = _bars_debug(candidate)
                     dbg.update({
-                        "mode": f"expanded_x{factor}",
+                        "mode": f"backfill_x{factor}",
                         "format": "name",
                         "period": str(period_value),
                         "from_ms": expanded_from_ms,
                         "has_more": body.get("hasMore"),
+                        "merged_total": len(bars_by_minute),
                     })
                     attempt_debug.append(dbg)
-                    if candidate:
-                        bars = candidate
-                        from_ms = expanded_from_ms
+                    from_ms = expanded_from_ms
+                    if len(bars_by_minute) >= count:
                         break
                 except Exception as exc:
                     attempt_debug.append({
-                        "mode": f"expanded_x{factor}",
+                        "mode": f"backfill_x{factor}",
                         "format": "name",
                         "period": str(period_value),
                         "error": str(exc)[:180],
                     })
+
+        # 3) Última tentativa dirigida ao histórico anterior ao candle mais antigo.
+        # Evita depender de um range enorme caso o broker limite a quantidade por resposta.
+        if 0 < len(bars_by_minute) < count:
+            oldest_minute = min(bars_by_minute)
+            page_to_ms = max(0, oldest_minute * 60 * 1000 - 1)
+            # Um bloco de até ~2 dias para M1 e proporcional nos demais timeframes.
+            page_window_seconds = max(primary_window_seconds * 8, 2 * 24 * 60 * 60)
+            for page in range(3):
+                page_from_ms = max(0, page_to_ms - int(page_window_seconds * 1000))
+                payload = {
+                    "ctidTraderAccountId": account_id,
+                    "fromTimestamp": page_from_ms,
+                    "toTimestamp": page_to_ms,
+                    "period": _ctrader_period_name(interval),
+                    "symbolId": symbol_id,
+                }
+                try:
+                    body = _ctrader_send_wait(
+                        ws, 2137, payload, 2138,
+                        timeout=max(CTRADER_DATA_TIMEOUT, 18),
+                    )
+                    candidate = body.get("trendbar") or body.get("trendbars") or []
+                    before = len(bars_by_minute)
+                    _merge_bars(candidate)
+                    dbg = _bars_debug(candidate)
+                    dbg.update({
+                        "mode": f"backward_page_{page + 1}",
+                        "format": "name",
+                        "period": _ctrader_period_name(interval),
+                        "from_ms": page_from_ms,
+                        "to_ms": page_to_ms,
+                        "merged_total": len(bars_by_minute),
+                    })
+                    attempt_debug.append(dbg)
+                    if len(bars_by_minute) >= count:
+                        break
+                    if candidate:
+                        oldest_minute = min(
+                            [int(x.get("utcTimestampInMinutes") or 0) for x in candidate if isinstance(x, dict)]
+                            or [oldest_minute]
+                        )
+                        page_to_ms = max(0, oldest_minute * 60 * 1000 - 1)
+                    else:
+                        page_to_ms = max(0, page_from_ms - 1)
+                    if len(bars_by_minute) == before and page_to_ms <= 0:
+                        break
+                except Exception as exc:
+                    attempt_debug.append({
+                        "mode": f"backward_page_{page + 1}",
+                        "format": "name",
+                        "period": _ctrader_period_name(interval),
+                        "error": str(exc)[:180],
+                    })
+                    page_to_ms = max(0, page_from_ms - 1)
     finally:
         try:
             ws.close()
         except Exception:
             pass
 
+    bars = _sorted_bars()
     item["last_trendbar_debug"] = {
         "at": iso(now()),
         "symbol": str(symbol),
@@ -13213,11 +13293,12 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
         "from_ms": from_ms,
         "to_ms": to_ms,
         "requested_bars": count,
-        "attempts": attempt_debug[-6:],
+        "merged_bars": len(bars),
+        "attempts": attempt_debug[-10:],
     }
 
     rows = []
-    for bar in bars if isinstance(bars, list) else []:
+    for bar in bars:
         if not isinstance(bar, dict):
             continue
         try:
@@ -13255,9 +13336,9 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
             pass
     if not rows:
         details = "; ".join(
-            f"{x.get('format')}={x.get('bars', 0)}"
+            f"{x.get('mode')}={x.get('bars', 0)}"
             + (f" erro:{x.get('error')}" if x.get("error") else "")
-            for x in attempt_debug[-2:]
+            for x in attempt_debug[-3:]
         )
         raise RuntimeError(
             f"cTrader retornou zero candles para {entry.get('raw_symbol') or symbol} "
@@ -13265,6 +13346,8 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
             f"{'live' if is_live else 'demo'}). {details}"[:420]
         )
 
+    # Se ainda não completou o solicitado, entregamos o que existe. O roteador OPEN
+    # decidirá se é suficiente ou se deve usar o fallback automático configurado.
     with ctrader_data_guard:
         item.setdefault("candle_cache", {})[cache_key] = (time.time(), list(rows))
     return rows[-int(n):]
