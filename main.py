@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.72"
+APP_VERSION = "3.74"
 PWA_VERSION = "v136"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -148,12 +148,29 @@ ALPHAX_VOL_FACTOR = max(0.60, min(1.80, float(os.getenv("ALPHAX_VOL_FACTOR", "0.
 ALPHAX_BODY_ATR_MIN = max(0.15, min(1.20, float(os.getenv("ALPHAX_BODY_ATR_MIN", "0.35"))))
 ALPHAX_MIN_CONFIRMATIONS = max(1, min(3, int(os.getenv("ALPHAX_MIN_CONFIRMATIONS", "1"))))
 ALPHAX_COOLDOWN_BARS = max(1, min(10, int(os.getenv("ALPHAX_COOLDOWN_BARS", "2"))))
+# 3.73 — AlphaX antecipa o sinal oficial para aproximadamente 30 s antes
+# da próxima vela. A leitura usa um snapshot da vela em formação nessa janela
+# e, depois de liberado, o sinal fica travado até a expiração (não repinta).
+ALPHAX_EARLY_SIGNAL_SECONDS = max(20, min(45, int(os.getenv("ALPHAX_EARLY_SIGNAL_SECONDS", "30"))))
+ALPHAX_EARLY_WINDOW_BEFORE = max(ALPHAX_EARLY_SIGNAL_SECONDS, min(50, int(os.getenv("ALPHAX_EARLY_WINDOW_BEFORE", "35"))))
+ALPHAX_EARLY_MIN_REMAINING = max(12, min(ALPHAX_EARLY_SIGNAL_SECONDS, int(os.getenv("ALPHAX_EARLY_MIN_REMAINING", "18"))))
 # RELAY original usa FORMING -> ARMED -> FIRED. Para o app, a zona ARMED é
 # deliberadamente um pouco mais larga e o breakout um pouco mais curto para
 # não atrasar demais a entrada em opções binárias.
 ALPHAX_MIN_FORM_PCT = max(45.0, min(80.0, float(os.getenv("ALPHAX_MIN_FORM_PCT", "52"))))
 ALPHAX_ARMED_ATR = max(0.15, min(1.00, float(os.getenv("ALPHAX_ARMED_ATR", "0.50"))))
 ALPHAX_BREAK_ATR = max(0.10, min(1.20, float(os.getenv("ALPHAX_BREAK_ATR", "0.35"))))
+
+# 3.74 — motor independente IMPULSO ZONA.
+# Reaproveita somente a parte leve dos EAs enviados: região + microimpulso +
+# confirmação rápida. Não usa as formações pesadas do AlphaX.
+IMPULSE_ZONE_ATR_PERIOD = max(7, min(30, int(os.getenv("IMPULSE_ZONE_ATR_PERIOD", "14"))))
+IMPULSE_ZONE_MIN_CONFIRMATIONS = max(1, min(3, int(os.getenv("IMPULSE_ZONE_MIN_CONFIRMATIONS", "1"))))
+IMPULSE_ZONE_MAX_OPPOSITE = max(0, min(3, int(os.getenv("IMPULSE_ZONE_MAX_OPPOSITE", "2"))))
+IMPULSE_ZONE_COOLDOWN_BARS = max(1, min(5, int(os.getenv("IMPULSE_ZONE_COOLDOWN_BARS", "1"))))
+IMPULSE_EARLY_SIGNAL_SECONDS = max(20, min(45, int(os.getenv("IMPULSE_EARLY_SIGNAL_SECONDS", "30"))))
+IMPULSE_EARLY_WINDOW_BEFORE = max(IMPULSE_EARLY_SIGNAL_SECONDS, min(50, int(os.getenv("IMPULSE_EARLY_WINDOW_BEFORE", "35"))))
+IMPULSE_EARLY_MIN_REMAINING = max(12, min(IMPULSE_EARLY_SIGNAL_SECONDS, int(os.getenv("IMPULSE_EARLY_MIN_REMAINING", "18"))))
 
 xgb_model_cache: Dict[str, Dict[str, Any]] = {}
 xgb_model_guard = threading.RLock()
@@ -8212,6 +8229,245 @@ def _alphax_structure_bias(rows, atr_value: float):
     return int(setup.get("direction") or 0), str(setup.get("name") or "")
 
 
+def _alphax_wma(values, period=5):
+    vals=[float(x) for x in (values or [])]
+    if period <= 0 or len(vals) < period:
+        return None
+    win=vals[-period:]
+    den=period*(period+1)/2.0
+    return sum(v*(i+1) for i,v in enumerate(win))/den
+
+
+def _alphax_rapid_modules(rows, atr_value: float):
+    """Confirmações rápidas reaproveitadas dos EAs enviados pelo usuário.
+
+    - CRIPTOBOT: zona fractal + LWMA 1/5 + MACD/Momentum.
+    - Russian Bear HFT: microimpulso/velocidade direcional (adaptado para OHLCV).
+    - USDJPY AUTOBOT / Big Figures: níveis redondos e institucionais.
+    - Scalper_FX: canal curtíssimo de média das máximas/mínimas.
+
+    Nenhuma rotina de OrderSend, martingale, trailing ou gestão original é usada.
+    """
+    rows=list(rows or [])
+    a=float(atr_value or 0.0)
+    if len(rows) < 35 or a <= 0:
+        return {"zone_dir":0,"zone_name":"","fast_dir":0,"macd_dir":0,"momentum_dir":0,
+                "impulse_dir":0,"channel_dir":0,"labels":[]}
+
+    last=rows[-1]
+    o=float(last["open"]); h=float(last["high"]); l=float(last["low"]); c=float(last["close"])
+    closes=[float(x["close"]) for x in rows]
+    typical=[(float(x["high"])+float(x["low"])+float(x["close"]))/3.0 for x in rows]
+
+    # CRIPTOBOT — LWMA 1/5.
+    slow=_alphax_wma(typical,5)
+    fast=typical[-1]
+    fast_dir=1 if slow is not None and fast>slow else (-1 if slow is not None and fast<slow else 0)
+
+    # CRIPTOBOT — MACD 12/26/9 + momentum de 3 candles.
+    ms=_macd_snapshot(closes,12,26,9)
+    macd_dir=0
+    if ms:
+        hist=float(ms.get("hist") or 0.0)
+        macd=float(ms.get("macd") or 0.0); sig=float(ms.get("signal") or 0.0)
+        macd_dir=1 if macd>sig and hist>0 else (-1 if macd<sig and hist<0 else 0)
+    mom=(c-closes[-4]) if len(closes)>=4 else 0.0
+    momentum_dir=1 if mom >= a*0.22 else (-1 if mom <= -a*0.22 else 0)
+
+    # Russian Bear — microimpulso: deslocamento curto + corpo/range atual.
+    recent_ranges=[max(float(x["high"])-float(x["low"]),1e-12) for x in rows[-12:-1]]
+    avg_range=(sum(recent_ranges)/len(recent_ranges)) if recent_ranges else a
+    rng=max(h-l,1e-12); body=abs(c-o)
+    move=(c-closes[-3]) if len(closes)>=3 else (c-o)
+    impulse_dir=0
+    if rng >= max(a*0.38,avg_range*0.72) and body/rng >= 0.48:
+        if move >= a*0.20 and c>o: impulse_dir=1
+        elif move <= -a*0.20 and c<o: impulse_dir=-1
+
+    # Scalper_FX — canal rápido baseado em média ponderada de LOW/HIGH (período 3).
+    low_ma=_alphax_wma([float(x["low"]) for x in rows],3)
+    high_ma=_alphax_wma([float(x["high"]) for x in rows],3)
+    channel_dir=1 if high_ma is not None and c>high_ma else (-1 if low_ma is not None and c<low_ma else 0)
+
+    # CRIPTOBOT — suporte/resistência por fractais confirmados.
+    highs,lows=_alphax_pivots(rows,max(2,min(ALPHAX_PIVOT_LEN,4)))
+    support=max((v for _,v in lows if v<=c+a*0.20), default=None)
+    resistance=min((v for _,v in highs if v>=c-a*0.20), default=None)
+    zone_dir=0; zone_name=""
+    if support is not None and abs(c-support) <= a*0.55 and c>=o:
+        zone_dir=1; zone_name="FRACTAL S/R"
+    if resistance is not None and abs(resistance-c) <= a*0.55 and c<=o:
+        # Se as duas zonas estiverem muito próximas, prioriza a rejeição da vela atual.
+        if zone_dir==0 or abs(resistance-c) < abs(c-(support if support is not None else c-a*10)):
+            zone_dir=-1; zone_name="FRACTAL S/R"
+
+    # USDJPY AUTOBOT / ICT Big Figures — big figure, +/-0.2 e mid figure.
+    step=1.0 if abs(c)>=20.0 else 0.01
+    base=round(c/step)*step
+    levels=[]
+    for k in (-1,0,1):
+        b=base+k*step
+        levels.extend([(b,"BIG FIGURE"),(b+0.2*step,"INSTITUCIONAL"),(b-0.2*step,"INSTITUCIONAL"),(b+0.5*step,"MID FIGURE")])
+    near_level=None
+    if levels:
+        near_level=min(levels,key=lambda z:abs(c-z[0]))
+    if near_level and abs(c-near_level[0]) <= a*0.38:
+        if c>o and l <= near_level[0]+a*0.10:
+            zone_dir=1; zone_name=near_level[1]
+        elif c<o and h >= near_level[0]-a*0.10:
+            zone_dir=-1; zone_name=near_level[1]
+
+    labels=[]
+    if zone_dir: labels.append((zone_dir,"ZONA "+zone_name))
+    if fast_dir: labels.append((fast_dir,"LWMA 1/5"))
+    if macd_dir: labels.append((macd_dir,"MACD"))
+    if momentum_dir: labels.append((momentum_dir,"MOMENTUM"))
+    if impulse_dir: labels.append((impulse_dir,"MICRO IMPULSO"))
+    if channel_dir: labels.append((channel_dir,"SCALPER CHANNEL"))
+    return {"zone_dir":zone_dir,"zone_name":zone_name,"fast_dir":fast_dir,"macd_dir":macd_dir,
+            "momentum_dir":momentum_dir,"impulse_dir":impulse_dir,"channel_dir":channel_dir,"labels":labels,
+            "support":support,"resistance":resistance,"lwma_fast":fast,"lwma_slow":slow}
+
+
+def _impulse_zone_snapshot(rows):
+    """Motor leve: ZONA + MICRO IMPULSO + confirmação rápida.
+
+    A zona vem de fractal confirmado ou Big/Mid/Institutional Figure. O impulso
+    vem da adaptação do detector de velocidade do Russian Bear. A entrada só
+    existe quando os dois apontam para o mesmo lado e pelo menos uma leitura
+    rápida adicional confirma (LWMA 1/5, MACD, Momentum ou Scalper Channel).
+    """
+    rows=list(rows or [])
+    if len(rows) < 40:
+        return None
+    a=atr(rows, IMPULSE_ZONE_ATR_PERIOD)
+    if not a or float(a) <= 0:
+        return None
+    rapid=_alphax_rapid_modules(rows,float(a))
+    zdir=int(rapid.get("zone_dir") or 0)
+    zone_name=str(rapid.get("zone_name") or "")
+    idir=int(rapid.get("impulse_dir") or 0)
+
+    # Para este motor a ZONA significa toque/reação, não obrigação de fechar
+    # colado no nível. Isso permite que uma vela de impulso saia da região e
+    # ainda seja reconhecida como reação válida.
+    last=rows[-1]
+    o=float(last["open"]); h=float(last["high"]); l=float(last["low"]); c=float(last["close"])
+    support=rapid.get("support"); resistance=rapid.get("resistance")
+    if zdir==0 and support is not None and c>o and l <= float(support)+float(a)*0.18 and c>float(support):
+        zdir=1; zone_name="FRACTAL S/R"
+    if zdir==0 and resistance is not None and c<o and h >= float(resistance)-float(a)*0.18 and c<float(resistance):
+        zdir=-1; zone_name="FRACTAL S/R"
+
+    # Big/Mid/Institutional Figures também contam pelo toque da máxima/mínima.
+    if zdir==0:
+        step=1.0 if abs(c)>=20.0 else 0.01
+        base=round(c/step)*step
+        levels=[]
+        for k in (-1,0,1):
+            b=base+k*step
+            levels.extend([(b,"BIG FIGURE"),(b+0.2*step,"INSTITUCIONAL"),(b-0.2*step,"INSTITUCIONAL"),(b+0.5*step,"MID FIGURE")])
+        touched_low=min(levels,key=lambda z:abs(l-z[0])) if levels else None
+        touched_high=min(levels,key=lambda z:abs(h-z[0])) if levels else None
+        if touched_low and c>o and abs(l-touched_low[0]) <= float(a)*0.20 and c>touched_low[0]:
+            zdir=1; zone_name=touched_low[1]
+        elif touched_high and c<o and abs(h-touched_high[0]) <= float(a)*0.20 and c<touched_high[0]:
+            zdir=-1; zone_name=touched_high[1]
+    confirm_fields=(
+        ("fast_dir","LWMA 1/5"),
+        ("macd_dir","MACD"),
+        ("momentum_dir","MOMENTUM"),
+        ("channel_dir","SCALPER CHANNEL"),
+    )
+    matches=[]; opposite=[]
+    if zdir in (-1,1):
+        for field,label in confirm_fields:
+            d=int(rapid.get(field) or 0)
+            if d==zdir: matches.append(label)
+            elif d==-zdir: opposite.append(label)
+
+    confirmed=(
+        zdir in (-1,1) and idir==zdir and
+        len(matches) >= IMPULSE_ZONE_MIN_CONFIRMATIONS and
+        len(opposite) <= IMPULSE_ZONE_MAX_OPPOSITE
+    )
+    direction="CALL" if confirmed and zdir>0 else ("PUT" if confirmed else "NEUTRO")
+    confidence=0.0
+    if confirmed:
+        confidence=76.0 + min(14.0,5.0*len(matches))
+        if "MACD" in matches: confidence += 2.0
+        if "MOMENTUM" in matches: confidence += 2.0
+        if len(opposite)==0: confidence += 2.0
+        confidence=clamp(confidence,76.0,94.0)
+
+    return {
+        "direction":direction,
+        "confirmed":bool(confirmed),
+        "confidence":float(confidence),
+        "zone_dir":zdir,
+        "zone_name":zone_name,
+        "impulse_dir":idir,
+        "confirmations":matches,
+        "opposite":opposite,
+        "atr":float(a),
+        "rapid":rapid,
+    }
+
+
+def impulse_zone_strategy(cs, timeframe="1min", market="OPEN", early_signal=False):
+    """IMPULSO ZONA — motor independente e propositalmente pequeno."""
+    rows=list(cs or [])
+    tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30"}.get(timeframe,timeframe)
+    name=f"IMPULSO ZONA {tf_label}"
+    snap=_impulse_zone_snapshot(rows)
+    if not snap:
+        return {
+            "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
+            "risk":"HIGH","strategy":name,"engine":"IMPULSE_ZONE","provider":"LOCAL_IMPULSE_ZONE",
+            "reason":"Coletando candles para Zona + Impulso + Confirmação.",
+            "non_repaint":not bool(early_signal),"gale_signal":False,"martingale":False,
+            "direct_win_only":True,"next_candle":True,
+        }
+
+    confirmed=bool(snap.get("confirmed"))
+    direction=str(snap.get("direction") or "NEUTRO") if confirmed else "NEUTRO"
+    zone=str(snap.get("zone_name") or "zona")
+    if confirmed:
+        conf_txt=" + ".join(snap.get("confirmations") or [])
+        reason=(
+            f"{direction} • ZONA {zone} + MICRO IMPULSO + {conf_txt}. "
+            f"Entrada na próxima vela" + (" • sinal ~30s antes." if early_signal else ".")
+        )
+    else:
+        zdir=int(snap.get("zone_dir") or 0); idir=int(snap.get("impulse_dir") or 0)
+        side="CALL" if zdir>0 else ("PUT" if zdir<0 else "NEUTRO")
+        if zdir==0:
+            reason="Impulso Zona monitorando • aguardando preço chegar em fractal/SR ou nível institucional."
+        elif idir!=zdir:
+            reason=f"Zona {zone} ({side}) encontrada • aguardando MICRO IMPULSO confirmar a reação."
+        elif len(snap.get("confirmations") or []) < IMPULSE_ZONE_MIN_CONFIRMATIONS:
+            reason=f"Zona + impulso ({side}) ativos • aguardando confirmação rápida adicional."
+        else:
+            reason=f"Setup {side} quase pronto • conflito rápido: " + ", ".join(snap.get("opposite") or [])
+
+    return {
+        "available":True,"direction":direction,
+        "confidence":round(float(snap.get("confidence") or 0.0),1),
+        "confirmed":confirmed,
+        "risk":("LOW" if confirmed and float(snap.get("confidence") or 0)>=86 else ("MEDIUM" if confirmed else "HIGH")),
+        "strategy":name,"engine":"IMPULSE_ZONE","provider":"LOCAL_IMPULSE_ZONE",
+        "reason":reason[:480],"external_ai_disabled":True,"gale_signal":False,"martingale":False,
+        "non_repaint":not bool(early_signal),"direct_win_only":True,"next_candle":True,
+        "cooldown_bars":IMPULSE_ZONE_COOLDOWN_BARS,
+        "diagnostics":{
+            "zone":zone,"zone_dir":snap.get("zone_dir"),"impulse_dir":snap.get("impulse_dir"),
+            "confirmations":snap.get("confirmations") or [],"opposite":snap.get("opposite") or [],
+            "min_confirmations":IMPULSE_ZONE_MIN_CONFIRMATIONS,"rapid_modules":snap.get("rapid") or {},
+            "early_signal":bool(early_signal),
+        },
+    }
+
+
 def _alphax_snapshot(rows):
     rows=list(rows or [])
     need=max(70, ALPHAX_EMA_SLOW+ALPHAX_PIVOT_LEN*2+5)
@@ -8252,6 +8508,7 @@ def _alphax_snapshot(rows):
     strong_bear=c<o and body >= float(a)*ALPHAX_BODY_ATR_MIN
     trend_bull=efast>eslow and c>=efast
     trend_bear=efast<eslow and c<=efast
+    rapid=_alphax_rapid_modules(rows,float(a))
 
     def context_confirms(direction, include_structure=True, include_candle=True):
         out=[]
@@ -8265,6 +8522,11 @@ def _alphax_snapshot(rows):
         else:
             if trend_bear: out.append(f"EMA {ALPHAX_EMA_FAST}/{ALPHAX_EMA_SLOW}↓")
             if strong_bear or (volume_ok and c<o): out.append("FORÇA/VOLUME↓")
+        # Confirmações reaproveitadas dos EAs analisados. Entram como reforço,
+        # sem importar execução de ordens ou gestão de risco dos códigos originais.
+        for d,label in rapid.get("labels",[]):
+            if int(d)==int(direction) and label not in out:
+                out.append((label+"↑") if direction>0 else (label+"↓"))
         return out
 
     candidates=[]
@@ -8290,6 +8552,22 @@ def _alphax_snapshot(rows):
             q += min(4.0,max(0.0,(scomp-ALPHAX_MIN_FORM_PCT)*0.08))
             candidates.append({"direction":sdir,"trigger":"ALPHAX_STRUCTURE","trigger_name":sname,
                                "confirmations":confirms,"confidence":clamp(q,70.0,94.0)})
+
+    # CAMINHO 3 — zona boa + velocidade. Esse caminho aproveita CRIPTOBOT,
+    # Russian Bear, Big Figures e Scalper_FX para gerar sinais mais cedo em região.
+    zdir=int(rapid.get("zone_dir") or 0)
+    if zdir in (-1,1) and chop_ok:
+        zconf=[]
+        for d,label in rapid.get("labels",[]):
+            if int(d)==zdir and not str(label).startswith("ZONA "):
+                zconf.append((label+"↑") if zdir>0 else (label+"↓"))
+        # Zona sozinha não dispara: exige pelo menos duas confirmações rápidas.
+        if len(zconf) >= 2:
+            q=71.0 + min(18.0,4.5*len(zconf))
+            if int(rapid.get("impulse_dir") or 0)==zdir: q += 3.0
+            candidates.append({"direction":zdir,"trigger":"RAPID_ZONE","trigger_name":str(rapid.get("zone_name") or "ZONA"),
+                               "confirmations":["ZONA "+str(rapid.get("zone_name") or "S/R")]+zconf,
+                               "confidence":clamp(q,72.0,94.0)})
 
     chosen=None
     if candidates:
@@ -8332,16 +8610,18 @@ def _alphax_snapshot(rows):
         "chop":float(chop if chop is not None else 50.0),"chop_ok":bool(chop_ok),
         "ema_fast":float(efast),"ema_slow":float(eslow),"atr":float(a),
         "body_atr":float(body/max(float(a),1e-12)),"volume":float(vcur),"volume_ma":float(vma),
+        "rapid":rapid,
     }
 
 
-def alphax_relay_strategy(cs, timeframe="1min", market="OPEN"):
+def alphax_relay_strategy(cs, timeframe="1min", market="OPEN", early_signal=False):
     """AlphaX RELAY híbrido e rápido para próxima vela.
 
     Preserva as formações originais do RELAY (Double Top/Bottom, H&S/Inv H&S,
     triângulos, flags/pennants e wedges) e acrescenta os padrões de vela do
-    Sniper Pro. O primeiro gatilho válido — vela ou estrutura ARMED/FIRED — pode
-    liberar CALL/PUT com apenas 1 confirmação simples. Somente candles fechados.
+    Sniper Pro, zonas rápidas e microimpulso. O primeiro gatilho válido pode
+    liberar CALL/PUT com confirmação curta. No modo early_signal o último candle
+    é um snapshot da vela em formação capturado perto de 30 s antes da próxima.
     """
     rows=list(cs or [])
     tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30"}.get(timeframe,timeframe)
@@ -8379,7 +8659,7 @@ def alphax_relay_strategy(cs, timeframe="1min", market="OPEN"):
         tname=snap.get("trigger_name") or snap.get("pattern") or snap.get("structure") or "setup"
         reason=(f"{direction} • {trig}: {tname} + " + " + ".join(snap.get("confirmations") or []) +
                 f". AlphaX {snap.get('structure') or 'estrutura livre'} {snap.get('structure_phase') or ''}; "
-                f"Choppiness {snap['chop']:.1f}; entrada na próxima vela.")
+                f"Choppiness {snap['chop']:.1f}; entrada na próxima vela" + (" • sinal ~30s antes." if early_signal else "."))
     elif not snap.get("chop_ok"):
         reason=f"AlphaX detectou contexto, mas bloqueou mercado muito lateral: Choppiness {snap['chop']:.1f}."
     elif snap.get("confirmed") and snap.get("direction") in ("CALL","PUT"):
@@ -8408,7 +8688,8 @@ def alphax_relay_strategy(cs, timeframe="1min", market="OPEN"):
                        "confirmations":snap.get("confirmations") or [],"min_confirmations":ALPHAX_MIN_CONFIRMATIONS,
                        "choppiness":round(snap.get("chop",0.0),2),"chop_max":ALPHAX_CHOP_MAX,
                        "ema_fast":round(snap.get("ema_fast",0.0),10),"ema_slow":round(snap.get("ema_slow",0.0),10),
-                       "body_atr":round(snap.get("body_atr",0.0),3),"volume":snap.get("volume",0.0),"volume_ma":snap.get("volume_ma",0.0)}
+                       "body_atr":round(snap.get("body_atr",0.0),3),"volume":snap.get("volume",0.0),"volume_ma":snap.get("volume_ma",0.0),
+                       "early_signal":bool(early_signal),"rapid_modules":snap.get("rapid") or {}}
     }
 
 
@@ -10261,12 +10542,18 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
-    if engine in ("ICT", "SNIPER", "ALPHAX"):
+    if engine in ("ICT", "SNIPER"):
         # ICT/SMC e Sniper Pro só usam candle fechado e entram na abertura imediatamente seguinte.
         entry_mode = "BIRTH"
+    elif engine == "ALPHAX":
+        # AlphaX 3.73: sinal oficial antecipado ~30 s e entrada na próxima abertura.
+        entry_mode = "MIDDLE"
+    elif engine == "IMPULSE":
+        # Impulso Zona usa a mesma janela antecipada para comparação justa com o AlphaX.
+        entry_mode = "MIDDLE"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
@@ -10455,6 +10742,25 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 raw = await iq_ea_candles(iq_state, symbol, interval, 150, regular_market=False)
             else:
                 raw = await candles(symbol, interval, 150, "OPEN", None, request=request)
+        elif engine == "IMPULSE":
+            if market == "IQ_OTC":
+                if not iq_state:
+                    out = neutral_signal(
+                        symbol, interval, market,
+                        "IMPULSO ZONA • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para o Impulso Zona analisar candles OTC reais.",
+                        source_state="WAITING",
+                    )
+                    out.update({
+                        "strategy": "IMPULSO ZONA", "mode": "IMPULSE_ZONE",
+                        "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
+                        "direct_win_only": True, "gale_signal": False,
+                    })
+                    cache[key] = (time.time(), out)
+                    return out
+                raw = await iq_ea_candles(iq_state, symbol, interval, 120, regular_market=False)
+            else:
+                raw = await candles(symbol, interval, 120, "OPEN", None, request=request)
         elif engine == "ICT":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -10510,6 +10816,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "SNIPER PRO • FONTE EM ESPERA" if market == "OPEN" else "SNIPER PRO • IQ OPTION EM ESPERA"
         elif engine == "ALPHAX":
             status = "ALPHAX RELAY • FONTE EM ESPERA" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION EM ESPERA"
+        elif engine == "IMPULSE":
+            status = "IMPULSO ZONA • FONTE EM ESPERA" if market == "OPEN" else "IMPULSO ZONA • IQ OPTION EM ESPERA"
         elif engine == "ICT":
             status = "ICT/SMC • FONTE EM ESPERA" if market == "OPEN" else "ICT/SMC • IQ OPTION EM ESPERA"
         elif engine == "FORCE" and market == "IQ_OTC":
@@ -10536,6 +10844,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "SNIPER PRO • FONTE RECONECTANDO" if market == "OPEN" else "SNIPER PRO • IQ OPTION RECONECTANDO"
         elif engine == "ALPHAX":
             status = "ALPHAX RELAY • FONTE RECONECTANDO" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION RECONECTANDO"
+        elif engine == "IMPULSE":
+            status = "IMPULSO ZONA • FONTE RECONECTANDO" if market == "OPEN" else "IMPULSO ZONA • IQ OPTION RECONECTANDO"
         elif engine == "ICT":
             status = "ICT/SMC • FONTE RECONECTANDO" if market == "OPEN" else "ICT/SMC • IQ OPTION RECONECTANDO"
         elif engine == "FORCE" and market == "IQ_OTC":
@@ -10606,6 +10916,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "ALPHAX":
             engine_title = "ALPHAX RELAY"
             engine_mode = "ALPHAX_RELAY"
+        elif engine == "IMPULSE":
+            engine_title = "IMPULSO ZONA"
+            engine_mode = "IMPULSE_ZONE"
         elif engine == "ICT":
             engine_title = "ICT/SMC INSTITUCIONAL"
             engine_mode = "ICT_SMC_INSTITUTIONAL"
@@ -10619,7 +10932,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX"):
+        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -10637,6 +10950,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "VELOCITY": "LOCAL_VELOCITY_FLOW",
                     "SNIPER": "LOCAL_SNIPER_PRO_MEGA",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
+                    "IMPULSE": "LOCAL_IMPULSE_ZONE",
                     "ICT": "LOCAL_ICT_SMC_INSTITUTIONAL",
                     "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
                 }.get(engine, "DISABLED")),
@@ -10655,7 +10969,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "ICT", "SNIPER", "ALPHAX") else (closed[-90:] if len(closed) > 90 else closed)))
+            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE") else (closed[-90:] if len(closed) > 90 else closed)))
             if engine == "SMART":
                 moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
                 analysis = await openai_direct_signal(
@@ -10674,7 +10988,50 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "SNIPER":
                 analysis = sniper_pro_strategy(engine_closed, interval, market=market)
             elif engine == "ALPHAX":
-                analysis = alphax_relay_strategy(engine_closed, interval, market=market)
+                alphax_seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                alphax_early_window=(ALPHAX_EARLY_MIN_REMAINING <= alphax_seconds_to_entry <= ALPHAX_EARLY_WINDOW_BEFORE)
+                if alphax_early_window:
+                    # Usa o snapshot atual da vela em formação. Depois que o sinal é
+                    # liberado, active_signal o congela até a expiração: não repinta.
+                    analysis = alphax_relay_strategy(raw[-120:], interval, market=market, early_signal=True)
+                    analysis["early_signal_window"] = True
+                    analysis["seconds_to_entry_snapshot"] = round(alphax_seconds_to_entry,1)
+                else:
+                    analysis = alphax_relay_strategy(engine_closed, interval, market=market, early_signal=False)
+                    # Fora da janela de 30 s o AlphaX só monitora; não libera em cima da abertura.
+                    if analysis.get("confirmed"):
+                        analysis["preview_direction"] = analysis.get("direction")
+                        analysis["preview_confidence"] = analysis.get("confidence")
+                    analysis["confirmed"] = False
+                    analysis["direction"] = "NEUTRO"
+                    analysis["confidence"] = 0.0
+                    analysis["reason"] = (
+                        f"AlphaX monitorando • sinal oficial será avaliado cerca de {ALPHAX_EARLY_SIGNAL_SECONDS}s antes da próxima vela "
+                        f"(agora faltam {int(alphax_seconds_to_entry)}s)."
+                    )
+                    analysis["early_signal_window"] = False
+                    analysis["seconds_to_entry_snapshot"] = round(alphax_seconds_to_entry,1)
+            elif engine == "IMPULSE":
+                impulse_seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                impulse_early_window=(IMPULSE_EARLY_MIN_REMAINING <= impulse_seconds_to_entry <= IMPULSE_EARLY_WINDOW_BEFORE)
+                if impulse_early_window:
+                    analysis = impulse_zone_strategy(raw[-120:], interval, market=market, early_signal=True)
+                    analysis["early_signal_window"] = True
+                    analysis["seconds_to_entry_snapshot"] = round(impulse_seconds_to_entry,1)
+                else:
+                    analysis = impulse_zone_strategy(engine_closed, interval, market=market, early_signal=False)
+                    if analysis.get("confirmed"):
+                        analysis["preview_direction"] = analysis.get("direction")
+                        analysis["preview_confidence"] = analysis.get("confidence")
+                    analysis["confirmed"] = False
+                    analysis["direction"] = "NEUTRO"
+                    analysis["confidence"] = 0.0
+                    analysis["reason"] = (
+                        f"Impulso Zona monitorando • sinal oficial será avaliado cerca de {IMPULSE_EARLY_SIGNAL_SECONDS}s antes da próxima vela "
+                        f"(agora faltam {int(impulse_seconds_to_entry)}s)."
+                    )
+                    analysis["early_signal_window"] = False
+                    analysis["seconds_to_entry_snapshot"] = round(impulse_seconds_to_entry,1)
             elif engine == "ICT":
                 if market == "OPEN":
                     h1_raw = await candles(symbol, "1h", 140, "OPEN", None, request=request)
@@ -10744,7 +11101,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX") and analysis.get("confirmed")),
+            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE") and analysis.get("confirmed")),
             "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                 "EA": "XGBOOST_RSI_VALUE_CHART",
                 "RUBIK": "LOCAL_RUBIK_ADAPTED",
@@ -10752,10 +11109,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "VELOCITY": "LOCAL_VELOCITY_FLOW",
                 "SNIPER": "LOCAL_SNIPER_PRO_MEGA",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
+                "IMPULSE": "LOCAL_IMPULSE_ZONE",
                 "ICT": "LOCAL_ICT_SMC_INSTITUTIONAL",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX") else "HIGH").upper(),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
                 else (analysis.get("strategy") or (
@@ -10764,6 +11122,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "LARRY BREAKOUT" if engine == "LARRY"
                     else "VELOCITY FLOW • MR MT4" if engine == "VELOCITY"
                     else "ALPHAX RELAY" if engine == "ALPHAX"
+                    else "IMPULSO ZONA" if engine == "IMPULSE"
                     else "ICT/SMC INSTITUCIONAL" if engine == "ICT"
                     else "EA Força do Movimento" if engine == "FORCE"
                     else f"{engine_title} {tf_label}"
@@ -10803,6 +11162,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         if analysis.get("confirmed") and analysis.get("direction") in ("CALL", "PUT"):
             direction_now = analysis["direction"]
             reference_candle = engine_closed[-1].get("datetime") if engine_closed else None
+            if engine in ("ALPHAX", "IMPULSE") and analysis.get("early_signal_window") and raw:
+                reference_candle = raw[-1].get("datetime")
 
             # MEGA IA 3.39 — confirmação invisível da vela em formação.
             # Quando houve tape REAL de ticks durante o pré-alerta para esta mesma
@@ -10847,6 +11208,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "VELOCITY": "velocity_fingerprint",
                 "SNIPER": "sniper_fingerprint",
                 "ALPHAX": "alphax_fingerprint",
+                "IMPULSE": "impulse_fingerprint",
                 "ICT": "ict_fingerprint",
                 "FORCE": "force_fingerprint",
                 "BIGRISE": "btc_force_fingerprint",
@@ -10892,17 +11254,56 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key] = (time.time(), base)
                         return base
 
-                if engine in ("SNIPER", "ALPHAX"):
-                    # O setup pertence ao último candle fechado. O sinal é válido
-                    # somente para a abertura imediatamente seguinte; não entra atrasado.
+                if engine == "SNIPER":
+                    # Sniper permanece no modelo de candle fechado / nascimento.
                     sniper_age = max(0.0, (now() - current_boundary(interval)).total_seconds())
                     if sniper_age > 10.0:
-                        _late_name = "ALPHAX RELAY" if engine == "ALPHAX" else "SNIPER PRO"
-                        base["status"] = f"ONLINE • {_late_name} • AGUARDANDO PRÓXIMO FECHAMENTO"
+                        base["status"] = "ONLINE • SNIPER PRO • AGUARDANDO PRÓXIMO FECHAMENTO"
                         base["reason"] = (
-                            f"Setup {_late_name} detectado, mas a janela da próxima vela já passou. "
+                            "Setup Sniper detectado, mas a janela da próxima vela já passou. "
                             "A entrada tardia foi descartada; o motor recalcula no próximo candle fechado."
                         )
+                        base["direction"] = "NEUTRO"
+                        base["entry_time"] = None
+                        base["expiry_time"] = None
+                        base["risk"] = "HIGH"
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
+
+                if engine == "ALPHAX":
+                    # AlphaX nunca solta o CALL/PUT em cima da abertura. O sinal só é
+                    # oficializado na janela antecipada e entra na próxima vela.
+                    _ax_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                    if not (ALPHAX_EARLY_MIN_REMAINING <= _ax_remaining <= ALPHAX_EARLY_WINDOW_BEFORE):
+                        base["status"] = "ONLINE • ALPHAX RELAY • AGUARDANDO JANELA DE 30S"
+                        base["reason"] = f"AlphaX aguardando a janela antecipada; faltam {int(_ax_remaining)}s para a próxima vela."
+                        base["direction"] = "NEUTRO"
+                        base["entry_time"] = None
+                        base["expiry_time"] = None
+                        base["risk"] = "HIGH"
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
+
+                if engine == "IMPULSE":
+                    _imp_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                    if not (IMPULSE_EARLY_MIN_REMAINING <= _imp_remaining <= IMPULSE_EARLY_WINDOW_BEFORE):
+                        base["status"] = "ONLINE • IMPULSO ZONA • AGUARDANDO JANELA DE 30S"
+                        base["reason"] = f"Impulso Zona aguardando a janela antecipada; faltam {int(_imp_remaining)}s para a próxima vela."
+                        base["direction"] = "NEUTRO"
+                        base["entry_time"] = None
+                        base["expiry_time"] = None
+                        base["risk"] = "HIGH"
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
+                    impulse_gap_seconds = IMPULSE_ZONE_COOLDOWN_BARS * INTERVALS.get(interval, 60)
+                    last_impulse_ts = float(release_state.get("last_impulse_signal_ts", 0.0) or 0.0)
+                    impulse_remaining = max(0, int(impulse_gap_seconds - (time.time() - last_impulse_ts))) if last_impulse_ts else 0
+                    if impulse_remaining > 0:
+                        base["status"] = "ONLINE • IMPULSO ZONA • COOLDOWN CURTO"
+                        base["reason"] = f"Setup confirmado, mas o motor aguarda mais {impulse_remaining}s para não repetir a mesma reação de zona."
                         base["direction"] = "NEUTRO"
                         base["entry_time"] = None
                         base["expiry_time"] = None
@@ -10957,16 +11358,27 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "VELOCITY": "SINAL VELOCITY FLOW LIBERADO",
                         "SNIPER": "SINAL SNIPER PRO MEGA LIBERADO",
                         "ALPHAX": "SINAL ALPHAX RELAY LIBERADO",
+                        "IMPULSE": "SINAL IMPULSO ZONA LIBERADO",
                         "ICT": "SINAL ICT/SMC INSTITUCIONAL LIBERADO",
                         "FORCE": "SINAL EA FORÇA DO MOVIMENTO LIBERADO",
                         "BIGRISE": "SINAL BTC FORCE + DOM LIBERADO",
                     }.get(engine, "SINAL IA GRÁFICA LIBERADO")),
-                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "ICT", "SNIPER", "ALPHAX") else "MEDIUM").upper(),
+                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "ICT", "SNIPER", "ALPHAX", "IMPULSE") else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
                     "expiry_time": iso(expiry),
                     "reference_candle": reference_candle,
                 })
+                if engine == "ALPHAX":
+                    base["announce_seconds_before"] = ALPHAX_EARLY_SIGNAL_SECONDS
+                    base["early_signal_locked"] = True
+                    base["non_repaint_after_release"] = True
+                    base["signal_snapshot"] = "FORMING_CANDLE_AT_30S"
+                if engine == "IMPULSE":
+                    base["announce_seconds_before"] = IMPULSE_EARLY_SIGNAL_SECONDS
+                    base["early_signal_locked"] = True
+                    base["non_repaint_after_release"] = True
+                    base["signal_snapshot"] = "FORMING_CANDLE_AT_30S"
 
                 if engine == "SMART" and moment_gate.get("confirmed"):
                     base["reason"] = (str(base.get("reason") or "") +
@@ -10980,7 +11392,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX"):
+                if engine not in ("EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -11000,6 +11412,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     release_state["last_ict_signal_ts"] = time.time()
                     base["ict_signal_gap_seconds"] = _ict_cooldown_bars(interval) * INTERVALS.get(interval, 60)
                     base["ict_signal_gap_remaining"] = 0
+                if engine == "IMPULSE":
+                    release_state["last_impulse_signal_ts"] = time.time()
+                    base["impulse_signal_gap_seconds"] = IMPULSE_ZONE_COOLDOWN_BARS * INTERVALS.get(interval, 60)
+                    base["impulse_signal_gap_remaining"] = 0
 
                 # Só as IAs entram no ciclo com Gale. EAs continuam com sua
                 # regra própria de entrada direta/sem Gale. Fallback local da IA
@@ -11087,6 +11503,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "VELOCITY": "LOCAL_VELOCITY_FLOW",
                 "SNIPER": "LOCAL_SNIPER_PRO_MEGA",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
+                "IMPULSE": "LOCAL_IMPULSE_ZONE",
                 "ICT": "LOCAL_ICT_SMC_INSTITUTIONAL",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
@@ -13819,7 +14236,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     "GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE",
-    "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX",
+    "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE",
 }
 
 
@@ -14618,11 +15035,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, VELOCITY, ICT, SNIPER ou ALPHAX.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, VELOCITY, ICT, SNIPER, ALPHAX ou IMPULSE.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX"):
+    if engine in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -14722,6 +15139,19 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
                     data["feed_message"] = "AlphaX RELAY usando candles OTC reais da sessão IQ Option."
+            elif engine == "IMPULSE":
+                if requested_market == "OPEN":
+                    feed_info = _current_open_feed_info(symbol, interval)
+                    feed_src = str(feed_info.get("source") or "MULTIFEED")
+                    data["feed_source"] = feed_src
+                    data["feed_label"] = _feed_source_label(feed_src)
+                    data["feed_fallback"] = bool(feed_info.get("fallback"))
+                    data["feed_message"] = "Impulso Zona usando candles do mercado aberto via roteador cTrader/multifuente."
+                else:
+                    data["feed_source"] = "IQ_OPTION_OTC"
+                    data["feed_label"] = _feed_source_label(data["feed_source"])
+                    data["feed_fallback"] = False
+                    data["feed_message"] = "Impulso Zona usando candles OTC reais da sessão IQ Option."
             elif engine == "ICT":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -15166,7 +15596,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -15204,7 +15634,15 @@ async def pre_signals(
     if engine == "ALPHAX":
         return {
             "ok": True,
-            "message": "ALPHAX RELAY usa padrão de vela fechado como gatilho + 1 confirmação; pré-sinal intrabar fica desligado para não repintar.",
+            "message": "ALPHAX RELAY avalia um snapshot da vela em formação e libera o sinal oficial cerca de 30s antes da próxima vela; após liberado, o CALL/PUT fica travado e não repinta.",
+            "items": [],
+            "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
+        }
+
+    if engine == "IMPULSE":
+        return {
+            "ok": True,
+            "message": "IMPULSO ZONA procura região + microimpulso + confirmação rápida e oficializa a leitura cerca de 30s antes da próxima vela; o sinal liberado fica travado até a expiração.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -15223,10 +15661,10 @@ async def pre_signals(
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE")
     if fallback_twelve:
         market = "OPEN"
-    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX") and not iq_state:
+    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE") and not iq_state:
         wait_label = {
             "EA": "EA Tripla",
             "RUBIK": "Robô Rubik Adaptado",
@@ -15234,6 +15672,7 @@ async def pre_signals(
             "VELOCITY": "Velocity Flow",
             "SNIPER": "Sniper Pro MEGA",
             "ALPHAX": "AlphaX RELAY",
+            "IMPULSE": "Impulso Zona",
             "ICT": "ICT/SMC Institucional",
         }.get(engine, engine)
         return {
@@ -15299,7 +15738,7 @@ async def pre_signals(
         key = f"{group_key}|{symbol}"
         try:
             pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (120 if engine == "RUBIK" else 90))
-            if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX") and requested_market == "IQ_OTC":
+            if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
                 )
@@ -15693,12 +16132,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, VELOCITY, ICT, SNIPER ou ALPHAX.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, VELOCITY, ICT, SNIPER, ALPHAX ou IMPULSE.")
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE")
     if fallback_twelve:
         market = "OPEN"
 
@@ -15785,6 +16224,13 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 raw = await iq_ea_candles(iq_state, sym, interval, 150, regular_market=False)
             else:
                 raw = await candles(sym, interval, 150, "OPEN", None, request=request)
+        elif engine == "IMPULSE":
+            if market == "IQ_OTC":
+                if not iq_state:
+                    raise RuntimeError("Conecte a IQ Option para o Impulso Zona analisar OTC.")
+                raw = await iq_ea_candles(iq_state, sym, interval, 120, regular_market=False)
+            else:
+                raw = await candles(sym, interval, 120, "OPEN", None, request=request)
         elif engine == "ICT":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -15862,6 +16308,18 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     if direction != "NEUTRO"
                     else f"{engine_label} • MONITORANDO • {why}"
                 )
+            elif engine == "IMPULSE":
+                _imp_sec=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                _imp_window=(IMPULSE_EARLY_MIN_REMAINING <= _imp_sec <= IMPULSE_EARLY_WINDOW_BEFORE)
+                tech = impulse_zone_strategy((raw[-120:] if _imp_window else closed), interval, market=market, early_signal=_imp_window)
+                engine_label = "IMPULSO ZONA"
+                direction = tech.get("direction", "NEUTRO") if (_imp_window and tech.get("confirmed")) else "NEUTRO"
+                why = str(tech.get("reason") or "Impulso Zona monitorando").replace("\n", " ")[:88]
+                status_text = (
+                    f"{engine_label} • OPORTUNIDADE ENCONTRADA"
+                    if direction != "NEUTRO"
+                    else f"{engine_label} • MONITORANDO • {why}"
+                )
             elif engine == "ICT":
                 if market == "OPEN":
                     h1_raw = await candles(sym, "1h", 120, "OPEN", None, request=request)
@@ -15934,18 +16392,18 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if (engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX") or (engine == "FORCE" and market == "IQ_OTC"))
+                    status_text if (engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE") or (engine == "FORCE" and market == "IQ_OTC"))
                     else (((_feed_source_label(_feed_source_from_rows(raw)) + " • " + status_text) if market == "OPEN" else status_text))
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
+                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
                 "strategy": str(tech.get("strategy") or ""),
             }
-            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX"):
+            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE"):
                 radar_probe = {
                     "symbol": sym, "market": market, "interval": interval,
                     "direction": item.get("direction"), "confidence": item.get("confidence"),
@@ -15982,6 +16440,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             source_status = "SNIPER PRO • FONTE EM ESPERA" if market == "OPEN" else "SNIPER PRO • IQ OPTION OTC EM ESPERA"
         elif engine == "ALPHAX":
             source_status = "ALPHAX RELAY • FONTE EM ESPERA" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION OTC EM ESPERA"
+        elif engine == "IMPULSE":
+            source_status = "IMPULSO ZONA • FONTE EM ESPERA" if market == "OPEN" else "IMPULSO ZONA • IQ OPTION OTC EM ESPERA"
         elif engine == "ICT":
             source_status = "ICT/SMC • FONTE EM ESPERA" if market == "OPEN" else "ICT/SMC • IQ OPTION OTC EM ESPERA"
         elif engine == "FORCE" and market == "IQ_OTC":
@@ -16005,7 +16465,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
+            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -16379,7 +16839,7 @@ async def result(
     engine = str(engine or "").upper()
     # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
-    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX")
+    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "IMPULSE")
 
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
@@ -16784,7 +17244,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .robot-mode-copy{min-width:150px}
 .robot-mode-title{font-weight:900;font-size:13px;letter-spacing:.4px}
 .robot-mode-desc{font-size:11px;color:#9fb2ca;margin-top:3px;max-width:245px}
-#robotPowerBtn,#aiPowerBtn,#larryPowerBtn,#sniperPowerBtn,#alphaxPowerBtn,#forcePowerBtn,#bigrisePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+#robotPowerBtn,#aiPowerBtn,#larryPowerBtn,#sniperPowerBtn,#alphaxPowerBtn,#impulsePowerBtn,#forcePowerBtn,#bigrisePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
 
 .daily-engine-board{margin-top:14px;border-color:#1c82c9;background:linear-gradient(180deg,#0b1b2e,#071321);box-shadow:0 0 24px #00aaff22}
 .daily-engine-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
@@ -16872,7 +17332,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • AlphaX RELAY • cTrader Open API • Aprendizado automático • Gráfico fluido</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • AlphaX 30s • Impulso Zona • cTrader Open API • Gráfico fluido</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -16933,7 +17393,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Inteligência Artificial">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧠 INTELIGÊNCIA ARTIFICIAL</div>
-      <div class="robot-mode-desc" id="aiModeDesc">IA pura • lê somente os candles do gráfico e decide CALL, PUT ou NEUTRO sem usar indicadores.</div>
+      <div class="robot-mode-desc" id="aiModeDesc">IA pura • lê somente os candles do gráfico e decide CALL, PUT ou NEUTRO por preço.</div>
     </div>
     <button id="aiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -16960,9 +17420,18 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="AlphaX RELAY">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧬 ALPHAX RELAY</div>
-      <div class="robot-mode-desc" id="alphaxModeDesc">AlphaX original + padrões de vela • o primeiro gatilho válido + 1 confirmação libera • candle fechado • próxima vela.</div>
+      <div class="robot-mode-desc" id="alphaxModeDesc">AlphaX + zonas rápidas • fractal/institucional • microimpulso • LWMA/MACD • sinal ~30s antes • entrada na próxima vela.</div>
     </div>
     <button id="alphaxPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
+  <div class="robot-mode-card" id="impulseModeCard">
+    <img src="__MEGA_IMAGE__" alt="Impulso Zona">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">⚡ IMPULSO ZONA</div>
+      <div class="robot-mode-desc" id="impulseModeDesc">Zona fractal/institucional + Micro Impulso Russian Bear + 1 confirmação rápida • sinal ~30s antes • próxima vela.</div>
+    </div>
+    <button id="impulsePowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
   <div class="robot-mode-card" id="ictModeCard">
@@ -17636,6 +18105,8 @@ const sniperPowerBtn=document.getElementById('sniperPowerBtn');
 const sniperModeDesc=document.getElementById('sniperModeDesc');
 const alphaxPowerBtn=document.getElementById('alphaxPowerBtn');
 const alphaxModeDesc=document.getElementById('alphaxModeDesc');
+const impulsePowerBtn=document.getElementById('impulsePowerBtn');
+const impulseModeDesc=document.getElementById('impulseModeDesc');
 const ictPowerBtn=document.getElementById('ictPowerBtn');
 const ictTabPowerBtn=document.getElementById('ictTabPowerBtn');
 const ictModeDesc=document.getElementById('ictModeDesc');
@@ -17689,6 +18160,7 @@ let larryEnabled=false;
 let velocityEnabled=false;
 let sniperEnabled=false;
 let alphaxEnabled=false;
+let impulseEnabled=false;
 let ictEnabled=false;
 try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
@@ -17701,22 +18173,25 @@ try{
   velocityEnabled=localStorage.getItem('mega_velocity_power')==='ONLINE';
   sniperEnabled=localStorage.getItem('mega_sniper_power')==='ONLINE';
   alphaxEnabled=localStorage.getItem('mega_alphax_power')==='ONLINE';
+  impulseEnabled=localStorage.getItem('mega_impulse_power')==='ONLINE';
   ictEnabled=localStorage.getItem('mega_ict_power')==='ONLINE';
   localStorage.setItem('mega_ea_power','OFFLINE');
   localStorage.setItem('mega_rubik_power','OFFLINE');
   localStorage.setItem('mega_larry_power',larryEnabled?'ONLINE':'OFFLINE');
   forceEnabled=localStorage.getItem('mega_force_power')==='ONLINE';
   bigriseEnabled=localStorage.getItem('mega_bigrise_power')==='ONLINE';
-  if(alphaxEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; }
-  else if(sniperEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; alphaxEnabled=false; }
-  else if(ictEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
-  else if(velocityEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
-  else if(bigriseEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
-  else if(forceEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
-  else if(larryEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(impulseEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  else if(alphaxEnabled){ impulseEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; }
+  else if(sniperEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
+  else if(ictEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
+  else if(velocityEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
+  else if(bigriseEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
+  else if(forceEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
+  else if(larryEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
+  if(impulseEnabled) return 'IMPULSE';
   if(alphaxEnabled) return 'ALPHAX';
   if(sniperEnabled) return 'SNIPER';
   if(ictEnabled) return 'ICT';
@@ -17734,8 +18209,9 @@ function adoptBackgroundEngineState(d){
   const e=String(d.engine||'').toUpperCase();
   robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
   forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false;
-  ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;
-  if(e==='ALPHAX') alphaxEnabled=true;
+  ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false;
+  if(e==='IMPULSE') impulseEnabled=true;
+  else if(e==='ALPHAX') alphaxEnabled=true;
   else if(e==='SNIPER') sniperEnabled=true;
   else if(e==='ICT') ictEnabled=true;
   else if(e==='VELOCITY') velocityEnabled=true;
@@ -17758,6 +18234,7 @@ function adoptBackgroundEngineState(d){
     localStorage.setItem('mega_ict_power',ictEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_sniper_power',sniperEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_alphax_power',alphaxEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_impulse_power',impulseEnabled?'ONLINE':'OFFLINE');
   }catch(_){}
   if(typeof applyRobotPowerState==='function') applyRobotPowerState();
 }
@@ -18660,6 +19137,7 @@ function normalizeEngineKey(value){
   if(e==='VELOCITY' || e==='VELOCITY_FLOW' || e==='MR_MT4') return 'VELOCITY';
   if(e==='SNIPER' || e==='SNIPER_PRO' || e==='SNIPER_PRO_MEGA') return 'SNIPER';
   if(e==='ALPHAX' || e==='ALPHAX_RELAY' || e==='ALPHA_X') return 'ALPHAX';
+  if(e==='IMPULSE' || e==='IMPULSE_ZONE' || e==='IMPULSO_ZONA') return 'IMPULSE';
   if(e==='ICT' || e==='ICT_SMC' || e==='ICT_SMC_INSTITUTIONAL') return 'ICT';
   if(e==='BIGRISE' || e==='BIGRISE_USD_BASKET' || e==='BTC_FORCE' || e==='BTC_FORCE_NEXT_CANDLE') return 'BIGRISE';
   return '';
@@ -18678,6 +19156,7 @@ function momentStudyEngineName(key){
     VELOCITY:'⚡ VELOCITY FLOW',
     SNIPER:'🎯 SNIPER PRO MEGA',
     ALPHAX:'🧬 ALPHAX RELAY',
+    IMPULSE:'⚡ IMPULSO ZONA',
     ICT:'🏦 ICT/SMC INSTITUCIONAL',
     FORCE:'💥 EA FORÇA DO MOVIMENTO',
     BIGRISE:'₿ BTC FORCE'
@@ -19001,7 +19480,7 @@ function rememberPendingTrade(sig){
   if(!sig.expiry_time || !sig.entry_time) return;
 
   const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
-  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='ICT'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('ICT'));
+  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='IMPULSE'||engineKey==='ICT'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('IMPULSE')||engineKey.includes('ICT'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
     // Motores de entrada direta (AlphaX/Sniper/ICT/Larry/EA/Força/BigRise/Velocity) são apurados na primeira vela; outros preservam G1/G2.
@@ -19018,7 +19497,7 @@ function rememberPendingTrade(sig){
     confidence:Number(sig.confidence||0),
     risk:String(sig.risk||''),
     strategy:String(sig.strategy||''),
-    engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('BIGRISE')?'BIGRISE':(engineKey.includes('LARRY')?'LARRY':(engineKey.includes('VELOCITY')?'VELOCITY':(engineKey.includes('SNIPER')?'SNIPER':(engineKey.includes('ALPHAX')?'ALPHAX':(engineKey.includes('ICT')?'ICT':String(sig.selected_engine||sig.mode||''))))))))),
+    engine:(normalizeEngineKey(engineKey)||String(sig.selected_engine||sig.mode||'')),
     entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH')),
     value_stake:currentValueStake(),
     value_payout:currentValuePayout()
@@ -21092,6 +21571,12 @@ function applyRobotPowerState(){
     alphaxPowerBtn.style.color='#fff';
     alphaxPowerBtn.style.borderColor=alphaxEnabled?'#16c56b':'#ff5252';
   }
+  if(impulsePowerBtn){
+    impulsePowerBtn.textContent=impulseEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    impulsePowerBtn.style.background=impulseEnabled?'#0b7a3d':'#7d1d1d';
+    impulsePowerBtn.style.color='#fff';
+    impulsePowerBtn.style.borderColor=impulseEnabled?'#16c56b':'#ff5252';
+  }
   for(const btn of [ictPowerBtn,ictTabPowerBtn]){
     if(!btn) continue;
     btn.textContent=ictEnabled?'🟢 ONLINE':'🔴 OFFLINE';
@@ -21117,7 +21602,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: IA Gráfica lendo padrões, H1, Dow H4 e LTA/LTB sem RSI.'
     : 'OFFLINE: IA Gráfica pausada.';
   if(aiModeDesc) aiModeDesc.textContent=aiEnabled
-    ? 'ONLINE: IA pura analisando somente candles e contexto de preço, sem indicadores.'
+    ? 'ONLINE: IA pura analisando somente candles e contexto de preço.'
     : 'OFFLINE: análise inteligente pausada.';
   if(eaModeDesc) eaModeDesc.textContent=eaEnabled
     ? 'ONLINE: RSI 14 + Value Chart + XGBoost • sinal somente com tripla confirmação • OPEN/OTC.'
@@ -21132,8 +21617,11 @@ function applyRobotPowerState(){
     ? 'ONLINE: score 5/8 • EMA 9/21 + VWAP + RSI + MACD + ADX/DMI + volume + price action • candle fechado • próxima vela • sem Gale.'
     : 'OFFLINE: Sniper Pro MEGA pausado.';
   if(alphaxModeDesc) alphaxModeDesc.textContent=alphaxEnabled
-    ? 'ONLINE: AlphaX original (Double/OCO/Triângulos/Flags/Wedges) + padrões de vela • primeiro gatilho válido + 1 confirmação • próxima vela • sem Gale.'
+    ? 'ONLINE: AlphaX + zonas fractal/institucional + microimpulso/LWMA/MACD • sinal oficial ~30s antes • entrada na próxima vela • sem Gale.'
     : 'OFFLINE: AlphaX RELAY pausado.';
+  if(impulseModeDesc) impulseModeDesc.textContent=impulseEnabled
+    ? 'ONLINE: Zona fractal/institucional + Micro Impulso Russian Bear + confirmação rápida • sinal ~30s antes • próxima vela • sem Gale.'
+    : 'OFFLINE: Impulso Zona pausado.';
   if(ictModeDesc) ictModeDesc.textContent=ictEnabled
     ? 'ONLINE: BOS/CHoCH + liquidez + FVG/OB + OTE + EMA/VWAP + volume + contexto H1/H4 • próxima vela • sem Gale.'
     : 'OFFLINE: ICT/SMC Institucional pausado.';
@@ -21148,10 +21636,15 @@ function applyRobotPowerState(){
     : 'OFFLINE: BTC FORCE pausado.';
 
   const engine=selectedRobotEngine();
-  if(engine==='ALPHAX'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ALPHAX RELAY ONLINE • PADRÃO DE VELA + 1 CONFIRMAÇÃO • PRÓXIMA VELA • SEM GALE';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧬 AlphaX RELAY selecionado • formações originais + padrões de vela; o primeiro gatilho válido exige só 1 confirmação.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar AlphaX ativo • Double/OCO/Triângulos/Flags/Wedges + padrões de vela → 1 confirmação</div>';
+  if(engine==='IMPULSE'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IMPULSO ZONA ONLINE • ZONA + MICRO IMPULSO + CONFIRMAÇÃO • SINAL ~30S ANTES';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Impulso Zona selecionado • só dispara quando região + microimpulso + confirmação rápida apontam juntos.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar Impulso Zona ativo • fractal/SR + níveis institucionais + Russian Bear + LWMA/MACD/Momentum/canal</div>';
+    rad();
+  }else if(engine==='ALPHAX'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ALPHAX RELAY ONLINE • ZONA + IMPULSO • SINAL ~30S ANTES • PRÓXIMA VELA • SEM GALE';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧬 AlphaX selecionado • formações + zonas fractal/institucional + microimpulso; sinal oficial perto de 30s antes da próxima vela.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar AlphaX ativo • estruturas + fractais/Big Figures + microimpulso + LWMA/MACD + canal rápido</div>';
     rad();
   }else if(engine==='SNIPER'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='SNIPER PRO MEGA ONLINE • SCORE 5/8 • VELA FECHADA • PRÓXIMA VELA • SEM GALE';
@@ -21205,7 +21698,7 @@ function applyRobotPowerState(){
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ AlphaX, Sniper Pro, ICT/SMC, IA Gráfica, Inteligência Artificial, Velocity Flow, Larry Breakout, EA Força e BIGRISE estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ Impulso Zona, AlphaX, Sniper Pro, ICT/SMC, IA Gráfica, Inteligência Artificial, Velocity Flow, Larry Breakout, EA Força e BIGRISE estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -21225,7 +21718,7 @@ function resetEngineVisualState(){
 
 async function setRobotPower(enabled){
   robotEnabled=!!enabled;
-  if(robotEnabled){ aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(robotEnabled){ aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
   try{
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21238,6 +21731,7 @@ async function setRobotPower(enabled){
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_impulse_power', impulseEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21250,7 +21744,7 @@ async function setRobotPower(enabled){
 
 async function setAiPower(enabled){
   aiEnabled=!!enabled;
-  if(aiEnabled){ robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(aiEnabled){ robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
   try{
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21263,6 +21757,7 @@ async function setAiPower(enabled){
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_impulse_power', impulseEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21275,7 +21770,7 @@ async function setAiPower(enabled){
 
 async function setEaPower(enabled){
   eaEnabled=!!enabled;
-  if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
   try{
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21288,6 +21783,7 @@ async function setEaPower(enabled){
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_impulse_power', impulseEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21300,7 +21796,7 @@ async function setEaPower(enabled){
 
 async function setRubikPower(enabled){
   rubikEnabled=!!enabled;
-  if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
   try{
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21313,6 +21809,7 @@ async function setRubikPower(enabled){
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_impulse_power', impulseEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21325,7 +21822,7 @@ async function setRubikPower(enabled){
 
 async function setLarryPower(enabled){
   larryEnabled=!!enabled;
-  if(larryEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(larryEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
   try{
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21338,6 +21835,7 @@ async function setLarryPower(enabled){
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_impulse_power', impulseEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21350,7 +21848,7 @@ async function setLarryPower(enabled){
 
 async function setForcePower(enabled){
   forceEnabled=!!enabled;
-  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
   try{
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21363,6 +21861,7 @@ async function setForcePower(enabled){
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_impulse_power', impulseEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21375,7 +21874,7 @@ async function setForcePower(enabled){
 
 async function setBigrisePower(enabled){
   bigriseEnabled=!!enabled;
-  if(bigriseEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(bigriseEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
   try{
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21388,6 +21887,7 @@ async function setBigrisePower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_impulse_power', impulseEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21400,7 +21900,7 @@ async function setBigrisePower(enabled){
 
 async function setVelocityPower(enabled){
   velocityEnabled=!!enabled;
-  if(velocityEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(velocityEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
   try{
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21413,6 +21913,7 @@ async function setVelocityPower(enabled){
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_impulse_power', impulseEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21425,7 +21926,7 @@ async function setVelocityPower(enabled){
 
 async function setIctPower(enabled){
   ictEnabled=!!enabled;
-  if(ictEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(ictEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
   try{
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21438,6 +21939,7 @@ async function setIctPower(enabled){
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_impulse_power', impulseEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21450,10 +21952,11 @@ async function setIctPower(enabled){
 
 async function setSniperPower(enabled){
   sniperEnabled=!!enabled;
-  if(sniperEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; }
+  if(sniperEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; alphaxEnabled=false; impulseEnabled=false; }
   try{
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_impulse_power', impulseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', 'OFFLINE');
@@ -21477,9 +21980,10 @@ async function setSniperPower(enabled){
 
 async function setAlphaxPower(enabled){
   alphaxEnabled=!!enabled;
-  if(alphaxEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; }
+  if(alphaxEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; impulseEnabled=false; }
   try{
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_impulse_power', impulseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21500,6 +22004,32 @@ async function setAlphaxPower(enabled){
   if(voiceEnabled) speak(alphaxEnabled ? 'AlphaX Relay online.' : 'AlphaX Relay offline.');
 }
 
+async function setImpulsePower(enabled){
+  impulseEnabled=!!enabled;
+  if(impulseEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  try{
+    localStorage.setItem('mega_impulse_power', impulseEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ea_power', 'OFFLINE');
+    localStorage.setItem('mega_rubik_power', 'OFFLINE');
+    localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'IMPULSE'});
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(impulseEnabled ? 'Impulso Zona online.' : 'Impulso Zona offline.');
+}
+
 if(robotPowerBtn) robotPowerBtn.onclick=()=>{ setRobotPower(!robotEnabled); };
 if(aiPowerBtn) aiPowerBtn.onclick=()=>{ setAiPower(!aiEnabled); };
 if(eaPowerBtn) eaPowerBtn.onclick=()=>{ setEaPower(!eaEnabled); };
@@ -21508,6 +22038,7 @@ if(larryPowerBtn) larryPowerBtn.onclick=()=>{ setLarryPower(!larryEnabled); };
 if(velocityPowerBtn) velocityPowerBtn.onclick=()=>{ setVelocityPower(!velocityEnabled); };
 if(sniperPowerBtn) sniperPowerBtn.onclick=()=>{ setSniperPower(!sniperEnabled); };
 if(alphaxPowerBtn) alphaxPowerBtn.onclick=()=>{ setAlphaxPower(!alphaxEnabled); };
+if(impulsePowerBtn) impulsePowerBtn.onclick=()=>{ setImpulsePower(!impulseEnabled); };
 if(ictPowerBtn) ictPowerBtn.onclick=()=>{ setIctPower(!ictEnabled); };
 if(ictTabPowerBtn) ictTabPowerBtn.onclick=()=>{ setIctPower(!ictEnabled); };
 if(ictOpenPanelBtn) ictOpenPanelBtn.onclick=()=>showTab('main');
