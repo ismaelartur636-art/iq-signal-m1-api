@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.81.0"
-PWA_VERSION = "v140"
+APP_VERSION = "3.83.0"
+PWA_VERSION = "v142"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -83,13 +83,14 @@ EA_VALUE_CHART_PERIOD = max(3, int(os.getenv("EA_VALUE_CHART_PERIOD", "5")))
 EA_VALUE_CHART_EXTREME = max(4.0, min(12.0, float(os.getenv("EA_VALUE_CHART_EXTREME", "8"))))
 
 # MEGA IA 3.52 — LARRY BREAKOUT para opções binárias.
+# MEGA IA 3.82 — Larry levemente mais solto: corpo 45%, expansão 0.85x e fechamento 65/35.
 # Adaptação do conceito de rompimento do Larry FX, sem Grid, sem Martingale,
 # sem aumento de mão e sem ordens pendentes. Só usa candles fechados.
 LARRY_LOOKBACK = max(6, min(30, int(os.getenv("LARRY_LOOKBACK", "12"))))
 LARRY_ATR_PERIOD = max(5, min(30, int(os.getenv("LARRY_ATR_PERIOD", "14"))))
 LARRY_BREAK_BUFFER_ATR = max(0.0, min(0.30, float(os.getenv("LARRY_BREAK_BUFFER_ATR", "0.03"))))
-LARRY_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("LARRY_MIN_BODY_RATIO", "0.48"))))
-LARRY_MIN_RANGE_EXPANSION = max(0.70, min(2.00, float(os.getenv("LARRY_MIN_RANGE_EXPANSION", "0.90"))))
+LARRY_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("LARRY_MIN_BODY_RATIO", "0.45"))))
+LARRY_MIN_RANGE_EXPANSION = max(0.70, min(2.00, float(os.getenv("LARRY_MIN_RANGE_EXPANSION", "0.85"))))
 LARRY_MAX_RANGE_ATR = max(1.20, min(6.00, float(os.getenv("LARRY_MAX_RANGE_ATR", "3.00"))))
 
 # MEGA IA 3.68 — Velocity Flow mais solto, porém ainda confirmado em vela fechada.
@@ -415,19 +416,20 @@ background_bot_state: Dict[str, Any] = {
 
 
 # MEGA IA 3.56 — BTC FORCE DOM: vela de força + região forte/LTA/LTB + profundidade de mercado.
+# MEGA IA 3.83 — BTC FORCE moderadamente mais solto: corpo/ATR/fechamento/DOM e zonas com tolerância um pouco maior.
 # 3.81 — BTC FORCE moderadamente mais solto: mantém força + estrutura + DOM obrigatórios,
 # mas amplia a frequência reduzindo os limiares e alargando um pouco as zonas estruturais.
 BIGRISE_BTC_SYMBOL = "BTC/USD"  # chave interna antiga preservada para compatibilidade do painel
 BTC_FORCE_ATR_PERIOD = max(5, min(30, int(os.getenv("BTC_FORCE_ATR_PERIOD", "14"))))
-BTC_FORCE_MIN_BODY_ATR = max(0.08, min(1.20, float(os.getenv("BTC_FORCE_MIN_BODY_ATR", "0.15"))))
-BTC_FORCE_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("BTC_FORCE_MIN_BODY_RATIO", "0.38"))))
-BTC_FORCE_MIN_CLOSE_POS = max(0.55, min(0.90, float(os.getenv("BTC_FORCE_MIN_CLOSE_POS", "0.60"))))
+BTC_FORCE_MIN_BODY_ATR = max(0.08, min(1.20, float(os.getenv("BTC_FORCE_MIN_BODY_ATR", "0.13"))))
+BTC_FORCE_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("BTC_FORCE_MIN_BODY_RATIO", "0.35"))))
+BTC_FORCE_MIN_CLOSE_POS = max(0.55, min(0.90, float(os.getenv("BTC_FORCE_MIN_CLOSE_POS", "0.58"))))
 BTC_FORCE_MAX_RANGE_ATR = max(1.50, min(6.00, float(os.getenv("BTC_FORCE_MAX_RANGE_ATR", "3.20"))))
 BTC_FORCE_SIGNAL_COOLDOWN_SECONDS = max(180, min(900, int(os.getenv("BTC_FORCE_SIGNAL_COOLDOWN_SECONDS", "240"))))
 # DOM/Level II: confirmação adicional do fluxo. cTrader é preferida quando conectada;
 # Binance COIN-M BTCUSD_PERP é fallback público 24/7 para o BTC/USD.
 BTC_DOM_ENABLED = os.getenv("BTC_DOM_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
-BTC_DOM_MIN_SIDE_SHARE = max(0.51, min(0.75, float(os.getenv("BTC_DOM_MIN_SIDE_SHARE", "0.53"))))
+BTC_DOM_MIN_SIDE_SHARE = max(0.51, min(0.75, float(os.getenv("BTC_DOM_MIN_SIDE_SHARE", "0.52"))))
 BTC_DOM_CACHE_TTL = max(2.0, min(30.0, float(os.getenv("BTC_DOM_CACHE_TTL", "6"))))
 BTC_DOM_BAND_PCT = max(0.0005, min(0.01, float(os.getenv("BTC_DOM_BAND_PCT", "0.0035"))))
 BTC_DOM_BINANCE_SYMBOL = os.getenv("BTC_DOM_BINANCE_SYMBOL", "BTCUSD_PERP").strip() or "BTCUSD_PERP"
@@ -7395,9 +7397,9 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None,
         levels = _support_resistance_levels(data, "1h" if tf_name == "H1" else "4h")
         tf_atr = atr(data, 14)
         zone_radius = max(
-            float(levels.get("tolerance", 0.0) or 0.0) * 2.25,
-            (float(tf_atr) * (0.30 if tf_name == "H1" else 0.22)) if tf_atr else 0.0,
-            abs(c) * 0.00028,
+            float(levels.get("tolerance", 0.0) or 0.0) * 2.45,
+            (float(tf_atr) * (0.34 if tf_name == "H1" else 0.25)) if tf_atr else 0.0,
+            abs(c) * 0.00032,
         )
         for x in levels.get("supports", []):
             supports.append({"tf": tf_name, "price": float(x["price"]), "touches": int(x.get("touches", 2)), "radius": zone_radius})
@@ -7423,7 +7425,7 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None,
         highs, lows = _otc_swing_points(sample, 2, 2)
         h4_ranges = [max(float(x["high"]) - float(x["low"]), 1e-12) for x in sample[-20:]]
         h4_avg_range = sum(h4_ranges) / max(1, len(h4_ranges)) if h4_ranges else float(a)
-        line_tol = max(h4_avg_range * 0.22, float(a) * 1.05, abs(c) * 0.00035)
+        line_tol = max(h4_avg_range * 0.25, float(a) * 1.15, abs(c) * 0.00040)
         current_idx = len(sample) - 1
 
         if len(lows) >= 2:
@@ -7605,8 +7607,8 @@ def larry_breakout_strategy(cs, timeframe="1min", market="OPEN"):
     body_ok = body_ratio >= LARRY_MIN_BODY_RATIO
     expansion_ok = expansion >= LARRY_MIN_RANGE_EXPANSION
     not_exhausted = candle_range <= (a * LARRY_MAX_RANGE_ATR)
-    call_close_ok = close_pos >= 0.68 and c > o
-    put_close_ok = close_pos <= 0.32 and c < o
+    call_close_ok = close_pos >= 0.65 and c > o
+    put_close_ok = close_pos <= 0.35 and c < o
 
     # Contexto simples de continuidade, sem RSI/Value Chart/MACD.
     prev_closes = [float(x["close"]) for x in rows[-6:-1]]
