@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.67"
-PWA_VERSION = "v132"
+APP_VERSION = "3.68"
+PWA_VERSION = "v133"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -92,34 +92,33 @@ LARRY_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("LARRY_MIN_BODY_RATIO
 LARRY_MIN_RANGE_EXPANSION = max(0.70, min(2.00, float(os.getenv("LARRY_MIN_RANGE_EXPANSION", "0.90"))))
 LARRY_MAX_RANGE_ATR = max(1.20, min(6.00, float(os.getenv("LARRY_MAX_RANGE_ATR", "3.00"))))
 
-# MEGA IA 3.67 — Velocity Flow levemente afrouxado para aumentar a frequência
-# sem liberar sinal intrabar: rompimento de 2 fechamentos, ADX mínimo 22,
-# RSI 7 em corredor mais amplo e cooldown de 4 velas. A direção da vela
-# continua obrigatória e a entrada permanece somente após candle fechado.
+# MEGA IA 3.68 — Velocity Flow mais solto, porém ainda confirmado em vela fechada.
+# Rompimento de 1 fechamento, ADX mínimo 18, RSI 7 mais amplo e cooldown curto.
+# DI dominante e direção da vela continuam obrigatórios para evitar sinal aleatório.
 VELOCITY_DMI_PERIOD = max(5, min(30, int(os.getenv("VELOCITY_DMI_PERIOD", "14"))))
 VELOCITY_ADX_SMOOTH = max(5, min(30, int(os.getenv("VELOCITY_ADX_SMOOTH", "14"))))
-VELOCITY_ADX_MIN = max(5.0, min(60.0, float(os.getenv("VELOCITY_ADX_MIN", "22"))))
-VELOCITY_BREAKOUT_LOOKBACK = max(2, min(10, int(os.getenv("VELOCITY_BREAKOUT_LOOKBACK", "2"))))
-VELOCITY_COOLDOWN_BARS = max(1, min(20, int(os.getenv("VELOCITY_COOLDOWN_BARS", "4"))))
-VELOCITY_RSI_BUY_MIN = max(20.0, min(60.0, float(os.getenv("VELOCITY_RSI_BUY_MIN", "42"))))
-VELOCITY_RSI_BUY_MAX = max(VELOCITY_RSI_BUY_MIN + 1.0, min(85.0, float(os.getenv("VELOCITY_RSI_BUY_MAX", "68"))))
-VELOCITY_RSI_SELL_MIN = max(15.0, min(55.0, float(os.getenv("VELOCITY_RSI_SELL_MIN", "32"))))
-VELOCITY_RSI_SELL_MAX = max(VELOCITY_RSI_SELL_MIN + 1.0, min(80.0, float(os.getenv("VELOCITY_RSI_SELL_MAX", "58"))))
+VELOCITY_ADX_MIN = max(5.0, min(60.0, float(os.getenv("VELOCITY_ADX_MIN", "18"))))
+VELOCITY_BREAKOUT_LOOKBACK = max(1, min(10, int(os.getenv("VELOCITY_BREAKOUT_LOOKBACK", "1"))))
+VELOCITY_COOLDOWN_BARS = max(1, min(20, int(os.getenv("VELOCITY_COOLDOWN_BARS", "2"))))
+VELOCITY_RSI_BUY_MIN = max(20.0, min(60.0, float(os.getenv("VELOCITY_RSI_BUY_MIN", "38"))))
+VELOCITY_RSI_BUY_MAX = max(VELOCITY_RSI_BUY_MIN + 1.0, min(85.0, float(os.getenv("VELOCITY_RSI_BUY_MAX", "72"))))
+VELOCITY_RSI_SELL_MIN = max(15.0, min(55.0, float(os.getenv("VELOCITY_RSI_SELL_MIN", "28"))))
+VELOCITY_RSI_SELL_MAX = max(VELOCITY_RSI_SELL_MIN + 1.0, min(80.0, float(os.getenv("VELOCITY_RSI_SELL_MAX", "62"))))
 
-# MEGA IA 3.66 — ICT/SMC Institucional levemente afrouxado, mantendo vela confirmada.
-# O motor usa somente candles fechados. Pivôs são confirmados com barras à direita,
-# e o sinal entra apenas na próxima vela.
-ICT_PIVOT_LEFT = max(1, min(8, int(os.getenv("ICT_PIVOT_LEFT", "3"))))
-ICT_PIVOT_RIGHT = max(1, min(8, int(os.getenv("ICT_PIVOT_RIGHT", "2"))))
+# MEGA IA 3.68 — ICT/SMC mais solto para gerar oportunidades com maior frequência.
+# Continua usando apenas candles fechados e entrada na próxima vela. O pivô confirma
+# com 1 barra à direita e a confluência aceita alinhamento parcial forte.
+ICT_PIVOT_LEFT = max(1, min(8, int(os.getenv("ICT_PIVOT_LEFT", "2"))))
+ICT_PIVOT_RIGHT = max(1, min(8, int(os.getenv("ICT_PIVOT_RIGHT", "1"))))
 ICT_ATR_PERIOD = max(7, min(30, int(os.getenv("ICT_ATR_PERIOD", "14"))))
-ICT_MIN_SCORE = max(65.0, min(90.0, float(os.getenv("ICT_MIN_SCORE", "70"))))
-ICT_STRONG_SCORE = max(ICT_MIN_SCORE, min(96.0, float(os.getenv("ICT_STRONG_SCORE", "82"))))
-ICT_FVG_PROX_ATR = max(0.05, min(0.60, float(os.getenv("ICT_FVG_PROX_ATR", "0.20"))))
-ICT_SWEEP_MIN_ATR = max(0.02, min(0.80, float(os.getenv("ICT_SWEEP_MIN_ATR", "0.06"))))
-ICT_M1_COOLDOWN_BARS = max(4, min(30, int(os.getenv("ICT_M1_COOLDOWN_BARS", "6"))))
+ICT_MIN_SCORE = max(62.0, min(90.0, float(os.getenv("ICT_MIN_SCORE", "66"))))
+ICT_STRONG_SCORE = max(ICT_MIN_SCORE, min(96.0, float(os.getenv("ICT_STRONG_SCORE", "78"))))
+ICT_FVG_PROX_ATR = max(0.05, min(0.60, float(os.getenv("ICT_FVG_PROX_ATR", "0.25"))))
+ICT_SWEEP_MIN_ATR = max(0.01, min(0.80, float(os.getenv("ICT_SWEEP_MIN_ATR", "0.04"))))
+ICT_M1_COOLDOWN_BARS = max(2, min(30, int(os.getenv("ICT_M1_COOLDOWN_BARS", "4"))))
 
 def _ict_cooldown_bars(interval: str) -> int:
-    return {"1min": ICT_M1_COOLDOWN_BARS, "5min": 3, "15min": 2, "30min": 2}.get(str(interval), 2)
+    return {"1min": ICT_M1_COOLDOWN_BARS, "5min": 2, "15min": 2, "30min": 1}.get(str(interval), 2)
 
 xgb_model_cache: Dict[str, Dict[str, Any]] = {}
 xgb_model_guard = threading.RLock()
@@ -7882,16 +7881,20 @@ def ict_smc_institutional_strategy(cs, timeframe="1min", market="OPEN", h1=None,
     positive_vols=[x for x in vols[:-1] if x>0]
     vol_avg=sum(positive_vols)/len(positive_vols) if positive_vols else 0.0
     last_vol=vols[-1] if vols else 0.0
-    volume_confirm = vol_avg <= 0 or last_vol >= 1.10*vol_avg
-    impulse_bull = c > o and body_ratio >= 0.52 and close_pos >= 0.68 and candle_range <= 2.8*a
-    impulse_bear = c < o and body_ratio >= 0.52 and close_pos <= 0.32 and candle_range <= 2.8*a
+    # 3.68: filtros de força um pouco mais permissivos. A vela ainda precisa fechar
+    # na direção e manter corpo/posição coerentes; só reduzimos a rigidez.
+    volume_confirm = vol_avg <= 0 or last_vol >= 1.02*vol_avg
+    impulse_bull = c > o and body_ratio >= 0.44 and close_pos >= 0.60 and candle_range <= 3.2*a
+    impulse_bear = c < o and body_ratio >= 0.44 and close_pos <= 0.40 and candle_range <= 3.2*a
 
     h1_bias = _ict_bias_from_rows(h1 or [])
     h4_bias = _ict_bias_from_rows(h4 or [])
     local_bias = _ict_bias_from_rows(rows)
     context_bias = h4_bias if h4_bias else (h1_bias if h1_bias else local_bias)
-    htf_bull = context_bias == 1 and h1_bias in (0,1) and h4_bias in (0,1)
-    htf_bear = context_bias == -1 and h1_bias in (0,-1) and h4_bias in (0,-1)
+    # Contexto maior continua valendo, porém 3.68 não exige alinhamento perfeito H1+H4.
+    # Só bloqueia quando os dois TFs superiores estão claramente contra o lado avaliado.
+    htf_bull = context_bias == 1 and not (h1_bias == -1 and h4_bias == -1)
+    htf_bear = context_bias == -1 and not (h1_bias == 1 and h4_bias == 1)
 
     cont_call = (20 if htf_bull else 0) + (14 if struct_dir==1 else 0) + (12 if ema_bull else 0) + (14 if bos_bull else 0) + (10 if impulse_bull else 0) + (6 if vwap_bull else 0) + (6 if volume_confirm else 0) + (6 if fvg_bull and fvg_bull.get("near") else 0) + (6 if discount or ote_discount or (ob_bull and ob_bull.get("near")) else 0) + (6 if not premium else 0)
     cont_put = (20 if htf_bear else 0) + (14 if struct_dir==-1 else 0) + (12 if ema_bear else 0) + (14 if bos_bear else 0) + (10 if impulse_bear else 0) + (6 if vwap_bear else 0) + (6 if volume_confirm else 0) + (6 if fvg_bear and fvg_bear.get("near") else 0) + (6 if premium or ote_premium or (ob_bear and ob_bear.get("near")) else 0) + (6 if not discount else 0)
@@ -7899,10 +7902,24 @@ def ict_smc_institutional_strategy(cs, timeframe="1min", market="OPEN", h1=None,
     rev_put = (24 if sweep_bear else 0) + (20 if choch_bear else 0) + (10 if premium else 0) + (8 if ote_premium else 0) + (9 if impulse_bear else 0) + (7 if volume_confirm else 0) + (7 if fvg_bear and fvg_bear.get("near") else 0) + (6 if ob_bear and ob_bear.get("near") else 0) + (5 if vwap_bear else 0) + (4 if e9 is not None and c<=e9 else 0)
 
     candidates=[]
-    if htf_bull and ema_bull and (bos_bull or (impulse_bull and struct_dir==1)): candidates.append((cont_call,"CALL","CONTINUATION"))
-    if htf_bear and ema_bear and (bos_bear or (impulse_bear and struct_dir==-1)): candidates.append((cont_put,"PUT","CONTINUATION"))
-    if sweep_bull and choch_bull: candidates.append((rev_call,"CALL","REVERSAL"))
-    if sweep_bear and choch_bear: candidates.append((rev_put,"PUT","REVERSAL"))
+    # 3.68: continuidade aceita alinhamento parcial forte. Mantemos pelo menos
+    # contexto/estrutura, mais um gatilho objetivo (BOS, impulso ou zona próxima).
+    call_zone = bool((fvg_bull and fvg_bull.get("near")) or (ob_bull and ob_bull.get("near")) or ote_discount)
+    put_zone = bool((fvg_bear and fvg_bear.get("near")) or (ob_bear and ob_bear.get("near")) or ote_premium)
+    call_context_ok = htf_bull or (context_bias in (0, 1) and struct_dir == 1)
+    put_context_ok = htf_bear or (context_bias in (0, -1) and struct_dir == -1)
+    call_trend_ok = ema_bull or struct_dir == 1
+    put_trend_ok = ema_bear or struct_dir == -1
+    if call_context_ok and call_trend_ok and (bos_bull or impulse_bull or call_zone):
+        candidates.append((cont_call,"CALL","CONTINUATION"))
+    if put_context_ok and put_trend_ok and (bos_bear or impulse_bear or put_zone):
+        candidates.append((cont_put,"PUT","CONTINUATION"))
+    # Reversão: sweep continua obrigatório, mas CHoCH pode ser substituído por
+    # rejeição/impulso coerente em premium/discount ou zona institucional próxima.
+    if sweep_bull and (choch_bull or (impulse_bull and (discount or call_zone))):
+        candidates.append((rev_call,"CALL","REVERSAL"))
+    if sweep_bear and (choch_bear or (impulse_bear and (premium or put_zone))):
+        candidates.append((rev_put,"PUT","REVERSAL"))
     candidates.sort(key=lambda x:x[0], reverse=True)
 
     direction="NEUTRO"; path="NONE"; confidence=0.0
