@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.62"
-PWA_VERSION = "v128"
+APP_VERSION = "3.63"
+PWA_VERSION = "v129"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -15947,6 +15947,7 @@ try{
 }
 let lastSignalVoice='';
 let lastVelocityRobotSignal='';
+let lastVelocityPreviewKey='';
 let velocityRobotAlertTimer=null;
 let lastAnalysis=0;
 let thirtyFive=false;
@@ -19367,6 +19368,34 @@ function renderVelocityTab(data){
   if(velocityMa) velocityMa.textContent='EMA9 '+Number(diag.ema9||0).toFixed(5)+' • SMA21 '+Number(diag.sma21||0).toFixed(5);
 }
 
+function renderVelocityPreviewOnMain(data){
+  const d=data||{};
+  const diag=(d.technical&&d.technical.diagnostics)?d.technical.diagnostics:(d.diagnostics||{});
+  const previewDir=diag.breakout_buy?'CALL':(diag.breakout_sell?'PUT':'');
+  if(!previewDir) return false;
+
+  const key=[d.symbol||((S&&S.value)||''),d.interval||((interval&&interval.value)||''),previewDir,String(diag.last_closed_ts||diag.candle_time||'')].join('|');
+  const isCall=previewDir==='CALL';
+
+  // Mostra no painel principal que o primeiro gatilho do Velocity apareceu,
+  // mas não altera cur.direction: isso evita Telegram, contabilidade ou ordem
+  // automática antes de ADX/DMI + RSI confirmarem o sinal final.
+  direction.textContent='PRÉ-'+previewDir;
+  direction.className='big '+(isCall?'call':'put');
+  confidence.textContent='Pré-sinal • aguardando filtros';
+  entry.textContent='ENTRADA AINDA NÃO LIBERADA';
+  countdown.textContent='Aguardando confirmação final do Velocity';
+  statusBox.textContent='VELOCITY FLOW • PRÉ-SINAL '+previewDir+' • '+String(d.reason||'aguardando ADX/DMI e RSI').replace(/\s+/g,' ').slice(0,120);
+
+  if(key!==lastVelocityPreviewKey){
+    lastVelocityPreviewKey=key;
+    showRobot();
+    analysisText.style.display='block';
+    analysisText.textContent='⚡ VELOCITY FLOW • PRÉ-'+previewDir+' DETECTADO • AGUARDANDO CONFIRMAÇÃO';
+  }
+  return true;
+}
+
 async function sig(announce=false){
   if(!appEnabled) return;
   if(sigBusy) return;
@@ -19438,6 +19467,13 @@ async function sig(announce=false){
       const src=String(cur.feed_label||cur.feed_source||'MULTIFONTE').replaceAll('_',' ');
       const fb=cur.feed_fallback===true?' • FALLBACK ATIVO':'';
       dataFeedText.textContent=src+fb;
+    }
+
+    // No Velocity, um rompimento isolado é apenas pré-sinal.
+    // Exibimos no painel/robô para o usuário acompanhar, mas somente
+    // CALL/PUT confirmado continua para Telegram, resultado e autoentrada.
+    if(engine==='VELOCITY' && String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO') {
+      renderVelocityPreviewOnMain(cur);
     }
 
     rememberPendingTrade(cur);
