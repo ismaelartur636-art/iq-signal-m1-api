@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.66"
-PWA_VERSION = "v132"
+APP_VERSION = "3.67"
+PWA_VERSION = "v133"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -7637,7 +7637,13 @@ def _macd_pullback_validation_indicator(rows, fast=12, slow=26, signal=9, lookba
         "macd": round(macd[last], 10),
         "signal": round(signal_line[last], 10),
         "hist": round(hist[last], 10),
+        "hist_prev": round(hist[last-1], 10),
         "hist_rising": bool(hist[last] > hist[last-1]),
+        "hist_bullish": bool(hist_bull),
+        "hist_bearish": bool(hist_bear),
+        "macd_prev": round(macd[last-1], 10),
+        "macd_rising": bool(macd[last] > macd[last-1]),
+        "macd_falling": bool(macd[last] < macd[last-1]),
         "recent_bearish_pullback": recent_bear_cross,
         "recent_bullish_pullback": recent_bull_cross,
         "recent_bullish_divergence": recent_bull_div,
@@ -13173,12 +13179,52 @@ async def macd_pullback_indicator_api(
             "feed_source": feed_source,
         }
 
+    # O sinal oficial usa somente velas fechadas. O pré-alerta pode observar a
+    # vela atual, mas nunca é tratado como confirmação nem como ordem.
     closed = raw[:-1]
     result = _macd_pullback_validation_indicator(closed[-120:])
+    live = _macd_pullback_validation_indicator(raw[-120:])
+
+    pre_dir = "NEUTRO"
+    pre_reason = "Aguardando alinhamento do pullback + divergência + retomada do histograma."
+    if live.get("available"):
+        macd_now = float(live.get("macd") or 0.0)
+        macd_prev = float(live.get("macd_prev") or 0.0)
+        hist_now = float(live.get("hist") or 0.0)
+        # Distância relativa da linha zero. Evita um limite fixo que seria ruim
+        # entre Forex e BTC/USD.
+        near_zero = abs(macd_now) <= max(abs(hist_now) * 2.75, abs(macd_prev) * 0.35, 1e-12)
+        call_core = bool(live.get("recent_bearish_pullback") and live.get("recent_bullish_divergence"))
+        put_core = bool(live.get("recent_bullish_pullback") and live.get("recent_bearish_divergence"))
+        call_momentum = bool(live.get("hist_bullish") and live.get("macd_rising"))
+        put_momentum = bool(live.get("hist_bearish") and live.get("macd_falling"))
+
+        if str(live.get("direction") or "").upper() == "CALL":
+            pre_dir = "CALL"
+            pre_reason = "PRÉ-CALL: condições do MACD já estão alinhadas na vela atual; aguarda fechamento para confirmação oficial."
+        elif str(live.get("direction") or "").upper() == "PUT":
+            pre_dir = "PUT"
+            pre_reason = "PRÉ-PUT: condições do MACD já estão alinhadas na vela atual; aguarda fechamento para confirmação oficial."
+        elif call_core and call_momentum and macd_now <= 0 and near_zero:
+            pre_dir = "CALL"
+            pre_reason = "PRÉ-CALL: pullback e divergência de alta confirmados, histograma retomando força e MACD se aproximando da linha zero."
+        elif put_core and put_momentum and macd_now >= 0 and near_zero:
+            pre_dir = "PUT"
+            pre_reason = "PRÉ-PUT: pullback e divergência de baixa confirmados, histograma acelerando para baixo e MACD se aproximando da linha zero."
+
+    current = raw[-1] if raw else {}
+    pre_candle = current.get("datetime") or current.get("timestamp") or current.get("time") or current.get("from") or ""
     result.update({
         "symbol": symbol, "interval": interval, "market": requested_market,
         "feed_source": feed_source, "standalone": True,
         "updated_at": iso(now()),
+        "prealert_active": pre_dir in ("CALL", "PUT"),
+        "prealert_direction": pre_dir,
+        "prealert_reason": pre_reason,
+        "prealert_candle": str(pre_candle),
+        "preview_macd": live.get("macd"),
+        "preview_signal": live.get("signal"),
+        "preview_hist": live.get("hist"),
     })
     return result
 
@@ -15414,9 +15460,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         </div>
         <button id="macdPullbackPowerBtn" type="button" style="font-weight:1000;min-width:135px">🔴 OFFLINE</button>
       </div>
-      <div class="label" style="margin-top:8px;line-height:1.45">Versão corrigida • candles fechados • pivô só vale depois da confirmação • sem consulta extra ao servidor.</div>
+      <div class="label" style="margin-top:8px;line-height:1.45">Versão corrigida • sinal oficial em vela fechada • pré-alerta observa a vela atual • pivô só vale depois da confirmação • usa o mesmo roteador/cache de candles do app.</div>
       <div class="grid" style="margin-top:10px">
-        <div class="card" style="padding:10px"><div class="label">SINAL</div><div id="macdPullbackState" class="big neutral" style="font-size:18px">OFFLINE</div><small id="macdPullbackReason">Ative o indicador para acompanhar.</small></div>
+        <div class="card" style="padding:10px"><div class="label">🔔 PRÉ-ALERTA</div><div id="macdPullbackPreAlert" class="big neutral" style="font-size:16px">OFFLINE</div><small id="macdPullbackPreReason">Ative o indicador para acompanhar.</small></div>
+        <div class="card" style="padding:10px"><div class="label">🟢 PRÉ-CALL</div><div id="macdPullbackPreCall" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível compra antes da confirmação final</small></div>
+        <div class="card" style="padding:10px"><div class="label">🔴 PRÉ-PUT</div><div id="macdPullbackPrePut" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível venda antes da confirmação final</small></div>
+        <div class="card" style="padding:10px"><div class="label">SINAL CONFIRMADO</div><div id="macdPullbackState" class="big neutral" style="font-size:18px">OFFLINE</div><small id="macdPullbackReason">Ative o indicador para acompanhar.</small></div>
         <div class="card" style="padding:10px"><div class="label">MACD / SIGNAL</div><div id="macdPullbackLines" class="big" style="font-size:15px">--</div><small>Cruzamento e linha zero</small></div>
         <div class="card" style="padding:10px"><div class="label">HISTOGRAMA</div><div id="macdPullbackHist" class="big" style="font-size:15px">--</div><small>Momentum positivo/negativo e aceleração</small></div>
         <div class="card" style="padding:10px"><div class="label">PULLBACK / DIVERGÊNCIA</div><div id="macdPullbackContext" class="big" style="font-size:14px">--</div><small>Pivôs confirmados sem retroceder sinal</small></div>
@@ -15900,6 +15949,10 @@ const macdPullbackReason=document.getElementById('macdPullbackReason');
 const macdPullbackLines=document.getElementById('macdPullbackLines');
 const macdPullbackHist=document.getElementById('macdPullbackHist');
 const macdPullbackContext=document.getElementById('macdPullbackContext');
+const macdPullbackPreAlert=document.getElementById('macdPullbackPreAlert');
+const macdPullbackPreCall=document.getElementById('macdPullbackPreCall');
+const macdPullbackPrePut=document.getElementById('macdPullbackPrePut');
+const macdPullbackPreReason=document.getElementById('macdPullbackPreReason');
 const velocityBreakout=document.getElementById('velocityBreakout');
 const velocityDmi=document.getElementById('velocityDmi');
 const velocityRsi=document.getElementById('velocityRsi');
@@ -15940,6 +15993,7 @@ let larryEnabled=false;
 let velocityEnabled=false;
 let macdPullbackEnabled=false;
 let macdPullbackBusy=false;
+let lastMacdPreAlertKey='';
 let lastMacdPullbackData=null;
 let lastVelocityData=null;
 let lastVelocityDataAt=0;
@@ -19570,6 +19624,10 @@ function renderMacdPullbackIndicator(data){
   if(!macdPullbackEnabled){
     macdPullbackState.textContent='OFFLINE'; macdPullbackState.className='big neutral';
     if(macdPullbackReason) macdPullbackReason.textContent='Ative o indicador para acompanhar.';
+    if(macdPullbackPreAlert){ macdPullbackPreAlert.textContent='OFFLINE'; macdPullbackPreAlert.className='big neutral'; }
+    if(macdPullbackPreCall){ macdPullbackPreCall.textContent='AGUARDANDO'; macdPullbackPreCall.className='big neutral'; }
+    if(macdPullbackPrePut){ macdPullbackPrePut.textContent='AGUARDANDO'; macdPullbackPrePut.className='big neutral'; }
+    if(macdPullbackPreReason) macdPullbackPreReason.textContent='Ative o indicador para acompanhar.';
     if(macdPullbackLines) macdPullbackLines.textContent='--';
     if(macdPullbackHist) macdPullbackHist.textContent='--';
     if(macdPullbackContext) macdPullbackContext.textContent='--';
@@ -19583,13 +19641,35 @@ function renderMacdPullbackIndicator(data){
     ((Object.prototype.hasOwnProperty.call(d,'macd') && Object.prototype.hasOwnProperty.call(d,'direction'))?d:null);
   if(!mp){
     macdPullbackState.textContent='AGUARDANDO'; macdPullbackState.className='big neutral';
-    if(macdPullbackReason) macdPullbackReason.textContent='Aguardando a próxima leitura do Velocity Flow.';
+    if(macdPullbackReason) macdPullbackReason.textContent='Aguardando a próxima leitura independente do MACD.';
     return;
   }
   const dir=String(mp.direction||'NEUTRO').toUpperCase();
+  const preDir=String(mp.prealert_direction||'NEUTRO').toUpperCase();
+  const preActive=Boolean(mp.prealert_active) && (preDir==='CALL'||preDir==='PUT');
   macdPullbackState.textContent=dir==='CALL'?'🟢 CALL':dir==='PUT'?'🔴 PUT':'⚪ NEUTRO';
   macdPullbackState.className='big '+(dir==='CALL'?'call':dir==='PUT'?'put':'neutral');
   if(macdPullbackReason) macdPullbackReason.textContent=String(mp.reason||'Monitorando MACD Pullback.');
+  if(macdPullbackPreAlert){
+    macdPullbackPreAlert.textContent=preActive?('ATIVO • '+preDir):'MONITORANDO';
+    macdPullbackPreAlert.className='big '+(preDir==='CALL'?'call':preDir==='PUT'?'put':'neutral');
+  }
+  if(macdPullbackPreCall){
+    macdPullbackPreCall.textContent=preDir==='CALL'?'PRÉ-CALL ATIVO':'AGUARDANDO';
+    macdPullbackPreCall.className='big '+(preDir==='CALL'?'call':'neutral');
+  }
+  if(macdPullbackPrePut){
+    macdPullbackPrePut.textContent=preDir==='PUT'?'PRÉ-PUT ATIVO':'AGUARDANDO';
+    macdPullbackPrePut.className='big '+(preDir==='PUT'?'put':'neutral');
+  }
+  if(macdPullbackPreReason) macdPullbackPreReason.textContent=String(mp.prealert_reason||'Monitorando pré-alerta do MACD.');
+  if(preActive){
+    const preKey=[String(mp.symbol||((S&&S.value)||'')),String(mp.interval||((interval&&interval.value)||'')),preDir,String(mp.prealert_candle||'')].join('|');
+    if(preKey!==lastMacdPreAlertKey){
+      lastMacdPreAlertKey=preKey;
+      if(voiceEnabled) speak('Pré alerta MACD. '+(preDir==='CALL'?'Possível compra':'Possível venda')+' no ativo '+String(mp.symbol||((S&&S.value)||'')).replace('/',' ').replace('-',' ')+'.');
+    }
+  }
   if(macdPullbackLines) macdPullbackLines.textContent='MACD '+Number(mp.macd||0).toFixed(6)+' • SIG '+Number(mp.signal||0).toFixed(6);
   if(macdPullbackHist) macdPullbackHist.textContent=Number(mp.hist||0).toFixed(6)+' • '+(mp.hist_rising?'ACELERANDO':'SEM ACELERAÇÃO');
   if(macdPullbackContext){
@@ -19605,18 +19685,6 @@ async function loadMacdPullbackIndicator(force=false){
     return;
   }
   if(macdPullbackBusy) return;
-
-  // Se o Velocity está online e acabou de trazer os mesmos candles, reutiliza
-  // esse resultado e não cria uma requisição extra.
-  const freshVelocity=velocityEnabled && lastVelocityData && (Date.now()-lastVelocityDataAt)<15000;
-  if(!force && freshVelocity){
-    const tech=lastVelocityData.technical||lastVelocityData||{};
-    if(tech.indicators && tech.indicators.macd_pullback){
-      lastMacdPullbackData=tech.indicators.macd_pullback;
-      renderMacdPullbackIndicator(lastMacdPullbackData);
-      return;
-    }
-  }
 
   macdPullbackBusy=true;
   if(macdPullbackState){
@@ -20737,8 +20805,8 @@ setInterval(()=>{
   if(megaCanPoll() && selectedRobotEngine()!=='OFF') loadPreSignals();
 },10000);
 
-// MACD Pullback independente. Quando o Velocity está online, reaproveita a
-// mesma leitura; caso contrário faz uma leitura própria, limitada a 12 s.
+// MACD Pullback independente com pré-alerta intrabar. A rota própria usa o mesmo
+// roteador/cache de candles do app e roda no máximo a cada 12 s.
 setInterval(()=>{
   if(megaCanPoll() && macdPullbackEnabled) loadMacdPullbackIndicator(false);
 },12000);
