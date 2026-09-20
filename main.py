@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.69"
-PWA_VERSION = "v135"
+APP_VERSION = "3.70"
+PWA_VERSION = "v136"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -13187,50 +13187,80 @@ async def macd_pullback_indicator_api(
 
     pre_dir = "NEUTRO"
     pre_score = 0
-    pre_reason = "Aguardando formação do pullback + aceleração do histograma + aproximação da linha zero."
+    pre_reason = "MACD frouxo monitorando: precisa de 2/4 condições para soltar o pré-alerta."
     if live.get("available"):
         macd_now = float(live.get("macd") or 0.0)
         macd_prev = float(live.get("macd_prev") or 0.0)
         hist_now = float(live.get("hist") or 0.0)
         hist_prev = float(live.get("hist_prev") or 0.0)
 
-        # O pré-alerta precisa acontecer ANTES do sinal final. Por isso a
-        # divergência confirmada continua obrigatória apenas no sinal oficial.
-        # Aqui observamos a formação: pullback recente + MACD/histograma virando
-        # na direção esperada + aproximação da linha zero.
-        zero_band = max(abs(hist_now) * 3.5, abs(hist_prev) * 3.0, abs(macd_prev) * 0.55, 1e-12)
+        # PERFIL FROUXO — SOMENTE PARA O SEGUNDO INDICADOR.
+        # O Velocity Flow de cima não usa este bloco e permanece intocado.
+        # O sinal final do MACD também continua com as regras originais/rigorosas;
+        # aqui apenas antecipamos o aviso usando 2 de 4 evidências de formação.
+        zero_band = max(abs(hist_now) * 4.5, abs(hist_prev) * 4.0, abs(macd_prev) * 0.75, 1e-12)
         near_zero = abs(macd_now) <= zero_band
+
+        call_hist = hist_now > hist_prev
+        put_hist = hist_now < hist_prev
+        call_macd = macd_now > macd_prev
+        put_macd = macd_now < macd_prev
 
         call_pullback = bool(live.get("recent_bearish_pullback"))
         put_pullback = bool(live.get("recent_bullish_pullback"))
-        call_turn = bool(live.get("macd_rising") and hist_now > hist_prev)
-        put_turn = bool(live.get("macd_falling") and hist_now < hist_prev)
-        call_position = bool(macd_now <= 0 or near_zero)
-        put_position = bool(macd_now >= 0 or near_zero)
         call_div = bool(live.get("recent_bullish_divergence"))
         put_div = bool(live.get("recent_bearish_divergence"))
 
-        call_score = int(call_pullback) + int(call_turn) + int(call_position) + int(call_div)
-        put_score = int(put_pullback) + int(put_turn) + int(put_position) + int(put_div)
+        # Contexto de zona: serve como bônus, não como trava obrigatória.
+        call_zone = bool(macd_now <= 0 or near_zero or call_pullback or call_div)
+        put_zone = bool(macd_now >= 0 or near_zero or put_pullback or put_div)
 
-        if str(live.get("direction") or "").upper() == "CALL":
+        live_candle = raw[-1] if raw else {}
+        live_open = float(live_candle.get("open") or 0.0)
+        live_close = float(live_candle.get("close") or 0.0)
+        call_candle = live_close > live_open
+        put_candle = live_close < live_open
+
+        call_score = int(call_hist) + int(call_macd) + int(call_zone) + int(call_candle)
+        put_score = int(put_hist) + int(put_macd) + int(put_zone) + int(put_candle)
+
+        final_live = str(live.get("direction") or "").upper()
+        if final_live == "CALL":
             pre_dir = "CALL"
             pre_score = 4
-            pre_reason = "PRÉ-CALL: compra já alinhada na vela atual; o sinal final aguarda fechamento."
-        elif str(live.get("direction") or "").upper() == "PUT":
+            pre_reason = "PRÉ-CALL: compra já alinhada na vela atual; confirmação final aguarda fechamento."
+        elif final_live == "PUT":
             pre_dir = "PUT"
             pre_score = 4
-            pre_reason = "PRÉ-PUT: venda já alinhada na vela atual; o sinal final aguarda fechamento."
-        elif call_pullback and call_turn and call_position:
+            pre_reason = "PRÉ-PUT: venda já alinhada na vela atual; confirmação final aguarda fechamento."
+        elif call_score >= 2 and call_score > put_score:
             pre_dir = "CALL"
             pre_score = call_score
-            extra = " + divergência de alta já confirmada" if call_div else ""
-            pre_reason = "PRÉ-CALL: pullback de alta em formação, histograma/MACD virando para cima e aproximando da linha zero" + extra + "."
-        elif put_pullback and put_turn and put_position:
+            detalhes = []
+            if call_hist: detalhes.append("histograma acelerando")
+            if call_macd: detalhes.append("MACD subindo")
+            if call_zone: detalhes.append("zona favorável")
+            if call_candle: detalhes.append("vela compradora")
+            pre_reason = "PRÉ-CALL FROUXO: " + " + ".join(detalhes[:4]) + "."
+        elif put_score >= 2 and put_score > call_score:
             pre_dir = "PUT"
             pre_score = put_score
-            extra = " + divergência de baixa já confirmada" if put_div else ""
-            pre_reason = "PRÉ-PUT: pullback de baixa em formação, histograma/MACD virando para baixo e aproximando da linha zero" + extra + "."
+            detalhes = []
+            if put_hist: detalhes.append("histograma enfraquecendo")
+            if put_macd: detalhes.append("MACD caindo")
+            if put_zone: detalhes.append("zona favorável")
+            if put_candle: detalhes.append("vela vendedora")
+            pre_reason = "PRÉ-PUT FROUXO: " + " + ".join(detalhes[:4]) + "."
+        elif call_score >= 2 and put_score >= 2:
+            # Empate: usamos a inclinação conjunta MACD/histograma para desempatar.
+            if call_hist and call_macd and not (put_hist and put_macd):
+                pre_dir = "CALL"
+                pre_score = call_score
+                pre_reason = "PRÉ-CALL FROUXO: MACD e histograma virando para cima."
+            elif put_hist and put_macd and not (call_hist and call_macd):
+                pre_dir = "PUT"
+                pre_score = put_score
+                pre_reason = "PRÉ-PUT FROUXO: MACD e histograma virando para baixo."
 
     current = raw[-1] if raw else {}
     last_closed = closed[-1] if closed else {}
@@ -15487,8 +15517,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="label" style="margin-top:8px;line-height:1.45">Versão corrigida • sinal oficial em vela fechada • pré-alerta observa a vela atual • pivô só vale depois da confirmação • usa o mesmo roteador/cache de candles do app.</div>
       <div class="grid" style="margin-top:10px">
         <div class="card" style="padding:10px"><div class="label">🔔 PRÉ-ALERTA</div><div id="macdPullbackPreAlert" class="big neutral" style="font-size:16px">OFFLINE</div><small id="macdPullbackPreReason">Ative o indicador para acompanhar.</small></div>
-        <div class="card" style="padding:10px"><div class="label">🟢 PRÉ-CALL</div><div id="macdPullbackPreCall" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível compra antes da confirmação final</small></div>
-        <div class="card" style="padding:10px"><div class="label">🔴 PRÉ-PUT</div><div id="macdPullbackPrePut" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível venda antes da confirmação final</small></div>
+        <div class="card" style="padding:10px"><div class="label">🟢 PRÉ-CALL</div><div id="macdPullbackPreCall" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível compra com 2/4 condições de formação</small></div>
+        <div class="card" style="padding:10px"><div class="label">🔴 PRÉ-PUT</div><div id="macdPullbackPrePut" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível venda com 2/4 condições de formação</small></div>
         <div class="card" style="padding:10px"><div class="label">SINAL CONFIRMADO</div><div id="macdPullbackState" class="big neutral" style="font-size:18px">OFFLINE</div><small id="macdPullbackReason">Ative o indicador para acompanhar.</small></div>
         <div class="card" style="padding:10px"><div class="label">MACD / SIGNAL</div><div id="macdPullbackLines" class="big" style="font-size:15px">--</div><small>Cruzamento e linha zero</small></div>
         <div class="card" style="padding:10px"><div class="label">HISTOGRAMA</div><div id="macdPullbackHist" class="big" style="font-size:15px">--</div><small>Momentum positivo/negativo e aceleração</small></div>
