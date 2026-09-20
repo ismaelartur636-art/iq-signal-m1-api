@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.65"
-PWA_VERSION = "v131"
+APP_VERSION = "3.66"
+PWA_VERSION = "v132"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -13128,6 +13128,61 @@ async def ai_analysis(request: Request, symbol: str = "EUR/USD", interval: str =
     return {k: data.get(k) for k in public_keys}
 
 
+@app.get("/macd-pullback")
+async def macd_pullback_indicator_api(
+    request: Request,
+    symbol: str = "EUR/USD",
+    interval: str = "1min",
+    market: str = "OPEN",
+):
+    """Indicador MACD Pullback independente do motor Velocity.
+
+    Reutiliza o mesmo roteador/cache de candles do app e só faz leitura quando
+    o usuário deixa o indicador ONLINE. Não publica ordem nem altera o motor
+    selecionado no painel principal.
+    """
+    requested_market = str(market or "OPEN").upper()
+    if interval not in INTERVALS or not _symbol_allowed(symbol, requested_market):
+        raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
+    if requested_market not in ("OPEN", "IQ_OTC"):
+        return {
+            "available": False, "direction": "NEUTRO", "confirmed": False,
+            "reason": "MACD Pullback disponível em Mercado Aberto e IQ OTC.",
+            "symbol": symbol, "interval": interval, "market": requested_market,
+        }
+
+    state = _iq_session_state(request, required=False) if requested_market == "IQ_OTC" else None
+    if requested_market == "IQ_OTC":
+        if not state:
+            return {
+                "available": False, "direction": "NEUTRO", "confirmed": False,
+                "reason": "Conecte a IQ Option para o MACD Pullback analisar OTC real.",
+                "symbol": symbol, "interval": interval, "market": requested_market,
+            }
+        raw = await iq_ea_candles(state, symbol, interval, 120, regular_market=False)
+        feed_source = "IQ_OPTION_OTC"
+    else:
+        raw = await candles(symbol, interval, 120, "OPEN", None, request=request)
+        feed_source = _feed_source_from_rows(raw) or "MULTIFEED"
+
+    if len(raw) < 2:
+        return {
+            "available": False, "direction": "NEUTRO", "confirmed": False,
+            "reason": "Aguardando candles para calcular o MACD Pullback.",
+            "symbol": symbol, "interval": interval, "market": requested_market,
+            "feed_source": feed_source,
+        }
+
+    closed = raw[:-1]
+    result = _macd_pullback_validation_indicator(closed[-120:])
+    result.update({
+        "symbol": symbol, "interval": interval, "market": requested_market,
+        "feed_source": feed_source, "standalone": True,
+        "updated_at": iso(now()),
+    })
+    return result
+
+
 
 
 def _moment_ea_key(market: str, symbol: str, interval: str) -> str:
@@ -15884,7 +15939,10 @@ let bigriseEnabled=false;
 let larryEnabled=false;
 let velocityEnabled=false;
 let macdPullbackEnabled=false;
+let macdPullbackBusy=false;
+let lastMacdPullbackData=null;
 let lastVelocityData=null;
+let lastVelocityDataAt=0;
 try{
   macdPullbackEnabled=localStorage.getItem('mega_macd_pullback_power')==='ONLINE';
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
@@ -19519,7 +19577,10 @@ function renderMacdPullbackIndicator(data){
   }
   const d=data||{};
   const tech=d.technical||d||{};
-  const mp=(tech.indicators&&tech.indicators.macd_pullback)?tech.indicators.macd_pullback:null;
+  const mp=(d.macd_pullback)||
+    ((tech.indicators&&tech.indicators.macd_pullback)?tech.indicators.macd_pullback:null)||
+    ((d.indicators&&d.indicators.macd_pullback)?d.indicators.macd_pullback:null)||
+    ((Object.prototype.hasOwnProperty.call(d,'macd') && Object.prototype.hasOwnProperty.call(d,'direction'))?d:null);
   if(!mp){
     macdPullbackState.textContent='AGUARDANDO'; macdPullbackState.className='big neutral';
     if(macdPullbackReason) macdPullbackReason.textContent='Aguardando a próxima leitura do Velocity Flow.';
@@ -19538,11 +19599,58 @@ function renderMacdPullbackIndicator(data){
   }
 }
 
+async function loadMacdPullbackIndicator(force=false){
+  if(!macdPullbackEnabled){
+    renderMacdPullbackIndicator(null);
+    return;
+  }
+  if(macdPullbackBusy) return;
+
+  // Se o Velocity está online e acabou de trazer os mesmos candles, reutiliza
+  // esse resultado e não cria uma requisição extra.
+  const freshVelocity=velocityEnabled && lastVelocityData && (Date.now()-lastVelocityDataAt)<15000;
+  if(!force && freshVelocity){
+    const tech=lastVelocityData.technical||lastVelocityData||{};
+    if(tech.indicators && tech.indicators.macd_pullback){
+      lastMacdPullbackData=tech.indicators.macd_pullback;
+      renderMacdPullbackIndicator(lastMacdPullbackData);
+      return;
+    }
+  }
+
+  macdPullbackBusy=true;
+  if(macdPullbackState){
+    macdPullbackState.textContent='ANALISANDO';
+    macdPullbackState.className='big neutral';
+  }
+  if(macdPullbackReason) macdPullbackReason.textContent='Lendo candles fechados para o MACD Pullback...';
+  try{
+    const d=await get('/macd-pullback?market='+encodeURIComponent((market&&market.value)||'OPEN')+
+      '&symbol='+encodeURIComponent((S&&S.value)||'BTC/USD')+
+      '&interval='+encodeURIComponent((interval&&interval.value)||'1min'));
+    lastMacdPullbackData=d||null;
+    renderMacdPullbackIndicator(d);
+  }catch(e){
+    if(macdPullbackState){
+      macdPullbackState.textContent='AGUARDANDO';
+      macdPullbackState.className='big neutral';
+    }
+    if(macdPullbackReason) macdPullbackReason.textContent='Falha temporária na leitura: '+String((e&&e.message)||e).slice(0,120);
+  }finally{
+    macdPullbackBusy=false;
+  }
+}
+
 if(macdPullbackPowerBtn){
-  macdPullbackPowerBtn.onclick=()=>{
+  macdPullbackPowerBtn.onclick=async()=>{
     macdPullbackEnabled=!macdPullbackEnabled;
     try{ localStorage.setItem('mega_macd_pullback_power',macdPullbackEnabled?'ONLINE':'OFFLINE'); }catch(_){}
-    renderMacdPullbackIndicator(lastVelocityData);
+    applyMacdPullbackPowerState();
+    if(macdPullbackEnabled){
+      await loadMacdPullbackIndicator(true);
+    }else{
+      renderMacdPullbackIndicator(null);
+    }
     if(voiceEnabled) speak(macdPullbackEnabled?'Indicador MACD Pullback online.':'Indicador MACD Pullback offline.');
   };
 }
@@ -19590,6 +19698,7 @@ function renderVelocityTab(data){
   if(!velocityReadout) return;
   const d=data||{};
   lastVelocityData=d;
+  lastVelocityDataAt=Date.now();
   const diag=(d.technical&&d.technical.diagnostics)?d.technical.diagnostics:(d.diagnostics||{});
   if(velocityOriginalState){
     velocityOriginalState.textContent=velocityEnabled?'ONLINE':'OFFLINE';
@@ -19614,6 +19723,12 @@ function renderVelocityTab(data){
   if(velocityDmi) velocityDmi.textContent='ADX '+Number(diag.adx||0).toFixed(1)+' • +DI '+Number(diag.plus_di||0).toFixed(1)+' • -DI '+Number(diag.minus_di||0).toFixed(1);
   if(velocityRsi) velocityRsi.textContent=Number(diag.rsi7||0).toFixed(1);
   if(velocityMa) velocityMa.textContent='EMA9 '+Number(diag.ema9||0).toFixed(5)+' • SMA21 '+Number(diag.sma21||0).toFixed(5);
+  if(macdPullbackEnabled){
+    const tech=d.technical||d||{};
+    if(tech.indicators && tech.indicators.macd_pullback){
+      lastMacdPullbackData=tech.indicators.macd_pullback;
+    }
+  }
   renderMacdPullbackIndicator(d);
 }
 
@@ -20581,6 +20696,7 @@ async function bootApp(){
   }
 
   if(appEnabled) safe('performance',perf);
+  if(appEnabled && macdPullbackEnabled) safe('macd-pullback',()=>loadMacdPullbackIndicator(true));
 }
 
 bootApp().catch(err=>{
@@ -20620,6 +20736,12 @@ setInterval(()=>{
 setInterval(()=>{
   if(megaCanPoll() && selectedRobotEngine()!=='OFF') loadPreSignals();
 },10000);
+
+// MACD Pullback independente. Quando o Velocity está online, reaproveita a
+// mesma leitura; caso contrário faz uma leitura própria, limitada a 12 s.
+setInterval(()=>{
+  if(megaCanPoll() && macdPullbackEnabled) loadMacdPullbackIndicator(false);
+},12000);
 
 // Resultado das operações abertas.
 setInterval(()=>{ if(megaCanPoll()) resultCheck(); },10000);
