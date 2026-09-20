@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.63"
-PWA_VERSION = "v129"
+APP_VERSION = "3.65"
+PWA_VERSION = "v131"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -7528,6 +7528,128 @@ def _velocity_dmi_series(rows, period=14, adx_smoothing=14):
     return plus_out, minus_out, adx_out
 
 
+def _ema_series_local(values, period):
+    vals = [float(x) for x in values]
+    if not vals:
+        return []
+    alpha = 2.0 / (float(period) + 1.0)
+    out = [vals[0]]
+    for v in vals[1:]:
+        out.append(alpha * v + (1.0 - alpha) * out[-1])
+    return out
+
+
+def _macd_pullback_validation_indicator(rows, fast=12, slow=26, signal=9, lookback=10, lb_l=5, lb_r=5, range_low=5, range_high=60):
+    """Adaptação não-repaint do MACD Pullback Validation com divergência.
+
+    Usa somente os candles recebidos pelo Velocity; não faz qualquer chamada de rede.
+    Pivôs são considerados apenas depois das `lb_r` barras de confirmação, então a
+    divergência não é desenhada retroativamente como se fosse conhecida antes.
+    Os filtros opcionais S/R e Bollinger do Pine original permanecem desligados,
+    exatamente como nos defaults publicados pelo autor.
+    """
+    rows = list(rows or [])
+    n = len(rows)
+    if n < max(45, slow + signal + lb_l + lb_r + 2):
+        return {
+            "available": False, "direction": "NEUTRO", "confirmed": False,
+            "reason": f"Coletando candles para MACD Pullback ({n}/45).",
+            "non_repaint": True,
+        }
+
+    closes = [float(x.get("close") or 0.0) for x in rows]
+    lows = [float(x.get("low") or x.get("close") or 0.0) for x in rows]
+    highs = [float(x.get("high") or x.get("close") or 0.0) for x in rows]
+    ema_fast = _ema_series_local(closes, fast)
+    ema_slow = _ema_series_local(closes, slow)
+    macd = [a-b for a,b in zip(ema_fast, ema_slow)]
+    signal_line = _ema_series_local(macd, signal)
+    hist = [m-s for m,s in zip(macd, signal_line)]
+
+    bearish_crosses=[]
+    bullish_crosses=[]
+    for i in range(1,n):
+        if macd[i] < signal_line[i] and macd[i-1] >= signal_line[i-1] and macd[i] > 0 and signal_line[i] > 0:
+            bearish_crosses.append(i)
+        if macd[i] > signal_line[i] and macd[i-1] <= signal_line[i-1] and macd[i] < 0 and signal_line[i] < 0:
+            bullish_crosses.append(i)
+
+    def pivot_low(idx):
+        if idx-lb_l < 0 or idx+lb_r >= n:
+            return False
+        v=hist[idx]
+        return all(v <= hist[j] for j in range(idx-lb_l, idx+lb_r+1) if j != idx)
+
+    def pivot_high(idx):
+        if idx-lb_l < 0 or idx+lb_r >= n:
+            return False
+        v=hist[idx]
+        return all(v >= hist[j] for j in range(idx-lb_l, idx+lb_r+1) if j != idx)
+
+    pl=[i for i in range(lb_l,n-lb_r) if pivot_low(i)]
+    ph=[i for i in range(lb_l,n-lb_r) if pivot_high(i)]
+    bull_div_confirm=[]
+    bear_div_confirm=[]
+    for prev,cur in zip(pl,pl[1:]):
+        dist=cur-prev
+        if range_low <= dist <= range_high and lows[cur] < lows[prev] and hist[cur] > hist[prev]:
+            bull_div_confirm.append(cur+lb_r)
+    for prev,cur in zip(ph,ph[1:]):
+        dist=cur-prev
+        if range_low <= dist <= range_high and highs[cur] > highs[prev] and hist[cur] < hist[prev]:
+            bear_div_confirm.append(cur+lb_r)
+
+    last=n-1
+    recent_bear_cross = bool(bearish_crosses and last-bearish_crosses[-1] <= lookback)
+    recent_bull_cross = bool(bullish_crosses and last-bullish_crosses[-1] <= lookback)
+    recent_bull_div = bool(bull_div_confirm and last-bull_div_confirm[-1] <= 30)
+    recent_bear_div = bool(bear_div_confirm and last-bear_div_confirm[-1] <= 30)
+    hist_bull = hist[last] > 0 and hist[last] > hist[last-1]
+    hist_bear = hist[last] < 0 and hist[last] < hist[last-1]
+    macd_cross_up_zero = macd[last] > 0 and macd[last-1] <= 0
+    macd_cross_down_zero = macd[last] < 0 and macd[last-1] >= 0
+
+    bull = hist_bull and macd_cross_up_zero and recent_bear_cross and recent_bull_div
+    bear = hist_bear and macd_cross_down_zero and recent_bull_cross and recent_bear_div
+    direction = "CALL" if bull else ("PUT" if bear else "NEUTRO")
+    confirmed = direction in ("CALL","PUT")
+
+    if confirmed:
+        reason=(
+            f"{direction}: pullback MACD recente + histograma retomando força + cruzamento da linha zero + "
+            f"divergência regular confirmada por pivô."
+        )
+    else:
+        blockers=[]
+        if not (hist_bull or hist_bear): blockers.append("histograma sem retomada completa")
+        if not (macd_cross_up_zero or macd_cross_down_zero): blockers.append("MACD ainda não cruzou a linha zero nesta vela fechada")
+        if not (recent_bear_cross or recent_bull_cross): blockers.append("sem pullback MACD recente")
+        if not (recent_bull_div or recent_bear_div): blockers.append("sem divergência regular recente confirmada")
+        reason="MACD Pullback monitorando: "+", ".join(blockers[:4])+"."
+
+    return {
+        "available": True,
+        "direction": direction,
+        "confirmed": confirmed,
+        "confidence": (82.0 if confirmed else 0.0),
+        "reason": reason[:320],
+        "non_repaint": True,
+        "macd": round(macd[last], 10),
+        "signal": round(signal_line[last], 10),
+        "hist": round(hist[last], 10),
+        "hist_rising": bool(hist[last] > hist[last-1]),
+        "recent_bearish_pullback": recent_bear_cross,
+        "recent_bullish_pullback": recent_bull_cross,
+        "recent_bullish_divergence": recent_bull_div,
+        "recent_bearish_divergence": recent_bear_div,
+        "macd_cross_up_zero": macd_cross_up_zero,
+        "macd_cross_down_zero": macd_cross_down_zero,
+        "pivot_right_confirmation": lb_r,
+        "sr_filter_enabled": False,
+        "bb_filter_enabled": False,
+    }
+
+
 def velocity_flow_strategy(cs, timeframe="1min", market="OPEN"):
     """MR Mt4 (Ultra Fast) / Velocity Flow adaptado para o MEGA IA.
 
@@ -7640,6 +7762,7 @@ def velocity_flow_strategy(cs, timeframe="1min", market="OPEN"):
 
     ema9 = ema(closes, 9)
     sma21 = sma(closes, 21)
+    macd_pullback = _macd_pullback_validation_indicator(rows)
     return {
         "available": True,
         "direction": direction,
@@ -7655,6 +7778,7 @@ def velocity_flow_strategy(cs, timeframe="1min", market="OPEN"):
         "martingale": False,
         "non_repaint": True,
         "cooldown_bars": VELOCITY_COOLDOWN_BARS,
+        "indicators": {"macd_pullback": macd_pullback},
         "diagnostics": {
             "ema9": round(float(ema9 or 0), 10),
             "sma21": round(float(sma21 or 0), 10),
@@ -13571,7 +13695,7 @@ async def pre_signals(
 
             if preview:
                 status = (
-                    "PRÉ-ALERTA VELOCITY • AGUARDE CONFIRMAÇÃO NO FECHAMENTO"
+                    "ALERTA VELOCITY • ENTRADA NA PRÓXIMA VELA"
                     if engine == "VELOCITY"
                     else "PRÉ-SINAL • AGUARDANDO FECHAMENTO"
                 )
@@ -13637,8 +13761,8 @@ async def pre_signals(
         "ok": True,
         "message": (
             (
-                "Velocity Flow: pré-alerta calculado com a vela em formação nos últimos 60 segundos; "
-                "a entrada só vira sinal oficial se rompimento + ADX/DMI + RSI permanecerem válidos no fechamento."
+                "Velocity Flow: quando o pré-alerta completo aparece nos últimos 60 segundos, "
+                "ele já é promovido a ALERTA no painel/robô para a próxima vela."
             )
             if engine == "VELOCITY"
             else (
@@ -15194,6 +15318,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div id="velocityModeDesc" style="margin-top:10px;line-height:1.55;color:#b8c7db">
         Rompimento dos 3 fechamentos anteriores + ADX/DMI 14 + RSI 7 + direção da vela • cooldown de 5 velas.
       </div>
+      <div class="grid" style="margin-top:12px">
+        <div class="card" style="padding:10px"><div class="label">⚡ SCRIPT ORIGINAL</div><div id="velocityOriginalState" class="big neutral" style="font-size:16px">OFFLINE</div><small>MR Mt4 (Ultra Fast) • lógica original do Velocity Flow</small></div>
+        <div class="card" style="padding:10px"><div class="label">🔔 PRÉ-ALERTA</div><div id="velocityPreAlertState" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Janela final antes da próxima vela</small></div>
+        <div class="card" style="padding:10px"><div class="label">🟢 PRÉ-CALL</div><div id="velocityPreCallState" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Só acende com o pré-alerta completo de compra</small></div>
+        <div class="card" style="padding:10px"><div class="label">🔴 PRÉ-PUT</div><div id="velocityPrePutState" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Só acende com o pré-alerta completo de venda</small></div>
+      </div>
     </div>
 
     <div id="velocityRobotAlert" class="card" style="display:none;margin-top:10px;border-color:#21c7ff;box-shadow:0 0 20px #21c7ff22">
@@ -15219,6 +15349,23 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div id="velocityReadout" style="font-size:16px;font-weight:900;margin-top:7px">Motor offline.</div>
       <div id="velocityReason" style="margin-top:7px;line-height:1.5;color:#a9bdd3">Ative o motor para começar a analisar candles fechados.</div>
       <div class="label" style="margin-top:10px">O app usa a própria contabilidade WIN/LOSS. A marcação antiga de segunda tentativa do Pine não abre Gale automaticamente.</div>
+    </div>
+
+    <div class="card" style="margin-top:10px;border-color:#8b5cf6">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+        <div>
+          <div class="label">📐 INDICADORES</div>
+          <h3 style="margin:4px 0 0">🎯 MACD Pullback + Divergência</h3>
+        </div>
+        <button id="macdPullbackPowerBtn" type="button" style="font-weight:1000;min-width:135px">🔴 OFFLINE</button>
+      </div>
+      <div class="label" style="margin-top:8px;line-height:1.45">Versão corrigida • candles fechados • pivô só vale depois da confirmação • sem consulta extra ao servidor.</div>
+      <div class="grid" style="margin-top:10px">
+        <div class="card" style="padding:10px"><div class="label">SINAL</div><div id="macdPullbackState" class="big neutral" style="font-size:18px">OFFLINE</div><small id="macdPullbackReason">Ative o indicador para acompanhar.</small></div>
+        <div class="card" style="padding:10px"><div class="label">MACD / SIGNAL</div><div id="macdPullbackLines" class="big" style="font-size:15px">--</div><small>Cruzamento e linha zero</small></div>
+        <div class="card" style="padding:10px"><div class="label">HISTOGRAMA</div><div id="macdPullbackHist" class="big" style="font-size:15px">--</div><small>Momentum positivo/negativo e aceleração</small></div>
+        <div class="card" style="padding:10px"><div class="label">PULLBACK / DIVERGÊNCIA</div><div id="macdPullbackContext" class="big" style="font-size:14px">--</div><small>Pivôs confirmados sem retroceder sinal</small></div>
+      </div>
     </div>
 
     <button id="velocityOpenPanelBtn" type="button" style="width:100%;margin-top:10px;font-weight:1000">📊 ABRIR PAINEL PRINCIPAL</button>
@@ -15688,6 +15835,16 @@ const larryPowerBtn=document.getElementById('larryPowerBtn');
 const larryModeDesc=document.getElementById('larryModeDesc');
 const velocityPowerBtn=document.getElementById('velocityPowerBtn');
 const velocityModeDesc=document.getElementById('velocityModeDesc');
+const velocityOriginalState=document.getElementById('velocityOriginalState');
+const velocityPreAlertState=document.getElementById('velocityPreAlertState');
+const velocityPreCallState=document.getElementById('velocityPreCallState');
+const velocityPrePutState=document.getElementById('velocityPrePutState');
+const macdPullbackPowerBtn=document.getElementById('macdPullbackPowerBtn');
+const macdPullbackState=document.getElementById('macdPullbackState');
+const macdPullbackReason=document.getElementById('macdPullbackReason');
+const macdPullbackLines=document.getElementById('macdPullbackLines');
+const macdPullbackHist=document.getElementById('macdPullbackHist');
+const macdPullbackContext=document.getElementById('macdPullbackContext');
 const velocityBreakout=document.getElementById('velocityBreakout');
 const velocityDmi=document.getElementById('velocityDmi');
 const velocityRsi=document.getElementById('velocityRsi');
@@ -15726,7 +15883,10 @@ let forceEnabled=false;
 let bigriseEnabled=false;
 let larryEnabled=false;
 let velocityEnabled=false;
+let macdPullbackEnabled=false;
+let lastVelocityData=null;
 try{
+  macdPullbackEnabled=localStorage.getItem('mega_macd_pullback_power')==='ONLINE';
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
   aiEnabled=localStorage.getItem('mega_ai_power')==='ONLINE';
   const legacyEaOnline=localStorage.getItem('mega_ea_power')==='ONLINE';
@@ -15948,6 +16108,8 @@ try{
 let lastSignalVoice='';
 let lastVelocityRobotSignal='';
 let lastVelocityPreviewKey='';
+let velocityPromotedSignal=null;
+let lastVelocityPromotedKey='';
 let velocityRobotAlertTimer=null;
 let lastAnalysis=0;
 let thirtyFive=false;
@@ -19059,7 +19221,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: rompimento + força/expansão de vela • candles fechados • OPEN/OTC • sem Grid, Martingale ou Gale.'
     : 'OFFLINE: Larry Breakout pausado.';
   if(velocityModeDesc) velocityModeDesc.textContent=velocityEnabled
-    ? 'ONLINE: rompimento dos 3 fechamentos + ADX/DMI 14 + RSI 7 + direção da vela • cooldown original de 5 velas • OPEN/OTC.'
+    ? 'ONLINE: script original no topo • pré-alerta/PRÉ-CALL/PRÉ-PUT visíveis • rompimento + ADX/DMI 14 + RSI 7 + direção da vela • cooldown de 5 velas.'
     : 'OFFLINE: Velocity Flow pausado • parâmetros originais preservados.';
   if(forceModeDesc) forceModeDesc.textContent=forceEnabled
     ? 'ONLINE: OPEN multifuente para qualquer corretora Forex • OTC pela IQ Option • configuração protegida • sem Gale.'
@@ -19071,7 +19233,7 @@ function applyRobotPowerState(){
   const engine=selectedRobotEngine();
   if(engine==='VELOCITY'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='VELOCITY FLOW ONLINE • MR MT4 • BREAKOUT + ADX/DMI + RSI7 • OPEN + OTC';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Velocity Flow selecionado • pré-alerta nos últimos 60s usando a vela em formação • sinal final somente no fechamento • cooldown de 5 velas.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Velocity Flow selecionado • pré-alerta completo nos últimos 60s já vira ALERTA para a próxima vela • cooldown de 5 velas.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Velocity Flow ativo • procurando rompimento + força DMI/ADX + RSI</div>';
     rad();
   }else if(engine==='BIGRISE'){
@@ -19307,6 +19469,85 @@ if(velocityOpenPanelBtn) velocityOpenPanelBtn.onclick=()=>showTab('main');
 if(forcePowerBtn) forcePowerBtn.onclick=()=>{ setForcePower(!forceEnabled); };
 if(bigrisePowerBtn) bigrisePowerBtn.onclick=()=>{ setBigrisePower(!bigriseEnabled); };
 
+function setVelocityTopPreAlert(items, remain){
+  if(!velocityPreAlertState || !velocityPreCallState || !velocityPrePutState) return;
+  if(!velocityEnabled){
+    velocityPreAlertState.textContent='OFFLINE';
+    velocityPreAlertState.className='big neutral';
+    velocityPreCallState.textContent='AGUARDANDO'; velocityPreCallState.className='big neutral';
+    velocityPrePutState.textContent='AGUARDANDO'; velocityPrePutState.className='big neutral';
+    return;
+  }
+  const list=Array.isArray(items)?items:[];
+  const best=list[0]||null;
+  const dir=String((best&&best.direction)||'').toUpperCase();
+  if(best && (dir==='CALL'||dir==='PUT')){
+    velocityPreAlertState.textContent='ATIVO • '+dir;
+    velocityPreAlertState.className='big '+(dir==='CALL'?'call':'put');
+    velocityPreCallState.textContent=dir==='CALL'?'PRÉ-CALL ATIVO':'AGUARDANDO';
+    velocityPreCallState.className='big '+(dir==='CALL'?'call':'neutral');
+    velocityPrePutState.textContent=dir==='PUT'?'PRÉ-PUT ATIVO':'AGUARDANDO';
+    velocityPrePutState.className='big '+(dir==='PUT'?'put':'neutral');
+  }else{
+    const sec=Math.max(0,Number(remain||0));
+    velocityPreAlertState.textContent=sec>60?'FORA DA JANELA':'MONITORANDO';
+    velocityPreAlertState.className='big neutral';
+    velocityPreCallState.textContent='AGUARDANDO'; velocityPreCallState.className='big neutral';
+    velocityPrePutState.textContent='AGUARDANDO'; velocityPrePutState.className='big neutral';
+  }
+}
+
+function applyMacdPullbackPowerState(){
+  if(macdPullbackPowerBtn){
+    macdPullbackPowerBtn.textContent=macdPullbackEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    macdPullbackPowerBtn.style.background=macdPullbackEnabled?'#0b7a3d':'#7d1d1d';
+    macdPullbackPowerBtn.style.color='#fff';
+    macdPullbackPowerBtn.style.borderColor=macdPullbackEnabled?'#16c56b':'#ff5252';
+  }
+}
+
+function renderMacdPullbackIndicator(data){
+  if(!macdPullbackState) return;
+  applyMacdPullbackPowerState();
+  if(!macdPullbackEnabled){
+    macdPullbackState.textContent='OFFLINE'; macdPullbackState.className='big neutral';
+    if(macdPullbackReason) macdPullbackReason.textContent='Ative o indicador para acompanhar.';
+    if(macdPullbackLines) macdPullbackLines.textContent='--';
+    if(macdPullbackHist) macdPullbackHist.textContent='--';
+    if(macdPullbackContext) macdPullbackContext.textContent='--';
+    return;
+  }
+  const d=data||{};
+  const tech=d.technical||d||{};
+  const mp=(tech.indicators&&tech.indicators.macd_pullback)?tech.indicators.macd_pullback:null;
+  if(!mp){
+    macdPullbackState.textContent='AGUARDANDO'; macdPullbackState.className='big neutral';
+    if(macdPullbackReason) macdPullbackReason.textContent='Aguardando a próxima leitura do Velocity Flow.';
+    return;
+  }
+  const dir=String(mp.direction||'NEUTRO').toUpperCase();
+  macdPullbackState.textContent=dir==='CALL'?'🟢 CALL':dir==='PUT'?'🔴 PUT':'⚪ NEUTRO';
+  macdPullbackState.className='big '+(dir==='CALL'?'call':dir==='PUT'?'put':'neutral');
+  if(macdPullbackReason) macdPullbackReason.textContent=String(mp.reason||'Monitorando MACD Pullback.');
+  if(macdPullbackLines) macdPullbackLines.textContent='MACD '+Number(mp.macd||0).toFixed(6)+' • SIG '+Number(mp.signal||0).toFixed(6);
+  if(macdPullbackHist) macdPullbackHist.textContent=Number(mp.hist||0).toFixed(6)+' • '+(mp.hist_rising?'ACELERANDO':'SEM ACELERAÇÃO');
+  if(macdPullbackContext){
+    const pull=mp.recent_bearish_pullback?'PB↓ recente':(mp.recent_bullish_pullback?'PB↑ recente':'sem PB recente');
+    const div=mp.recent_bullish_divergence?'DIV alta':(mp.recent_bearish_divergence?'DIV baixa':'sem DIV recente');
+    macdPullbackContext.textContent=pull+' • '+div+' • pivô +'+Number(mp.pivot_right_confirmation||5)+' velas';
+  }
+}
+
+if(macdPullbackPowerBtn){
+  macdPullbackPowerBtn.onclick=()=>{
+    macdPullbackEnabled=!macdPullbackEnabled;
+    try{ localStorage.setItem('mega_macd_pullback_power',macdPullbackEnabled?'ONLINE':'OFFLINE'); }catch(_){}
+    renderMacdPullbackIndicator(lastVelocityData);
+    if(voiceEnabled) speak(macdPullbackEnabled?'Indicador MACD Pullback online.':'Indicador MACD Pullback offline.');
+  };
+}
+applyMacdPullbackPowerState();
+
 function showVelocitySignalOnRobot(signal){
   if(!signal) return;
   const dir=String(signal.direction||'').toUpperCase();
@@ -19348,11 +19589,18 @@ function showVelocitySignalOnRobot(signal){
 function renderVelocityTab(data){
   if(!velocityReadout) return;
   const d=data||{};
+  lastVelocityData=d;
   const diag=(d.technical&&d.technical.diagnostics)?d.technical.diagnostics:(d.diagnostics||{});
+  if(velocityOriginalState){
+    velocityOriginalState.textContent=velocityEnabled?'ONLINE':'OFFLINE';
+    velocityOriginalState.className='big '+(velocityEnabled?'call':'neutral');
+  }
   if(!velocityEnabled){
+    setVelocityTopPreAlert([],0);
     velocityReadout.textContent='Motor offline.';
     if(velocityReason) velocityReason.textContent='Ative o Velocity Flow para começar a analisar candles fechados.';
     if(velocityRobotAlert) velocityRobotAlert.style.display='none';
+    renderMacdPullbackIndicator(d);
     return;
   }
   const dir=String(d.direction||'NEUTRO').toUpperCase();
@@ -19366,6 +19614,70 @@ function renderVelocityTab(data){
   if(velocityDmi) velocityDmi.textContent='ADX '+Number(diag.adx||0).toFixed(1)+' • +DI '+Number(diag.plus_di||0).toFixed(1)+' • -DI '+Number(diag.minus_di||0).toFixed(1);
   if(velocityRsi) velocityRsi.textContent=Number(diag.rsi7||0).toFixed(1);
   if(velocityMa) velocityMa.textContent='EMA9 '+Number(diag.ema9||0).toFixed(5)+' • SMA21 '+Number(diag.sma21||0).toFixed(5);
+  renderMacdPullbackIndicator(d);
+}
+
+function promoteVelocityPreAlertToOfficial(item){
+  if(!item || selectedRobotEngine()!=='VELOCITY') return false;
+  const dir=String(item.direction||'').toUpperCase();
+  if(dir!=='CALL' && dir!=='PUT') return false;
+  if(!item.entry_time) return false;
+
+  const entryMs=Date.parse(item.entry_time);
+  if(!Number.isFinite(entryMs)) return false;
+  const stepMs=intervalSecondsValue((interval&&interval.value)||'1min')*1000;
+  const expiryIso=new Date(entryMs+stepMs).toISOString();
+  const sym=String(item.symbol||((S&&S.value)||''));
+  const intv=String((interval&&interval.value)||'1min');
+  const mkt=String((market&&market.value)||'OPEN');
+  const key=[sym,intv,dir,item.entry_time].join('|');
+
+  const signal={
+    source:'VELOCITY_PRE_ALERT_PROMOTED',
+    selected_engine:'VELOCITY',
+    mode:'VELOCITY',
+    strategy:String(item.strategy||'VELOCITY FLOW'),
+    symbol:sym,
+    interval:intv,
+    requested_market:mkt,
+    market:mkt,
+    direction:dir,
+    confidence:Number(item.confidence||0),
+    entry_time:item.entry_time,
+    expiry_time:expiryIso,
+    entry_mode:'BIRTH',
+    risk:'MEDIUM',
+    status:'⚡ VELOCITY FLOW • ALERTA '+dir+' • ENTRADA NA PRÓXIMA VELA',
+    reason:String(item.reason||'Pré-alerta completo do Velocity promovido a alerta.'),
+    promoted_from_prealert:true,
+    auto_trade_allowed:false
+  };
+
+  velocityPromotedSignal=signal;
+  cur=signal;
+
+  const isCall=dir==='CALL';
+  direction.textContent=dir;
+  direction.className='big '+(isCall?'call':'put');
+  confidence.textContent='Confiança: '+Math.round(Number(signal.confidence||0))+'%';
+  entry.textContent=ft(signal.entry_time);
+  countdown.textContent='ALERTA CONFIRMADO • próxima vela';
+  statusBox.textContent=signal.status;
+  if(risk) risk.textContent='Risco: '+signal.risk+' • alerta antecipado do Velocity';
+
+  rememberPendingTrade(signal);
+  showVelocitySignalOnRobot(signal);
+  maybeSendTelegramSignal(signal);
+
+  if(key!==lastVelocityPromotedKey){
+    lastVelocityPromotedKey=key;
+    lastPreAlertVoiceKey=key;
+    if(voiceEnabled){
+      const ativoFalado=spokenAssetName(sym);
+      speak('Alerta Velocity Flow. '+(isCall?'Compra':'Venda')+' no ativo '+ativoFalado+'. Entrada na próxima vela.');
+    }
+  }
+  return true;
 }
 
 function renderVelocityPreviewOnMain(data){
@@ -19427,6 +19739,22 @@ async function sig(announce=false){
     cur=await get(
       `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent((entryMode&&entryMode.value)||'BIRTH')}`
     );
+
+    // 3.64: quando o pré-alerta completo do Velocity já foi promovido a ALERTA,
+    // o polling do sinal fechado não pode apagar esse alerta antes da entrada.
+    if(engine==='VELOCITY' && velocityPromotedSignal){
+      const expMs=Date.parse(velocityPromotedSignal.expiry_time||'');
+      const sameSymbol=String(velocityPromotedSignal.symbol||'')===String((S&&S.value)||'');
+      const sameInterval=String(velocityPromotedSignal.interval||'')===String((interval&&interval.value)||'');
+      const stillAlive=Number.isFinite(expMs) && expMs>Date.now();
+      const serverDir=String((cur&&cur.direction)||'NEUTRO').toUpperCase();
+      if(stillAlive && sameSymbol && sameInterval && serverDir==='NEUTRO'){
+        cur={...velocityPromotedSignal};
+      }else if(!stillAlive || !sameSymbol || !sameInterval || serverDir==='CALL' || serverDir==='PUT'){
+        velocityPromotedSignal=null;
+      }
+    }
+
     if(engine==='VELOCITY' && velocityTab && velocityTab.classList.contains('active')) renderVelocityTab(cur);
 
     if(announce){
@@ -19746,6 +20074,7 @@ async function loadPreSignals(){
 
   const engine=selectedRobotEngine();
   if(engine==='OFF'){
+    setVelocityTopPreAlert([],0);
     if(preSignalStatus) preSignalStatus.textContent='Pré-alerta aguardando um motor ficar ONLINE.';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔕 Coloque IA Gráfica, Inteligência Artificial ou EA ONLINE para usar o pré-alerta.</div>';
     return;
@@ -19759,6 +20088,7 @@ async function loadPreSignals(){
     const data=await get(url);
     const items=Array.isArray(data&&data.items)?data.items:[];
     const remain=Math.max(0,Number((data&&data.seconds_to_entry)||0));
+    if(engine==='VELOCITY') setVelocityTopPreAlert(items,remain);
 
     if(preSignalStatus){
       if(remain>60){
@@ -19775,6 +20105,12 @@ async function loadPreSignals(){
           : '<div style="opacity:.75">⚪ Nenhum pré-alerta confirmado na vela em formação. Continuo monitorando.</div>';
       }
       return;
+    }
+
+    // 3.64: no Velocity, o melhor pré-alerta completo já vira ALERTA oficial
+    // no painel/robô para a próxima vela. Ele não espera o fechamento.
+    if(engine==='VELOCITY' && items[0]){
+      promoteVelocityPreAlertToOfficial(items[0]);
     }
 
     if(preSignals){
@@ -19800,9 +20136,9 @@ async function loadPreSignals(){
           }
         }
         return `<div class="${d==='CALL'?'radar-call':'radar-put'}" style="border:1px solid rgba(255,193,7,.65)">
-          <b>${engine==='VELOCITY'?'⚡ PRÉ-ALERTA VELOCITY':'🔔 PRÉ-ALERTA'} • ${icon} ${item.symbol||sym} ${d}</b><br>
-          <span>Possível entrada às ${when} • em ${Math.ceil(secs)}s</span><br>
-          <small>Confiança preliminar ${conf}% • AGUARDE CONFIRMAÇÃO FINAL</small>${momentLine}
+          <b>${engine==='VELOCITY'?'⚡ ALERTA VELOCITY':'🔔 PRÉ-ALERTA'} • ${icon} ${item.symbol||sym} ${d}</b><br>
+          <span>${engine==='VELOCITY'?'Entrada':'Possível entrada'} às ${when} • em ${Math.ceil(secs)}s</span><br>
+          <small>${engine==='VELOCITY'?'ALERTA LIBERADO PARA A PRÓXIMA VELA • confiança ':'Confiança preliminar '}${conf}%${engine==='VELOCITY'?'':' • AGUARDE CONFIRMAÇÃO FINAL'}</small>${momentLine}
         </div>`;
       }).join('');
     }
@@ -19819,7 +20155,7 @@ async function loadPreSignals(){
           const lado=String(best.direction||'').toUpperCase()==='CALL'?'compra':'venda';
           const ativoFalado=spokenAssetName(best.symbol||sym);
           if(engine==='VELOCITY'){
-            speak('Pré alerta. Possível entrada de '+lado+' no ativo '+ativoFalado+' em até um minuto. O Velocity Flow está verificando rompimento, ADX DMI e RSI. Aguarde a confirmação final.');
+            // A fala principal já é feita por promoteVelocityPreAlertToOfficial().
           }else{
             speak('Pré alerta. Possível entrada de '+lado+' no ativo '+ativoFalado+'. A EA da vela começou a analisar a força do momento.');
           }
@@ -19929,7 +20265,9 @@ function cd(){
 
   const birthGrace=(String(cur.entry_mode||'').toUpperCase()==='BIRTH')?12:2;
   if(n<=0 && n>-birthGrace){
-    if(autoTradeEnabled) executeAutoTrade(cur);
+    // Alertas antecipados promovidos do Velocity vão para painel/robô/Telegram,
+    // mas não disparam ordem automática sem confirmação no candle fechado.
+    if(autoTradeEnabled && cur.auto_trade_allowed!==false) executeAutoTrade(cur);
   }
   if(n<=0 && n>-birthGrace && !entered){
     entered=true;
