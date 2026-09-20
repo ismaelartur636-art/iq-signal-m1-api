@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.71"
-PWA_VERSION = "v136"
+APP_VERSION = "3.72"
+PWA_VERSION = "v137"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -172,6 +172,24 @@ MONSTER_ST_RMA1 = max(5, min(50, int(os.getenv("MONSTER_ST_RMA1", "14"))))
 MONSTER_ST_RMA2 = max(MONSTER_ST_RMA1 + 1, min(80, int(os.getenv("MONSTER_ST_RMA2", "21"))))
 MONSTER_ST_ATR = max(5, min(50, int(os.getenv("MONSTER_ST_ATR", "14"))))
 MONSTER_ST_MULT = max(0.3, min(4.0, float(os.getenv("MONSTER_ST_MULT", "1.0"))))
+
+
+# MEGA IA 3.72 — MALAYSIAN SNR EMPEROR adaptado para o app.
+# Baseado no material enviado: SNR por corpo Open/Close, Fresh/Unfresh, MISS,
+# rejeição por pavio, Engulfing (Perfect/QM/Golden), breakout e confluência SNR+TL.
+# Usa somente candles FECHADOS e libera CALL/PUT exclusivamente para a próxima vela.
+MALAYSIAN_ATR_PERIOD = max(7, min(30, int(os.getenv("MALAYSIAN_ATR_PERIOD", "14"))))
+MALAYSIAN_SNR_LOOKBACK = max(40, min(240, int(os.getenv("MALAYSIAN_SNR_LOOKBACK", "140"))))
+MALAYSIAN_LEVEL_TOL_ATR = max(0.05, min(0.60, float(os.getenv("MALAYSIAN_LEVEL_TOL_ATR", "0.18"))))
+MALAYSIAN_MIN_WICK_RATIO = max(0.05, min(0.50, float(os.getenv("MALAYSIAN_MIN_WICK_RATIO", "0.16"))))
+MALAYSIAN_MISS_MIN_BARS = max(1, min(8, int(os.getenv("MALAYSIAN_MISS_MIN_BARS", "2"))))
+MALAYSIAN_MIN_SCORE = max(2.0, min(7.0, float(os.getenv("MALAYSIAN_MIN_SCORE", "3.0"))))
+MALAYSIAN_SCORE_LEAD = max(0.0, min(2.0, float(os.getenv("MALAYSIAN_SCORE_LEAD", "0.50"))))
+MALAYSIAN_PIVOT_SPAN = max(1, min(5, int(os.getenv("MALAYSIAN_PIVOT_SPAN", "2"))))
+MALAYSIAN_PIVOT_LOOKBACK = max(20, min(160, int(os.getenv("MALAYSIAN_PIVOT_LOOKBACK", "80"))))
+MALAYSIAN_TREND_TOL_ATR = max(0.05, min(0.80, float(os.getenv("MALAYSIAN_TREND_TOL_ATR", "0.24"))))
+MALAYSIAN_GOLDEN_ENGULF_BARS = max(2, min(5, int(os.getenv("MALAYSIAN_GOLDEN_ENGULF_BARS", "3"))))
+MALAYSIAN_COOLDOWN_BARS = max(1, min(10, int(os.getenv("MALAYSIAN_COOLDOWN_BARS", "2"))))
 
 xgb_model_cache: Dict[str, Dict[str, Any]] = {}
 xgb_model_guard = threading.RLock()
@@ -8368,6 +8386,287 @@ def alphax_relay_strategy(cs, timeframe="1min", market="OPEN"):
 
 
 
+# ---------------------------------------------------------------------------
+# MALAYSIAN SNR EMPEROR — adaptação mecânica para opções binárias
+# ---------------------------------------------------------------------------
+def _malaysian_row_values(row):
+    return (
+        float(row.get("open") or 0.0), float(row.get("high") or 0.0),
+        float(row.get("low") or 0.0), float(row.get("close") or 0.0),
+    )
+
+
+def _malaysian_pivots(rows, span=MALAYSIAN_PIVOT_SPAN):
+    rows = list(rows or [])
+    highs, lows = [], []
+    span = max(1, int(span))
+    if len(rows) < span * 2 + 3:
+        return highs, lows
+    # Só pivôs com barras à direita suficientes; portanto já confirmados.
+    for i in range(span, len(rows) - span):
+        h = float(rows[i].get("high") or 0.0)
+        l = float(rows[i].get("low") or 0.0)
+        if h and all(h > float(rows[j].get("high") or 0.0) for j in range(i-span, i)) and all(h >= float(rows[j].get("high") or 0.0) for j in range(i+1, i+span+1)):
+            highs.append((i, h))
+        if l and all(l < float(rows[j].get("low") or 0.0) for j in range(i-span, i)) and all(l <= float(rows[j].get("low") or 0.0) for j in range(i+1, i+span+1)):
+            lows.append((i, l))
+    return highs, lows
+
+
+def _malaysian_structure_bias(rows):
+    highs, lows = _malaysian_pivots(rows, MALAYSIAN_PIVOT_SPAN)
+    if len(highs) < 2 or len(lows) < 2:
+        return 0
+    older_h, recent_h = highs[-2][1], highs[-1][1]
+    older_l, recent_l = lows[-2][1], lows[-1][1]
+    if recent_h > older_h and recent_l > older_l:
+        return 1
+    if recent_h < older_h and recent_l < older_l:
+        return -1
+    return 0
+
+
+def _malaysian_snr_levels(rows, atr_value):
+    rows = list(rows or [])
+    n = len(rows)
+    if n < 8:
+        return None, None
+    cur_close = float(rows[-1].get("close") or 0.0)
+    tol = max(abs(float(atr_value or 0.0)) * MALAYSIAN_LEVEL_TOL_ATR, abs(cur_close) * 0.00001, 1e-12)
+    start = max(0, n - MALAYSIAN_SNR_LOOKBACK - 2)
+    supports, resistances = [], []
+
+    for i in range(start, n - 2):
+        a, b = rows[i], rows[i+1]
+        ao, ah, al, ac = _malaysian_row_values(a)
+        bo, bh, bl, bc = _malaysian_row_values(b)
+        kind = None
+        if ac < ao and bc > bo:  # bearish close -> next bullish open = Support / V
+            kind = "SUPPORT"
+            p1, p2 = ac, bo
+        elif ac > ao and bc < bo:  # bullish close -> next bearish open = Resistance / A
+            kind = "RESISTANCE"
+            p1, p2 = ac, bo
+        if not kind:
+            continue
+
+        zlo, zhi = min(p1, p2), max(p1, p2)
+        level = (p1 + p2) / 2.0
+        after = rows[i+2:-1]  # exclui a vela atual, que será testada como rejeição
+        touched = False
+        invalid = False
+        for r in after:
+            ro, rh, rl, rc = _malaysian_row_values(r)
+            if kind == "SUPPORT" and rc < zlo - tol:
+                invalid = True; break
+            if kind == "RESISTANCE" and rc > zhi + tol:
+                invalid = True; break
+            if rl <= zhi + tol and rh >= zlo - tol:
+                touched = True
+        if invalid:
+            continue
+        fresh = not touched
+        miss = len(after) >= MALAYSIAN_MISS_MIN_BARS and not touched
+        item = {
+            "kind": kind, "level": level, "low": zlo, "high": zhi,
+            "fresh": fresh, "miss": miss, "formation_index": i+1,
+        }
+        if kind == "SUPPORT" and level <= cur_close + 2.0*tol:
+            supports.append(item)
+        elif kind == "RESISTANCE" and level >= cur_close - 2.0*tol:
+            resistances.append(item)
+
+    support = min(supports, key=lambda x: abs(cur_close-x["level"])) if supports else None
+    resistance = min(resistances, key=lambda x: abs(cur_close-x["level"])) if resistances else None
+    return support, resistance
+
+
+def _malaysian_rejection(row, zone, side, tol):
+    if not zone:
+        return False
+    o, h, l, c = _malaysian_row_values(row)
+    rng = max(h-l, 1e-12)
+    if side == "CALL":
+        wick = max(0.0, min(o,c)-l) / rng
+        return bool(l <= zone["high"] + tol and min(o,c) >= zone["low"] - 0.10*tol and c > zone["level"] and wick >= MALAYSIAN_MIN_WICK_RATIO)
+    wick = max(0.0, h-max(o,c)) / rng
+    return bool(h >= zone["low"] - tol and max(o,c) <= zone["high"] + 0.10*tol and c < zone["level"] and wick >= MALAYSIAN_MIN_WICK_RATIO)
+
+
+def _malaysian_engulfing(rows):
+    rows = list(rows or [])
+    out = {"bull": False, "bear": False, "bull_perfect": False, "bear_perfect": False,
+           "bull_qm": False, "bear_qm": False, "bull_golden": False, "bear_golden": False}
+    if len(rows) < 7:
+        return out
+    cur, prev = rows[-1], rows[-2]
+    o,h,l,c = _malaysian_row_values(cur)
+    po,ph,pl,pc = _malaysian_row_values(prev)
+    bull = c > o and pc < po and o <= pc and c >= po
+    bear = c < o and pc > po and o >= pc and c <= po
+    out["bull"] = bull
+    out["bear"] = bear
+    out["bull_perfect"] = bool(bull and h >= ph and l <= pl)
+    out["bear_perfect"] = bool(bear and h >= ph and l <= pl)
+
+    recent = rows[-6:-1]
+    recent_low = min(float(x.get("low") or 0.0) for x in recent)
+    recent_high = max(float(x.get("high") or 0.0) for x in recent)
+    out["bull_qm"] = bool(bull and l < recent_low and c > ph)
+    out["bear_qm"] = bool(bear and h > recent_high and c < pl)
+
+    n = MALAYSIAN_GOLDEN_ENGULF_BARS
+    prior = rows[-(n+1):-1]
+    if len(prior) == n:
+        pmax = max(float(x.get("high") or 0.0) for x in prior)
+        pmin = min(float(x.get("low") or 0.0) for x in prior)
+        out["bull_golden"] = bool(c > o and h > pmax and l < pmin)
+        out["bear_golden"] = bool(c < o and h > pmax and l < pmin)
+    return out
+
+
+def _malaysian_breakout(rows, atr_value):
+    rows = list(rows or [])
+    if len(rows) < 12:
+        return False, False, None, None
+    highs, lows = _malaysian_pivots(rows[:-1], MALAYSIAN_PIVOT_SPAN)
+    cur = rows[-1]; prev = rows[-2]
+    c = float(cur.get("close") or 0.0); pc = float(prev.get("close") or 0.0)
+    tol = max(float(atr_value or 0.0) * MALAYSIAN_LEVEL_TOL_ATR * 0.10, abs(c)*0.000001)
+    ph = highs[-1][1] if highs else None
+    pl = lows[-1][1] if lows else None
+    bull = bool(ph is not None and c > ph + tol and pc <= ph + tol)
+    bear = bool(pl is not None and c < pl - tol and pc >= pl - tol)
+    return bull, bear, ph, pl
+
+
+def _malaysian_trendline_confluence(rows, support, resistance, atr_value):
+    rows = list(rows or [])
+    highs, lows = _malaysian_pivots(rows, MALAYSIAN_PIVOT_SPAN)
+    idx = len(rows)-1
+    tol = max(float(atr_value or 0.0) * MALAYSIAN_TREND_TOL_ATR, 1e-12)
+    bull_tl = bear_tl = False
+    bull_proj = bear_proj = None
+
+    if support and len(lows) >= 3:
+        pts = lows[-3:]
+        old_i, old_p = pts[0]; new_i, new_p = pts[-1]
+        if new_i != old_i and new_p > old_p:
+            slope = (new_p-old_p)/(new_i-old_i)
+            bull_proj = new_p + slope*(idx-new_i)
+            cur_low = float(rows[-1].get("low") or 0.0)
+            bull_tl = abs(bull_proj-support["level"]) <= 2.5*tol and abs(cur_low-bull_proj) <= 2.5*tol
+
+    if resistance and len(highs) >= 3:
+        pts = highs[-3:]
+        old_i, old_p = pts[0]; new_i, new_p = pts[-1]
+        if new_i != old_i and new_p < old_p:
+            slope = (new_p-old_p)/(new_i-old_i)
+            bear_proj = new_p + slope*(idx-new_i)
+            cur_high = float(rows[-1].get("high") or 0.0)
+            bear_tl = abs(bear_proj-resistance["level"]) <= 2.5*tol and abs(cur_high-bear_proj) <= 2.5*tol
+    return bull_tl, bear_tl, bull_proj, bear_proj
+
+
+def malaysian_snr_emperor_strategy(cs, timeframe="1min", market="OPEN", h1=None, h4=None):
+    rows = list(cs or [])
+    tf_label = {'1min':'M1','5min':'M5','15min':'M15','30min':'M30','1h':'H1','4h':'H4'}.get(str(timeframe), str(timeframe))
+    name = f"MALAYSIAN SNR EMPEROR {tf_label}"
+    need = max(70, MALAYSIAN_ATR_PERIOD + 30, MALAYSIAN_PIVOT_LOOKBACK)
+    if len(rows) < need:
+        return {
+            "available": True, "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
+            "risk": "HIGH", "strategy": name, "engine": "MALAYSIAN_SNR",
+            "provider": "LOCAL_MALAYSIAN_SNR", "reason": f"Coletando candles fechados para o Malaysian SNR ({len(rows)}/{need}).",
+            "non_repaint": True, "direct_win_only": True, "gale_signal": False, "next_candle_entry": True,
+        }
+
+    a = atr(rows, MALAYSIAN_ATR_PERIOD)
+    if not a:
+        return {
+            "available": True, "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
+            "risk": "HIGH", "strategy": name, "engine": "MALAYSIAN_SNR",
+            "provider": "LOCAL_MALAYSIAN_SNR", "reason": "ATR ainda sem histórico suficiente.",
+            "non_repaint": True, "direct_win_only": True, "gale_signal": False, "next_candle_entry": True,
+        }
+
+    support, resistance = _malaysian_snr_levels(rows, a)
+    close = float(rows[-1].get("close") or 0.0)
+    tol = max(float(a)*MALAYSIAN_LEVEL_TOL_ATR, abs(close)*0.00001, 1e-12)
+    bull_rej = _malaysian_rejection(rows[-1], support, "CALL", tol)
+    bear_rej = _malaysian_rejection(rows[-1], resistance, "PUT", tol)
+    eg = _malaysian_engulfing(rows)
+    bull_bo, bear_bo, ph, pl = _malaysian_breakout(rows, a)
+    bull_tl, bear_tl, bull_tl_price, bear_tl_price = _malaysian_trendline_confluence(rows, support, resistance, a)
+
+    bull = bear = 0.0
+    bull_tags, bear_tags = [], []
+    if bull_rej:
+        bull += 2.0; bull_tags.append("SNR+rejeição")
+        if support and support.get("fresh"): bull += 0.5; bull_tags.append("Fresh")
+        if support and support.get("miss"): bull += 0.5; bull_tags.append("MISS")
+    if bear_rej:
+        bear += 2.0; bear_tags.append("SNR+rejeição")
+        if resistance and resistance.get("fresh"): bear += 0.5; bear_tags.append("Fresh")
+        if resistance and resistance.get("miss"): bear += 0.5; bear_tags.append("MISS")
+
+    if eg["bull"]: bull += 0.75; bull_tags.append("Engulf")
+    if eg["bear"]: bear += 0.75; bear_tags.append("Engulf")
+    if eg["bull_perfect"]: bull += 0.50; bull_tags.append("Perfect EG")
+    if eg["bear_perfect"]: bear += 0.50; bear_tags.append("Perfect EG")
+    if eg["bull_qm"]: bull += 0.50; bull_tags.append("QM EG")
+    if eg["bear_qm"]: bear += 0.50; bear_tags.append("QM EG")
+    if eg["bull_golden"]: bull += 1.25; bull_tags.append("Golden EG")
+    if eg["bear_golden"]: bear += 1.25; bear_tags.append("Golden EG")
+    if bull_bo: bull += 1.0; bull_tags.append("Breakout")
+    if bear_bo: bear += 1.0; bear_tags.append("Breakout")
+    if bull_tl: bull += 1.0; bull_tags.append("SNR+TL X")
+    if bear_tl: bear += 1.0; bear_tags.append("SNR+TL X")
+
+    h4_bias = _malaysian_structure_bias(list(h4 or [])) if h4 else 0
+    h1_bias = _malaysian_structure_bias(list(h1 or [])) if h1 else 0
+    if h4_bias > 0: bull += 0.75; bull_tags.append("Storyline H4↑")
+    elif h4_bias < 0: bear += 0.75; bear_tags.append("Storyline H4↓")
+    if h1_bias > 0: bull += 0.50; bull_tags.append("H1↑")
+    elif h1_bias < 0: bear += 0.50; bear_tags.append("H1↓")
+
+    bull_core = bool(bull_rej or eg["bull_perfect"] or eg["bull_qm"] or eg["bull_golden"] or bull_bo)
+    bear_core = bool(bear_rej or eg["bear_perfect"] or eg["bear_qm"] or eg["bear_golden"] or bear_bo)
+    direction = "NEUTRO"
+    score = max(bull, bear)
+    if bull_core and bull >= MALAYSIAN_MIN_SCORE and bull >= bear + MALAYSIAN_SCORE_LEAD:
+        direction = "CALL"
+    elif bear_core and bear >= MALAYSIAN_MIN_SCORE and bear >= bull + MALAYSIAN_SCORE_LEAD:
+        direction = "PUT"
+
+    confirmed = direction in ("CALL", "PUT")
+    confidence = min(94.0, max(0.0, 58.0 + score*6.0)) if confirmed else 0.0
+    winner_tags = bull_tags if direction == "CALL" else bear_tags if direction == "PUT" else (bull_tags if bull >= bear else bear_tags)
+    if confirmed:
+        reason = f"{direction} Malaysian SNR • score {score:.2f}/{MALAYSIAN_MIN_SCORE:.2f} • " + " + ".join(winner_tags[:7]) + ". Candle fechado; entrada na próxima vela."
+    else:
+        reason = f"Malaysian SNR monitorando • CALL {bull:.2f} / PUT {bear:.2f} • mínimo {MALAYSIAN_MIN_SCORE:.2f}. Aguardando rejeição/engulf/breakout/confluência confirmada."
+
+    return {
+        "available": True, "direction": direction, "confidence": round(confidence,1), "confirmed": confirmed,
+        "risk": ("LOW" if confirmed and confidence >= 86 else ("MEDIUM" if confirmed else "HIGH")),
+        "strategy": name, "engine": "MALAYSIAN_SNR", "provider": "LOCAL_MALAYSIAN_SNR",
+        "reason": reason[:520], "external_ai_disabled": True, "non_repaint": True,
+        "direct_win_only": True, "gale_signal": False, "martingale": False, "next_candle_entry": True,
+        "score": round(score,2), "call_score": round(bull,2), "put_score": round(bear,2),
+        "cooldown_bars": MALAYSIAN_COOLDOWN_BARS,
+        "diagnostics": {
+            "support": support, "resistance": resistance,
+            "bull_rejection": bull_rej, "bear_rejection": bear_rej,
+            "engulfing": eg, "bull_breakout": bull_bo, "bear_breakout": bear_bo,
+            "pivot_high": ph, "pivot_low": pl,
+            "bull_tl_confluence": bull_tl, "bear_tl_confluence": bear_tl,
+            "bull_tl_price": bull_tl_price, "bear_tl_price": bear_tl_price,
+            "h1_bias": h1_bias, "h4_bias": h4_bias,
+        },
+    }
+
+
 def _monster_rma_series(values, period):
     vals = [float(x) for x in (values or [])]
     if not vals:
@@ -10515,12 +10814,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
-    if engine in ("ICT", "SNIPER", "ALPHAX", "MONSTER"):
+    if engine in ("ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN"):
         # ICT/SMC e Sniper Pro só usam candle fechado e entram na abertura imediatamente seguinte.
         entry_mode = "BIRTH"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
@@ -10709,6 +11008,25 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 raw = await iq_ea_candles(iq_state, symbol, interval, 150, regular_market=False)
             else:
                 raw = await candles(symbol, interval, 150, "OPEN", None, request=request)
+        elif engine == "MALAYSIAN":
+            if market == "IQ_OTC":
+                if not iq_state:
+                    out = neutral_signal(
+                        symbol, interval, market,
+                        "MALAYSIAN SNR • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para o Malaysian SNR analisar candles OTC reais.",
+                        source_state="WAITING",
+                    )
+                    out.update({
+                        "strategy": "MALAYSIAN SNR EMPEROR", "mode": "MALAYSIAN_SNR_EMPEROR",
+                        "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
+                        "non_repaint": True, "direct_win_only": True, "gale_signal": False,
+                    })
+                    cache[key] = (time.time(), out)
+                    return out
+                raw = await iq_ea_candles(iq_state, symbol, interval, 180, regular_market=False)
+            else:
+                raw = await candles(symbol, interval, 180, "OPEN", None, request=request)
         elif engine == "MONSTER":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -10785,6 +11103,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "ALPHAX RELAY • FONTE EM ESPERA" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION EM ESPERA"
         elif engine == "MONSTER":
             status = "MONSTER ARROWS • FONTE EM ESPERA" if market == "OPEN" else "MONSTER ARROWS • IQ OPTION EM ESPERA"
+        elif engine == "MALAYSIAN":
+            status = "MALAYSIAN SNR • FONTE EM ESPERA" if market == "OPEN" else "MALAYSIAN SNR • IQ OPTION EM ESPERA"
         elif engine == "ICT":
             status = "ICT/SMC • FONTE EM ESPERA" if market == "OPEN" else "ICT/SMC • IQ OPTION EM ESPERA"
         elif engine == "FORCE" and market == "IQ_OTC":
@@ -10813,6 +11133,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "ALPHAX RELAY • FONTE RECONECTANDO" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION RECONECTANDO"
         elif engine == "MONSTER":
             status = "MONSTER ARROWS • FONTE RECONECTANDO" if market == "OPEN" else "MONSTER ARROWS • IQ OPTION RECONECTANDO"
+        elif engine == "MALAYSIAN":
+            status = "MALAYSIAN SNR • FONTE RECONECTANDO" if market == "OPEN" else "MALAYSIAN SNR • IQ OPTION RECONECTANDO"
         elif engine == "ICT":
             status = "ICT/SMC • FONTE RECONECTANDO" if market == "OPEN" else "ICT/SMC • IQ OPTION RECONECTANDO"
         elif engine == "FORCE" and market == "IQ_OTC":
@@ -10886,6 +11208,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "MONSTER":
             engine_title = "MONSTER ARROWS NR"
             engine_mode = "MONSTER_ARROWS_NR"
+        elif engine == "MALAYSIAN":
+            engine_title = "MALAYSIAN SNR EMPEROR"
+            engine_mode = "MALAYSIAN_SNR_EMPEROR"
         elif engine == "ICT":
             engine_title = "ICT/SMC INSTITUCIONAL"
             engine_mode = "ICT_SMC_INSTITUTIONAL"
@@ -10899,7 +11224,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER"):
+        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -10918,6 +11243,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "SNIPER": "LOCAL_SNIPER_PRO_MEGA",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "MONSTER": "LOCAL_MONSTER_ARROWS_NR",
+                    "MALAYSIAN": "LOCAL_MALAYSIAN_SNR",
                     "ICT": "LOCAL_ICT_SMC_INSTITUTIONAL",
                     "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
                 }.get(engine, "DISABLED")),
@@ -10936,7 +11262,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-160:] if engine == "MONSTER" else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "ICT", "SNIPER", "ALPHAX") else (closed[-90:] if len(closed) > 90 else closed))))
+            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-180:] if engine in ("MONSTER", "MALAYSIAN") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "ICT", "SNIPER", "ALPHAX") else (closed[-90:] if len(closed) > 90 else closed))))
             if engine == "SMART":
                 moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
                 analysis = await openai_direct_signal(
@@ -10956,6 +11282,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis = sniper_pro_strategy(engine_closed, interval, market=market)
             elif engine == "ALPHAX":
                 analysis = alphax_relay_strategy(engine_closed, interval, market=market)
+            elif engine == "MALAYSIAN":
+                if market == "OPEN":
+                    h1_raw = await candles(symbol, "1h", 220, "OPEN", None, request=request)
+                else:
+                    h1_raw = await iq_ea_candles(iq_state, symbol, "1h", 220, regular_market=False)
+                h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
+                h4_all = _aggregate_closed_candles(h1_closed, 4 * 60 * 60)
+                h4_closed = h4_all[:-1] if len(h4_all) > 1 else h4_all
+                analysis = malaysian_snr_emperor_strategy(engine_closed, interval, market=market, h1=h1_closed, h4=h4_closed)
             elif engine == "MONSTER":
                 htf_interval = _monster_htf_interval(interval)
                 if market == "OPEN":
@@ -11033,7 +11368,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER") and analysis.get("confirmed")),
+            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN") and analysis.get("confirmed")),
             "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                 "EA": "XGBOOST_RSI_VALUE_CHART",
                 "RUBIK": "LOCAL_RUBIK_ADAPTED",
@@ -11042,10 +11377,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "SNIPER": "LOCAL_SNIPER_PRO_MEGA",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                 "MONSTER": "LOCAL_MONSTER_ARROWS_NR",
+                    "MALAYSIAN": "LOCAL_MALAYSIAN_SNR",
                 "ICT": "LOCAL_ICT_SMC_INSTITUTIONAL",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER") else "HIGH").upper(),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
                 else (analysis.get("strategy") or (
@@ -11055,6 +11391,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "VELOCITY FLOW • MR MT4" if engine == "VELOCITY"
                     else "ALPHAX RELAY" if engine == "ALPHAX"
                     else "MONSTER ARROWS NR" if engine == "MONSTER"
+                    else "MALAYSIAN SNR EMPEROR" if engine == "MALAYSIAN"
                     else "ICT/SMC INSTITUCIONAL" if engine == "ICT"
                     else "EA Força do Movimento" if engine == "FORCE"
                     else f"{engine_title} {tf_label}"
@@ -11138,6 +11475,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "VELOCITY": "velocity_fingerprint",
                 "SNIPER": "sniper_fingerprint",
                 "ALPHAX": "alphax_fingerprint",
+                "MALAYSIAN": "malaysian_fingerprint",
                 "ICT": "ict_fingerprint",
                 "FORCE": "force_fingerprint",
                 "BIGRISE": "btc_force_fingerprint",
@@ -11183,12 +11521,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key] = (time.time(), base)
                         return base
 
-                if engine in ("SNIPER", "ALPHAX", "MONSTER"):
+                if engine in ("SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN"):
                     # O setup pertence ao último candle fechado. O sinal é válido
                     # somente para a abertura imediatamente seguinte; não entra atrasado.
                     sniper_age = max(0.0, (now() - current_boundary(interval)).total_seconds())
                     if sniper_age > 10.0:
-                        _late_name = "MONSTER ARROWS NR" if engine == "MONSTER" else ("ALPHAX RELAY" if engine == "ALPHAX" else "SNIPER PRO")
+                        _late_name = "MALAYSIAN SNR EMPEROR" if engine == "MALAYSIAN" else ("MONSTER ARROWS NR" if engine == "MONSTER" else ("ALPHAX RELAY" if engine == "ALPHAX" else "SNIPER PRO"))
                         base["status"] = f"ONLINE • {_late_name} • AGUARDANDO PRÓXIMO FECHAMENTO"
                         base["reason"] = (
                             f"Setup {_late_name} detectado, mas a janela da próxima vela já passou. "
@@ -11198,6 +11536,19 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         base["entry_time"] = None
                         base["expiry_time"] = None
                         base["risk"] = "HIGH"
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
+
+                if engine == "MALAYSIAN":
+                    malaysia_gap_seconds = MALAYSIAN_COOLDOWN_BARS * INTERVALS.get(interval, 60)
+                    last_malaysia_signal_ts = float(release_state.get("last_malaysian_signal_ts", 0.0) or 0.0)
+                    malaysia_remaining = max(0, int(malaysia_gap_seconds - (time.time() - last_malaysia_signal_ts))) if last_malaysia_signal_ts else 0
+                    if malaysia_remaining > 0:
+                        base["status"] = "ONLINE • MALAYSIAN SNR • COOLDOWN"
+                        base["reason"] = f"Setup confirmado, mas o Malaysian SNR aguarda mais {malaysia_remaining}s para evitar sinais grudados."
+                        base["malaysian_signal_gap_seconds"] = malaysia_gap_seconds
+                        base["malaysian_signal_gap_remaining"] = malaysia_remaining
                         release_state["active_signal"] = None
                         cache[key] = (time.time(), base)
                         return base
@@ -11249,6 +11600,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "SNIPER": "SINAL SNIPER PRO MEGA LIBERADO",
                         "ALPHAX": "SINAL ALPHAX RELAY LIBERADO",
                         "MONSTER": "SINAL MONSTER ARROWS NR LIBERADO",
+                        "MALAYSIAN": "SINAL MALAYSIAN SNR EMPEROR LIBERADO",
                         "ICT": "SINAL ICT/SMC INSTITUCIONAL LIBERADO",
                         "FORCE": "SINAL EA FORÇA DO MOVIMENTO LIBERADO",
                         "BIGRISE": "SINAL BTC FORCE + DOM LIBERADO",
@@ -11272,7 +11624,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER"):
+                if engine not in ("EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -11292,6 +11644,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     release_state["last_ict_signal_ts"] = time.time()
                     base["ict_signal_gap_seconds"] = _ict_cooldown_bars(interval) * INTERVALS.get(interval, 60)
                     base["ict_signal_gap_remaining"] = 0
+                if engine == "MALAYSIAN":
+                    release_state["last_malaysian_signal_ts"] = time.time()
+                    base["malaysian_signal_gap_seconds"] = MALAYSIAN_COOLDOWN_BARS * INTERVALS.get(interval, 60)
+                    base["malaysian_signal_gap_remaining"] = 0
 
                 # Só as IAs entram no ciclo com Gale. EAs continuam com sua
                 # regra própria de entrada direta/sem Gale. Fallback local da IA
@@ -11380,6 +11736,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "SNIPER": "LOCAL_SNIPER_PRO_MEGA",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                 "MONSTER": "LOCAL_MONSTER_ARROWS_NR",
+                    "MALAYSIAN": "LOCAL_MALAYSIAN_SNR",
                 "ICT": "LOCAL_ICT_SMC_INSTITUTIONAL",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
@@ -14374,11 +14731,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, VELOCITY, ICT, SNIPER, ALPHAX ou MONSTER.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, VELOCITY, ICT, SNIPER, ALPHAX, MONSTER ou MALAYSIAN.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER"):
+    if engine in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -14491,6 +14848,19 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
                     data["feed_message"] = f"Monster Arrows NR usando candles OTC reais da IQ Option + HTF {_monster_htf_interval(interval)} fechado."
+            elif engine == "MALAYSIAN":
+                if requested_market == "OPEN":
+                    feed_info = _current_open_feed_info(symbol, interval)
+                    feed_src = str(feed_info.get("source") or "MULTIFEED")
+                    data["feed_source"] = feed_src
+                    data["feed_label"] = _feed_source_label(feed_src)
+                    data["feed_fallback"] = bool(feed_info.get("fallback"))
+                    data["feed_message"] = "Malaysian SNR Emperor usando candles fechados do mercado aberto + contexto H1/H4."
+                else:
+                    data["feed_source"] = "IQ_OPTION_OTC"
+                    data["feed_label"] = _feed_source_label(data["feed_source"])
+                    data["feed_fallback"] = False
+                    data["feed_message"] = "Malaysian SNR Emperor usando candles OTC reais da IQ Option + contexto H1/H4."
             elif engine == "ICT":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -14935,7 +15305,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -14986,6 +15356,14 @@ async def pre_signals(
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
 
+    if engine == "MALAYSIAN":
+        return {
+            "ok": True,
+            "message": "MALAYSIAN SNR EMPEROR usa somente candles fechados; SNR, rejeição, engulfing, breakout e trendline são confirmados antes da entrada na próxima vela. Pré-sinal intrabar fica desligado para não repintar.",
+            "items": [],
+            "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
+        }
+
     if engine == "ICT":
         return {
             "ok": True,
@@ -15000,10 +15378,10 @@ async def pre_signals(
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN")
     if fallback_twelve:
         market = "OPEN"
-    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER") and not iq_state:
+    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN") and not iq_state:
         wait_label = {
             "EA": "EA Tripla",
             "RUBIK": "Robô Rubik Adaptado",
@@ -15011,6 +15389,7 @@ async def pre_signals(
             "VELOCITY": "Velocity Flow",
             "SNIPER": "Sniper Pro MEGA",
             "ALPHAX": "AlphaX RELAY",
+            "MALAYSIAN": "Malaysian SNR Emperor",
             "ICT": "ICT/SMC Institucional",
         }.get(engine, engine)
         return {
@@ -15076,7 +15455,7 @@ async def pre_signals(
         key = f"{group_key}|{symbol}"
         try:
             pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (120 if engine == "RUBIK" else 90))
-            if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER") and requested_market == "IQ_OTC":
+            if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
                 )
@@ -15470,12 +15849,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, VELOCITY, ICT, SNIPER, ALPHAX ou MONSTER.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, VELOCITY, ICT, SNIPER, ALPHAX, MONSTER ou MALAYSIAN.")
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN")
     if fallback_twelve:
         market = "OPEN"
 
@@ -15562,6 +15941,13 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 raw = await iq_ea_candles(iq_state, sym, interval, 150, regular_market=False)
             else:
                 raw = await candles(sym, interval, 150, "OPEN", None, request=request)
+        elif engine == "MALAYSIAN":
+            if market == "IQ_OTC":
+                if not iq_state:
+                    raise RuntimeError("Conecte a IQ Option para o Malaysian SNR analisar OTC.")
+                raw = await iq_ea_candles(iq_state, sym, interval, 180, regular_market=False)
+            else:
+                raw = await candles(sym, interval, 180, "OPEN", None, request=request)
         elif engine == "MONSTER":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -15646,6 +16032,19 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     if direction != "NEUTRO"
                     else f"{engine_label} • MONITORANDO • {why}"
                 )
+            elif engine == "MALAYSIAN":
+                if market == "OPEN":
+                    h1_raw = await candles(sym, "1h", 200, "OPEN", None, request=request)
+                else:
+                    h1_raw = await iq_ea_candles(iq_state, sym, "1h", 200, regular_market=False)
+                h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
+                h4_all = _aggregate_closed_candles(h1_closed, 4 * 60 * 60)
+                h4_closed = h4_all[:-1] if len(h4_all) > 1 else h4_all
+                tech = malaysian_snr_emperor_strategy(closed, interval, market=market, h1=h1_closed, h4=h4_closed)
+                engine_label = "MALAYSIAN SNR EMPEROR"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "Malaysian SNR monitorando").replace("\n", " ")[:88]
+                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "MONSTER":
                 htf_interval = _monster_htf_interval(interval)
                 if market == "OPEN":
@@ -15734,18 +16133,18 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if (engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER") or (engine == "FORCE" and market == "IQ_OTC"))
+                    status_text if (engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN") or (engine == "FORCE" and market == "IQ_OTC"))
                     else (((_feed_source_label(_feed_source_from_rows(raw)) + " • " + status_text) if market == "OPEN" else status_text))
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
+                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
                 "strategy": str(tech.get("strategy") or ""),
             }
-            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER"):
+            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN"):
                 radar_probe = {
                     "symbol": sym, "market": market, "interval": interval,
                     "direction": item.get("direction"), "confidence": item.get("confidence"),
@@ -15784,6 +16183,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             source_status = "ALPHAX RELAY • FONTE EM ESPERA" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION OTC EM ESPERA"
         elif engine == "MONSTER":
             source_status = "MONSTER ARROWS NR • FONTE EM ESPERA" if market == "OPEN" else "MONSTER ARROWS NR • IQ OPTION OTC EM ESPERA"
+        elif engine == "MALAYSIAN":
+            source_status = "MALAYSIAN SNR • FONTE EM ESPERA" if market == "OPEN" else "MALAYSIAN SNR • IQ OPTION OTC EM ESPERA"
         elif engine == "ICT":
             source_status = "ICT/SMC • FONTE EM ESPERA" if market == "OPEN" else "ICT/SMC • IQ OPTION OTC EM ESPERA"
         elif engine == "FORCE" and market == "IQ_OTC":
@@ -15807,7 +16208,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
+            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -16170,7 +16571,7 @@ async def result(
     - LOSS/empate no G1 => aguarda G2.
     - WIN no G2 => WIN G2; caso contrário => LOSS G2.
 
-    ``direct_only=true`` fecha somente a primeira vela. EA Tripla, EA Força, BIGRISE, LARRY BREAKOUT, VELOCITY FLOW, SNIPER PRO, ALPHAX RELAY, MONSTER ARROWS NR e ICT/SMC
+    ``direct_only=true`` fecha somente a primeira vela. EA Tripla, EA Força, BIGRISE, LARRY BREAKOUT, VELOCITY FLOW, SNIPER PRO, ALPHAX RELAY, MONSTER ARROWS NR, MALAYSIAN SNR EMPEROR e ICT/SMC
     usam esse modo; os demais motores podem acompanhar G1/G2.
     """
     if not expiry_time:
@@ -16181,7 +16582,7 @@ async def result(
     engine = str(engine or "").upper()
     # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
-    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER")
+    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "MONSTER", "MALAYSIAN")
 
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
@@ -16586,7 +16987,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .robot-mode-copy{min-width:150px}
 .robot-mode-title{font-weight:900;font-size:13px;letter-spacing:.4px}
 .robot-mode-desc{font-size:11px;color:#9fb2ca;margin-top:3px;max-width:245px}
-#robotPowerBtn,#aiPowerBtn,#larryPowerBtn,#sniperPowerBtn,#alphaxPowerBtn,#forcePowerBtn,#bigrisePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+#robotPowerBtn,#aiPowerBtn,#larryPowerBtn,#sniperPowerBtn,#alphaxPowerBtn,#monsterPowerBtn,#malaysianPowerBtn,#ictPowerBtn,#forcePowerBtn,#bigrisePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
 
 .daily-engine-board{margin-top:14px;border-color:#1c82c9;background:linear-gradient(180deg,#0b1b2e,#071321);box-shadow:0 0 24px #00aaff22}
 .daily-engine-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
@@ -16774,6 +17175,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-desc" id="monsterModeDesc">Liquidity Sweep • FVG • Fib 61,8% • EMA + SuperTrend/RMA no HTF fechado • sem repaint • próxima vela.</div>
     </div>
     <button id="monsterPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
+  <div class="robot-mode-card" id="malaysianModeCard">
+    <img src="__MEGA_IMAGE__" alt="Malaysian SNR Emperor">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">🇲🇾 MALAYSIAN SNR EMPEROR</div>
+      <div class="robot-mode-desc" id="malaysianModeDesc">SNR Open/Close • Fresh/MISS • rejeição • Engulfing • breakout • trendline + H1/H4 • candle fechado • próxima vela.</div>
+    </div>
+    <button id="malaysianPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
   <div class="robot-mode-card" id="ictModeCard">
@@ -17449,6 +17859,8 @@ const alphaxPowerBtn=document.getElementById('alphaxPowerBtn');
 const alphaxModeDesc=document.getElementById('alphaxModeDesc');
 const monsterPowerBtn=document.getElementById('monsterPowerBtn');
 const monsterModeDesc=document.getElementById('monsterModeDesc');
+const malaysianPowerBtn=document.getElementById('malaysianPowerBtn');
+const malaysianModeDesc=document.getElementById('malaysianModeDesc');
 const ictPowerBtn=document.getElementById('ictPowerBtn');
 const ictTabPowerBtn=document.getElementById('ictTabPowerBtn');
 const ictModeDesc=document.getElementById('ictModeDesc');
@@ -17503,6 +17915,7 @@ let velocityEnabled=false;
 let sniperEnabled=false;
 let alphaxEnabled=false;
 let monsterEnabled=false;
+let malaysianEnabled=false;
 let ictEnabled=false;
 try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
@@ -17516,23 +17929,26 @@ try{
   sniperEnabled=localStorage.getItem('mega_sniper_power')==='ONLINE';
   alphaxEnabled=localStorage.getItem('mega_alphax_power')==='ONLINE';
   monsterEnabled=localStorage.getItem('mega_monster_power')==='ONLINE';
+  malaysianEnabled=localStorage.getItem('mega_malaysian_power')==='ONLINE';
   ictEnabled=localStorage.getItem('mega_ict_power')==='ONLINE';
   localStorage.setItem('mega_ea_power','OFFLINE');
   localStorage.setItem('mega_rubik_power','OFFLINE');
   localStorage.setItem('mega_larry_power',larryEnabled?'ONLINE':'OFFLINE');
   forceEnabled=localStorage.getItem('mega_force_power')==='ONLINE';
   bigriseEnabled=localStorage.getItem('mega_bigrise_power')==='ONLINE';
-  if(monsterEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
-  else if(alphaxEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; }
-  else if(sniperEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; alphaxEnabled=false; }
-  else if(ictEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
-  else if(velocityEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
-  else if(bigriseEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
-  else if(forceEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
-  else if(larryEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(malaysianEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; monsterEnabled=false; }
+  else if(monsterEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  else if(alphaxEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false;  malaysianEnabled=false;}
+  else if(sniperEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
+  else if(ictEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
+  else if(velocityEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
+  else if(bigriseEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
+  else if(forceEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
+  else if(larryEnabled){ alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
+  if(malaysianEnabled) return 'MALAYSIAN';
   if(monsterEnabled) return 'MONSTER';
   if(alphaxEnabled) return 'ALPHAX';
   if(sniperEnabled) return 'SNIPER';
@@ -18420,6 +18836,7 @@ function normalizeEngineKey(value){
   if(e==='SNIPER' || e==='SNIPER_PRO' || e==='SNIPER_PRO_MEGA') return 'SNIPER';
   if(e==='ALPHAX' || e==='ALPHAX_RELAY' || e==='ALPHA_X') return 'ALPHAX';
   if(e==='MONSTER' || e==='MONSTER_ARROWS' || e==='MONSTER_ARROWS_NR') return 'MONSTER';
+  if(e==='MALAYSIAN' || e==='MALAYSIAN_SNR' || e==='MALAYSIAN_SNR_EMPEROR') return 'MALAYSIAN';
   if(e==='ICT' || e==='ICT_SMC' || e==='ICT_SMC_INSTITUTIONAL') return 'ICT';
   if(e==='BIGRISE' || e==='BIGRISE_USD_BASKET' || e==='BTC_FORCE' || e==='BTC_FORCE_NEXT_CANDLE') return 'BIGRISE';
   return '';
@@ -18439,6 +18856,7 @@ function momentStudyEngineName(key){
     SNIPER:'🎯 SNIPER PRO MEGA',
     ALPHAX:'🧬 ALPHAX RELAY',
     MONSTER:'👹 MONSTER ARROWS NR',
+    MALAYSIAN:'🇲🇾 MALAYSIAN SNR EMPEROR',
     ICT:'🏦 ICT/SMC INSTITUCIONAL',
     FORCE:'💥 EA FORÇA DO MOVIMENTO',
     BIGRISE:'₿ BTC FORCE'
@@ -18762,7 +19180,7 @@ function rememberPendingTrade(sig){
   if(!sig.expiry_time || !sig.entry_time) return;
 
   const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
-  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='MONSTER'||engineKey==='ICT'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('MONSTER')||engineKey.includes('ICT'));
+  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='MONSTER'||engineKey==='MALAYSIAN'||engineKey==='ICT'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('MONSTER')||engineKey.includes('MALAYSIAN')||engineKey.includes('ICT'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
     // Motores de entrada direta (Monster/AlphaX/Sniper/ICT/Larry/EA/Força/BigRise/Velocity) são apurados na primeira vela; outros preservam G1/G2.
@@ -20857,6 +21275,12 @@ function applyRobotPowerState(){
     monsterPowerBtn.style.color='#fff';
     monsterPowerBtn.style.borderColor=monsterEnabled?'#16c56b':'#ff5252';
   }
+  if(malaysianPowerBtn){
+    malaysianPowerBtn.textContent=malaysianEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    malaysianPowerBtn.style.background=malaysianEnabled?'#0b7a3d':'#7d1d1d';
+    malaysianPowerBtn.style.color='#fff';
+    malaysianPowerBtn.style.borderColor=malaysianEnabled?'#16c56b':'#ff5252';
+  }
   for(const btn of [ictPowerBtn,ictTabPowerBtn]){
     if(!btn) continue;
     btn.textContent=ictEnabled?'🟢 ONLINE':'🔴 OFFLINE';
@@ -20902,6 +21326,9 @@ function applyRobotPowerState(){
   if(monsterModeDesc) monsterModeDesc.textContent=monsterEnabled
     ? 'ONLINE: Sweep + FVG + Fib 61,8% + EMA/SuperTrend Dual RMA no HTF fechado • candle fechado • próxima vela • sem repaint.'
     : 'OFFLINE: Monster Arrows NR pausado.';
+  if(malaysianModeDesc) malaysianModeDesc.textContent=malaysianEnabled
+    ? 'ONLINE: SNR Open/Close + Fresh/MISS + rejeição + Engulfing + breakout + SNR/TL + H1/H4 • candle fechado • próxima vela • sem repaint.'
+    : 'OFFLINE: Malaysian SNR Emperor pausado.';
   if(ictModeDesc) ictModeDesc.textContent=ictEnabled
     ? 'ONLINE: BOS/CHoCH + liquidez + FVG/OB + OTE + EMA/VWAP + volume + contexto H1/H4 • próxima vela • sem Gale.'
     : 'OFFLINE: ICT/SMC Institucional pausado.';
@@ -20916,7 +21343,12 @@ function applyRobotPowerState(){
     : 'OFFLINE: BTC FORCE pausado.';
 
   const engine=selectedRobotEngine();
-  if(engine==='MONSTER'){
+  if(engine==='MALAYSIAN'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MALAYSIAN SNR EMPEROR ONLINE • SNR + REJEIÇÃO + ENGULFING + BREAKOUT + TRENDLINE • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🇲🇾 Malaysian SNR selecionado • decisão somente em candle fechado; entrada na vela seguinte.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar Malaysian SNR ativo • Fresh/MISS + rejeição + Engulfing + breakout + SNR/TL + H1/H4</div>';
+    rad();
+  }else if(engine==='MONSTER'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MONSTER ARROWS NR ONLINE • SWEEP + FVG + HTF FECHADO • PRÓXIMA VELA • SEM REPAINT';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">👹 Monster Arrows selecionado • decisão somente após candle fechado; entrada na vela seguinte.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Monster ativo • Liquidity Sweep + FVG + Fib 61,8% + EMA/SuperTrend no HTF fechado</div>';
@@ -21002,12 +21434,16 @@ function disableMonsterForOther(enabled){
     monsterEnabled=false;
     try{localStorage.setItem('mega_monster_power','OFFLINE');}catch(_){ }
   }
+  if(enabled && malaysianEnabled){
+    malaysianEnabled=false;
+    try{localStorage.setItem('mega_malaysian_power','OFFLINE');}catch(_){ }
+  }
 }
 
 async function setRobotPower(enabled){
   disableMonsterForOther(enabled);
   robotEnabled=!!enabled;
-  if(robotEnabled){ aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(robotEnabled){ aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
   try{
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21020,6 +21456,7 @@ async function setRobotPower(enabled){
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21032,7 +21469,7 @@ async function setRobotPower(enabled){
 async function setAiPower(enabled){
   disableMonsterForOther(enabled);
   aiEnabled=!!enabled;
-  if(aiEnabled){ robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(aiEnabled){ robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
   try{
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21045,6 +21482,7 @@ async function setAiPower(enabled){
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21057,7 +21495,7 @@ async function setAiPower(enabled){
 async function setEaPower(enabled){
   disableMonsterForOther(enabled);
   eaEnabled=!!enabled;
-  if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
   try{
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21070,6 +21508,7 @@ async function setEaPower(enabled){
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21082,7 +21521,7 @@ async function setEaPower(enabled){
 async function setRubikPower(enabled){
   disableMonsterForOther(enabled);
   rubikEnabled=!!enabled;
-  if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
   try{
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21095,6 +21534,7 @@ async function setRubikPower(enabled){
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21107,7 +21547,7 @@ async function setRubikPower(enabled){
 async function setLarryPower(enabled){
   disableMonsterForOther(enabled);
   larryEnabled=!!enabled;
-  if(larryEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(larryEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
   try{
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21120,6 +21560,7 @@ async function setLarryPower(enabled){
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21132,7 +21573,7 @@ async function setLarryPower(enabled){
 async function setForcePower(enabled){
   disableMonsterForOther(enabled);
   forceEnabled=!!enabled;
-  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
   try{
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21145,6 +21586,7 @@ async function setForcePower(enabled){
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21157,7 +21599,7 @@ async function setForcePower(enabled){
 async function setBigrisePower(enabled){
   disableMonsterForOther(enabled);
   bigriseEnabled=!!enabled;
-  if(bigriseEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(bigriseEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
   try{
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21170,6 +21612,7 @@ async function setBigrisePower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21182,7 +21625,7 @@ async function setBigrisePower(enabled){
 async function setVelocityPower(enabled){
   disableMonsterForOther(enabled);
   velocityEnabled=!!enabled;
-  if(velocityEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(velocityEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
   try{
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21195,6 +21638,7 @@ async function setVelocityPower(enabled){
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21207,7 +21651,7 @@ async function setVelocityPower(enabled){
 async function setIctPower(enabled){
   disableMonsterForOther(enabled);
   ictEnabled=!!enabled;
-  if(ictEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false; }
+  if(ictEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false;  malaysianEnabled=false;}
   try{
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21220,6 +21664,7 @@ async function setIctPower(enabled){
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -21232,10 +21677,11 @@ async function setIctPower(enabled){
 async function setSniperPower(enabled){
   disableMonsterForOther(enabled);
   sniperEnabled=!!enabled;
-  if(sniperEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; }
+  if(sniperEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false;  malaysianEnabled=false;}
   try{
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', 'OFFLINE');
@@ -21259,9 +21705,10 @@ async function setSniperPower(enabled){
 async function setAlphaxPower(enabled){
   disableMonsterForOther(enabled);
   alphaxEnabled=!!enabled;
-  if(alphaxEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; }
+  if(alphaxEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false;  malaysianEnabled=false;}
   try{
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21286,9 +21733,41 @@ async function setMonsterPower(enabled){
   if(monsterEnabled){
     robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
     forceEnabled=false; bigriseEnabled=false; larryEnabled=false;
-    velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;
+    velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; malaysianEnabled=false;
   }
   try{
+    localStorage.setItem('mega_monster_power', monsterEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ea_power', 'OFFLINE');
+    localStorage.setItem('mega_rubik_power', 'OFFLINE');
+    localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(monsterEnabled ? 'Monster Arrows online.' : 'Monster Arrows offline.');
+}
+
+async function setMalaysianPower(enabled){
+  malaysianEnabled=!!enabled;
+  if(malaysianEnabled){
+    robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
+    forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false;
+    ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; monsterEnabled=false;
+  }
+  try{
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_monster_power', monsterEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
@@ -21301,13 +21780,14 @@ async function setMonsterPower(enabled){
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_malaysian_power', malaysianEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled) speak(monsterEnabled ? 'Monster Arrows online.' : 'Monster Arrows offline.');
+  if(voiceEnabled) speak(malaysianEnabled ? 'Malaysian S N R Emperor online.' : 'Malaysian S N R Emperor offline.');
 }
 
 if(robotPowerBtn) robotPowerBtn.onclick=()=>{ setRobotPower(!robotEnabled); };
@@ -21319,6 +21799,7 @@ if(velocityPowerBtn) velocityPowerBtn.onclick=()=>{ setVelocityPower(!velocityEn
 if(sniperPowerBtn) sniperPowerBtn.onclick=()=>{ setSniperPower(!sniperEnabled); };
 if(alphaxPowerBtn) alphaxPowerBtn.onclick=()=>{ setAlphaxPower(!alphaxEnabled); };
 if(monsterPowerBtn) monsterPowerBtn.onclick=()=>{ setMonsterPower(!monsterEnabled); };
+if(malaysianPowerBtn) malaysianPowerBtn.onclick=()=>{ setMalaysianPower(!malaysianEnabled); };
 if(ictPowerBtn) ictPowerBtn.onclick=()=>{ setIctPower(!ictEnabled); };
 if(ictTabPowerBtn) ictTabPowerBtn.onclick=()=>{ setIctPower(!ictEnabled); };
 if(ictOpenPanelBtn) ictOpenPanelBtn.onclick=()=>showTab('main');
@@ -21764,7 +22245,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='MONSTER'?'MONSTER ARROWS NR':ek==='ALPHAX'?'ALPHAX RELAY':ek==='SNIPER'?'SNIPER PRO MEGA':ek==='ICT'?'ICT/SMC INSTITUCIONAL':ek==='SMART'?'INTELIGÊNCIA ARTIFICIAL':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='MALAYSIAN'?'MALAYSIAN SNR EMPEROR':ek==='MONSTER'?'MONSTER ARROWS NR':ek==='ALPHAX'?'ALPHAX RELAY':ek==='SNIPER'?'SNIPER PRO MEGA':ek==='ICT'?'ICT/SMC INSTITUCIONAL':ek==='SMART'?'INTELIGÊNCIA ARTIFICIAL':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
