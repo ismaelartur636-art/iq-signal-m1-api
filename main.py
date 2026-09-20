@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.74"
+APP_VERSION = "3.75"
 PWA_VERSION = "v140"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -2096,7 +2096,7 @@ def htf_sr_rsi_macd_strategy(cs, h1=None, h4=None, interval="5min"):
     if touch_resistance and not rsi_put:
         reasons.append(f"RSI {r_now:.1f} não está em sobrecompra")
     if (touch_support and rsi_call and not macd_call) or (touch_resistance and rsi_put and not macd_put):
-        reasons.append("MACD ainda não confirmou o cruzamento")
+        reasons.append("Kinetic ainda não confirmou o cruzamento")
 
     return {
         "direction": "NEUTRO",
@@ -6957,7 +6957,7 @@ def rubik_adapted_strategy(cs, timeframe="1min", market="OPEN"):
 
     macd = _rubik_macd_snapshot(closes)
     if not macd:
-        return neutral("MACD ainda sem histórico suficiente.")
+        return neutral("Kinetic ainda sem histórico suficiente.")
     macd_call = bool(macd["line"] > macd["signal"] and macd["hist"] > 0)
     macd_put = bool(macd["line"] < macd["signal"] and macd["hist"] < 0)
 
@@ -7539,122 +7539,197 @@ def _ema_series_local(values, period):
     return out
 
 
-def _macd_pullback_validation_indicator(rows, fast=12, slow=26, signal=9, lookback=10, lb_l=5, lb_r=5, range_low=5, range_high=60):
-    """Adaptação não-repaint do MACD Pullback Validation com divergência.
+def _rma_series_local(values, period=14):
+    vals = [float(x) for x in values]
+    n = len(vals)
+    out = [None] * n
+    if n < period or period <= 0:
+        return out
+    seed = sum(vals[:period]) / float(period)
+    out[period - 1] = seed
+    prev = seed
+    for i in range(period, n):
+        prev = ((prev * (period - 1)) + vals[i]) / float(period)
+        out[i] = prev
+    return out
 
-    Usa somente os candles recebidos pelo Velocity; não faz qualquer chamada de rede.
-    Pivôs são considerados apenas depois das `lb_r` barras de confirmação, então a
-    divergência não é desenhada retroativamente como se fosse conhecida antes.
-    Os filtros opcionais S/R e Bollinger do Pine original permanecem desligados,
-    exatamente como nos defaults publicados pelo autor.
+
+def _wma_series_local(values, period):
+    vals = [float(x) for x in values]
+    n = len(vals)
+    out = [None] * n
+    if period <= 0:
+        return out
+    denom = float(period * (period + 1) // 2)
+    weights = list(range(1, period + 1))
+    for i in range(period - 1, n):
+        win = vals[i - period + 1:i + 1]
+        out[i] = sum(v * w for v, w in zip(win, weights)) / denom
+    return out
+
+
+def _hma_series_local(values, period=20):
+    vals = [float(x) for x in values]
+    n = len(vals)
+    if not vals:
+        return []
+    half = max(1, period // 2)
+    root = max(1, int(round(period ** 0.5)))
+    w_half = _wma_series_local(vals, half)
+    w_full = _wma_series_local(vals, period)
+    raw = [None] * n
+    for i in range(n):
+        if w_half[i] is not None and w_full[i] is not None:
+            raw[i] = (2.0 * w_half[i]) - w_full[i]
+    out = [None] * n
+    valid_idx = [i for i, v in enumerate(raw) if v is not None]
+    if len(valid_idx) < root:
+        return out
+    # Os valores válidos de `raw` são contíguos após o warmup.
+    first = valid_idx[0]
+    compact = [float(v) for v in raw[first:] if v is not None]
+    compact_wma = _wma_series_local(compact, root)
+    for j, v in enumerate(compact_wma):
+        if v is not None:
+            out[first + j] = v
+    return out
+
+
+def _kinetic_pulse_indicator(rows, threshold=0.30, cooldown_bars=5):
+    """Volatility Normalized Kinetic Pulse do Pine enviado pelo usuário.
+
+    Reproduz o gatilho original:
+      velocity = close - close[5]
+      acceleration = velocity - velocity[1]
+      normAcc = acceleration / ATR(14)
+      CALL = crossover(normAcc, +0.30) + vela compradora
+      PUT  = crossunder(normAcc, -0.30) + vela vendedora
+      cooldown original = 5 barras.
+
+    O HMA20 e a EMA20 são calculados só para leitura visual, como no Pine.
     """
     rows = list(rows or [])
     n = len(rows)
-    if n < max(45, slow + signal + lb_l + lb_r + 2):
+    need = 24
+    if n < need:
         return {
-            "available": False, "direction": "NEUTRO", "confirmed": False,
-            "reason": f"Coletando candles para MACD Pullback ({n}/45).",
+            "available": False,
+            "direction": "NEUTRO",
+            "confirmed": False,
+            "reason": f"Coletando candles para Kinetic Pulse ({n}/{need}).",
             "non_repaint": True,
+            "cooldown_bars": cooldown_bars,
         }
 
-    closes = [float(x.get("close") or 0.0) for x in rows]
-    lows = [float(x.get("low") or x.get("close") or 0.0) for x in rows]
+    opens = [float(x.get("open") or 0.0) for x in rows]
     highs = [float(x.get("high") or x.get("close") or 0.0) for x in rows]
-    ema_fast = _ema_series_local(closes, fast)
-    ema_slow = _ema_series_local(closes, slow)
-    macd = [a-b for a,b in zip(ema_fast, ema_slow)]
-    signal_line = _ema_series_local(macd, signal)
-    hist = [m-s for m,s in zip(macd, signal_line)]
+    lows = [float(x.get("low") or x.get("close") or 0.0) for x in rows]
+    closes = [float(x.get("close") or 0.0) for x in rows]
 
-    bearish_crosses=[]
-    bullish_crosses=[]
-    for i in range(1,n):
-        if macd[i] < signal_line[i] and macd[i-1] >= signal_line[i-1] and macd[i] > 0 and signal_line[i] > 0:
-            bearish_crosses.append(i)
-        if macd[i] > signal_line[i] and macd[i-1] <= signal_line[i-1] and macd[i] < 0 and signal_line[i] < 0:
-            bullish_crosses.append(i)
+    tr = []
+    for i in range(n):
+        if i == 0:
+            tr.append(max(0.0, highs[i] - lows[i]))
+        else:
+            pc = closes[i - 1]
+            tr.append(max(highs[i] - lows[i], abs(highs[i] - pc), abs(lows[i] - pc)))
+    atr14 = _rma_series_local(tr, 14)
 
-    def pivot_low(idx):
-        if idx-lb_l < 0 or idx+lb_r >= n:
-            return False
-        v=hist[idx]
-        return all(v <= hist[j] for j in range(idx-lb_l, idx+lb_r+1) if j != idx)
+    velocity = [None] * n
+    acceleration = [None] * n
+    norm_acc = [None] * n
+    for i in range(5, n):
+        velocity[i] = closes[i] - closes[i - 5]
+    for i in range(6, n):
+        if velocity[i] is not None and velocity[i - 1] is not None:
+            acceleration[i] = velocity[i] - velocity[i - 1]
+            av = atr14[i]
+            if av is not None and abs(av) > 1e-12:
+                norm_acc[i] = acceleration[i] / av
 
-    def pivot_high(idx):
-        if idx-lb_l < 0 or idx+lb_r >= n:
-            return False
-        v=hist[idx]
-        return all(v >= hist[j] for j in range(idx-lb_l, idx+lb_r+1) if j != idx)
+    cooldown = 0
+    fired_index = None
+    fired_direction = "NEUTRO"
+    last_raw = "NEUTRO"
+    start_i = max(15, 7)
+    for i in range(start_i, n):
+        na = norm_acc[i]
+        prev = norm_acc[i - 1]
+        if na is None or prev is None:
+            if cooldown > 0:
+                cooldown -= 1
+            continue
+        buy = prev <= threshold and na > threshold and closes[i] > opens[i]
+        sell = prev >= -threshold and na < -threshold and closes[i] < opens[i]
+        raw_dir = "CALL" if buy else ("PUT" if sell else "NEUTRO")
+        if i == n - 1:
+            last_raw = raw_dir
+        if cooldown <= 0:
+            if raw_dir != "NEUTRO":
+                fired_index = i
+                fired_direction = raw_dir
+                cooldown = int(cooldown_bars)
+        else:
+            cooldown -= 1
 
-    pl=[i for i in range(lb_l,n-lb_r) if pivot_low(i)]
-    ph=[i for i in range(lb_l,n-lb_r) if pivot_high(i)]
-    bull_div_confirm=[]
-    bear_div_confirm=[]
-    for prev,cur in zip(pl,pl[1:]):
-        dist=cur-prev
-        if range_low <= dist <= range_high and lows[cur] < lows[prev] and hist[cur] > hist[prev]:
-            bull_div_confirm.append(cur+lb_r)
-    for prev,cur in zip(ph,ph[1:]):
-        dist=cur-prev
-        if range_low <= dist <= range_high and highs[cur] > highs[prev] and hist[cur] < hist[prev]:
-            bear_div_confirm.append(cur+lb_r)
+    i = n - 1
+    na = float(norm_acc[i] or 0.0)
+    prev_na = float(norm_acc[i - 1] or 0.0)
+    vel = float(velocity[i] or 0.0)
+    acc = float(acceleration[i] or 0.0)
+    av = float(atr14[i] or 0.0)
+    bullish_candle = closes[i] > opens[i]
+    bearish_candle = closes[i] < opens[i]
+    raw_call = prev_na <= threshold and na > threshold and bullish_candle
+    raw_put = prev_na >= -threshold and na < -threshold and bearish_candle
 
-    last=n-1
-    recent_bear_cross = bool(bearish_crosses and last-bearish_crosses[-1] <= lookback)
-    recent_bull_cross = bool(bullish_crosses and last-bullish_crosses[-1] <= lookback)
-    recent_bull_div = bool(bull_div_confirm and last-bull_div_confirm[-1] <= 30)
-    recent_bear_div = bool(bear_div_confirm and last-bear_div_confirm[-1] <= 30)
-    hist_bull = hist[last] > 0 and hist[last] > hist[last-1]
-    hist_bear = hist[last] < 0 and hist[last] < hist[last-1]
-    macd_cross_up_zero = macd[last] > 0 and macd[last-1] <= 0
-    macd_cross_down_zero = macd[last] < 0 and macd[last-1] >= 0
-
-    bull = hist_bull and macd_cross_up_zero and recent_bear_cross and recent_bull_div
-    bear = hist_bear and macd_cross_down_zero and recent_bull_cross and recent_bear_div
-    direction = "CALL" if bull else ("PUT" if bear else "NEUTRO")
-    confirmed = direction in ("CALL","PUT")
-
+    direction = fired_direction if fired_index == i else "NEUTRO"
+    confirmed = direction in ("CALL", "PUT")
     if confirmed:
-        reason=(
-            f"{direction}: pullback MACD recente + histograma retomando força + cruzamento da linha zero + "
-            f"divergência regular confirmada por pivô."
+        strength = min(12.0, max(0.0, abs(na) - threshold) * 18.0)
+        confidence = clamp(76.0 + strength, 76.0, 90.0)
+        reason = (
+            f"{direction} Kinetic: normAcc {na:.3f} cruzou "
+            f"{'+' if direction == 'CALL' else '-'}{threshold:.2f}, "
+            f"com vela {'compradora' if direction == 'CALL' else 'vendedora'}; cooldown original de {cooldown_bars} velas."
         )
     else:
-        blockers=[]
-        if not (hist_bull or hist_bear): blockers.append("histograma sem retomada completa")
-        if not (macd_cross_up_zero or macd_cross_down_zero): blockers.append("MACD ainda não cruzou a linha zero nesta vela fechada")
-        if not (recent_bear_cross or recent_bull_cross): blockers.append("sem pullback MACD recente")
-        if not (recent_bull_div or recent_bear_div): blockers.append("sem divergência regular recente confirmada")
-        reason="MACD Pullback monitorando: "+", ".join(blockers[:4])+"."
+        confidence = 0.0
+        if last_raw != "NEUTRO" and fired_index != i:
+            reason = f"Kinetic Pulse: gatilho {last_raw} bloqueado pelo cooldown original de {cooldown_bars} velas."
+        else:
+            side = "subindo" if na > prev_na else ("caindo" if na < prev_na else "estável")
+            reason = f"Kinetic Pulse monitorando: normAcc {na:.3f} ({side}); gatilhos em +{threshold:.2f} / -{threshold:.2f}."
+
+    ema20_series = _ema_series_local(closes, 20)
+    hma20_series = _hma_series_local(closes, 20)
+    ema20 = ema20_series[-1] if ema20_series else None
+    hma20 = hma20_series[-1] if hma20_series else None
 
     return {
         "available": True,
         "direction": direction,
         "confirmed": confirmed,
-        "confidence": (82.0 if confirmed else 0.0),
+        "confidence": round(float(confidence), 1),
         "reason": reason[:320],
         "non_repaint": True,
-        "macd": round(macd[last], 10),
-        "signal": round(signal_line[last], 10),
-        "hist": round(hist[last], 10),
-        "hist_prev": round(hist[last-1], 10),
-        "hist_rising": bool(hist[last] > hist[last-1]),
-        "hist_bullish": bool(hist_bull),
-        "hist_bearish": bool(hist_bear),
-        "macd_prev": round(macd[last-1], 10),
-        "macd_rising": bool(macd[last] > macd[last-1]),
-        "macd_falling": bool(macd[last] < macd[last-1]),
-        "recent_bearish_pullback": recent_bear_cross,
-        "recent_bullish_pullback": recent_bull_cross,
-        "recent_bullish_divergence": recent_bull_div,
-        "recent_bearish_divergence": recent_bear_div,
-        "macd_cross_up_zero": macd_cross_up_zero,
-        "macd_cross_down_zero": macd_cross_down_zero,
-        "pivot_right_confirmation": lb_r,
-        "sr_filter_enabled": False,
-        "bb_filter_enabled": False,
+        "threshold": float(threshold),
+        "cooldown_bars": int(cooldown_bars),
+        "cooldown_remaining": int(max(0, cooldown)),
+        "velocity": round(vel, 10),
+        "acceleration": round(acc, 10),
+        "atr14": round(av, 10),
+        "norm_acc": round(na, 10),
+        "norm_acc_prev": round(prev_na, 10),
+        "norm_acc_rising": bool(na > prev_na),
+        "norm_acc_falling": bool(na < prev_na),
+        "bullish_candle": bool(bullish_candle),
+        "bearish_candle": bool(bearish_candle),
+        "raw_call_trigger": bool(raw_call),
+        "raw_put_trigger": bool(raw_put),
+        "ema20": round(float(ema20 or 0.0), 10),
+        "hma20": round(float(hma20 or 0.0), 10),
     }
-
 
 def velocity_flow_strategy(cs, timeframe="1min", market="OPEN"):
     """MR Mt4 (Ultra Fast) / Velocity Flow adaptado para o MEGA IA.
@@ -7768,7 +7843,6 @@ def velocity_flow_strategy(cs, timeframe="1min", market="OPEN"):
 
     ema9 = ema(closes, 9)
     sma21 = sma(closes, 21)
-    macd_pullback = _macd_pullback_validation_indicator(rows)
     return {
         "available": True,
         "direction": direction,
@@ -7784,7 +7858,7 @@ def velocity_flow_strategy(cs, timeframe="1min", market="OPEN"):
         "martingale": False,
         "non_repaint": True,
         "cooldown_bars": VELOCITY_COOLDOWN_BARS,
-        "indicators": {"macd_pullback": macd_pullback},
+        "indicators": {},
         "diagnostics": {
             "ema9": round(float(ema9 or 0), 10),
             "sma21": round(float(sma21 or 0), 10),
@@ -13134,18 +13208,18 @@ async def ai_analysis(request: Request, symbol: str = "EUR/USD", interval: str =
     return {k: data.get(k) for k in public_keys}
 
 
-@app.get("/macd-pullback")
-async def macd_pullback_indicator_api(
+@app.get("/kinetic-pulse")
+async def kinetic_pulse_indicator_api(
     request: Request,
     symbol: str = "EUR/USD",
     interval: str = "1min",
     market: str = "OPEN",
 ):
-    """Indicador MACD Pullback independente do motor Velocity.
+    """Segundo indicador: Volatility Normalized Kinetic Pulse.
 
-    Reutiliza o mesmo roteador/cache de candles do app e só faz leitura quando
-    o usuário deixa o indicador ONLINE. Não publica ordem nem altera o motor
-    selecionado no painel principal.
+    É independente do Velocity Flow de cima. Reutiliza o mesmo roteador/cache
+    de candles, usa o gatilho original do Pine e só roda quando o usuário deixa
+    o segundo indicador ONLINE no navegador.
     """
     requested_market = str(market or "OPEN").upper()
     if interval not in INTERVALS or not _symbol_allowed(symbol, requested_market):
@@ -13153,7 +13227,7 @@ async def macd_pullback_indicator_api(
     if requested_market not in ("OPEN", "IQ_OTC"):
         return {
             "available": False, "direction": "NEUTRO", "confirmed": False,
-            "reason": "MACD Pullback disponível em Mercado Aberto e IQ OTC.",
+            "reason": "Kinetic Pulse disponível em Mercado Aberto e IQ OTC.",
             "symbol": symbol, "interval": interval, "market": requested_market,
         }
 
@@ -13162,7 +13236,7 @@ async def macd_pullback_indicator_api(
         if not state:
             return {
                 "available": False, "direction": "NEUTRO", "confirmed": False,
-                "reason": "Conecte a IQ Option para o MACD Pullback analisar OTC real.",
+                "reason": "Conecte a IQ Option para o Kinetic Pulse analisar OTC real.",
                 "symbol": symbol, "interval": interval, "market": requested_market,
             }
         raw = await iq_ea_candles(state, symbol, interval, 120, regular_market=False)
@@ -13171,118 +13245,89 @@ async def macd_pullback_indicator_api(
         raw = await candles(symbol, interval, 120, "OPEN", None, request=request)
         feed_source = _feed_source_from_rows(raw) or "MULTIFEED"
 
-    if len(raw) < 2:
+    if len(raw) < 8:
         return {
             "available": False, "direction": "NEUTRO", "confirmed": False,
-            "reason": "Aguardando candles para calcular o MACD Pullback.",
+            "reason": "Aguardando candles para calcular o Kinetic Pulse.",
             "symbol": symbol, "interval": interval, "market": requested_market,
             "feed_source": feed_source,
         }
 
-    # O sinal oficial usa somente velas fechadas. O pré-alerta pode observar a
-    # vela atual, mas nunca é tratado como confirmação nem como ordem.
+    # Sinal confirmado = somente candles fechados. O pré-alerta observa a
+    # vela em formação para preparar a entrada da próxima vela.
     closed = raw[:-1]
-    result = _macd_pullback_validation_indicator(closed[-120:])
-    live = _macd_pullback_validation_indicator(raw[-120:])
+    result = _kinetic_pulse_indicator(closed[-120:])
+    live = _kinetic_pulse_indicator(raw[-120:])
 
     pre_dir = "NEUTRO"
     pre_score = 0
-    pre_reason = "MACD moderado monitorando: precisa de 3/4 condições para soltar o pré-alerta."
+    pre_reason = "Kinetic Pulse monitorando aceleração normalizada."
     if live.get("available"):
-        macd_now = float(live.get("macd") or 0.0)
-        macd_prev = float(live.get("macd_prev") or 0.0)
-        hist_now = float(live.get("hist") or 0.0)
-        hist_prev = float(live.get("hist_prev") or 0.0)
+        norm_now = float(live.get("norm_acc") or 0.0)
+        norm_prev = float(live.get("norm_acc_prev") or 0.0)
+        vel_now = float(live.get("velocity") or 0.0)
+        threshold = float(live.get("threshold") or 0.30)
+        cooldown_remaining = int(live.get("cooldown_remaining") or 0)
+        current = raw[-1] if raw else {}
+        o = float(current.get("open") or 0.0)
+        c = float(current.get("close") or 0.0)
+        call_candle = c > o
+        put_candle = c < o
 
-        # PERFIL FROUXO — SOMENTE PARA O SEGUNDO INDICADOR.
-        # O Velocity Flow de cima não usa este bloco e permanece intocado.
-        # O sinal final do MACD também continua com as regras originais/rigorosas;
-        # aqui apenas antecipamos o aviso usando 3 de 4 evidências de formação.
-        zero_band = max(abs(hist_now) * 4.5, abs(hist_prev) * 4.0, abs(macd_prev) * 0.75, 1e-12)
-        near_zero = abs(macd_now) <= zero_band
+        # Pré-alerta do segundo motor: mais cedo que o gatilho final, mas ainda
+        # coerente com o script. 0.22 aproxima o limiar original 0.30 sem liberar
+        # sinais completamente fora da região cinética.
+        approach = max(0.18, threshold * 0.73)
+        call_score = int(norm_now >= approach) + int(norm_now > norm_prev) + int(vel_now > 0) + int(call_candle)
+        put_score = int(norm_now <= -approach) + int(norm_now < norm_prev) + int(vel_now < 0) + int(put_candle)
 
-        call_hist = hist_now > hist_prev
-        put_hist = hist_now < hist_prev
-        call_macd = macd_now > macd_prev
-        put_macd = macd_now < macd_prev
-
-        call_pullback = bool(live.get("recent_bearish_pullback"))
-        put_pullback = bool(live.get("recent_bullish_pullback"))
-        call_div = bool(live.get("recent_bullish_divergence"))
-        put_div = bool(live.get("recent_bearish_divergence"))
-
-        # Contexto de zona: serve como bônus, não como trava obrigatória.
-        call_zone = bool(macd_now <= 0 or near_zero or call_pullback or call_div)
-        put_zone = bool(macd_now >= 0 or near_zero or put_pullback or put_div)
-
-        live_candle = raw[-1] if raw else {}
-        live_open = float(live_candle.get("open") or 0.0)
-        live_close = float(live_candle.get("close") or 0.0)
-        call_candle = live_close > live_open
-        put_candle = live_close < live_open
-
-        call_score = int(call_hist) + int(call_macd) + int(call_zone) + int(call_candle)
-        put_score = int(put_hist) + int(put_macd) + int(put_zone) + int(put_candle)
-
-        final_live = str(live.get("direction") or "").upper()
-        if final_live == "CALL":
+        live_dir = str(live.get("direction") or "NEUTRO").upper()
+        if cooldown_remaining > 0 and live_dir == "NEUTRO":
+            pre_reason = f"Kinetic Pulse em cooldown: {cooldown_remaining} vela(s) restante(s)."
+        elif live_dir == "CALL":
             pre_dir = "CALL"
             pre_score = 4
-            pre_reason = "PRÉ-CALL: compra já alinhada na vela atual; confirmação final aguarda fechamento."
-        elif final_live == "PUT":
+            pre_reason = f"PRÉ-CALL: normAcc cruzou +{threshold:.2f} com vela compradora."
+        elif live_dir == "PUT":
             pre_dir = "PUT"
             pre_score = 4
-            pre_reason = "PRÉ-PUT: venda já alinhada na vela atual; confirmação final aguarda fechamento."
-        elif call_score >= 3 and call_score > put_score:
+            pre_reason = f"PRÉ-PUT: normAcc cruzou -{threshold:.2f} com vela vendedora."
+        elif cooldown_remaining <= 0 and call_score >= 3 and call_score > put_score:
             pre_dir = "CALL"
             pre_score = call_score
             detalhes = []
-            if call_hist: detalhes.append("histograma acelerando")
-            if call_macd: detalhes.append("MACD subindo")
-            if call_zone: detalhes.append("zona favorável")
+            if norm_now >= approach: detalhes.append(f"normAcc {norm_now:.3f}")
+            if norm_now > norm_prev: detalhes.append("aceleração subindo")
+            if vel_now > 0: detalhes.append("velocidade positiva")
             if call_candle: detalhes.append("vela compradora")
-            pre_reason = "PRÉ-CALL FROUXO: " + " + ".join(detalhes[:4]) + "."
-        elif put_score >= 3 and put_score > call_score:
+            pre_reason = "PRÉ-CALL Kinetic: " + " + ".join(detalhes[:4]) + "."
+        elif cooldown_remaining <= 0 and put_score >= 3 and put_score > call_score:
             pre_dir = "PUT"
             pre_score = put_score
             detalhes = []
-            if put_hist: detalhes.append("histograma enfraquecendo")
-            if put_macd: detalhes.append("MACD caindo")
-            if put_zone: detalhes.append("zona favorável")
+            if norm_now <= -approach: detalhes.append(f"normAcc {norm_now:.3f}")
+            if norm_now < norm_prev: detalhes.append("aceleração caindo")
+            if vel_now < 0: detalhes.append("velocidade negativa")
             if put_candle: detalhes.append("vela vendedora")
-            pre_reason = "PRÉ-PUT FROUXO: " + " + ".join(detalhes[:4]) + "."
-        elif call_score >= 3 and put_score >= 3:
-            # Empate: usamos a inclinação conjunta MACD/histograma para desempatar.
-            if call_hist and call_macd and not (put_hist and put_macd):
-                pre_dir = "CALL"
-                pre_score = call_score
-                pre_reason = "PRÉ-CALL FROUXO: MACD e histograma virando para cima."
-            elif put_hist and put_macd and not (call_hist and call_macd):
-                pre_dir = "PUT"
-                pre_score = put_score
-                pre_reason = "PRÉ-PUT FROUXO: MACD e histograma virando para baixo."
+            pre_reason = "PRÉ-PUT Kinetic: " + " + ".join(detalhes[:4]) + "."
 
     current = raw[-1] if raw else {}
     last_closed = closed[-1] if closed else {}
     pre_candle = current.get("datetime") or current.get("timestamp") or current.get("time") or current.get("from") or ""
     confirmed_candle = last_closed.get("datetime") or last_closed.get("timestamp") or last_closed.get("time") or last_closed.get("from") or ""
 
-    # Horário oficial do pré-alerta: usa a próxima fronteira REAL do servidor,
-    # não o timestamp do último candle recebido. Assim um feed atrasado nunca
-    # cria entrada no passado nem deixa o cronograma sem horário.
     step_seconds = int(INTERVALS.get(interval, 60))
     now_epoch = int(now().timestamp())
     next_epoch = ((now_epoch // step_seconds) + 1) * step_seconds
     pre_entry_dt = datetime.fromtimestamp(next_epoch, tz=UTC).astimezone(BR_TZ)
     pre_expiry_dt = pre_entry_dt + timedelta(seconds=step_seconds)
 
-    # 3.74: a rota apenas informa o pré-alerta bruto.
-    # A operação oficial só é registrada depois que o navegador confirma
-    # 2 leituras seguidas na mesma direção e respeita o cooldown de 3 velas.
-
     result.update({
-        "symbol": symbol, "interval": interval, "market": requested_market,
-        "feed_source": feed_source, "standalone": True,
+        "symbol": symbol,
+        "interval": interval,
+        "market": requested_market,
+        "feed_source": feed_source,
+        "standalone": True,
         "updated_at": iso(now()),
         "prealert_active": pre_dir in ("CALL", "PUT"),
         "prealert_direction": pre_dir,
@@ -13293,16 +13338,17 @@ async def macd_pullback_indicator_api(
         "prealert_expiry_time": iso(pre_expiry_dt),
         "seconds_to_entry": max(0, int((pre_entry_dt - now()).total_seconds())),
         "confirmed_candle": str(confirmed_candle),
-        "preview_macd": live.get("macd"),
-        "preview_signal": live.get("signal"),
-        "preview_hist": live.get("hist"),
+        "preview_norm_acc": live.get("norm_acc"),
+        "preview_norm_acc_prev": live.get("norm_acc_prev"),
+        "preview_velocity": live.get("velocity"),
+        "preview_acceleration": live.get("acceleration"),
     })
     return result
 
 
-@app.post("/macd-pullback-register")
-async def macd_pullback_register(request: Request):
-    """Registra no servidor somente o sinal MACD já liberado pelo gate 3.74."""
+@app.post("/kinetic-pulse-register")
+async def kinetic_pulse_register(request: Request):
+    """Registra o sinal oficial do segundo Kinetic para WIN/LOSS do app."""
     try:
         payload = await request.json()
     except Exception:
@@ -13330,12 +13376,11 @@ async def macd_pullback_register(request: Request):
         "direction": direction,
         "entry_time": payload.get("entry_time"),
         "expiry_time": payload.get("expiry_time"),
-        "source": "MACD_PULLBACK_PREALERT",
-        "strategy": "MACD_PULLBACK_PREALERT_3_OF_4_STABLE",
+        "source": "KINETIC_PULSE_ALERT",
+        "strategy": "KINETIC_PULSE_ORIGINAL",
     }
     _remember_accounting_signal(request, item)
     return {"ok": True, "registered": True}
-
 
 
 def _moment_ea_key(market: str, symbol: str, interval: str) -> str:
@@ -15563,19 +15608,19 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
         <div>
           <div class="label">📐 INDICADORES</div>
-          <h3 style="margin:4px 0 0">🎯 MACD Pullback + Divergência</h3>
+          <h3 style="margin:4px 0 0">🎯 Volatility Normalized Kinetic Pulse</h3>
         </div>
-        <button id="macdPullbackPowerBtn" type="button" style="font-weight:1000;min-width:135px">🔴 OFFLINE</button>
+        <button id="kineticPulsePowerBtn" type="button" style="font-weight:1000;min-width:135px">🔴 OFFLINE</button>
       </div>
-      <div class="label" style="margin-top:8px;line-height:1.45">Versão corrigida • sinal oficial em vela fechada • pré-alerta observa a vela atual • pivô só vale depois da confirmação • usa o mesmo roteador/cache de candles do app.</div>
+      <div class="label" style="margin-top:8px;line-height:1.45">Script Kinetic Pulse • velocity/acceleration normalizados pelo ATR14 • gatilho original ±0,30 • cooldown original de 5 velas • usa o mesmo roteador/cache de candles do app.</div>
       <div class="grid" style="margin-top:10px">
-        <div class="card" style="padding:10px"><div class="label">🔔 PRÉ-ALERTA</div><div id="macdPullbackPreAlert" class="big neutral" style="font-size:16px">OFFLINE</div><small id="macdPullbackPreReason">Ative o indicador para acompanhar.</small></div>
-        <div class="card" style="padding:10px"><div class="label">🟢 PRÉ-CALL</div><div id="macdPullbackPreCall" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível compra com 3/4 condições de formação</small></div>
-        <div class="card" style="padding:10px"><div class="label">🔴 PRÉ-PUT</div><div id="macdPullbackPrePut" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível venda com 3/4 condições de formação</small></div>
-        <div class="card" style="padding:10px"><div class="label">SINAL CONFIRMADO</div><div id="macdPullbackState" class="big neutral" style="font-size:18px">OFFLINE</div><small id="macdPullbackReason">Ative o indicador para acompanhar.</small></div>
-        <div class="card" style="padding:10px"><div class="label">MACD / SIGNAL</div><div id="macdPullbackLines" class="big" style="font-size:15px">--</div><small>Cruzamento e linha zero</small></div>
-        <div class="card" style="padding:10px"><div class="label">HISTOGRAMA</div><div id="macdPullbackHist" class="big" style="font-size:15px">--</div><small>Momentum positivo/negativo e aceleração</small></div>
-        <div class="card" style="padding:10px"><div class="label">PULLBACK / DIVERGÊNCIA</div><div id="macdPullbackContext" class="big" style="font-size:14px">--</div><small>Pivôs confirmados sem retroceder sinal</small></div>
+        <div class="card" style="padding:10px"><div class="label">🔔 PRÉ-ALERTA</div><div id="kineticPulsePreAlert" class="big neutral" style="font-size:16px">OFFLINE</div><small id="kineticPulsePreReason">Ative o indicador para acompanhar.</small></div>
+        <div class="card" style="padding:10px"><div class="label">🟢 PRÉ-CALL</div><div id="kineticPulsePreCall" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível compra quando a aceleração se aproxima do gatilho +0,30</small></div>
+        <div class="card" style="padding:10px"><div class="label">🔴 PRÉ-PUT</div><div id="kineticPulsePrePut" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível venda quando a aceleração se aproxima do gatilho -0,30</small></div>
+        <div class="card" style="padding:10px"><div class="label">SINAL CONFIRMADO</div><div id="kineticPulseState" class="big neutral" style="font-size:18px">OFFLINE</div><small id="kineticPulseReason">Ative o indicador para acompanhar.</small></div>
+        <div class="card" style="padding:10px"><div class="label">NORM ACC</div><div id="kineticPulseLines" class="big" style="font-size:15px">--</div><small>Gatilhos originais: CALL +0,30 • PUT -0,30</small></div>
+        <div class="card" style="padding:10px"><div class="label">VELOCIDADE / ACELERAÇÃO</div><div id="kineticPulseHist" class="big" style="font-size:15px">--</div><small>close-close[5] e variação da velocidade</small></div>
+        <div class="card" style="padding:10px"><div class="label">HMA 20 / EMA 20</div><div id="kineticPulseContext" class="big" style="font-size:14px">--</div><small>Leitura visual do script; não é gatilho de entrada</small></div>
       </div>
     </div>
 
@@ -16050,16 +16095,16 @@ const velocityOriginalState=document.getElementById('velocityOriginalState');
 const velocityPreAlertState=document.getElementById('velocityPreAlertState');
 const velocityPreCallState=document.getElementById('velocityPreCallState');
 const velocityPrePutState=document.getElementById('velocityPrePutState');
-const macdPullbackPowerBtn=document.getElementById('macdPullbackPowerBtn');
-const macdPullbackState=document.getElementById('macdPullbackState');
-const macdPullbackReason=document.getElementById('macdPullbackReason');
-const macdPullbackLines=document.getElementById('macdPullbackLines');
-const macdPullbackHist=document.getElementById('macdPullbackHist');
-const macdPullbackContext=document.getElementById('macdPullbackContext');
-const macdPullbackPreAlert=document.getElementById('macdPullbackPreAlert');
-const macdPullbackPreCall=document.getElementById('macdPullbackPreCall');
-const macdPullbackPrePut=document.getElementById('macdPullbackPrePut');
-const macdPullbackPreReason=document.getElementById('macdPullbackPreReason');
+const kineticPulsePowerBtn=document.getElementById('kineticPulsePowerBtn');
+const kineticPulseState=document.getElementById('kineticPulseState');
+const kineticPulseReason=document.getElementById('kineticPulseReason');
+const kineticPulseLines=document.getElementById('kineticPulseLines');
+const kineticPulseHist=document.getElementById('kineticPulseHist');
+const kineticPulseContext=document.getElementById('kineticPulseContext');
+const kineticPulsePreAlert=document.getElementById('kineticPulsePreAlert');
+const kineticPulsePreCall=document.getElementById('kineticPulsePreCall');
+const kineticPulsePrePut=document.getElementById('kineticPulsePrePut');
+const kineticPulsePreReason=document.getElementById('kineticPulsePreReason');
 const velocityBreakout=document.getElementById('velocityBreakout');
 const velocityDmi=document.getElementById('velocityDmi');
 const velocityRsi=document.getElementById('velocityRsi');
@@ -16098,35 +16143,35 @@ let forceEnabled=false;
 let bigriseEnabled=false;
 let larryEnabled=false;
 let velocityEnabled=false;
-let macdPullbackEnabled=false;
-let macdPullbackBusy=false;
-let lastMacdPreAlertKey='';
-let lastMacdConfirmedKey='';
-let lastMacdOfficialEntryKey='';
-let lastMacdOfficialSentAt=0;
-let macdOfficialActiveSignal=null;
-let lastMacdPullbackData=null;
-// 3.74 — o segundo indicador fica moderado: exige 3/4 condições,
-// mesma direção em 2 leituras consecutivas e cooldown mínimo de 3 velas.
+let kineticPulseEnabled=false;
+let kineticPulseBusy=false;
+let lastKineticPreAlertKey='';
+let lastKineticConfirmedKey='';
+let lastKineticOfficialEntryKey='';
+let lastKineticOfficialSentAt=0;
+let kineticOfficialActiveSignal=null;
+let lastKineticPulseData=null;
+// 3.75 — segundo indicador substituído pelo Kinetic Pulse original,
+// com pré-alerta estável e cooldown original de 5 velas.
 // O Velocity original permanece intocado.
-let macdPreCandidateDir='';
-let macdPreCandidateCount=0;
-let macdPreCandidateSampleKey='';
-let macdLastOfficialEntryMs=0;
-const MACD_PRE_STABILITY_READS=2;
-const MACD_PRE_COOLDOWN_CANDLES=3;
+let kineticPreCandidateDir='';
+let kineticPreCandidateCount=0;
+let kineticPreCandidateSampleKey='';
+let kineticLastOfficialEntryMs=0;
+const KINETIC_PRE_STABILITY_READS=2;
+const KINETIC_PRE_COOLDOWN_CANDLES=5;
 try{
-  macdLastOfficialEntryMs=Number(localStorage.getItem('mega_macd_last_official_entry_ms')||0)||0;
+  kineticLastOfficialEntryMs=Number(localStorage.getItem('mega_kinetic_last_official_entry_ms')||0)||0;
 }catch(_){
-  macdLastOfficialEntryMs=0;
+  kineticLastOfficialEntryMs=0;
 }
-let macdMainPreview=null;
-let macdMainPreviewUntil=0;
-let macdMainPreviewShowing=false;
+let kineticMainPreview=null;
+let kineticMainPreviewUntil=0;
+let kineticMainPreviewShowing=false;
 let lastVelocityData=null;
 let lastVelocityDataAt=0;
 try{
-  macdPullbackEnabled=localStorage.getItem('mega_macd_pullback_power')==='ONLINE';
+  kineticPulseEnabled=localStorage.getItem('mega_kinetic_pulse_power')==='ONLINE';
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
   aiEnabled=localStorage.getItem('mega_ai_power')==='ONLINE';
   const legacyEaOnline=localStorage.getItem('mega_ea_power')==='ONLINE';
@@ -19737,56 +19782,56 @@ function setVelocityTopPreAlert(items, remain){
   }
 }
 
-function applyMacdPullbackPowerState(){
-  if(macdPullbackPowerBtn){
-    macdPullbackPowerBtn.textContent=macdPullbackEnabled?'🟢 ONLINE':'🔴 OFFLINE';
-    macdPullbackPowerBtn.style.background=macdPullbackEnabled?'#0b7a3d':'#7d1d1d';
-    macdPullbackPowerBtn.style.color='#fff';
-    macdPullbackPowerBtn.style.borderColor=macdPullbackEnabled?'#16c56b':'#ff5252';
+function applyKineticPulsePowerState(){
+  if(kineticPulsePowerBtn){
+    kineticPulsePowerBtn.textContent=kineticPulseEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    kineticPulsePowerBtn.style.background=kineticPulseEnabled?'#0b7a3d':'#7d1d1d';
+    kineticPulsePowerBtn.style.color='#fff';
+    kineticPulsePowerBtn.style.borderColor=kineticPulseEnabled?'#16c56b':'#ff5252';
   }
 }
 
-function macdHasConfirmedMainSignal(){
+function kineticHasConfirmedMainSignal(){
   const d=String((cur&&cur.direction)||'NEUTRO').toUpperCase();
   if(d!=='CALL' && d!=='PUT') return false;
   const exp=Date.parse(String((cur&&cur.expiry_time)||''));
   return !Number.isFinite(exp) || exp>Date.now()+1000;
 }
 
-function clearMacdMainPreview(){
-  macdMainPreview=null;
-  macdMainPreviewUntil=0;
-  macdMainPreviewShowing=false;
+function clearKineticMainPreview(){
+  kineticMainPreview=null;
+  kineticMainPreviewUntil=0;
+  kineticMainPreviewShowing=false;
 }
 
-function evaluateMacdPreAlertGate(mp){
+function evaluateKineticPreAlertGate(mp){
   const dir=String((mp&&mp.prealert_direction)||'NEUTRO').toUpperCase();
   const score=Math.max(0,Math.min(4,Number((mp&&mp.prealert_score)||0)));
   const rawActive=Boolean(mp&&mp.prealert_active) && (dir==='CALL'||dir==='PUT') && score>=3;
 
   if(!rawActive){
-    macdPreCandidateDir='';
-    macdPreCandidateCount=0;
-    macdPreCandidateSampleKey='';
+    kineticPreCandidateDir='';
+    kineticPreCandidateCount=0;
+    kineticPreCandidateSampleKey='';
     return {active:false,rawActive:false,dir:'NEUTRO',score:score,count:0,cooldown:false,candlesLeft:0};
   }
 
-  const sampleKey=[String(mp.updated_at||''),String(mp.prealert_entry_time||''),dir,String(score),String(mp.preview_macd||''),String(mp.preview_hist||'')].join('|');
-  if(sampleKey!==macdPreCandidateSampleKey){
-    macdPreCandidateSampleKey=sampleKey;
-    if(dir===macdPreCandidateDir){
-      macdPreCandidateCount=Math.min(9,macdPreCandidateCount+1);
+  const sampleKey=[String(mp.updated_at||''),String(mp.prealert_entry_time||''),dir,String(score),String(mp.preview_norm_acc||''),String(mp.preview_velocity||'')].join('|');
+  if(sampleKey!==kineticPreCandidateSampleKey){
+    kineticPreCandidateSampleKey=sampleKey;
+    if(dir===kineticPreCandidateDir){
+      kineticPreCandidateCount=Math.min(9,kineticPreCandidateCount+1);
     }else{
-      macdPreCandidateDir=dir;
-      macdPreCandidateCount=1;
+      kineticPreCandidateDir=dir;
+      kineticPreCandidateCount=1;
     }
   }
 
-  const stable=macdPreCandidateCount>=MACD_PRE_STABILITY_READS;
+  const stable=kineticPreCandidateCount>=KINETIC_PRE_STABILITY_READS;
   const entryMs=Date.parse(String(mp.prealert_entry_time||''));
   const stepMs=Math.max(60000,intervalSecondsValue(String(mp.interval||((interval&&interval.value)||'1min')))*1000);
-  const sameCurrentSignal=Number.isFinite(entryMs) && macdLastOfficialEntryMs>0 && entryMs===macdLastOfficialEntryMs;
-  const nextAllowedMs=macdLastOfficialEntryMs>0 ? macdLastOfficialEntryMs+(MACD_PRE_COOLDOWN_CANDLES*stepMs) : 0;
+  const sameCurrentSignal=Number.isFinite(entryMs) && kineticLastOfficialEntryMs>0 && entryMs===kineticLastOfficialEntryMs;
+  const nextAllowedMs=kineticLastOfficialEntryMs>0 ? kineticLastOfficialEntryMs+(KINETIC_PRE_COOLDOWN_CANDLES*stepMs) : 0;
   const cooldown=Number.isFinite(entryMs) && nextAllowedMs>0 && !sameCurrentSignal && entryMs<nextAllowedMs;
   const candlesLeft=cooldown?Math.max(1,Math.ceil((nextAllowedMs-entryMs)/stepMs)):0;
 
@@ -19795,7 +19840,7 @@ function evaluateMacdPreAlertGate(mp){
     rawActive:true,
     dir:dir,
     score:score,
-    count:macdPreCandidateCount,
+    count:kineticPreCandidateCount,
     stable:stable,
     cooldown:cooldown,
     candlesLeft:candlesLeft,
@@ -19803,16 +19848,16 @@ function evaluateMacdPreAlertGate(mp){
   };
 }
 
-function paintMacdPreAlertOnMain(mp, withArrow=true){
-  if(!macdPullbackEnabled || !mp) return false;
+function paintKineticPreAlertOnMain(mp, withArrow=true){
+  if(!kineticPulseEnabled || !mp) return false;
   const preDir=String(mp.prealert_direction||'NEUTRO').toUpperCase();
   if(!Boolean(mp.prealert_active) || (preDir!=='CALL' && preDir!=='PUT')) return false;
   // Um sinal confirmado do motor principal sempre tem prioridade visual.
-  if(macdHasConfirmedMainSignal()) return false;
+  if(kineticHasConfirmedMainSignal()) return false;
 
   const isCall=preDir==='CALL';
   const score=Math.max(0,Math.min(4,Number(mp.prealert_score||0)));
-  macdMainPreview={
+  kineticMainPreview={
     direction:preDir,
     score:score,
     reason:String(mp.prealert_reason||''),
@@ -19824,25 +19869,25 @@ function paintMacdPreAlertOnMain(mp, withArrow=true){
   };
   // O endpoint é lido a cada 12 s. Mantemos o visual vivo um pouco além disso
   // para o polling normal de 5 s não apagar o pré-alerta da tela.
-  macdMainPreviewUntil=Date.now()+18000;
-  macdMainPreviewShowing=true;
+  kineticMainPreviewUntil=Date.now()+18000;
+  kineticMainPreviewShowing=true;
 
   direction.textContent=isCall?'PRÉ-CALL':'PRÉ-PUT';
   direction.className='big '+(isCall?'call':'put');
-  confidence.textContent='MACD frouxo • formação '+score+'/4';
-  const macdEntryTime=String(mp.prealert_entry_time||'');
-  const macdEntryLabel=macdEntryTime?ft(macdEntryTime):'--:--:--';
-  entry.textContent=macdEntryLabel;
-  if(entryScheduleLabel) entryScheduleLabel.textContent='⏱ CRONOGRAMA • MACD • PRÓXIMA VELA';
-  countdown.textContent=(isCall?'Possível COMPRA':'Possível VENDA')+' • entrada '+macdEntryLabel;
-  const macdExpiryLabel=mp.prealert_expiry_time?ft(mp.prealert_expiry_time):'--:--:--';
-  if(expiryCountdown) expiryCountdown.textContent='⏱ EXPIRAÇÃO: '+macdExpiryLabel;
-  statusBox.textContent='🎯 MACD PULLBACK • '+(isCall?'PRÉ-CALL':'PRÉ-PUT')+' • '+(isCall?'POSSÍVEL COMPRA':'POSSÍVEL VENDA')+' • ENTRADA '+macdEntryLabel;
+  confidence.textContent='Kinetic Pulse • formação '+score+'/4';
+  const kineticEntryTime=String(mp.prealert_entry_time||'');
+  const kineticEntryLabel=kineticEntryTime?ft(kineticEntryTime):'--:--:--';
+  entry.textContent=kineticEntryLabel;
+  if(entryScheduleLabel) entryScheduleLabel.textContent='⏱ CRONOGRAMA • KINETIC • PRÓXIMA VELA';
+  countdown.textContent=(isCall?'Possível COMPRA':'Possível VENDA')+' • entrada '+kineticEntryLabel;
+  const kineticExpiryLabel=mp.prealert_expiry_time?ft(mp.prealert_expiry_time):'--:--:--';
+  if(expiryCountdown) expiryCountdown.textContent='⏱ EXPIRAÇÃO: '+kineticExpiryLabel;
+  statusBox.textContent='🎯 KINETIC PULSE • '+(isCall?'PRÉ-CALL':'PRÉ-PUT')+' • '+(isCall?'POSSÍVEL COMPRA':'POSSÍVEL VENDA')+' • ENTRADA '+kineticEntryLabel;
   if(risk) risk.textContent='Risco: PRÉ-ALERTA • ainda não confirmado';
 
   showRobot();
   analysisText.style.display='block';
-  analysisText.textContent='🎯 MACD PULLBACK • '+(isCall?'PRÉ-CALL • POSSÍVEL COMPRA':'PRÉ-PUT • POSSÍVEL VENDA');
+  analysisText.textContent='🎯 KINETIC PULSE • '+(isCall?'PRÉ-CALL • POSSÍVEL COMPRA':'PRÉ-PUT • POSSÍVEL VENDA');
 
   if(withArrow){
     entryArrow.className='entry-arrow '+(isCall?'call':'put');
@@ -19853,9 +19898,9 @@ function paintMacdPreAlertOnMain(mp, withArrow=true){
     arrowTimer=setTimeout(()=>{
       // Não apaga a seta se o pré-alerta continua válido; a próxima leitura
       // renova o tempo. Sinal confirmado de outro motor pode sobrescrever.
-      if(macdMainPreviewShowing && Date.now()<macdMainPreviewUntil && !macdHasConfirmedMainSignal()){
-        restoreMacdPreviewOnMain();
-      }else if(!macdHasConfirmedMainSignal()){
+      if(kineticMainPreviewShowing && Date.now()<kineticMainPreviewUntil && !kineticHasConfirmedMainSignal()){
+        restoreKineticPreviewOnMain();
+      }else if(!kineticHasConfirmedMainSignal()){
         entryArrow.className='entry-arrow';
       }
     },15000);
@@ -19863,64 +19908,64 @@ function paintMacdPreAlertOnMain(mp, withArrow=true){
   return true;
 }
 
-function restoreMacdPreviewOnMain(){
-  if(!macdPullbackEnabled || !macdMainPreview || Date.now()>=macdMainPreviewUntil){
-    if(Date.now()>=macdMainPreviewUntil) clearMacdMainPreview();
+function restoreKineticPreviewOnMain(){
+  if(!kineticPulseEnabled || !kineticMainPreview || Date.now()>=kineticMainPreviewUntil){
+    if(Date.now()>=kineticMainPreviewUntil) clearKineticMainPreview();
     return false;
   }
-  if(macdHasConfirmedMainSignal()) return false;
-  return paintMacdPreAlertOnMain({
+  if(kineticHasConfirmedMainSignal()) return false;
+  return paintKineticPreAlertOnMain({
     prealert_active:true,
-    prealert_direction:macdMainPreview.direction,
-    prealert_score:macdMainPreview.score,
-    prealert_reason:macdMainPreview.reason,
-    symbol:macdMainPreview.symbol,
-    interval:macdMainPreview.interval,
-    prealert_candle:macdMainPreview.candle,
-    prealert_entry_time:macdMainPreview.entry_time,
-    prealert_expiry_time:macdMainPreview.expiry_time,
+    prealert_direction:kineticMainPreview.direction,
+    prealert_score:kineticMainPreview.score,
+    prealert_reason:kineticMainPreview.reason,
+    symbol:kineticMainPreview.symbol,
+    interval:kineticMainPreview.interval,
+    prealert_candle:kineticMainPreview.candle,
+    prealert_entry_time:kineticMainPreview.entry_time,
+    prealert_expiry_time:kineticMainPreview.expiry_time,
   },false);
 }
 
-function paintMacdConfirmedOnMain(mp){
-  if(!macdPullbackEnabled || !mp || !Boolean(mp.confirmed)) return false;
+function paintKineticConfirmedOnMain(mp){
+  if(!kineticPulseEnabled || !mp || !Boolean(mp.confirmed)) return false;
   const dir=String(mp.direction||'NEUTRO').toUpperCase();
   if(dir!=='CALL' && dir!=='PUT') return false;
   const isCall=dir==='CALL';
-  clearMacdMainPreview();
+  clearKineticMainPreview();
   direction.textContent=dir;
   direction.className='big '+(isCall?'call':'put');
-  confidence.textContent='MACD Pullback • CONFIRMADO';
-  entry.textContent='PRÓXIMA VELA';
-  countdown.textContent=isCall?'CALL confirmado • preparar compra':'PUT confirmado • preparar venda';
-  statusBox.textContent='🎯 MACD PULLBACK • '+dir+' CONFIRMADO • PRÓXIMA VELA';
+  confidence.textContent='Kinetic Pulse • CONFIRMADO';
+  const confirmedEntry=mp.prealert_entry_time?ft(mp.prealert_entry_time):'PRÓXIMA VELA';
+  entry.textContent=confirmedEntry;
+  countdown.textContent=(isCall?'CALL confirmado':'PUT confirmado')+' • entrada '+confirmedEntry;
+  statusBox.textContent='🎯 KINETIC PULSE • '+dir+' CONFIRMADO • ENTRADA '+confirmedEntry;
   if(risk) risk.textContent='Risco: sinal confirmado pelo segundo indicador';
   showRobot();
   analysisText.style.display='block';
-  analysisText.textContent='🎯 MACD PULLBACK • '+dir+' CONFIRMADO • PRÓXIMA VELA';
+  analysisText.textContent='🎯 KINETIC PULSE • '+dir+' CONFIRMADO • PRÓXIMA VELA';
   entryArrow.className='entry-arrow '+(isCall?'call':'put');
   entryArrowIcon.textContent=isCall?'⬆':'⬇';
   entryArrowLabel.textContent=isCall?'CALL • COMPRAR':'PUT • VENDER';
   clearTimeout(arrowTimer);
   arrowTimer=setTimeout(()=>{
-    if(!macdHasConfirmedMainSignal()) entryArrow.className='entry-arrow';
+    if(!kineticHasConfirmedMainSignal()) entryArrow.className='entry-arrow';
   },12000);
   return true;
 }
 
-function macdOfficialSignalFromPreAlert(mp){
-  if(!macdPullbackEnabled || !mp || !Boolean(mp.prealert_active)) return null;
+function kineticOfficialSignalFromPreAlert(mp){
+  if(!kineticPulseEnabled || !mp || !Boolean(mp.prealert_active)) return null;
   const dir=String(mp.prealert_direction||'').toUpperCase();
   if(dir!=='CALL' && dir!=='PUT') return null;
   const score=Math.max(0,Math.min(4,Number(mp.prealert_score||0)));
-  // 3.73: um pouco mais seletivo que a versão 2/4, mas ainda mais frouxo
-  // que o Velocity original.
+  // Kinetic Pulse: pré-alerta só vira operação após estabilidade no navegador.
   if(score<3) return null;
   const entryTime=String(mp.prealert_entry_time||'');
   const expiryTime=String(mp.prealert_expiry_time||'');
   if(!entryTime || !expiryTime) return null;
   return {
-    source:'MACD_PULLBACK_PREALERT',
+    source:'KINETIC_PULSE_ALERT',
     symbol:String(mp.symbol||((S&&S.value)||'')),
     interval:String(mp.interval||((interval&&interval.value)||'1min')),
     direction:dir,
@@ -19931,29 +19976,29 @@ function macdOfficialSignalFromPreAlert(mp){
     market:String(mp.market||((market&&market.value)||'OPEN')),
     feed_source:String(mp.feed_source||''),
     risk:'MEDIUM',
-    strategy:'MACD_PULLBACK_PREALERT_3_OF_4_STABLE',
-    selected_engine:'MACD_PULLBACK',
-    mode:'MACD_PULLBACK',
+    strategy:'KINETIC_PULSE_ORIGINAL_PLUS_PREALERT',
+    selected_engine:'KINETIC_PULSE',
+    mode:'KINETIC_PULSE',
     entry_mode:'BIRTH',
     auto_trade_allowed:false
   };
 }
 
-async function publishMacdPreAlertOfficial(mp){
-  const signal=macdOfficialSignalFromPreAlert(mp);
+async function publishKineticPreAlertOfficial(mp){
+  const signal=kineticOfficialSignalFromPreAlert(mp);
   if(!signal) return false;
 
   const entryKey=[signal.symbol,signal.interval,signal.entry_time].join('|');
 
-  // Mantém a PRIMEIRA direção liberada para aquela vela. Se o MACD oscilar
+  // Mantém a PRIMEIRA direção liberada para aquela vela. Se o Kinetic oscilar
   // intrabar depois, não cria CALL e PUT para o mesmo horário.
-  if(macdOfficialActiveSignal &&
-     String(macdOfficialActiveSignal.symbol)===String(signal.symbol) &&
-     String(macdOfficialActiveSignal.interval)===String(signal.interval) &&
-     String(macdOfficialActiveSignal.entry_time)===String(signal.entry_time)){
-    signal.direction=String(macdOfficialActiveSignal.direction||signal.direction).toUpperCase();
+  if(kineticOfficialActiveSignal &&
+     String(kineticOfficialActiveSignal.symbol)===String(signal.symbol) &&
+     String(kineticOfficialActiveSignal.interval)===String(signal.interval) &&
+     String(kineticOfficialActiveSignal.entry_time)===String(signal.entry_time)){
+    signal.direction=String(kineticOfficialActiveSignal.direction||signal.direction).toUpperCase();
   }else{
-    macdOfficialActiveSignal={...signal};
+    kineticOfficialActiveSignal={...signal};
   }
 
   // Repassa para a fila em TODA leitura enquanto o alerta estiver vivo.
@@ -19974,23 +20019,23 @@ async function publishMacdPreAlertOfficial(mp){
     confidence:signal.confidence,
     risk:signal.risk,
     strategy:signal.strategy,
-    engine:'MACD_PULLBACK',
+    engine:'KINETIC_PULSE',
     entry_mode:'BIRTH',
     value_stake:currentValueStake(),
     value_payout:currentValuePayout()
   });
 
-  if(entryKey!==lastMacdOfficialEntryKey){
-    lastMacdOfficialEntryKey=entryKey;
-    lastMacdOfficialSentAt=Date.now();
+  if(entryKey!==lastKineticOfficialEntryKey){
+    lastKineticOfficialEntryKey=entryKey;
+    lastKineticOfficialSentAt=Date.now();
     const entryMs=Date.parse(String(signal.entry_time||''));
     if(Number.isFinite(entryMs)){
-      macdLastOfficialEntryMs=entryMs;
-      try{ localStorage.setItem('mega_macd_last_official_entry_ms',String(entryMs)); }catch(_){}
+      kineticLastOfficialEntryMs=entryMs;
+      try{ localStorage.setItem('mega_kinetic_last_official_entry_ms',String(entryMs)); }catch(_){}
     }
     // Backup de contabilidade no servidor SOMENTE para o sinal que passou
     // pelo gate de estabilidade + cooldown.
-    post('/macd-pullback-register',{
+    post('/kinetic-pulse-register',{
       market:signal.market,
       symbol:signal.symbol,
       interval:signal.interval,
@@ -20000,174 +20045,187 @@ async function publishMacdPreAlertOfficial(mp){
     }).catch(()=>{});
   }
 
-  // Não bloqueia nova tentativa de Telegram pelo lastMacdOfficialEntryKey.
+  // Não bloqueia nova tentativa de Telegram pelo lastKineticOfficialEntryKey.
   // maybeSendTelegramSignal só grava a chave depois que o envio realmente
   // teve sucesso; se Telegram estiver ocupado, a próxima leitura tenta de novo.
   await maybeSendTelegramSignal(signal);
   if(telegramEnabled && telegramLastSignalKey===[signal.symbol,signal.interval,signal.direction,signal.entry_time].join('|') && telegramSendStatus){
-    telegramSendStatus.textContent='✅ MACD Pullback enviado: '+signal.symbol+' '+signal.direction+' • entrada '+ft(signal.entry_time);
+    telegramSendStatus.textContent='✅ Kinetic Pulse enviado: '+signal.symbol+' '+signal.direction+' • entrada '+ft(signal.entry_time);
   }
   return true;
 }
 
-function renderMacdPullbackIndicator(data){
-  if(!macdPullbackState) return;
-  applyMacdPullbackPowerState();
-  if(!macdPullbackEnabled){
-    macdPullbackState.textContent='OFFLINE'; macdPullbackState.className='big neutral';
-    if(macdPullbackReason) macdPullbackReason.textContent='Ative o indicador para acompanhar.';
-    if(macdPullbackPreAlert){ macdPullbackPreAlert.textContent='OFFLINE'; macdPullbackPreAlert.className='big neutral'; }
-    if(macdPullbackPreCall){ macdPullbackPreCall.textContent='AGUARDANDO'; macdPullbackPreCall.className='big neutral'; }
-    if(macdPullbackPrePut){ macdPullbackPrePut.textContent='AGUARDANDO'; macdPullbackPrePut.className='big neutral'; }
-    if(macdPullbackPreReason) macdPullbackPreReason.textContent='Ative o indicador para acompanhar.';
-    if(macdPullbackLines) macdPullbackLines.textContent='--';
-    if(macdPullbackHist) macdPullbackHist.textContent='--';
-    if(macdPullbackContext) macdPullbackContext.textContent='--';
+function renderKineticPulseIndicator(data){
+  if(!kineticPulseState) return;
+  applyKineticPulsePowerState();
+  if(!kineticPulseEnabled){
+    kineticPulseState.textContent='OFFLINE'; kineticPulseState.className='big neutral';
+    if(kineticPulseReason) kineticPulseReason.textContent='Ative o indicador para acompanhar.';
+    if(kineticPulsePreAlert){ kineticPulsePreAlert.textContent='OFFLINE'; kineticPulsePreAlert.className='big neutral'; }
+    if(kineticPulsePreCall){ kineticPulsePreCall.textContent='AGUARDANDO'; kineticPulsePreCall.className='big neutral'; }
+    if(kineticPulsePrePut){ kineticPulsePrePut.textContent='AGUARDANDO'; kineticPulsePrePut.className='big neutral'; }
+    if(kineticPulsePreReason) kineticPulsePreReason.textContent='Ative o indicador para acompanhar.';
+    if(kineticPulseLines) kineticPulseLines.textContent='--';
+    if(kineticPulseHist) kineticPulseHist.textContent='--';
+    if(kineticPulseContext) kineticPulseContext.textContent='--';
     return;
   }
   const d=data||{};
   const tech=d.technical||d||{};
-  const mp=(d.macd_pullback)||
-    ((tech.indicators&&tech.indicators.macd_pullback)?tech.indicators.macd_pullback:null)||
-    ((d.indicators&&d.indicators.macd_pullback)?d.indicators.macd_pullback:null)||
-    ((Object.prototype.hasOwnProperty.call(d,'macd') && Object.prototype.hasOwnProperty.call(d,'direction'))?d:null);
+  const mp=(d.kinetic_pulse)||
+    ((tech.indicators&&tech.indicators.kinetic_pulse)?tech.indicators.kinetic_pulse:null)||
+    ((d.indicators&&d.indicators.kinetic_pulse)?d.indicators.kinetic_pulse:null)||
+    ((Object.prototype.hasOwnProperty.call(d,'norm_acc') && Object.prototype.hasOwnProperty.call(d,'direction'))?d:null);
   if(!mp){
-    macdPullbackState.textContent='AGUARDANDO'; macdPullbackState.className='big neutral';
-    if(macdPullbackReason) macdPullbackReason.textContent='Aguardando a próxima leitura independente do MACD.';
+    kineticPulseState.textContent='AGUARDANDO'; kineticPulseState.className='big neutral';
+    if(kineticPulseReason) kineticPulseReason.textContent='Aguardando a próxima leitura independente do Kinetic Pulse.';
     return;
   }
   const dir=String(mp.direction||'NEUTRO').toUpperCase();
   const rawPreDir=String(mp.prealert_direction||'NEUTRO').toUpperCase();
-  const macdGate=evaluateMacdPreAlertGate(mp);
-  const preDir=macdGate.dir;
-  const preActive=Boolean(macdGate.active);
-  macdPullbackState.textContent=dir==='CALL'?'🟢 CALL':dir==='PUT'?'🔴 PUT':'⚪ NEUTRO';
-  macdPullbackState.className='big '+(dir==='CALL'?'call':dir==='PUT'?'put':'neutral');
-  if(macdPullbackReason) macdPullbackReason.textContent=String(mp.reason||'Monitorando MACD Pullback.');
-  if(macdPullbackPreAlert){
+  const kineticGate=evaluateKineticPreAlertGate(mp);
+  const preDir=kineticGate.dir;
+  const preActive=Boolean(kineticGate.active);
+  kineticPulseState.textContent=dir==='CALL'?'🟢 CALL':dir==='PUT'?'🔴 PUT':'⚪ NEUTRO';
+  kineticPulseState.className='big '+(dir==='CALL'?'call':dir==='PUT'?'put':'neutral');
+  if(kineticPulseReason) kineticPulseReason.textContent=String(mp.reason||'Monitorando Kinetic Pulse.');
+  if(kineticPulsePreAlert){
     if(preActive){
-      macdPullbackPreAlert.textContent='ATIVO • '+preDir;
-      macdPullbackPreAlert.className='big '+(preDir==='CALL'?'call':'put');
-    }else if(macdGate.cooldown){
-      macdPullbackPreAlert.textContent='PAUSA • '+macdGate.candlesLeft+' VELA'+(macdGate.candlesLeft===1?'':'S');
-      macdPullbackPreAlert.className='big neutral';
-    }else if(macdGate.rawActive){
-      macdPullbackPreAlert.textContent='CONFIRMANDO '+macdGate.count+'/'+MACD_PRE_STABILITY_READS;
-      macdPullbackPreAlert.className='big neutral';
+      kineticPulsePreAlert.textContent='ATIVO • '+preDir;
+      kineticPulsePreAlert.className='big '+(preDir==='CALL'?'call':'put');
+    }else if(kineticGate.cooldown){
+      kineticPulsePreAlert.textContent='PAUSA • '+kineticGate.candlesLeft+' VELA'+(kineticGate.candlesLeft===1?'':'S');
+      kineticPulsePreAlert.className='big neutral';
+    }else if(kineticGate.rawActive){
+      kineticPulsePreAlert.textContent='CONFIRMANDO '+kineticGate.count+'/'+KINETIC_PRE_STABILITY_READS;
+      kineticPulsePreAlert.className='big neutral';
     }else{
-      macdPullbackPreAlert.textContent='MONITORANDO';
-      macdPullbackPreAlert.className='big neutral';
+      kineticPulsePreAlert.textContent='MONITORANDO';
+      kineticPulsePreAlert.className='big neutral';
     }
   }
-  if(macdPullbackPreCall){
-    macdPullbackPreCall.textContent=preActive&&preDir==='CALL'?'PRÉ-CALL ATIVO':(macdGate.rawActive&&preDir==='CALL'?'CONFIRMANDO':'AGUARDANDO');
-    macdPullbackPreCall.className='big '+(preActive&&preDir==='CALL'?'call':'neutral');
+  if(kineticPulsePreCall){
+    kineticPulsePreCall.textContent=preActive&&preDir==='CALL'?'PRÉ-CALL ATIVO':(kineticGate.rawActive&&preDir==='CALL'?'CONFIRMANDO':'AGUARDANDO');
+    kineticPulsePreCall.className='big '+(preActive&&preDir==='CALL'?'call':'neutral');
   }
-  if(macdPullbackPrePut){
-    macdPullbackPrePut.textContent=preActive&&preDir==='PUT'?'PRÉ-PUT ATIVO':(macdGate.rawActive&&preDir==='PUT'?'CONFIRMANDO':'AGUARDANDO');
-    macdPullbackPrePut.className='big '+(preActive&&preDir==='PUT'?'put':'neutral');
+  if(kineticPulsePrePut){
+    kineticPulsePrePut.textContent=preActive&&preDir==='PUT'?'PRÉ-PUT ATIVO':(kineticGate.rawActive&&preDir==='PUT'?'CONFIRMANDO':'AGUARDANDO');
+    kineticPulsePrePut.className='big '+(preActive&&preDir==='PUT'?'put':'neutral');
   }
-  if(macdPullbackPreReason){
+  if(kineticPulsePreReason){
     const score=Number(mp.prealert_score||0);
     const vozTxt=voiceEnabled?'':' • VOZ OFFLINE';
     const horario=(preActive&&mp.prealert_entry_time)?(' • entrada '+ft(mp.prealert_entry_time)):'';
     let gateTxt='';
-    if(macdGate.cooldown) gateTxt=' • aguardando '+macdGate.candlesLeft+' vela'+(macdGate.candlesLeft===1?'':'s')+' de intervalo';
-    else if(macdGate.rawActive&&!preActive) gateTxt=' • confirmação '+macdGate.count+'/'+MACD_PRE_STABILITY_READS;
-    macdPullbackPreReason.textContent=String(mp.prealert_reason||'Monitorando pré-alerta do MACD.')+(preActive?(' • formação '+score+'/4'+horario+vozTxt):gateTxt);
+    if(kineticGate.cooldown) gateTxt=' • aguardando '+kineticGate.candlesLeft+' vela'+(kineticGate.candlesLeft===1?'':'s')+' de intervalo';
+    else if(kineticGate.rawActive&&!preActive) gateTxt=' • confirmação '+kineticGate.count+'/'+KINETIC_PRE_STABILITY_READS;
+    kineticPulsePreReason.textContent=String(mp.prealert_reason||'Monitorando pré-alerta do Kinetic Pulse.')+(preActive?(' • formação '+score+'/4'+horario+vozTxt):gateTxt);
   }
   if(preActive){
     const preKey=[String(mp.symbol||((S&&S.value)||'')),String(mp.interval||((interval&&interval.value)||'')),preDir,String(mp.prealert_candle||'')].join('|');
 
-    // 3.74: só após 2 leituras seguidas e fora do cooldown, o pré-alerta 3/4 do SEGUNDO indicador
+    // 3.75: só após 2 leituras seguidas e fora do cooldown original de 5 velas, o pré-alerta do Kinetic
     // aparece no painel principal e na seta do robô e também entra no mesmo
     // fluxo oficial de Telegram + WIN/LOSS. Autoentrada continua bloqueada.
-    paintMacdPreAlertOnMain(mp,true);
+    paintKineticPreAlertOnMain(mp,true);
     // O pré-alerta 3/4 do segundo indicador agora é o sinal oficial dele:
     // entra na fila de WIN/LOSS e no Telegram, sem acionar autoentrada.
-    publishMacdPreAlertOfficial(mp).catch(()=>{});
+    publishKineticPreAlertOfficial(mp).catch(()=>{});
 
-    if(preKey!==lastMacdPreAlertKey){
-      lastMacdPreAlertKey=preKey;
+    if(preKey!==lastKineticPreAlertKey){
+      lastKineticPreAlertKey=preKey;
       if(voiceEnabled){
         const ativoFalado=spokenAssetName(mp.symbol || (S&&S.value) || '');
         const h=mp.prealert_entry_time?ft(mp.prealert_entry_time):'';
-        speak('Pré alerta MACD Pullback. '+(preDir==='CALL'?'Possível compra':'Possível venda')+' no ativo '+ativoFalado+(h?'. Entrada às '+h:'')+'.');
+        speak('Pré alerta Kinetic Pulse. '+(preDir==='CALL'?'Possível compra':'Possível venda')+' no ativo '+ativoFalado+(h?'. Entrada às '+h:'')+'.');
       }
     }
   }else{
-    clearMacdMainPreview();
+    clearKineticMainPreview();
   }
 
   if(Boolean(mp.confirmed) && (dir==='CALL'||dir==='PUT')){
+    // Fallback robusto: se o celular perdeu o pré-alerta, o BUY/SELL original
+    // confirmado ainda entra no Telegram e na fila WIN/LOSS para a próxima vela.
+    publishKineticPreAlertOfficial({
+      ...mp,
+      prealert_active:true,
+      prealert_direction:dir,
+      prealert_score:4,
+      prealert_reason:String(mp.reason||'Gatilho original Kinetic confirmado.')
+    }).catch(()=>{});
     const confirmedKey=[String(mp.symbol||((S&&S.value)||'')),String(mp.interval||((interval&&interval.value)||'')),dir,String(mp.confirmed_candle||mp.prealert_candle||'')].join('|');
-    if(confirmedKey!==lastMacdConfirmedKey){
-      lastMacdConfirmedKey=confirmedKey;
-      paintMacdConfirmedOnMain(mp);
+    if(confirmedKey!==lastKineticConfirmedKey){
+      lastKineticConfirmedKey=confirmedKey;
+      paintKineticConfirmedOnMain(mp);
       if(voiceEnabled){
         const ativoFalado=spokenAssetName(mp.symbol || (S&&S.value) || '');
-        speak('MACD Pullback confirmou '+(dir==='CALL'?'compra':'venda')+' no ativo '+ativoFalado+'. Entrada na próxima vela.');
+        speak('Kinetic Pulse confirmou '+(dir==='CALL'?'compra':'venda')+' no ativo '+ativoFalado+'. Entrada na próxima vela.');
       }
     }
   }
-  if(macdPullbackLines) macdPullbackLines.textContent='MACD '+Number(mp.macd||0).toFixed(6)+' • SIG '+Number(mp.signal||0).toFixed(6);
-  if(macdPullbackHist) macdPullbackHist.textContent=Number(mp.hist||0).toFixed(6)+' • '+(mp.hist_rising?'ACELERANDO':'SEM ACELERAÇÃO');
-  if(macdPullbackContext){
-    const pull=mp.recent_bearish_pullback?'PB↓ recente':(mp.recent_bullish_pullback?'PB↑ recente':'sem PB recente');
-    const div=mp.recent_bullish_divergence?'DIV alta':(mp.recent_bearish_divergence?'DIV baixa':'sem DIV recente');
-    macdPullbackContext.textContent=pull+' • '+div+' • pivô +'+Number(mp.pivot_right_confirmation||5)+' velas';
+  if(kineticPulseLines){
+    const na=Number((mp.preview_norm_acc??mp.norm_acc)||0);
+    const prev=Number((mp.preview_norm_acc_prev??mp.norm_acc_prev)||0);
+    kineticPulseLines.textContent=na.toFixed(3)+' • anterior '+prev.toFixed(3);
+  }
+  if(kineticPulseHist){
+    kineticPulseHist.textContent='V '+Number((mp.preview_velocity??mp.velocity)||0).toFixed(6)+' • A '+Number((mp.preview_acceleration??mp.acceleration)||0).toFixed(6);
+  }
+  if(kineticPulseContext){
+    kineticPulseContext.textContent='HMA20 '+Number(mp.hma20||0).toFixed(5)+' • EMA20 '+Number(mp.ema20||0).toFixed(5);
   }
 }
 
-async function loadMacdPullbackIndicator(force=false){
-  if(!macdPullbackEnabled){
-    renderMacdPullbackIndicator(null);
+async function loadKineticPulseIndicator(force=false){
+  if(!kineticPulseEnabled){
+    renderKineticPulseIndicator(null);
     return;
   }
-  if(macdPullbackBusy) return;
+  if(kineticPulseBusy) return;
 
-  macdPullbackBusy=true;
-  if(macdPullbackState){
-    macdPullbackState.textContent='ANALISANDO';
-    macdPullbackState.className='big neutral';
+  kineticPulseBusy=true;
+  if(kineticPulseState){
+    kineticPulseState.textContent='ANALISANDO';
+    kineticPulseState.className='big neutral';
   }
-  if(macdPullbackReason) macdPullbackReason.textContent='Lendo candles fechados para o MACD Pullback...';
+  if(kineticPulseReason) kineticPulseReason.textContent='Lendo candles fechados para o Kinetic Pulse...';
   try{
-    const d=await get('/macd-pullback?market='+encodeURIComponent((market&&market.value)||'OPEN')+
+    const d=await get('/kinetic-pulse?market='+encodeURIComponent((market&&market.value)||'OPEN')+
       '&symbol='+encodeURIComponent((S&&S.value)||'BTC/USD')+
       '&interval='+encodeURIComponent((interval&&interval.value)||'1min'));
-    lastMacdPullbackData=d||null;
-    renderMacdPullbackIndicator(d);
+    lastKineticPulseData=d||null;
+    renderKineticPulseIndicator(d);
   }catch(e){
-    if(macdPullbackState){
-      macdPullbackState.textContent='AGUARDANDO';
-      macdPullbackState.className='big neutral';
+    if(kineticPulseState){
+      kineticPulseState.textContent='AGUARDANDO';
+      kineticPulseState.className='big neutral';
     }
-    if(macdPullbackReason) macdPullbackReason.textContent='Falha temporária na leitura: '+String((e&&e.message)||e).slice(0,120);
+    if(kineticPulseReason) kineticPulseReason.textContent='Falha temporária na leitura: '+String((e&&e.message)||e).slice(0,120);
   }finally{
-    macdPullbackBusy=false;
+    kineticPulseBusy=false;
   }
 }
 
-if(macdPullbackPowerBtn){
-  macdPullbackPowerBtn.onclick=async()=>{
-    macdPullbackEnabled=!macdPullbackEnabled;
-    try{ localStorage.setItem('mega_macd_pullback_power',macdPullbackEnabled?'ONLINE':'OFFLINE'); }catch(_){}
-    applyMacdPullbackPowerState();
-    if(macdPullbackEnabled){
-      await loadMacdPullbackIndicator(true);
+if(kineticPulsePowerBtn){
+  kineticPulsePowerBtn.onclick=async()=>{
+    kineticPulseEnabled=!kineticPulseEnabled;
+    try{ localStorage.setItem('mega_kinetic_pulse_power',kineticPulseEnabled?'ONLINE':'OFFLINE'); }catch(_){}
+    applyKineticPulsePowerState();
+    if(kineticPulseEnabled){
+      await loadKineticPulseIndicator(true);
     }else{
-      clearMacdMainPreview();
-      macdOfficialActiveSignal=null;
-      macdPreCandidateDir='';
-      macdPreCandidateCount=0;
-      macdPreCandidateSampleKey='';
-      renderMacdPullbackIndicator(null);
+      clearKineticMainPreview();
+      kineticOfficialActiveSignal=null;
+      kineticPreCandidateDir='';
+      kineticPreCandidateCount=0;
+      kineticPreCandidateSampleKey='';
+      renderKineticPulseIndicator(null);
     }
-    if(voiceEnabled) speak(macdPullbackEnabled?'Indicador MACD Pullback online.':'Indicador MACD Pullback offline.');
+    if(voiceEnabled) speak(kineticPulseEnabled?'Indicador Kinetic Pulse online.':'Indicador Kinetic Pulse offline.');
   };
 }
-applyMacdPullbackPowerState();
+applyKineticPulsePowerState();
 
 function showVelocitySignalOnRobot(signal){
   if(!signal) return;
@@ -20222,7 +20280,6 @@ function renderVelocityTab(data){
     velocityReadout.textContent='Motor offline.';
     if(velocityReason) velocityReason.textContent='Ative o Velocity Flow para começar a analisar candles fechados.';
     if(velocityRobotAlert) velocityRobotAlert.style.display='none';
-    renderMacdPullbackIndicator(d);
     return;
   }
   const dir=String(d.direction||'NEUTRO').toUpperCase();
@@ -20236,13 +20293,8 @@ function renderVelocityTab(data){
   if(velocityDmi) velocityDmi.textContent='ADX '+Number(diag.adx||0).toFixed(1)+' • +DI '+Number(diag.plus_di||0).toFixed(1)+' • -DI '+Number(diag.minus_di||0).toFixed(1);
   if(velocityRsi) velocityRsi.textContent=Number(diag.rsi7||0).toFixed(1);
   if(velocityMa) velocityMa.textContent='EMA9 '+Number(diag.ema9||0).toFixed(5)+' • SMA21 '+Number(diag.sma21||0).toFixed(5);
-  if(macdPullbackEnabled){
-    const tech=d.technical||d||{};
-    if(tech.indicators && tech.indicators.macd_pullback){
-      lastMacdPullbackData=tech.indicators.macd_pullback;
-    }
-  }
-  renderMacdPullbackIndicator(d);
+  // O Kinetic Pulse de baixo é totalmente independente e não é redesenhado
+  // pela atualização do Velocity Flow de cima.
 }
 
 function promoteVelocityPreAlertToOfficial(item){
@@ -20364,7 +20416,7 @@ async function sig(announce=false){
       if(dataFeedText) dataFeedText.textContent='MOTORES OFFLINE • nenhuma análise solicitada';
       // O segundo indicador é independente dos motores principais.
       // Se houver PRÉ-CALL/PRÉ-PUT MACD ativo, ele continua aparecendo.
-      restoreMacdPreviewOnMain();
+      restoreKineticPreviewOnMain();
       return;
     }
     cur=await get(
@@ -20439,7 +20491,7 @@ async function sig(announce=false){
     // Reaplica apenas o visual do pré-alerta MACD quando o motor principal
     // está NEUTRO, para CALL/PUT e a seta não sumirem entre as leituras.
     if(String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO'){
-      restoreMacdPreviewOnMain();
+      restoreKineticPreviewOnMain();
     }
 
     rememberPendingTrade(cur);
@@ -20866,13 +20918,13 @@ function activeTimingSignal(){
   if(cur && (cur.direction==='CALL' || cur.direction==='PUT') && cur.entry_time) return cur;
   // Quando os motores principais estão neutros/offline, o segundo indicador
   // mantém seu próprio cronograma até a expiração da operação.
-  if(macdPullbackEnabled && macdOfficialActiveSignal){
-    const d=String(macdOfficialActiveSignal.direction||'').toUpperCase();
-    const exp=Date.parse(String(macdOfficialActiveSignal.expiry_time||''));
-    const sameSymbol=String(macdOfficialActiveSignal.symbol||'')===String((S&&S.value)||'');
-    const sameInterval=String(macdOfficialActiveSignal.interval||'')===String((interval&&interval.value)||'');
+  if(kineticPulseEnabled && kineticOfficialActiveSignal){
+    const d=String(kineticOfficialActiveSignal.direction||'').toUpperCase();
+    const exp=Date.parse(String(kineticOfficialActiveSignal.expiry_time||''));
+    const sameSymbol=String(kineticOfficialActiveSignal.symbol||'')===String((S&&S.value)||'');
+    const sameInterval=String(kineticOfficialActiveSignal.interval||'')===String((interval&&interval.value)||'');
     if((d==='CALL'||d==='PUT') && sameSymbol && sameInterval && Number.isFinite(exp) && exp>Date.now()-2000){
-      return macdOfficialActiveSignal;
+      return kineticOfficialActiveSignal;
     }
   }
   return null;
@@ -21141,7 +21193,7 @@ marketMode.onchange=async()=>{
 
 
 S.onchange=()=>{
-  macdOfficialActiveSignal=null;
+  kineticOfficialActiveSignal=null;
   try{localStorage.setItem('mega_symbol',S.value)}catch(_){}
   renderAdaptiveLearningState();
 
@@ -21158,7 +21210,7 @@ S.onchange=()=>{
 };
 
 interval.onchange=()=>{
-  macdOfficialActiveSignal=null;
+  kineticOfficialActiveSignal=null;
   try{localStorage.setItem('mega_interval',interval.value)}catch(_){}
 
   lastSignalVoice='';
@@ -21239,7 +21291,7 @@ async function bootApp(){
   }
 
   if(appEnabled) safe('performance',perf);
-  if(appEnabled && macdPullbackEnabled) safe('macd-pullback',()=>loadMacdPullbackIndicator(true));
+  if(appEnabled && kineticPulseEnabled) safe('kinetic-pulse',()=>loadKineticPulseIndicator(true));
 }
 
 bootApp().catch(err=>{
@@ -21280,12 +21332,12 @@ setInterval(()=>{
   if(megaCanPoll() && selectedRobotEngine()!=='OFF') loadPreSignals();
 },10000);
 
-// MACD Pullback independente com pré-alerta intrabar. A rota própria usa o mesmo
-// roteador/cache de candles do app e roda no máximo a cada 12 s.
-// 3.74: duas leituras consecutivas + 3 velas de cooldown entre sinais oficiais.
+// Kinetic Pulse independente com pré-alerta intrabar. A rota própria usa o mesmo
+// roteador/cache de candles do app e roda no máximo a cada 10 s.
+// 3.75: duas leituras consecutivas + cooldown original de 5 velas entre sinais oficiais.
 setInterval(()=>{
-  if(megaCanPoll() && macdPullbackEnabled) loadMacdPullbackIndicator(false);
-},12000);
+  if(megaCanPoll() && kineticPulseEnabled) loadKineticPulseIndicator(false);
+},10000);
 
 // Resultado das operações abertas.
 setInterval(()=>{ if(megaCanPoll()) resultCheck(); },10000);
