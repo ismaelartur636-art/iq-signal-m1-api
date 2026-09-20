@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.72"
-PWA_VERSION = "v138"
+APP_VERSION = "3.74"
+PWA_VERSION = "v140"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -13267,19 +13267,18 @@ async def macd_pullback_indicator_api(
     pre_candle = current.get("datetime") or current.get("timestamp") or current.get("time") or current.get("from") or ""
     confirmed_candle = last_closed.get("datetime") or last_closed.get("timestamp") or last_closed.get("time") or last_closed.get("from") or ""
 
-    # Horário oficial do pré-alerta: entrada na abertura da PRÓXIMA vela e
-    # expiração ao fim dela. Isso permite que o segundo indicador use o mesmo
-    # pipeline de Telegram e WIN/LOSS dos outros motores.
+    # Horário oficial do pré-alerta: usa a próxima fronteira REAL do servidor,
+    # não o timestamp do último candle recebido. Assim um feed atrasado nunca
+    # cria entrada no passado nem deixa o cronograma sem horário.
     step_seconds = int(INTERVALS.get(interval, 60))
-    try:
-        live_start = parse_dt(str(pre_candle))
-    except Exception:
-        now_ts = now().timestamp()
-        live_start = datetime.fromtimestamp(
-            (int(now_ts) // step_seconds) * step_seconds, tz=UTC
-        )
-    pre_entry_dt = live_start + timedelta(seconds=step_seconds)
+    now_epoch = int(now().timestamp())
+    next_epoch = ((now_epoch // step_seconds) + 1) * step_seconds
+    pre_entry_dt = datetime.fromtimestamp(next_epoch, tz=UTC).astimezone(BR_TZ)
     pre_expiry_dt = pre_entry_dt + timedelta(seconds=step_seconds)
+
+    # 3.74: a rota apenas informa o pré-alerta bruto.
+    # A operação oficial só é registrada depois que o navegador confirma
+    # 2 leituras seguidas na mesma direção e respeita o cooldown de 3 velas.
 
     result.update({
         "symbol": symbol, "interval": interval, "market": requested_market,
@@ -13300,6 +13299,42 @@ async def macd_pullback_indicator_api(
     })
     return result
 
+
+@app.post("/macd-pullback-register")
+async def macd_pullback_register(request: Request):
+    """Registra no servidor somente o sinal MACD já liberado pelo gate 3.74."""
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "Payload inválido.")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Payload inválido.")
+
+    direction = str(payload.get("direction") or "").upper()
+    market_name = str(payload.get("market") or "OPEN").upper()
+    symbol = str(payload.get("symbol") or "")
+    interval_name = str(payload.get("interval") or "")
+    if direction not in ("CALL", "PUT"):
+        raise HTTPException(400, "Direção inválida.")
+    if interval_name not in INTERVALS or market_name not in ("OPEN", "IQ_OTC"):
+        raise HTTPException(400, "Intervalo ou mercado inválido.")
+    if not _symbol_allowed(symbol, market_name):
+        raise HTTPException(400, "Ativo inválido.")
+    if not payload.get("entry_time") or not payload.get("expiry_time"):
+        raise HTTPException(400, "Horário de entrada/expiração ausente.")
+
+    item = {
+        "market": market_name,
+        "symbol": symbol,
+        "interval": interval_name,
+        "direction": direction,
+        "entry_time": payload.get("entry_time"),
+        "expiry_time": payload.get("expiry_time"),
+        "source": "MACD_PULLBACK_PREALERT",
+        "strategy": "MACD_PULLBACK_PREALERT_3_OF_4_STABLE",
+    }
+    _remember_accounting_signal(request, item)
+    return {"ok": True, "registered": True}
 
 
 
@@ -16069,9 +16104,22 @@ let lastMacdPreAlertKey='';
 let lastMacdConfirmedKey='';
 let lastMacdOfficialEntryKey='';
 let lastMacdOfficialSentAt=0;
+let macdOfficialActiveSignal=null;
 let lastMacdPullbackData=null;
-// 3.72 — o segundo indicador projeta PRÉ-CALL/PRÉ-PUT no painel e, com
-// 3/4 condições, registra o sinal para Telegram + WIN/LOSS. Velocity intocado.
+// 3.74 — o segundo indicador fica moderado: exige 3/4 condições,
+// mesma direção em 2 leituras consecutivas e cooldown mínimo de 3 velas.
+// O Velocity original permanece intocado.
+let macdPreCandidateDir='';
+let macdPreCandidateCount=0;
+let macdPreCandidateSampleKey='';
+let macdLastOfficialEntryMs=0;
+const MACD_PRE_STABILITY_READS=2;
+const MACD_PRE_COOLDOWN_CANDLES=3;
+try{
+  macdLastOfficialEntryMs=Number(localStorage.getItem('mega_macd_last_official_entry_ms')||0)||0;
+}catch(_){
+  macdLastOfficialEntryMs=0;
+}
 let macdMainPreview=null;
 let macdMainPreviewUntil=0;
 let macdMainPreviewShowing=false;
@@ -19711,6 +19759,50 @@ function clearMacdMainPreview(){
   macdMainPreviewShowing=false;
 }
 
+function evaluateMacdPreAlertGate(mp){
+  const dir=String((mp&&mp.prealert_direction)||'NEUTRO').toUpperCase();
+  const score=Math.max(0,Math.min(4,Number((mp&&mp.prealert_score)||0)));
+  const rawActive=Boolean(mp&&mp.prealert_active) && (dir==='CALL'||dir==='PUT') && score>=3;
+
+  if(!rawActive){
+    macdPreCandidateDir='';
+    macdPreCandidateCount=0;
+    macdPreCandidateSampleKey='';
+    return {active:false,rawActive:false,dir:'NEUTRO',score:score,count:0,cooldown:false,candlesLeft:0};
+  }
+
+  const sampleKey=[String(mp.updated_at||''),String(mp.prealert_entry_time||''),dir,String(score),String(mp.preview_macd||''),String(mp.preview_hist||'')].join('|');
+  if(sampleKey!==macdPreCandidateSampleKey){
+    macdPreCandidateSampleKey=sampleKey;
+    if(dir===macdPreCandidateDir){
+      macdPreCandidateCount=Math.min(9,macdPreCandidateCount+1);
+    }else{
+      macdPreCandidateDir=dir;
+      macdPreCandidateCount=1;
+    }
+  }
+
+  const stable=macdPreCandidateCount>=MACD_PRE_STABILITY_READS;
+  const entryMs=Date.parse(String(mp.prealert_entry_time||''));
+  const stepMs=Math.max(60000,intervalSecondsValue(String(mp.interval||((interval&&interval.value)||'1min')))*1000);
+  const sameCurrentSignal=Number.isFinite(entryMs) && macdLastOfficialEntryMs>0 && entryMs===macdLastOfficialEntryMs;
+  const nextAllowedMs=macdLastOfficialEntryMs>0 ? macdLastOfficialEntryMs+(MACD_PRE_COOLDOWN_CANDLES*stepMs) : 0;
+  const cooldown=Number.isFinite(entryMs) && nextAllowedMs>0 && !sameCurrentSignal && entryMs<nextAllowedMs;
+  const candlesLeft=cooldown?Math.max(1,Math.ceil((nextAllowedMs-entryMs)/stepMs)):0;
+
+  return {
+    active:stable && !cooldown,
+    rawActive:true,
+    dir:dir,
+    score:score,
+    count:macdPreCandidateCount,
+    stable:stable,
+    cooldown:cooldown,
+    candlesLeft:candlesLeft,
+    entryMs:Number.isFinite(entryMs)?entryMs:0
+  };
+}
+
 function paintMacdPreAlertOnMain(mp, withArrow=true){
   if(!macdPullbackEnabled || !mp) return false;
   const preDir=String(mp.prealert_direction||'NEUTRO').toUpperCase();
@@ -19740,9 +19832,12 @@ function paintMacdPreAlertOnMain(mp, withArrow=true){
   confidence.textContent='MACD frouxo • formação '+score+'/4';
   const macdEntryTime=String(mp.prealert_entry_time||'');
   const macdEntryLabel=macdEntryTime?ft(macdEntryTime):'--:--:--';
-  entry.textContent='ENTRADA '+macdEntryLabel+' • PRÓXIMA VELA';
+  entry.textContent=macdEntryLabel;
+  if(entryScheduleLabel) entryScheduleLabel.textContent='⏱ CRONOGRAMA • MACD • PRÓXIMA VELA';
   countdown.textContent=(isCall?'Possível COMPRA':'Possível VENDA')+' • entrada '+macdEntryLabel;
-  statusBox.textContent='🎯 MACD PULLBACK • '+(isCall?'PRÉ-CALL':'PRÉ-PUT')+' • '+(isCall?'POSSÍVEL COMPRA':'POSSÍVEL VENDA')+' • '+macdEntryLabel;
+  const macdExpiryLabel=mp.prealert_expiry_time?ft(mp.prealert_expiry_time):'--:--:--';
+  if(expiryCountdown) expiryCountdown.textContent='⏱ EXPIRAÇÃO: '+macdExpiryLabel;
+  statusBox.textContent='🎯 MACD PULLBACK • '+(isCall?'PRÉ-CALL':'PRÉ-PUT')+' • '+(isCall?'POSSÍVEL COMPRA':'POSSÍVEL VENDA')+' • ENTRADA '+macdEntryLabel;
   if(risk) risk.textContent='Risco: PRÉ-ALERTA • ainda não confirmado';
 
   showRobot();
@@ -19818,7 +19913,7 @@ function macdOfficialSignalFromPreAlert(mp){
   const dir=String(mp.prealert_direction||'').toUpperCase();
   if(dir!=='CALL' && dir!=='PUT') return null;
   const score=Math.max(0,Math.min(4,Number(mp.prealert_score||0)));
-  // 3.72: um pouco mais seletivo que a versão 2/4, mas ainda mais frouxo
+  // 3.73: um pouco mais seletivo que a versão 2/4, mas ainda mais frouxo
   // que o Velocity original.
   if(score<3) return null;
   const entryTime=String(mp.prealert_entry_time||'');
@@ -19836,7 +19931,7 @@ function macdOfficialSignalFromPreAlert(mp){
     market:String(mp.market||((market&&market.value)||'OPEN')),
     feed_source:String(mp.feed_source||''),
     risk:'MEDIUM',
-    strategy:'MACD_PULLBACK_PREALERT_3_OF_4',
+    strategy:'MACD_PULLBACK_PREALERT_3_OF_4_STABLE',
     selected_engine:'MACD_PULLBACK',
     mode:'MACD_PULLBACK',
     entry_mode:'BIRTH',
@@ -19848,13 +19943,22 @@ async function publishMacdPreAlertOfficial(mp){
   const signal=macdOfficialSignalFromPreAlert(mp);
   if(!signal) return false;
 
-  // Máximo de um sinal oficial do MACD para o mesmo ativo/timeframe/horário
-  // de entrada. Se a leitura intrabar oscilar, não manda CALL e PUT na mesma vela.
   const entryKey=[signal.symbol,signal.interval,signal.entry_time].join('|');
-  if(entryKey===lastMacdOfficialEntryKey) return false;
-  lastMacdOfficialEntryKey=entryKey;
-  lastMacdOfficialSentAt=Date.now();
 
+  // Mantém a PRIMEIRA direção liberada para aquela vela. Se o MACD oscilar
+  // intrabar depois, não cria CALL e PUT para o mesmo horário.
+  if(macdOfficialActiveSignal &&
+     String(macdOfficialActiveSignal.symbol)===String(signal.symbol) &&
+     String(macdOfficialActiveSignal.interval)===String(signal.interval) &&
+     String(macdOfficialActiveSignal.entry_time)===String(signal.entry_time)){
+    signal.direction=String(macdOfficialActiveSignal.direction||signal.direction).toUpperCase();
+  }else{
+    macdOfficialActiveSignal={...signal};
+  }
+
+  // Repassa para a fila em TODA leitura enquanto o alerta estiver vivo.
+  // enqueuePendingTrade já deduplica; isso evita perder o WIN/LOSS se o celular
+  // suspender uma execução exatamente no primeiro disparo.
   enqueuePendingTrade({
     source:signal.source,
     direct_only:true,
@@ -19876,8 +19980,31 @@ async function publishMacdPreAlertOfficial(mp){
     value_payout:currentValuePayout()
   });
 
+  if(entryKey!==lastMacdOfficialEntryKey){
+    lastMacdOfficialEntryKey=entryKey;
+    lastMacdOfficialSentAt=Date.now();
+    const entryMs=Date.parse(String(signal.entry_time||''));
+    if(Number.isFinite(entryMs)){
+      macdLastOfficialEntryMs=entryMs;
+      try{ localStorage.setItem('mega_macd_last_official_entry_ms',String(entryMs)); }catch(_){}
+    }
+    // Backup de contabilidade no servidor SOMENTE para o sinal que passou
+    // pelo gate de estabilidade + cooldown.
+    post('/macd-pullback-register',{
+      market:signal.market,
+      symbol:signal.symbol,
+      interval:signal.interval,
+      direction:signal.direction,
+      entry_time:signal.entry_time,
+      expiry_time:signal.expiry_time
+    }).catch(()=>{});
+  }
+
+  // Não bloqueia nova tentativa de Telegram pelo lastMacdOfficialEntryKey.
+  // maybeSendTelegramSignal só grava a chave depois que o envio realmente
+  // teve sucesso; se Telegram estiver ocupado, a próxima leitura tenta de novo.
   await maybeSendTelegramSignal(signal);
-  if(telegramEnabled && telegramSendStatus){
+  if(telegramEnabled && telegramLastSignalKey===[signal.symbol,signal.interval,signal.direction,signal.entry_time].join('|') && telegramSendStatus){
     telegramSendStatus.textContent='✅ MACD Pullback enviado: '+signal.symbol+' '+signal.direction+' • entrada '+ft(signal.entry_time);
   }
   return true;
@@ -19910,33 +20037,49 @@ function renderMacdPullbackIndicator(data){
     return;
   }
   const dir=String(mp.direction||'NEUTRO').toUpperCase();
-  const preDir=String(mp.prealert_direction||'NEUTRO').toUpperCase();
-  const preActive=Boolean(mp.prealert_active) && (preDir==='CALL'||preDir==='PUT');
+  const rawPreDir=String(mp.prealert_direction||'NEUTRO').toUpperCase();
+  const macdGate=evaluateMacdPreAlertGate(mp);
+  const preDir=macdGate.dir;
+  const preActive=Boolean(macdGate.active);
   macdPullbackState.textContent=dir==='CALL'?'🟢 CALL':dir==='PUT'?'🔴 PUT':'⚪ NEUTRO';
   macdPullbackState.className='big '+(dir==='CALL'?'call':dir==='PUT'?'put':'neutral');
   if(macdPullbackReason) macdPullbackReason.textContent=String(mp.reason||'Monitorando MACD Pullback.');
   if(macdPullbackPreAlert){
-    macdPullbackPreAlert.textContent=preActive?('ATIVO • '+preDir):'MONITORANDO';
-    macdPullbackPreAlert.className='big '+(preDir==='CALL'?'call':preDir==='PUT'?'put':'neutral');
+    if(preActive){
+      macdPullbackPreAlert.textContent='ATIVO • '+preDir;
+      macdPullbackPreAlert.className='big '+(preDir==='CALL'?'call':'put');
+    }else if(macdGate.cooldown){
+      macdPullbackPreAlert.textContent='PAUSA • '+macdGate.candlesLeft+' VELA'+(macdGate.candlesLeft===1?'':'S');
+      macdPullbackPreAlert.className='big neutral';
+    }else if(macdGate.rawActive){
+      macdPullbackPreAlert.textContent='CONFIRMANDO '+macdGate.count+'/'+MACD_PRE_STABILITY_READS;
+      macdPullbackPreAlert.className='big neutral';
+    }else{
+      macdPullbackPreAlert.textContent='MONITORANDO';
+      macdPullbackPreAlert.className='big neutral';
+    }
   }
   if(macdPullbackPreCall){
-    macdPullbackPreCall.textContent=preDir==='CALL'?'PRÉ-CALL ATIVO':'AGUARDANDO';
-    macdPullbackPreCall.className='big '+(preDir==='CALL'?'call':'neutral');
+    macdPullbackPreCall.textContent=preActive&&preDir==='CALL'?'PRÉ-CALL ATIVO':(macdGate.rawActive&&preDir==='CALL'?'CONFIRMANDO':'AGUARDANDO');
+    macdPullbackPreCall.className='big '+(preActive&&preDir==='CALL'?'call':'neutral');
   }
   if(macdPullbackPrePut){
-    macdPullbackPrePut.textContent=preDir==='PUT'?'PRÉ-PUT ATIVO':'AGUARDANDO';
-    macdPullbackPrePut.className='big '+(preDir==='PUT'?'put':'neutral');
+    macdPullbackPrePut.textContent=preActive&&preDir==='PUT'?'PRÉ-PUT ATIVO':(macdGate.rawActive&&preDir==='PUT'?'CONFIRMANDO':'AGUARDANDO');
+    macdPullbackPrePut.className='big '+(preActive&&preDir==='PUT'?'put':'neutral');
   }
   if(macdPullbackPreReason){
     const score=Number(mp.prealert_score||0);
     const vozTxt=voiceEnabled?'':' • VOZ OFFLINE';
     const horario=(preActive&&mp.prealert_entry_time)?(' • entrada '+ft(mp.prealert_entry_time)):'';
-    macdPullbackPreReason.textContent=String(mp.prealert_reason||'Monitorando pré-alerta do MACD.')+(preActive?(' • formação '+score+'/4'+horario+vozTxt):'');
+    let gateTxt='';
+    if(macdGate.cooldown) gateTxt=' • aguardando '+macdGate.candlesLeft+' vela'+(macdGate.candlesLeft===1?'':'s')+' de intervalo';
+    else if(macdGate.rawActive&&!preActive) gateTxt=' • confirmação '+macdGate.count+'/'+MACD_PRE_STABILITY_READS;
+    macdPullbackPreReason.textContent=String(mp.prealert_reason||'Monitorando pré-alerta do MACD.')+(preActive?(' • formação '+score+'/4'+horario+vozTxt):gateTxt);
   }
   if(preActive){
     const preKey=[String(mp.symbol||((S&&S.value)||'')),String(mp.interval||((interval&&interval.value)||'')),preDir,String(mp.prealert_candle||'')].join('|');
 
-    // 3.72: além da aba do indicador, o pré-alerta 3/4 do SEGUNDO indicador
+    // 3.74: só após 2 leituras seguidas e fora do cooldown, o pré-alerta 3/4 do SEGUNDO indicador
     // aparece no painel principal e na seta do robô e também entra no mesmo
     // fluxo oficial de Telegram + WIN/LOSS. Autoentrada continua bloqueada.
     paintMacdPreAlertOnMain(mp,true);
@@ -20015,6 +20158,10 @@ if(macdPullbackPowerBtn){
       await loadMacdPullbackIndicator(true);
     }else{
       clearMacdMainPreview();
+      macdOfficialActiveSignal=null;
+      macdPreCandidateDir='';
+      macdPreCandidateCount=0;
+      macdPreCandidateSampleKey='';
       renderMacdPullbackIndicator(null);
     }
     if(voiceEnabled) speak(macdPullbackEnabled?'Indicador MACD Pullback online.':'Indicador MACD Pullback offline.');
@@ -20714,16 +20861,34 @@ function spokenAssetName(symbol){
   return String(symbol||'').replace('/', ' ');
 }
 
+function activeTimingSignal(){
+  // Sinal confirmado do motor principal tem prioridade.
+  if(cur && (cur.direction==='CALL' || cur.direction==='PUT') && cur.entry_time) return cur;
+  // Quando os motores principais estão neutros/offline, o segundo indicador
+  // mantém seu próprio cronograma até a expiração da operação.
+  if(macdPullbackEnabled && macdOfficialActiveSignal){
+    const d=String(macdOfficialActiveSignal.direction||'').toUpperCase();
+    const exp=Date.parse(String(macdOfficialActiveSignal.expiry_time||''));
+    const sameSymbol=String(macdOfficialActiveSignal.symbol||'')===String((S&&S.value)||'');
+    const sameInterval=String(macdOfficialActiveSignal.interval||'')===String((interval&&interval.value)||'');
+    if((d==='CALL'||d==='PUT') && sameSymbol && sameInterval && Number.isFinite(exp) && exp>Date.now()-2000){
+      return macdOfficialActiveSignal;
+    }
+  }
+  return null;
+}
+
 function cd(){
-  if(!cur || cur.direction==='NEUTRO' || !cur.entry_time){
+  const timingSig=activeTimingSignal();
+  if(!timingSig){
     countdown.textContent='Sem entrada confirmada';
     expiryCountdown.textContent='⏱ EXPIRAÇÃO: --:--';
     return;
   }
 
   const nowMs=Date.now();
-  const et=new Date(cur.entry_time).getTime();
-  const xt=cur.expiry_time?new Date(cur.expiry_time).getTime():0;
+  const et=new Date(timingSig.entry_time).getTime();
+  const xt=timingSig.expiry_time?new Date(timingSig.expiry_time).getTime():0;
   const n=Math.ceil((et-nowMs)/1000);
 
   countdown.textContent=n>0?'Entrada em '+n+'s':'Entrada liberada';
@@ -20742,7 +20907,7 @@ function cd(){
   if(n<=30 && n>0 && !thirtyFive){
     thirtyFive=true;
     if(voiceEnabled){
-      const ativoFalado=spokenAssetName(cur.symbol || (S&&S.value) || '');
+      const ativoFalado=spokenAssetName(timingSig.symbol || (S&&S.value) || '');
       speak('Olá trader. Entrada encontrada no ativo '+ativoFalado+'.');
     }
   }
@@ -20754,19 +20919,19 @@ function cd(){
     }
   }
 
-  const birthGrace=(String(cur.entry_mode||'').toUpperCase()==='BIRTH')?12:2;
+  const birthGrace=(String(timingSig.entry_mode||'').toUpperCase()==='BIRTH')?12:2;
   if(n<=0 && n>-birthGrace){
     // Alertas antecipados promovidos do Velocity vão para painel/robô/Telegram,
     // mas não disparam ordem automática sem confirmação no candle fechado.
-    if(autoTradeEnabled && cur.auto_trade_allowed!==false) executeAutoTrade(cur);
+    if(autoTradeEnabled && timingSig.auto_trade_allowed!==false) executeAutoTrade(timingSig);
   }
   if(n<=0 && n>-birthGrace && !entered){
     entered=true;
-    showEntryArrow(cur.direction);
+    showEntryArrow(timingSig.direction);
 
     if(voiceEnabled){
       speak(
-        cur.direction==='CALL'
+        timingSig.direction==='CALL'
         ? 'Entrada liberada. Comprar agora.'
         : 'Entrada liberada. Vender agora.'
       );
@@ -20976,6 +21141,7 @@ marketMode.onchange=async()=>{
 
 
 S.onchange=()=>{
+  macdOfficialActiveSignal=null;
   try{localStorage.setItem('mega_symbol',S.value)}catch(_){}
   renderAdaptiveLearningState();
 
@@ -20992,6 +21158,7 @@ S.onchange=()=>{
 };
 
 interval.onchange=()=>{
+  macdOfficialActiveSignal=null;
   try{localStorage.setItem('mega_interval',interval.value)}catch(_){}
 
   lastSignalVoice='';
@@ -21115,6 +21282,7 @@ setInterval(()=>{
 
 // MACD Pullback independente com pré-alerta intrabar. A rota própria usa o mesmo
 // roteador/cache de candles do app e roda no máximo a cada 12 s.
+// 3.74: duas leituras consecutivas + 3 velas de cooldown entre sinais oficiais.
 setInterval(()=>{
   if(megaCanPoll() && macdPullbackEnabled) loadMacdPullbackIndicator(false);
 },12000);
