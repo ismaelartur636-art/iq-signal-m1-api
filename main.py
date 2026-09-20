@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.65"
-PWA_VERSION = "v131"
+APP_VERSION = "3.66"
+PWA_VERSION = "v132"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -102,20 +102,20 @@ VELOCITY_ADX_MIN = max(5.0, min(60.0, float(os.getenv("VELOCITY_ADX_MIN", "25"))
 VELOCITY_BREAKOUT_LOOKBACK = max(2, min(10, int(os.getenv("VELOCITY_BREAKOUT_LOOKBACK", "3"))))
 VELOCITY_COOLDOWN_BARS = max(1, min(20, int(os.getenv("VELOCITY_COOLDOWN_BARS", "5"))))
 
-# MEGA IA 3.65 — ICT/SMC Institucional adaptado do Pine IID Dual fornecido.
+# MEGA IA 3.66 — ICT/SMC Institucional levemente afrouxado, mantendo vela confirmada.
 # O motor usa somente candles fechados. Pivôs são confirmados com barras à direita,
 # e o sinal entra apenas na próxima vela.
 ICT_PIVOT_LEFT = max(1, min(8, int(os.getenv("ICT_PIVOT_LEFT", "3"))))
-ICT_PIVOT_RIGHT = max(1, min(8, int(os.getenv("ICT_PIVOT_RIGHT", "3"))))
+ICT_PIVOT_RIGHT = max(1, min(8, int(os.getenv("ICT_PIVOT_RIGHT", "2"))))
 ICT_ATR_PERIOD = max(7, min(30, int(os.getenv("ICT_ATR_PERIOD", "14"))))
-ICT_MIN_SCORE = max(65.0, min(90.0, float(os.getenv("ICT_MIN_SCORE", "74"))))
-ICT_STRONG_SCORE = max(ICT_MIN_SCORE, min(96.0, float(os.getenv("ICT_STRONG_SCORE", "84"))))
-ICT_FVG_PROX_ATR = max(0.05, min(0.60, float(os.getenv("ICT_FVG_PROX_ATR", "0.18"))))
-ICT_SWEEP_MIN_ATR = max(0.02, min(0.80, float(os.getenv("ICT_SWEEP_MIN_ATR", "0.08"))))
-ICT_M1_COOLDOWN_BARS = max(4, min(30, int(os.getenv("ICT_M1_COOLDOWN_BARS", "8"))))
+ICT_MIN_SCORE = max(65.0, min(90.0, float(os.getenv("ICT_MIN_SCORE", "70"))))
+ICT_STRONG_SCORE = max(ICT_MIN_SCORE, min(96.0, float(os.getenv("ICT_STRONG_SCORE", "82"))))
+ICT_FVG_PROX_ATR = max(0.05, min(0.60, float(os.getenv("ICT_FVG_PROX_ATR", "0.20"))))
+ICT_SWEEP_MIN_ATR = max(0.02, min(0.80, float(os.getenv("ICT_SWEEP_MIN_ATR", "0.06"))))
+ICT_M1_COOLDOWN_BARS = max(4, min(30, int(os.getenv("ICT_M1_COOLDOWN_BARS", "6"))))
 
 def _ict_cooldown_bars(interval: str) -> int:
-    return {"1min": ICT_M1_COOLDOWN_BARS, "5min": 4, "15min": 3, "30min": 2}.get(str(interval), 2)
+    return {"1min": ICT_M1_COOLDOWN_BARS, "5min": 3, "15min": 2, "30min": 2}.get(str(interval), 2)
 
 xgb_model_cache: Dict[str, Dict[str, Any]] = {}
 xgb_model_guard = threading.RLock()
@@ -7847,8 +7847,8 @@ def ict_smc_institutional_strategy(cs, timeframe="1min", market="OPEN", h1=None,
     struct_dir = _ict_structure_direction(highs, lows)
     prior_high = highs[-1][1] if highs else max(float(x["high"]) for x in rows[-20:-1])
     prior_low = lows[-1][1] if lows else min(float(x["low"]) for x in rows[-20:-1])
-    bos_bull = pc <= prior_high and c > prior_high + 0.03*a
-    bos_bear = pc >= prior_low and c < prior_low - 0.03*a
+    bos_bull = pc <= prior_high and c > prior_high + 0.02*a
+    bos_bear = pc >= prior_low and c < prior_low - 0.02*a
     choch_bull = struct_dir == -1 and bos_bull
     choch_bear = struct_dir == 1 and bos_bear
     sweep_bull = l < prior_low - ICT_SWEEP_MIN_ATR*a and c > prior_low
@@ -7878,9 +7878,9 @@ def ict_smc_institutional_strategy(cs, timeframe="1min", market="OPEN", h1=None,
     positive_vols=[x for x in vols[:-1] if x>0]
     vol_avg=sum(positive_vols)/len(positive_vols) if positive_vols else 0.0
     last_vol=vols[-1] if vols else 0.0
-    volume_confirm = vol_avg <= 0 or last_vol >= 1.15*vol_avg
-    impulse_bull = c > o and body_ratio >= 0.55 and close_pos >= 0.72 and candle_range <= 2.8*a
-    impulse_bear = c < o and body_ratio >= 0.55 and close_pos <= 0.28 and candle_range <= 2.8*a
+    volume_confirm = vol_avg <= 0 or last_vol >= 1.10*vol_avg
+    impulse_bull = c > o and body_ratio >= 0.52 and close_pos >= 0.68 and candle_range <= 2.8*a
+    impulse_bear = c < o and body_ratio >= 0.52 and close_pos <= 0.32 and candle_range <= 2.8*a
 
     h1_bias = _ict_bias_from_rows(h1 or [])
     h4_bias = _ict_bias_from_rows(h4 or [])
