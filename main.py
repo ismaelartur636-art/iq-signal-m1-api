@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.79.1"
+APP_VERSION = "3.80.0"
 PWA_VERSION = "v139"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -209,23 +209,25 @@ RSI_MONITOR_EARLY_WINDOW_BEFORE = max(20, min(26, int(os.getenv("RSI_MONITOR_EAR
 RSI_MONITOR_EARLY_MIN_REMAINING = max(12, min(20, int(os.getenv("RSI_MONITOR_EARLY_MIN_REMAINING", "16"))))
 RSI_MONITOR_COOLDOWN_BARS = max(1, min(8, int(os.getenv("RSI_MONITOR_COOLDOWN_BARS", "2"))))
 
-# 3.79 — Volume POC adaptado do Foot Print X-Ray.mq5.
-# O app não possui bid/ask agressor nativo em todas as fontes; por isso o delta
-# é uma estimativa OHLCV transparente. O motor usa somente candles FECHADOS,
-# monta um perfil de volume por preço, encontra o POC e procura confluência de
-# imbalance, absorção, divergência e exaustão para a próxima vela.
-VOLUME_POC_LOOKBACK = max(24, min(90, int(os.getenv("VOLUME_POC_LOOKBACK", "48"))))
-VOLUME_POC_BINS = max(12, min(40, int(os.getenv("VOLUME_POC_BINS", "24"))))
-VOLUME_POC_DELTA_LOOKBACK = max(5, min(25, int(os.getenv("VOLUME_POC_DELTA_LOOKBACK", "10"))))
-VOLUME_POC_IMBALANCE_THRESHOLD = max(0.20, min(0.80, float(os.getenv("VOLUME_POC_IMBALANCE_THRESHOLD", "0.36"))))
-VOLUME_POC_STACKED_ROWS = max(2, min(5, int(os.getenv("VOLUME_POC_STACKED_ROWS", "3"))))
-VOLUME_POC_ABSORPTION_VOL = max(1.00, min(3.00, float(os.getenv("VOLUME_POC_ABSORPTION_VOL", "1.18"))))
-VOLUME_POC_EXHAUSTION_VOL = max(1.30, min(4.00, float(os.getenv("VOLUME_POC_EXHAUSTION_VOL", "2.00"))))
-VOLUME_POC_EXHAUSTION_DELTA = max(0.05, min(0.35, float(os.getenv("VOLUME_POC_EXHAUSTION_DELTA", "0.15"))))
-VOLUME_POC_MIN_SCORE = max(3, min(9, int(os.getenv("VOLUME_POC_MIN_SCORE", "5"))))
-VOLUME_POC_SCORE_EDGE = max(1, min(5, int(os.getenv("VOLUME_POC_SCORE_EDGE", "2"))))
-VOLUME_POC_COOLDOWN_BARS = max(1, min(10, int(os.getenv("VOLUME_POC_COOLDOWN_BARS", "2"))))
-VOLUME_POC_MIN_VOLUME_COVERAGE = max(0.35, min(1.00, float(os.getenv("VOLUME_POC_MIN_VOLUME_COVERAGE", "0.65"))))
+# 3.80 — Volume POC rápido: snapshot nos 20s finais para a PRÓXIMA vela.
+# O delta continua sendo estimado por OHLCV quando a fonte não entrega agressor bid/ask real.
+# Os filtros foram levemente afrouxados para aumentar a frequência sem liberar um lado
+# sem vantagem mínima sobre o lado oposto. Depois da liberação, active_signal congela o sinal.
+VOLUME_POC_LOOKBACK = max(24, min(90, int(os.getenv("VOLUME_POC_LOOKBACK", "40"))))
+VOLUME_POC_BINS = max(12, min(40, int(os.getenv("VOLUME_POC_BINS", "20"))))
+VOLUME_POC_DELTA_LOOKBACK = max(5, min(25, int(os.getenv("VOLUME_POC_DELTA_LOOKBACK", "8"))))
+VOLUME_POC_IMBALANCE_THRESHOLD = max(0.20, min(0.80, float(os.getenv("VOLUME_POC_IMBALANCE_THRESHOLD", "0.30"))))
+VOLUME_POC_STACKED_ROWS = max(2, min(5, int(os.getenv("VOLUME_POC_STACKED_ROWS", "2"))))
+VOLUME_POC_ABSORPTION_VOL = max(0.90, min(3.00, float(os.getenv("VOLUME_POC_ABSORPTION_VOL", "1.08"))))
+VOLUME_POC_EXHAUSTION_VOL = max(1.10, min(4.00, float(os.getenv("VOLUME_POC_EXHAUSTION_VOL", "1.55"))))
+VOLUME_POC_EXHAUSTION_DELTA = max(0.05, min(0.35, float(os.getenv("VOLUME_POC_EXHAUSTION_DELTA", "0.18"))))
+VOLUME_POC_MIN_SCORE = max(3, min(9, int(os.getenv("VOLUME_POC_MIN_SCORE", "4"))))
+VOLUME_POC_SCORE_EDGE = max(1, min(5, int(os.getenv("VOLUME_POC_SCORE_EDGE", "1"))))
+VOLUME_POC_COOLDOWN_BARS = max(1, min(10, int(os.getenv("VOLUME_POC_COOLDOWN_BARS", "1"))))
+VOLUME_POC_MIN_VOLUME_COVERAGE = max(0.35, min(1.00, float(os.getenv("VOLUME_POC_MIN_VOLUME_COVERAGE", "0.50"))))
+VOLUME_POC_EARLY_SIGNAL_SECONDS = 20
+VOLUME_POC_EARLY_WINDOW_BEFORE = max(20, min(26, int(os.getenv("VOLUME_POC_EARLY_WINDOW_BEFORE", "23"))))
+VOLUME_POC_EARLY_MIN_REMAINING = max(12, min(20, int(os.getenv("VOLUME_POC_EARLY_MIN_REMAINING", "16"))))
 
 xgb_model_cache: Dict[str, Dict[str, Any]] = {}
 xgb_model_guard = threading.RLock()
@@ -8768,9 +8770,9 @@ def _volume_poc_unfinished_zone(rows):
     return None
 
 
-def _volume_poc_snapshot(rows):
+def _volume_poc_snapshot(rows, early_signal=False):
     rows = list(rows or [])
-    need = max(VOLUME_POC_LOOKBACK + 2, 52)
+    need = max(VOLUME_POC_LOOKBACK + 2, 44)
     if len(rows) < need:
         return None
     profile = _volume_poc_profile(rows)
@@ -8803,9 +8805,14 @@ def _volume_poc_snapshot(rows):
     bear_div = h > prior_high and dcur < 0
     bull_div = l < prior_low and dcur > 0
 
-    bull_abs = bool(vratio >= VOLUME_POC_ABSORPTION_VOL and lower >= 0.32 and dr <= -0.08 and close_pos >= 0.52)
-    bear_abs = bool(vratio >= VOLUME_POC_ABSORPTION_VOL and upper >= 0.32 and dr >= 0.08 and close_pos <= 0.48)
-    exhaustion = bool(vratio >= VOLUME_POC_EXHAUSTION_VOL and abs(dr) <= VOLUME_POC_EXHAUSTION_DELTA)
+    # Na janela antecipada a vela ainda está formando, portanto o volume acumulado
+    # naturalmente é menor. Compensamos isso apenas nos limiares de volume, sem
+    # inventar volume futuro nem alterar o preço/delta observado.
+    absorption_vol = max(0.78, VOLUME_POC_ABSORPTION_VOL * (0.80 if early_signal else 1.0))
+    exhaustion_vol = max(1.00, VOLUME_POC_EXHAUSTION_VOL * (0.82 if early_signal else 1.0))
+    bull_abs = bool(vratio >= absorption_vol and lower >= 0.30 and dr <= -0.06 and close_pos >= 0.51)
+    bear_abs = bool(vratio >= absorption_vol and upper >= 0.30 and dr >= 0.06 and close_pos <= 0.49)
+    exhaustion = bool(vratio >= exhaustion_vol and abs(dr) <= VOLUME_POC_EXHAUSTION_DELTA)
     delta_flip_call = dcur > 0 and dprev <= 0
     delta_flip_put = dcur < 0 and dprev >= 0
 
@@ -8844,8 +8851,10 @@ def _volume_poc_snapshot(rows):
         elif upper > lower * 1.15 and close_pos <= 0.48:
             add_put(1, "EXAUSTÃO COMPRADORA")
     # Volume forte with directional close is a light confirmation, never a trigger alone.
-    if vratio >= 1.10 and dr >= 0.18 and c > o: add_call(1, "VOLUME + DELTA")
-    if vratio >= 1.10 and dr <= -0.18 and c < o: add_put(1, "VOLUME + DELTA")
+    strong_vol = 0.82 if early_signal else 0.95
+    strong_delta = 0.12 if early_signal else 0.14
+    if vratio >= strong_vol and dr >= strong_delta and c > o: add_call(1, "VOLUME + DELTA")
+    if vratio >= strong_vol and dr <= -strong_delta and c < o: add_put(1, "VOLUME + DELTA")
 
     coverage = float(profile.get("volume_coverage") or 0.0)
     coverage_ok = coverage >= VOLUME_POC_MIN_VOLUME_COVERAGE
@@ -8875,22 +8884,23 @@ def _volume_poc_snapshot(rows):
         "bull_divergence": bull_div, "bear_divergence": bear_div,
         "exhaustion": exhaustion, "delta_flip_call": delta_flip_call, "delta_flip_put": delta_flip_put,
         "poc_call": poc_call, "poc_put": poc_put, "unfinished_business": ub,
-        "atr": a, "coverage_ok": coverage_ok,
+        "atr": a, "coverage_ok": coverage_ok, "early_signal": bool(early_signal),
         "event_key": f"VOLUME_POC:{direction}:{dt}" if direction in ("CALL", "PUT") else "",
         "delta_method": "OHLCV_PROXY_NOT_TRUE_BID_ASK",
     }
 
 
-def volume_poc_strategy(cs, timeframe="1min", market="OPEN"):
+def volume_poc_strategy(cs, timeframe="1min", market="OPEN", early_signal=False):
     """VOLUME POC — profile/POC + estimated delta + imbalance/absorption/divergence/exhaustion.
 
-    Only closed candles are accepted by the caller. A signal is for the immediately
-    following candle and is not recalculated from a still-forming candle.
+    In normal mode it reads closed candles. In early_signal mode it takes one
+    snapshot of the forming candle inside the final ~20s window. Once released,
+    the outer signal state locks that CALL/PUT for the immediately following candle.
     """
     rows = list(cs or [])
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
     name = f"VOLUME POC {tf_label}"
-    need = max(VOLUME_POC_LOOKBACK + 2, 52)
+    need = max(VOLUME_POC_LOOKBACK + 2, 44)
     if len(rows) < need:
         return {"available":True, "direction":"NEUTRO", "confidence":0.0, "confirmed":False, "risk":"HIGH",
                 "strategy":name, "engine":"VOLUME_POC", "provider":"LOCAL_VOLUME_POC",
@@ -8899,26 +8909,38 @@ def volume_poc_strategy(cs, timeframe="1min", market="OPEN"):
 
     start = max(need - 1, len(rows) - 24)
     last_fired = None; last_snap = None; seen = set()
-    for i in range(start, len(rows)):
-        snap = _volume_poc_snapshot(rows[:i+1])
-        if not snap:
+    # No modo 20s, o último candle é a vela em formação. O histórico/cooldown
+    # é calculado só até a vela anterior; o snapshot atual usa os limiares intrabar.
+    history_end = len(rows) - 1 if early_signal else len(rows)
+    for i in range(start, history_end):
+        snap_hist = _volume_poc_snapshot(rows[:i+1], early_signal=False)
+        if not snap_hist:
             continue
         if i == len(rows) - 1:
-            last_snap = snap
-        if snap.get("confirmed") and snap.get("direction") in ("CALL", "PUT"):
-            key = str(snap.get("event_key") or f"VOLUME_POC:{snap.get('direction')}:{i}")
+            last_snap = snap_hist
+        if snap_hist.get("confirmed") and snap_hist.get("direction") in ("CALL", "PUT"):
+            key = str(snap_hist.get("event_key") or f"VOLUME_POC:{snap_hist.get('direction')}:{i}")
             is_new = key not in seen; seen.add(key)
             if is_new and (last_fired is None or (i - last_fired) > VOLUME_POC_COOLDOWN_BARS):
                 last_fired = i
 
-    snap = last_snap or _volume_poc_snapshot(rows)
+    if early_signal:
+        snap = _volume_poc_snapshot(rows, early_signal=True)
+        current_i = len(rows) - 1
+        current_allowed = bool(
+            snap and snap.get("confirmed") and snap.get("direction") in ("CALL", "PUT")
+            and (last_fired is None or (current_i - last_fired) > VOLUME_POC_COOLDOWN_BARS)
+        )
+    else:
+        snap = last_snap or _volume_poc_snapshot(rows, early_signal=False)
+        current_allowed = bool(last_fired == len(rows) - 1)
     if not snap:
         return {"available":True, "direction":"NEUTRO", "confidence":0.0, "confirmed":False, "risk":"HIGH",
                 "strategy":name, "engine":"VOLUME_POC", "provider":"LOCAL_VOLUME_POC",
                 "reason":"Volume POC aguardando histórico/volume suficiente.", "non_repaint":True,
                 "gale_signal":False, "martingale":False, "direct_win_only":True, "next_candle":True}
 
-    direction = snap.get("direction") if last_fired == len(rows) - 1 else "NEUTRO"
+    direction = snap.get("direction") if current_allowed else "NEUTRO"
     confirmed = direction in ("CALL", "PUT")
     if not snap.get("coverage_ok"):
         reason = (f"Volume POC aguardando volume confiável da fonte: cobertura {float(snap.get('volume_coverage') or 0)*100:.0f}% "
@@ -11273,8 +11295,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         # RSI Monitor: decisão nos segundos finais e entrada na próxima abertura.
         entry_mode = "MIDDLE"
     elif engine == "VOLUME":
-        # Volume POC usa exclusivamente o último candle fechado e entra na abertura seguinte.
-        entry_mode = "BIRTH"
+        # Volume POC 3.80: snapshot nos 20s finais e entrada na próxima abertura.
+        entry_mode = "MIDDLE"
     if engine == "RSI":
         engine = "GRAPH_AI"
     if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON"):
@@ -11855,7 +11877,26 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     analysis["early_signal_window"] = False
                     analysis["seconds_to_entry_snapshot"] = round(rsi_seconds_to_entry,1)
             elif engine == "VOLUME":
-                analysis = volume_poc_strategy(engine_closed, interval, market=market)
+                volume_seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                volume_early_window=(VOLUME_POC_EARLY_MIN_REMAINING <= volume_seconds_to_entry <= VOLUME_POC_EARLY_WINDOW_BEFORE)
+                if volume_early_window:
+                    analysis = volume_poc_strategy(raw[-120:], interval, market=market, early_signal=True)
+                    analysis["early_signal_window"] = True
+                    analysis["seconds_to_entry_snapshot"] = round(volume_seconds_to_entry,1)
+                else:
+                    analysis = volume_poc_strategy(engine_closed, interval, market=market, early_signal=False)
+                    if analysis.get("confirmed"):
+                        analysis["preview_direction"] = analysis.get("direction")
+                        analysis["preview_confidence"] = analysis.get("confidence")
+                    analysis["confirmed"] = False
+                    analysis["direction"] = "NEUTRO"
+                    analysis["confidence"] = 0.0
+                    analysis["reason"] = (
+                        f"Volume POC rápido monitorando • sinal oficial será avaliado cerca de {VOLUME_POC_EARLY_SIGNAL_SECONDS}s antes da próxima vela "
+                        f"(agora faltam {int(volume_seconds_to_entry)}s)."
+                    )
+                    analysis["early_signal_window"] = False
+                    analysis["seconds_to_entry_snapshot"] = round(volume_seconds_to_entry,1)
             elif engine == "SAMURAI":
                 samurai_seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
                 samurai_early_window=(SAMURAI_EARLY_MIN_REMAINING <= samurai_seconds_to_entry <= SAMURAI_EARLY_WINDOW_BEFORE)
@@ -12022,6 +12063,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             if engine == "SAMURAI" and analysis.get("early_signal_window") and raw:
                 reference_candle = raw[-1].get("datetime")
             if engine == "RSIMON" and analysis.get("early_signal_window") and raw:
+                reference_candle = raw[-1].get("datetime")
+            if engine == "VOLUME" and analysis.get("early_signal_window") and raw:
                 reference_candle = raw[-1].get("datetime")
 
             # MEGA IA 3.39 — confirmação invisível da vela em formação.
@@ -12251,6 +12294,19 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key] = (time.time(), base)
                         return base
 
+                if engine == "VOLUME":
+                    _vp_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                    if not (VOLUME_POC_EARLY_MIN_REMAINING <= _vp_remaining <= VOLUME_POC_EARLY_WINDOW_BEFORE):
+                        base["status"] = "ONLINE • VOLUME POC • AGUARDANDO JANELA DE 20S"
+                        base["reason"] = f"Volume POC aguardando a janela antecipada; faltam {int(_vp_remaining)}s para a próxima vela."
+                        base["direction"] = "NEUTRO"
+                        base["entry_time"] = None
+                        base["expiry_time"] = None
+                        base["risk"] = "HIGH"
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
+
                 if engine == "RSIMON":
                     _rsi_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
                     if not (RSI_MONITOR_EARLY_MIN_REMAINING <= _rsi_remaining <= RSI_MONITOR_EARLY_WINDOW_BEFORE):
@@ -12296,9 +12352,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key] = (time.time(), base)
                         return base
 
-                if engine == "RSIMON":
+                if engine in ("RSIMON", "VOLUME"):
                     entry = next_boundary(interval)
-                    announce = entry - timedelta(seconds=RSI_MONITOR_EARLY_SIGNAL_SECONDS)
+                    _lead = RSI_MONITOR_EARLY_SIGNAL_SECONDS if engine == "RSIMON" else VOLUME_POC_EARLY_SIGNAL_SECONDS
+                    announce = entry - timedelta(seconds=_lead)
                     expiry = entry + timedelta(seconds=INTERVALS[interval])
                 else:
                     announce, entry, expiry = entry_window(interval, entry_mode)
@@ -12348,6 +12405,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     base["training_mode"] = True
                     base["auto_trade_allowed"] = False
                     base["samurai_source"] = "Algo Samurai.mq4"
+                if engine == "VOLUME":
+                    base["announce_seconds_before"] = VOLUME_POC_EARLY_SIGNAL_SECONDS
+                    base["early_signal_locked"] = True
+                    base["non_repaint_after_release"] = True
+                    base["signal_snapshot"] = "FORMING_CANDLE_AT_20S"
+                    base["volume_poc_fast"] = {"min_score": VOLUME_POC_MIN_SCORE, "score_edge": VOLUME_POC_SCORE_EDGE, "cooldown_bars": VOLUME_POC_COOLDOWN_BARS}
                 if engine == "RSIMON":
                     base["announce_seconds_before"] = RSI_MONITOR_EARLY_SIGNAL_SECONDS
                     base["early_signal_locked"] = True
@@ -22833,7 +22896,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: TREINAMENTO • rompimento Samurai com step adaptativo • sinal ~30s antes • próxima vela • WIN/LOSS contabilizado • autoentrada real bloqueada.'
     : 'OFFLINE: Algo Samurai em treinamento pausado.';
   if(volumePocModeDesc) volumePocModeDesc.textContent=volumePocEnabled
-    ? 'ONLINE: POC + perfil de volume + delta estimado + imbalance + absorção + divergência + exaustão • só candle fechado • próxima vela • sem Gale.'
+    ? 'ONLINE: POC rápido + delta estimado + imbalance + absorção + divergência • sinal ~20s antes • próxima vela • sem Gale.'
     : 'OFFLINE: Volume POC pausado.';
   if(ictModeDesc) ictModeDesc.textContent=ictEnabled
     ? 'ONLINE: BOS/CHoCH + liquidez + FVG/OB + OTE + EMA/VWAP + volume + contexto H1/H4 • próxima vela • sem Gale.'
@@ -22850,8 +22913,8 @@ function applyRobotPowerState(){
 
   const engine=selectedRobotEngine();
   if(engine==='VOLUME'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='VOLUME POC ONLINE • POC + DELTA + IMBALANCE + ABSORÇÃO • VELA FECHADA • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📊 Volume POC selecionado • sem pré-sinal intrabar • usa candle fechado para não repintar.</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='VOLUME POC RÁPIDO ONLINE • SINAL ~20S ANTES • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📊 Volume POC rápido • snapshot nos 20s finais • depois do disparo o CALL/PUT fica travado.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Volume POC ativo • procurando reação no POC + fluxo de volume</div>';
     rad();
   }else if(engine==='RSIMON'){
