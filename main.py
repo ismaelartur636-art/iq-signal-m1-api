@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.75"
+APP_VERSION = "3.76"
 PWA_VERSION = "v138"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -161,16 +161,21 @@ ALPHAX_MIN_FORM_PCT = max(45.0, min(80.0, float(os.getenv("ALPHAX_MIN_FORM_PCT",
 ALPHAX_ARMED_ATR = max(0.15, min(1.00, float(os.getenv("ALPHAX_ARMED_ATR", "0.50"))))
 ALPHAX_BREAK_ATR = max(0.10, min(1.20, float(os.getenv("ALPHAX_BREAK_ATR", "0.35"))))
 
-# 3.75 — novo motor separado. O AlphaX acima permanece com a estratégia 3.73 intacta.
+# 3.76 — Núcleo Rápido mais seletivo. O AlphaX acima permanece com a estratégia 3.73 intacta.
+# O novo motor só libera quando zona + microimpulso + Scalper + CRIPTOBOT concordam.
 RAPID_EARLY_SIGNAL_SECONDS = max(20, min(45, int(os.getenv("RAPID_EARLY_SIGNAL_SECONDS", "30"))))
 RAPID_EARLY_WINDOW_BEFORE = max(RAPID_EARLY_SIGNAL_SECONDS, min(50, int(os.getenv("RAPID_EARLY_WINDOW_BEFORE", "35"))))
 RAPID_EARLY_MIN_REMAINING = max(12, min(RAPID_EARLY_SIGNAL_SECONDS, int(os.getenv("RAPID_EARLY_MIN_REMAINING", "18"))))
-RAPID_COOLDOWN_BARS = max(1, min(10, int(os.getenv("RAPID_COOLDOWN_BARS", "2"))))
-RAPID_AI_GEN_QUALITY_MIN = max(25.0, min(75.0, float(os.getenv("RAPID_AI_GEN_QUALITY_MIN", "42"))))
-RAPID_AI_GEN_HARD_BLOCK = max(15.0, min(RAPID_AI_GEN_QUALITY_MIN, float(os.getenv("RAPID_AI_GEN_HARD_BLOCK", "32"))))
-RAPID_AI_GEN_MAX_RANGE_RATIO = max(1.50, min(6.00, float(os.getenv("RAPID_AI_GEN_MAX_RANGE_RATIO", "3.20"))))
-RAPID_AI_GEN_MIN_RANGE_RATIO = max(0.05, min(0.60, float(os.getenv("RAPID_AI_GEN_MIN_RANGE_RATIO", "0.15"))))
-RAPID_AI_GEN_MAX_WICK_RATIO = max(0.55, min(0.95, float(os.getenv("RAPID_AI_GEN_MAX_WICK_RATIO", "0.84"))))
+RAPID_COOLDOWN_BARS = max(2, min(10, int(os.getenv("RAPID_COOLDOWN_BARS", "3"))))
+RAPID_MIN_CONFIDENCE = max(75.0, min(95.0, float(os.getenv("RAPID_MIN_CONFIDENCE", "82"))))
+RAPID_RB_CONFIRM_SCORE = max(60.0, min(90.0, float(os.getenv("RAPID_RB_CONFIRM_SCORE", "65"))))
+RAPID_MAX_STRETCH_ATR = max(0.70, min(2.50, float(os.getenv("RAPID_MAX_STRETCH_ATR", "1.30"))))
+RAPID_MAX_ENTRY_RANGE_RATIO = max(1.20, min(3.50, float(os.getenv("RAPID_MAX_ENTRY_RANGE_RATIO", "1.90"))))
+RAPID_AI_GEN_QUALITY_MIN = max(35.0, min(80.0, float(os.getenv("RAPID_AI_GEN_QUALITY_MIN", "55"))))
+RAPID_AI_GEN_HARD_BLOCK = max(20.0, min(RAPID_AI_GEN_QUALITY_MIN, float(os.getenv("RAPID_AI_GEN_HARD_BLOCK", "38"))))
+RAPID_AI_GEN_MAX_RANGE_RATIO = max(1.50, min(6.00, float(os.getenv("RAPID_AI_GEN_MAX_RANGE_RATIO", "2.80"))))
+RAPID_AI_GEN_MIN_RANGE_RATIO = max(0.05, min(0.60, float(os.getenv("RAPID_AI_GEN_MIN_RANGE_RATIO", "0.18"))))
+RAPID_AI_GEN_MAX_WICK_RATIO = max(0.55, min(0.95, float(os.getenv("RAPID_AI_GEN_MAX_WICK_RATIO", "0.78"))))
 
 xgb_model_cache: Dict[str, Dict[str, Any]] = {}
 xgb_model_guard = threading.RLock()
@@ -8388,7 +8393,14 @@ def _rapid_ai_gen_quality(rows, atr_value: float):
 
 
 def _rapid_eas_snapshot(rows):
-    """Motor separado: somente CRIPTOBOT + Scalper FX + Russian Bear + Big Figures + AI Gen XII.
+    """Motor separado e seletivo: CRIPTOBOT + Scalper FX + Russian Bear + Big Figures + AI Gen XII.
+
+    Regras 3.76:
+    - zona/Big Figure obrigatória na mesma direção;
+    - microimpulso + Scalper FX obrigatórios;
+    - persistência pelo Momentum e ao menos uma confirmação adicional do CRIPTOBOT;
+    - bloqueio de movimento já esticado;
+    - confiança mínima antes de liberar.
 
     Não usa formações, padrões ou filtros próprios do AlphaX RELAY.
     """
@@ -8398,8 +8410,9 @@ def _rapid_eas_snapshot(rows):
     a=atr(rows,14)
     if not a or a <= 0:
         return None
-    rapid=_alphax_rapid_modules(rows,float(a))
-    quality=_rapid_ai_gen_quality(rows,float(a))
+    a=float(a)
+    rapid=_alphax_rapid_modules(rows,a)
+    quality=_rapid_ai_gen_quality(rows,a)
     labels=list(rapid.get("labels") or [])
     zdir=int(rapid.get("zone_dir") or 0)
     impulse=int(rapid.get("impulse_dir") or 0)
@@ -8408,51 +8421,77 @@ def _rapid_eas_snapshot(rows):
     macd=int(rapid.get("macd_dir") or 0)
     momentum=int(rapid.get("momentum_dir") or 0)
 
-    candidates=[]
+    last=rows[-1]
+    o=float(last["open"]); h=float(last["high"]); l=float(last["low"]); c=float(last["close"])
+    slow=float(rapid.get("lwma_slow") or c)
+    stretch_atr=abs(c-slow)/max(a,1e-12)
+    range_ratio=float(quality.get("range_ratio") or 0.0)
+    exhausted=bool(
+        stretch_atr > RAPID_MAX_STRETCH_ATR
+        or range_ratio > RAPID_MAX_ENTRY_RANGE_RATIO
+    )
+
     def aligned(direction):
         out=[]
         for d,label in labels:
             if int(d)==direction and not str(label).startswith("ZONA "):
-                if label not in out: out.append(str(label))
+                if label not in out:
+                    out.append(str(label))
         return out
+
     def opposite_count(direction):
         return sum(1 for d,label in labels if int(d)==-direction and not str(label).startswith("ZONA "))
 
-    if not quality.get("hard_block"):
-        # Caminho A: zona forte + duas confirmações rápidas.
-        if zdir in (-1,1):
-            conf=aligned(zdir)
-            if len(conf)>=2 and opposite_count(zdir)<=2:
-                q=72.0+min(16.0,4.0*len(conf))
-                if impulse==zdir: q+=3.0
-                if channel==zdir: q+=2.0
-                q+=clamp((float(quality.get("score") or 50.0)-55.0)*0.10,-4.0,4.0)
-                candidates.append({"direction":zdir,"trigger":"ZONE_IMPULSE","trigger_name":str(rapid.get("zone_name") or "ZONA"),
-                                   "confirmations":["ZONA "+str(rapid.get("zone_name") or "S/R")]+conf,"confidence":clamp(q,72.0,94.0)})
+    chosen=None
+    reject_reason=""
+    # Só existe candidato quando todos os pilares principais concordam.
+    if quality.get("hard_block"):
+        reject_reason=f"AI Gen XII bloqueou ruído: {quality.get('reason') or 'mercado ruim'}"
+    elif not quality.get("quality_ok"):
+        reject_reason=f"qualidade abaixo do mínimo ({float(quality.get('score') or 0):.0f}% < {RAPID_AI_GEN_QUALITY_MIN:.0f}%)"
+    elif exhausted:
+        reject_reason=(f"impulso esticado: distância {stretch_atr:.2f} ATR / range {range_ratio:.2f}x")
+    elif zdir not in (-1,1):
+        reject_reason="sem zona/Big Figure válida"
+    elif impulse != zdir:
+        reject_reason="Russian Bear ainda não confirmou a direção da zona"
+    elif channel != zdir:
+        reject_reason="Scalper FX ainda não confirmou a direção"
+    elif momentum != zdir:
+        reject_reason="impulso sem persistência no Momentum"
+    else:
+        crypto_helpers=[]
+        if fast==zdir:
+            crypto_helpers.append("LWMA 1/5")
+        if macd==zdir:
+            crypto_helpers.append("MACD")
+        # Momentum é obrigatório acima e entra como confirmação persistente.
+        crypto_helpers.append("MOMENTUM")
+        if len(crypto_helpers) < 2:
+            reject_reason="CRIPTOBOT sem confirmação adicional"
+        elif opposite_count(zdir) > 1:
+            reject_reason="confluências contrárias em excesso"
+        else:
+            q=79.0
+            q+=3.0*len(crypto_helpers)
+            q+=clamp((float(quality.get("score") or 50.0)-55.0)*0.18,-2.0,6.0)
+            q+=2.0 if str(rapid.get("zone_name") or "").upper() in ("BIG FIGURE","INSTITUCIONAL") else 0.0
+            confidence=clamp(q,78.0,96.0)
+            if confidence >= RAPID_MIN_CONFIDENCE:
+                chosen={
+                    "direction":zdir,
+                    "trigger":"STRICT_CONFLUENCE",
+                    "trigger_name":"ZONA + RUSSIAN BEAR + SCALPER FX + CRIPTOBOT",
+                    "confirmations":[
+                        "ZONA "+str(rapid.get("zone_name") or "S/R"),
+                        "MICRO IMPULSO PERSISTENTE",
+                        "SCALPER CHANNEL",
+                    ]+crypto_helpers,
+                    "confidence":confidence,
+                }
+            else:
+                reject_reason=f"confiança insuficiente ({confidence:.0f}% < {RAPID_MIN_CONFIDENCE:.0f}%)"
 
-        # Caminho B: Russian Bear + Scalper FX concordam e pelo menos um filtro do CRIPTOBOT confirma.
-        if impulse in (-1,1) and channel==impulse:
-            helpers=[]
-            if fast==impulse: helpers.append("LWMA 1/5")
-            if macd==impulse: helpers.append("MACD")
-            if momentum==impulse: helpers.append("MOMENTUM")
-            if helpers and opposite_count(impulse)<=2:
-                q=74.0+min(12.0,4.0*len(helpers))
-                if zdir==impulse: q+=4.0
-                q+=clamp((float(quality.get("score") or 50.0)-55.0)*0.10,-4.0,4.0)
-                candidates.append({"direction":impulse,"trigger":"MICRO_BREAKOUT","trigger_name":"RUSSIAN BEAR + SCALPER FX",
-                                   "confirmations":["MICRO IMPULSO","SCALPER CHANNEL"]+helpers,"confidence":clamp(q,74.0,95.0)})
-
-        # Caminho C: CRIPTOBOT alinhado com o canal mesmo sem zona próxima.
-        for d in (1,-1):
-            core=sum(1 for x in (fast,macd,momentum) if x==d)
-            if channel==d and core>=2 and opposite_count(d)<=1:
-                q=70.0+core*4.0+(3.0 if impulse==d else 0.0)
-                q+=clamp((float(quality.get("score") or 50.0)-55.0)*0.08,-3.0,3.0)
-                candidates.append({"direction":d,"trigger":"CRIPTO_SCALPER","trigger_name":"CRIPTOBOT + SCALPER FX",
-                                   "confirmations":aligned(d),"confidence":clamp(q,70.0,91.0)})
-
-    chosen=max(candidates,key=lambda x:x["confidence"]) if candidates else None
     confirmed=bool(chosen)
     direction="CALL" if confirmed and chosen["direction"]>0 else ("PUT" if confirmed else "NEUTRO")
     event_key=""
@@ -8465,9 +8504,10 @@ def _rapid_eas_snapshot(rows):
         "trigger":str(chosen.get("trigger") if chosen else ""),
         "trigger_name":str(chosen.get("trigger_name") if chosen else ""),
         "confirmations":list(chosen.get("confirmations") if chosen else []),
-        "event_key":event_key,"atr":float(a),"rapid":rapid,"ai_gen_quality":quality,
+        "event_key":event_key,"atr":a,"rapid":rapid,"ai_gen_quality":quality,
+        "stretch_atr":round(stretch_atr,3),"exhausted":exhausted,"reject_reason":reject_reason,
+        "strict_filters":True,"min_confidence":RAPID_MIN_CONFIDENCE,
     }
-
 
 def rapid_eas_strategy(cs, timeframe="1min", market="OPEN", early_signal=False):
     """Novo robô independente. Não chama nem altera a estratégia AlphaX."""
@@ -8507,8 +8547,10 @@ def rapid_eas_strategy(cs, timeframe="1min", market="OPEN", early_signal=False):
         reason=f"AI Gen XII bloqueou ruído extremo: {q.get('reason') or 'mercado ruim'} ({float(q.get('score') or 0):.0f}%)."
     elif snap.get("confirmed"):
         reason=f"Setup rápido já apareceu, mas o cooldown de {RAPID_COOLDOWN_BARS} velas evitou repetição."
+    elif snap.get("reject_reason"):
+        reason=f"Núcleo Rápido aguardando confluência forte: {snap.get('reject_reason')}."
     else:
-        reason="Núcleo Rápido monitorando CRIPTOBOT, Scalper FX, Russian Bear, Big Figures e qualidade AI Gen XII."
+        reason="Núcleo Rápido aguardando zona + impulso persistente + Scalper FX + CRIPTOBOT."
     return {
         "available":True,"direction":direction,"confidence":round(float(snap["confidence"] if confirmed else 0.0),1),
         "confirmed":confirmed,"risk":("LOW" if confirmed and snap["confidence"]>=85 else ("MEDIUM" if confirmed else "HIGH")),
@@ -8517,7 +8559,9 @@ def rapid_eas_strategy(cs, timeframe="1min", market="OPEN", early_signal=False):
         "next_candle":True,"cooldown_bars":RAPID_COOLDOWN_BARS,
         "diagnostics":{"trigger":snap.get("trigger") or "","trigger_name":snap.get("trigger_name") or "",
                        "confirmations":snap.get("confirmations") or [],"rapid_modules":snap.get("rapid") or {},
-                       "ai_gen_quality":q,"early_signal":bool(early_signal)}
+                       "ai_gen_quality":q,"early_signal":bool(early_signal),
+                       "stretch_atr":snap.get("stretch_atr"),"exhausted":bool(snap.get("exhausted")),
+                       "reject_reason":snap.get("reject_reason") or "","min_confidence":RAPID_MIN_CONFIDENCE}
     }
 
 def _alphax_snapshot(rows):
@@ -11251,17 +11295,30 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
             if engine == "RAPID":
                 # Russian Bear real-time fica somente no novo motor; o AlphaX não é tocado.
+                # Quando há tape real, ele vira confirmação obrigatória: impulso fraco, neutro
+                # ou contrário não libera a entrada. Sem tape real, continuam valendo os
+                # filtros estritos de candle/zona do próprio Núcleo Rápido.
                 try:
                     _, moment_entry, _ = entry_window(interval, entry_mode)
                     sec_to_entry=max(0,int((moment_entry-now()).total_seconds()))
                     rb = await _moment_ea_confirm_live_candle(
                         raw, symbol, interval, market, direction_now, sec_to_entry, moment_entry
                     )
-                    moment_gate = {**rb, "available": bool(rb.get("tick_ready")), "required": False}
+                    tick_ready=bool(rb.get("tick_ready"))
                     rb_dir=str(rb.get("direction") or "NEUTRO").upper()
                     rb_score=float(rb.get("score") or 0.0)
-                    hard_veto=bool(rb.get("tick_ready") and rb_dir in ("CALL","PUT") and rb_dir!=direction_now and rb_score>=MOMENT_EA_VETO_SCORE)
-                    moment_gate["hard_veto"]=hard_veto
+                    rb_reversal=bool(rb.get("reversal"))
+                    rb_confirmed=bool(
+                        tick_ready and rb_dir==direction_now
+                        and rb_score>=RAPID_RB_CONFIRM_SCORE and not rb_reversal
+                    )
+                    hard_veto=bool(
+                        tick_ready and rb_dir in ("CALL","PUT")
+                        and rb_dir!=direction_now and rb_score>=MOMENT_EA_VETO_SCORE
+                    )
+                    moment_gate = {**rb, "available": tick_ready, "required": tick_ready,
+                                   "confirmed": rb_confirmed, "hard_veto": hard_veto,
+                                   "rapid_confirm_score": RAPID_RB_CONFIRM_SCORE}
                     base["russian_bear_micro_impulse"] = moment_gate
                     if hard_veto:
                         base["status"] = "NÚCLEO RÁPIDO • MICRO IMPULSO CONTRÁRIO"
@@ -11271,10 +11328,25 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         release_state["active_signal"] = None
                         cache[key] = (time.time(), base)
                         return base
-                    if rb.get("tick_ready") and rb_dir==direction_now and rb_score>=MOMENT_EA_CONFIRM_SCORE:
-                        base["confidence"] = round(min(96.0,float(base.get("confidence") or 0.0)+3.0),1)
+                    if tick_ready and not rb_confirmed:
+                        base["status"] = "NÚCLEO RÁPIDO • AGUARDANDO IMPULSO PERSISTENTE"
+                        if rb_reversal:
+                            why="os ticks finais mostraram reversão"
+                        elif rb_dir not in ("CALL","PUT"):
+                            why="o tape está neutro"
+                        elif rb_dir!=direction_now:
+                            why=f"o tape aponta {rb_dir}"
+                        else:
+                            why=f"a força está em {rb_score:.0f}% e o mínimo é {RAPID_RB_CONFIRM_SCORE:.0f}%"
+                        base["reason"] = f"Setup {direction_now} ainda não liberado: {why}."
+                        base["risk"] = "HIGH"
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
+                    if rb_confirmed:
+                        base["confidence"] = round(min(96.0,float(base.get("confidence") or 0.0)+2.0),1)
                         base["reason"] = (str(base.get("reason") or "") +
-                            f" • Russian Bear confirmou microimpulso {direction_now} ({rb_score:.0f}%, {int(rb.get('ticks') or 0)} ticks).")[:520]
+                            f" • Russian Bear confirmou impulso persistente {direction_now} ({rb_score:.0f}%, {int(rb.get('ticks') or 0)} ticks).")[:520]
                 except Exception as exc:
                     base["russian_bear_micro_impulse"] = {"available":False,"tick_ready":False,"reason":str(exc)[:140]}
 
@@ -17427,7 +17499,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • AlphaX original + Núcleo Rápido separado • cTrader Open API • Gráfico fluido</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • AlphaX original + Núcleo Rápido filtro reforçado • cTrader Open API • Gráfico fluido</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -17525,7 +17597,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Núcleo Rápido EAs">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">⚡ NÚCLEO RÁPIDO EAs</div>
-      <div class="robot-mode-desc" id="rapidModeDesc">CRIPTOBOT + Scalper FX + Russian Bear + Big Figures + AI Gen XII • motor independente do AlphaX • sinal ~30s antes • próxima vela.</div>
+      <div class="robot-mode-desc" id="rapidModeDesc">CRIPTOBOT + Scalper FX + Russian Bear + Big Figures + AI Gen XII • filtro reforçado • motor independente do AlphaX • sinal ~30s antes • próxima vela.</div>
     </div>
     <button id="rapidPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -21715,7 +21787,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: AlphaX + zonas fractal/institucional + microimpulso/LWMA/MACD • sinal oficial ~30s antes • entrada na próxima vela • sem Gale.'
     : 'OFFLINE: AlphaX RELAY pausado.';
   if(rapidModeDesc) rapidModeDesc.textContent=rapidEnabled
-    ? 'ONLINE: CRIPTOBOT + Scalper FX + Russian Bear + Big Figures + AI Gen XII • independente do AlphaX • sinal ~30s antes • próxima vela • sem Gale.'
+    ? 'ONLINE: Núcleo Rápido com filtro reforçado • zona + impulso persistente + Scalper FX + CRIPTOBOT • independente do AlphaX • próxima vela • sem Gale.'
     : 'OFFLINE: Núcleo Rápido EAs pausado.';
   if(ictModeDesc) ictModeDesc.textContent=ictEnabled
     ? 'ONLINE: BOS/CHoCH + liquidez + FVG/OB + OTE + EMA/VWAP + volume + contexto H1/H4 • próxima vela • sem Gale.'
@@ -21738,7 +21810,7 @@ function applyRobotPowerState(){
     rad();
   }else if(engine==='RAPID'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='NÚCLEO RÁPIDO EAs ONLINE • ZONA + IMPULSO + TICKS • SINAL ~30S ANTES • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Núcleo Rápido selecionado • CRIPTOBOT + Scalper FX + Russian Bear + Big Figures + AI Gen XII.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Núcleo Rápido selecionado • filtro reforçado: zona + impulso persistente + Scalper FX + CRIPTOBOT.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Núcleo Rápido ativo • zonas + rompimento + microimpulso + qualidade</div>';
     rad();
   }else if(engine==='SNIPER'){
