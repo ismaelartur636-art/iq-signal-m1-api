@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.75"
-PWA_VERSION = "v140"
+APP_VERSION = "3.65"
+PWA_VERSION = "v131"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -101,6 +101,21 @@ VELOCITY_ADX_SMOOTH = max(5, min(30, int(os.getenv("VELOCITY_ADX_SMOOTH", "14"))
 VELOCITY_ADX_MIN = max(5.0, min(60.0, float(os.getenv("VELOCITY_ADX_MIN", "25"))))
 VELOCITY_BREAKOUT_LOOKBACK = max(2, min(10, int(os.getenv("VELOCITY_BREAKOUT_LOOKBACK", "3"))))
 VELOCITY_COOLDOWN_BARS = max(1, min(20, int(os.getenv("VELOCITY_COOLDOWN_BARS", "5"))))
+
+# MEGA IA 3.65 — ICT/SMC Institucional adaptado do Pine IID Dual fornecido.
+# O motor usa somente candles fechados. Pivôs são confirmados com barras à direita,
+# e o sinal entra apenas na próxima vela.
+ICT_PIVOT_LEFT = max(1, min(8, int(os.getenv("ICT_PIVOT_LEFT", "3"))))
+ICT_PIVOT_RIGHT = max(1, min(8, int(os.getenv("ICT_PIVOT_RIGHT", "3"))))
+ICT_ATR_PERIOD = max(7, min(30, int(os.getenv("ICT_ATR_PERIOD", "14"))))
+ICT_MIN_SCORE = max(65.0, min(90.0, float(os.getenv("ICT_MIN_SCORE", "74"))))
+ICT_STRONG_SCORE = max(ICT_MIN_SCORE, min(96.0, float(os.getenv("ICT_STRONG_SCORE", "84"))))
+ICT_FVG_PROX_ATR = max(0.05, min(0.60, float(os.getenv("ICT_FVG_PROX_ATR", "0.18"))))
+ICT_SWEEP_MIN_ATR = max(0.02, min(0.80, float(os.getenv("ICT_SWEEP_MIN_ATR", "0.08"))))
+ICT_M1_COOLDOWN_BARS = max(4, min(30, int(os.getenv("ICT_M1_COOLDOWN_BARS", "8"))))
+
+def _ict_cooldown_bars(interval: str) -> int:
+    return {"1min": ICT_M1_COOLDOWN_BARS, "5min": 4, "15min": 3, "30min": 2}.get(str(interval), 2)
 
 xgb_model_cache: Dict[str, Dict[str, Any]] = {}
 xgb_model_guard = threading.RLock()
@@ -2096,7 +2111,7 @@ def htf_sr_rsi_macd_strategy(cs, h1=None, h4=None, interval="5min"):
     if touch_resistance and not rsi_put:
         reasons.append(f"RSI {r_now:.1f} não está em sobrecompra")
     if (touch_support and rsi_call and not macd_call) or (touch_resistance and rsi_put and not macd_put):
-        reasons.append("Kinetic ainda não confirmou o cruzamento")
+        reasons.append("MACD ainda não confirmou o cruzamento")
 
     return {
         "direction": "NEUTRO",
@@ -6957,7 +6972,7 @@ def rubik_adapted_strategy(cs, timeframe="1min", market="OPEN"):
 
     macd = _rubik_macd_snapshot(closes)
     if not macd:
-        return neutral("Kinetic ainda sem histórico suficiente.")
+        return neutral("MACD ainda sem histórico suficiente.")
     macd_call = bool(macd["line"] > macd["signal"] and macd["hist"] > 0)
     macd_put = bool(macd["line"] < macd["signal"] and macd["hist"] < 0)
 
@@ -7528,209 +7543,6 @@ def _velocity_dmi_series(rows, period=14, adx_smoothing=14):
     return plus_out, minus_out, adx_out
 
 
-def _ema_series_local(values, period):
-    vals = [float(x) for x in values]
-    if not vals:
-        return []
-    alpha = 2.0 / (float(period) + 1.0)
-    out = [vals[0]]
-    for v in vals[1:]:
-        out.append(alpha * v + (1.0 - alpha) * out[-1])
-    return out
-
-
-def _rma_series_local(values, period=14):
-    vals = [float(x) for x in values]
-    n = len(vals)
-    out = [None] * n
-    if n < period or period <= 0:
-        return out
-    seed = sum(vals[:period]) / float(period)
-    out[period - 1] = seed
-    prev = seed
-    for i in range(period, n):
-        prev = ((prev * (period - 1)) + vals[i]) / float(period)
-        out[i] = prev
-    return out
-
-
-def _wma_series_local(values, period):
-    vals = [float(x) for x in values]
-    n = len(vals)
-    out = [None] * n
-    if period <= 0:
-        return out
-    denom = float(period * (period + 1) // 2)
-    weights = list(range(1, period + 1))
-    for i in range(period - 1, n):
-        win = vals[i - period + 1:i + 1]
-        out[i] = sum(v * w for v, w in zip(win, weights)) / denom
-    return out
-
-
-def _hma_series_local(values, period=20):
-    vals = [float(x) for x in values]
-    n = len(vals)
-    if not vals:
-        return []
-    half = max(1, period // 2)
-    root = max(1, int(round(period ** 0.5)))
-    w_half = _wma_series_local(vals, half)
-    w_full = _wma_series_local(vals, period)
-    raw = [None] * n
-    for i in range(n):
-        if w_half[i] is not None and w_full[i] is not None:
-            raw[i] = (2.0 * w_half[i]) - w_full[i]
-    out = [None] * n
-    valid_idx = [i for i, v in enumerate(raw) if v is not None]
-    if len(valid_idx) < root:
-        return out
-    # Os valores válidos de `raw` são contíguos após o warmup.
-    first = valid_idx[0]
-    compact = [float(v) for v in raw[first:] if v is not None]
-    compact_wma = _wma_series_local(compact, root)
-    for j, v in enumerate(compact_wma):
-        if v is not None:
-            out[first + j] = v
-    return out
-
-
-def _kinetic_pulse_indicator(rows, threshold=0.30, cooldown_bars=5):
-    """Volatility Normalized Kinetic Pulse do Pine enviado pelo usuário.
-
-    Reproduz o gatilho original:
-      velocity = close - close[5]
-      acceleration = velocity - velocity[1]
-      normAcc = acceleration / ATR(14)
-      CALL = crossover(normAcc, +0.30) + vela compradora
-      PUT  = crossunder(normAcc, -0.30) + vela vendedora
-      cooldown original = 5 barras.
-
-    O HMA20 e a EMA20 são calculados só para leitura visual, como no Pine.
-    """
-    rows = list(rows or [])
-    n = len(rows)
-    need = 24
-    if n < need:
-        return {
-            "available": False,
-            "direction": "NEUTRO",
-            "confirmed": False,
-            "reason": f"Coletando candles para Kinetic Pulse ({n}/{need}).",
-            "non_repaint": True,
-            "cooldown_bars": cooldown_bars,
-        }
-
-    opens = [float(x.get("open") or 0.0) for x in rows]
-    highs = [float(x.get("high") or x.get("close") or 0.0) for x in rows]
-    lows = [float(x.get("low") or x.get("close") or 0.0) for x in rows]
-    closes = [float(x.get("close") or 0.0) for x in rows]
-
-    tr = []
-    for i in range(n):
-        if i == 0:
-            tr.append(max(0.0, highs[i] - lows[i]))
-        else:
-            pc = closes[i - 1]
-            tr.append(max(highs[i] - lows[i], abs(highs[i] - pc), abs(lows[i] - pc)))
-    atr14 = _rma_series_local(tr, 14)
-
-    velocity = [None] * n
-    acceleration = [None] * n
-    norm_acc = [None] * n
-    for i in range(5, n):
-        velocity[i] = closes[i] - closes[i - 5]
-    for i in range(6, n):
-        if velocity[i] is not None and velocity[i - 1] is not None:
-            acceleration[i] = velocity[i] - velocity[i - 1]
-            av = atr14[i]
-            if av is not None and abs(av) > 1e-12:
-                norm_acc[i] = acceleration[i] / av
-
-    cooldown = 0
-    fired_index = None
-    fired_direction = "NEUTRO"
-    last_raw = "NEUTRO"
-    start_i = max(15, 7)
-    for i in range(start_i, n):
-        na = norm_acc[i]
-        prev = norm_acc[i - 1]
-        if na is None or prev is None:
-            if cooldown > 0:
-                cooldown -= 1
-            continue
-        buy = prev <= threshold and na > threshold and closes[i] > opens[i]
-        sell = prev >= -threshold and na < -threshold and closes[i] < opens[i]
-        raw_dir = "CALL" if buy else ("PUT" if sell else "NEUTRO")
-        if i == n - 1:
-            last_raw = raw_dir
-        if cooldown <= 0:
-            if raw_dir != "NEUTRO":
-                fired_index = i
-                fired_direction = raw_dir
-                cooldown = int(cooldown_bars)
-        else:
-            cooldown -= 1
-
-    i = n - 1
-    na = float(norm_acc[i] or 0.0)
-    prev_na = float(norm_acc[i - 1] or 0.0)
-    vel = float(velocity[i] or 0.0)
-    acc = float(acceleration[i] or 0.0)
-    av = float(atr14[i] or 0.0)
-    bullish_candle = closes[i] > opens[i]
-    bearish_candle = closes[i] < opens[i]
-    raw_call = prev_na <= threshold and na > threshold and bullish_candle
-    raw_put = prev_na >= -threshold and na < -threshold and bearish_candle
-
-    direction = fired_direction if fired_index == i else "NEUTRO"
-    confirmed = direction in ("CALL", "PUT")
-    if confirmed:
-        strength = min(12.0, max(0.0, abs(na) - threshold) * 18.0)
-        confidence = clamp(76.0 + strength, 76.0, 90.0)
-        reason = (
-            f"{direction} Kinetic: normAcc {na:.3f} cruzou "
-            f"{'+' if direction == 'CALL' else '-'}{threshold:.2f}, "
-            f"com vela {'compradora' if direction == 'CALL' else 'vendedora'}; cooldown original de {cooldown_bars} velas."
-        )
-    else:
-        confidence = 0.0
-        if last_raw != "NEUTRO" and fired_index != i:
-            reason = f"Kinetic Pulse: gatilho {last_raw} bloqueado pelo cooldown original de {cooldown_bars} velas."
-        else:
-            side = "subindo" if na > prev_na else ("caindo" if na < prev_na else "estável")
-            reason = f"Kinetic Pulse monitorando: normAcc {na:.3f} ({side}); gatilhos em +{threshold:.2f} / -{threshold:.2f}."
-
-    ema20_series = _ema_series_local(closes, 20)
-    hma20_series = _hma_series_local(closes, 20)
-    ema20 = ema20_series[-1] if ema20_series else None
-    hma20 = hma20_series[-1] if hma20_series else None
-
-    return {
-        "available": True,
-        "direction": direction,
-        "confirmed": confirmed,
-        "confidence": round(float(confidence), 1),
-        "reason": reason[:320],
-        "non_repaint": True,
-        "threshold": float(threshold),
-        "cooldown_bars": int(cooldown_bars),
-        "cooldown_remaining": int(max(0, cooldown)),
-        "velocity": round(vel, 10),
-        "acceleration": round(acc, 10),
-        "atr14": round(av, 10),
-        "norm_acc": round(na, 10),
-        "norm_acc_prev": round(prev_na, 10),
-        "norm_acc_rising": bool(na > prev_na),
-        "norm_acc_falling": bool(na < prev_na),
-        "bullish_candle": bool(bullish_candle),
-        "bearish_candle": bool(bearish_candle),
-        "raw_call_trigger": bool(raw_call),
-        "raw_put_trigger": bool(raw_put),
-        "ema20": round(float(ema20 or 0.0), 10),
-        "hma20": round(float(hma20 or 0.0), 10),
-    }
-
 def velocity_flow_strategy(cs, timeframe="1min", market="OPEN"):
     """MR Mt4 (Ultra Fast) / Velocity Flow adaptado para o MEGA IA.
 
@@ -7858,7 +7670,6 @@ def velocity_flow_strategy(cs, timeframe="1min", market="OPEN"):
         "martingale": False,
         "non_repaint": True,
         "cooldown_bars": VELOCITY_COOLDOWN_BARS,
-        "indicators": {},
         "diagnostics": {
             "ema9": round(float(ema9 or 0), 10),
             "sma21": round(float(sma21 or 0), 10),
@@ -7879,6 +7690,266 @@ def velocity_flow_strategy(cs, timeframe="1min", market="OPEN"):
             "raw_direction": last_raw_direction,
         },
     }
+
+def _ict_confirmed_pivots(rows, left=3, right=3):
+    """Pivôs confirmados sem usar candle futuro além do histórico já fechado."""
+    highs, lows = [], []
+    n = len(rows or [])
+    if n < left + right + 3:
+        return highs, lows
+    for i in range(left, n - right):
+        hv = float(rows[i]["high"])
+        lv = float(rows[i]["low"])
+        is_high = all(float(rows[j]["high"]) < hv for j in range(i-left, i)) and all(float(rows[j]["high"]) < hv for j in range(i+1, i+right+1))
+        is_low = all(float(rows[j]["low"]) > lv for j in range(i-left, i)) and all(float(rows[j]["low"]) > lv for j in range(i+1, i+right+1))
+        if is_high:
+            highs.append((i, hv))
+        if is_low:
+            lows.append((i, lv))
+    return highs, lows
+
+
+def _ict_structure_direction(highs, lows):
+    if len(highs) < 2 or len(lows) < 2:
+        return 0
+    h1, h2 = highs[-2][1], highs[-1][1]
+    l1, l2 = lows[-2][1], lows[-1][1]
+    if h2 > h1 and l2 > l1:
+        return 1
+    if h2 < h1 and l2 < l1:
+        return -1
+    return 0
+
+
+def _ict_bias_from_rows(rows):
+    rows = list(rows or [])
+    if len(rows) < 24:
+        return 0
+    closes = [float(x["close"]) for x in rows]
+    e21 = ema(closes, 21)
+    e50 = ema(closes, 50) if len(closes) >= 50 else None
+    a = atr(rows, ICT_ATR_PERIOD) or 0.0
+    delta = closes[-1] - closes[-11]
+    tol = max(a * 0.10, abs(closes[-1]) * 0.00002)
+    bull = delta > tol and e21 is not None and closes[-1] >= e21 and (e50 is None or e21 >= e50)
+    bear = delta < -tol and e21 is not None and closes[-1] <= e21 and (e50 is None or e21 <= e50)
+    return 1 if bull else (-1 if bear else 0)
+
+
+def _ict_rolling_vwap(rows, length=50):
+    sample = list(rows or [])[-max(5, int(length)):]
+    num = 0.0
+    den = 0.0
+    for c in sample:
+        try:
+            vol = float(c.get("volume") or 0.0)
+            if vol <= 0:
+                continue
+            tp = (float(c["high"]) + float(c["low"]) + float(c["close"])) / 3.0
+            num += tp * vol
+            den += vol
+        except Exception:
+            continue
+    return (num / den) if den > 0 else None
+
+
+def _ict_recent_fvg(rows, atr_value, direction):
+    rows = list(rows or [])
+    if len(rows) < 4:
+        return None
+    close = float(rows[-1]["close"])
+    tol = max(float(atr_value or 0.0) * ICT_FVG_PROX_ATR, abs(close) * 0.00001)
+    best = None
+    for i in range(max(2, len(rows)-24), len(rows)):
+        old, cur = rows[i-2], rows[i]
+        old_h = float(old["high"]); old_l = float(old["low"])
+        cur_h = float(cur["high"]); cur_l = float(cur["low"])
+        if direction == 1 and cur_l > old_h:
+            lo, hi = old_h, cur_l
+            if close >= lo - tol:
+                dist = 0.0 if lo <= close <= hi else min(abs(close-lo), abs(close-hi))
+                if best is None or dist < best[0]:
+                    best = (dist, lo, hi, i)
+        if direction == -1 and cur_h < old_l:
+            lo, hi = cur_h, old_l
+            if close <= hi + tol:
+                dist = 0.0 if lo <= close <= hi else min(abs(close-lo), abs(close-hi))
+                if best is None or dist < best[0]:
+                    best = (dist, lo, hi, i)
+    if best is None:
+        return None
+    dist, lo, hi, idx = best
+    return {"low": lo, "high": hi, "index": idx, "near": dist <= tol, "distance": dist}
+
+
+def _ict_last_opposite_order_block(rows, direction, atr_value):
+    rows = list(rows or [])
+    if len(rows) < 8:
+        return None
+    close = float(rows[-1]["close"])
+    a = max(float(atr_value or 0.0), 1e-12)
+    for i in range(len(rows)-3, max(1, len(rows)-18), -1):
+        c = rows[i]
+        o = float(c["open"]); cl = float(c["close"])
+        if direction == 1 and cl < o:
+            post_high = max(float(x["high"]) for x in rows[i+1:min(len(rows), i+5)])
+            if post_high - float(c["high"]) >= 0.35*a:
+                lo, hi = float(c["low"]), float(c["high"])
+                return {"low":lo,"high":hi,"index":i,"near":close >= lo - 0.18*a and close <= hi + 0.22*a}
+        if direction == -1 and cl > o:
+            post_low = min(float(x["low"]) for x in rows[i+1:min(len(rows), i+5)])
+            if float(c["low"]) - post_low >= 0.35*a:
+                lo, hi = float(c["low"]), float(c["high"])
+                return {"low":lo,"high":hi,"index":i,"near":close >= lo - 0.22*a and close <= hi + 0.18*a}
+    return None
+
+
+def ict_smc_institutional_strategy(cs, timeframe="1min", market="OPEN", h1=None, h4=None):
+    """ICT/SMC Institucional — adaptação do IID Dual para o MEGA IA.
+
+    Preserva os blocos úteis para CALL/PUT: estrutura por pivôs confirmados,
+    BOS/CHoCH, sweep de liquidez, FVG, proxy de Order Block, Premium/Discount,
+    EMA 9/21/50, VWAP, volume/impulso e contexto H1/H4. SMT/DXY e o painel
+    visual do TradingView ficam fora do gatilho do app.
+    """
+    rows = list(cs or [])
+    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
+    name = f"ICT/SMC INSTITUCIONAL {tf_label}"
+    need = max(72, ICT_ATR_PERIOD + 55, ICT_PIVOT_LEFT + ICT_PIVOT_RIGHT + 20)
+    if len(rows) < need:
+        return {
+            "available": True, "direction": "NEUTRO", "confidence": 0.0,
+            "confirmed": False, "risk": "HIGH", "strategy": name,
+            "engine": "ICT_SMC", "provider": "LOCAL_ICT_SMC_INSTITUTIONAL",
+            "reason": f"Coletando candles fechados para o ICT/SMC ({len(rows)}/{need}).",
+            "non_repaint": True, "direct_win_only": True, "gale_signal": False,
+            "next_candle_entry": True,
+        }
+
+    closes = [float(x["close"]) for x in rows]
+    last, prev = rows[-1], rows[-2]
+    o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"])
+    pc = float(prev["close"])
+    candle_range = max(h-l, 1e-12)
+    body_ratio = abs(c-o)/candle_range
+    close_pos = (c-l)/candle_range
+    a = atr(rows, ICT_ATR_PERIOD)
+    if a is None or a <= 0:
+        ranges=[max(float(x["high"])-float(x["low"]),0.0) for x in rows[-20:]]
+        a=sum(ranges)/max(1,len(ranges))
+    a=max(float(a),1e-12)
+
+    e9 = ema(closes, 9); e21 = ema(closes, 21); e50 = ema(closes, 50)
+    ema_bull = e9 is not None and e21 is not None and e50 is not None and c > e9 > e21 > e50
+    ema_bear = e9 is not None and e21 is not None and e50 is not None and c < e9 < e21 < e50
+
+    highs, lows = _ict_confirmed_pivots(rows, ICT_PIVOT_LEFT, ICT_PIVOT_RIGHT)
+    struct_dir = _ict_structure_direction(highs, lows)
+    prior_high = highs[-1][1] if highs else max(float(x["high"]) for x in rows[-20:-1])
+    prior_low = lows[-1][1] if lows else min(float(x["low"]) for x in rows[-20:-1])
+    bos_bull = pc <= prior_high and c > prior_high + 0.03*a
+    bos_bear = pc >= prior_low and c < prior_low - 0.03*a
+    choch_bull = struct_dir == -1 and bos_bull
+    choch_bear = struct_dir == 1 and bos_bear
+    sweep_bull = l < prior_low - ICT_SWEEP_MIN_ATR*a and c > prior_low
+    sweep_bear = h > prior_high + ICT_SWEEP_MIN_ATR*a and c < prior_high
+
+    recent_high = max(float(x["high"]) for x in rows[-36:])
+    recent_low = min(float(x["low"]) for x in rows[-36:])
+    rr = max(recent_high-recent_low, 1e-12)
+    range_pct = (c-recent_low)/rr*100.0
+    discount = range_pct <= 40.0
+    premium = range_pct >= 60.0
+    ote_discount = 21.0 <= range_pct <= 38.0
+    ote_premium = 62.0 <= range_pct <= 79.0
+
+    fvg_bull = _ict_recent_fvg(rows, a, 1)
+    fvg_bear = _ict_recent_fvg(rows, a, -1)
+    ob_bull = _ict_last_opposite_order_block(rows, 1, a)
+    ob_bear = _ict_last_opposite_order_block(rows, -1, a)
+    vwap = _ict_rolling_vwap(rows, 50)
+    vwap_bull = vwap is None or c >= vwap
+    vwap_bear = vwap is None or c <= vwap
+
+    vols=[]
+    for x in rows[-21:]:
+        try: vols.append(float(x.get("volume") or 0.0))
+        except Exception: vols.append(0.0)
+    positive_vols=[x for x in vols[:-1] if x>0]
+    vol_avg=sum(positive_vols)/len(positive_vols) if positive_vols else 0.0
+    last_vol=vols[-1] if vols else 0.0
+    volume_confirm = vol_avg <= 0 or last_vol >= 1.15*vol_avg
+    impulse_bull = c > o and body_ratio >= 0.55 and close_pos >= 0.72 and candle_range <= 2.8*a
+    impulse_bear = c < o and body_ratio >= 0.55 and close_pos <= 0.28 and candle_range <= 2.8*a
+
+    h1_bias = _ict_bias_from_rows(h1 or [])
+    h4_bias = _ict_bias_from_rows(h4 or [])
+    local_bias = _ict_bias_from_rows(rows)
+    context_bias = h4_bias if h4_bias else (h1_bias if h1_bias else local_bias)
+    htf_bull = context_bias == 1 and h1_bias in (0,1) and h4_bias in (0,1)
+    htf_bear = context_bias == -1 and h1_bias in (0,-1) and h4_bias in (0,-1)
+
+    cont_call = (20 if htf_bull else 0) + (14 if struct_dir==1 else 0) + (12 if ema_bull else 0) + (14 if bos_bull else 0) + (10 if impulse_bull else 0) + (6 if vwap_bull else 0) + (6 if volume_confirm else 0) + (6 if fvg_bull and fvg_bull.get("near") else 0) + (6 if discount or ote_discount or (ob_bull and ob_bull.get("near")) else 0) + (6 if not premium else 0)
+    cont_put = (20 if htf_bear else 0) + (14 if struct_dir==-1 else 0) + (12 if ema_bear else 0) + (14 if bos_bear else 0) + (10 if impulse_bear else 0) + (6 if vwap_bear else 0) + (6 if volume_confirm else 0) + (6 if fvg_bear and fvg_bear.get("near") else 0) + (6 if premium or ote_premium or (ob_bear and ob_bear.get("near")) else 0) + (6 if not discount else 0)
+    rev_call = (24 if sweep_bull else 0) + (20 if choch_bull else 0) + (10 if discount else 0) + (8 if ote_discount else 0) + (9 if impulse_bull else 0) + (7 if volume_confirm else 0) + (7 if fvg_bull and fvg_bull.get("near") else 0) + (6 if ob_bull and ob_bull.get("near") else 0) + (5 if vwap_bull else 0) + (4 if e9 is not None and c>=e9 else 0)
+    rev_put = (24 if sweep_bear else 0) + (20 if choch_bear else 0) + (10 if premium else 0) + (8 if ote_premium else 0) + (9 if impulse_bear else 0) + (7 if volume_confirm else 0) + (7 if fvg_bear and fvg_bear.get("near") else 0) + (6 if ob_bear and ob_bear.get("near") else 0) + (5 if vwap_bear else 0) + (4 if e9 is not None and c<=e9 else 0)
+
+    candidates=[]
+    if htf_bull and ema_bull and (bos_bull or (impulse_bull and struct_dir==1)): candidates.append((cont_call,"CALL","CONTINUATION"))
+    if htf_bear and ema_bear and (bos_bear or (impulse_bear and struct_dir==-1)): candidates.append((cont_put,"PUT","CONTINUATION"))
+    if sweep_bull and choch_bull: candidates.append((rev_call,"CALL","REVERSAL"))
+    if sweep_bear and choch_bear: candidates.append((rev_put,"PUT","REVERSAL"))
+    candidates.sort(key=lambda x:x[0], reverse=True)
+
+    direction="NEUTRO"; path="NONE"; confidence=0.0
+    if candidates and candidates[0][0] >= ICT_MIN_SCORE:
+        top=candidates[0]
+        if len(candidates)>1 and candidates[1][1] != top[1] and abs(top[0]-candidates[1][0]) < 8.0:
+            path="CONFLICT"
+        else:
+            confidence=clamp(top[0], ICT_MIN_SCORE, 94.0)
+            direction=top[1]; path=top[2]
+
+    if direction == "CALL":
+        reason=(f"{path} CALL confirmado • contexto H1/H4 comprador • score {confidence:.0f}% • "
+                f"estrutura {'HH/HL' if struct_dir==1 else 'transição'} • "
+                f"{'BOS ' if bos_bull else ''}{'sweep+CHoCH ' if sweep_bull and choch_bull else ''}"
+                f"{'FVG ' if fvg_bull and fvg_bull.get('near') else ''}{'OB ' if ob_bull and ob_bull.get('near') else ''}• próxima vela.")
+    elif direction == "PUT":
+        reason=(f"{path} PUT confirmado • contexto H1/H4 vendedor • score {confidence:.0f}% • "
+                f"estrutura {'LL/LH' if struct_dir==-1 else 'transição'} • "
+                f"{'BOS ' if bos_bear else ''}{'sweep+CHoCH ' if sweep_bear and choch_bear else ''}"
+                f"{'FVG ' if fvg_bear and fvg_bear.get('near') else ''}{'OB ' if ob_bear and ob_bear.get('near') else ''}• próxima vela.")
+    else:
+        best=max(cont_call,cont_put,rev_call,rev_put)
+        reason=(f"ICT/SMC monitorando • melhor score {best:.0f}%/{ICT_MIN_SCORE:.0f}% • "
+                f"contexto {('CALL' if context_bias==1 else 'PUT' if context_bias==-1 else 'MISTO')} • "
+                f"estrutura {('HH/HL' if struct_dir==1 else 'LL/LH' if struct_dir==-1 else 'MISTA')} • aguardando confluência confirmada.")
+
+    return {
+        "available": True, "direction": direction, "confidence": round(float(confidence),1),
+        "confirmed": direction in ("CALL","PUT"),
+        "risk": ("LOW" if confidence >= ICT_STRONG_SCORE else ("MEDIUM" if direction != "NEUTRO" else "HIGH")),
+        "strategy": name, "engine": "ICT_SMC", "provider": "LOCAL_ICT_SMC_INSTITUTIONAL",
+        "reason": reason[:460], "non_repaint": True, "direct_win_only": True,
+        "gale_signal": False, "martingale": False, "next_candle_entry": True,
+        "cooldown_bars": _ict_cooldown_bars(timeframe), "path": path,
+        "diagnostics": {
+            "score_cont_call": round(cont_call,1), "score_cont_put": round(cont_put,1),
+            "score_rev_call": round(rev_call,1), "score_rev_put": round(rev_put,1),
+            "min_score": ICT_MIN_SCORE, "structure_dir": struct_dir, "context_bias": context_bias,
+            "h1_bias": h1_bias, "h4_bias": h4_bias, "bos_bull": bos_bull, "bos_bear": bos_bear,
+            "choch_bull": choch_bull, "choch_bear": choch_bear, "sweep_bull": sweep_bull, "sweep_bear": sweep_bear,
+            "range_pct": round(range_pct,1), "premium": premium, "discount": discount,
+            "ote_discount": ote_discount, "ote_premium": ote_premium,
+            "ema9": round(float(e9 or 0.0),10), "ema21": round(float(e21 or 0.0),10), "ema50": round(float(e50 or 0.0),10),
+            "vwap": round(float(vwap or 0.0),10), "volume_confirm": bool(volume_confirm),
+            "body_ratio": round(body_ratio,3), "close_position": round(close_pos,3), "atr": round(a,10),
+            "fvg_bull_near": bool(fvg_bull and fvg_bull.get("near")), "fvg_bear_near": bool(fvg_bear and fvg_bear.get("near")),
+            "ob_bull_near": bool(ob_bull and ob_bull.get("near")), "ob_bear_near": bool(ob_bear and ob_bear.get("near")),
+        },
+    }
+
 
 def _pure_ai_price_context(cs):
     """Resume somente price action/OHLCV para filtrar entradas fracas da IA PURA.
@@ -9451,9 +9522,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
+    if engine == "ICT":
+        # ICT/SMC só usa candle fechado e entra sempre na próxima abertura.
+        entry_mode = "BIRTH"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
@@ -9604,6 +9678,25 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 raw = await iq_ea_candles(iq_state, symbol, interval, 120, regular_market=False)
             else:
                 raw = await candles(symbol, interval, 120, "OPEN", None, request=request)
+        elif engine == "ICT":
+            if market == "IQ_OTC":
+                if not iq_state:
+                    out = neutral_signal(
+                        symbol, interval, market,
+                        "ICT/SMC • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para o ICT/SMC analisar candles OTC reais.",
+                        source_state="WAITING",
+                    )
+                    out.update({
+                        "strategy": "ICT/SMC INSTITUCIONAL", "mode": "ICT_SMC_INSTITUTIONAL",
+                        "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
+                        "non_repaint": True, "direct_win_only": True, "gale_signal": False,
+                    })
+                    cache[key] = (time.time(), out)
+                    return out
+                raw = await iq_ea_candles(iq_state, symbol, interval, 220, regular_market=False)
+            else:
+                raw = await candles(symbol, interval, 220, "OPEN", None, request=request)
         elif engine == "FORCE" and market == "IQ_OTC":
             if not iq_state:
                 out = neutral_signal(
@@ -9636,6 +9729,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "LARRY BREAKOUT • FONTE EM ESPERA" if market == "OPEN" else "LARRY BREAKOUT • IQ OPTION EM ESPERA"
         elif engine == "VELOCITY":
             status = "VELOCITY FLOW • FONTE EM ESPERA" if market == "OPEN" else "VELOCITY FLOW • IQ OPTION EM ESPERA"
+        elif engine == "ICT":
+            status = "ICT/SMC • FONTE EM ESPERA" if market == "OPEN" else "ICT/SMC • IQ OPTION EM ESPERA"
         elif engine == "FORCE" and market == "IQ_OTC":
             status = "EA FORÇA DO MOVIMENTO • IQ OPTION EM ESPERA"
         elif market == "OPEN" and exc.status_code in (429, 503):
@@ -9656,6 +9751,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "LARRY BREAKOUT • FONTE RECONECTANDO" if market == "OPEN" else "LARRY BREAKOUT • IQ OPTION RECONECTANDO"
         elif engine == "VELOCITY":
             status = "VELOCITY FLOW • FONTE RECONECTANDO" if market == "OPEN" else "VELOCITY FLOW • IQ OPTION RECONECTANDO"
+        elif engine == "ICT":
+            status = "ICT/SMC • FONTE RECONECTANDO" if market == "OPEN" else "ICT/SMC • IQ OPTION RECONECTANDO"
         elif engine == "FORCE" and market == "IQ_OTC":
             status = "EA FORÇA DO MOVIMENTO • IQ OPTION RECONECTANDO"
         else:
@@ -9718,6 +9815,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "VELOCITY":
             engine_title = "VELOCITY FLOW • MR MT4"
             engine_mode = "VELOCITY_FLOW"
+        elif engine == "ICT":
+            engine_title = "ICT/SMC INSTITUCIONAL"
+            engine_mode = "ICT_SMC_INSTITUTIONAL"
         elif engine == "FORCE":
             engine_title = "EA FORÇA DO MOVIMENTO"
             engine_mode = "EA_FORCE_MOVEMENT"
@@ -9728,7 +9828,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY"):
+        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -9755,7 +9855,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY") else (closed[-90:] if len(closed) > 90 else closed)))
+            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "ICT") else (closed[-90:] if len(closed) > 90 else closed)))
             if engine == "SMART":
                 moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
                 analysis = await openai_direct_signal(
@@ -9771,6 +9871,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis = larry_breakout_strategy(engine_closed, interval, market=market)
             elif engine == "VELOCITY":
                 analysis = velocity_flow_strategy(engine_closed, interval, market=market)
+            elif engine == "ICT":
+                if market == "OPEN":
+                    h1_raw = await candles(symbol, "1h", 140, "OPEN", None, request=request)
+                else:
+                    h1_raw = await iq_ea_candles(iq_state, symbol, "1h", 140, regular_market=False)
+                h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
+                h4_all = _aggregate_closed_candles(h1_closed, 4 * 60 * 60)
+                h4_closed = h4_all[:-1] if len(h4_all) > 1 else h4_all
+                analysis = ict_smc_institutional_strategy(engine_closed, interval, market=market, h1=h1_closed, h4=h4_closed)
             elif engine == "BIGRISE":
                 # BTC FORCE DOM: somente BTC/USD, com regiões fortes H1/H4, LTA/LTB H4 e profundidade Level II.
                 h1_raw = await candles(symbol, "1h", 150, "OPEN", None, request=request)
@@ -9831,9 +9940,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY") and analysis.get("confirmed")),
-            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RSI_VALUE_CHART" if engine == "EA" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else ("LOCAL_LARRY_BREAKOUT" if engine == "LARRY" else ("LOCAL_VELOCITY_FLOW" if engine == "VELOCITY" else ("LOCAL_BTC_FORCE_STRUCTURE" if engine == "BIGRISE" else "DISABLED")))))),
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY") else "HIGH").upper(),
+            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT") and analysis.get("confirmed")),
+            "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else ("XGBOOST_RSI_VALUE_CHART" if engine == "EA" else ("LOCAL_RUBIK_ADAPTED" if engine == "RUBIK" else ("LOCAL_LARRY_BREAKOUT" if engine == "LARRY" else ("LOCAL_VELOCITY_FLOW" if engine == "VELOCITY" else ("LOCAL_ICT_SMC_INSTITUTIONAL" if engine == "ICT" else ("LOCAL_BTC_FORCE_STRUCTURE" if engine == "BIGRISE" else "DISABLED"))))))),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
                 else (analysis.get("strategy") or (
@@ -9841,6 +9950,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "ROBÔ RUBIK ADAPTADO" if engine == "RUBIK"
                     else "LARRY BREAKOUT" if engine == "LARRY"
                     else "VELOCITY FLOW • MR MT4" if engine == "VELOCITY"
+                    else "ICT/SMC INSTITUCIONAL" if engine == "ICT"
                     else "EA Força do Movimento" if engine == "FORCE"
                     else f"{engine_title} {tf_label}"
                 ))
@@ -9921,6 +10031,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "RUBIK": "rubik_fingerprint",
                 "LARRY": "larry_fingerprint",
                 "VELOCITY": "velocity_fingerprint",
+                "ICT": "ict_fingerprint",
                 "FORCE": "force_fingerprint",
                 "BIGRISE": "btc_force_fingerprint",
             }.get(engine, "graph_ai_fingerprint")
@@ -9965,6 +10076,38 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key] = (time.time(), base)
                         return base
 
+                if engine == "ICT":
+                    # O setup pertence ao último candle FECHADO. Só liberamos
+                    # a entrada na abertura imediatamente seguinte. Se a janela
+                    # de nascimento já passou, descartamos o gatilho e esperamos
+                    # o próximo fechamento para não entrar uma vela atrasado.
+                    ict_age = max(0.0, (now() - current_boundary(interval)).total_seconds())
+                    if ict_age > 10.0:
+                        base["status"] = "ONLINE • ICT/SMC • AGUARDANDO PRÓXIMO FECHAMENTO"
+                        base["reason"] = (
+                            "Setup institucional detectado, mas a janela da próxima vela já passou. "
+                            "O motor descartou a entrada tardia e vai recalcular no próximo candle fechado."
+                        )
+                        base["direction"] = "NEUTRO"
+                        base["entry_time"] = None
+                        base["expiry_time"] = None
+                        base["risk"] = "HIGH"
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
+
+                    ict_gap_seconds = _ict_cooldown_bars(interval) * INTERVALS.get(interval, 60)
+                    last_ict_signal_ts = float(release_state.get("last_ict_signal_ts", 0.0) or 0.0)
+                    ict_remaining = max(0, int(ict_gap_seconds - (time.time() - last_ict_signal_ts))) if last_ict_signal_ts else 0
+                    if ict_remaining > 0:
+                        base["status"] = "ONLINE • ICT/SMC • COOLDOWN INSTITUCIONAL"
+                        base["reason"] = f"Setup confirmado, mas o filtro anti-excesso aguarda mais {ict_remaining}s antes de liberar outro sinal."
+                        base["ict_signal_gap_seconds"] = ict_gap_seconds
+                        base["ict_signal_gap_remaining"] = ict_remaining
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
+
                 announce, entry, expiry = entry_window(interval, entry_mode)
                 smart_status = (
                     "FALLBACK LOCAL • BLOQUEADO PARA ENTRADA" if analysis.get("fallback")
@@ -9977,10 +10120,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "RUBIK": "SINAL ROBÔ RUBIK ADAPTADO LIBERADO",
                         "LARRY": "SINAL LARRY BREAKOUT LIBERADO",
                         "VELOCITY": "SINAL VELOCITY FLOW LIBERADO",
+                        "ICT": "SINAL ICT/SMC INSTITUCIONAL LIBERADO",
                         "FORCE": "SINAL EA FORÇA DO MOVIMENTO LIBERADO",
                         "BIGRISE": "SINAL BTC FORCE + DOM LIBERADO",
                     }.get(engine, "SINAL IA GRÁFICA LIBERADO")),
-                    "risk": str(analysis.get("risk", "MEDIUM") if engine == "SMART" else "MEDIUM").upper(),
+                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "ICT") else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
                     "expiry_time": iso(expiry),
@@ -9999,7 +10143,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY"):
+                if engine not in ("EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -10015,6 +10159,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     release_state["last_btc_force_signal_ts"] = time.time()
                     base["btc_force_signal_gap_seconds"] = BTC_FORCE_SIGNAL_COOLDOWN_SECONDS
                     base["btc_force_signal_gap_remaining"] = 0
+                if engine == "ICT":
+                    release_state["last_ict_signal_ts"] = time.time()
+                    base["ict_signal_gap_seconds"] = _ict_cooldown_bars(interval) * INTERVALS.get(interval, 60)
+                    base["ict_signal_gap_remaining"] = 0
 
                 # Só as IAs entram no ciclo com Gale. EAs continuam com sua
                 # regra própria de entrada direta/sem Gale. Fallback local da IA
@@ -12940,6 +13088,12 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
         16*f["directional_consistency"] + 9*f["alignment"] +
         7*f["volume_expansion"] - 14*f["flip_ratio"], 0, 100
     )
+    ict = clamp(
+        20 + 22*f["alignment"] + 18*f["efficiency"] +
+        16*f["rejection"] + 12*f["near_edge"] +
+        8*f["directional_consistency"] + 6*f["volume_expansion"] -
+        (18 if f["choppy"] else 0), 0, 100
+    )
 
     ai_ready=bool(GEMINI_KEY or OAI_KEY)
     defs=[
@@ -12959,6 +13113,13 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
             "reason": ("Rompimento + força/expansão da vela em candles fechados; no mercado aberto usa o roteador multifuente."
                        if market=="OPEN" else
                        "Rompimento + força/expansão da vela em candles OTC reais; no OTC exige conexão ativa com a IQ Option.")
+        },
+        {
+            "key":"ICT","name":"ICT/SMC INSTITUCIONAL","score":ict,
+            "supported":True,"operational":bool(market=="OPEN" or iq_ready),
+            "reason": ("Favorece estrutura limpa, reação em extremos e continuidade/reversão com confluência; o sinal real ainda exige H1/H4, pivôs confirmados e score institucional."
+                       if market=="OPEN" else
+                       "No OTC usa candles reais da IQ Option e mantém a exigência de estrutura, liquidez e contexto H1/H4."),
         },
         {
             "key":"FORCE","name":"EA FORÇA DO MOVIMENTO","score":force,
@@ -13062,11 +13223,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY ou VELOCITY.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, VELOCITY ou ICT.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY"):
+    if engine in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -13140,6 +13301,19 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
                     data["feed_message"] = "Velocity Flow usando candles OTC reais da sessão IQ Option."
+            elif engine == "ICT":
+                if requested_market == "OPEN":
+                    feed_info = _current_open_feed_info(symbol, interval)
+                    feed_src = str(feed_info.get("source") or "MULTIFEED")
+                    data["feed_source"] = feed_src
+                    data["feed_label"] = _feed_source_label(feed_src)
+                    data["feed_fallback"] = bool(feed_info.get("fallback"))
+                    data["feed_message"] = "ICT/SMC Institucional usando candles fechados do mercado aberto + contexto H1/H4."
+                else:
+                    data["feed_source"] = "IQ_OPTION_OTC"
+                    data["feed_label"] = _feed_source_label(data["feed_source"])
+                    data["feed_fallback"] = False
+                    data["feed_message"] = "ICT/SMC Institucional usando candles OTC reais da IQ Option + contexto H1/H4."
             elif engine == "FORCE" and requested_market == "IQ_OTC":
                 data["feed_source"] = "IQ_OPTION_OTC"
                 data["feed_label"] = _feed_source_label(data["feed_source"])
@@ -13208,179 +13382,6 @@ async def ai_analysis(request: Request, symbol: str = "EUR/USD", interval: str =
     return {k: data.get(k) for k in public_keys}
 
 
-@app.get("/kinetic-pulse")
-async def kinetic_pulse_indicator_api(
-    request: Request,
-    symbol: str = "EUR/USD",
-    interval: str = "1min",
-    market: str = "OPEN",
-):
-    """Segundo indicador: Volatility Normalized Kinetic Pulse.
-
-    É independente do Velocity Flow de cima. Reutiliza o mesmo roteador/cache
-    de candles, usa o gatilho original do Pine e só roda quando o usuário deixa
-    o segundo indicador ONLINE no navegador.
-    """
-    requested_market = str(market or "OPEN").upper()
-    if interval not in INTERVALS or not _symbol_allowed(symbol, requested_market):
-        raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
-    if requested_market not in ("OPEN", "IQ_OTC"):
-        return {
-            "available": False, "direction": "NEUTRO", "confirmed": False,
-            "reason": "Kinetic Pulse disponível em Mercado Aberto e IQ OTC.",
-            "symbol": symbol, "interval": interval, "market": requested_market,
-        }
-
-    state = _iq_session_state(request, required=False) if requested_market == "IQ_OTC" else None
-    if requested_market == "IQ_OTC":
-        if not state:
-            return {
-                "available": False, "direction": "NEUTRO", "confirmed": False,
-                "reason": "Conecte a IQ Option para o Kinetic Pulse analisar OTC real.",
-                "symbol": symbol, "interval": interval, "market": requested_market,
-            }
-        raw = await iq_ea_candles(state, symbol, interval, 120, regular_market=False)
-        feed_source = "IQ_OPTION_OTC"
-    else:
-        raw = await candles(symbol, interval, 120, "OPEN", None, request=request)
-        feed_source = _feed_source_from_rows(raw) or "MULTIFEED"
-
-    if len(raw) < 8:
-        return {
-            "available": False, "direction": "NEUTRO", "confirmed": False,
-            "reason": "Aguardando candles para calcular o Kinetic Pulse.",
-            "symbol": symbol, "interval": interval, "market": requested_market,
-            "feed_source": feed_source,
-        }
-
-    # Sinal confirmado = somente candles fechados. O pré-alerta observa a
-    # vela em formação para preparar a entrada da próxima vela.
-    closed = raw[:-1]
-    result = _kinetic_pulse_indicator(closed[-120:])
-    live = _kinetic_pulse_indicator(raw[-120:])
-
-    pre_dir = "NEUTRO"
-    pre_score = 0
-    pre_reason = "Kinetic Pulse monitorando aceleração normalizada."
-    if live.get("available"):
-        norm_now = float(live.get("norm_acc") or 0.0)
-        norm_prev = float(live.get("norm_acc_prev") or 0.0)
-        vel_now = float(live.get("velocity") or 0.0)
-        threshold = float(live.get("threshold") or 0.30)
-        cooldown_remaining = int(live.get("cooldown_remaining") or 0)
-        current = raw[-1] if raw else {}
-        o = float(current.get("open") or 0.0)
-        c = float(current.get("close") or 0.0)
-        call_candle = c > o
-        put_candle = c < o
-
-        # Pré-alerta do segundo motor: mais cedo que o gatilho final, mas ainda
-        # coerente com o script. 0.22 aproxima o limiar original 0.30 sem liberar
-        # sinais completamente fora da região cinética.
-        approach = max(0.18, threshold * 0.73)
-        call_score = int(norm_now >= approach) + int(norm_now > norm_prev) + int(vel_now > 0) + int(call_candle)
-        put_score = int(norm_now <= -approach) + int(norm_now < norm_prev) + int(vel_now < 0) + int(put_candle)
-
-        live_dir = str(live.get("direction") or "NEUTRO").upper()
-        if cooldown_remaining > 0 and live_dir == "NEUTRO":
-            pre_reason = f"Kinetic Pulse em cooldown: {cooldown_remaining} vela(s) restante(s)."
-        elif live_dir == "CALL":
-            pre_dir = "CALL"
-            pre_score = 4
-            pre_reason = f"PRÉ-CALL: normAcc cruzou +{threshold:.2f} com vela compradora."
-        elif live_dir == "PUT":
-            pre_dir = "PUT"
-            pre_score = 4
-            pre_reason = f"PRÉ-PUT: normAcc cruzou -{threshold:.2f} com vela vendedora."
-        elif cooldown_remaining <= 0 and call_score >= 3 and call_score > put_score:
-            pre_dir = "CALL"
-            pre_score = call_score
-            detalhes = []
-            if norm_now >= approach: detalhes.append(f"normAcc {norm_now:.3f}")
-            if norm_now > norm_prev: detalhes.append("aceleração subindo")
-            if vel_now > 0: detalhes.append("velocidade positiva")
-            if call_candle: detalhes.append("vela compradora")
-            pre_reason = "PRÉ-CALL Kinetic: " + " + ".join(detalhes[:4]) + "."
-        elif cooldown_remaining <= 0 and put_score >= 3 and put_score > call_score:
-            pre_dir = "PUT"
-            pre_score = put_score
-            detalhes = []
-            if norm_now <= -approach: detalhes.append(f"normAcc {norm_now:.3f}")
-            if norm_now < norm_prev: detalhes.append("aceleração caindo")
-            if vel_now < 0: detalhes.append("velocidade negativa")
-            if put_candle: detalhes.append("vela vendedora")
-            pre_reason = "PRÉ-PUT Kinetic: " + " + ".join(detalhes[:4]) + "."
-
-    current = raw[-1] if raw else {}
-    last_closed = closed[-1] if closed else {}
-    pre_candle = current.get("datetime") or current.get("timestamp") or current.get("time") or current.get("from") or ""
-    confirmed_candle = last_closed.get("datetime") or last_closed.get("timestamp") or last_closed.get("time") or last_closed.get("from") or ""
-
-    step_seconds = int(INTERVALS.get(interval, 60))
-    now_epoch = int(now().timestamp())
-    next_epoch = ((now_epoch // step_seconds) + 1) * step_seconds
-    pre_entry_dt = datetime.fromtimestamp(next_epoch, tz=UTC).astimezone(BR_TZ)
-    pre_expiry_dt = pre_entry_dt + timedelta(seconds=step_seconds)
-
-    result.update({
-        "symbol": symbol,
-        "interval": interval,
-        "market": requested_market,
-        "feed_source": feed_source,
-        "standalone": True,
-        "updated_at": iso(now()),
-        "prealert_active": pre_dir in ("CALL", "PUT"),
-        "prealert_direction": pre_dir,
-        "prealert_score": int(pre_score),
-        "prealert_reason": pre_reason,
-        "prealert_candle": str(pre_candle),
-        "prealert_entry_time": iso(pre_entry_dt),
-        "prealert_expiry_time": iso(pre_expiry_dt),
-        "seconds_to_entry": max(0, int((pre_entry_dt - now()).total_seconds())),
-        "confirmed_candle": str(confirmed_candle),
-        "preview_norm_acc": live.get("norm_acc"),
-        "preview_norm_acc_prev": live.get("norm_acc_prev"),
-        "preview_velocity": live.get("velocity"),
-        "preview_acceleration": live.get("acceleration"),
-    })
-    return result
-
-
-@app.post("/kinetic-pulse-register")
-async def kinetic_pulse_register(request: Request):
-    """Registra o sinal oficial do segundo Kinetic para WIN/LOSS do app."""
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(400, "Payload inválido.")
-    if not isinstance(payload, dict):
-        raise HTTPException(400, "Payload inválido.")
-
-    direction = str(payload.get("direction") or "").upper()
-    market_name = str(payload.get("market") or "OPEN").upper()
-    symbol = str(payload.get("symbol") or "")
-    interval_name = str(payload.get("interval") or "")
-    if direction not in ("CALL", "PUT"):
-        raise HTTPException(400, "Direção inválida.")
-    if interval_name not in INTERVALS or market_name not in ("OPEN", "IQ_OTC"):
-        raise HTTPException(400, "Intervalo ou mercado inválido.")
-    if not _symbol_allowed(symbol, market_name):
-        raise HTTPException(400, "Ativo inválido.")
-    if not payload.get("entry_time") or not payload.get("expiry_time"):
-        raise HTTPException(400, "Horário de entrada/expiração ausente.")
-
-    item = {
-        "market": market_name,
-        "symbol": symbol,
-        "interval": interval_name,
-        "direction": direction,
-        "entry_time": payload.get("entry_time"),
-        "expiry_time": payload.get("expiry_time"),
-        "source": "KINETIC_PULSE_ALERT",
-        "strategy": "KINETIC_PULSE_ORIGINAL",
-    }
-    _remember_accounting_signal(request, item)
-    return {"ok": True, "registered": True}
 
 
 def _moment_ea_key(market: str, symbol: str, interval: str) -> str:
@@ -13744,7 +13745,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -13771,21 +13772,30 @@ async def pre_signals(
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
 
+    if engine == "ICT":
+        return {
+            "ok": True,
+            "message": "ICT/SMC Institucional usa somente candles fechados e pivôs confirmados; pré-sinal intrabar fica desativado para evitar repaint.",
+            "items": [],
+            "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
+        }
+
     requested_market = market
     iq_state = (
         _iq_session_state(request, required=False)
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT")
     if fallback_twelve:
         market = "OPEN"
-    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "VELOCITY") and not iq_state:
+    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT") and not iq_state:
         wait_label = {
             "EA": "EA Tripla",
             "RUBIK": "Robô Rubik Adaptado",
             "LARRY": "Larry Breakout",
             "VELOCITY": "Velocity Flow",
+            "ICT": "ICT/SMC Institucional",
         }.get(engine, engine)
         return {
             "ok": True,
@@ -13850,7 +13860,7 @@ async def pre_signals(
         key = f"{group_key}|{symbol}"
         try:
             pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (120 if engine == "RUBIK" else 90))
-            if engine in ("EA", "RUBIK", "LARRY", "VELOCITY") and requested_market == "IQ_OTC":
+            if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
                 )
@@ -14244,12 +14254,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY ou VELOCITY.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, VELOCITY ou ICT.")
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT")
     if fallback_twelve:
         market = "OPEN"
 
@@ -14322,6 +14332,13 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 raw = await iq_ea_candles(iq_state, sym, interval, 120, regular_market=False)
             else:
                 raw = await candles(sym, interval, 120, "OPEN", None, request=request)
+        elif engine == "ICT":
+            if market == "IQ_OTC":
+                if not iq_state:
+                    raise RuntimeError("Conecte a IQ Option para o ICT/SMC analisar OTC.")
+                raw = await iq_ea_candles(iq_state, sym, interval, 220, regular_market=False)
+            else:
+                raw = await candles(sym, interval, 220, "OPEN", None, request=request)
         elif engine == "FORCE" and market == "IQ_OTC":
             if not iq_state:
                 raise RuntimeError("Conecte a IQ Option para usar este motor no OTC.")
@@ -14367,6 +14384,23 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 engine_label = "VELOCITY FLOW"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why = str(tech.get("reason") or "Velocity Flow monitorando").replace("\n", " ")[:88]
+                status_text = (
+                    f"{engine_label} • OPORTUNIDADE ENCONTRADA"
+                    if direction != "NEUTRO"
+                    else f"{engine_label} • MONITORANDO • {why}"
+                )
+            elif engine == "ICT":
+                if market == "OPEN":
+                    h1_raw = await candles(sym, "1h", 120, "OPEN", None, request=request)
+                else:
+                    h1_raw = await iq_ea_candles(iq_state, sym, "1h", 120, regular_market=False)
+                h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
+                h4_all = _aggregate_closed_candles(h1_closed, 4 * 60 * 60)
+                h4_closed = h4_all[:-1] if len(h4_all) > 1 else h4_all
+                tech = ict_smc_institutional_strategy(closed, interval, market=market, h1=h1_closed, h4=h4_closed)
+                engine_label = "ICT/SMC INSTITUCIONAL"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "ICT/SMC monitorando").replace("\n", " ")[:88]
                 status_text = (
                     f"{engine_label} • OPORTUNIDADE ENCONTRADA"
                     if direction != "NEUTRO"
@@ -14427,18 +14461,18 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if (engine in ("EA", "RUBIK", "LARRY", "VELOCITY") or (engine == "FORCE" and market == "IQ_OTC"))
+                    status_text if (engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT") or (engine == "FORCE" and market == "IQ_OTC"))
                     else (((_feed_source_label(_feed_source_from_rows(raw)) + " • " + status_text) if market == "OPEN" else status_text))
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
+                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
                 "strategy": str(tech.get("strategy") or ""),
             }
-            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY"):
+            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT"):
                 radar_probe = {
                     "symbol": sym, "market": market, "interval": interval,
                     "direction": item.get("direction"), "confidence": item.get("confidence"),
@@ -14471,6 +14505,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             source_status = "LARRY BREAKOUT • FONTE EM ESPERA" if market == "OPEN" else "LARRY BREAKOUT • IQ OPTION OTC EM ESPERA"
         elif engine == "VELOCITY":
             source_status = "VELOCITY FLOW • FONTE EM ESPERA" if market == "OPEN" else "VELOCITY FLOW • IQ OPTION OTC EM ESPERA"
+        elif engine == "ICT":
+            source_status = "ICT/SMC • FONTE EM ESPERA" if market == "OPEN" else "ICT/SMC • IQ OPTION OTC EM ESPERA"
         elif engine == "FORCE" and market == "IQ_OTC":
             source_status = "IQ OPTION • FONTE EM ESPERA"
         elif market == "OPEN":
@@ -14492,7 +14528,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
+            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -14855,7 +14891,7 @@ async def result(
     - LOSS/empate no G1 => aguarda G2.
     - WIN no G2 => WIN G2; caso contrário => LOSS G2.
 
-    ``direct_only=true`` fecha somente a primeira vela. EA Tripla, EA Força, BIGRISE, LARRY BREAKOUT e VELOCITY FLOW
+    ``direct_only=true`` fecha somente a primeira vela. EA Tripla, EA Força, BIGRISE, LARRY BREAKOUT, VELOCITY FLOW e ICT/SMC
     usam esse modo; os demais motores podem acompanhar G1/G2.
     """
     if not expiry_time:
@@ -14866,7 +14902,7 @@ async def result(
     engine = str(engine or "").upper()
     # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
-    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "VELOCITY")
+    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "VELOCITY", "ICT")
 
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
@@ -15434,6 +15470,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="larryPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
+  <div class="robot-mode-card" id="ictModeCard">
+    <img src="__MEGA_IMAGE__" alt="ICT SMC Institucional">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">🏦 ICT/SMC INSTITUCIONAL</div>
+      <div class="robot-mode-desc" id="ictModeDesc">BOS • CHoCH • Liquidez • FVG • Order Block • Premium/Discount • H1/H4 • somente candles fechados • próxima vela.</div>
+    </div>
+    <button id="ictPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
   <div class="robot-mode-card" id="forceModeCard">
     <img src="__MEGA_IMAGE__" alt="EA Força do Movimento">
     <div class="robot-mode-copy">
@@ -15456,6 +15501,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
     <button class="tabbtn" id="tabChart">📈 Gráfico</button>
     <button class="tabbtn" id="tabVelocity">⚡ Velocity Flow</button>
+    <button class="tabbtn" id="tabIct">🏦 ICT/SMC</button>
     <button class="tabbtn" id="tabResults">🎯 Resultados</button>
     <button class="tabbtn" id="tabValues">💰 Valores</button>
     <button class="tabbtn" id="tabHistory">🗓️ Histórico 15 dias</button>
@@ -15559,6 +15605,34 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
 
+  <div id="ictTab" class="tab">
+    <div class="card" style="border-color:#a78bfa;box-shadow:0 0 22px #a78bfa22">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+        <div>
+          <h2 style="margin:0">🏦 ICT/SMC Institucional</h2>
+          <div class="label" style="margin-top:5px">IID Dual adaptado • somente candles fechados • entrada na próxima vela</div>
+        </div>
+        <button id="ictTabPowerBtn" type="button" style="font-weight:1000;min-width:150px">🔴 OFFLINE</button>
+      </div>
+      <div style="margin-top:10px;line-height:1.55;color:#b8c7db">
+        Estrutura confirmada por pivôs • BOS/CHoCH • sweep de liquidez • FVG • Order Block • Premium/Discount/OTE • EMA 9/21/50 • VWAP • volume • contexto H1/H4.
+      </div>
+    </div>
+    <div class="grid" style="margin-top:10px">
+      <div class="card"><div class="label">VEREDITO</div><div id="ictVerdict" class="big neutral" style="font-size:22px">AGUARDANDO</div><small id="ictPath">--</small></div>
+      <div class="card"><div class="label">SCORE</div><div id="ictScore" class="big" style="font-size:22px">0%</div><small>mínimo: 74%</small></div>
+      <div class="card"><div class="label">ESTRUTURA</div><div id="ictStructure" class="big" style="font-size:18px">--</div><small>BOS / CHoCH / pivôs confirmados</small></div>
+      <div class="card"><div class="label">CONTEXTO H1/H4</div><div id="ictContext" class="big" style="font-size:18px">--</div><small>SMT/DXY não participa do gatilho</small></div>
+    </div>
+    <div class="card" style="margin-top:10px">
+      <div class="label">📡 ÚLTIMA LEITURA</div>
+      <div id="ictReadout" style="font-size:16px;font-weight:900;margin-top:7px">Motor offline.</div>
+      <div id="ictReason" style="margin-top:7px;line-height:1.5;color:#a9bdd3">Ative o ICT/SMC para iniciar a leitura institucional.</div>
+      <div class="label" style="margin-top:10px">Sem pré-sinal intrabar • sem Gale • WIN/LOSS na primeira vela • Telegram usa o mesmo fluxo do painel.</div>
+    </div>
+    <button id="ictOpenPanelBtn" type="button" style="width:100%;margin-top:10px;font-weight:1000">📊 ABRIR PAINEL PRINCIPAL</button>
+  </div>
+
   <div id="velocityTab" class="tab">
     <div class="card" style="border-color:#21c7ff;box-shadow:0 0 22px #21c7ff22">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
@@ -15570,12 +15644,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
       <div id="velocityModeDesc" style="margin-top:10px;line-height:1.55;color:#b8c7db">
         Rompimento dos 3 fechamentos anteriores + ADX/DMI 14 + RSI 7 + direção da vela • cooldown de 5 velas.
-      </div>
-      <div class="grid" style="margin-top:12px">
-        <div class="card" style="padding:10px"><div class="label">⚡ SCRIPT ORIGINAL</div><div id="velocityOriginalState" class="big neutral" style="font-size:16px">OFFLINE</div><small>MR Mt4 (Ultra Fast) • lógica original do Velocity Flow</small></div>
-        <div class="card" style="padding:10px"><div class="label">🔔 PRÉ-ALERTA</div><div id="velocityPreAlertState" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Janela final antes da próxima vela</small></div>
-        <div class="card" style="padding:10px"><div class="label">🟢 PRÉ-CALL</div><div id="velocityPreCallState" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Só acende com o pré-alerta completo de compra</small></div>
-        <div class="card" style="padding:10px"><div class="label">🔴 PRÉ-PUT</div><div id="velocityPrePutState" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Só acende com o pré-alerta completo de venda</small></div>
       </div>
     </div>
 
@@ -15602,26 +15670,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div id="velocityReadout" style="font-size:16px;font-weight:900;margin-top:7px">Motor offline.</div>
       <div id="velocityReason" style="margin-top:7px;line-height:1.5;color:#a9bdd3">Ative o motor para começar a analisar candles fechados.</div>
       <div class="label" style="margin-top:10px">O app usa a própria contabilidade WIN/LOSS. A marcação antiga de segunda tentativa do Pine não abre Gale automaticamente.</div>
-    </div>
-
-    <div class="card" style="margin-top:10px;border-color:#8b5cf6">
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
-        <div>
-          <div class="label">📐 INDICADORES</div>
-          <h3 style="margin:4px 0 0">🎯 Volatility Normalized Kinetic Pulse</h3>
-        </div>
-        <button id="kineticPulsePowerBtn" type="button" style="font-weight:1000;min-width:135px">🔴 OFFLINE</button>
-      </div>
-      <div class="label" style="margin-top:8px;line-height:1.45">Script Kinetic Pulse • velocity/acceleration normalizados pelo ATR14 • gatilho original ±0,30 • cooldown original de 5 velas • usa o mesmo roteador/cache de candles do app.</div>
-      <div class="grid" style="margin-top:10px">
-        <div class="card" style="padding:10px"><div class="label">🔔 PRÉ-ALERTA</div><div id="kineticPulsePreAlert" class="big neutral" style="font-size:16px">OFFLINE</div><small id="kineticPulsePreReason">Ative o indicador para acompanhar.</small></div>
-        <div class="card" style="padding:10px"><div class="label">🟢 PRÉ-CALL</div><div id="kineticPulsePreCall" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível compra quando a aceleração se aproxima do gatilho +0,30</small></div>
-        <div class="card" style="padding:10px"><div class="label">🔴 PRÉ-PUT</div><div id="kineticPulsePrePut" class="big neutral" style="font-size:16px">AGUARDANDO</div><small>Possível venda quando a aceleração se aproxima do gatilho -0,30</small></div>
-        <div class="card" style="padding:10px"><div class="label">SINAL CONFIRMADO</div><div id="kineticPulseState" class="big neutral" style="font-size:18px">OFFLINE</div><small id="kineticPulseReason">Ative o indicador para acompanhar.</small></div>
-        <div class="card" style="padding:10px"><div class="label">NORM ACC</div><div id="kineticPulseLines" class="big" style="font-size:15px">--</div><small>Gatilhos originais: CALL +0,30 • PUT -0,30</small></div>
-        <div class="card" style="padding:10px"><div class="label">VELOCIDADE / ACELERAÇÃO</div><div id="kineticPulseHist" class="big" style="font-size:15px">--</div><small>close-close[5] e variação da velocidade</small></div>
-        <div class="card" style="padding:10px"><div class="label">HMA 20 / EMA 20</div><div id="kineticPulseContext" class="big" style="font-size:14px">--</div><small>Leitura visual do script; não é gatilho de entrada</small></div>
-      </div>
     </div>
 
     <button id="velocityOpenPanelBtn" type="button" style="width:100%;margin-top:10px;font-weight:1000">📊 ABRIR PAINEL PRINCIPAL</button>
@@ -16089,22 +16137,19 @@ const rubikPowerBtn=null;
 const rubikModeDesc=null;
 const larryPowerBtn=document.getElementById('larryPowerBtn');
 const larryModeDesc=document.getElementById('larryModeDesc');
+const ictPowerBtn=document.getElementById('ictPowerBtn');
+const ictTabPowerBtn=document.getElementById('ictTabPowerBtn');
+const ictModeDesc=document.getElementById('ictModeDesc');
+const ictVerdict=document.getElementById('ictVerdict');
+const ictPath=document.getElementById('ictPath');
+const ictScore=document.getElementById('ictScore');
+const ictStructure=document.getElementById('ictStructure');
+const ictContext=document.getElementById('ictContext');
+const ictReadout=document.getElementById('ictReadout');
+const ictReason=document.getElementById('ictReason');
+const ictOpenPanelBtn=document.getElementById('ictOpenPanelBtn');
 const velocityPowerBtn=document.getElementById('velocityPowerBtn');
 const velocityModeDesc=document.getElementById('velocityModeDesc');
-const velocityOriginalState=document.getElementById('velocityOriginalState');
-const velocityPreAlertState=document.getElementById('velocityPreAlertState');
-const velocityPreCallState=document.getElementById('velocityPreCallState');
-const velocityPrePutState=document.getElementById('velocityPrePutState');
-const kineticPulsePowerBtn=document.getElementById('kineticPulsePowerBtn');
-const kineticPulseState=document.getElementById('kineticPulseState');
-const kineticPulseReason=document.getElementById('kineticPulseReason');
-const kineticPulseLines=document.getElementById('kineticPulseLines');
-const kineticPulseHist=document.getElementById('kineticPulseHist');
-const kineticPulseContext=document.getElementById('kineticPulseContext');
-const kineticPulsePreAlert=document.getElementById('kineticPulsePreAlert');
-const kineticPulsePreCall=document.getElementById('kineticPulsePreCall');
-const kineticPulsePrePut=document.getElementById('kineticPulsePrePut');
-const kineticPulsePreReason=document.getElementById('kineticPulsePreReason');
 const velocityBreakout=document.getElementById('velocityBreakout');
 const velocityDmi=document.getElementById('velocityDmi');
 const velocityRsi=document.getElementById('velocityRsi');
@@ -16143,35 +16188,8 @@ let forceEnabled=false;
 let bigriseEnabled=false;
 let larryEnabled=false;
 let velocityEnabled=false;
-let kineticPulseEnabled=false;
-let kineticPulseBusy=false;
-let lastKineticPreAlertKey='';
-let lastKineticConfirmedKey='';
-let lastKineticOfficialEntryKey='';
-let lastKineticOfficialSentAt=0;
-let kineticOfficialActiveSignal=null;
-let lastKineticPulseData=null;
-// 3.75 — segundo indicador substituído pelo Kinetic Pulse original,
-// com pré-alerta estável e cooldown original de 5 velas.
-// O Velocity original permanece intocado.
-let kineticPreCandidateDir='';
-let kineticPreCandidateCount=0;
-let kineticPreCandidateSampleKey='';
-let kineticLastOfficialEntryMs=0;
-const KINETIC_PRE_STABILITY_READS=2;
-const KINETIC_PRE_COOLDOWN_CANDLES=5;
+let ictEnabled=false;
 try{
-  kineticLastOfficialEntryMs=Number(localStorage.getItem('mega_kinetic_last_official_entry_ms')||0)||0;
-}catch(_){
-  kineticLastOfficialEntryMs=0;
-}
-let kineticMainPreview=null;
-let kineticMainPreviewUntil=0;
-let kineticMainPreviewShowing=false;
-let lastVelocityData=null;
-let lastVelocityDataAt=0;
-try{
-  kineticPulseEnabled=localStorage.getItem('mega_kinetic_pulse_power')==='ONLINE';
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
   aiEnabled=localStorage.getItem('mega_ai_power')==='ONLINE';
   const legacyEaOnline=localStorage.getItem('mega_ea_power')==='ONLINE';
@@ -16180,18 +16198,21 @@ try{
   rubikEnabled=false;
   larryEnabled=localStorage.getItem('mega_larry_power')==='ONLINE' || legacyEaOnline || legacyRubikOnline;
   velocityEnabled=localStorage.getItem('mega_velocity_power')==='ONLINE';
+  ictEnabled=localStorage.getItem('mega_ict_power')==='ONLINE';
   localStorage.setItem('mega_ea_power','OFFLINE');
   localStorage.setItem('mega_rubik_power','OFFLINE');
   localStorage.setItem('mega_larry_power',larryEnabled?'ONLINE':'OFFLINE');
   forceEnabled=localStorage.getItem('mega_force_power')==='ONLINE';
   bigriseEnabled=localStorage.getItem('mega_bigrise_power')==='ONLINE';
-  if(velocityEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; }
-  else if(bigriseEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; }
-  else if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; }
-  else if(larryEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; }
+  if(ictEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; }
+  else if(velocityEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; }
+  else if(bigriseEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; }
+  else if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; }
+  else if(larryEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; }
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
+  if(ictEnabled) return 'ICT';
   if(velocityEnabled) return 'VELOCITY';
   if(bigriseEnabled) return 'BIGRISE';
   if(forceEnabled) return 'FORCE';
@@ -16216,6 +16237,7 @@ const analysisText=document.getElementById('analysisText');
 const mainTab=document.getElementById('mainTab');
 const chartTab=document.getElementById('chartTab');
 const velocityTab=document.getElementById('velocityTab');
+const ictTab=document.getElementById('ictTab');
 const accountTab=document.getElementById('accountTab');
 const resultsTab=document.getElementById('resultsTab');
 const valuesTab=document.getElementById('valuesTab');
@@ -16265,6 +16287,7 @@ const valueStakeBtns=[...document.querySelectorAll('.valueStakeBtn')];
 const tabMain=document.getElementById('tabMain');
 const tabChart=document.getElementById('tabChart');
 const tabVelocity=document.getElementById('tabVelocity');
+const tabIct=document.getElementById('tabIct');
 const tabAccount=document.getElementById('tabAccount');
 const iqEmail=document.getElementById('iqEmail');
 const accountUserLabel=document.getElementById('accountUserLabel');
@@ -17070,6 +17093,7 @@ function normalizeEngineKey(value){
   if(e==='FORCE' || e==='EA_FORCE_MOVEMENT') return 'FORCE';
   if(e==='LARRY' || e==='LARRY_BREAKOUT') return 'LARRY';
   if(e==='VELOCITY' || e==='VELOCITY_FLOW' || e==='MR_MT4') return 'VELOCITY';
+  if(e==='ICT' || e==='ICT_SMC' || e==='ICT_SMC_INSTITUTIONAL') return 'ICT';
   if(e==='BIGRISE' || e==='BIGRISE_USD_BASKET' || e==='BTC_FORCE' || e==='BTC_FORCE_NEXT_CANDLE') return 'BIGRISE';
   return '';
 }
@@ -17085,6 +17109,7 @@ function momentStudyEngineName(key){
     SMART:'🤖 INTELIGÊNCIA ARTIFICIAL',
     LARRY:'⚡ LARRY BREAKOUT',
     VELOCITY:'⚡ VELOCITY FLOW',
+    ICT:'🏦 ICT/SMC INSTITUCIONAL',
     FORCE:'💥 EA FORÇA DO MOVIMENTO',
     BIGRISE:'₿ BTC FORCE'
   };
@@ -17407,10 +17432,10 @@ function rememberPendingTrade(sig){
   if(!sig.expiry_time || !sig.entry_time) return;
 
   const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
-  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='VELOCITY'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY'));
+  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='VELOCITY'||engineKey==='ICT'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('ICT'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
-    // Motores de entrada direta (Larry/EA/Força/BigRise) são apurados na primeira vela; outros preservam G1/G2.
+    // Motores de entrada direta (ICT/Larry/EA/Força/BigRise/Velocity) são apurados na primeira vela; outros preservam G1/G2.
     direct_only:isDirectEa,
     market:signalResultMarket(sig),
     requested_market:sig.requested_market || (market&&market.value) || 'OPEN',
@@ -17424,7 +17449,7 @@ function rememberPendingTrade(sig){
     confidence:Number(sig.confidence||0),
     risk:String(sig.risk||''),
     strategy:String(sig.strategy||''),
-    engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('BIGRISE')?'BIGRISE':(engineKey.includes('LARRY')?'LARRY':(engineKey.includes('VELOCITY')?'VELOCITY':String(sig.selected_engine||sig.mode||'')))))),
+    engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('BIGRISE')?'BIGRISE':(engineKey.includes('LARRY')?'LARRY':(engineKey.includes('VELOCITY')?'VELOCITY':(engineKey.includes('ICT')?'ICT':String(sig.selected_engine||sig.mode||''))))))),
     entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH')),
     value_stake:currentValueStake(),
     value_payout:currentValuePayout()
@@ -18789,6 +18814,7 @@ function showTab(which){
   const main=which==='main';
   const chart=which==='chart';
   const velocity=which==='velocity';
+  const ict=which==='ict';
   const results=which==='results';
   const values=which==='values';
   const history=which==='history';
@@ -18799,6 +18825,7 @@ function showTab(which){
   mainTab.classList.toggle('active',main);
   chartTab.classList.toggle('active',chart);
   velocityTab.classList.toggle('active',velocity);
+  ictTab.classList.toggle('active',ict);
   resultsTab.classList.toggle('active',results);
   valuesTab.classList.toggle('active',values);
   historyTab.classList.toggle('active',history);
@@ -18809,6 +18836,7 @@ function showTab(which){
   tabMain.classList.toggle('active',main);
   tabChart.classList.toggle('active',chart);
   tabVelocity.classList.toggle('active',velocity);
+  tabIct.classList.toggle('active',ict);
   tabResults.classList.toggle('active',results);
   tabValues.classList.toggle('active',values);
   tabHistory.classList.toggle('active',history);
@@ -18823,6 +18851,10 @@ function showTab(which){
 
   if(velocity){
     if(velocityEnabled) sig(false);
+  }
+
+  if(ict){
+    if(ictEnabled) sig(false);
   }
 
   if(results){
@@ -18854,6 +18886,7 @@ function showTab(which){
 tabMain.onclick=()=>showTab('main');
 tabChart.onclick=()=>showTab('chart');
 tabVelocity.onclick=()=>showTab('velocity');
+tabIct.onclick=()=>showTab('ict');
 tabResults.onclick=()=>showTab('results');
 tabValues.onclick=()=>showTab('values');
 tabHistory.onclick=()=>showTab('history');
@@ -19476,6 +19509,13 @@ function applyRobotPowerState(){
     velocityPowerBtn.style.color='#fff';
     velocityPowerBtn.style.borderColor=velocityEnabled?'#16c56b':'#ff5252';
   }
+  for(const btn of [ictPowerBtn,ictTabPowerBtn]){
+    if(!btn) continue;
+    btn.textContent=ictEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    btn.style.background=ictEnabled?'#0b7a3d':'#7d1d1d';
+    btn.style.color='#fff';
+    btn.style.borderColor=ictEnabled?'#16c56b':'#ff5252';
+  }
   if(forcePowerBtn){
     forcePowerBtn.textContent=forceEnabled?'🟢 ONLINE':'🔴 OFFLINE';
     forcePowerBtn.style.background=forceEnabled?'#0b7a3d':'#7d1d1d';
@@ -19505,8 +19545,11 @@ function applyRobotPowerState(){
   if(larryModeDesc) larryModeDesc.textContent=larryEnabled
     ? 'ONLINE: rompimento + força/expansão de vela • candles fechados • OPEN/OTC • sem Grid, Martingale ou Gale.'
     : 'OFFLINE: Larry Breakout pausado.';
+  if(ictModeDesc) ictModeDesc.textContent=ictEnabled
+    ? 'ONLINE: BOS/CHoCH + liquidez + FVG/OB + OTE + EMA/VWAP + volume + contexto H1/H4 • próxima vela • sem Gale.'
+    : 'OFFLINE: ICT/SMC Institucional pausado.';
   if(velocityModeDesc) velocityModeDesc.textContent=velocityEnabled
-    ? 'ONLINE: script original no topo • pré-alerta/PRÉ-CALL/PRÉ-PUT visíveis • rompimento + ADX/DMI 14 + RSI 7 + direção da vela • cooldown de 5 velas.'
+    ? 'ONLINE: rompimento dos 3 fechamentos + ADX/DMI 14 + RSI 7 + direção da vela • cooldown original de 5 velas • OPEN/OTC.'
     : 'OFFLINE: Velocity Flow pausado • parâmetros originais preservados.';
   if(forceModeDesc) forceModeDesc.textContent=forceEnabled
     ? 'ONLINE: OPEN multifuente para qualquer corretora Forex • OTC pela IQ Option • configuração protegida • sem Gale.'
@@ -19516,7 +19559,12 @@ function applyRobotPowerState(){
     : 'OFFLINE: BTC FORCE pausado.';
 
   const engine=selectedRobotEngine();
-  if(engine==='VELOCITY'){
+  if(engine==='ICT'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ICT/SMC INSTITUCIONAL ONLINE • VELA FECHADA • PRÓXIMA VELA • SEM GALE';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🏦 ICT/SMC selecionado • sem pré-sinal intrabar • aguarda confluência confirmada para evitar repintura.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar ICT/SMC ativo • estrutura + liquidez + FVG/OB + contexto H1/H4</div>';
+    rad();
+  }else if(engine==='VELOCITY'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='VELOCITY FLOW ONLINE • MR MT4 • BREAKOUT + ADX/DMI + RSI7 • OPEN + OTC';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Velocity Flow selecionado • pré-alerta completo nos últimos 60s já vira ALERTA para a próxima vela • cooldown de 5 velas.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Velocity Flow ativo • procurando rompimento + força DMI/ADX + RSI</div>';
@@ -19558,7 +19606,7 @@ function applyRobotPowerState(){
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, Inteligência Artificial, Velocity Flow, Larry Breakout, EA Força e BIGRISE estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ ICT/SMC, IA Gráfica, Inteligência Artificial, Velocity Flow, Larry Breakout, EA Força e BIGRISE estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -19578,7 +19626,7 @@ function resetEngineVisualState(){
 
 async function setRobotPower(enabled){
   robotEnabled=!!enabled;
-  if(robotEnabled){ aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; }
+  if(robotEnabled){ aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; }
   try{
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
@@ -19588,6 +19636,7 @@ async function setRobotPower(enabled){
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -19599,7 +19648,7 @@ async function setRobotPower(enabled){
 
 async function setAiPower(enabled){
   aiEnabled=!!enabled;
-  if(aiEnabled){ robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; }
+  if(aiEnabled){ robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; }
   try{
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -19609,6 +19658,7 @@ async function setAiPower(enabled){
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -19620,7 +19670,7 @@ async function setAiPower(enabled){
 
 async function setEaPower(enabled){
   eaEnabled=!!enabled;
-  if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; }
+  if(eaEnabled){ robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; }
   try{
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -19630,6 +19680,7 @@ async function setEaPower(enabled){
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -19641,7 +19692,7 @@ async function setEaPower(enabled){
 
 async function setRubikPower(enabled){
   rubikEnabled=!!enabled;
-  if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; }
+  if(rubikEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; }
   try{
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -19651,6 +19702,7 @@ async function setRubikPower(enabled){
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
@@ -19662,10 +19714,11 @@ async function setRubikPower(enabled){
 
 async function setLarryPower(enabled){
   larryEnabled=!!enabled;
-  if(larryEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; }
+  if(larryEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; }
   try{
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', 'OFFLINE');
@@ -19683,12 +19736,13 @@ async function setLarryPower(enabled){
 
 async function setForcePower(enabled){
   forceEnabled=!!enabled;
-  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; }
+  if(forceEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; }
   try{
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
@@ -19704,11 +19758,12 @@ async function setForcePower(enabled){
 
 async function setBigrisePower(enabled){
   bigriseEnabled=!!enabled;
-  if(bigriseEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; }
+  if(bigriseEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; }
   try{
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
@@ -19725,9 +19780,10 @@ async function setBigrisePower(enabled){
 
 async function setVelocityPower(enabled){
   velocityEnabled=!!enabled;
-  if(velocityEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; }
+  if(velocityEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; }
   try{
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ea_power', 'OFFLINE');
@@ -19744,488 +19800,40 @@ async function setVelocityPower(enabled){
   if(voiceEnabled) speak(velocityEnabled ? 'Velocity Flow online.' : 'Velocity Flow offline.');
 }
 
+async function setIctPower(enabled){
+  ictEnabled=!!enabled;
+  if(ictEnabled){ robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; }
+  try{
+    localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ea_power', 'OFFLINE');
+    localStorage.setItem('mega_rubik_power', 'OFFLINE');
+    localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(ictEnabled ? 'ICT SMC Institucional online.' : 'ICT SMC Institucional offline.');
+}
+
 if(robotPowerBtn) robotPowerBtn.onclick=()=>{ setRobotPower(!robotEnabled); };
 if(aiPowerBtn) aiPowerBtn.onclick=()=>{ setAiPower(!aiEnabled); };
 if(eaPowerBtn) eaPowerBtn.onclick=()=>{ setEaPower(!eaEnabled); };
 if(rubikPowerBtn) rubikPowerBtn.onclick=()=>{ setRubikPower(!rubikEnabled); };
 if(larryPowerBtn) larryPowerBtn.onclick=()=>{ setLarryPower(!larryEnabled); };
 if(velocityPowerBtn) velocityPowerBtn.onclick=()=>{ setVelocityPower(!velocityEnabled); };
+if(ictPowerBtn) ictPowerBtn.onclick=()=>{ setIctPower(!ictEnabled); };
+if(ictTabPowerBtn) ictTabPowerBtn.onclick=()=>{ setIctPower(!ictEnabled); };
+if(ictOpenPanelBtn) ictOpenPanelBtn.onclick=()=>showTab('main');
 if(velocityOpenPanelBtn) velocityOpenPanelBtn.onclick=()=>showTab('main');
 if(forcePowerBtn) forcePowerBtn.onclick=()=>{ setForcePower(!forceEnabled); };
 if(bigrisePowerBtn) bigrisePowerBtn.onclick=()=>{ setBigrisePower(!bigriseEnabled); };
-
-function setVelocityTopPreAlert(items, remain){
-  if(!velocityPreAlertState || !velocityPreCallState || !velocityPrePutState) return;
-  if(!velocityEnabled){
-    velocityPreAlertState.textContent='OFFLINE';
-    velocityPreAlertState.className='big neutral';
-    velocityPreCallState.textContent='AGUARDANDO'; velocityPreCallState.className='big neutral';
-    velocityPrePutState.textContent='AGUARDANDO'; velocityPrePutState.className='big neutral';
-    return;
-  }
-  const list=Array.isArray(items)?items:[];
-  const best=list[0]||null;
-  const dir=String((best&&best.direction)||'').toUpperCase();
-  if(best && (dir==='CALL'||dir==='PUT')){
-    velocityPreAlertState.textContent='ATIVO • '+dir;
-    velocityPreAlertState.className='big '+(dir==='CALL'?'call':'put');
-    velocityPreCallState.textContent=dir==='CALL'?'PRÉ-CALL ATIVO':'AGUARDANDO';
-    velocityPreCallState.className='big '+(dir==='CALL'?'call':'neutral');
-    velocityPrePutState.textContent=dir==='PUT'?'PRÉ-PUT ATIVO':'AGUARDANDO';
-    velocityPrePutState.className='big '+(dir==='PUT'?'put':'neutral');
-  }else{
-    const sec=Math.max(0,Number(remain||0));
-    velocityPreAlertState.textContent=sec>60?'FORA DA JANELA':'MONITORANDO';
-    velocityPreAlertState.className='big neutral';
-    velocityPreCallState.textContent='AGUARDANDO'; velocityPreCallState.className='big neutral';
-    velocityPrePutState.textContent='AGUARDANDO'; velocityPrePutState.className='big neutral';
-  }
-}
-
-function applyKineticPulsePowerState(){
-  if(kineticPulsePowerBtn){
-    kineticPulsePowerBtn.textContent=kineticPulseEnabled?'🟢 ONLINE':'🔴 OFFLINE';
-    kineticPulsePowerBtn.style.background=kineticPulseEnabled?'#0b7a3d':'#7d1d1d';
-    kineticPulsePowerBtn.style.color='#fff';
-    kineticPulsePowerBtn.style.borderColor=kineticPulseEnabled?'#16c56b':'#ff5252';
-  }
-}
-
-function kineticHasConfirmedMainSignal(){
-  const d=String((cur&&cur.direction)||'NEUTRO').toUpperCase();
-  if(d!=='CALL' && d!=='PUT') return false;
-  const exp=Date.parse(String((cur&&cur.expiry_time)||''));
-  return !Number.isFinite(exp) || exp>Date.now()+1000;
-}
-
-function clearKineticMainPreview(){
-  kineticMainPreview=null;
-  kineticMainPreviewUntil=0;
-  kineticMainPreviewShowing=false;
-}
-
-function evaluateKineticPreAlertGate(mp){
-  const dir=String((mp&&mp.prealert_direction)||'NEUTRO').toUpperCase();
-  const score=Math.max(0,Math.min(4,Number((mp&&mp.prealert_score)||0)));
-  const rawActive=Boolean(mp&&mp.prealert_active) && (dir==='CALL'||dir==='PUT') && score>=3;
-
-  if(!rawActive){
-    kineticPreCandidateDir='';
-    kineticPreCandidateCount=0;
-    kineticPreCandidateSampleKey='';
-    return {active:false,rawActive:false,dir:'NEUTRO',score:score,count:0,cooldown:false,candlesLeft:0};
-  }
-
-  const sampleKey=[String(mp.updated_at||''),String(mp.prealert_entry_time||''),dir,String(score),String(mp.preview_norm_acc||''),String(mp.preview_velocity||'')].join('|');
-  if(sampleKey!==kineticPreCandidateSampleKey){
-    kineticPreCandidateSampleKey=sampleKey;
-    if(dir===kineticPreCandidateDir){
-      kineticPreCandidateCount=Math.min(9,kineticPreCandidateCount+1);
-    }else{
-      kineticPreCandidateDir=dir;
-      kineticPreCandidateCount=1;
-    }
-  }
-
-  const stable=kineticPreCandidateCount>=KINETIC_PRE_STABILITY_READS;
-  const entryMs=Date.parse(String(mp.prealert_entry_time||''));
-  const stepMs=Math.max(60000,intervalSecondsValue(String(mp.interval||((interval&&interval.value)||'1min')))*1000);
-  const sameCurrentSignal=Number.isFinite(entryMs) && kineticLastOfficialEntryMs>0 && entryMs===kineticLastOfficialEntryMs;
-  const nextAllowedMs=kineticLastOfficialEntryMs>0 ? kineticLastOfficialEntryMs+(KINETIC_PRE_COOLDOWN_CANDLES*stepMs) : 0;
-  const cooldown=Number.isFinite(entryMs) && nextAllowedMs>0 && !sameCurrentSignal && entryMs<nextAllowedMs;
-  const candlesLeft=cooldown?Math.max(1,Math.ceil((nextAllowedMs-entryMs)/stepMs)):0;
-
-  return {
-    active:stable && !cooldown,
-    rawActive:true,
-    dir:dir,
-    score:score,
-    count:kineticPreCandidateCount,
-    stable:stable,
-    cooldown:cooldown,
-    candlesLeft:candlesLeft,
-    entryMs:Number.isFinite(entryMs)?entryMs:0
-  };
-}
-
-function paintKineticPreAlertOnMain(mp, withArrow=true){
-  if(!kineticPulseEnabled || !mp) return false;
-  const preDir=String(mp.prealert_direction||'NEUTRO').toUpperCase();
-  if(!Boolean(mp.prealert_active) || (preDir!=='CALL' && preDir!=='PUT')) return false;
-  // Um sinal confirmado do motor principal sempre tem prioridade visual.
-  if(kineticHasConfirmedMainSignal()) return false;
-
-  const isCall=preDir==='CALL';
-  const score=Math.max(0,Math.min(4,Number(mp.prealert_score||0)));
-  kineticMainPreview={
-    direction:preDir,
-    score:score,
-    reason:String(mp.prealert_reason||''),
-    symbol:String(mp.symbol||((S&&S.value)||'')),
-    interval:String(mp.interval||((interval&&interval.value)||'')),
-    candle:String(mp.prealert_candle||''),
-    entry_time:String(mp.prealert_entry_time||''),
-    expiry_time:String(mp.prealert_expiry_time||''),
-  };
-  // O endpoint é lido a cada 12 s. Mantemos o visual vivo um pouco além disso
-  // para o polling normal de 5 s não apagar o pré-alerta da tela.
-  kineticMainPreviewUntil=Date.now()+18000;
-  kineticMainPreviewShowing=true;
-
-  direction.textContent=isCall?'PRÉ-CALL':'PRÉ-PUT';
-  direction.className='big '+(isCall?'call':'put');
-  confidence.textContent='Kinetic Pulse • formação '+score+'/4';
-  const kineticEntryTime=String(mp.prealert_entry_time||'');
-  const kineticEntryLabel=kineticEntryTime?ft(kineticEntryTime):'--:--:--';
-  entry.textContent=kineticEntryLabel;
-  if(entryScheduleLabel) entryScheduleLabel.textContent='⏱ CRONOGRAMA • KINETIC • PRÓXIMA VELA';
-  countdown.textContent=(isCall?'Possível COMPRA':'Possível VENDA')+' • entrada '+kineticEntryLabel;
-  const kineticExpiryLabel=mp.prealert_expiry_time?ft(mp.prealert_expiry_time):'--:--:--';
-  if(expiryCountdown) expiryCountdown.textContent='⏱ EXPIRAÇÃO: '+kineticExpiryLabel;
-  statusBox.textContent='🎯 KINETIC PULSE • '+(isCall?'PRÉ-CALL':'PRÉ-PUT')+' • '+(isCall?'POSSÍVEL COMPRA':'POSSÍVEL VENDA')+' • ENTRADA '+kineticEntryLabel;
-  if(risk) risk.textContent='Risco: PRÉ-ALERTA • ainda não confirmado';
-
-  showRobot();
-  analysisText.style.display='block';
-  analysisText.textContent='🎯 KINETIC PULSE • '+(isCall?'PRÉ-CALL • POSSÍVEL COMPRA':'PRÉ-PUT • POSSÍVEL VENDA');
-
-  if(withArrow){
-    entryArrow.className='entry-arrow '+(isCall?'call':'put');
-    entryArrowIcon.textContent=isCall?'⬆':'⬇';
-    // O nome CALL/PUT fica explícito no robô, como solicitado.
-    entryArrowLabel.textContent=isCall?'CALL • COMPRAR':'PUT • VENDER';
-    clearTimeout(arrowTimer);
-    arrowTimer=setTimeout(()=>{
-      // Não apaga a seta se o pré-alerta continua válido; a próxima leitura
-      // renova o tempo. Sinal confirmado de outro motor pode sobrescrever.
-      if(kineticMainPreviewShowing && Date.now()<kineticMainPreviewUntil && !kineticHasConfirmedMainSignal()){
-        restoreKineticPreviewOnMain();
-      }else if(!kineticHasConfirmedMainSignal()){
-        entryArrow.className='entry-arrow';
-      }
-    },15000);
-  }
-  return true;
-}
-
-function restoreKineticPreviewOnMain(){
-  if(!kineticPulseEnabled || !kineticMainPreview || Date.now()>=kineticMainPreviewUntil){
-    if(Date.now()>=kineticMainPreviewUntil) clearKineticMainPreview();
-    return false;
-  }
-  if(kineticHasConfirmedMainSignal()) return false;
-  return paintKineticPreAlertOnMain({
-    prealert_active:true,
-    prealert_direction:kineticMainPreview.direction,
-    prealert_score:kineticMainPreview.score,
-    prealert_reason:kineticMainPreview.reason,
-    symbol:kineticMainPreview.symbol,
-    interval:kineticMainPreview.interval,
-    prealert_candle:kineticMainPreview.candle,
-    prealert_entry_time:kineticMainPreview.entry_time,
-    prealert_expiry_time:kineticMainPreview.expiry_time,
-  },false);
-}
-
-function paintKineticConfirmedOnMain(mp){
-  if(!kineticPulseEnabled || !mp || !Boolean(mp.confirmed)) return false;
-  const dir=String(mp.direction||'NEUTRO').toUpperCase();
-  if(dir!=='CALL' && dir!=='PUT') return false;
-  const isCall=dir==='CALL';
-  clearKineticMainPreview();
-  direction.textContent=dir;
-  direction.className='big '+(isCall?'call':'put');
-  confidence.textContent='Kinetic Pulse • CONFIRMADO';
-  const confirmedEntry=mp.prealert_entry_time?ft(mp.prealert_entry_time):'PRÓXIMA VELA';
-  entry.textContent=confirmedEntry;
-  countdown.textContent=(isCall?'CALL confirmado':'PUT confirmado')+' • entrada '+confirmedEntry;
-  statusBox.textContent='🎯 KINETIC PULSE • '+dir+' CONFIRMADO • ENTRADA '+confirmedEntry;
-  if(risk) risk.textContent='Risco: sinal confirmado pelo segundo indicador';
-  showRobot();
-  analysisText.style.display='block';
-  analysisText.textContent='🎯 KINETIC PULSE • '+dir+' CONFIRMADO • PRÓXIMA VELA';
-  entryArrow.className='entry-arrow '+(isCall?'call':'put');
-  entryArrowIcon.textContent=isCall?'⬆':'⬇';
-  entryArrowLabel.textContent=isCall?'CALL • COMPRAR':'PUT • VENDER';
-  clearTimeout(arrowTimer);
-  arrowTimer=setTimeout(()=>{
-    if(!kineticHasConfirmedMainSignal()) entryArrow.className='entry-arrow';
-  },12000);
-  return true;
-}
-
-function kineticOfficialSignalFromPreAlert(mp){
-  if(!kineticPulseEnabled || !mp || !Boolean(mp.prealert_active)) return null;
-  const dir=String(mp.prealert_direction||'').toUpperCase();
-  if(dir!=='CALL' && dir!=='PUT') return null;
-  const score=Math.max(0,Math.min(4,Number(mp.prealert_score||0)));
-  // Kinetic Pulse: pré-alerta só vira operação após estabilidade no navegador.
-  if(score<3) return null;
-  const entryTime=String(mp.prealert_entry_time||'');
-  const expiryTime=String(mp.prealert_expiry_time||'');
-  if(!entryTime || !expiryTime) return null;
-  return {
-    source:'KINETIC_PULSE_ALERT',
-    symbol:String(mp.symbol||((S&&S.value)||'')),
-    interval:String(mp.interval||((interval&&interval.value)||'1min')),
-    direction:dir,
-    confidence:Math.max(60,Math.min(95,60+score*8)),
-    entry_time:entryTime,
-    expiry_time:expiryTime,
-    requested_market:String(mp.market||((market&&market.value)||'OPEN')),
-    market:String(mp.market||((market&&market.value)||'OPEN')),
-    feed_source:String(mp.feed_source||''),
-    risk:'MEDIUM',
-    strategy:'KINETIC_PULSE_ORIGINAL_PLUS_PREALERT',
-    selected_engine:'KINETIC_PULSE',
-    mode:'KINETIC_PULSE',
-    entry_mode:'BIRTH',
-    auto_trade_allowed:false
-  };
-}
-
-async function publishKineticPreAlertOfficial(mp){
-  const signal=kineticOfficialSignalFromPreAlert(mp);
-  if(!signal) return false;
-
-  const entryKey=[signal.symbol,signal.interval,signal.entry_time].join('|');
-
-  // Mantém a PRIMEIRA direção liberada para aquela vela. Se o Kinetic oscilar
-  // intrabar depois, não cria CALL e PUT para o mesmo horário.
-  if(kineticOfficialActiveSignal &&
-     String(kineticOfficialActiveSignal.symbol)===String(signal.symbol) &&
-     String(kineticOfficialActiveSignal.interval)===String(signal.interval) &&
-     String(kineticOfficialActiveSignal.entry_time)===String(signal.entry_time)){
-    signal.direction=String(kineticOfficialActiveSignal.direction||signal.direction).toUpperCase();
-  }else{
-    kineticOfficialActiveSignal={...signal};
-  }
-
-  // Repassa para a fila em TODA leitura enquanto o alerta estiver vivo.
-  // enqueuePendingTrade já deduplica; isso evita perder o WIN/LOSS se o celular
-  // suspender uma execução exatamente no primeiro disparo.
-  enqueuePendingTrade({
-    source:signal.source,
-    direct_only:true,
-    market:signalResultMarket(signal),
-    requested_market:signal.requested_market,
-    feed_source:signal.feed_source,
-    feed_fallback:false,
-    symbol:signal.symbol,
-    interval:signal.interval,
-    direction:signal.direction,
-    entry_time:signal.entry_time,
-    expiry_time:signal.expiry_time,
-    confidence:signal.confidence,
-    risk:signal.risk,
-    strategy:signal.strategy,
-    engine:'KINETIC_PULSE',
-    entry_mode:'BIRTH',
-    value_stake:currentValueStake(),
-    value_payout:currentValuePayout()
-  });
-
-  if(entryKey!==lastKineticOfficialEntryKey){
-    lastKineticOfficialEntryKey=entryKey;
-    lastKineticOfficialSentAt=Date.now();
-    const entryMs=Date.parse(String(signal.entry_time||''));
-    if(Number.isFinite(entryMs)){
-      kineticLastOfficialEntryMs=entryMs;
-      try{ localStorage.setItem('mega_kinetic_last_official_entry_ms',String(entryMs)); }catch(_){}
-    }
-    // Backup de contabilidade no servidor SOMENTE para o sinal que passou
-    // pelo gate de estabilidade + cooldown.
-    post('/kinetic-pulse-register',{
-      market:signal.market,
-      symbol:signal.symbol,
-      interval:signal.interval,
-      direction:signal.direction,
-      entry_time:signal.entry_time,
-      expiry_time:signal.expiry_time
-    }).catch(()=>{});
-  }
-
-  // Não bloqueia nova tentativa de Telegram pelo lastKineticOfficialEntryKey.
-  // maybeSendTelegramSignal só grava a chave depois que o envio realmente
-  // teve sucesso; se Telegram estiver ocupado, a próxima leitura tenta de novo.
-  await maybeSendTelegramSignal(signal);
-  if(telegramEnabled && telegramLastSignalKey===[signal.symbol,signal.interval,signal.direction,signal.entry_time].join('|') && telegramSendStatus){
-    telegramSendStatus.textContent='✅ Kinetic Pulse enviado: '+signal.symbol+' '+signal.direction+' • entrada '+ft(signal.entry_time);
-  }
-  return true;
-}
-
-function renderKineticPulseIndicator(data){
-  if(!kineticPulseState) return;
-  applyKineticPulsePowerState();
-  if(!kineticPulseEnabled){
-    kineticPulseState.textContent='OFFLINE'; kineticPulseState.className='big neutral';
-    if(kineticPulseReason) kineticPulseReason.textContent='Ative o indicador para acompanhar.';
-    if(kineticPulsePreAlert){ kineticPulsePreAlert.textContent='OFFLINE'; kineticPulsePreAlert.className='big neutral'; }
-    if(kineticPulsePreCall){ kineticPulsePreCall.textContent='AGUARDANDO'; kineticPulsePreCall.className='big neutral'; }
-    if(kineticPulsePrePut){ kineticPulsePrePut.textContent='AGUARDANDO'; kineticPulsePrePut.className='big neutral'; }
-    if(kineticPulsePreReason) kineticPulsePreReason.textContent='Ative o indicador para acompanhar.';
-    if(kineticPulseLines) kineticPulseLines.textContent='--';
-    if(kineticPulseHist) kineticPulseHist.textContent='--';
-    if(kineticPulseContext) kineticPulseContext.textContent='--';
-    return;
-  }
-  const d=data||{};
-  const tech=d.technical||d||{};
-  const mp=(d.kinetic_pulse)||
-    ((tech.indicators&&tech.indicators.kinetic_pulse)?tech.indicators.kinetic_pulse:null)||
-    ((d.indicators&&d.indicators.kinetic_pulse)?d.indicators.kinetic_pulse:null)||
-    ((Object.prototype.hasOwnProperty.call(d,'norm_acc') && Object.prototype.hasOwnProperty.call(d,'direction'))?d:null);
-  if(!mp){
-    kineticPulseState.textContent='AGUARDANDO'; kineticPulseState.className='big neutral';
-    if(kineticPulseReason) kineticPulseReason.textContent='Aguardando a próxima leitura independente do Kinetic Pulse.';
-    return;
-  }
-  const dir=String(mp.direction||'NEUTRO').toUpperCase();
-  const rawPreDir=String(mp.prealert_direction||'NEUTRO').toUpperCase();
-  const kineticGate=evaluateKineticPreAlertGate(mp);
-  const preDir=kineticGate.dir;
-  const preActive=Boolean(kineticGate.active);
-  kineticPulseState.textContent=dir==='CALL'?'🟢 CALL':dir==='PUT'?'🔴 PUT':'⚪ NEUTRO';
-  kineticPulseState.className='big '+(dir==='CALL'?'call':dir==='PUT'?'put':'neutral');
-  if(kineticPulseReason) kineticPulseReason.textContent=String(mp.reason||'Monitorando Kinetic Pulse.');
-  if(kineticPulsePreAlert){
-    if(preActive){
-      kineticPulsePreAlert.textContent='ATIVO • '+preDir;
-      kineticPulsePreAlert.className='big '+(preDir==='CALL'?'call':'put');
-    }else if(kineticGate.cooldown){
-      kineticPulsePreAlert.textContent='PAUSA • '+kineticGate.candlesLeft+' VELA'+(kineticGate.candlesLeft===1?'':'S');
-      kineticPulsePreAlert.className='big neutral';
-    }else if(kineticGate.rawActive){
-      kineticPulsePreAlert.textContent='CONFIRMANDO '+kineticGate.count+'/'+KINETIC_PRE_STABILITY_READS;
-      kineticPulsePreAlert.className='big neutral';
-    }else{
-      kineticPulsePreAlert.textContent='MONITORANDO';
-      kineticPulsePreAlert.className='big neutral';
-    }
-  }
-  if(kineticPulsePreCall){
-    kineticPulsePreCall.textContent=preActive&&preDir==='CALL'?'PRÉ-CALL ATIVO':(kineticGate.rawActive&&preDir==='CALL'?'CONFIRMANDO':'AGUARDANDO');
-    kineticPulsePreCall.className='big '+(preActive&&preDir==='CALL'?'call':'neutral');
-  }
-  if(kineticPulsePrePut){
-    kineticPulsePrePut.textContent=preActive&&preDir==='PUT'?'PRÉ-PUT ATIVO':(kineticGate.rawActive&&preDir==='PUT'?'CONFIRMANDO':'AGUARDANDO');
-    kineticPulsePrePut.className='big '+(preActive&&preDir==='PUT'?'put':'neutral');
-  }
-  if(kineticPulsePreReason){
-    const score=Number(mp.prealert_score||0);
-    const vozTxt=voiceEnabled?'':' • VOZ OFFLINE';
-    const horario=(preActive&&mp.prealert_entry_time)?(' • entrada '+ft(mp.prealert_entry_time)):'';
-    let gateTxt='';
-    if(kineticGate.cooldown) gateTxt=' • aguardando '+kineticGate.candlesLeft+' vela'+(kineticGate.candlesLeft===1?'':'s')+' de intervalo';
-    else if(kineticGate.rawActive&&!preActive) gateTxt=' • confirmação '+kineticGate.count+'/'+KINETIC_PRE_STABILITY_READS;
-    kineticPulsePreReason.textContent=String(mp.prealert_reason||'Monitorando pré-alerta do Kinetic Pulse.')+(preActive?(' • formação '+score+'/4'+horario+vozTxt):gateTxt);
-  }
-  if(preActive){
-    const preKey=[String(mp.symbol||((S&&S.value)||'')),String(mp.interval||((interval&&interval.value)||'')),preDir,String(mp.prealert_candle||'')].join('|');
-
-    // 3.75: só após 2 leituras seguidas e fora do cooldown original de 5 velas, o pré-alerta do Kinetic
-    // aparece no painel principal e na seta do robô e também entra no mesmo
-    // fluxo oficial de Telegram + WIN/LOSS. Autoentrada continua bloqueada.
-    paintKineticPreAlertOnMain(mp,true);
-    // O pré-alerta 3/4 do segundo indicador agora é o sinal oficial dele:
-    // entra na fila de WIN/LOSS e no Telegram, sem acionar autoentrada.
-    publishKineticPreAlertOfficial(mp).catch(()=>{});
-
-    if(preKey!==lastKineticPreAlertKey){
-      lastKineticPreAlertKey=preKey;
-      if(voiceEnabled){
-        const ativoFalado=spokenAssetName(mp.symbol || (S&&S.value) || '');
-        const h=mp.prealert_entry_time?ft(mp.prealert_entry_time):'';
-        speak('Pré alerta Kinetic Pulse. '+(preDir==='CALL'?'Possível compra':'Possível venda')+' no ativo '+ativoFalado+(h?'. Entrada às '+h:'')+'.');
-      }
-    }
-  }else{
-    clearKineticMainPreview();
-  }
-
-  if(Boolean(mp.confirmed) && (dir==='CALL'||dir==='PUT')){
-    // Fallback robusto: se o celular perdeu o pré-alerta, o BUY/SELL original
-    // confirmado ainda entra no Telegram e na fila WIN/LOSS para a próxima vela.
-    publishKineticPreAlertOfficial({
-      ...mp,
-      prealert_active:true,
-      prealert_direction:dir,
-      prealert_score:4,
-      prealert_reason:String(mp.reason||'Gatilho original Kinetic confirmado.')
-    }).catch(()=>{});
-    const confirmedKey=[String(mp.symbol||((S&&S.value)||'')),String(mp.interval||((interval&&interval.value)||'')),dir,String(mp.confirmed_candle||mp.prealert_candle||'')].join('|');
-    if(confirmedKey!==lastKineticConfirmedKey){
-      lastKineticConfirmedKey=confirmedKey;
-      paintKineticConfirmedOnMain(mp);
-      if(voiceEnabled){
-        const ativoFalado=spokenAssetName(mp.symbol || (S&&S.value) || '');
-        speak('Kinetic Pulse confirmou '+(dir==='CALL'?'compra':'venda')+' no ativo '+ativoFalado+'. Entrada na próxima vela.');
-      }
-    }
-  }
-  if(kineticPulseLines){
-    const na=Number((mp.preview_norm_acc??mp.norm_acc)||0);
-    const prev=Number((mp.preview_norm_acc_prev??mp.norm_acc_prev)||0);
-    kineticPulseLines.textContent=na.toFixed(3)+' • anterior '+prev.toFixed(3);
-  }
-  if(kineticPulseHist){
-    kineticPulseHist.textContent='V '+Number((mp.preview_velocity??mp.velocity)||0).toFixed(6)+' • A '+Number((mp.preview_acceleration??mp.acceleration)||0).toFixed(6);
-  }
-  if(kineticPulseContext){
-    kineticPulseContext.textContent='HMA20 '+Number(mp.hma20||0).toFixed(5)+' • EMA20 '+Number(mp.ema20||0).toFixed(5);
-  }
-}
-
-async function loadKineticPulseIndicator(force=false){
-  if(!kineticPulseEnabled){
-    renderKineticPulseIndicator(null);
-    return;
-  }
-  if(kineticPulseBusy) return;
-
-  kineticPulseBusy=true;
-  if(kineticPulseState){
-    kineticPulseState.textContent='ANALISANDO';
-    kineticPulseState.className='big neutral';
-  }
-  if(kineticPulseReason) kineticPulseReason.textContent='Lendo candles fechados para o Kinetic Pulse...';
-  try{
-    const d=await get('/kinetic-pulse?market='+encodeURIComponent((market&&market.value)||'OPEN')+
-      '&symbol='+encodeURIComponent((S&&S.value)||'BTC/USD')+
-      '&interval='+encodeURIComponent((interval&&interval.value)||'1min'));
-    lastKineticPulseData=d||null;
-    renderKineticPulseIndicator(d);
-  }catch(e){
-    if(kineticPulseState){
-      kineticPulseState.textContent='AGUARDANDO';
-      kineticPulseState.className='big neutral';
-    }
-    if(kineticPulseReason) kineticPulseReason.textContent='Falha temporária na leitura: '+String((e&&e.message)||e).slice(0,120);
-  }finally{
-    kineticPulseBusy=false;
-  }
-}
-
-if(kineticPulsePowerBtn){
-  kineticPulsePowerBtn.onclick=async()=>{
-    kineticPulseEnabled=!kineticPulseEnabled;
-    try{ localStorage.setItem('mega_kinetic_pulse_power',kineticPulseEnabled?'ONLINE':'OFFLINE'); }catch(_){}
-    applyKineticPulsePowerState();
-    if(kineticPulseEnabled){
-      await loadKineticPulseIndicator(true);
-    }else{
-      clearKineticMainPreview();
-      kineticOfficialActiveSignal=null;
-      kineticPreCandidateDir='';
-      kineticPreCandidateCount=0;
-      kineticPreCandidateSampleKey='';
-      renderKineticPulseIndicator(null);
-    }
-    if(voiceEnabled) speak(kineticPulseEnabled?'Indicador Kinetic Pulse online.':'Indicador Kinetic Pulse offline.');
-  };
-}
-applyKineticPulsePowerState();
 
 function showVelocitySignalOnRobot(signal){
   if(!signal) return;
@@ -20265,18 +19873,48 @@ function showVelocitySignalOnRobot(signal){
   },45000);
 }
 
+function renderIctTab(data){
+  if(!ictReadout) return;
+  const d=data||{};
+  const tech=(d.technical&&typeof d.technical==='object')?d.technical:{};
+  const diag=(tech.diagnostics&&typeof tech.diagnostics==='object')?tech.diagnostics:{};
+  if(!ictEnabled){
+    ictReadout.textContent='Motor offline.';
+    if(ictReason) ictReason.textContent='Ative o ICT/SMC Institucional para analisar candles fechados.';
+    if(ictVerdict){ ictVerdict.textContent='OFFLINE'; ictVerdict.className='big neutral'; }
+    if(ictPath) ictPath.textContent='--';
+    return;
+  }
+  const dir=String(d.direction||'NEUTRO').toUpperCase();
+  const score=Math.round(Number(d.confidence||0));
+  const path=String(tech.path||'NONE').toUpperCase();
+  if(ictVerdict){
+    ictVerdict.textContent=dir==='CALL'?'🟢 CALL':dir==='PUT'?'🔴 PUT':'⚪ AGUARDANDO';
+    ictVerdict.className='big '+(dir==='CALL'?'call':dir==='PUT'?'put':'neutral');
+  }
+  if(ictPath) ictPath.textContent=path==='NONE'?'SEM GATILHO CONFIRMADO':path;
+  if(ictScore){
+    const best=Math.max(Number(diag.score_cont_call||0),Number(diag.score_cont_put||0),Number(diag.score_rev_call||0),Number(diag.score_rev_put||0));
+    ictScore.textContent=(dir==='NEUTRO'?Math.round(best):score)+'% / mínimo '+Math.round(Number(diag.min_score||74))+'%';
+  }
+  if(ictStructure){
+    const st=Number(diag.structure_dir||0);
+    ictStructure.textContent=st===1?'HH/HL • ALTA':st===-1?'LL/LH • BAIXA':'MISTA/TRANSIÇÃO';
+  }
+  if(ictContext){
+    const ctx=Number(diag.context_bias||0), h1=Number(diag.h1_bias||0), h4=Number(diag.h4_bias||0);
+    const fmt=x=>x===1?'CALL':x===-1?'PUT':'MISTO';
+    ictContext.textContent='H1 '+fmt(h1)+' • H4 '+fmt(h4)+' • viés '+fmt(ctx);
+  }
+  ictReadout.textContent=(dir==='CALL'?'🟢 CALL':dir==='PUT'?'🔴 PUT':'⚪ NEUTRO')+' • '+(path==='NONE'?'monitorando':path)+' • confiança '+score+'%';
+  if(ictReason) ictReason.textContent=String(d.reason||'Monitorando estrutura, liquidez e zonas institucionais.');
+}
+
 function renderVelocityTab(data){
   if(!velocityReadout) return;
   const d=data||{};
-  lastVelocityData=d;
-  lastVelocityDataAt=Date.now();
   const diag=(d.technical&&d.technical.diagnostics)?d.technical.diagnostics:(d.diagnostics||{});
-  if(velocityOriginalState){
-    velocityOriginalState.textContent=velocityEnabled?'ONLINE':'OFFLINE';
-    velocityOriginalState.className='big '+(velocityEnabled?'call':'neutral');
-  }
   if(!velocityEnabled){
-    setVelocityTopPreAlert([],0);
     velocityReadout.textContent='Motor offline.';
     if(velocityReason) velocityReason.textContent='Ative o Velocity Flow para começar a analisar candles fechados.';
     if(velocityRobotAlert) velocityRobotAlert.style.display='none';
@@ -20293,8 +19931,6 @@ function renderVelocityTab(data){
   if(velocityDmi) velocityDmi.textContent='ADX '+Number(diag.adx||0).toFixed(1)+' • +DI '+Number(diag.plus_di||0).toFixed(1)+' • -DI '+Number(diag.minus_di||0).toFixed(1);
   if(velocityRsi) velocityRsi.textContent=Number(diag.rsi7||0).toFixed(1);
   if(velocityMa) velocityMa.textContent='EMA9 '+Number(diag.ema9||0).toFixed(5)+' • SMA21 '+Number(diag.sma21||0).toFixed(5);
-  // O Kinetic Pulse de baixo é totalmente independente e não é redesenhado
-  // pela atualização do Velocity Flow de cima.
 }
 
 function promoteVelocityPreAlertToOfficial(item){
@@ -20414,9 +20050,6 @@ async function sig(announce=false){
       statusBox.textContent=cur.status;
       risk.textContent='Risco: --';
       if(dataFeedText) dataFeedText.textContent='MOTORES OFFLINE • nenhuma análise solicitada';
-      // O segundo indicador é independente dos motores principais.
-      // Se houver PRÉ-CALL/PRÉ-PUT MACD ativo, ele continua aparecendo.
-      restoreKineticPreviewOnMain();
       return;
     }
     cur=await get(
@@ -20439,6 +20072,7 @@ async function sig(announce=false){
     }
 
     if(engine==='VELOCITY' && velocityTab && velocityTab.classList.contains('active')) renderVelocityTab(cur);
+    if(engine==='ICT' && ictTab && ictTab.classList.contains('active')) renderIctTab(cur);
 
     if(announce){
       showRobot();
@@ -20485,13 +20119,6 @@ async function sig(announce=false){
     // CALL/PUT confirmado continua para Telegram, resultado e autoentrada.
     if(engine==='VELOCITY' && String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO') {
       renderVelocityPreviewOnMain(cur);
-    }
-
-    // O polling do motor principal roda a cada 5 s; o MACD a cada 12 s.
-    // Reaplica apenas o visual do pré-alerta MACD quando o motor principal
-    // está NEUTRO, para CALL/PUT e a seta não sumirem entre as leituras.
-    if(String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO'){
-      restoreKineticPreviewOnMain();
     }
 
     rememberPendingTrade(cur);
@@ -20647,7 +20274,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox) statusBox.textContent=`RADAR → ${selectedRobotEngine()==='SMART'?'INTELIGÊNCIA ARTIFICIAL':(selectedRobotEngine()==='VELOCITY'?'VELOCITY FLOW':(selectedRobotEngine()==='LARRY'?'LARRY BREAKOUT':(selectedRobotEngine()==='FORCE'?'EA FORÇA DO MOVIMENTO':(selectedRobotEngine()==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'))))} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`;
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='ICT'?'ICT/SMC INSTITUCIONAL':ek==='SMART'?'INTELIGÊNCIA ARTIFICIAL':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
@@ -20764,7 +20391,6 @@ async function loadPreSignals(){
 
   const engine=selectedRobotEngine();
   if(engine==='OFF'){
-    setVelocityTopPreAlert([],0);
     if(preSignalStatus) preSignalStatus.textContent='Pré-alerta aguardando um motor ficar ONLINE.';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔕 Coloque IA Gráfica, Inteligência Artificial ou EA ONLINE para usar o pré-alerta.</div>';
     return;
@@ -20778,10 +20404,11 @@ async function loadPreSignals(){
     const data=await get(url);
     const items=Array.isArray(data&&data.items)?data.items:[];
     const remain=Math.max(0,Number((data&&data.seconds_to_entry)||0));
-    if(engine==='VELOCITY') setVelocityTopPreAlert(items,remain);
 
     if(preSignalStatus){
-      if(remain>60){
+      if(engine==='ICT' && data && data.message){
+        preSignalStatus.textContent=String(data.message);
+      }else if(remain>60){
         preSignalStatus.textContent=`Aguardando janela do pré-alerta • faltam ${Math.ceil(remain)}s para a próxima abertura.`;
       }else{
         preSignalStatus.textContent=`🔔 Janela de pré-alerta ativa • próxima abertura em ${Math.ceil(remain)}s.`;
@@ -20792,7 +20419,9 @@ async function loadPreSignals(){
       if(preSignals){
         preSignals.innerHTML = engine==='VELOCITY'
           ? '<div style="opacity:.75">⚡ Velocity Flow monitorando a vela em formação • ainda não há alinhamento provisório para CALL/PUT.</div>'
-          : '<div style="opacity:.75">⚪ Nenhum pré-alerta confirmado na vela em formação. Continuo monitorando.</div>';
+          : engine==='ICT'
+            ? '<div style="opacity:.75">🏦 ICT/SMC não usa pré-sinal intrabar • aguarda o candle fechar e só então decide CALL/PUT para a próxima vela.</div>'
+            : '<div style="opacity:.75">⚪ Nenhum pré-alerta confirmado na vela em formação. Continuo monitorando.</div>';
       }
       return;
     }
@@ -20913,34 +20542,16 @@ function spokenAssetName(symbol){
   return String(symbol||'').replace('/', ' ');
 }
 
-function activeTimingSignal(){
-  // Sinal confirmado do motor principal tem prioridade.
-  if(cur && (cur.direction==='CALL' || cur.direction==='PUT') && cur.entry_time) return cur;
-  // Quando os motores principais estão neutros/offline, o segundo indicador
-  // mantém seu próprio cronograma até a expiração da operação.
-  if(kineticPulseEnabled && kineticOfficialActiveSignal){
-    const d=String(kineticOfficialActiveSignal.direction||'').toUpperCase();
-    const exp=Date.parse(String(kineticOfficialActiveSignal.expiry_time||''));
-    const sameSymbol=String(kineticOfficialActiveSignal.symbol||'')===String((S&&S.value)||'');
-    const sameInterval=String(kineticOfficialActiveSignal.interval||'')===String((interval&&interval.value)||'');
-    if((d==='CALL'||d==='PUT') && sameSymbol && sameInterval && Number.isFinite(exp) && exp>Date.now()-2000){
-      return kineticOfficialActiveSignal;
-    }
-  }
-  return null;
-}
-
 function cd(){
-  const timingSig=activeTimingSignal();
-  if(!timingSig){
+  if(!cur || cur.direction==='NEUTRO' || !cur.entry_time){
     countdown.textContent='Sem entrada confirmada';
     expiryCountdown.textContent='⏱ EXPIRAÇÃO: --:--';
     return;
   }
 
   const nowMs=Date.now();
-  const et=new Date(timingSig.entry_time).getTime();
-  const xt=timingSig.expiry_time?new Date(timingSig.expiry_time).getTime():0;
+  const et=new Date(cur.entry_time).getTime();
+  const xt=cur.expiry_time?new Date(cur.expiry_time).getTime():0;
   const n=Math.ceil((et-nowMs)/1000);
 
   countdown.textContent=n>0?'Entrada em '+n+'s':'Entrada liberada';
@@ -20959,7 +20570,7 @@ function cd(){
   if(n<=30 && n>0 && !thirtyFive){
     thirtyFive=true;
     if(voiceEnabled){
-      const ativoFalado=spokenAssetName(timingSig.symbol || (S&&S.value) || '');
+      const ativoFalado=spokenAssetName(cur.symbol || (S&&S.value) || '');
       speak('Olá trader. Entrada encontrada no ativo '+ativoFalado+'.');
     }
   }
@@ -20971,19 +20582,19 @@ function cd(){
     }
   }
 
-  const birthGrace=(String(timingSig.entry_mode||'').toUpperCase()==='BIRTH')?12:2;
+  const birthGrace=(String(cur.entry_mode||'').toUpperCase()==='BIRTH')?12:2;
   if(n<=0 && n>-birthGrace){
     // Alertas antecipados promovidos do Velocity vão para painel/robô/Telegram,
     // mas não disparam ordem automática sem confirmação no candle fechado.
-    if(autoTradeEnabled && timingSig.auto_trade_allowed!==false) executeAutoTrade(timingSig);
+    if(autoTradeEnabled && cur.auto_trade_allowed!==false) executeAutoTrade(cur);
   }
   if(n<=0 && n>-birthGrace && !entered){
     entered=true;
-    showEntryArrow(timingSig.direction);
+    showEntryArrow(cur.direction);
 
     if(voiceEnabled){
       speak(
-        timingSig.direction==='CALL'
+        cur.direction==='CALL'
         ? 'Entrada liberada. Comprar agora.'
         : 'Entrada liberada. Vender agora.'
       );
@@ -21193,7 +20804,6 @@ marketMode.onchange=async()=>{
 
 
 S.onchange=()=>{
-  kineticOfficialActiveSignal=null;
   try{localStorage.setItem('mega_symbol',S.value)}catch(_){}
   renderAdaptiveLearningState();
 
@@ -21210,7 +20820,6 @@ S.onchange=()=>{
 };
 
 interval.onchange=()=>{
-  kineticOfficialActiveSignal=null;
   try{localStorage.setItem('mega_interval',interval.value)}catch(_){}
 
   lastSignalVoice='';
@@ -21291,7 +20900,6 @@ async function bootApp(){
   }
 
   if(appEnabled) safe('performance',perf);
-  if(appEnabled && kineticPulseEnabled) safe('kinetic-pulse',()=>loadKineticPulseIndicator(true));
 }
 
 bootApp().catch(err=>{
@@ -21330,13 +20938,6 @@ setInterval(()=>{
 // as leituras extras do motor em relação à versão anterior.
 setInterval(()=>{
   if(megaCanPoll() && selectedRobotEngine()!=='OFF') loadPreSignals();
-},10000);
-
-// Kinetic Pulse independente com pré-alerta intrabar. A rota própria usa o mesmo
-// roteador/cache de candles do app e roda no máximo a cada 10 s.
-// 3.75: duas leituras consecutivas + cooldown original de 5 velas entre sinais oficiais.
-setInterval(()=>{
-  if(megaCanPoll() && kineticPulseEnabled) loadKineticPulseIndicator(false);
 },10000);
 
 // Resultado das operações abertas.
