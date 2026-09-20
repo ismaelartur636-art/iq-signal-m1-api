@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.71"
+APP_VERSION = "3.72"
 PWA_VERSION = "v136"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -305,7 +305,7 @@ SYMBOLS = [
 ]
 OTC_SYMBOLS = [s for s in SYMBOLS if s != BINOMO_CRYPTO_IDX_SYMBOL]
 
-# MEGA IA 3.71 — robô de sinais em segundo plano.
+# MEGA IA 3.72 — robô de sinais em segundo plano com motor travado por ação explícita.
 # O navegador deixa de ser responsável por manter a análise viva: o servidor
 # varre um ativo por ciclo, envia CALL/PUT pelo Telegram e fecha WIN/LOSS.
 BACKGROUND_STATE_PATH = os.getenv(
@@ -1135,6 +1135,11 @@ class BackgroundBotStateBody(BaseModel):
     interval: str = "1min"
     symbols: list[str] = []
     chat_id: str | None = None
+    # PASSIVE nunca troca o motor nem liga/desliga o bot.
+    # ACTIVATE_ENGINE/DEACTIVATE_ENGINE só são enviados por clique explícito
+    # no botão ONLINE/OFFLINE do motor.
+    action: str = "PASSIVE"
+    telegram_enabled: bool | None = None
 
 
 
@@ -11991,6 +11996,11 @@ async def ctrader_logout(request: Request):
     return response
 
 
+@app.head("/health")
+async def health_head():
+    return Response(status_code=200)
+
+
 @app.get("/health")
 async def health():
     now_ts = time.time()
@@ -13805,7 +13815,7 @@ async def telegram_send(body: TelegramSignalBody):
 
 
 # -----------------------------------------------------------------------------
-# MEGA IA 3.71 — execução em segundo plano no servidor
+# MEGA IA 3.72 — execução em segundo plano no servidor; motor só muda por clique explícito
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     "GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE",
@@ -14256,33 +14266,91 @@ async def background_bot_get_state():
 
 @app.post("/background-bot/state")
 async def background_bot_set_state(body: BackgroundBotStateBody):
-    engine = str(body.engine or "ALPHAX").upper()
+    """Atualiza o bot 24h sem deixar a navegação do painel trocar o motor.
+
+    Regras:
+    - PASSIVE: só pode atualizar chat_id; não troca engine e não liga/desliga.
+    - ACTIVATE_ENGINE: clique explícito ONLINE; trava engine + mercado + intervalo.
+    - DEACTIVATE_ENGINE: clique explícito OFFLINE; só desliga se for o mesmo engine.
+    - TELEGRAM_TOGGLE: liga/desliga a execução mantendo o engine já travado.
+    """
+    action = str(body.action or "PASSIVE").strip().upper()
+    requested_engine = str(body.engine or "ALPHAX").upper()
     market = str(body.market or "OPEN").upper()
     interval = str(body.interval or "1min")
-    if engine not in _BACKGROUND_ENGINES:
+
+    if requested_engine not in _BACKGROUND_ENGINES:
         raise HTTPException(400, "Motor de segundo plano inválido.")
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado de segundo plano inválido.")
     if interval not in INTERVALS:
         raise HTTPException(400, "Intervalo de segundo plano inválido.")
+
     allowed = SYMBOLS if market == "OPEN" else OTC_SYMBOLS
     symbols = []
     for raw in body.symbols or []:
         sym = str(raw or "").upper().strip()
         if sym in allowed and sym not in symbols:
             symbols.append(sym)
+
     async with background_bot_lock:
-        background_bot_state.update({
-            "enabled": bool(body.enabled),
-            "engine": engine,
-            "market": market,
-            "interval": interval,
-            "symbols": symbols,
-            "chat_id": str(body.chat_id or background_bot_state.get("chat_id") or TELEGRAM_CHAT_ID or "").strip(),
-            "status": (f"ONLINE • {engine} • {market} • FILA ATIVA" if body.enabled else "OFFLINE • SERVIDOR AGUARDANDO"),
-            "last_error": "",
-        })
+        chat = str(body.chat_id or "").strip()
+        if chat:
+            background_bot_state["chat_id"] = chat
+
+        if action == "ACTIVATE_ENGINE":
+            background_bot_state.update({
+                "enabled": True,
+                "engine": requested_engine,
+                "market": market,
+                "interval": interval,
+                "symbols": symbols,
+                "status": f"ONLINE • {requested_engine} • {market} • FILA ATIVA",
+                "last_error": "",
+            })
+            print(
+                f"[BG CONTROL] motor ativado explicitamente: "
+                f"{requested_engine} • {market} • {interval}",
+                flush=True,
+            )
+
+        elif action == "DEACTIVATE_ENGINE":
+            current_engine = str(background_bot_state.get("engine") or "").upper()
+            if current_engine == requested_engine:
+                background_bot_state["enabled"] = False
+                background_bot_state["status"] = "OFFLINE • SERVIDOR AGUARDANDO"
+                background_bot_state["last_error"] = ""
+                print(
+                    f"[BG CONTROL] motor desativado explicitamente: {requested_engine}",
+                    flush=True,
+                )
+
+        elif action == "TELEGRAM_TOGGLE":
+            if body.telegram_enabled is False:
+                background_bot_state["enabled"] = False
+                background_bot_state["status"] = "OFFLINE • TELEGRAM DESLIGADO"
+            elif body.telegram_enabled is True:
+                current_engine = str(background_bot_state.get("engine") or BACKGROUND_DEFAULT_ENGINE).upper()
+                if current_engine not in _BACKGROUND_ENGINES:
+                    current_engine = "ALPHAX"
+                    background_bot_state["engine"] = current_engine
+                background_bot_state["enabled"] = True
+                background_bot_state["status"] = (
+                    f"ONLINE • {current_engine} • "
+                    f"{background_bot_state.get('market') or 'OPEN'} • FILA ATIVA"
+                )
+            background_bot_state["last_error"] = ""
+
+        elif action == "PASSIVE":
+            # Abrir o app, mudar de aba, ativo, mercado ou intervalo não pode
+            # trocar o motor que está trabalhando 24h no servidor.
+            pass
+
+        else:
+            raise HTTPException(400, "Ação de segundo plano inválida.")
+
         _background_save_state()
+
     return {"ok": True, **_background_state_snapshot()}
 
 
@@ -17661,19 +17729,57 @@ function selectedRobotEngine(){
   return 'OFF';
 }
 
-async function syncBackgroundBotState(){
-  const engine=selectedRobotEngine();
+function adoptBackgroundEngineState(d){
+  if(!d || !d.server_side || !d.enabled) return;
+  const e=String(d.engine||'').toUpperCase();
+  robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
+  forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false;
+  ictEnabled=false; sniperEnabled=false; alphaxEnabled=false;
+  if(e==='ALPHAX') alphaxEnabled=true;
+  else if(e==='SNIPER') sniperEnabled=true;
+  else if(e==='ICT') ictEnabled=true;
+  else if(e==='VELOCITY') velocityEnabled=true;
+  else if(e==='BIGRISE') bigriseEnabled=true;
+  else if(e==='FORCE') forceEnabled=true;
+  else if(e==='LARRY') larryEnabled=true;
+  else if(e==='SMART') aiEnabled=true;
+  else if(e==='GRAPH_AI') robotEnabled=true;
+  else if(e==='EA') eaEnabled=true;
+  else if(e==='RUBIK') rubikEnabled=true;
+  try{
+    localStorage.setItem('mega_robot_power',robotEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_ai_power',aiEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_ea_power',eaEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_rubik_power',rubikEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_force_power',forceEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_bigrise_power',bigriseEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_larry_power',larryEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_velocity_power',velocityEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_ict_power',ictEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_sniper_power',sniperEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_alphax_power',alphaxEnabled?'ONLINE':'OFFLINE');
+  }catch(_){}
+  if(typeof applyRobotPowerState==='function') applyRobotPowerState();
+}
+
+async function syncBackgroundBotState(opts={}){
+  const selected=selectedRobotEngine();
+  const explicitEngine=String(opts.engine||selected||'ALPHAX').toUpperCase();
+  const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
   const payload={
-    enabled:!!(appEnabled && engine!=='OFF' && telegramEnabled),
-    engine:(engine==='OFF'?'ALPHAX':engine),
+    enabled:!!(appEnabled && selected!=='OFF' && telegramEnabled),
+    engine:(explicitEngine==='OFF'?'ALPHAX':explicitEngine),
     market:String((market && market.value)||'OPEN'),
     interval:String((interval && interval.value)||'1min'),
     symbols:(btcOnlyEnabled ? ['BTC/USD'] : []),
-    chat_id:chat||null
+    chat_id:chat||null,
+    action:action,
+    telegram_enabled:(action==='TELEGRAM_TOGGLE' ? !!telegramEnabled : null)
   };
   try{
     const d=await post('/background-bot/state',payload);
+    if(action==='PASSIVE') adoptBackgroundEngineState(d);
     return d;
   }catch(err){
     console.warn('[MEGA IA] segundo plano',err);
@@ -20266,7 +20372,7 @@ if(telegramToggle){
     telegramEnabled=!telegramEnabled;
     try{ localStorage.setItem(TELEGRAM_ENABLED_KEY,telegramEnabled?'1':'0'); }catch(_){ }
     paintTelegramSettings();
-    syncBackgroundBotState();
+    syncBackgroundBotState({action:'TELEGRAM_TOGGLE'});
     if(telegramSendStatus) telegramSendStatus.textContent=telegramEnabled?'🟢 Envio automático de sinais para o grupo ativado neste aparelho.':'🔴 Envio de sinais para o Telegram desligado.';
   };
 }
@@ -21135,7 +21241,7 @@ async function setRobotPower(enabled){
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
-  await syncBackgroundBotState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'GRAPH_AI'});
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
@@ -21160,7 +21266,7 @@ async function setAiPower(enabled){
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
-  await syncBackgroundBotState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'SMART'});
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
@@ -21185,7 +21291,7 @@ async function setEaPower(enabled){
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
-  await syncBackgroundBotState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'EA'});
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
@@ -21210,7 +21316,7 @@ async function setRubikPower(enabled){
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
-  await syncBackgroundBotState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'RUBIK'});
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
@@ -21235,7 +21341,7 @@ async function setLarryPower(enabled){
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
-  await syncBackgroundBotState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'LARRY'});
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
@@ -21260,7 +21366,7 @@ async function setForcePower(enabled){
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
-  await syncBackgroundBotState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'FORCE'});
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
@@ -21285,7 +21391,7 @@ async function setBigrisePower(enabled){
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
-  await syncBackgroundBotState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'BIGRISE'});
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
@@ -21310,7 +21416,7 @@ async function setVelocityPower(enabled){
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
-  await syncBackgroundBotState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'VELOCITY'});
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
@@ -21335,7 +21441,7 @@ async function setIctPower(enabled){
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
-  await syncBackgroundBotState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'ICT'});
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
@@ -21360,7 +21466,7 @@ async function setSniperPower(enabled){
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
-  await syncBackgroundBotState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'SNIPER'});
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
@@ -21387,7 +21493,7 @@ async function setAlphaxPower(enabled){
   }catch(_){}
   resetEngineVisualState();
   applyRobotPowerState();
-  await syncBackgroundBotState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'ALPHAX'});
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
