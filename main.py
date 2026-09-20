@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.76"
+APP_VERSION = "3.77"
 PWA_VERSION = "v138"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -161,7 +161,7 @@ ALPHAX_MIN_FORM_PCT = max(45.0, min(80.0, float(os.getenv("ALPHAX_MIN_FORM_PCT",
 ALPHAX_ARMED_ATR = max(0.15, min(1.00, float(os.getenv("ALPHAX_ARMED_ATR", "0.50"))))
 ALPHAX_BREAK_ATR = max(0.10, min(1.20, float(os.getenv("ALPHAX_BREAK_ATR", "0.35"))))
 
-# 3.76 — Núcleo Rápido mais seletivo. O AlphaX acima permanece com a estratégia 3.73 intacta.
+# 3.77 — Núcleo Rápido mantém os filtros 3.76 e inverte somente o sinal final (CALL↔PUT). AlphaX intacto.
 # O novo motor só libera quando zona + microimpulso + Scalper + CRIPTOBOT concordam.
 RAPID_EARLY_SIGNAL_SECONDS = max(20, min(45, int(os.getenv("RAPID_EARLY_SIGNAL_SECONDS", "30"))))
 RAPID_EARLY_WINDOW_BEFORE = max(RAPID_EARLY_SIGNAL_SECONDS, min(50, int(os.getenv("RAPID_EARLY_WINDOW_BEFORE", "35"))))
@@ -8395,7 +8395,7 @@ def _rapid_ai_gen_quality(rows, atr_value: float):
 def _rapid_eas_snapshot(rows):
     """Motor separado e seletivo: CRIPTOBOT + Scalper FX + Russian Bear + Big Figures + AI Gen XII.
 
-    Regras 3.76:
+    Regras 3.77 (análise-base mantém as regras 3.76):
     - zona/Big Figure obrigatória na mesma direção;
     - microimpulso + Scalper FX obrigatórios;
     - persistência pelo Momentum e ao menos uma confirmação adicional do CRIPTOBOT;
@@ -11349,6 +11349,26 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                             f" • Russian Bear confirmou impulso persistente {direction_now} ({rb_score:.0f}%, {int(rb.get('ticks') or 0)} ticks).")[:520]
                 except Exception as exc:
                     base["russian_bear_micro_impulse"] = {"available":False,"tick_ready":False,"reason":str(exc)[:140]}
+
+            # MEGA IA 3.77 — inversão exclusiva do sinal FINAL do Núcleo Rápido.
+            # Todos os filtros (zona, Russian Bear, Scalper FX, CRIPTOBOT, AI Gen XII)
+            # confirmam a direção-base primeiro. Só depois disso a entrada é invertida.
+            # O AlphaX e os demais motores não passam por esta regra.
+            if engine == "RAPID" and direction_now in ("CALL", "PUT"):
+                rapid_original_direction = direction_now
+                direction_now = "PUT" if rapid_original_direction == "CALL" else "CALL"
+                base["rapid_signal_inverted"] = True
+                base["rapid_original_direction"] = rapid_original_direction
+                base["rapid_final_direction"] = direction_now
+                base["reason"] = (
+                    f"Leitura-base {rapid_original_direction} confirmada pelos filtros do Núcleo Rápido. "
+                    f"MODO INVERTIDO ativo: sinal final {direction_now}. • " + str(base.get("reason") or "")
+                )[:520]
+                technical = base.get("technical")
+                if isinstance(technical, dict):
+                    technical["rapid_signal_inverted"] = True
+                    technical["rapid_original_direction"] = rapid_original_direction
+                    technical["rapid_final_direction"] = direction_now
 
             signal_fingerprint = f"{engine}|{direction_now}|{reference_candle}"
             fingerprint_key = {
@@ -17499,7 +17519,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • AlphaX original + Núcleo Rápido filtro reforçado • cTrader Open API • Gráfico fluido</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • AlphaX original + Núcleo Rápido invertido • cTrader Open API • Gráfico fluido</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -17597,7 +17617,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Núcleo Rápido EAs">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">⚡ NÚCLEO RÁPIDO EAs</div>
-      <div class="robot-mode-desc" id="rapidModeDesc">CRIPTOBOT + Scalper FX + Russian Bear + Big Figures + AI Gen XII • filtro reforçado • motor independente do AlphaX • sinal ~30s antes • próxima vela.</div>
+      <div class="robot-mode-desc" id="rapidModeDesc">CRIPTOBOT + Scalper FX + Russian Bear + Big Figures + AI Gen XII • filtro reforçado • SINAL FINAL INVERTIDO (CALL↔PUT) • independente do AlphaX • sinal ~30s antes • próxima vela.</div>
     </div>
     <button id="rapidPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -21787,7 +21807,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: AlphaX + zonas fractal/institucional + microimpulso/LWMA/MACD • sinal oficial ~30s antes • entrada na próxima vela • sem Gale.'
     : 'OFFLINE: AlphaX RELAY pausado.';
   if(rapidModeDesc) rapidModeDesc.textContent=rapidEnabled
-    ? 'ONLINE: Núcleo Rápido com filtro reforçado • zona + impulso persistente + Scalper FX + CRIPTOBOT • independente do AlphaX • próxima vela • sem Gale.'
+    ? 'ONLINE: Núcleo Rápido com filtro reforçado • zona + impulso persistente + Scalper FX + CRIPTOBOT • SINAL FINAL INVERTIDO CALL↔PUT • independente do AlphaX • próxima vela • sem Gale.'
     : 'OFFLINE: Núcleo Rápido EAs pausado.';
   if(ictModeDesc) ictModeDesc.textContent=ictEnabled
     ? 'ONLINE: BOS/CHoCH + liquidez + FVG/OB + OTE + EMA/VWAP + volume + contexto H1/H4 • próxima vela • sem Gale.'
@@ -21809,7 +21829,7 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar AlphaX ativo • estratégia original do motor principal</div>';
     rad();
   }else if(engine==='RAPID'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='NÚCLEO RÁPIDO EAs ONLINE • ZONA + IMPULSO + TICKS • SINAL ~30S ANTES • PRÓXIMA VELA';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='NÚCLEO RÁPIDO EAs ONLINE • SINAL INVERTIDO CALL↔PUT • ZONA + IMPULSO + TICKS • ~30S ANTES • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Núcleo Rápido selecionado • filtro reforçado: zona + impulso persistente + Scalper FX + CRIPTOBOT.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Núcleo Rápido ativo • zonas + rompimento + microimpulso + qualidade</div>';
     rad();
