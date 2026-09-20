@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.67"
-PWA_VERSION = "v133"
+APP_VERSION = "3.69"
+PWA_VERSION = "v135"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -13186,42 +13186,66 @@ async def macd_pullback_indicator_api(
     live = _macd_pullback_validation_indicator(raw[-120:])
 
     pre_dir = "NEUTRO"
-    pre_reason = "Aguardando alinhamento do pullback + divergência + retomada do histograma."
+    pre_score = 0
+    pre_reason = "Aguardando formação do pullback + aceleração do histograma + aproximação da linha zero."
     if live.get("available"):
         macd_now = float(live.get("macd") or 0.0)
         macd_prev = float(live.get("macd_prev") or 0.0)
         hist_now = float(live.get("hist") or 0.0)
-        # Distância relativa da linha zero. Evita um limite fixo que seria ruim
-        # entre Forex e BTC/USD.
-        near_zero = abs(macd_now) <= max(abs(hist_now) * 2.75, abs(macd_prev) * 0.35, 1e-12)
-        call_core = bool(live.get("recent_bearish_pullback") and live.get("recent_bullish_divergence"))
-        put_core = bool(live.get("recent_bullish_pullback") and live.get("recent_bearish_divergence"))
-        call_momentum = bool(live.get("hist_bullish") and live.get("macd_rising"))
-        put_momentum = bool(live.get("hist_bearish") and live.get("macd_falling"))
+        hist_prev = float(live.get("hist_prev") or 0.0)
+
+        # O pré-alerta precisa acontecer ANTES do sinal final. Por isso a
+        # divergência confirmada continua obrigatória apenas no sinal oficial.
+        # Aqui observamos a formação: pullback recente + MACD/histograma virando
+        # na direção esperada + aproximação da linha zero.
+        zero_band = max(abs(hist_now) * 3.5, abs(hist_prev) * 3.0, abs(macd_prev) * 0.55, 1e-12)
+        near_zero = abs(macd_now) <= zero_band
+
+        call_pullback = bool(live.get("recent_bearish_pullback"))
+        put_pullback = bool(live.get("recent_bullish_pullback"))
+        call_turn = bool(live.get("macd_rising") and hist_now > hist_prev)
+        put_turn = bool(live.get("macd_falling") and hist_now < hist_prev)
+        call_position = bool(macd_now <= 0 or near_zero)
+        put_position = bool(macd_now >= 0 or near_zero)
+        call_div = bool(live.get("recent_bullish_divergence"))
+        put_div = bool(live.get("recent_bearish_divergence"))
+
+        call_score = int(call_pullback) + int(call_turn) + int(call_position) + int(call_div)
+        put_score = int(put_pullback) + int(put_turn) + int(put_position) + int(put_div)
 
         if str(live.get("direction") or "").upper() == "CALL":
             pre_dir = "CALL"
-            pre_reason = "PRÉ-CALL: condições do MACD já estão alinhadas na vela atual; aguarda fechamento para confirmação oficial."
+            pre_score = 4
+            pre_reason = "PRÉ-CALL: compra já alinhada na vela atual; o sinal final aguarda fechamento."
         elif str(live.get("direction") or "").upper() == "PUT":
             pre_dir = "PUT"
-            pre_reason = "PRÉ-PUT: condições do MACD já estão alinhadas na vela atual; aguarda fechamento para confirmação oficial."
-        elif call_core and call_momentum and macd_now <= 0 and near_zero:
+            pre_score = 4
+            pre_reason = "PRÉ-PUT: venda já alinhada na vela atual; o sinal final aguarda fechamento."
+        elif call_pullback and call_turn and call_position:
             pre_dir = "CALL"
-            pre_reason = "PRÉ-CALL: pullback e divergência de alta confirmados, histograma retomando força e MACD se aproximando da linha zero."
-        elif put_core and put_momentum and macd_now >= 0 and near_zero:
+            pre_score = call_score
+            extra = " + divergência de alta já confirmada" if call_div else ""
+            pre_reason = "PRÉ-CALL: pullback de alta em formação, histograma/MACD virando para cima e aproximando da linha zero" + extra + "."
+        elif put_pullback and put_turn and put_position:
             pre_dir = "PUT"
-            pre_reason = "PRÉ-PUT: pullback e divergência de baixa confirmados, histograma acelerando para baixo e MACD se aproximando da linha zero."
+            pre_score = put_score
+            extra = " + divergência de baixa já confirmada" if put_div else ""
+            pre_reason = "PRÉ-PUT: pullback de baixa em formação, histograma/MACD virando para baixo e aproximando da linha zero" + extra + "."
 
     current = raw[-1] if raw else {}
+    last_closed = closed[-1] if closed else {}
     pre_candle = current.get("datetime") or current.get("timestamp") or current.get("time") or current.get("from") or ""
+    confirmed_candle = last_closed.get("datetime") or last_closed.get("timestamp") or last_closed.get("time") or last_closed.get("from") or ""
     result.update({
         "symbol": symbol, "interval": interval, "market": requested_market,
         "feed_source": feed_source, "standalone": True,
         "updated_at": iso(now()),
         "prealert_active": pre_dir in ("CALL", "PUT"),
         "prealert_direction": pre_dir,
+        "prealert_score": int(pre_score),
         "prealert_reason": pre_reason,
         "prealert_candle": str(pre_candle),
+        "confirmed_candle": str(confirmed_candle),
         "preview_macd": live.get("macd"),
         "preview_signal": live.get("signal"),
         "preview_hist": live.get("hist"),
@@ -15994,6 +16018,7 @@ let velocityEnabled=false;
 let macdPullbackEnabled=false;
 let macdPullbackBusy=false;
 let lastMacdPreAlertKey='';
+let lastMacdConfirmedKey='';
 let lastMacdPullbackData=null;
 let lastVelocityData=null;
 let lastVelocityDataAt=0;
@@ -19662,12 +19687,40 @@ function renderMacdPullbackIndicator(data){
     macdPullbackPrePut.textContent=preDir==='PUT'?'PRÉ-PUT ATIVO':'AGUARDANDO';
     macdPullbackPrePut.className='big '+(preDir==='PUT'?'put':'neutral');
   }
-  if(macdPullbackPreReason) macdPullbackPreReason.textContent=String(mp.prealert_reason||'Monitorando pré-alerta do MACD.');
+  if(macdPullbackPreReason){
+    const score=Number(mp.prealert_score||0);
+    const vozTxt=voiceEnabled?'':' • VOZ OFFLINE';
+    macdPullbackPreReason.textContent=String(mp.prealert_reason||'Monitorando pré-alerta do MACD.')+(preActive?(' • formação '+score+'/4'+vozTxt):'');
+  }
   if(preActive){
     const preKey=[String(mp.symbol||((S&&S.value)||'')),String(mp.interval||((interval&&interval.value)||'')),preDir,String(mp.prealert_candle||'')].join('|');
+
+    // O pré-alerta do MACD também aparece no robô principal. Isso é apenas
+    // aviso antecipado; não publica ordem nem entra na contabilidade.
+    showRobot();
+    analysisText.style.display='block';
+    analysisText.textContent='🎯 MACD PULLBACK • '+(preDir==='CALL'?'PRÉ-CALL • POSSÍVEL COMPRA':'PRÉ-PUT • POSSÍVEL VENDA');
+
     if(preKey!==lastMacdPreAlertKey){
       lastMacdPreAlertKey=preKey;
-      if(voiceEnabled) speak('Pré alerta MACD. '+(preDir==='CALL'?'Possível compra':'Possível venda')+' no ativo '+String(mp.symbol||((S&&S.value)||'')).replace('/',' ').replace('-',' ')+'.');
+      if(voiceEnabled){
+        const ativoFalado=spokenAssetName(mp.symbol || (S&&S.value) || '');
+        speak('Pré alerta MACD Pullback. '+(preDir==='CALL'?'Possível compra':'Possível venda')+' no ativo '+ativoFalado+'.');
+      }
+    }
+  }
+
+  if(Boolean(mp.confirmed) && (dir==='CALL'||dir==='PUT')){
+    const confirmedKey=[String(mp.symbol||((S&&S.value)||'')),String(mp.interval||((interval&&interval.value)||'')),dir,String(mp.confirmed_candle||mp.prealert_candle||'')].join('|');
+    if(confirmedKey!==lastMacdConfirmedKey){
+      lastMacdConfirmedKey=confirmedKey;
+      showRobot();
+      analysisText.style.display='block';
+      analysisText.textContent='🎯 MACD PULLBACK • '+dir+' CONFIRMADO • PRÓXIMA VELA';
+      if(voiceEnabled){
+        const ativoFalado=spokenAssetName(mp.symbol || (S&&S.value) || '');
+        speak('MACD Pullback confirmou '+(dir==='CALL'?'compra':'venda')+' no ativo '+ativoFalado+'. Entrada na próxima vela.');
+      }
     }
   }
   if(macdPullbackLines) macdPullbackLines.textContent='MACD '+Number(mp.macd||0).toFixed(6)+' • SIG '+Number(mp.signal||0).toFixed(6);
