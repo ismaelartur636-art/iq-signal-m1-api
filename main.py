@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.70"
-PWA_VERSION = "v136"
+APP_VERSION = "3.71"
+PWA_VERSION = "v137"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -16050,6 +16050,11 @@ let macdPullbackBusy=false;
 let lastMacdPreAlertKey='';
 let lastMacdConfirmedKey='';
 let lastMacdPullbackData=null;
+// 3.71 — o segundo indicador pode projetar seu PRÉ-CALL/PRÉ-PUT no painel
+// principal sem virar ordem/resultado. O Velocity de cima não usa este estado.
+let macdMainPreview=null;
+let macdMainPreviewUntil=0;
+let macdMainPreviewShowing=false;
 let lastVelocityData=null;
 let lastVelocityDataAt=0;
 try{
@@ -19673,6 +19678,115 @@ function applyMacdPullbackPowerState(){
   }
 }
 
+function macdHasConfirmedMainSignal(){
+  const d=String((cur&&cur.direction)||'NEUTRO').toUpperCase();
+  if(d!=='CALL' && d!=='PUT') return false;
+  const exp=Date.parse(String((cur&&cur.expiry_time)||''));
+  return !Number.isFinite(exp) || exp>Date.now()+1000;
+}
+
+function clearMacdMainPreview(){
+  macdMainPreview=null;
+  macdMainPreviewUntil=0;
+  macdMainPreviewShowing=false;
+}
+
+function paintMacdPreAlertOnMain(mp, withArrow=true){
+  if(!macdPullbackEnabled || !mp) return false;
+  const preDir=String(mp.prealert_direction||'NEUTRO').toUpperCase();
+  if(!Boolean(mp.prealert_active) || (preDir!=='CALL' && preDir!=='PUT')) return false;
+  // Um sinal confirmado do motor principal sempre tem prioridade visual.
+  if(macdHasConfirmedMainSignal()) return false;
+
+  const isCall=preDir==='CALL';
+  const score=Math.max(0,Math.min(4,Number(mp.prealert_score||0)));
+  macdMainPreview={
+    direction:preDir,
+    score:score,
+    reason:String(mp.prealert_reason||''),
+    symbol:String(mp.symbol||((S&&S.value)||'')),
+    interval:String(mp.interval||((interval&&interval.value)||'')),
+    candle:String(mp.prealert_candle||''),
+  };
+  // O endpoint é lido a cada 12 s. Mantemos o visual vivo um pouco além disso
+  // para o polling normal de 5 s não apagar o pré-alerta da tela.
+  macdMainPreviewUntil=Date.now()+18000;
+  macdMainPreviewShowing=true;
+
+  direction.textContent=isCall?'PRÉ-CALL':'PRÉ-PUT';
+  direction.className='big '+(isCall?'call':'put');
+  confidence.textContent='MACD frouxo • formação '+score+'/4';
+  entry.textContent='PRÓXIMA VELA • PRÉ-ALERTA';
+  countdown.textContent=isCall?'Possível COMPRA • aguardando confirmação':'Possível VENDA • aguardando confirmação';
+  statusBox.textContent='🎯 MACD PULLBACK • '+(isCall?'PRÉ-CALL':'PRÉ-PUT')+' • '+(isCall?'POSSÍVEL COMPRA':'POSSÍVEL VENDA');
+  if(risk) risk.textContent='Risco: PRÉ-ALERTA • ainda não confirmado';
+
+  showRobot();
+  analysisText.style.display='block';
+  analysisText.textContent='🎯 MACD PULLBACK • '+(isCall?'PRÉ-CALL • POSSÍVEL COMPRA':'PRÉ-PUT • POSSÍVEL VENDA');
+
+  if(withArrow){
+    entryArrow.className='entry-arrow '+(isCall?'call':'put');
+    entryArrowIcon.textContent=isCall?'⬆':'⬇';
+    // O nome CALL/PUT fica explícito no robô, como solicitado.
+    entryArrowLabel.textContent=isCall?'CALL • COMPRAR':'PUT • VENDER';
+    clearTimeout(arrowTimer);
+    arrowTimer=setTimeout(()=>{
+      // Não apaga a seta se o pré-alerta continua válido; a próxima leitura
+      // renova o tempo. Sinal confirmado de outro motor pode sobrescrever.
+      if(macdMainPreviewShowing && Date.now()<macdMainPreviewUntil && !macdHasConfirmedMainSignal()){
+        restoreMacdPreviewOnMain();
+      }else if(!macdHasConfirmedMainSignal()){
+        entryArrow.className='entry-arrow';
+      }
+    },15000);
+  }
+  return true;
+}
+
+function restoreMacdPreviewOnMain(){
+  if(!macdPullbackEnabled || !macdMainPreview || Date.now()>=macdMainPreviewUntil){
+    if(Date.now()>=macdMainPreviewUntil) clearMacdMainPreview();
+    return false;
+  }
+  if(macdHasConfirmedMainSignal()) return false;
+  return paintMacdPreAlertOnMain({
+    prealert_active:true,
+    prealert_direction:macdMainPreview.direction,
+    prealert_score:macdMainPreview.score,
+    prealert_reason:macdMainPreview.reason,
+    symbol:macdMainPreview.symbol,
+    interval:macdMainPreview.interval,
+    prealert_candle:macdMainPreview.candle,
+  },false);
+}
+
+function paintMacdConfirmedOnMain(mp){
+  if(!macdPullbackEnabled || !mp || !Boolean(mp.confirmed)) return false;
+  const dir=String(mp.direction||'NEUTRO').toUpperCase();
+  if(dir!=='CALL' && dir!=='PUT') return false;
+  const isCall=dir==='CALL';
+  clearMacdMainPreview();
+  direction.textContent=dir;
+  direction.className='big '+(isCall?'call':'put');
+  confidence.textContent='MACD Pullback • CONFIRMADO';
+  entry.textContent='PRÓXIMA VELA';
+  countdown.textContent=isCall?'CALL confirmado • preparar compra':'PUT confirmado • preparar venda';
+  statusBox.textContent='🎯 MACD PULLBACK • '+dir+' CONFIRMADO • PRÓXIMA VELA';
+  if(risk) risk.textContent='Risco: sinal confirmado pelo segundo indicador';
+  showRobot();
+  analysisText.style.display='block';
+  analysisText.textContent='🎯 MACD PULLBACK • '+dir+' CONFIRMADO • PRÓXIMA VELA';
+  entryArrow.className='entry-arrow '+(isCall?'call':'put');
+  entryArrowIcon.textContent=isCall?'⬆':'⬇';
+  entryArrowLabel.textContent=isCall?'CALL • COMPRAR':'PUT • VENDER';
+  clearTimeout(arrowTimer);
+  arrowTimer=setTimeout(()=>{
+    if(!macdHasConfirmedMainSignal()) entryArrow.className='entry-arrow';
+  },12000);
+  return true;
+}
+
 function renderMacdPullbackIndicator(data){
   if(!macdPullbackState) return;
   applyMacdPullbackPowerState();
@@ -19725,11 +19839,10 @@ function renderMacdPullbackIndicator(data){
   if(preActive){
     const preKey=[String(mp.symbol||((S&&S.value)||'')),String(mp.interval||((interval&&interval.value)||'')),preDir,String(mp.prealert_candle||'')].join('|');
 
-    // O pré-alerta do MACD também aparece no robô principal. Isso é apenas
-    // aviso antecipado; não publica ordem nem entra na contabilidade.
-    showRobot();
-    analysisText.style.display='block';
-    analysisText.textContent='🎯 MACD PULLBACK • '+(preDir==='CALL'?'PRÉ-CALL • POSSÍVEL COMPRA':'PRÉ-PUT • POSSÍVEL VENDA');
+    // 3.71: além da aba do indicador, o pré-alerta do SEGUNDO indicador
+    // aparece no painel principal e na seta do robô. Continua sendo somente
+    // aviso visual/voz: não vira ordem, Telegram ou resultado automaticamente.
+    paintMacdPreAlertOnMain(mp,true);
 
     if(preKey!==lastMacdPreAlertKey){
       lastMacdPreAlertKey=preKey;
@@ -19738,15 +19851,15 @@ function renderMacdPullbackIndicator(data){
         speak('Pré alerta MACD Pullback. '+(preDir==='CALL'?'Possível compra':'Possível venda')+' no ativo '+ativoFalado+'.');
       }
     }
+  }else{
+    clearMacdMainPreview();
   }
 
   if(Boolean(mp.confirmed) && (dir==='CALL'||dir==='PUT')){
     const confirmedKey=[String(mp.symbol||((S&&S.value)||'')),String(mp.interval||((interval&&interval.value)||'')),dir,String(mp.confirmed_candle||mp.prealert_candle||'')].join('|');
     if(confirmedKey!==lastMacdConfirmedKey){
       lastMacdConfirmedKey=confirmedKey;
-      showRobot();
-      analysisText.style.display='block';
-      analysisText.textContent='🎯 MACD PULLBACK • '+dir+' CONFIRMADO • PRÓXIMA VELA';
+      paintMacdConfirmedOnMain(mp);
       if(voiceEnabled){
         const ativoFalado=spokenAssetName(mp.symbol || (S&&S.value) || '');
         speak('MACD Pullback confirmou '+(dir==='CALL'?'compra':'venda')+' no ativo '+ativoFalado+'. Entrada na próxima vela.');
@@ -19800,6 +19913,7 @@ if(macdPullbackPowerBtn){
     if(macdPullbackEnabled){
       await loadMacdPullbackIndicator(true);
     }else{
+      clearMacdMainPreview();
       renderMacdPullbackIndicator(null);
     }
     if(voiceEnabled) speak(macdPullbackEnabled?'Indicador MACD Pullback online.':'Indicador MACD Pullback offline.');
@@ -20000,6 +20114,9 @@ async function sig(announce=false){
       statusBox.textContent=cur.status;
       risk.textContent='Risco: --';
       if(dataFeedText) dataFeedText.textContent='MOTORES OFFLINE • nenhuma análise solicitada';
+      // O segundo indicador é independente dos motores principais.
+      // Se houver PRÉ-CALL/PRÉ-PUT MACD ativo, ele continua aparecendo.
+      restoreMacdPreviewOnMain();
       return;
     }
     cur=await get(
@@ -20068,6 +20185,13 @@ async function sig(announce=false){
     // CALL/PUT confirmado continua para Telegram, resultado e autoentrada.
     if(engine==='VELOCITY' && String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO') {
       renderVelocityPreviewOnMain(cur);
+    }
+
+    // O polling do motor principal roda a cada 5 s; o MACD a cada 12 s.
+    // Reaplica apenas o visual do pré-alerta MACD quando o motor principal
+    // está NEUTRO, para CALL/PUT e a seta não sumirem entre as leituras.
+    if(String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO'){
+      restoreMacdPreviewOnMain();
     }
 
     rememberPendingTrade(cur);
