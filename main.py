@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.92.0"
-PWA_VERSION = "v151"
+APP_VERSION = "3.93.0"
+PWA_VERSION = "v152"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -11243,7 +11243,7 @@ def _pure_ai_candle_pattern_filter(cs, expected_direction="NEUTRO"):
     }
 
 
-async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=None):
+async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=None, state_namespace="SMART"):
     """IA PURA com gatilhos independentes + micro-momento real da vela atual.
 
     Gatilhos independentes:
@@ -11262,7 +11262,7 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
         }
 
     live = rows[-1]
-    state_key = f"AI_SMART_V3|{market}|{symbol}|{interval}"
+    state_key = f"AI_SMART_V3|{state_namespace}|{market}|{symbol}|{interval}"
     st = ai_scan_state.setdefault(state_key, {})
     now_ts = time.time()
 
@@ -11779,6 +11779,50 @@ def entry_window(interval, entry_mode="BIRTH"):
     return entry - timedelta(seconds=35), entry, entry + step
 
 
+async def ai_volume_poc_consensus_signal(
+    symbol: str, interval: str, raw, closed, market: str = "OPEN",
+    request: Request | None = None, iq_state=None,
+):
+    """Volume POC cria o candidato; IA Leitura do Gráfico precisa concordar."""
+    raw_rows=list(raw or [])
+    closed_rows=list(closed or [])
+    seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
+    early_window=VOLUME_POC_EARLY_MIN_REMAINING <= seconds_to_entry <= VOLUME_POC_EARLY_WINDOW_BEFORE
+    try:
+        mtf=await _volume_poc_fetch_mtf(symbol,market=market,request=request,iq_state=iq_state,current_closed=closed_rows,current_interval=interval)
+        mtf_error=""
+    except Exception as exc:
+        mtf={}
+        mtf_error=str(exc)[:140]
+    if not early_window:
+        monitor=volume_poc_strategy(closed_rows,interval,market=market,early_signal=False,use_ai=False,mtf=mtf)
+        preview=str(monitor.get("direction") or "NEUTRO").upper()
+        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":f"IA + Volume POC monitorando • confirmação final nos últimos {VOLUME_POC_EARLY_SIGNAL_SECONDS}s antes da próxima vela (faltam {int(seconds_to_entry)}s).","early_signal_window":False,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"candidate_direction":preview if preview in ("CALL","PUT") else "NEUTRO","consensus":{"required":True,"agreed":False,"stage":"WAITING_VOLUME_WINDOW","volume_direction":preview if preview in ("CALL","PUT") else "NEUTRO","ai_direction":"AGUARDANDO","ai_called":False},"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"gale_signal":False}
+    volume_vote=volume_poc_strategy(raw_rows[-120:],interval,market=market,early_signal=True,use_ai=False,mtf=mtf)
+    volume_dir=str(volume_vote.get("direction") or "NEUTRO").upper()
+    volume_conf=float(volume_vote.get("confidence") or 0.0)
+    if not (volume_vote.get("confirmed") and volume_dir in ("CALL","PUT")):
+        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":"Volume POC ainda não encontrou CALL/PUT válido; a IA fica em espera até existir candidato.","early_signal_window":True,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"candidate_direction":"NEUTRO","volume_vote":volume_vote,"consensus":{"required":True,"agreed":False,"stage":"WAITING_VOLUME_TRIGGER","volume_direction":"NEUTRO","volume_confidence":round(volume_conf,1),"ai_direction":"AGUARDANDO","ai_called":False},"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"gale_signal":False}
+    try:
+        ai_vote=await openai_direct_signal(symbol,interval,closed_rows[-220:] if len(closed_rows)>220 else closed_rows,market,moment_hint=None,state_namespace="VOLUME_POC_CONSENSUS")
+    except Exception as exc:
+        ai_vote={"available":False,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","provider":"EXTERNAL_AI_UNAVAILABLE","reason":str(exc)[:180]}
+    ai_dir=str(ai_vote.get("direction") or "NEUTRO").upper()
+    ai_conf=float(ai_vote.get("confidence") or 0.0)
+    ai_ok=bool(ai_vote.get("available",True) and ai_vote.get("confirmed") and ai_dir in ("CALL","PUT"))
+    agreed=bool(ai_ok and ai_dir==volume_dir)
+    consensus={"required":True,"agreed":agreed,"stage":"CONFIRMED" if agreed else "DISAGREEMENT_OR_NEUTRAL","volume_direction":volume_dir,"volume_confidence":round(volume_conf,1),"ai_direction":ai_dir if ai_dir in ("CALL","PUT") else "NEUTRO","ai_confidence":round(ai_conf,1),"ai_called":True,"ai_provider":ai_vote.get("provider") or "EXTERNAL_AI"}
+    if not agreed:
+        if not ai_vote.get("available",True): why="IA Leitura do Gráfico indisponível; candidato do Volume POC não foi liberado."
+        elif ai_dir in ("CALL","PUT") and ai_dir!=volume_dir: why=f"Volume POC apontou {volume_dir}, mas a IA apontou {ai_dir}; entrada cancelada."
+        else: why=f"Volume POC apontou {volume_dir}, mas a IA ficou NEUTRO; entrada cancelada."
+        return {"available":bool(ai_vote.get("available",True)),"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":why,"candidate_direction":volume_dir,"preview_direction":volume_dir,"preview_confidence":round(volume_conf,1),"early_signal_window":True,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"volume_vote":volume_vote,"ai_vote":ai_vote,"consensus":consensus,"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"gale_signal":False}
+    final_conf=round(clamp(volume_conf*0.45+ai_conf*0.55,0.0,96.0),1)
+    risk=str(ai_vote.get("risk") or "MEDIUM").upper()
+    if risk not in ("LOW","MEDIUM","HIGH"): risk="MEDIUM"
+    return {"available":True,"direction":volume_dir,"confidence":final_conf,"confirmed":True,"risk":risk,"strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":f"CONCORDÂNCIA: Volume POC {volume_dir} ({volume_conf:.0f}%) + IA {ai_dir} ({ai_conf:.0f}%). Entrada liberada porque os dois concordaram.","candidate_direction":volume_dir,"early_signal_window":True,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"event_key":volume_vote.get("event_key") or f"AI_VOLUME_POC:{volume_dir}:{raw_rows[-1].get('datetime') if raw_rows else ''}","volume_vote":volume_vote,"ai_vote":ai_vote,"consensus":consensus,"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"direct_win_only":True,"gale_signal":False}
+
+
 def _adaptive_client_id(request: Request | None) -> str:
     if request is None:
         return "default"
@@ -12253,7 +12297,6 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         raise HTTPException(400, "Ativo ou intervalo inválido.")
 
     engine = (engine or "GRAPH_AI").upper()
-    if engine in ("VOLUME", "VOLUME_AI"): engine = "GRAPH_AI"  # Volume POC removido do app
     entry_mode = normalize_entry_mode(entry_mode)
     if engine == "RSI5":
         # RSI + ADX AFIADO usa somente candles fechados e entra na abertura seguinte.
@@ -12275,7 +12318,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         entry_mode = "MIDDLE"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "VOLUME_AI"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
@@ -12561,8 +12604,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             else:
                 raw = await candles(symbol, interval, 140, "OPEN", None, request=request)
         elif engine in ("VOLUME", "VOLUME_AI"):
-            volume_label = "VOLUME POC ESTRUTURAL" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
-            volume_mode = "VOLUME_POC_AI" if engine == "VOLUME_AI" else "VOLUME_POC"
+            volume_label = "IA + VOLUME POC" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
+            volume_mode = "AI_VOLUME_POC_CONSENSUS" if engine == "VOLUME_AI" else "VOLUME_POC"
             if market == "IQ_OTC":
                 if not iq_state:
                     out = neutral_signal(
@@ -12662,7 +12705,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "RSIMON":
             status = "RSI MONITOR • FONTE EM ESPERA" if market == "OPEN" else "RSI MONITOR • IQ OPTION EM ESPERA"
         elif engine in ("VOLUME", "VOLUME_AI"):
-            _vl = "VOLUME POC ESTRUTURAL" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
+            _vl = "IA + VOLUME POC" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
             status = f"{_vl} • FONTE EM ESPERA" if market == "OPEN" else f"{_vl} • IQ OPTION EM ESPERA"
         elif engine == "SUNTZU":
             status = "SUNTZU FLEX • FONTE EM ESPERA" if market == "OPEN" else "SUNTZU FLEX • IQ OPTION EM ESPERA"
@@ -12699,7 +12742,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "RSIMON":
             status = "RSI MONITOR • FONTE RECONECTANDO" if market == "OPEN" else "RSI MONITOR • IQ OPTION RECONECTANDO"
         elif engine in ("VOLUME", "VOLUME_AI"):
-            _vl = "VOLUME POC ESTRUTURAL" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
+            _vl = "IA + VOLUME POC" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
             status = f"{_vl} • FONTE RECONECTANDO" if market == "OPEN" else f"{_vl} • IQ OPTION RECONECTANDO"
         elif engine == "SUNTZU":
             status = "SUNTZU FLEX • FONTE RECONECTANDO" if market == "OPEN" else "SUNTZU FLEX • IQ OPTION RECONECTANDO"
@@ -12747,13 +12790,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     # 33.78.0: dois motores independentes e selecionáveis no painel.
     # IA GRÁFICA substitui o antigo Robô Principal/RSI e usa somente leitura estrutural de preço.
-    # INTELIGÊNCIA ARTIFICIAL é IA PURA: recebe somente candles OHLCV fechados
+    # IA LEITURA DO GRÁFICO recebe candles OHLCV fechados e usa IA para a próxima vela
     # e decide CALL, PUT ou NEUTRO sem usar RSI, médias, MACD, Bollinger, ATR
     # ou qualquer outro indicador/score interno na decisão.
     if ai_only and SELECTABLE_ENGINES_ENABLED:
         tf_label = {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval)
         if engine == "SMART":
-            engine_title = "INTELIGÊNCIA ARTIFICIAL"
+            engine_title = "IA LEITURA DO GRÁFICO"
             engine_mode = "PURE_AI"
         elif engine == "EA":
             engine_title = "EA RSI + VALUE CHART + XGBOOST"
@@ -12789,8 +12832,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "RSI MONITOR 20S"
             engine_mode = "RSI_MONITOR_20S"
         elif engine in ("VOLUME", "VOLUME_AI"):
-            engine_title = "VOLUME POC ESTRUTURAL" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
-            engine_mode = "VOLUME_POC_AI" if engine == "VOLUME_AI" else "VOLUME_POC"
+            engine_title = "IA + VOLUME POC" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
+            engine_mode = "AI_VOLUME_POC_CONSENSUS" if engine == "VOLUME_AI" else "VOLUME_POC"
         elif engine == "SUNTZU":
             engine_title = "SUNTZU FLEX 2/3"
             engine_mode = "SUNTZU_FLEX"
@@ -12815,7 +12858,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 source_state="READY",
             )
             out.update({
-                "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
+                "strategy": "IA LEITURA DO GRÁFICO" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
                 "mode": engine_mode,
                 "selected_engine": engine,
                 "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
@@ -12829,7 +12872,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
                     "RAPID": "LOCAL_RAPID_EAS",
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
-                    "VOLUME_AI": "LOCAL_VOLUME_POC_AI_CONTEXT",
+                    "VOLUME_AI": "AI_VOLUME_POC_CONSENSUS",
                     "SUNTZU": "LOCAL_SUNTZU_FLEX",
                     "RSI5": "LOCAL_RSI_ADX_4TF",
                     "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
@@ -12944,32 +12987,29 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     analysis["early_signal_window"] = False
                     analysis["seconds_to_entry_snapshot"] = round(rsi_seconds_to_entry,1)
             elif engine in ("VOLUME", "VOLUME_AI"):
-                volume_seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
-                volume_early_window=(VOLUME_POC_EARLY_MIN_REMAINING <= volume_seconds_to_entry <= VOLUME_POC_EARLY_WINDOW_BEFORE)
-                volume_use_ai=(engine == "VOLUME_AI")
-                volume_label=("Volume POC Estrutural" if volume_use_ai else "Volume POC Estrutural")
-                volume_mtf = await _volume_poc_fetch_mtf(
-                    symbol, market=market, request=request, iq_state=iq_state,
-                    current_closed=engine_closed, current_interval=interval
-                )
-                if volume_early_window:
-                    analysis = volume_poc_strategy(raw[-120:], interval, market=market, early_signal=True, use_ai=volume_use_ai, mtf=volume_mtf)
-                    analysis["early_signal_window"] = True
-                    analysis["seconds_to_entry_snapshot"] = round(volume_seconds_to_entry,1)
-                else:
-                    analysis = volume_poc_strategy(engine_closed, interval, market=market, early_signal=False, use_ai=volume_use_ai, mtf=volume_mtf)
-                    if analysis.get("confirmed"):
-                        analysis["preview_direction"] = analysis.get("direction")
-                        analysis["preview_confidence"] = analysis.get("confidence")
-                    analysis["confirmed"] = False
-                    analysis["direction"] = "NEUTRO"
-                    analysis["confidence"] = 0.0
-                    analysis["reason"] = (
-                        f"{volume_label} monitorando • sinal oficial será avaliado cerca de {VOLUME_POC_EARLY_SIGNAL_SECONDS}s antes da próxima vela "
-                        f"(agora faltam {int(volume_seconds_to_entry)}s)."
+                if engine == "VOLUME_AI":
+                    analysis = await ai_volume_poc_consensus_signal(
+                        symbol, interval, raw, engine_closed, market=market, request=request, iq_state=iq_state
                     )
-                    analysis["early_signal_window"] = False
-                    analysis["seconds_to_entry_snapshot"] = round(volume_seconds_to_entry,1)
+                else:
+                    volume_seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                    volume_early_window=(VOLUME_POC_EARLY_MIN_REMAINING <= volume_seconds_to_entry <= VOLUME_POC_EARLY_WINDOW_BEFORE)
+                    volume_mtf = await _volume_poc_fetch_mtf(symbol,market=market,request=request,iq_state=iq_state,current_closed=engine_closed,current_interval=interval)
+                    if volume_early_window:
+                        analysis=volume_poc_strategy(raw[-120:],interval,market=market,early_signal=True,use_ai=False,mtf=volume_mtf)
+                        analysis["early_signal_window"]=True
+                        analysis["seconds_to_entry_snapshot"]=round(volume_seconds_to_entry,1)
+                    else:
+                        analysis=volume_poc_strategy(engine_closed,interval,market=market,early_signal=False,use_ai=False,mtf=volume_mtf)
+                        if analysis.get("confirmed"):
+                            analysis["preview_direction"]=analysis.get("direction")
+                            analysis["preview_confidence"]=analysis.get("confidence")
+                        analysis["confirmed"]=False
+                        analysis["direction"]="NEUTRO"
+                        analysis["confidence"]=0.0
+                        analysis["reason"]=(f"Volume POC Estrutural monitorando • sinal oficial será avaliado cerca de {VOLUME_POC_EARLY_SIGNAL_SECONDS}s antes da próxima vela (agora faltam {int(volume_seconds_to_entry)}s).")
+                        analysis["early_signal_window"]=False
+                        analysis["seconds_to_entry_snapshot"]=round(volume_seconds_to_entry,1)
             elif engine == "SUNTZU":
                 suntzu_seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
                 suntzu_early_window=(SUNTZU_EARLY_MIN_REMAINING <= suntzu_seconds_to_entry <= SUNTZU_EARLY_WINDOW_BEFORE)
@@ -13073,7 +13113,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 source_state="WAITING",
             )
             out.update({
-                "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
+                "strategy": "IA LEITURA DO GRÁFICO" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
                 "mode": engine_mode,
                 "selected_engine": engine,
             })
@@ -13100,14 +13140,14 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
                     "RAPID": "LOCAL_RAPID_EAS",
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
-                    "VOLUME_AI": "LOCAL_VOLUME_POC_AI_CONTEXT",
+                    "VOLUME_AI": "AI_VOLUME_POC_CONSENSUS",
                     "SUNTZU": "LOCAL_SUNTZU_FLEX",
                 "RSI5": "LOCAL_RSI_ADX_4TF",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
             "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "HIGH").upper(),
             "strategy": (
-                "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
+                "IA LEITURA DO GRÁFICO" if engine == "SMART"
                 else (analysis.get("strategy") or (
                     "EA RSI + VALUE CHART + XGBOOST" if engine == "EA"
                     else "ROBÔ RUBIK ADAPTADO" if engine == "RUBIK"
@@ -13410,7 +13450,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
                 if engine in ("VOLUME", "VOLUME_AI"):
                     _vp_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
-                    _vp_label = "VOLUME POC ESTRUTURAL" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
+                    _vp_label = "IA + VOLUME POC" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
                     if not (VOLUME_POC_EARLY_MIN_REMAINING <= _vp_remaining <= VOLUME_POC_EARLY_WINDOW_BEFORE):
                         base["status"] = f"ONLINE • {_vp_label} • AGUARDANDO JANELA DE 20S"
                         base["reason"] = f"{_vp_label} aguardando a janela antecipada; faltam {int(_vp_remaining)}s para a próxima vela."
@@ -13495,7 +13535,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "RAPID": "SINAL NÚCLEO RÁPIDO EAs LIBERADO",
                         "SAMURAI": "SINAL ALGO SAMURAI • TREINAMENTO LIBERADO",
                         "VOLUME": "SINAL VOLUME POC ESTRUTURAL LIBERADO",
-                        "VOLUME_AI": "SINAL VOLUME POC ESTRUTURAL LIBERADO",
+                        "VOLUME_AI": "SINAL IA + VOLUME POC • CONCORDÂNCIA LIBERADA",
                         "SUNTZU": "SINAL SUNTZU FLEX 2/3 LIBERADO",
                         "RSIMON": "SINAL RSI MONITOR 20S LIBERADO",
                         "RSI5": "SINAL RSI + ADX AFIADO LIBERADO",
@@ -13672,7 +13712,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
-                    "VOLUME_AI": "LOCAL_VOLUME_POC_AI_CONTEXT",
+                    "VOLUME_AI": "AI_VOLUME_POC_CONSENSUS",
                     "SUNTZU": "LOCAL_SUNTZU_FLEX",
                 "RSI5": "LOCAL_RSI_ADX_4TF",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
@@ -16411,7 +16451,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     "GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE",
-    "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN",
+    "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "VOLUME_AI",
 }
 
 
@@ -16779,10 +16819,6 @@ async def _background_bot_loop() -> None:
                 continue
 
             engine = str(background_bot_state.get("engine") or "ALPHAX").upper()
-            if engine == "VOLUME_AI":
-                engine = "VOLUME"
-                background_bot_state["engine"] = "VOLUME"
-                _background_save_state()
             market = str(background_bot_state.get("market") or "OPEN").upper()
             interval = str(background_bot_state.get("interval") or "1min")
             if engine not in _BACKGROUND_ENGINES or market not in VALID_MARKETS or interval not in INTERVALS:
@@ -17134,7 +17170,7 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
             "reason": "Boa quando a estrutura e o price action estão organizados; perde qualidade em ruído/lateralização."
         },
         {
-            "key":"SMART","name":"INTELIGÊNCIA ARTIFICIAL","score":smart,
+            "key":"SMART","name":"IA LEITURA DO GRÁFICO","score":smart,
             "supported":market=="OPEN","operational":market=="OPEN" and ai_ready,
             "reason": "Mais flexível em cenários mistos, desde que o preço não esteja excessivamente lateral e a IA externa esteja disponível."
         },
@@ -17703,7 +17739,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "VOLUME_AI"):
         raise HTTPException(400, "Motor inválido.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
@@ -17877,7 +17913,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                 data["non_repaint_after_release"] = True
                 data["next_candle"] = True
             elif engine in ("VOLUME", "VOLUME_AI"):
-                volume_label = "Volume POC Estrutural" if engine == "VOLUME_AI" else "Volume POC Estrutural"
+                volume_label = "IA + Volume POC" if engine == "VOLUME_AI" else "Volume POC Estrutural"
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
                     feed_src = str(feed_info.get("source") or "MULTIFEED")
@@ -18379,7 +18415,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "VOLUME_AI"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -18466,7 +18502,7 @@ async def pre_signals(
         }
 
     if engine in ("VOLUME", "VOLUME_AI"):
-        volume_label = "VOLUME POC ESTRUTURAL" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
+        volume_label = "IA + VOLUME POC" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
         extra = " + IA contextual local como bônus/proteção leve" if engine == "VOLUME_AI" else " sem IA contextual"
         return {
             "ok": True,
@@ -18518,7 +18554,7 @@ async def pre_signals(
             "RAPID": "Núcleo Rápido EAs",
             "SAMURAI": "Algo Samurai • Treinamento",
             "VOLUME": "Volume POC Estrutural",
-            "VOLUME_AI": "Volume POC Estrutural",
+            "VOLUME_AI": "IA + Volume POC",
             "SUNTZU": "SUNTZU FLEX 2/3",
             "RSIMON": "RSI Monitor 20S",
             "RSI5": "RSI + ADX AFIADO",
@@ -19041,7 +19077,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "VOLUME_AI"):
         raise HTTPException(400, "Motor inválido.")
 
     requested_market = market
@@ -19162,7 +19198,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             else:
                 raw = await candles(sym, interval, 140, "OPEN", None, request=request)
         elif engine in ("VOLUME", "VOLUME_AI"):
-            volume_label = "Volume POC Estrutural" if engine == "VOLUME_AI" else "Volume POC Estrutural"
+            volume_label = "IA + Volume POC" if engine == "VOLUME_AI" else "Volume POC Estrutural"
             if market == "IQ_OTC":
                 if not iq_state:
                     raise RuntimeError(f"Conecte a IQ Option para o {volume_label} analisar OTC.")
@@ -19312,19 +19348,17 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 )
             elif engine in ("VOLUME", "VOLUME_AI"):
                 volume_use_ai = engine == "VOLUME_AI"
-                volume_mtf = await _volume_poc_fetch_mtf(
-                    sym, market=market, request=request, iq_state=iq_state,
-                    current_closed=closed, current_interval=interval
-                )
-                tech = volume_poc_strategy(closed, interval, market=market, use_ai=volume_use_ai, mtf=volume_mtf)
-                engine_label = "VOLUME POC ESTRUTURAL" if volume_use_ai else "VOLUME POC ESTRUTURAL"
-                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                volume_mtf = await _volume_poc_fetch_mtf(sym,market=market,request=request,iq_state=iq_state,current_closed=closed,current_interval=interval)
+                tech = volume_poc_strategy(closed, interval, market=market, use_ai=False, mtf=volume_mtf)
+                engine_label = "IA + VOLUME POC" if volume_use_ai else "VOLUME POC ESTRUTURAL"
+                volume_candidate = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why = str(tech.get("reason") or f"{engine_label} monitorando").replace("\n", " ")[:88]
-                status_text = (
-                    f"{engine_label} • OPORTUNIDADE ENCONTRADA"
-                    if direction != "NEUTRO"
-                    else f"{engine_label} • MONITORANDO • {why}"
-                )
+                if volume_use_ai:
+                    direction="NEUTRO"
+                    status_text=(f"IA + VOLUME POC • VOLUME {volume_candidate} DETECTADO • IA CONFIRMA NO MOTOR" if volume_candidate in ("CALL","PUT") else f"IA + VOLUME POC • VOLUME MONITORANDO • IA EM ESPERA • {why}")
+                else:
+                    direction=volume_candidate
+                    status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction!="NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "SUNTZU":
                 tech = suntzu_flex_strategy(closed, interval, market=market, early_signal=False)
                 engine_label = "SUNTZU FLEX 2/3"
@@ -19490,7 +19524,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         elif engine == "RSIMON":
             source_status = "RSI MONITOR • FONTE EM ESPERA" if market == "OPEN" else "RSI MONITOR • IQ OPTION OTC EM ESPERA"
         elif engine in ("VOLUME", "VOLUME_AI"):
-            _vl = "VOLUME POC ESTRUTURAL" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
+            _vl = "IA + VOLUME POC" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
             source_status = f"{_vl} • FONTE EM ESPERA" if market == "OPEN" else f"{_vl} • IQ OPTION OTC EM ESPERA"
         elif engine == "SUNTZU":
             source_status = "SUNTZU FLEX • FONTE EM ESPERA" if market == "OPEN" else "SUNTZU FLEX • IQ OPTION OTC EM ESPERA"
@@ -20434,7 +20468,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • IA EXTERNA + SUPER Z PMAX + RSI/ADX + AlphaX • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • IA EXTERNA + IA LEITURA + IA/VOLUME + AlphaX • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -20492,12 +20526,21 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   <div class="robot-mode-card" id="aiModeCard">
-    <img src="__MEGA_IMAGE__" alt="Inteligência Artificial">
+    <img src="__MEGA_IMAGE__" alt="IA Leitura do Gráfico">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">🧠 INTELIGÊNCIA ARTIFICIAL</div>
-      <div class="robot-mode-desc" id="aiModeDesc">IA pura • lê somente os candles do gráfico e decide CALL, PUT ou NEUTRO por preço.</div>
+      <div class="robot-mode-title">🧠 IA LEITURA DO GRÁFICO</div>
+      <div class="robot-mode-desc" id="aiModeDesc">Leitura do gráfico por price action + IA • candles fechados • CALL, PUT ou NEUTRO • próxima vela.</div>
     </div>
     <button id="aiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
+  <div class="robot-mode-card" id="volumePocAiModeCard">
+    <img src="__MEGA_IMAGE__" alt="IA + Volume POC">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">🧠 IA + VOLUME POC</div>
+      <div class="robot-mode-desc" id="volumePocAiModeDesc">Volume POC detecta primeiro • IA Leitura do Gráfico confirma em segundos • CALL/PUT somente quando os dois concordam • próxima vela.</div>
+    </div>
+    <button id="volumePocAiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
   <div class="robot-mode-card" id="larryModeCard">
@@ -21264,8 +21307,8 @@ const samuraiPowerBtn=null;
 const samuraiModeDesc=null;
 const volumePocPowerBtn=document.getElementById('volumePocPowerBtn');
 const volumePocModeDesc=document.getElementById('volumePocModeDesc');
-const volumePocAiPowerBtn=null;
-const volumePocAiModeDesc=null;
+const volumePocAiPowerBtn=document.getElementById('volumePocAiPowerBtn');
+const volumePocAiModeDesc=document.getElementById('volumePocAiModeDesc');
 const rsi5PowerBtn=document.getElementById('rsi5PowerBtn');
 const rsi5ModeDesc=document.getElementById('rsi5ModeDesc');
 const velocityPowerBtn=document.getElementById('velocityPowerBtn');
@@ -21338,9 +21381,8 @@ try{
   samuraiEnabled=false;
   localStorage.removeItem('mega_samurai_power');
   volumePocEnabled=false;
-  volumePocAiEnabled=false;
+  volumePocAiEnabled=localStorage.getItem('mega_volume_poc_ai_power')==='ONLINE';
   localStorage.removeItem('mega_volume_poc_power');
-  localStorage.removeItem('mega_volume_poc_ai_power');
   rsiMonEnabled=false;
   localStorage.removeItem('mega_rsi_monitor_power');
   rsi5Enabled=localStorage.getItem('mega_rsi_pure_power')==='ONLINE'; localStorage.removeItem('mega_rsi5_power');
@@ -21369,6 +21411,7 @@ try{
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
+  if(volumePocAiEnabled) return 'VOLUME_AI';
   if(presidenEnabled) return 'PRESIDEN';
   if(sniperEnabled) return 'SNIPER';
   if(rangeEnabled) return 'RANGE';
@@ -21398,7 +21441,8 @@ function adoptBackgroundEngineState(d){
   robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
   forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false;
   rsi5Enabled=false; sniperEnabled=false; alphaxEnabled=false; presidenEnabled=false; rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false; rangeEnabled=false;
-  if(e==='PRESIDEN') presidenEnabled=true;
+  if(e==='VOLUME_AI') volumePocAiEnabled=true;
+  else if(e==='PRESIDEN') presidenEnabled=true;
   else if(e==='SNIPER') sniperEnabled=true;
   else if(e==='RANGE') rangeEnabled=true;
   else if(e==='ALPHAX') alphaxEnabled=true;
@@ -22447,7 +22491,7 @@ let momentStudyUpdatedAt=0;
 function momentStudyEngineName(key){
   const names={
     GRAPH_AI:'🧠 IA GRÁFICA',
-    SMART:'🤖 INTELIGÊNCIA ARTIFICIAL',
+    SMART:'🧠 IA LEITURA DO GRÁFICO',
     LARRY:'⚡ LARRY BREAKOUT',
     VELOCITY:'⚡ VELOCITY FLOW',
     ALPHAX:'🧬 ALPHAX RELAY',
@@ -22774,7 +22818,7 @@ function rememberPendingTrade(sig){
   if(!sig.expiry_time || !sig.entry_time) return;
 
   const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
-  const canonicalResultEngine=(engineKey.includes('VOLUME_POC_AI')||engineKey==='VOLUME_AI')?'VOLUME':(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('BIGRISE')?'BIGRISE':(engineKey.includes('LARRY')?'LARRY':(engineKey.includes('RANGE')?'RANGE':(engineKey.includes('VELOCITY')?'VELOCITY':(engineKey.includes('SNIPER')?'SNIPER':(engineKey.includes('ALPHAX')?'ALPHAX':(engineKey.includes('RAPID')?'RAPID':(engineKey.includes('SAMURAI')?'SAMURAI':(engineKey.includes('VOLUME')?'VOLUME':(engineKey.includes('RSI5')?'RSI5':String(sig.selected_engine||sig.mode||'')))))))))))));
+  const canonicalResultEngine=(engineKey.includes('AI_VOLUME_POC_CONSENSUS')||engineKey==='VOLUME_AI')?'VOLUME_AI':(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('BIGRISE')?'BIGRISE':(engineKey.includes('LARRY')?'LARRY':(engineKey.includes('RANGE')?'RANGE':(engineKey.includes('VELOCITY')?'VELOCITY':(engineKey.includes('SNIPER')?'SNIPER':(engineKey.includes('ALPHAX')?'ALPHAX':(engineKey.includes('RAPID')?'RAPID':(engineKey.includes('SAMURAI')?'SAMURAI':(engineKey.includes('VOLUME')?'VOLUME':(engineKey.includes('RSI5')?'RSI5':String(sig.selected_engine||sig.mode||'')))))))))))));
   const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='RANGE'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='SUNTZU'||engineKey==='RSI5'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('RANGE')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('SUNTZU')||engineKey.includes('RSI5'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
@@ -25146,8 +25190,8 @@ function applyRobotPowerState(){
     ? 'ONLINE: IA Gráfica lendo padrões, H1, Dow H4 e LTA/LTB sem RSI.'
     : 'OFFLINE: IA Gráfica pausada.';
   if(aiModeDesc) aiModeDesc.textContent=aiEnabled
-    ? 'ONLINE: IA pura analisando somente candles e contexto de preço.'
-    : 'OFFLINE: análise inteligente pausada.';
+    ? 'ONLINE: IA Leitura do Gráfico analisando candles fechados e price action para a próxima vela.'
+    : 'OFFLINE: IA Leitura do Gráfico pausada.';
   if(eaModeDesc) eaModeDesc.textContent=eaEnabled
     ? 'ONLINE: RSI 14 + Value Chart + XGBoost • sinal somente com tripla confirmação • OPEN/OTC.'
     : 'OFFLINE: EA RSI + Value Chart + XGBoost pausada.';
@@ -25182,8 +25226,8 @@ function applyRobotPowerState(){
     ? 'ONLINE: VOLUME/POC + SUPORTE/RESISTÊNCIA + LTA/LTB • sem IA/EA • sinal ~20s antes • próxima vela.'
     : 'OFFLINE: Volume POC Estrutural pausado.';
   if(volumePocAiModeDesc) volumePocAiModeDesc.textContent=volumePocAiEnabled
-    ? 'ONLINE: POC + IA contextual local • IA dá bônus/proteção leve e não vira confirmação obrigatória • próxima vela.'
-    : 'OFFLINE: Volume POC Estrutural pausado.';
+    ? 'ONLINE: Volume POC detecta primeiro • IA Leitura do Gráfico vota depois • CALL/PUT somente com concordância dos dois • próxima vela.'
+    : 'OFFLINE: IA + Volume POC pausado.';
   if(rsi5ModeDesc) rsi5ModeDesc.textContent=rsi5Enabled
     ? 'ONLINE: RSI9 4TF + ADX/DMI14 • ADX ≥25 • pullback a favor da tendência • próxima vela.'
     : 'OFFLINE: RSI + ADX Afiado pausado.';
@@ -25198,7 +25242,12 @@ function applyRobotPowerState(){
     : 'OFFLINE: BTC FORCE MULTIATIVOS pausado.';
 
   const engine=selectedRobotEngine();
-  if(engine==='SUNTZU'){
+  if(engine==='VOLUME_AI'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA + VOLUME POC ONLINE • VOLUME DETECTA → IA CONFIRMA • SOMENTE COM CONCORDÂNCIA • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA + Volume POC selecionado • o Volume POC cria o candidato e a IA só libera quando concorda na mesma direção.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar IA + Volume POC ativo • procurando candidato de volume para chamar a IA</div>';
+    rad();
+  }else if(engine==='SUNTZU'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='SUNTZU FLEX 2/3 ONLINE • 2 DE 3 • SINAL ~20S ANTES • PRÓXIMA VELA • SEM GALE';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚔️ SUNTZU FLEX • Filtro SUNTZU + zona DonForex + Value Chart ±5 • basta 2/3.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar SUNTZU ativo • procurando 2 de 3 confirmações</div>';
@@ -25269,7 +25318,7 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar EA Tripla ativo • RSI + Value Chart + XGBoost • OPEN/OTC</div>';
     rad();
   }else if(engine==='SMART'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='INTELIGÊNCIA ARTIFICIAL ONLINE • IA PURA ANALISANDO CANDLES';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA LEITURA DO GRÁFICO ONLINE • PRICE ACTION + IA • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 Inteligência Artificial selecionada.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar IA pura ativo • analisando candles</div>';
     rad();
@@ -25754,10 +25803,34 @@ async function setVolumePocPower(enabled){
 }
 
 async function setVolumePocAiPower(enabled){
-  // Compatibilidade: o antigo POC + IA foi removido e redireciona ao POC Estrutural.
-  volumePocAiEnabled=false;
-  try{ localStorage.removeItem('mega_volume_poc_ai_power'); }catch(_){}
-  return setVolumePocPower(enabled);
+  volumePocAiEnabled=!!enabled;
+  if(volumePocAiEnabled){
+    robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
+    forceEnabled=false; bigriseEnabled=false; larryEnabled=false; rangeEnabled=false; velocityEnabled=false;
+    rsi5Enabled=false; sniperEnabled=false; alphaxEnabled=false; presidenEnabled=false;
+    rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; rsiMonEnabled=false;
+  }
+  try{
+    localStorage.setItem('mega_volume_poc_ai_power',volumePocAiEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_robot_power',robotEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_ai_power',aiEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_larry_power',larryEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_alphax_power',alphaxEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_force_power',forceEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_bigrise_power',bigriseEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_range_power',rangeEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_velocity_power',velocityEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_rsi_pure_power',rsi5Enabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_sniper_power',sniperEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_presiden_power',presidenEnabled?'ONLINE':'OFFLINE');
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'VOLUME_AI'});
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(volumePocAiEnabled ? 'IA mais Volume P O C online. Concordância obrigatória.' : 'IA mais Volume P O C offline.');
 }
 
 async function setRsiMonPower(enabled){
@@ -26314,7 +26387,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='ALPHAX'?'ALPHAX RELAY':ek==='SNIPER'?'SUPER Z PMAX':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'INTELIGÊNCIA ARTIFICIAL':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='ALPHAX'?'ALPHAX RELAY':ek==='SNIPER'?'SUPER Z PMAX':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
