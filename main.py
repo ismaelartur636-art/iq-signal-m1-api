@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.84.0"
-PWA_VERSION = "v142"
+APP_VERSION = "3.85.1"
+PWA_VERSION = "v144"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -137,20 +137,22 @@ VELOCITY_RSI_BUY_MAX = max(VELOCITY_RSI_BUY_MIN + 1.0, min(85.0, float(os.getenv
 VELOCITY_RSI_SELL_MIN = max(15.0, min(55.0, float(os.getenv("VELOCITY_RSI_SELL_MIN", "28"))))
 VELOCITY_RSI_SELL_MAX = max(VELOCITY_RSI_SELL_MIN + 1.0, min(80.0, float(os.getenv("VELOCITY_RSI_SELL_MAX", "62"))))
 
-# RSI PURO 4TF — adaptação não-repaint para o app.
-# O arquivo original combina RSI 2/3/4/5/6 com bandas dinâmicas. Aqui usamos
-# somente candles fechados, 4 de 5 extremos para o gatilho e UMA confirmação
-# entre Volume POC, força da vela ou IA contextual. Assim a confluência filtra
-# sem exigir que tudo concorde ao mesmo tempo.
-RSI5_PERIODS = (2, 3, 4, 5, 6)
-RSI5_DEVIATIONS = (0.10, 0.30, 0.60, 0.80, 1.00)
-RSI5_HALF_LENGTH = max(2, min(12, int(os.getenv("RSI5_HALF_LENGTH", "5"))))
-RSI5_DEV_PERIOD = max(30, min(180, int(os.getenv("RSI5_DEV_PERIOD", "100"))))
-RSI5_MIN_EXTREME_VOTES = max(3, min(5, int(os.getenv("RSI5_MIN_EXTREME_VOTES", "4"))))
-RSI5_MIN_CONFIRMATIONS = 1
-RSI5_AI_MIN_CONFIDENCE = max(50.0, min(85.0, float(os.getenv("RSI5_AI_MIN_CONFIDENCE", "58"))))
-RSI5_FORCE_BODY_RATIO = max(0.25, min(0.80, float(os.getenv("RSI5_FORCE_BODY_RATIO", "0.42"))))
-RSI5_FORCE_RANGE_RATIO = max(0.50, min(1.80, float(os.getenv("RSI5_FORCE_RANGE_RATIO", "0.82"))))
+# RSI + ADX 4TF — perfil AFIADO para próxima vela, sempre com candle fechado.
+# RSI 9 mantém o timing do 4Period_RSI_Arrows; ADX/DMI atua somente como filtro
+# de força/direção. O motor prioriza pullbacks A FAVOR da tendência e não tenta
+# adivinhar reversão contra ADX forte. Engine key RSI5 é preservada por compatibilidade.
+RSI_ADX_PERIOD = max(7, min(30, int(os.getenv("RSI_ADX_PERIOD", "14"))))
+RSI_ADX_SMOOTH = max(7, min(30, int(os.getenv("RSI_ADX_SMOOTH", "14"))))
+RSI_ADX_MIN = max(15.0, min(40.0, float(os.getenv("RSI_ADX_MIN", "25"))))
+RSI_ADX_STRONG = max(RSI_ADX_MIN + 5.0, min(60.0, float(os.getenv("RSI_ADX_STRONG", "40"))))
+RSI_ADX_DI_EDGE = max(0.0, min(15.0, float(os.getenv("RSI_ADX_DI_EDGE", "2.0"))))
+RSI_PULLBACK_CALL_MIN = max(20.0, min(40.0, float(os.getenv("RSI_PULLBACK_CALL_MIN", "30"))))
+RSI_PULLBACK_CALL_MAX = max(RSI_PULLBACK_CALL_MIN + 2.0, min(55.0, float(os.getenv("RSI_PULLBACK_CALL_MAX", "48"))))
+RSI_PULLBACK_PUT_MIN = max(45.0, min(75.0, float(os.getenv("RSI_PULLBACK_PUT_MIN", "52"))))
+RSI_PULLBACK_PUT_MAX = max(RSI_PULLBACK_PUT_MIN + 2.0, min(85.0, float(os.getenv("RSI_PULLBACK_PUT_MAX", "70"))))
+RSI_EXTREME_LOW = max(10.0, min(35.0, float(os.getenv("RSI_EXTREME_LOW", "30"))))
+RSI_EXTREME_HIGH = max(65.0, min(90.0, float(os.getenv("RSI_EXTREME_HIGH", "70"))))
+RSI_ADX_PREALERT_SECONDS = max(15, min(40, int(os.getenv("RSI_ADX_PREALERT_SECONDS", "25"))))
 
 # Sniper Pro MEGA — adaptação do indicador MQ5 para opções binárias.
 # Usa somente candles fechados e libera CALL/PUT para a próxima vela.
@@ -9985,13 +9987,38 @@ def _rsi_pure_frame(rows, label, seconds, period=9):
     }
 
 
-def rsi_pure_4tf_strategy(tf_rows, market="OPEN"):
-    """RSI PURO 4TF — adaptação assertiva e não-repaint do 4Period_RSI_Arrows.mq4.
+def _rsi_adx_snapshot(rows):
+    """Snapshot DMI/ADX causal no último candle fechado do M5."""
+    rows = list(rows or [])
+    if len(rows) < RSI_ADX_PERIOD + RSI_ADX_SMOOTH + 5:
+        return None
+    plus_di, minus_di, adx_vals = _velocity_dmi_series(rows, RSI_ADX_PERIOD, RSI_ADX_SMOOTH)
+    pdi = plus_di[-1]
+    mdi = minus_di[-1]
+    av = adx_vals[-1]
+    prev_adx = adx_vals[-2] if len(adx_vals) > 1 else None
+    if pdi is None or mdi is None or av is None:
+        return None
+    return {
+        "adx": float(av),
+        "adx_prev": float(prev_adx) if prev_adx is not None else None,
+        "plus_di": float(pdi),
+        "minus_di": float(mdi),
+        "adx_rising": bool(prev_adx is None or float(av) >= float(prev_adx)),
+        "bull_trend": bool(float(pdi) >= float(mdi) + RSI_ADX_DI_EDGE),
+        "bear_trend": bool(float(mdi) >= float(pdi) + RSI_ADX_DI_EDGE),
+        "trend_strong": bool(float(av) >= RSI_ADX_MIN),
+        "trend_extreme": bool(float(av) >= RSI_ADX_STRONG),
+    }
 
-    Mantém a essência do original: RSI 9, PRICE_TYPICAL, zonas 38/62 e os quatro
-    tempos M5/M15/M30/H1. A melhoria é não sinalizar simplesmente por permanecer
-    no extremo. O M5 precisa mostrar recuperação/virada e pelo menos um timeframe
-    maior precisa apoiar o mesmo lado. Tudo é RSI; nenhum outro indicador participa.
+
+def rsi_pure_4tf_strategy(tf_rows, market="OPEN"):
+    """RSI + ADX 4TF — pullback a favor da tendência, causal e não-repaint.
+
+    RSI 9 / PRICE_TYPICAL em M5/M15/M30/H1 fornece o timing. ADX 14 + DMI no M5
+    valida força e direção: CALL exige +DI dominante; PUT exige -DI dominante.
+    ADX abaixo de 25 não libera entrada. ADX muito alto não dispara reversão contra
+    a tendência; apenas marca possível exaustão e aguarda o RSI recuperar do extremo.
     """
     data = dict(tf_rows or {})
     specs = (("M5", "5min", 300), ("M15", "15min", 900), ("M30", "30min", 1800), ("H1", "1h", 3600))
@@ -10004,70 +10031,114 @@ def rsi_pure_4tf_strategy(tf_rows, market="OPEN"):
         else:
             frames.append(f)
 
-    name = "RSI PURO 4TF • 9 • 38/62"
-    if missing or len(frames) < 4:
+    adx_ctx = _rsi_adx_snapshot(data.get("5min"))
+    name = "RSI + ADX AFIADO • 4TF • 9/14"
+    if missing or len(frames) < 4 or adx_ctx is None:
+        extra = []
+        if missing:
+            extra.append("RSI " + ", ".join(missing))
+        if adx_ctx is None:
+            extra.append("ADX/DMI M5")
         return {
             "available": True, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "strategy": name,
-            "engine": "RSI_PURE_4TF", "provider": "LOCAL_RSI_PURE_4TF",
-            "reason": "RSI PURO coletando candles fechados: faltam " + ", ".join(missing or ["dados"]),
+            "engine": "RSI_ADX_4TF", "provider": "LOCAL_RSI_ADX_4TF",
+            "reason": "RSI + ADX coletando candles fechados: faltam " + ", ".join(extra or ["dados"]),
             "non_repaint": True, "gale_signal": False, "martingale": False,
-            "direct_win_only": True, "next_candle": True, "pure_rsi": True,
+            "direct_win_only": True, "next_candle": True, "pure_rsi": False,
+            "adx_filter": True,
         }
 
     by = {x["label"]: x for x in frames}
     m5 = by["M5"]
     higher = [by["M15"], by["M30"], by["H1"]]
+    r_now = float(m5["rsi"])
+    r_prev = float(m5["prev"])
+    slope = float(m5["slope"])
 
     call_supports = sum(1 for x in higher if x["call_support"])
     put_supports = sum(1 for x in higher if x["put_support"])
 
-    call_ready = bool(m5["call_trigger"] and call_supports >= 1)
-    put_ready = bool(m5["put_trigger"] and put_supports >= 1)
+    # Pullback afiado: RSI precisa estar retornando da região baixa/alta, não apenas
+    # permanecer extremo. Mantemos 38/62 como gatilho-base e aceitamos 30–48/52–70
+    # como faixa operacional para não perder o respiro dentro da tendência.
+    call_pullback = bool(
+        m5["call_trigger"]
+        and RSI_PULLBACK_CALL_MIN <= r_now <= RSI_PULLBACK_CALL_MAX
+        and r_now > r_prev
+        and slope >= 0.70
+    )
+    put_pullback = bool(
+        m5["put_trigger"]
+        and RSI_PULLBACK_PUT_MIN <= r_now <= RSI_PULLBACK_PUT_MAX
+        and r_now < r_prev
+        and slope <= -0.70
+    )
 
-    # Em caso raro de dupla leitura, escolhe o lado que tem mais apoio RSI.
-    direction = "NEUTRO"
-    if call_ready and not put_ready:
-        direction = "CALL"
-    elif put_ready and not call_ready:
-        direction = "PUT"
-    elif call_ready and put_ready:
-        call_strength = call_supports + (2 if m5["call_cross"] else 1)
-        put_strength = put_supports + (2 if m5["put_cross"] else 1)
-        if call_strength > put_strength:
-            direction = "CALL"
-        elif put_strength > call_strength:
-            direction = "PUT"
+    adx_ok = bool(adx_ctx["trend_strong"])
+    call_trend = bool(adx_ctx["bull_trend"])
+    put_trend = bool(adx_ctx["bear_trend"])
+
+    call_ready = bool(adx_ok and call_trend and call_pullback and call_supports >= 1)
+    put_ready = bool(adx_ok and put_trend and put_pullback and put_supports >= 1)
+
+    # Exaustão extrema é informação, não gatilho contra-tendência.
+    exhaustion_low = bool(adx_ctx["trend_extreme"] and r_now <= RSI_EXTREME_LOW)
+    exhaustion_high = bool(adx_ctx["trend_extreme"] and r_now >= RSI_EXTREME_HIGH)
+
+    direction = "CALL" if call_ready else ("PUT" if put_ready else "NEUTRO")
 
     confidence = 0.0
-    if direction == "CALL":
-        confidence = 68.0 + call_supports * 5.0 + (6.0 if m5["call_cross"] else 2.0) + min(6.0, max(0.0, m5["slope"]) * 1.5)
-    elif direction == "PUT":
-        confidence = 68.0 + put_supports * 5.0 + (6.0 if m5["put_cross"] else 2.0) + min(6.0, max(0.0, -m5["slope"]) * 1.5)
-    confidence = clamp(confidence, 0.0, 94.0)
+    if direction in ("CALL", "PUT"):
+        supports = call_supports if direction == "CALL" else put_supports
+        di_gap = abs(float(adx_ctx["plus_di"]) - float(adx_ctx["minus_di"]))
+        adx_bonus = min(8.0, max(0.0, float(adx_ctx["adx"]) - RSI_ADX_MIN) * 0.45)
+        di_bonus = min(7.0, max(0.0, di_gap - RSI_ADX_DI_EDGE) * 0.30)
+        cross_bonus = 5.0 if (m5["call_cross"] if direction == "CALL" else m5["put_cross"]) else 2.0
+        confidence = 72.0 + supports * 4.0 + adx_bonus + di_bonus + cross_bonus
+        if adx_ctx["adx_rising"]:
+            confidence += 2.0
+    confidence = clamp(confidence, 0.0, 95.0)
 
     if direction == "CALL":
         supporters = [x["label"] for x in higher if x["call_support"]]
         reason = (
-            f"RSI PURO CALL: M5 virou da sobrevenda (RSI {m5['prev']:.1f}→{m5['rsi']:.1f}) "
-            f"e {', '.join(supporters)} apoia(m) a recuperação. Só RSI 9 / 38-62 • próxima vela."
+            f"RSI+ADX CALL: tendência forte ADX {adx_ctx['adx']:.1f}, +DI {adx_ctx['plus_di']:.1f} > -DI {adx_ctx['minus_di']:.1f}; "
+            f"RSI9 M5 recuperou {r_prev:.1f}→{r_now:.1f} e {', '.join(supporters)} apoia(m) o pullback. Próxima vela."
         )
     elif direction == "PUT":
         supporters = [x["label"] for x in higher if x["put_support"]]
         reason = (
-            f"RSI PURO PUT: M5 virou da sobrecompra (RSI {m5['prev']:.1f}→{m5['rsi']:.1f}) "
-            f"e {', '.join(supporters)} apoia(m) a correção. Só RSI 9 / 38-62 • próxima vela."
+            f"RSI+ADX PUT: tendência forte ADX {adx_ctx['adx']:.1f}, -DI {adx_ctx['minus_di']:.1f} > +DI {adx_ctx['plus_di']:.1f}; "
+            f"RSI9 M5 recuou {r_prev:.1f}→{r_now:.1f} e {', '.join(supporters)} apoia(m) o pullback. Próxima vela."
         )
     else:
+        blockers = []
+        if not adx_ok:
+            blockers.append(f"ADX {adx_ctx['adx']:.1f}<25")
+        elif not call_trend and not put_trend:
+            blockers.append(f"DI sem direção (+DI {adx_ctx['plus_di']:.1f}/-DI {adx_ctx['minus_di']:.1f})")
+        if exhaustion_low:
+            blockers.append("exaustão baixa: aguarda RSI recuperar")
+        elif exhaustion_high:
+            blockers.append("exaustão alta: aguarda RSI recuar")
+        if adx_ok and call_trend and not call_pullback:
+            blockers.append(f"aguarda pullback CALL RSI 30–48 (M5 {r_now:.1f})")
+        elif adx_ok and put_trend and not put_pullback:
+            blockers.append(f"aguarda pullback PUT RSI 52–70 (M5 {r_now:.1f})")
+        if call_pullback and call_supports < 1:
+            blockers.append("CALL sem apoio RSI dos TF maiores")
+        if put_pullback and put_supports < 1:
+            blockers.append("PUT sem apoio RSI dos TF maiores")
         reason = (
-            f"RSI PURO monitorando • M5 {m5['rsi']:.1f} • "
-            f"M15 {by['M15']['rsi']:.1f} • M30 {by['M30']['rsi']:.1f} • H1 {by['H1']['rsi']:.1f}. "
-            "Aguardando o M5 virar de 38/62 com pelo menos 1 apoio dos tempos maiores."
+            f"RSI+ADX monitorando • ADX {adx_ctx['adx']:.1f} • +DI {adx_ctx['plus_di']:.1f} • -DI {adx_ctx['minus_di']:.1f} • "
+            f"RSI M5 {r_now:.1f} • M15 {by['M15']['rsi']:.1f} • M30 {by['M30']['rsi']:.1f} • H1 {by['H1']['rsi']:.1f}. "
+            + (" • ".join(blockers[:3]) if blockers else "Aguardando confluência.")
         )
 
     event_key = ""
     if direction in ("CALL", "PUT"):
-        event_key = f"RSI_PURE:{direction}:{m5.get('datetime')}"
+        event_key = f"RSI_ADX:{direction}:{m5.get('datetime')}"
 
     return {
         "available": True,
@@ -10076,28 +10147,40 @@ def rsi_pure_4tf_strategy(tf_rows, market="OPEN"):
         "confidence": round(float(confidence), 1),
         "preview_confidence": round(float(confidence), 1),
         "confirmed": direction in ("CALL", "PUT"),
-        "risk": "LOW" if confidence >= 84 else ("MEDIUM" if direction != "NEUTRO" else "HIGH"),
+        "risk": "LOW" if confidence >= 86 else ("MEDIUM" if direction != "NEUTRO" else "HIGH"),
         "strategy": name,
-        "engine": "RSI_PURE_4TF",
-        "provider": "LOCAL_RSI_PURE_4TF",
-        "reason": reason[:520],
+        "engine": "RSI_ADX_4TF",
+        "provider": "LOCAL_RSI_ADX_4TF",
+        "reason": reason[:620],
         "non_repaint": True,
         "direct_win_only": True,
         "gale_signal": False,
         "martingale": False,
         "next_candle": True,
-        "pure_rsi": True,
+        "pure_rsi": False,
+        "adx_filter": True,
         "event_key": event_key,
         "diagnostics": {
-            "period": 9,
+            "rsi_period": 9,
             "applied_price": "TYPICAL",
-            "lower_trigger": 38,
-            "upper_trigger": 62,
+            "original_rsi_levels": [38, 62],
+            "pullback_call_zone": [RSI_PULLBACK_CALL_MIN, RSI_PULLBACK_CALL_MAX],
+            "pullback_put_zone": [RSI_PULLBACK_PUT_MIN, RSI_PULLBACK_PUT_MAX],
+            "adx_period": RSI_ADX_PERIOD,
+            "adx_smoothing": RSI_ADX_SMOOTH,
+            "adx_min": RSI_ADX_MIN,
+            "adx_extreme": RSI_ADX_STRONG,
+            "di_edge": RSI_ADX_DI_EDGE,
             "trigger_timeframe": "M5",
-            "min_higher_supports": 1,
+            "min_higher_rsi_supports": 1,
+            "adx": round(float(adx_ctx["adx"]), 2),
+            "plus_di": round(float(adx_ctx["plus_di"]), 2),
+            "minus_di": round(float(adx_ctx["minus_di"]), 2),
+            "adx_rising": bool(adx_ctx["adx_rising"]),
+            "trend_extreme": bool(adx_ctx["trend_extreme"]),
             "frames": frames,
             "source_indicator": "4Period_RSI_Arrows.mq4",
-            "adaptation": "PURE_RSI_CLOSED_CANDLE_RECOVERY_4TF",
+            "adaptation": "RSI9_4TF_PLUS_ADX14_DMI_PULLBACK_CLOSED_CANDLE",
         },
     }
 
@@ -11675,7 +11758,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     if engine in ("VOLUME", "VOLUME_AI"): engine = "GRAPH_AI"  # Volume POC removido do app
     entry_mode = normalize_entry_mode(entry_mode)
     if engine == "RSI5":
-        # RSI PURO 4TF usa somente candles fechados e entra na abertura seguinte.
+        # RSI + ADX AFIADO usa somente candles fechados e entra na abertura seguinte.
         entry_mode = "BIRTH"
     elif engine == "ALPHAX":
         # AlphaX 3.73: sinal oficial antecipado ~30 s e entrada na próxima abertura.
@@ -11999,12 +12082,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 if not iq_state:
                     out = neutral_signal(
                         symbol, interval, market,
-                        "RSI PURO 4TF • IQ OPTION OFFLINE",
-                        "Conecte a IQ Option para o RSI PURO 4TF analisar candles OTC reais.",
+                        "RSI + ADX AFIADO • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para o RSI + ADX Afiado analisar candles OTC reais.",
                         source_state="WAITING",
                     )
                     out.update({
-                        "strategy": "RSI PURO 4TF", "mode": "RSI_PURE_4TF",
+                        "strategy": "RSI + ADX AFIADO", "mode": "RSI_ADX_4TF",
                         "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
                         "non_repaint": True, "direct_win_only": True, "gale_signal": False,
                     })
@@ -12061,7 +12144,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "SUNTZU":
             status = "SUNTZU FLEX • FONTE EM ESPERA" if market == "OPEN" else "SUNTZU FLEX • IQ OPTION EM ESPERA"
         elif engine == "RSI5":
-            status = "RSI PURO 4TF • FONTE EM ESPERA" if market == "OPEN" else "RSI PURO 4TF • IQ OPTION EM ESPERA"
+            status = "RSI + ADX AFIADO • FONTE EM ESPERA" if market == "OPEN" else "RSI + ADX AFIADO • IQ OPTION EM ESPERA"
         elif engine == "FORCE" and market == "IQ_OTC":
             status = "EA FORÇA DO MOVIMENTO • IQ OPTION EM ESPERA"
         elif market == "OPEN" and exc.status_code in (429, 503):
@@ -12098,7 +12181,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "SUNTZU":
             status = "SUNTZU FLEX • FONTE RECONECTANDO" if market == "OPEN" else "SUNTZU FLEX • IQ OPTION RECONECTANDO"
         elif engine == "RSI5":
-            status = "RSI PURO 4TF • FONTE RECONECTANDO" if market == "OPEN" else "RSI PURO 4TF • IQ OPTION RECONECTANDO"
+            status = "RSI + ADX AFIADO • FONTE RECONECTANDO" if market == "OPEN" else "RSI + ADX AFIADO • IQ OPTION RECONECTANDO"
         elif engine == "FORCE" and market == "IQ_OTC":
             status = "EA FORÇA DO MOVIMENTO • IQ OPTION RECONECTANDO"
         else:
@@ -12186,8 +12269,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "SUNTZU FLEX 2/3"
             engine_mode = "SUNTZU_FLEX"
         elif engine == "RSI5":
-            engine_title = "RSI PURO 4TF"
-            engine_mode = "RSI_PURE_4TF"
+            engine_title = "RSI + ADX AFIADO"
+            engine_mode = "RSI_ADX_4TF"
         elif engine == "FORCE":
             engine_title = "EA FORÇA DO MOVIMENTO"
             engine_mode = "EA_FORCE_MOVEMENT"
@@ -12221,7 +12304,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
                     "VOLUME_AI": "LOCAL_VOLUME_POC_AI_CONTEXT",
                     "SUNTZU": "LOCAL_SUNTZU_FLEX",
-                    "RSI5": "LOCAL_RSI_PURE_4TF",
+                    "RSI5": "LOCAL_RSI_ADX_4TF",
                     "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
                 }.get(engine, "DISABLED")),
                 "technical": (
@@ -12482,7 +12565,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
                     "VOLUME_AI": "LOCAL_VOLUME_POC_AI_CONTEXT",
                     "SUNTZU": "LOCAL_SUNTZU_FLEX",
-                "RSI5": "LOCAL_RSI_PURE_4TF",
+                "RSI5": "LOCAL_RSI_ADX_4TF",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
             "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "HIGH").upper(),
@@ -12501,7 +12584,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "VOLUME POC ESTRUTURAL" if engine == "VOLUME"
                     else "SUNTZU FLEX 2/3" if engine == "SUNTZU"
                     else "RSI MONITOR 20S" if engine == "RSIMON"
-                    else "RSI PURO 4TF" if engine == "RSI5"
+                    else "RSI + ADX AFIADO" if engine == "RSI5"
                     else "EA Força do Movimento" if engine == "FORCE"
                     else f"{engine_title} {tf_label}"
                 ))
@@ -12819,9 +12902,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     # imediatamente seguinte; não carregamos um sinal velho para outra vela.
                     rsi5_age = max(0.0, (now() - current_boundary(interval)).total_seconds())
                     if rsi5_age > 10.0:
-                        base["status"] = "ONLINE • RSI PURO 4TF • AGUARDANDO PRÓXIMO FECHAMENTO"
+                        base["status"] = "ONLINE • RSI + ADX AFIADO • AGUARDANDO PRÓXIMO FECHAMENTO"
                         base["reason"] = (
-                            "Gatilho RSI PURO detectado, mas a janela de nascimento já passou. "
+                            "Gatilho RSI + ADX detectado, mas a janela de nascimento já passou. "
                             "A entrada tardia foi descartada e o motor recalcula no próximo candle fechado."
                         )
                         base["direction"] = "NEUTRO"
@@ -12859,7 +12942,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "VOLUME_AI": "SINAL VOLUME POC ESTRUTURAL LIBERADO",
                         "SUNTZU": "SINAL SUNTZU FLEX 2/3 LIBERADO",
                         "RSIMON": "SINAL RSI MONITOR 20S LIBERADO",
-                        "RSI5": "SINAL RSI PURO 4TF LIBERADO",
+                        "RSI5": "SINAL RSI + ADX AFIADO LIBERADO",
                         "FORCE": "SINAL EA FORÇA DO MOVIMENTO LIBERADO",
                         "BIGRISE": "SINAL BTC FORCE MULTIATIVOS LIBERADO",
                     }.get(engine, "SINAL IA GRÁFICA LIBERADO")),
@@ -13030,7 +13113,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
                     "VOLUME_AI": "LOCAL_VOLUME_POC_AI_CONTEXT",
                     "SUNTZU": "LOCAL_SUNTZU_FLEX",
-                "RSI5": "LOCAL_RSI_PURE_4TF",
+                "RSI5": "LOCAL_RSI_ADX_4TF",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
             "reason": ai.get("reason") or "IA analisando os mesmos candles exibidos no gráfico.",
@@ -16509,7 +16592,7 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
                        "Compressão adaptativa + rompimento/reversão por pavio em candles OTC reais; exige conexão ativa com a IQ Option."),
         },
         {
-             "key":"RSI5","name":"RSI PURO 4TF","score":rsi5,
+             "key":"RSI5","name":"RSI + ADX AFIADO","score":rsi5,
             "supported":True,"operational":bool(market=="OPEN" or iq_ready),
             "reason": ("RSI puro: M5 reage em 38/62 e M15/M30/H1 dão apoio; nenhum POC, média, volume ou IA entra na decisão."
                        if market=="OPEN" else
@@ -16801,12 +16884,12 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = feed_src
                     data["feed_label"] = _feed_source_label(feed_src)
                     data["feed_fallback"] = bool(feed_info.get("fallback"))
-                    data["feed_message"] = "RSI PURO 4TF usando somente RSI 9 em M5/M15/M30/H1, PRICE_TYPICAL e zonas 38/62."
+                    data["feed_message"] = "RSI + ADX Afiado usando RSI9 4TF com ADX/DMI14 no M5; ADX mínimo 25 e entrada a favor da tendência."
                 else:
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                    data["feed_message"] = "RSI PURO 4TF usando somente RSI 9 nos candles OTC reais de M5/M15/M30/H1."
+                    data["feed_message"] = "RSI + ADX Afiado usando RSI9 4TF + ADX/DMI14 nos candles OTC reais."
                 data["non_repaint"] = True
                 data["next_candle"] = True
             elif engine == "FORCE" and requested_market == "IQ_OTC":
@@ -17374,12 +17457,18 @@ async def pre_signals(
         }
 
     if engine == "RSI5":
-        return {
-            "ok": True,
-            "message": "RSI PURO 4TF usa somente candles fechados: RSI 9 com PRICE_TYPICAL em M5/M15/M30/H1, zonas 38/62 e recuperação do M5 apoiada por pelo menos um timeframe maior. Nenhum outro indicador participa.",
-            "items": [],
-            "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
-        }
+        _rsi_adx_remain = int(max(0, (next_boundary(interval) - now()).total_seconds()))
+        if _rsi_adx_remain > RSI_ADX_PREALERT_SECONDS:
+            return {
+                "ok": True,
+                "message": (
+                    f"RSI + ADX Afiado monitorando. O pré-alerta abre nos últimos {RSI_ADX_PREALERT_SECONDS}s "
+                    f"antes da próxima vela; faltam {_rsi_adx_remain}s."
+                ),
+                "items": [],
+                "seconds_to_entry": _rsi_adx_remain,
+                "prealert_seconds": RSI_ADX_PREALERT_SECONDS,
+            }
 
     requested_market = market
     iq_state = (
@@ -17405,7 +17494,7 @@ async def pre_signals(
             "VOLUME_AI": "Volume POC Estrutural",
             "SUNTZU": "SUNTZU FLEX 2/3",
             "RSIMON": "RSI Monitor 20S",
-            "RSI5": "RSI PURO 4TF",
+            "RSI5": "RSI + ADX AFIADO",
         }.get(engine, engine)
         return {
             "ok": True,
@@ -17528,6 +17617,36 @@ async def pre_signals(
                     if velocity_preview.get("confirmed") and velocity_preview.get("direction") in ("CALL", "PUT")
                     else None
                 )
+            elif engine == "RSI5":
+                # PRÉ-ALERTA 25S: usa o snapshot das velas ainda em formação apenas
+                # como aviso. A entrada oficial continua dependendo do fechamento e
+                # da confirmação RSI9 4TF + ADX/DMI14 no /signal-ai.
+                rsi_preview_rows = {}
+                for _tf in ("5min", "15min", "30min", "1h"):
+                    if requested_market == "IQ_OTC":
+                        _tf_rows = await iq_ea_candles(
+                            iq_state, symbol, _tf, 90, regular_market=False
+                        )
+                    else:
+                        _tf_rows = await candles(
+                            symbol, _tf, 90, "OPEN", None, request=request
+                        )
+                    rsi_preview_rows[_tf] = list(_tf_rows or [])
+                rsi_preview = rsi_pure_4tf_strategy(rsi_preview_rows, market=requested_market)
+                preview = (
+                    {
+                        "direction": rsi_preview.get("direction"),
+                        "confidence": rsi_preview.get("confidence", 0),
+                        "strategy": rsi_preview.get("strategy", "RSI + ADX AFIADO"),
+                        "reason": (
+                            f"Pré-alerta provisório {RSI_ADX_PREALERT_SECONDS}s: "
+                            + str(rsi_preview.get("reason") or "RSI + ADX/DMI alinhados provisoriamente.")
+                        ),
+                        "prealert_only": True,
+                    }
+                    if rsi_preview.get("confirmed") and rsi_preview.get("direction") in ("CALL", "PUT")
+                    else None
+                )
             else:
                 preview = _pre_signal_from_live_candle(raw, interval, market, symbol)
             moment_ea = None
@@ -17570,7 +17689,11 @@ async def pre_signals(
                 status = (
                     "ALERTA VELOCITY • ENTRADA NA PRÓXIMA VELA"
                     if engine == "VELOCITY"
-                    else "PRÉ-SINAL • AGUARDANDO FECHAMENTO"
+                    else (
+                        f"PRÉ-ALERTA RSI+ADX • {RSI_ADX_PREALERT_SECONDS}S • AGUARDANDO FECHAMENTO"
+                        if engine == "RSI5"
+                        else "PRÉ-SINAL • AGUARDANDO FECHAMENTO"
+                    )
                 )
                 if moment_ea:
                     if moment_ea.get("confirmed"):
@@ -17639,9 +17762,14 @@ async def pre_signals(
             )
             if engine == "VELOCITY"
             else (
-                "Pré-sinais calculados com a vela em formação. "
-                "Na Inteligência Artificial, a EA Vela Atual mede força/micro-momento antes da entrada; "
-                "o CALL/PUT final ainda passa por Luna + XGBoost + filtros de risco."
+                f"RSI + ADX Afiado: pré-alerta provisório nos últimos {RSI_ADX_PREALERT_SECONDS}s; "
+                "a entrada só é confirmada após o fechamento validar RSI9 4TF + ADX/DMI14."
+                if engine == "RSI5"
+                else (
+                    "Pré-sinais calculados com a vela em formação. "
+                    "Na Inteligência Artificial, a EA Vela Atual mede força/micro-momento antes da entrada; "
+                    "o CALL/PUT final ainda passa por Luna + XGBoost + filtros de risco."
+                )
             )
         ),
         "items": items[:limit],
@@ -17995,7 +18123,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         elif engine == "RSI5":
             if market == "IQ_OTC":
                 if not iq_state:
-                    raise RuntimeError("Conecte a IQ Option para o RSI PURO 4TF analisar OTC.")
+                    raise RuntimeError("Conecte a IQ Option para o RSI + ADX Afiado analisar OTC.")
                 raw = await iq_ea_candles(iq_state, sym, interval, 100, regular_market=False)
             else:
                 raw = await candles(sym, interval, 100, "OPEN", None, request=request)
@@ -18150,9 +18278,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                         _raw_tf = await candles(sym, _tf, 80, "OPEN", None, request=request)
                     rsi_tf_rows[_tf] = _raw_tf[:-1] if len(_raw_tf) > 1 else _raw_tf
                 tech = rsi_pure_4tf_strategy(rsi_tf_rows, market=market)
-                engine_label = "RSI PURO 4TF"
+                engine_label = "RSI + ADX AFIADO"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why = str(tech.get("reason") or "RSI PURO 4TF monitorando").replace("\n", " ")[:88]
+                why = str(tech.get("reason") or "RSI + ADX Afiado monitorando").replace("\n", " ")[:88]
                 status_text = (
                     f"{engine_label} • OPORTUNIDADE ENCONTRADA"
                     if direction != "NEUTRO"
@@ -18298,7 +18426,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         elif engine == "SUNTZU":
             source_status = "SUNTZU FLEX • FONTE EM ESPERA" if market == "OPEN" else "SUNTZU FLEX • IQ OPTION OTC EM ESPERA"
         elif engine == "RSI5":
-            source_status = "RSI PURO 4TF • FONTE EM ESPERA" if market == "OPEN" else "RSI PURO 4TF • IQ OPTION OTC EM ESPERA"
+            source_status = "RSI + ADX AFIADO • FONTE EM ESPERA" if market == "OPEN" else "RSI + ADX AFIADO • IQ OPTION OTC EM ESPERA"
         elif engine == "FORCE" and market == "IQ_OTC":
             source_status = "IQ OPTION • FONTE EM ESPERA"
         elif market == "OPEN":
@@ -18683,7 +18811,7 @@ async def result(
     - LOSS/empate no G1 => aguarda G2.
     - WIN no G2 => WIN G2; caso contrário => LOSS G2.
 
-    ``direct_only=true`` fecha somente a primeira vela. EA Tripla, EA Força, BIGRISE, LARRY BREAKOUT, VELOCITY FLOW, SNIPER PRO, ALPHAX RELAY e RSI PURO 4TF
+    ``direct_only=true`` fecha somente a primeira vela. EA Tripla, EA Força, BIGRISE, LARRY BREAKOUT, VELOCITY FLOW, SNIPER PRO, ALPHAX RELAY e RSI + ADX AFIADO
     usam esse modo; os demais motores podem acompanhar G1/G2.
     """
     if not expiry_time:
@@ -19190,7 +19318,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • RSI PURO Arrow + AlphaX • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • RSI + ADX Afiado + AlphaX • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -19288,8 +19416,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="robot-mode-card" id="rsi5ModeCard">
     <img src="__MEGA_IMAGE__" alt="RSI Puro 4TF">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">📈 RSI PURO 4TF</div>
-      <div class="robot-mode-desc" id="rsi5ModeDesc">RSI 9 puro • M5/M15/M30/H1 • zonas 38/62 • recuperação do extremo • candle fechado • próxima vela.</div>
+      <div class="robot-mode-title">📈 RSI + ADX AFIADO</div>
+      <div class="robot-mode-desc" id="rsi5ModeDesc">RSI 9 + ADX/DMI 14 • pullback a favor da tendência • ADX ≥25 • pré-alerta 25s • confirmação no fechamento • próxima vela.</div>
     </div>
     <button id="rsi5PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -21040,7 +21168,7 @@ function momentStudyEngineName(key){
     LARRY:'⚡ LARRY BREAKOUT',
     VELOCITY:'⚡ VELOCITY FLOW',
     ALPHAX:'🧬 ALPHAX RELAY',
-    RSI5:'📈 RSI PURO 4TF',
+    RSI5:'📈 RSI + ADX AFIADO',
     FORCE:'💥 EA FORÇA DO MOVIMENTO',
     BIGRISE:'₿ BTC FORCE'
   };
@@ -21367,7 +21495,7 @@ function rememberPendingTrade(sig){
   const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='RANGE'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='SUNTZU'||engineKey==='RSI5'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('RANGE')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('SUNTZU')||engineKey.includes('RSI5'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
-    // Motores de entrada direta (AlphaX/Núcleo Rápido/Samurai/Sniper/RSI PURO/Larry/Range/EA/Força/BigRise/Velocity) são apurados na primeira vela; outros preservam G1/G2.
+    // Motores de entrada direta (AlphaX/Núcleo Rápido/Samurai/Sniper/RSI+ADX/Larry/Range/EA/Força/BigRise/Velocity) são apurados na primeira vela; outros preservam G1/G2.
     direct_only:isDirectEa,
     market:signalResultMarket(sig),
     requested_market:sig.requested_market || (market&&market.value) || 'OPEN',
@@ -23582,8 +23710,8 @@ function applyRobotPowerState(){
     ? 'ONLINE: POC + IA contextual local • IA dá bônus/proteção leve e não vira confirmação obrigatória • próxima vela.'
     : 'OFFLINE: Volume POC Estrutural pausado.';
   if(rsi5ModeDesc) rsi5ModeDesc.textContent=rsi5Enabled
-    ? 'ONLINE: RSI 9 puro em M5/M15/M30/H1 • zonas 38/62 • recuperação do M5 + apoio de 1 tempo maior • próxima vela.'
-    : 'OFFLINE: RSI PURO 4TF pausado.';
+    ? 'ONLINE: RSI9 4TF + ADX/DMI14 • ADX ≥25 • pullback a favor da tendência • próxima vela.'
+    : 'OFFLINE: RSI + ADX Afiado pausado.';
   if(velocityModeDesc) velocityModeDesc.textContent=velocityEnabled
     ? 'ONLINE: rompimento dos 3 fechamentos + ADX/DMI 14 + RSI 7 + direção da vela • cooldown original de 5 velas • OPEN/OTC.'
     : 'OFFLINE: Velocity Flow pausado • parâmetros originais preservados.';
@@ -23626,9 +23754,9 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar Sniper Pro ativo • EMA 9/21 + VWAP + RSI + MACD + ADX/DMI + volume + price action</div>';
     rad();
   }else if(engine==='RSI5'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI PURO 4TF ONLINE • RSI 9 • M5/M15/M30/H1 • 38/62 • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📈 RSI PURO 4TF selecionado • M5 vira de 38/62 + apoio de pelo menos 1 tempo maior • só RSI • candle fechado.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar RSI PURO ativo • RSI 9 em M5/M15/M30/H1 • 38/62 • recuperação</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI + ADX AFIADO ONLINE • RSI9 + ADX/DMI14 • ADX ≥25 • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📈 RSI + ADX selecionado • ADX ≥25 + direção do DMI • RSI9 pega o pullback • apoio de pelo menos 1 TF maior • candle fechado.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar RSI + ADX ativo • tendência ADX/DMI + pullback RSI9 • M5/M15/M30/H1</div>';
     rad();
   }else if(engine==='VELOCITY'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='VELOCITY FLOW ONLINE • MR MT4 • BREAKOUT + ADX/DMI + RSI7 • OPEN + OTC';
@@ -23677,7 +23805,7 @@ function applyRobotPowerState(){
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ AlphaX, Núcleo Rápido, RSI PURO 4TF, IA Gráfica, Inteligência Artificial, Velocity Flow, Larry Breakout, Range Compression, EA Força e BTC Force estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ AlphaX, Núcleo Rápido, RSI + ADX Afiado, IA Gráfica, Inteligência Artificial, Velocity Flow, Larry Breakout, Range Compression, EA Força e BTC Force estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -24015,7 +24143,7 @@ async function setRsi5Power(enabled){
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled) speak(rsi5Enabled ? 'RSI PURO Arrow online.' : 'RSI PURO Arrow offline.');
+  if(voiceEnabled) speak(rsi5Enabled ? 'RSI + ADX Afiado online.' : 'RSI + ADX Afiado offline.');
 }
 
 async function setSniperPower(enabled){
@@ -24665,7 +24793,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='ALPHAX'?'ALPHAX RELAY':ek==='RSI5'?'RSI PURO 4TF':ek==='SMART'?'INTELIGÊNCIA ARTIFICIAL':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='ALPHAX'?'ALPHAX RELAY':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'INTELIGÊNCIA ARTIFICIAL':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
@@ -24811,7 +24939,7 @@ async function loadPreSignals(){
         preSignals.innerHTML = engine==='VELOCITY'
           ? '<div style="opacity:.75">⚡ Velocity Flow monitorando a vela em formação • ainda não há alinhamento provisório para CALL/PUT.</div>'
           : engine==='RSI5'
-            ? '<div style="opacity:.75">📈 RSI PURO 4TF usa só candles fechados • RSI 9 em M5/M15/M30/H1 • entrada na próxima vela.</div>'
+            ? '<div style="opacity:.75">📈 RSI + ADX Afiado monitorando • pré-alerta abre aos 25s • confirmação final no fechamento • entrada na próxima vela.</div>'
             : '<div style="opacity:.75">⚪ Nenhum pré-alerta confirmado na vela em formação. Continuo monitorando.</div>';
       }
       return;
@@ -24846,7 +24974,7 @@ async function loadPreSignals(){
           }
         }
         return `<div class="${d==='CALL'?'radar-call':'radar-put'}" style="border:1px solid rgba(255,193,7,.65)">
-          <b>${engine==='VELOCITY'?'⚡ ALERTA VELOCITY':'🔔 PRÉ-ALERTA'} • ${icon} ${item.symbol||sym} ${d}</b><br>
+          <b>${engine==='VELOCITY'?'⚡ ALERTA VELOCITY':(engine==='RSI5'?'📈 PRÉ-ALERTA RSI+ADX 25S':'🔔 PRÉ-ALERTA')} • ${icon} ${item.symbol||sym} ${d}</b><br>
           <span>${engine==='VELOCITY'?'Entrada':'Possível entrada'} às ${when} • em ${Math.ceil(secs)}s</span><br>
           <small>${engine==='VELOCITY'?'ALERTA LIBERADO PARA A PRÓXIMA VELA • confiança ':'Confiança preliminar '}${conf}%${engine==='VELOCITY'?'':' • AGUARDE CONFIRMAÇÃO FINAL'}</small>${momentLine}
         </div>`;
@@ -24866,6 +24994,8 @@ async function loadPreSignals(){
           const ativoFalado=spokenAssetName(best.symbol||sym);
           if(engine==='VELOCITY'){
             // A fala principal já é feita por promoteVelocityPreAlertToOfficial().
+          }else if(engine==='RSI5'){
+            speak('Pré alerta RSI e ADX. Possível entrada de '+lado+' no ativo '+ativoFalado+' em aproximadamente vinte e cinco segundos. Aguarde a confirmação final no fechamento.');
           }else{
             speak('Pré alerta. Possível entrada de '+lado+' no ativo '+ativoFalado+'. A EA da vela começou a analisar a força do momento.');
           }
@@ -25330,11 +25460,14 @@ setInterval(()=>{
   if(megaCanPoll() && selectedRobotEngine()!=='OFF') rad();
 },45000);
 
-// Pré-alerta: 10 s é suficiente para a janela de 1 minuto e reduz pela metade
-// as leituras extras do motor em relação à versão anterior.
+// Pré-alerta geral permanece leve. No RSI + ADX usamos um relógio mais curto
+// para capturar a janela de 25 s com precisão sem aumentar a carga dos outros motores.
 setInterval(()=>{
-  if(megaCanPoll() && selectedRobotEngine()!=='OFF') loadPreSignals();
+  if(megaCanPoll() && selectedRobotEngine()!=='OFF' && selectedRobotEngine()!=='RSI5') loadPreSignals();
 },10000);
+setInterval(()=>{
+  if(megaCanPoll() && selectedRobotEngine()==='RSI5') loadPreSignals();
+},2000);
 
 // Resultado das operações abertas.
 setInterval(()=>{ if(megaCanPoll()) resultCheck(); },10000);
