@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.85.1"
-PWA_VERSION = "v144"
+APP_VERSION = "3.86.0"
+PWA_VERSION = "v145"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -167,6 +167,29 @@ SNIPER_ADX_MIN = max(10.0, min(45.0, float(os.getenv("SNIPER_ADX_MIN", "20"))))
 SNIPER_BODY_ATR_MIN = max(0.15, min(1.20, float(os.getenv("SNIPER_BODY_ATR_MIN", "0.35"))))
 SNIPER_VOLUME_FACTOR = max(0.50, min(1.50, float(os.getenv("SNIPER_VOLUME_FACTOR", "0.95"))))
 SNIPER_COOLDOWN_BARS = max(1, min(12, int(os.getenv("SNIPER_COOLDOWN_BARS", "2"))))
+
+
+# MEGA IA 3.86 — SUPER Z PMAX (modo de teste).
+# Reconstrução equivalente baseada na especificação recebida: PMAX com cascata EMA 5/18,
+# multiplicador Supertrend adaptado por Z-Score, confirmação de volume, ADX/DMI e
+# autoavaliação causal. O slot interno SNIPER é reutilizado apenas por compatibilidade.
+SUPERZ_LAMBDA_EMA = max(2, min(20, int(os.getenv("SUPERZ_LAMBDA_EMA", "5"))))
+SUPERZ_EMA = max(SUPERZ_LAMBDA_EMA + 2, min(60, int(os.getenv("SUPERZ_EMA", "18"))))
+SUPERZ_ATR_PERIOD = max(5, min(40, int(os.getenv("SUPERZ_ATR_PERIOD", "10"))))
+SUPERZ_Z_LOOKBACK = max(20, min(150, int(os.getenv("SUPERZ_Z_LOOKBACK", "50"))))
+SUPERZ_BASE_MULT = max(0.8, min(4.0, float(os.getenv("SUPERZ_BASE_MULT", "1.80"))))
+SUPERZ_Z_ADAPT = max(0.05, min(0.80, float(os.getenv("SUPERZ_Z_ADAPT", "0.22"))))
+SUPERZ_MULT_MIN = max(0.70, min(2.50, float(os.getenv("SUPERZ_MULT_MIN", "1.10"))))
+SUPERZ_MULT_MAX = max(SUPERZ_MULT_MIN + 0.40, min(5.00, float(os.getenv("SUPERZ_MULT_MAX", "3.20"))))
+SUPERZ_VOLUME_LOOKBACK = max(8, min(60, int(os.getenv("SUPERZ_VOLUME_LOOKBACK", "20"))))
+SUPERZ_VOLUME_FACTOR = max(0.70, min(2.00, float(os.getenv("SUPERZ_VOLUME_FACTOR", "1.02"))))
+SUPERZ_ADX_PERIOD = max(7, min(30, int(os.getenv("SUPERZ_ADX_PERIOD", "14"))))
+SUPERZ_ADX_MIN = max(12.0, min(40.0, float(os.getenv("SUPERZ_ADX_MIN", "20"))))
+SUPERZ_ADX_STRONG = max(SUPERZ_ADX_MIN + 3.0, min(55.0, float(os.getenv("SUPERZ_ADX_STRONG", "25"))))
+SUPERZ_CONVICTION_MIN = max(50.0, min(90.0, float(os.getenv("SUPERZ_CONVICTION_MIN", "60"))))
+SUPERZ_PREALERT_SECONDS = max(15, min(40, int(os.getenv("SUPERZ_PREALERT_SECONDS", "25"))))
+SUPERZ_HISTORY_BARS = max(180, min(1000, int(os.getenv("SUPERZ_HISTORY_BARS", "500"))))
+SUPERZ_BACKTEST_TARGET = 1000
 
 # AlphaX RELAY — padrão de vela é o gatilho principal; basta 1 confirmação
 # do contexto AlphaX para liberar CALL/PUT na próxima vela fechada.
@@ -405,7 +428,7 @@ BACKGROUND_SCAN_SECONDS = max(3.0, min(60.0, float(os.getenv("BACKGROUND_SCAN_SE
 BACKGROUND_RESULT_SECONDS = max(3.0, min(30.0, float(os.getenv("BACKGROUND_RESULT_SECONDS", "5"))))
 BACKGROUND_DEFAULT_ENABLED = os.getenv("BACKGROUND_SIGNALS_ENABLED", "0").strip().lower() in ("1", "true", "on", "yes")
 BACKGROUND_DEFAULT_ENGINE = os.getenv("BACKGROUND_ENGINE", "ALPHAX").strip().upper() or "ALPHAX"
-if BACKGROUND_DEFAULT_ENGINE in {"SNIPER", "RAPID", "SUNTZU"}:
+if BACKGROUND_DEFAULT_ENGINE in {"RAPID", "SUNTZU"}:
     BACKGROUND_DEFAULT_ENGINE = "ALPHAX"
 BACKGROUND_DEFAULT_MARKET = os.getenv("BACKGROUND_MARKET", "OPEN").strip().upper() or "OPEN"
 BACKGROUND_DEFAULT_INTERVAL = os.getenv("BACKGROUND_INTERVAL", "1min").strip() or "1min"
@@ -5321,7 +5344,7 @@ async def _binance_public_candles(symbol: str, interval: str, n: int = 80):
     b_interval = interval_map.get(interval)
     if not b_interval:
         raise RuntimeError("Intervalo não suportado pela Binance pública.")
-    limit = max(30, min(int(n) + 5, 500))
+    limit = max(30, min(int(n) + 5, 1000))
     last_error = ""
     for url in BINANCE_KLINES_URLS:
         try:
@@ -8424,6 +8447,309 @@ def sniper_pro_strategy(cs, timeframe="1min", market="OPEN"):
         },
     }
 
+
+
+
+def _superz_ema_full(values, period):
+    vals = [float(x) for x in (values or [])]
+    if not vals:
+        return []
+    period = max(1, int(period))
+    k = 2.0 / (period + 1.0)
+    out = [vals[0]]
+    for x in vals[1:]:
+        out.append(float(x) * k + out[-1] * (1.0 - k))
+    return out
+
+
+def _superz_atr_full(rows, period):
+    rows = list(rows or [])
+    n = len(rows)
+    out = [None] * n
+    if n < 2:
+        return out
+    trs = [None]
+    for i in range(1, n):
+        h = float(rows[i]["high"]); l = float(rows[i]["low"]); pc = float(rows[i-1]["close"])
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    seed = [x for x in trs[1:1+period] if x is not None]
+    if len(seed) < period:
+        return out
+    av = sum(seed) / period
+    out[period] = av
+    for i in range(period+1, n):
+        av = ((av * (period - 1)) + float(trs[i])) / period
+        out[i] = av
+    return out
+
+
+def _superz_series(rows):
+    """Calcula a cascata EMA, Z-Score adaptativo e trailing PMAX/Supertrend de forma causal."""
+    rows = list(rows or [])
+    n = len(rows)
+    if n < max(SUPERZ_Z_LOOKBACK + SUPERZ_EMA + 8, SUPERZ_ADX_PERIOD * 2 + 8):
+        return None
+    closes = [float(x["close"]) for x in rows]
+    e1 = _superz_ema_full(closes, SUPERZ_LAMBDA_EMA)
+    center = _superz_ema_full(e1, SUPERZ_EMA)
+    atrs = _superz_atr_full(rows, SUPERZ_ATR_PERIOD)
+    pdi, mdi, adx = _velocity_dmi_series(rows, SUPERZ_ADX_PERIOD, SUPERZ_ADX_PERIOD)
+
+    zvals = [None] * n
+    mults = [None] * n
+    upper = [None] * n
+    lower = [None] * n
+    trend = [0] * n
+    line = [None] * n
+
+    start = max(SUPERZ_Z_LOOKBACK-1, SUPERZ_ATR_PERIOD, SUPERZ_EMA)
+    for i in range(start, n):
+        w = center[max(0, i-SUPERZ_Z_LOOKBACK+1):i+1]
+        if len(w) < SUPERZ_Z_LOOKBACK or atrs[i] is None:
+            continue
+        mu = sum(w) / len(w)
+        var = sum((x-mu)**2 for x in w) / len(w)
+        sd = var ** 0.5
+        z = 0.0 if sd <= 1e-12 else (center[i] - mu) / sd
+        zvals[i] = z
+        mult = clamp(SUPERZ_BASE_MULT * (1.0 + min(abs(z), 3.0) * SUPERZ_Z_ADAPT), SUPERZ_MULT_MIN, SUPERZ_MULT_MAX)
+        mults[i] = float(mult)
+        bu = center[i] + float(atrs[i]) * float(mult)
+        bl = center[i] - float(atrs[i]) * float(mult)
+
+        prev_i = i-1
+        if prev_i >= 0 and upper[prev_i] is not None and lower[prev_i] is not None:
+            # Bandas finais estilo Supertrend/PMAX: só relaxam quando o preço permite.
+            upper[i] = bu if (bu < upper[prev_i] or center[prev_i] > upper[prev_i]) else upper[prev_i]
+            lower[i] = bl if (bl > lower[prev_i] or center[prev_i] < lower[prev_i]) else lower[prev_i]
+            prev_tr = trend[prev_i] if trend[prev_i] else (1 if center[i] >= center[prev_i] else -1)
+            if prev_tr > 0:
+                trend[i] = -1 if center[i] < lower[prev_i] else 1
+            else:
+                trend[i] = 1 if center[i] > upper[prev_i] else -1
+        else:
+            upper[i] = bu
+            lower[i] = bl
+            trend[i] = 1 if closes[i] >= center[i] else -1
+        line[i] = lower[i] if trend[i] > 0 else upper[i]
+
+    return {
+        "center": center, "atr": atrs, "z": zvals, "mult": mults,
+        "upper": upper, "lower": lower, "trend": trend, "line": line,
+        "plus_di": pdi, "minus_di": mdi, "adx": adx,
+    }
+
+
+def _superz_volume_snapshot(rows, idx=-1):
+    rows = list(rows or [])
+    if not rows:
+        return {"available": False, "volume": 0.0, "average": 0.0, "ratio": 0.0, "spike": False}
+    if idx < 0:
+        idx = len(rows) + idx
+    idx = max(0, min(idx, len(rows)-1))
+    start = max(0, idx - SUPERZ_VOLUME_LOOKBACK)
+    hist = [_sniper_volume(x) for x in rows[start:idx]]
+    hist = [v for v in hist if v > 0]
+    cur = _sniper_volume(rows[idx])
+    if not hist or cur <= 0:
+        return {"available": False, "volume": float(cur or 0), "average": 0.0, "ratio": 0.0, "spike": False}
+    avg = sum(hist) / len(hist)
+    ratio = cur / max(avg, 1e-12)
+    return {
+        "available": True, "volume": float(cur), "average": float(avg),
+        "ratio": float(ratio), "spike": bool(ratio >= SUPERZ_VOLUME_FACTOR),
+    }
+
+
+def _superz_backtest(rows, series):
+    rows = list(rows or [])
+    tr = list((series or {}).get("trend") or [])
+    start = max(1, len(rows) - SUPERZ_BACKTEST_TARGET)
+    wins = losses = draws = 0
+    fav = adv = 0.0
+    win_moves = []
+    loss_moves = []
+    signals = 0
+    for i in range(start, len(rows)-1):
+        if i >= len(tr) or tr[i] == 0 or tr[i-1] == 0 or tr[i] == tr[i-1]:
+            continue
+        direction = "CALL" if tr[i] > 0 else "PUT"
+        nxt = rows[i+1]
+        o = float(nxt["open"]); c = float(nxt["close"])
+        move = abs(c-o) / max(abs(o), 1e-12) * 100.0
+        signals += 1
+        good = (direction == "CALL" and c > o) or (direction == "PUT" and c < o)
+        bad = (direction == "CALL" and c < o) or (direction == "PUT" and c > o)
+        if good:
+            wins += 1; fav += move; win_moves.append(move)
+        elif bad:
+            losses += 1; adv += move; loss_moves.append(move)
+        else:
+            draws += 1
+    decided = wins + losses
+    winrate = (wins / decided * 100.0) if decided else 0.0
+    pf = (fav / adv) if adv > 1e-12 else (fav if fav > 0 else 0.0)
+    return {
+        "target_bars": SUPERZ_BACKTEST_TARGET,
+        "sample_bars": max(0, len(rows)-start),
+        "signals": signals, "wins": wins, "losses": losses, "draws": draws,
+        "edge_probability": round(winrate, 1),
+        "profit_factor_price": round(pf, 2),
+        "avg_win_pct": round(sum(win_moves)/len(win_moves), 4) if win_moves else 0.0,
+        "avg_loss_pct": round(sum(loss_moves)/len(loss_moves), 4) if loss_moves else 0.0,
+    }
+
+
+def _superz_tf_state(rows, label):
+    rows = list(rows or [])
+    s = _superz_series(rows)
+    if not s or not s["trend"]:
+        return {"timeframe": label, "trend": "WAIT", "adx": 0.0, "z": 0.0}
+    i = len(rows)-1
+    t = s["trend"][i]
+    av = s["adx"][i] if i < len(s["adx"]) else None
+    zv = s["z"][i] if i < len(s["z"]) else None
+    return {
+        "timeframe": label,
+        "trend": "BULL" if t > 0 else ("BEAR" if t < 0 else "WAIT"),
+        "adx": round(float(av or 0.0), 1),
+        "z": round(float(zv or 0.0), 2),
+    }
+
+
+def super_z_pmax_strategy(cs, timeframe="1min", market="OPEN", mtf=None, preview=False):
+    """SUPER Z PMAX — versão reconstruída para teste no MEGA IA.
+
+    PMAX/EMA Cascade 5→18 + Supertrend adaptativo por Z-Score + volume + ADX/DMI.
+    Um sinal real nasce na inversão do trailing trend e vale para a próxima vela.
+    `preview=True` é usado somente no pré-alerta de 25s e pode desaparecer antes do fechamento.
+    """
+    rows = list(cs or [])
+    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30", "1h":"H1", "4h":"H4"}.get(timeframe, timeframe)
+    name = f"SUPER Z PMAX • TESTE {tf_label}"
+    need = max(SUPERZ_Z_LOOKBACK + SUPERZ_EMA + 10, SUPERZ_ADX_PERIOD * 2 + 12)
+    if len(rows) < need:
+        return {
+            "available": True, "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
+            "risk": "HIGH", "strategy": name, "engine": "SUPER_Z_PMAX", "provider": "LOCAL_SUPER_Z_PMAX",
+            "reason": f"SUPER Z PMAX coletando histórico ({len(rows)}/{need}).", "non_repaint": not preview,
+            "preview": bool(preview), "gale_signal": False, "martingale": False, "next_candle": True,
+        }
+
+    series = _superz_series(rows)
+    if not series:
+        return {
+            "available": True, "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
+            "risk": "HIGH", "strategy": name, "engine": "SUPER_Z_PMAX", "provider": "LOCAL_SUPER_Z_PMAX",
+            "reason": "SUPER Z PMAX ainda sem histórico estatístico suficiente.", "non_repaint": not preview,
+            "preview": bool(preview), "gale_signal": False, "martingale": False,
+        }
+
+    i = len(rows)-1
+    t = int(series["trend"][i] or 0)
+    pt = int(series["trend"][i-1] or 0) if i > 0 else 0
+    flipped_up = t > 0 and pt < 0
+    flipped_down = t < 0 and pt > 0
+    av = float(series["adx"][i] or 0.0)
+    pdi = float(series["plus_di"][i] or 0.0)
+    mdi = float(series["minus_di"][i] or 0.0)
+    zv = float(series["z"][i] or 0.0)
+    mult = float(series["mult"][i] or SUPERZ_BASE_MULT)
+    line = float(series["line"][i] or 0.0)
+    center = float(series["center"][i] or 0.0)
+    vol = _superz_volume_snapshot(rows, i)
+    volume_ok = bool(vol["spike"] or not vol["available"])
+    adx_ok = av >= SUPERZ_ADX_MIN
+    dmi_call = pdi >= mdi
+    dmi_put = mdi >= pdi
+
+    direction = "CALL" if flipped_up else ("PUT" if flipped_down else "NEUTRO")
+    score = 0.0
+    reasons = []
+    if direction != "NEUTRO":
+        score += 40.0; reasons.append("virada PMAX/Supertrend")
+        if av >= SUPERZ_ADX_STRONG:
+            score += 25.0; reasons.append(f"ADX forte {av:.1f}")
+        elif adx_ok:
+            score += 18.0; reasons.append(f"ADX ativo {av:.1f}")
+        else:
+            reasons.append(f"ADX fraco {av:.1f}")
+        if vol["available"] and vol["spike"]:
+            score += 20.0; reasons.append(f"volume {vol['ratio']:.2f}x")
+        elif not vol["available"]:
+            score += 10.0; reasons.append("volume indisponível: fallback neutro")
+        else:
+            reasons.append(f"volume {vol['ratio']:.2f}x sem pico")
+        z_bonus = min(12.0, 5.0 + abs(zv) * 3.0)
+        score += z_bonus; reasons.append(f"Z {zv:+.2f} / mult {mult:.2f}")
+        if (direction == "CALL" and dmi_call) or (direction == "PUT" and dmi_put):
+            score += 8.0; reasons.append("DMI alinhado")
+        else:
+            score -= 6.0; reasons.append("DMI divergente")
+
+    mtf_scanner = []
+    if isinstance(mtf, dict):
+        for label in ("M15", "M30", "H1", "H4", "D1"):
+            if label in mtf:
+                mtf_scanner.append(_superz_tf_state(mtf.get(label), label))
+        if direction != "NEUTRO" and mtf_scanner:
+            wanted = "BULL" if direction == "CALL" else "BEAR"
+            aligned = sum(1 for x in mtf_scanner if x.get("trend") == wanted)
+            ready = sum(1 for x in mtf_scanner if x.get("trend") in ("BULL","BEAR"))
+            if ready:
+                mtf_bonus = min(10.0, aligned / ready * 10.0)
+                score += mtf_bonus
+                reasons.append(f"MTF {aligned}/{ready} alinhados")
+
+    score = clamp(score, 0.0, 99.0)
+    confirmed = bool(
+        direction in ("CALL", "PUT")
+        and score >= SUPERZ_CONVICTION_MIN
+        and adx_ok
+        and volume_ok
+        and ((direction == "CALL" and dmi_call) or (direction == "PUT" and dmi_put))
+    )
+    final_direction = direction if confirmed else "NEUTRO"
+
+    perf = _superz_backtest(rows, series)
+    regime = "TRENDING" if av >= SUPERZ_ADX_STRONG else ("TRANSITION" if av >= SUPERZ_ADX_MIN else "CHOPPY")
+    if confirmed:
+        reason = f"{direction} SUPER Z PMAX confirmado • " + "; ".join(reasons)
+    elif direction != "NEUTRO":
+        reason = f"Virada {direction} detectada, mas ainda sem confirmação completa • " + "; ".join(reasons)
+    else:
+        trend_text = "alta" if t > 0 else ("baixa" if t < 0 else "indefinida")
+        reason = f"SUPER Z PMAX monitorando tendência de {trend_text} • ADX {av:.1f} • Z {zv:+.2f} • volume {vol['ratio']:.2f}x."
+
+    return {
+        "available": True,
+        "direction": final_direction,
+        "candidate_direction": direction,
+        "confidence": round(float(score if confirmed else 0.0), 1),
+        "conviction_score": round(float(score), 1),
+        "confirmed": confirmed,
+        "risk": ("LOW" if confirmed and score >= 78 else ("MEDIUM" if confirmed else "HIGH")),
+        "strategy": name,
+        "engine": "SUPER_Z_PMAX",
+        "provider": "LOCAL_SUPER_Z_PMAX",
+        "reason": reason[:500],
+        "external_ai_disabled": True,
+        "gale_signal": False, "martingale": False, "direct_win_only": True,
+        "non_repaint": not preview, "preview": bool(preview), "next_candle": True,
+        "market_regime": regime,
+        "mtf_scanner": mtf_scanner,
+        "performance_dashboard": perf,
+        "diagnostics": {
+            "lambda_ema": SUPERZ_LAMBDA_EMA, "smooth_ema": SUPERZ_EMA,
+            "center": round(center, 10), "trend_line": round(line, 10),
+            "trend": "BULL" if t > 0 else ("BEAR" if t < 0 else "WAIT"),
+            "z_score": round(zv, 3), "adaptive_multiplier": round(mult, 3),
+            "adx": round(av, 2), "plus_di": round(pdi, 2), "minus_di": round(mdi, 2),
+            "volume_available": bool(vol["available"]), "volume_ratio": round(float(vol["ratio"]), 3),
+            "volume_spike": bool(vol["spike"]), "conviction_min": SUPERZ_CONVICTION_MIN,
+            "prealert_seconds": SUPERZ_PREALERT_SECONDS,
+        },
+    }
 
 
 def _alphax_choppiness(rows, period: int = ALPHAX_CHOP_LEN):
@@ -11774,7 +12100,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         entry_mode = "MIDDLE"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "ALPHAX"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
@@ -11943,24 +12269,25 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             else:
                 raw = await candles(sym, interval, 260, "OPEN", None, request=request)
         elif engine == "SNIPER":
+            # Slot SNIPER reaproveitado para o SUPER Z PMAX em modo de teste.
             if market == "IQ_OTC":
                 if not iq_state:
                     out = neutral_signal(
                         symbol, interval, market,
-                        "SNIPER PRO • IQ OPTION OFFLINE",
-                        "Conecte a IQ Option para o Sniper Pro analisar candles OTC reais.",
+                        "SUPER Z PMAX • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para o SUPER Z PMAX analisar candles OTC reais.",
                         source_state="WAITING",
                     )
                     out.update({
-                        "strategy": "SNIPER PRO MEGA", "mode": "SNIPER_PRO_MEGA",
+                        "strategy": "SUPER Z PMAX • TESTE", "mode": "SUPER_Z_PMAX",
                         "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
                         "non_repaint": True, "direct_win_only": True, "gale_signal": False,
                     })
                     cache[key] = (time.time(), out)
                     return out
-                raw = await iq_ea_candles(iq_state, symbol, interval, 140, regular_market=False)
+                raw = await iq_ea_candles(iq_state, symbol, interval, min(SUPERZ_HISTORY_BARS, 500), regular_market=False)
             else:
-                raw = await candles(symbol, interval, 140, "OPEN", None, request=request)
+                raw = await candles(symbol, interval, SUPERZ_HISTORY_BARS, "OPEN", None, request=request)
         elif engine == "ALPHAX":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -12131,7 +12458,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "VELOCITY":
             status = "VELOCITY FLOW • FONTE EM ESPERA" if market == "OPEN" else "VELOCITY FLOW • IQ OPTION EM ESPERA"
         elif engine == "SNIPER":
-            status = "SNIPER PRO • FONTE EM ESPERA" if market == "OPEN" else "SNIPER PRO • IQ OPTION EM ESPERA"
+            status = "SUPER Z PMAX • FONTE EM ESPERA" if market == "OPEN" else "SUPER Z PMAX • IQ OPTION EM ESPERA"
         elif engine == "ALPHAX":
             status = "ALPHAX RELAY • FONTE EM ESPERA" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION EM ESPERA"
         elif engine == "SAMURAI":
@@ -12168,7 +12495,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "VELOCITY":
             status = "VELOCITY FLOW • FONTE RECONECTANDO" if market == "OPEN" else "VELOCITY FLOW • IQ OPTION RECONECTANDO"
         elif engine == "SNIPER":
-            status = "SNIPER PRO • FONTE RECONECTANDO" if market == "OPEN" else "SNIPER PRO • IQ OPTION RECONECTANDO"
+            status = "SUPER Z PMAX • FONTE RECONECTANDO" if market == "OPEN" else "SUPER Z PMAX • IQ OPTION RECONECTANDO"
         elif engine == "ALPHAX":
             status = "ALPHAX RELAY • FONTE RECONECTANDO" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION RECONECTANDO"
         elif engine == "SAMURAI":
@@ -12248,8 +12575,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "VELOCITY FLOW • MR MT4"
             engine_mode = "VELOCITY_FLOW"
         elif engine == "SNIPER":
-            engine_title = "SNIPER PRO MEGA"
-            engine_mode = "SNIPER_PRO_MEGA"
+            engine_title = "SUPER Z PMAX • TESTE"
+            engine_mode = "SUPER_Z_PMAX"
         elif engine == "ALPHAX":
             engine_title = "ALPHAX RELAY"
             engine_mode = "ALPHAX_RELAY"
@@ -12298,7 +12625,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "LARRY": "LOCAL_LARRY_BREAKOUT",
                     "RANGE": "LOCAL_RANGE_COMPRESSION_BREAKOUT",
                     "VELOCITY": "LOCAL_VELOCITY_FLOW",
-                    "SNIPER": "LOCAL_SNIPER_PRO_MEGA",
+                    "SNIPER": "LOCAL_SUPER_Z_PMAX",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "RAPID": "LOCAL_RAPID_EAS",
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
@@ -12322,7 +12649,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = (closed[-260:] if engine == "RANGE" else (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else (closed[-90:] if len(closed) > 90 else closed))))
+            engine_closed = (closed[-260:] if engine == "RANGE" else (closed[-min(SUPERZ_HISTORY_BARS, len(closed)):] if engine == "SNIPER" else (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "RSI5", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else (closed[-90:] if len(closed) > 90 else closed)))))
             if engine == "SMART":
                 moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
                 analysis = await openai_direct_signal(
@@ -12341,7 +12668,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "VELOCITY":
                 analysis = velocity_flow_strategy(engine_closed, interval, market=market)
             elif engine == "SNIPER":
-                analysis = sniper_pro_strategy(engine_closed, interval, market=market)
+                # Scanner MTF derivado causalmente dos candles fechados disponíveis.
+                base_sec = int(INTERVALS.get(interval, 60))
+                mtf_rows = {}
+                for _label, _sec in (("M15",900),("M30",1800),("H1",3600),("H4",14400),("D1",86400)):
+                    if _sec >= base_sec:
+                        mtf_rows[_label] = _aggregate_closed_candles(engine_closed, _sec)
+                analysis = super_z_pmax_strategy(engine_closed, interval, market=market, mtf=mtf_rows, preview=False)
             elif engine == "ALPHAX":
                 alphax_seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
                 alphax_early_window=(ALPHAX_EARLY_MIN_REMAINING <= alphax_seconds_to_entry <= ALPHAX_EARLY_WINDOW_BEFORE)
@@ -12559,7 +12892,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "LARRY": "LOCAL_LARRY_BREAKOUT",
                     "RANGE": "LOCAL_RANGE_COMPRESSION_BREAKOUT",
                 "VELOCITY": "LOCAL_VELOCITY_FLOW",
-                "SNIPER": "LOCAL_SNIPER_PRO_MEGA",
+                "SNIPER": "LOCAL_SUPER_Z_PMAX",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "RAPID": "LOCAL_RAPID_EAS",
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
@@ -12759,7 +13092,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "LARRY": "larry_fingerprint",
                 "RANGE": "range_compression_fingerprint",
                 "VELOCITY": "velocity_fingerprint",
-                "SNIPER": "sniper_fingerprint",
+                "SNIPER": "superz_fingerprint",
                 "ALPHAX": "alphax_fingerprint",
                 "RAPID": "rapid_fingerprint",
                 "SAMURAI": "samurai_fingerprint",
@@ -12816,9 +13149,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     # Sniper permanece no modelo de candle fechado / nascimento.
                     sniper_age = max(0.0, (now() - current_boundary(interval)).total_seconds())
                     if sniper_age > 10.0:
-                        base["status"] = "ONLINE • SNIPER PRO • AGUARDANDO PRÓXIMO FECHAMENTO"
+                        base["status"] = "ONLINE • SUPER Z PMAX • AGUARDANDO PRÓXIMO FECHAMENTO"
                         base["reason"] = (
-                            "Setup Sniper detectado, mas a janela da próxima vela já passou. "
+                            "Setup SUPER Z PMAX detectado, mas a janela da próxima vela já passou. "
                             "A entrada tardia foi descartada; o motor recalcula no próximo candle fechado."
                         )
                         base["direction"] = "NEUTRO"
@@ -12934,7 +13267,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "LARRY": "SINAL LARRY BREAKOUT LIBERADO",
                         "RANGE": "SINAL RANGE COMPRESSION LIBERADO",
                         "VELOCITY": "SINAL VELOCITY FLOW LIBERADO",
-                        "SNIPER": "SINAL SNIPER PRO MEGA LIBERADO",
+                        "SNIPER": "SINAL SUPER Z PMAX LIBERADO",
                         "ALPHAX": "SINAL ALPHAX RELAY LIBERADO",
                         "RAPID": "SINAL NÚCLEO RÁPIDO EAs LIBERADO",
                         "SAMURAI": "SINAL ALGO SAMURAI • TREINAMENTO LIBERADO",
@@ -13108,7 +13441,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "LARRY": "LOCAL_LARRY_BREAKOUT",
                     "RANGE": "LOCAL_RANGE_COMPRESSION_BREAKOUT",
                 "VELOCITY": "LOCAL_VELOCITY_FLOW",
-                "SNIPER": "LOCAL_SNIPER_PRO_MEGA",
+                "SNIPER": "LOCAL_SUPER_Z_PMAX",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
                     "VOLUME_AI": "LOCAL_VOLUME_POC_AI_CONTEXT",
@@ -15850,7 +16183,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     "GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE",
-    "LARRY", "RANGE", "VELOCITY", "RSI5", "ALPHAX",
+    "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX",
 }
 
 
@@ -16700,7 +17033,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "ALPHAX"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX"):
         raise HTTPException(400, "Motor inválido.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
@@ -16798,12 +17131,12 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = feed_src
                     data["feed_label"] = _feed_source_label(feed_src)
                     data["feed_fallback"] = bool(feed_info.get("fallback"))
-                    data["feed_message"] = "Sniper Pro MEGA usando candles fechados do mercado aberto via roteador cTrader/multifuente."
+                    data["feed_message"] = "SUPER Z PMAX usando candles fechados do mercado aberto via roteador cTrader/multifuente."
                 else:
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                    data["feed_message"] = "Sniper Pro MEGA usando candles OTC reais da sessão IQ Option."
+                    data["feed_message"] = "SUPER Z PMAX usando candles OTC reais da sessão IQ Option."
             elif engine == "ALPHAX":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -17363,7 +17696,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "ALPHAX"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -17399,12 +17732,15 @@ async def pre_signals(
         }
 
     if engine == "SNIPER":
-        return {
-            "ok": True,
-            "message": "SNIPER PRO MEGA usa somente candles fechados; pré-sinal intrabar fica desligado para não repintar.",
-            "items": [],
-            "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
-        }
+        _superz_remain = int(max(0, (next_boundary(interval) - now()).total_seconds()))
+        if _superz_remain > SUPERZ_PREALERT_SECONDS:
+            return {
+                "ok": True,
+                "message": f"SUPER Z PMAX monitorando. O pré-alerta abre nos últimos {SUPERZ_PREALERT_SECONDS}s antes da próxima vela; faltam {_superz_remain}s.",
+                "items": [],
+                "seconds_to_entry": _superz_remain,
+                "prealert_seconds": SUPERZ_PREALERT_SECONDS,
+            }
 
     if engine == "ALPHAX":
         return {
@@ -17486,7 +17822,7 @@ async def pre_signals(
             "LARRY": "Larry Breakout",
             "RANGE": "Range Compression Breakout",
             "VELOCITY": "Velocity Flow",
-            "SNIPER": "Sniper Pro MEGA",
+            "SNIPER": "SUPER Z PMAX",
             "ALPHAX": "AlphaX RELAY",
             "RAPID": "Núcleo Rápido EAs",
             "SAMURAI": "Algo Samurai • Treinamento",
@@ -17558,7 +17894,7 @@ async def pre_signals(
     for symbol in batch:
         key = f"{group_key}|{symbol}"
         try:
-            pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (120 if engine == "RUBIK" else 90))
+            pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (180 if engine == "SNIPER" else (120 if engine == "RUBIK" else 90)))
             if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
@@ -17615,6 +17951,19 @@ async def pre_signals(
                         ),
                     }
                     if velocity_preview.get("confirmed") and velocity_preview.get("direction") in ("CALL", "PUT")
+                    else None
+                )
+            elif engine == "SNIPER":
+                superz_preview = super_z_pmax_strategy(raw, interval, market=requested_market, mtf=None, preview=True)
+                preview = (
+                    {
+                        "direction": superz_preview.get("direction"),
+                        "confidence": superz_preview.get("conviction_score", superz_preview.get("confidence", 0)),
+                        "strategy": superz_preview.get("strategy", "SUPER Z PMAX • TESTE"),
+                        "reason": (f"Pré-alerta provisório {SUPERZ_PREALERT_SECONDS}s: " + str(superz_preview.get("reason") or "PMAX/Z-Score/ADX/volume alinhados provisoriamente.")),
+                        "prealert_only": True,
+                    }
+                    if superz_preview.get("confirmed") and superz_preview.get("direction") in ("CALL", "PUT")
                     else None
                 )
             elif engine == "RSI5":
@@ -17690,9 +18039,13 @@ async def pre_signals(
                     "ALERTA VELOCITY • ENTRADA NA PRÓXIMA VELA"
                     if engine == "VELOCITY"
                     else (
-                        f"PRÉ-ALERTA RSI+ADX • {RSI_ADX_PREALERT_SECONDS}S • AGUARDANDO FECHAMENTO"
-                        if engine == "RSI5"
-                        else "PRÉ-SINAL • AGUARDANDO FECHAMENTO"
+                        f"PRÉ-ALERTA SUPER Z • {SUPERZ_PREALERT_SECONDS}S • AGUARDANDO FECHAMENTO"
+                        if engine == "SNIPER"
+                        else (
+                            f"PRÉ-ALERTA RSI+ADX • {RSI_ADX_PREALERT_SECONDS}S • AGUARDANDO FECHAMENTO"
+                            if engine == "RSI5"
+                            else "PRÉ-SINAL • AGUARDANDO FECHAMENTO"
+                        )
                     )
                 )
                 if moment_ea:
@@ -17762,13 +18115,17 @@ async def pre_signals(
             )
             if engine == "VELOCITY"
             else (
-                f"RSI + ADX Afiado: pré-alerta provisório nos últimos {RSI_ADX_PREALERT_SECONDS}s; "
-                "a entrada só é confirmada após o fechamento validar RSI9 4TF + ADX/DMI14."
-                if engine == "RSI5"
+                f"SUPER Z PMAX: pré-alerta provisório nos últimos {SUPERZ_PREALERT_SECONDS}s; a entrada só é confirmada após o fechamento validar PMAX/Z-Score + ADX/DMI + volume."
+                if engine == "SNIPER"
                 else (
-                    "Pré-sinais calculados com a vela em formação. "
-                    "Na Inteligência Artificial, a EA Vela Atual mede força/micro-momento antes da entrada; "
-                    "o CALL/PUT final ainda passa por Luna + XGBoost + filtros de risco."
+                    f"RSI + ADX Afiado: pré-alerta provisório nos últimos {RSI_ADX_PREALERT_SECONDS}s; "
+                    "a entrada só é confirmada após o fechamento validar RSI9 4TF + ADX/DMI14."
+                    if engine == "RSI5"
+                    else (
+                        "Pré-sinais calculados com a vela em formação. "
+                        "Na Inteligência Artificial, a EA Vela Atual mede força/micro-momento antes da entrada; "
+                        "o CALL/PUT final ainda passa por Luna + XGBoost + filtros de risco."
+                    )
                 )
             )
         ),
@@ -17992,7 +18349,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "ALPHAX"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX"):
         raise HTTPException(400, "Motor inválido.")
 
     requested_market = market
@@ -18073,10 +18430,10 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         elif engine == "SNIPER":
             if market == "IQ_OTC":
                 if not iq_state:
-                    raise RuntimeError("Conecte a IQ Option para o Sniper Pro analisar OTC.")
-                raw = await iq_ea_candles(iq_state, sym, interval, 140, regular_market=False)
+                    raise RuntimeError("Conecte a IQ Option para o SUPER Z PMAX analisar OTC.")
+                raw = await iq_ea_candles(iq_state, sym, interval, min(SUPERZ_HISTORY_BARS, 500), regular_market=False)
             else:
-                raw = await candles(sym, interval, 140, "OPEN", None, request=request)
+                raw = await candles(sym, interval, SUPERZ_HISTORY_BARS, "OPEN", None, request=request)
         elif engine == "ALPHAX":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -18195,10 +18552,10 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     else f"{engine_label} • MONITORANDO • {why}"
                 )
             elif engine == "SNIPER":
-                tech = sniper_pro_strategy(closed, interval, market=market)
-                engine_label = "SNIPER PRO MEGA"
+                tech = super_z_pmax_strategy(closed, interval, market=market, mtf=None, preview=False)
+                engine_label = "SUPER Z PMAX"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why = str(tech.get("reason") or "Sniper Pro monitorando").replace("\n", " ")[:88]
+                why = str(tech.get("reason") or "SUPER Z PMAX monitorando").replace("\n", " ")[:88]
                 status_text = (
                     f"{engine_label} • OPORTUNIDADE ENCONTRADA"
                     if direction != "NEUTRO"
@@ -18411,7 +18768,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         elif engine == "VELOCITY":
             source_status = "VELOCITY FLOW • FONTE EM ESPERA" if market == "OPEN" else "VELOCITY FLOW • IQ OPTION OTC EM ESPERA"
         elif engine == "SNIPER":
-            source_status = "SNIPER PRO • FONTE EM ESPERA" if market == "OPEN" else "SNIPER PRO • IQ OPTION OTC EM ESPERA"
+            source_status = "SUPER Z PMAX • FONTE EM ESPERA" if market == "OPEN" else "SUPER Z PMAX • IQ OPTION OTC EM ESPERA"
         elif engine == "ALPHAX":
             source_status = "ALPHAX RELAY • FONTE EM ESPERA" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION OTC EM ESPERA"
         elif engine == "RAPID":
@@ -18811,7 +19168,7 @@ async def result(
     - LOSS/empate no G1 => aguarda G2.
     - WIN no G2 => WIN G2; caso contrário => LOSS G2.
 
-    ``direct_only=true`` fecha somente a primeira vela. EA Tripla, EA Força, BIGRISE, LARRY BREAKOUT, VELOCITY FLOW, SNIPER PRO, ALPHAX RELAY e RSI + ADX AFIADO
+    ``direct_only=true`` fecha somente a primeira vela. EA Tripla, EA Força, BIGRISE, LARRY BREAKOUT, VELOCITY FLOW, SUPER Z PMAX, ALPHAX RELAY e RSI + ADX AFIADO
     usam esse modo; os demais motores podem acompanhar G1/G2.
     """
     if not expiry_time:
@@ -19318,7 +19675,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • RSI + ADX Afiado + AlphaX • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • SUPER Z PMAX + RSI/ADX + AlphaX • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -19411,6 +19768,16 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="alphaxPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
+
+
+  <div class="robot-mode-card" id="sniperModeCard">
+    <img src="__MEGA_IMAGE__" alt="SUPER Z PMAX">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">📊 SUPER Z PMAX • TESTE</div>
+      <div class="robot-mode-desc" id="sniperModeDesc">PMAX EMA 5→18 • Z-Score adaptativo • ADX/DMI • volume • pré-alerta 25s • próxima vela • autoavaliação.</div>
+    </div>
+    <button id="sniperPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
 
 
   <div class="robot-mode-card" id="rsi5ModeCard">
@@ -20053,8 +20420,8 @@ const larryPowerBtn=document.getElementById('larryPowerBtn');
 const larryModeDesc=document.getElementById('larryModeDesc');
 const rangePowerBtn=document.getElementById('rangePowerBtn');
 const rangeModeDesc=document.getElementById('rangeModeDesc');
-const sniperPowerBtn=null;
-const sniperModeDesc=null;
+const sniperPowerBtn=document.getElementById('sniperPowerBtn');
+const sniperModeDesc=document.getElementById('sniperModeDesc');
 const alphaxPowerBtn=document.getElementById('alphaxPowerBtn');
 const alphaxModeDesc=document.getElementById('alphaxModeDesc');
 const rapidPowerBtn=null;
@@ -20131,8 +20498,7 @@ try{
   larryEnabled=localStorage.getItem('mega_larry_power')==='ONLINE' || legacyEaOnline || legacyRubikOnline;
   rangeEnabled=localStorage.getItem('mega_range_power')==='ONLINE';
   velocityEnabled=localStorage.getItem('mega_velocity_power')==='ONLINE';
-  sniperEnabled=false;
-  localStorage.removeItem('mega_sniper_power');
+  sniperEnabled=localStorage.getItem('mega_sniper_power')==='ONLINE';
   alphaxEnabled=localStorage.getItem('mega_alphax_power')==='ONLINE';
   rapidEnabled=false;
   localStorage.removeItem('mega_rapid_power');
@@ -20170,6 +20536,7 @@ try{
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
+  if(sniperEnabled) return 'SNIPER';
   if(rangeEnabled) return 'RANGE';
   if(alphaxEnabled) return 'ALPHAX';
   if(rsi5Enabled) return 'RSI5';
@@ -20193,11 +20560,12 @@ function adoptBackgroundEngineState(d){
   }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(['SNIPER','RAPID','SUNTZU'].includes(e)) return;
+  if(['RAPID','SUNTZU'].includes(e)) return;
   robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
   forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false;
   rsi5Enabled=false; sniperEnabled=false; alphaxEnabled=false; rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false; rangeEnabled=false;
-  if(e==='RANGE') rangeEnabled=true;
+  if(e==='SNIPER') sniperEnabled=true;
+  else if(e==='RANGE') rangeEnabled=true;
   else if(e==='ALPHAX') alphaxEnabled=true;
   else if(e==='RSI5') rsi5Enabled=true;
   else if(e==='VELOCITY') velocityEnabled=true;
@@ -23686,8 +24054,8 @@ function applyRobotPowerState(){
     ? 'ONLINE: rompimento + força/expansão de vela • candles fechados • OPEN/OTC • sem Grid, Martingale ou Gale.'
     : 'OFFLINE: Larry Breakout pausado.';
   if(sniperModeDesc) sniperModeDesc.textContent=sniperEnabled
-    ? 'ONLINE: score 5/8 • EMA 9/21 + VWAP + RSI + MACD + ADX/DMI + volume + price action • candle fechado • próxima vela • sem Gale.'
-    : 'OFFLINE: Sniper Pro MEGA pausado.';
+    ? 'ONLINE: PMAX EMA 5→18 + Z-Score adaptativo + ADX/DMI + volume • pré-alerta 25s • confirmação no fechamento • próxima vela.'
+    : 'OFFLINE: SUPER Z PMAX pausado.';
   if(alphaxModeDesc) alphaxModeDesc.textContent=alphaxEnabled
     ? 'ONLINE: AlphaX + zonas fractal/institucional + microimpulso/LWMA/MACD • sinal oficial ~30s antes • entrada na próxima vela • sem Gale.'
     : 'OFFLINE: AlphaX RELAY pausado.';
@@ -23749,9 +24117,9 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar Samurai ativo • procurando rompimentos/impulsos para treino</div>';
     rad();
   }else if(engine==='SNIPER'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='SNIPER PRO MEGA ONLINE • SCORE 5/8 • VELA FECHADA • PRÓXIMA VELA • SEM GALE';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 Sniper Pro MEGA selecionado • sem pré-sinal intrabar • decisão só após candle fechado para não repintar.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar Sniper Pro ativo • EMA 9/21 + VWAP + RSI + MACD + ADX/DMI + volume + price action</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='SUPER Z PMAX ONLINE • PMAX 5→18 + Z-SCORE + ADX/DMI + VOLUME • PRÉ-ALERTA 25S';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📊 SUPER Z PMAX selecionado • pré-alerta 25s • confirmação final no fechamento • entrada na próxima vela.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar SUPER Z PMAX ativo • tendência + regime + volume + convicção</div>';
     rad();
   }else if(engine==='RSI5'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI + ADX AFIADO ONLINE • RSI9 + ADX/DMI14 • ADX ≥25 • PRÓXIMA VELA';
@@ -24175,7 +24543,7 @@ async function setSniperPower(enabled){
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled) speak(sniperEnabled ? 'Sniper Pro MEGA online.' : 'Sniper Pro MEGA offline.');
+  if(voiceEnabled) speak(sniperEnabled ? 'Super Z P Max online.' : 'Super Z P Max offline.');
 }
 
 
@@ -24793,7 +25161,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='ALPHAX'?'ALPHAX RELAY':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'INTELIGÊNCIA ARTIFICIAL':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='ALPHAX'?'ALPHAX RELAY':ek==='SNIPER'?'SUPER Z PMAX':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'INTELIGÊNCIA ARTIFICIAL':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
@@ -25463,10 +25831,10 @@ setInterval(()=>{
 // Pré-alerta geral permanece leve. No RSI + ADX usamos um relógio mais curto
 // para capturar a janela de 25 s com precisão sem aumentar a carga dos outros motores.
 setInterval(()=>{
-  if(megaCanPoll() && selectedRobotEngine()!=='OFF' && selectedRobotEngine()!=='RSI5') loadPreSignals();
+  if(megaCanPoll() && selectedRobotEngine()!=='OFF' && !['RSI5','SNIPER'].includes(selectedRobotEngine())) loadPreSignals();
 },10000);
 setInterval(()=>{
-  if(megaCanPoll() && selectedRobotEngine()==='RSI5') loadPreSignals();
+  if(megaCanPoll() && ['RSI5','SNIPER'].includes(selectedRobotEngine())) loadPreSignals();
 },2000);
 
 // Resultado das operações abertas.
