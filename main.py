@@ -181,6 +181,17 @@ SGH_TRIGGER_DISTANCE_POINTS = 10
 SGH_PROFILE_MODE = str(os.getenv("SGH_PROFILE_MODE", "SCALPER") or "SCALPER").strip().upper()
 SGH_COOLDOWN_SECONDS = max(60, min(1800, int(os.getenv("SGH_COOLDOWN_SECONDS", "60"))))
 
+# M1 RÁPIDO — perfil separado para opções binárias. O perfil SGH original continua
+# intacto e é usado nos demais timeframes (ou em M1 quando SGH_M1_FAST_ENABLED=0).
+# Mantemos a fórmula/offset do perfil escolhido; apenas a leitura de swings e o
+# gatilho ficam mais responsivos no M1. Continua usando vela fechada e próxima vela.
+SGH_M1_FAST_ENABLED = os.getenv("SGH_M1_FAST_ENABLED", "1").strip().lower() in ("1", "true", "on", "yes")
+SGH_M1_FAST_DEPTH = max(5, min(18, int(os.getenv("SGH_M1_FAST_DEPTH", "8"))))
+SGH_M1_FAST_DEVIATION_POINTS = max(2, min(10, int(os.getenv("SGH_M1_FAST_DEVIATION_POINTS", "6"))))
+SGH_M1_FAST_BACKSTEP = max(1, min(3, int(os.getenv("SGH_M1_FAST_BACKSTEP", "2"))))
+SGH_M1_FAST_TRIGGER_DISTANCE_POINTS = max(2, min(10, int(os.getenv("SGH_M1_FAST_TRIGGER_DISTANCE_POINTS", "5"))))
+SGH_M1_FAST_COOLDOWN_SECONDS = max(30, min(120, int(os.getenv("SGH_M1_FAST_COOLDOWN_SECONDS", "45"))))
+
 # Sniper Pro MEGA — adaptação do indicador MQ5 para opções binárias.
 # Usa somente candles fechados e libera CALL/PUT para a próxima vela.
 SNIPER_EMA_FAST = max(3, min(50, int(os.getenv("SNIPER_EMA_FAST", "9"))))
@@ -8154,7 +8165,14 @@ def sgh_next_candle_strategy(cs, timeframe="1min", market="OPEN", symbol=""):
     rows = list(cs or [])
     profile = _sgh_profile()
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30", "1h":"H1"}.get(timeframe, timeframe)
-    name = f"SMART GOLD HUNTER {profile['name'].upper()} {tf_label}"
+    m1_fast = bool(SGH_M1_FAST_ENABLED and str(timeframe).lower() in ("1min", "m1", "1m"))
+    effective_depth = SGH_M1_FAST_DEPTH if m1_fast else int(profile["swing_depth"])
+    effective_deviation_points = SGH_M1_FAST_DEVIATION_POINTS if m1_fast else SGH_ZIGZAG_DEVIATION_POINTS
+    effective_backstep = SGH_M1_FAST_BACKSTEP if m1_fast else SGH_ZIGZAG_BACKSTEP
+    effective_trigger_points = SGH_M1_FAST_TRIGGER_DISTANCE_POINTS if m1_fast else SGH_TRIGGER_DISTANCE_POINTS
+    effective_cooldown = SGH_M1_FAST_COOLDOWN_SECONDS if m1_fast else SGH_COOLDOWN_SECONDS
+    mode_label = "M1 RÁPIDO" if m1_fast else tf_label
+    name = f"SMART GOLD HUNTER {profile['name'].upper()} {mode_label}"
     need = SGH_COPY_RATES_COUNT
     if len(rows) < need:
         return {
@@ -8172,8 +8190,8 @@ def sgh_next_candle_strategy(cs, timeframe="1min", market="OPEN", symbol=""):
     # CopyRates(..., 0, 300). O ZigZag ignora shift 0 ao escolher os dois extremos.
     series = list(reversed(rates))
     raw_point, normalized_point = _sgh_symbol_points(symbol, rates)
-    deviation_price = SGH_ZIGZAG_DEVIATION_POINTS * normalized_point
-    built = _sgh_build_zigzag(series, int(profile["swing_depth"]), deviation_price, SGH_ZIGZAG_BACKSTEP)
+    deviation_price = effective_deviation_points * normalized_point
+    built = _sgh_build_zigzag(series, effective_depth, deviation_price, effective_backstep)
     if not built:
         return {
             "available": True, "direction": "NEUTRO", "confidence": 0.0,
@@ -8198,7 +8216,7 @@ def sgh_next_candle_strategy(cs, timeframe="1min", market="OPEN", symbol=""):
         }
 
     actionable = previous
-    trigger_distance = SGH_TRIGGER_DISTANCE_POINTS * normalized_point
+    trigger_distance = effective_trigger_points * normalized_point
     offset = float(profile["entry_offset_points"]) * raw_point
     original_side = "NONE"
     entry_price = 0.0
@@ -8245,7 +8263,7 @@ def sgh_next_candle_strategy(cs, timeframe="1min", market="OPEN", symbol=""):
         if original_side == "NONE":
             reason = "SMART GOLD HUNTER monitorando: os dois extremos estão sem direção de preço válida."
         elif not armed:
-            reason = f"SMART GOLD HUNTER monitorando: {original_side} existe, mas ainda não havia distância mínima de 10 pontos normalizados para armar o nível."
+            reason = f"SMART GOLD HUNTER monitorando: {original_side} existe, mas ainda não havia distância mínima de {effective_trigger_points} pontos normalizados para armar o nível."
         else:
             reason = f"SMART GOLD HUNTER monitorando: {original_side} armado em {entry_price:.8g}; aguardando cruzamento confirmado por vela fechada."
 
@@ -8273,9 +8291,11 @@ def sgh_next_candle_strategy(cs, timeframe="1min", market="OPEN", symbol=""):
             "native_profile_timeframe": profile["native_timeframe"],
             "app_timeframe": tf_label,
             "copy_rates_count": SGH_COPY_RATES_COUNT,
-            "swing_depth": int(profile["swing_depth"]),
-            "zigzag_deviation_points": SGH_ZIGZAG_DEVIATION_POINTS,
-            "zigzag_backstep": SGH_ZIGZAG_BACKSTEP,
+            "mode": "M1_FAST" if m1_fast else "ORIGINAL_PROFILE",
+            "m1_fast_enabled": bool(m1_fast),
+            "swing_depth": int(effective_depth),
+            "zigzag_deviation_points": int(effective_deviation_points),
+            "zigzag_backstep": int(effective_backstep),
             "latest_extremum": latest,
             "previous_extremum": previous,
             "original_side": original_side,
@@ -8283,10 +8303,11 @@ def sgh_next_candle_strategy(cs, timeframe="1min", market="OPEN", symbol=""):
             "entry_price": round(float(entry_price), 10),
             "raw_point": raw_point,
             "normalized_point": normalized_point,
+            "trigger_distance_points": int(effective_trigger_points),
             "trigger_distance": trigger_distance,
             "armed": bool(armed),
             "fresh_closed_cross": bool(fresh_cross),
-            "cooldown_seconds": SGH_COOLDOWN_SECONDS,
+            "cooldown_seconds": int(effective_cooldown),
             "trade_engine_used_for_execution": False,
         },
     }
@@ -13843,11 +13864,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key] = (time.time(), base)
                         return base
                     last_sgh_ts = float(release_state.get("last_sgh_signal_ts", 0.0) or 0.0)
-                    sgh_remaining = max(0, int(SGH_COOLDOWN_SECONDS - (time.time() - last_sgh_ts))) if last_sgh_ts else 0
+                    sgh_diag = analysis.get("diagnostics") if isinstance(analysis.get("diagnostics"), dict) else {}
+                    sgh_cooldown = max(30, int(sgh_diag.get("cooldown_seconds", SGH_COOLDOWN_SECONDS) or SGH_COOLDOWN_SECONDS))
+                    sgh_remaining = max(0, int(sgh_cooldown - (time.time() - last_sgh_ts))) if last_sgh_ts else 0
                     if sgh_remaining > 0:
                         base["status"] = "ONLINE • SMART GOLD HUNTER • PAUSA ENTRE SINAIS"
                         base["reason"] = f"Novo rompimento encontrado, mas o motor aguarda mais {sgh_remaining}s para respeitar a pausa configurada."
-                        base["sgh_cooldown_seconds"] = SGH_COOLDOWN_SECONDS
+                        base["sgh_cooldown_seconds"] = sgh_cooldown
                         base["sgh_cooldown_remaining"] = sgh_remaining
                         base["direction"] = "NEUTRO"
                         base["entry_time"] = None
@@ -14043,14 +14066,18 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 if engine == "SGH":
                     base["non_repaint_after_release"] = True
                     base["signal_snapshot"] = "SGH_PENDING_LEVEL_CROSSED_BY_LAST_CLOSED_CANDLE"
+                    sgh_diag = analysis.get("diagnostics") if isinstance(analysis.get("diagnostics"), dict) else {}
                     base["sgh"] = {
                         "copy_rates_count": SGH_COPY_RATES_COUNT,
                         "extrema_scan_limit": SGH_EXTREMA_SCAN_LIMIT,
-                        "zigzag_deviation_points": SGH_ZIGZAG_DEVIATION_POINTS,
-                        "zigzag_backstep": SGH_ZIGZAG_BACKSTEP,
-                        "trigger_distance_points": SGH_TRIGGER_DISTANCE_POINTS,
+                        "mode": sgh_diag.get("mode", "ORIGINAL_PROFILE"),
+                        "m1_fast_enabled": bool(sgh_diag.get("m1_fast_enabled", False)),
+                        "swing_depth": int(sgh_diag.get("swing_depth", _sgh_profile().get("swing_depth", 18))),
+                        "zigzag_deviation_points": int(sgh_diag.get("zigzag_deviation_points", SGH_ZIGZAG_DEVIATION_POINTS)),
+                        "zigzag_backstep": int(sgh_diag.get("zigzag_backstep", SGH_ZIGZAG_BACKSTEP)),
+                        "trigger_distance_points": int(sgh_diag.get("trigger_distance_points", SGH_TRIGGER_DISTANCE_POINTS)),
                         "profile": SGH_PROFILE_MODE,
-                        "cooldown_seconds": SGH_COOLDOWN_SECONDS,
+                        "cooldown_seconds": int(sgh_diag.get("cooldown_seconds", SGH_COOLDOWN_SECONDS)),
                         "source": "SGH_SignalEngine.mqh clean-room port",
                         "trade_engine": "SGH_TradeEngine.mqh reviewed; MT5 order execution not used by binary engine",
                     }
@@ -14089,7 +14116,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     base["rsi_adx_cooldown_remaining"] = 0
                 if engine == "SGH":
                     release_state["last_sgh_signal_ts"] = time.time()
-                    base["sgh_cooldown_seconds"] = SGH_COOLDOWN_SECONDS
+                    sgh_diag = analysis.get("diagnostics") if isinstance(analysis.get("diagnostics"), dict) else {}
+                    base["sgh_cooldown_seconds"] = max(30, int(sgh_diag.get("cooldown_seconds", SGH_COOLDOWN_SECONDS) or SGH_COOLDOWN_SECONDS))
                     base["sgh_cooldown_remaining"] = 0
 
                 # Só as IAs entram no ciclo com Gale. EAs continuam com sua
@@ -18550,7 +18578,7 @@ async def pre_signals(
     if engine == "SGH":
         return {
             "ok": True,
-            "message": "SMART GOLD HUNTER usa o ZigZag e os níveis BUY_STOP/SELL_STOP reconstruídos do SGH_SignalEngine; o CALL/PUT só libera após cruzamento em vela fechada e vale para a vela seguinte.",
+            "message": "SMART GOLD HUNTER usa o ZigZag e os níveis BUY_STOP/SELL_STOP reconstruídos do SGH_SignalEngine. Em M1, o perfil M1 RÁPIDO usa swings mais curtos e gatilho mais próximo; CALL/PUT continua liberando somente após cruzamento em vela fechada para a próxima vela.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
