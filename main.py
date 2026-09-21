@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.83.0"
-PWA_VERSION = "v142"
+APP_VERSION = "3.80.1"
+PWA_VERSION = "v139"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -83,14 +83,13 @@ EA_VALUE_CHART_PERIOD = max(3, int(os.getenv("EA_VALUE_CHART_PERIOD", "5")))
 EA_VALUE_CHART_EXTREME = max(4.0, min(12.0, float(os.getenv("EA_VALUE_CHART_EXTREME", "8"))))
 
 # MEGA IA 3.52 — LARRY BREAKOUT para opções binárias.
-# MEGA IA 3.82 — Larry levemente mais solto: corpo 45%, expansão 0.85x e fechamento 65/35.
 # Adaptação do conceito de rompimento do Larry FX, sem Grid, sem Martingale,
 # sem aumento de mão e sem ordens pendentes. Só usa candles fechados.
 LARRY_LOOKBACK = max(6, min(30, int(os.getenv("LARRY_LOOKBACK", "12"))))
 LARRY_ATR_PERIOD = max(5, min(30, int(os.getenv("LARRY_ATR_PERIOD", "14"))))
 LARRY_BREAK_BUFFER_ATR = max(0.0, min(0.30, float(os.getenv("LARRY_BREAK_BUFFER_ATR", "0.03"))))
-LARRY_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("LARRY_MIN_BODY_RATIO", "0.45"))))
-LARRY_MIN_RANGE_EXPANSION = max(0.70, min(2.00, float(os.getenv("LARRY_MIN_RANGE_EXPANSION", "0.85"))))
+LARRY_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("LARRY_MIN_BODY_RATIO", "0.48"))))
+LARRY_MIN_RANGE_EXPANSION = max(0.70, min(2.00, float(os.getenv("LARRY_MIN_RANGE_EXPANSION", "0.90"))))
 LARRY_MAX_RANGE_ATR = max(1.20, min(6.00, float(os.getenv("LARRY_MAX_RANGE_ATR", "3.00"))))
 
 # MEGA IA 3.68 — Velocity Flow mais solto, porém ainda confirmado em vela fechada.
@@ -416,20 +415,17 @@ background_bot_state: Dict[str, Any] = {
 
 
 # MEGA IA 3.56 — BTC FORCE DOM: vela de força + região forte/LTA/LTB + profundidade de mercado.
-# MEGA IA 3.83 — BTC FORCE moderadamente mais solto: corpo/ATR/fechamento/DOM e zonas com tolerância um pouco maior.
-# 3.81 — BTC FORCE moderadamente mais solto: mantém força + estrutura + DOM obrigatórios,
-# mas amplia a frequência reduzindo os limiares e alargando um pouco as zonas estruturais.
 BIGRISE_BTC_SYMBOL = "BTC/USD"  # chave interna antiga preservada para compatibilidade do painel
 BTC_FORCE_ATR_PERIOD = max(5, min(30, int(os.getenv("BTC_FORCE_ATR_PERIOD", "14"))))
-BTC_FORCE_MIN_BODY_ATR = max(0.08, min(1.20, float(os.getenv("BTC_FORCE_MIN_BODY_ATR", "0.13"))))
-BTC_FORCE_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("BTC_FORCE_MIN_BODY_RATIO", "0.35"))))
-BTC_FORCE_MIN_CLOSE_POS = max(0.55, min(0.90, float(os.getenv("BTC_FORCE_MIN_CLOSE_POS", "0.58"))))
+BTC_FORCE_MIN_BODY_ATR = max(0.08, min(1.20, float(os.getenv("BTC_FORCE_MIN_BODY_ATR", "0.20"))))
+BTC_FORCE_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("BTC_FORCE_MIN_BODY_RATIO", "0.43"))))
+BTC_FORCE_MIN_CLOSE_POS = max(0.55, min(0.90, float(os.getenv("BTC_FORCE_MIN_CLOSE_POS", "0.66"))))
 BTC_FORCE_MAX_RANGE_ATR = max(1.50, min(6.00, float(os.getenv("BTC_FORCE_MAX_RANGE_ATR", "3.20"))))
 BTC_FORCE_SIGNAL_COOLDOWN_SECONDS = max(180, min(900, int(os.getenv("BTC_FORCE_SIGNAL_COOLDOWN_SECONDS", "240"))))
 # DOM/Level II: confirmação adicional do fluxo. cTrader é preferida quando conectada;
 # Binance COIN-M BTCUSD_PERP é fallback público 24/7 para o BTC/USD.
 BTC_DOM_ENABLED = os.getenv("BTC_DOM_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
-BTC_DOM_MIN_SIDE_SHARE = max(0.51, min(0.75, float(os.getenv("BTC_DOM_MIN_SIDE_SHARE", "0.52"))))
+BTC_DOM_MIN_SIDE_SHARE = max(0.51, min(0.75, float(os.getenv("BTC_DOM_MIN_SIDE_SHARE", "0.56"))))
 BTC_DOM_CACHE_TTL = max(2.0, min(30.0, float(os.getenv("BTC_DOM_CACHE_TTL", "6"))))
 BTC_DOM_BAND_PCT = max(0.0005, min(0.01, float(os.getenv("BTC_DOM_BAND_PCT", "0.0035"))))
 BTC_DOM_BINANCE_SYMBOL = os.getenv("BTC_DOM_BINANCE_SYMBOL", "BTCUSD_PERP").strip() or "BTCUSD_PERP"
@@ -7397,9 +7393,9 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None,
         levels = _support_resistance_levels(data, "1h" if tf_name == "H1" else "4h")
         tf_atr = atr(data, 14)
         zone_radius = max(
-            float(levels.get("tolerance", 0.0) or 0.0) * 2.45,
-            (float(tf_atr) * (0.34 if tf_name == "H1" else 0.25)) if tf_atr else 0.0,
-            abs(c) * 0.00032,
+            float(levels.get("tolerance", 0.0) or 0.0) * 1.8,
+            (float(tf_atr) * (0.22 if tf_name == "H1" else 0.16)) if tf_atr else 0.0,
+            abs(c) * 0.00020,
         )
         for x in levels.get("supports", []):
             supports.append({"tf": tf_name, "price": float(x["price"]), "touches": int(x.get("touches", 2)), "radius": zone_radius})
@@ -7425,7 +7421,7 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None,
         highs, lows = _otc_swing_points(sample, 2, 2)
         h4_ranges = [max(float(x["high"]) - float(x["low"]), 1e-12) for x in sample[-20:]]
         h4_avg_range = sum(h4_ranges) / max(1, len(h4_ranges)) if h4_ranges else float(a)
-        line_tol = max(h4_avg_range * 0.25, float(a) * 1.15, abs(c) * 0.00040)
+        line_tol = max(h4_avg_range * 0.16, float(a) * 0.85, abs(c) * 0.00025)
         current_idx = len(sample) - 1
 
         if len(lows) >= 2:
@@ -7607,8 +7603,8 @@ def larry_breakout_strategy(cs, timeframe="1min", market="OPEN"):
     body_ok = body_ratio >= LARRY_MIN_BODY_RATIO
     expansion_ok = expansion >= LARRY_MIN_RANGE_EXPANSION
     not_exhausted = candle_range <= (a * LARRY_MAX_RANGE_ATR)
-    call_close_ok = close_pos >= 0.65 and c > o
-    put_close_ok = close_pos <= 0.35 and c < o
+    call_close_ok = close_pos >= 0.68 and c > o
+    put_close_ok = close_pos <= 0.32 and c < o
 
     # Contexto simples de continuidade, sem RSI/Value Chart/MACD.
     prev_closes = [float(x["close"]) for x in rows[-6:-1]]
@@ -18403,6 +18399,9 @@ body{margin:0;background:radial-gradient(circle at 50% 0,#07182b 0,#030812 42%,#
 @keyframes moneyRise{0%{opacity:0;transform:translate(-50%,70px) rotate(var(--rot)) scale(.8)}12%{opacity:1}78%{opacity:1}100%{opacity:0;transform:translate(-50%,-330px) rotate(calc(var(--rot) * -1)) scale(1.08)}}
 @keyframes moneyFall{0%{opacity:0;transform:translate(-50%,-90px) rotate(var(--rot)) scale(.82)}12%{opacity:1}80%{opacity:1}100%{opacity:0;transform:translate(-50%,330px) rotate(calc(var(--rot) * -1)) scale(1.06)}}
 .big{font-size:32px;font-weight:800;margin:8px}
+.signal-asset{display:none;font-size:30px;line-height:1.05;font-weight:1000;margin:2px 8px 10px;letter-spacing:.8px;color:#42ff9b;text-shadow:0 0 14px #21e58c66}
+.signal-asset.put{color:#ff5572;text-shadow:0 0 14px #ff405f66}
+@media(max-width:450px){.signal-asset{font-size:28px}}
 .call{color:#45ff9b}
 .put{color:#ff5c7a}
 .neutral{color:#ffd166}
@@ -18694,8 +18693,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="tabs">
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
     <button class="tabbtn" id="tabChart">📈 Gráfico</button>
-    <button class="tabbtn" id="tabVelocity">⚡ Velocity Flow</button>
-    <button class="tabbtn" id="tabIct">🏦 ICT/SMC</button>
     <button class="tabbtn" id="tabResults">🎯 Resultados</button>
     <button class="tabbtn" id="tabValues">💰 Valores</button>
     <button class="tabbtn" id="tabHistory">🗓️ Histórico 15 dias</button>
@@ -18722,6 +18719,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         <div id="moneyFx" class="money-fx" aria-hidden="true"></div>
         <div class="label">SINAL ATUAL</div>
         <div id="direction" class="big neutral">AGUARDANDO</div>
+        <div id="signalAsset" class="signal-asset"></div>
         <div id="confidence">Confiança: --</div>
       </div>
 
@@ -19627,6 +19625,7 @@ let telegramLastWinKey='';
 let brokerConnected={IQ_OPTION:false};
 const chartInfo=document.getElementById('chartInfo');
 const direction=document.getElementById('direction');
+const signalAsset=document.getElementById('signalAsset');
 const signalCard=document.getElementById('signalCard');
 const moneyFx=document.getElementById('moneyFx');
 const confidence=document.getElementById('confidence');
@@ -19703,6 +19702,29 @@ const syms=[
 const S=document.getElementById('symbol');
 
 let cur=null;
+
+function paintSignalAsset(assetName){
+  if(!signalAsset || !direction) return;
+  const dir=String(direction.textContent||'').toUpperCase();
+  const actionable=dir.includes('CALL') || dir.includes('PUT');
+  const raw=String(assetName || (cur&&cur.symbol) || (S&&S.value) || '').trim();
+  if(!actionable || !raw){
+    signalAsset.textContent='';
+    signalAsset.style.display='none';
+    signalAsset.className='signal-asset';
+    return;
+  }
+  signalAsset.textContent=raw;
+  signalAsset.style.display='block';
+  signalAsset.className='signal-asset '+(dir.includes('PUT')?'put':'call');
+}
+
+if(direction){
+  new MutationObserver(()=>paintSignalAsset()).observe(direction,{childList:true,subtree:true,characterData:true});
+}
+if(S){
+  S.addEventListener('change',()=>paintSignalAsset(S.value));
+}
 let voiceEnabled=false;
 try{
   voiceEnabled=localStorage.getItem('mega_voice_power')==='ONLINE';
@@ -22137,8 +22159,8 @@ function showTab(which){
 
   tabMain.classList.toggle('active',main);
   tabChart.classList.toggle('active',chart);
-  tabVelocity.classList.toggle('active',velocity);
-  tabIct.classList.toggle('active',ict);
+  if(tabVelocity) tabVelocity.classList.toggle('active',velocity);
+  if(tabIct) tabIct.classList.toggle('active',ict);
   tabResults.classList.toggle('active',results);
   tabValues.classList.toggle('active',values);
   tabHistory.classList.toggle('active',history);
@@ -22187,8 +22209,8 @@ function showTab(which){
 
 tabMain.onclick=()=>showTab('main');
 tabChart.onclick=()=>showTab('chart');
-tabVelocity.onclick=()=>showTab('velocity');
-tabIct.onclick=()=>showTab('ict');
+if(tabVelocity) tabVelocity.onclick=()=>showTab('velocity');
+if(tabIct) tabIct.onclick=()=>showTab('ict');
 tabResults.onclick=()=>showTab('results');
 tabValues.onclick=()=>showTab('values');
 tabHistory.onclick=()=>showTab('history');
@@ -23616,6 +23638,7 @@ function promoteVelocityPreAlertToOfficial(item){
   const isCall=dir==='CALL';
   direction.textContent=dir;
   direction.className='big '+(isCall?'call':'put');
+  paintSignalAsset(sym);
   confidence.textContent='Confiança: '+Math.round(Number(signal.confidence||0))+'%';
   entry.textContent=ft(signal.entry_time);
   countdown.textContent='ALERTA CONFIRMADO • próxima vela';
@@ -23726,6 +23749,7 @@ async function sig(announce=false){
       cur.direction==='PUT'?'put':
       'neutral'
     );
+    paintSignalAsset(cur.symbol||((S&&S.value)||''));
 
     confidence.textContent='Confiança: '+Number(cur.confidence||0).toFixed(0)+'%';
 
