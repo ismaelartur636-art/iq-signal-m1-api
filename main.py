@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.88.1"
+APP_VERSION = "3.88.2"
 PWA_VERSION = "v148"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -12425,6 +12425,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     elif engine == "SGH":
         # SMART GOLD HUNTER: swing e rompimento só com candle fechado; próxima vela.
         entry_mode = "BIRTH"
+    elif engine == "SMC":
+        # SMC FVG + HL: confirma somente candle fechado e entra na próxima vela.
+        entry_mode = "BIRTH"
     elif engine == "ALPHAX":
         # AlphaX 3.73: sinal oficial antecipado ~30 s e entrada na próxima abertura.
         entry_mode = "MIDDLE"
@@ -12439,7 +12442,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         entry_mode = "MIDDLE"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
@@ -12648,6 +12651,27 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 raw = await iq_ea_candles(iq_state, symbol, interval, 140, regular_market=False)
             else:
                 raw = await candles(symbol, interval, 140, "OPEN", None, request=request)
+        elif engine == "SMC":
+            # SMC FVG + HL: candle fechado, retorno ao FVG + estrutura/SR, próxima vela.
+            if market == "IQ_OTC":
+                if not iq_state:
+                    out = neutral_signal(
+                        symbol, interval, market,
+                        "SMC FVG + HL • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para o SMC FVG + HL analisar candles OTC reais.",
+                        source_state="WAITING",
+                    )
+                    out.update({
+                        "strategy": "SMC FVG + HL", "mode": "SMC_FVG_HL_NEXT",
+                        "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
+                        "non_repaint": True, "next_candle_entry": True,
+                        "direct_win_only": True, "gale_signal": False,
+                    })
+                    cache[key] = (time.time(), out)
+                    return out
+                raw = await iq_ea_candles(iq_state, symbol, interval, 180, regular_market=False)
+            else:
+                raw = await candles(symbol, interval, 180, "OPEN", None, request=request)
         elif engine == "PRESIDEN":
             # PRESIDEN BREAKOUT: somente candles fechados; entrada na próxima vela.
             if market == "IQ_OTC":
@@ -12844,6 +12868,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "ALPHAX RELAY • FONTE EM ESPERA" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION EM ESPERA"
         elif engine == "SGH":
             status = "SMART GOLD HUNTER • FONTE EM ESPERA" if market == "OPEN" else "SMART GOLD HUNTER • IQ OPTION EM ESPERA"
+        elif engine == "SMC":
+            status = "SMC FVG + HL • FONTE EM ESPERA" if market == "OPEN" else "SMC FVG + HL • IQ OPTION EM ESPERA"
         elif engine == "SAMURAI":
             status = "ALGO SAMURAI • FONTE EM ESPERA" if market == "OPEN" else "ALGO SAMURAI • IQ OPTION EM ESPERA"
         elif engine == "RSIMON":
@@ -12883,6 +12909,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "ALPHAX RELAY • FONTE RECONECTANDO" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION RECONECTANDO"
         elif engine == "SGH":
             status = "SMART GOLD HUNTER • FONTE RECONECTANDO" if market == "OPEN" else "SMART GOLD HUNTER • IQ OPTION RECONECTANDO"
+        elif engine == "SMC":
+            status = "SMC FVG + HL • FONTE RECONECTANDO" if market == "OPEN" else "SMC FVG + HL • IQ OPTION RECONECTANDO"
         elif engine == "SAMURAI":
             status = "ALGO SAMURAI • FONTE RECONECTANDO" if market == "OPEN" else "ALGO SAMURAI • IQ OPTION RECONECTANDO"
         elif engine == "RSIMON":
@@ -12971,6 +12999,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "SGH":
             engine_title = "SMART GOLD HUNTER"
             engine_mode = "SGH_NEXT_CANDLE"
+        elif engine == "SMC":
+            engine_title = "SMC FVG + HL"
+            engine_mode = "SMC_FVG_HL_NEXT"
         elif engine == "RAPID":
             engine_title = "NÚCLEO RÁPIDO EAs"
             engine_mode = "RAPID_EAS"
@@ -12999,7 +13030,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -13020,6 +13051,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
                     "SGH": "LOCAL_SGH_CONFIRMED_SWING",
+                "SMC": "LOCAL_SMC_FVG_HL",
                     "RAPID": "LOCAL_RAPID_EAS",
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
                     "VOLUME_AI": "LOCAL_VOLUME_POC_AI_CONTEXT",
@@ -13042,7 +13074,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = (closed[-260:] if engine == "RANGE" else (closed[-min(SUPERZ_HISTORY_BARS, len(closed)):] if engine == "SNIPER" else (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "RSI5", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else (closed[-90:] if len(closed) > 90 else closed)))))
+            engine_closed = (closed[-260:] if engine == "RANGE" else (closed[-min(SUPERZ_HISTORY_BARS, len(closed)):] if engine == "SNIPER" else (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "RSI5", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else (closed[-90:] if len(closed) > 90 else closed)))))
             if engine == "SMART":
                 moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
                 analysis = await openai_direct_signal(
@@ -13072,6 +13104,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis = presiden_breakout_strategy(engine_closed, interval, market=market)
             elif engine == "SGH":
                 analysis = sgh_next_candle_strategy(engine_closed, interval, market=market)
+            elif engine == "SMC":
+                base_sec = int(INTERVALS.get(interval, 60))
+                smc_mtf = {}
+                for _label, _sec in (("M15", 900), ("H1", 3600), ("H4", 14400)):
+                    if _sec >= base_sec:
+                        smc_mtf[_label] = _aggregate_closed_candles(engine_closed, _sec)
+                analysis = smc_fvg_hl_strategy(
+                    engine_closed, interval, market=market, mtf=smc_mtf
+                )
             elif engine == "ALPHAX":
                 alphax_seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
                 alphax_early_window=(ALPHAX_EARLY_MIN_REMAINING <= alphax_seconds_to_entry <= ALPHAX_EARLY_WINDOW_BEFORE)
@@ -13283,7 +13324,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and analysis.get("confirmed")),
+            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and analysis.get("confirmed")),
             "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                 "EA": "XGBOOST_RSI_VALUE_CHART",
                 "RUBIK": "LOCAL_RUBIK_ADAPTED",
@@ -13294,6 +13335,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
                     "SGH": "LOCAL_SGH_CONFIRMED_SWING",
+                "SMC": "LOCAL_SMC_FVG_HL",
                     "RAPID": "LOCAL_RAPID_EAS",
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
                     "VOLUME_AI": "LOCAL_VOLUME_POC_AI_CONTEXT",
@@ -13301,7 +13343,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "RSI5": "LOCAL_RSI_ADX_4TF",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "HIGH").upper(),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
                 else (analysis.get("strategy") or (
@@ -13313,6 +13355,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "ALPHAX RELAY" if engine == "ALPHAX"
                     else "PRESIDEN BREAKOUT" if engine == "PRESIDEN"
                     else "SMART GOLD HUNTER" if engine == "SGH"
+                    else "SMC FVG + HL" if engine == "SMC"
                     else "NÚCLEO RÁPIDO EAs" if engine == "RAPID"
                     else "ALGO SAMURAI • TREINAMENTO" if engine == "SAMURAI"
                     else "VOLUME POC ESTRUTURAL" if engine == "VOLUME_AI"
@@ -13734,7 +13777,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "FORCE": "SINAL EA FORÇA DO MOVIMENTO LIBERADO",
                         "BIGRISE": "SINAL BTC FORCE MULTIATIVOS LIBERADO",
                     }.get(engine, "SINAL IA GRÁFICA LIBERADO")),
-                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "MEDIUM").upper(),
+                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
                     "expiry_time": iso(expiry),
@@ -13803,7 +13846,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+                if engine not in ("EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -13917,6 +13960,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
                     "SGH": "LOCAL_SGH_CONFIRMED_SWING",
+                "SMC": "LOCAL_SMC_FVG_HL",
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
                     "VOLUME_AI": "LOCAL_VOLUME_POC_AI_CONTEXT",
                     "SUNTZU": "LOCAL_SUNTZU_FLEX",
@@ -16657,7 +16701,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     "GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE",
-    "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH",
+    "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC",
 }
 
 
@@ -17507,11 +17551,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC"):
         raise HTTPException(400, "Motor inválido.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+    if engine in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -17611,6 +17655,19 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
                     data["feed_message"] = "SUPER Z PMAX usando candles OTC reais da sessão IQ Option."
+            elif engine == "SMC":
+                if requested_market == "OPEN":
+                    feed_info = _current_open_feed_info(symbol, interval)
+                    feed_src = str(feed_info.get("source") or "MULTIFEED")
+                    data["feed_source"] = feed_src
+                    data["feed_label"] = _feed_source_label(feed_src)
+                    data["feed_fallback"] = bool(feed_info.get("fallback"))
+                    data["feed_message"] = "SMC FVG + HL usando candles fechados • FVG + estrutura HH/HL/LH/LL + suporte/resistência • próxima vela."
+                else:
+                    data["feed_source"] = "IQ_OPTION_OTC"
+                    data["feed_label"] = _feed_source_label(data["feed_source"])
+                    data["feed_fallback"] = False
+                    data["feed_message"] = "SMC FVG + HL usando candles OTC reais já fechados da sessão IQ Option."
             elif engine == "ALPHAX":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -18183,7 +18240,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -18315,10 +18372,10 @@ async def pre_signals(
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
     if fallback_twelve:
         market = "OPEN"
-    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and not iq_state:
+    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and not iq_state:
         wait_label = {
             "EA": "EA Tripla",
             "RUBIK": "Robô Rubik Adaptado",
@@ -18399,7 +18456,7 @@ async def pre_signals(
         key = f"{group_key}|{symbol}"
         try:
             pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (180 if engine == "SNIPER" else (120 if engine == "RUBIK" else 90)))
-            if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and requested_market == "IQ_OTC":
+            if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
                 )
@@ -18854,12 +18911,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC"):
         raise HTTPException(400, "Motor inválido.")
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
     if fallback_twelve:
         market = "OPEN"
 
@@ -18946,6 +19003,13 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 raw = await iq_ea_candles(iq_state, sym, interval, 140, regular_market=False)
             else:
                 raw = await candles(sym, interval, 140, "OPEN", None, request=request)
+        elif engine == "SMC":
+            if market == "IQ_OTC":
+                if not iq_state:
+                    raise RuntimeError("Conecte a IQ Option para o SMC FVG + HL analisar OTC.")
+                raw = await iq_ea_candles(iq_state, sym, interval, 180, regular_market=False)
+            else:
+                raw = await candles(sym, interval, 180, "OPEN", None, request=request)
         elif engine == "PRESIDEN":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -19094,6 +19158,21 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                         if direction != "NEUTRO"
                         else f"{engine_label} • MONITORANDO • {why}"
                     )
+            elif engine == "SMC":
+                base_sec = int(INTERVALS.get(interval, 60))
+                smc_mtf = {}
+                for _label, _sec in (("M15", 900), ("H1", 3600), ("H4", 14400)):
+                    if _sec >= base_sec:
+                        smc_mtf[_label] = _aggregate_closed_candles(closed, _sec)
+                tech = smc_fvg_hl_strategy(closed, interval, market=market, mtf=smc_mtf)
+                engine_label = "SMC FVG + HL"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "SMC FVG + HL monitorando").replace("\n", " ")[:88]
+                status_text = (
+                    f"{engine_label} • OPORTUNIDADE ENCONTRADA"
+                    if direction != "NEUTRO"
+                    else f"{engine_label} • MONITORANDO • {why}"
+                )
             elif engine == "PRESIDEN":
                 tech = presiden_breakout_strategy(closed, interval, market=market)
                 engine_label = "PRESIDEN BREAKOUT"
@@ -19265,18 +19344,18 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if (engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") or (engine == "FORCE" and market == "IQ_OTC"))
+                    status_text if (engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") or (engine == "FORCE" and market == "IQ_OTC"))
                     else (((_feed_source_label(_feed_source_from_rows(raw)) + " • " + status_text) if market == "OPEN" else status_text))
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
+                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
                 "strategy": str(tech.get("strategy") or ""),
             }
-            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
                 radar_probe = {
                     "symbol": sym, "market": market, "interval": interval,
                     "direction": item.get("direction"), "confidence": item.get("confidence"),
@@ -19317,6 +19396,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             source_status = "PRESIDEN BREAKOUT • FONTE EM ESPERA" if market == "OPEN" else "PRESIDEN BREAKOUT • IQ OPTION OTC EM ESPERA"
         elif engine == "SGH":
             source_status = "SMART GOLD HUNTER • FONTE EM ESPERA" if market == "OPEN" else "SMART GOLD HUNTER • IQ OPTION OTC EM ESPERA"
+        elif engine == "SMC":
+            source_status = "SMC FVG + HL • FONTE EM ESPERA" if market == "OPEN" else "SMC FVG + HL • IQ OPTION OTC EM ESPERA"
         elif engine == "ALPHAX":
             source_status = "ALPHAX RELAY • FONTE EM ESPERA" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION OTC EM ESPERA"
         elif engine == "RAPID":
@@ -19353,7 +19434,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
+            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -19727,7 +19808,7 @@ async def result(
     engine = str(engine or "").upper()
     # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
-    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
+    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
 
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
@@ -20223,7 +20304,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • SUPER Z PMAX + RSI/ADX + AlphaX • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • SMC FVG + HL • SUPER Z PMAX + RSI/ADX + AlphaX • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -20323,6 +20404,16 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-desc" id="sghModeDesc">Swing/ZigZag confirmado • rompimento por candle fechado • sem ordem pendente • CALL/PUT na próxima vela • sem Gale.</div>
     </div>
     <button id="sghPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
+
+  <div class="robot-mode-card" id="smcModeCard">
+    <img src="__MEGA_IMAGE__" alt="SMC FVG + HL">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">🧠 SMC FVG + HL</div>
+      <div class="robot-mode-desc" id="smcModeDesc">FVG + suporte/resistência + estrutura HH/HL/LH/LL • candle fechado • entrada na próxima vela • sem Gale.</div>
+    </div>
+    <button id="smcPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
   <div class="robot-mode-card" id="alphaxModeCard">
@@ -20992,6 +21083,8 @@ const presidenPowerBtn=document.getElementById('presidenPowerBtn');
 const presidenModeDesc=document.getElementById('presidenModeDesc');
 const sghPowerBtn=document.getElementById('sghPowerBtn');
 const sghModeDesc=document.getElementById('sghModeDesc');
+const smcPowerBtn=document.getElementById('smcPowerBtn');
+const smcModeDesc=document.getElementById('smcModeDesc');
 const alphaxPowerBtn=document.getElementById('alphaxPowerBtn');
 const alphaxModeDesc=document.getElementById('alphaxModeDesc');
 const rapidPowerBtn=null;
@@ -21060,6 +21153,7 @@ let rsiMonEnabled=false;
 let rsi5Enabled=false;
 let presidenEnabled=false;
 let sghEnabled=false;
+let smcEnabled=false;
 try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
   aiEnabled=localStorage.getItem('mega_ai_power')==='ONLINE';
@@ -21087,6 +21181,13 @@ try{
   rsi5Enabled=localStorage.getItem('mega_rsi_pure_power')==='ONLINE'; localStorage.removeItem('mega_rsi5_power');
   presidenEnabled=localStorage.getItem('mega_presiden_power')==='ONLINE';
   sghEnabled=localStorage.getItem('mega_sgh_power')==='ONLINE';
+  smcEnabled=localStorage.getItem('mega_smc_power')==='ONLINE';
+  if(smcEnabled){
+    robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false;
+    bigriseEnabled=false; larryEnabled=false; rangeEnabled=false; velocityEnabled=false; rsi5Enabled=false;
+    sniperEnabled=false; alphaxEnabled=false; presidenEnabled=false; sghEnabled=false; rapidEnabled=false;
+    suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false;
+  }
   localStorage.setItem('mega_ea_power','OFFLINE');
   localStorage.setItem('mega_rubik_power','OFFLINE');
   localStorage.setItem('mega_larry_power',larryEnabled?'ONLINE':'OFFLINE');
@@ -21112,6 +21213,7 @@ try{
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
+  if(smcEnabled) return 'SMC';
   if(sghEnabled) return 'SGH';
   if(presidenEnabled) return 'PRESIDEN';
   if(sniperEnabled) return 'SNIPER';
@@ -21141,8 +21243,9 @@ function adoptBackgroundEngineState(d){
   if(['RAPID','SUNTZU'].includes(e)) return;
   robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
   forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false;
-  rsi5Enabled=false; sniperEnabled=false; alphaxEnabled=false; presidenEnabled=false; sghEnabled=false; rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false; rangeEnabled=false;
-  if(e==='SGH') sghEnabled=true;
+  rsi5Enabled=false; sniperEnabled=false; alphaxEnabled=false; presidenEnabled=false; sghEnabled=false; smcEnabled=false; rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false; rangeEnabled=false;
+  if(e==='SMC') smcEnabled=true;
+  else if(e==='SGH') sghEnabled=true;
   else if(e==='PRESIDEN') presidenEnabled=true;
   else if(e==='SNIPER') sniperEnabled=true;
   else if(e==='RANGE') rangeEnabled=true;
@@ -21171,6 +21274,7 @@ function adoptBackgroundEngineState(d){
     localStorage.setItem('mega_alphax_power',alphaxEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_presiden_power',presidenEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_sgh_power',sghEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_smc_power',smcEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_rapid_power',rapidEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_suntzu_power',suntzuEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_samurai_power',samuraiEnabled?'ONLINE':'OFFLINE');
@@ -22103,6 +22207,7 @@ function normalizeEngineKey(value){
   if(e==='ALPHAX' || e==='ALPHAX_RELAY' || e==='ALPHA_X') return 'ALPHAX';
   if(e==='RSI5' || e==='RSI_PURE' || e==='RSI_PURO' || e==='RSI_PURE_4TF') return 'RSI5';
   if(e==='BIGRISE' || e==='BIGRISE_USD_BASKET' || e==='BTC_FORCE' || e==='BTC_FORCE_NEXT_CANDLE') return 'BIGRISE';
+  if(e==='SMC' || e==='SMC_FVG_HL_NEXT' || e==='SMC FVG + HL') return 'SMC';
   return '';
 }
 
@@ -22120,7 +22225,8 @@ function momentStudyEngineName(key){
     ALPHAX:'🧬 ALPHAX RELAY',
     RSI5:'📈 RSI + ADX AFIADO',
     FORCE:'💥 EA FORÇA DO MOVIMENTO',
-    BIGRISE:'₿ BTC FORCE'
+    BIGRISE:'₿ BTC FORCE',
+    SMC:'🧠 SMC FVG + HL'
   };
   return names[String(key||'').toUpperCase()]||String(key||'MOTOR');
 }
@@ -22441,8 +22547,8 @@ function rememberPendingTrade(sig){
   if(!sig.expiry_time || !sig.entry_time) return;
 
   const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
-  const canonicalResultEngine=(engineKey.includes('SMART_GOLD_HUNTER')||engineKey.includes('SGH_NEXT_CANDLE')||engineKey==='SGH')?'SGH':(engineKey.includes('VOLUME_POC_AI')||engineKey==='VOLUME_AI')?'VOLUME':(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('BIGRISE')?'BIGRISE':(engineKey.includes('LARRY')?'LARRY':(engineKey.includes('RANGE')?'RANGE':(engineKey.includes('VELOCITY')?'VELOCITY':(engineKey.includes('SNIPER')?'SNIPER':(engineKey.includes('ALPHAX')?'ALPHAX':(engineKey.includes('RAPID')?'RAPID':(engineKey.includes('SAMURAI')?'SAMURAI':(engineKey.includes('VOLUME')?'VOLUME':(engineKey.includes('RSI5')?'RSI5':String(sig.selected_engine||sig.mode||'')))))))))))));
-  const isDirectEa=(engineKey==='SGH'||engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='RANGE'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='SUNTZU'||engineKey==='RSI5'||engineKey.includes('SMART_GOLD_HUNTER')||engineKey.includes('SGH_NEXT_CANDLE')||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('RANGE')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('SUNTZU')||engineKey.includes('RSI5'));
+  const canonicalResultEngine=(engineKey.includes('SMC_FVG_HL')||engineKey==='SMC')?'SMC':(engineKey.includes('SMART_GOLD_HUNTER')||engineKey.includes('SGH_NEXT_CANDLE')||engineKey==='SGH')?'SGH':(engineKey.includes('VOLUME_POC_AI')||engineKey==='VOLUME_AI')?'VOLUME':(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('BIGRISE')?'BIGRISE':(engineKey.includes('LARRY')?'LARRY':(engineKey.includes('RANGE')?'RANGE':(engineKey.includes('VELOCITY')?'VELOCITY':(engineKey.includes('SNIPER')?'SNIPER':(engineKey.includes('ALPHAX')?'ALPHAX':(engineKey.includes('RAPID')?'RAPID':(engineKey.includes('SAMURAI')?'SAMURAI':(engineKey.includes('VOLUME')?'VOLUME':(engineKey.includes('RSI5')?'RSI5':String(sig.selected_engine||sig.mode||'')))))))))))));
+  const isDirectEa=(engineKey==='SMC'||engineKey.includes('SMC_FVG_HL')||engineKey==='SGH'||engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='RANGE'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='SUNTZU'||engineKey==='RSI5'||engineKey.includes('SMART_GOLD_HUNTER')||engineKey.includes('SGH_NEXT_CANDLE')||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('RANGE')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('SUNTZU')||engineKey.includes('RSI5'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
     // Motores de entrada direta (AlphaX/Núcleo Rápido/Samurai/Sniper/RSI+ADX/Larry/Range/EA/Força/BigRise/Velocity) são apurados na primeira vela; outros preservam G1/G2.
@@ -24504,6 +24610,7 @@ if(appPowerBtn){
 function applyRobotPowerState(){
   try{ localStorage.setItem('mega_presiden_power',presidenEnabled?'ONLINE':'OFFLINE'); }catch(_){}
   try{ localStorage.setItem('mega_sgh_power',sghEnabled?'ONLINE':'OFFLINE'); }catch(_){}
+  try{ localStorage.setItem('mega_smc_power',smcEnabled?'ONLINE':'OFFLINE'); }catch(_){}
   try{
     localStorage.setItem('mega_volume_poc_power',volumePocEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_volume_poc_ai_power',volumePocAiEnabled?'ONLINE':'OFFLINE');
@@ -24573,6 +24680,12 @@ function applyRobotPowerState(){
     sghPowerBtn.style.background=sghEnabled?'#0b7a3d':'#7d1d1d';
     sghPowerBtn.style.color='#fff';
     sghPowerBtn.style.borderColor=sghEnabled?'#16c56b':'#ff5252';
+  }
+  if(smcPowerBtn){
+    smcPowerBtn.textContent=smcEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    smcPowerBtn.style.background=smcEnabled?'#0b7a3d':'#7d1d1d';
+    smcPowerBtn.style.color='#fff';
+    smcPowerBtn.style.borderColor=smcEnabled?'#16c56b':'#ff5252';
   }
   if(rapidPowerBtn){
     rapidPowerBtn.textContent=rapidEnabled?'🟢 ONLINE':'🔴 OFFLINE';
@@ -24655,6 +24768,9 @@ function applyRobotPowerState(){
   if(sghModeDesc) sghModeDesc.textContent=sghEnabled
     ? 'ONLINE: swing confirmado + rompimento em candle fechado • entrada somente na próxima vela • sem Gale.'
     : 'OFFLINE: Smart Gold Hunter pausado.';
+  if(smcModeDesc) smcModeDesc.textContent=smcEnabled
+    ? 'ONLINE: FVG + suporte/resistência + HH/HL/LH/LL • somente candle fechado • próxima vela • sem Gale.'
+    : 'OFFLINE: SMC FVG + HL pausado.';
   if(alphaxModeDesc) alphaxModeDesc.textContent=alphaxEnabled
     ? 'ONLINE: AlphaX + zonas fractal/institucional + microimpulso/LWMA/MACD • sinal oficial ~30s antes • entrada na próxima vela • sem Gale.'
     : 'OFFLINE: AlphaX RELAY pausado.';
@@ -24690,7 +24806,12 @@ function applyRobotPowerState(){
     : 'OFFLINE: BTC FORCE MULTIATIVOS pausado.';
 
   const engine=selectedRobotEngine();
-  if(engine==='SUNTZU'){
+  if(engine==='SMC'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='SMC FVG + HL ONLINE • FVG + ESTRUTURA + S/R • CANDLE FECHADO • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 SMC FVG + HL selecionado • retorno ao FVG + rejeição + suporte/resistência ou estrutura confirmada.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar SMC FVG + HL ativo • procurando FVG + HH/HL/LH/LL + S/R</div>';
+    rad();
+  }else if(engine==='SUNTZU'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='SUNTZU FLEX 2/3 ONLINE • 2 DE 3 • SINAL ~20S ANTES • PRÓXIMA VELA • SEM GALE';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚔️ SUNTZU FLEX • Filtro SUNTZU + zona DonForex + Value Chart ±5 • basta 2/3.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar SUNTZU ativo • procurando 2 de 3 confirmações</div>';
@@ -25400,6 +25521,45 @@ async function setRapidPower(enabled){
   if(voiceEnabled) speak(rapidEnabled ? 'Núcleo Rápido E As online.' : 'Núcleo Rápido E As offline.');
 }
 
+
+function disableSmcForOtherEngine(){
+  if(!smcEnabled) return;
+  smcEnabled=false;
+  try{ localStorage.setItem('mega_smc_power','OFFLINE'); }catch(_){}
+}
+
+async function setSmcPower(enabled){
+  smcEnabled=!!enabled;
+  if(smcEnabled){
+    robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false;
+    bigriseEnabled=false; larryEnabled=false; rangeEnabled=false; velocityEnabled=false; rsi5Enabled=false;
+    sniperEnabled=false; alphaxEnabled=false; presidenEnabled=false; sghEnabled=false; rapidEnabled=false;
+    suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false;
+  }
+  try{
+    localStorage.setItem('mega_smc_power', smcEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_rsi_pure_power', rsi5Enabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_presiden_power', presidenEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_sgh_power', sghEnabled ? 'ONLINE' : 'OFFLINE');
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'SMC'});
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(smcEnabled ? 'SMC FVG mais HL online.' : 'SMC FVG mais HL offline.');
+}
+
 async function setAlphaxPower(enabled){
   if(enabled) disableSghForOtherEngine();
   alphaxEnabled=!!enabled;
@@ -25432,25 +25592,26 @@ async function setAlphaxPower(enabled){
   if(voiceEnabled) speak(alphaxEnabled ? 'AlphaX Relay online.' : 'AlphaX Relay offline.');
 }
 
-if(robotPowerBtn) robotPowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setRobotPower(!robotEnabled); };
-if(aiPowerBtn) aiPowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setAiPower(!aiEnabled); };
-if(eaPowerBtn) eaPowerBtn.onclick=()=>{ setEaPower(!eaEnabled); };
-if(rubikPowerBtn) rubikPowerBtn.onclick=()=>{ setRubikPower(!rubikEnabled); };
-if(larryPowerBtn) larryPowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setLarryPower(!larryEnabled); };
-if(rangePowerBtn) rangePowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setRangePower(!rangeEnabled); };
-if(presidenPowerBtn) presidenPowerBtn.onclick=()=>{ setPresidenPower(!presidenEnabled); };
-if(sghPowerBtn) sghPowerBtn.onclick=()=>{ setSghPower(!sghEnabled); };
-if(velocityPowerBtn) velocityPowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setVelocityPower(!velocityEnabled); };
-if(sniperPowerBtn) sniperPowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setSniperPower(!sniperEnabled); };
-if(alphaxPowerBtn) alphaxPowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setAlphaxPower(!alphaxEnabled); };
+if(robotPowerBtn) robotPowerBtn.onclick=()=>{ disableSmcForOtherEngine(); disablePresidenForOtherEngine(); setRobotPower(!robotEnabled); };
+if(aiPowerBtn) aiPowerBtn.onclick=()=>{ disableSmcForOtherEngine(); disablePresidenForOtherEngine(); setAiPower(!aiEnabled); };
+if(eaPowerBtn) eaPowerBtn.onclick=()=>{ disableSmcForOtherEngine(); setEaPower(!eaEnabled); };
+if(rubikPowerBtn) rubikPowerBtn.onclick=()=>{ disableSmcForOtherEngine(); setRubikPower(!rubikEnabled); };
+if(larryPowerBtn) larryPowerBtn.onclick=()=>{ disableSmcForOtherEngine(); disablePresidenForOtherEngine(); setLarryPower(!larryEnabled); };
+if(rangePowerBtn) rangePowerBtn.onclick=()=>{ disableSmcForOtherEngine(); disablePresidenForOtherEngine(); setRangePower(!rangeEnabled); };
+if(presidenPowerBtn) presidenPowerBtn.onclick=()=>{ disableSmcForOtherEngine(); setPresidenPower(!presidenEnabled); };
+if(sghPowerBtn) sghPowerBtn.onclick=()=>{ disableSmcForOtherEngine(); setSghPower(!sghEnabled); };
+if(smcPowerBtn) smcPowerBtn.onclick=()=>{ setSmcPower(!smcEnabled); };
+if(velocityPowerBtn) velocityPowerBtn.onclick=()=>{ disableSmcForOtherEngine(); disablePresidenForOtherEngine(); setVelocityPower(!velocityEnabled); };
+if(sniperPowerBtn) sniperPowerBtn.onclick=()=>{ disableSmcForOtherEngine(); disablePresidenForOtherEngine(); setSniperPower(!sniperEnabled); };
+if(alphaxPowerBtn) alphaxPowerBtn.onclick=()=>{ disableSmcForOtherEngine(); disablePresidenForOtherEngine(); setAlphaxPower(!alphaxEnabled); };
 if(rapidPowerBtn) rapidPowerBtn.onclick=()=>{ setRapidPower(!rapidEnabled); };
 if(suntzuPowerBtn) suntzuPowerBtn.onclick=()=>{ setSuntzuPower(!suntzuEnabled); };
 if(volumePocPowerBtn) volumePocPowerBtn.onclick=()=>{ setVolumePocPower(!volumePocEnabled); };
 if(volumePocAiPowerBtn) volumePocAiPowerBtn.onclick=()=>{ setVolumePocAiPower(!volumePocAiEnabled); };
-if(rsi5PowerBtn) rsi5PowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setRsi5Power(!rsi5Enabled); };
+if(rsi5PowerBtn) rsi5PowerBtn.onclick=()=>{ disableSmcForOtherEngine(); disablePresidenForOtherEngine(); setRsi5Power(!rsi5Enabled); };
 if(velocityOpenPanelBtn) velocityOpenPanelBtn.onclick=()=>showTab('main');
-if(forcePowerBtn) forcePowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setForcePower(!forceEnabled); };
-if(bigrisePowerBtn) bigrisePowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setBigrisePower(!bigriseEnabled); };
+if(forcePowerBtn) forcePowerBtn.onclick=()=>{ disableSmcForOtherEngine(); disablePresidenForOtherEngine(); setForcePower(!forceEnabled); };
+if(bigrisePowerBtn) bigrisePowerBtn.onclick=()=>{ disableSmcForOtherEngine(); disablePresidenForOtherEngine(); setBigrisePower(!bigriseEnabled); };
 function showVelocitySignalOnRobot(signal){
   if(!signal) return;
   const dir=String(signal.direction||'').toUpperCase();
@@ -25854,7 +26015,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='SGH'?'SMART GOLD HUNTER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='SNIPER'?'SUPER Z PMAX':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'INTELIGÊNCIA ARTIFICIAL':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='SMC'?'SMC FVG + HL':ek==='SGH'?'SMART GOLD HUNTER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='SNIPER'?'SUPER Z PMAX':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'INTELIGÊNCIA ARTIFICIAL':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
@@ -26618,7 +26779,7 @@ def _normalize_candles(candles: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]
     for c in candles:
         try:
             row = {
-                "time": c.get("time", c.get("timestamp")),
+                "time": c.get("time", c.get("timestamp", c.get("datetime"))),
                 "open": _num(c["open"]),
                 "high": _num(c["high"]),
                 "low": _num(c["low"]),
@@ -27029,6 +27190,52 @@ def analyze_signal(
     }
 
 
+
+def smc_fvg_hl_strategy(
+    candles: Sequence[Dict[str, Any]],
+    interval: str,
+    market: str = "OPEN",
+    mtf: Optional[Dict[str, Sequence[Dict[str, Any]]]] = None,
+) -> Dict[str, Any]:
+    """Adapta o motor SMC/FVG + HL ao formato interno do MEGA IA."""
+    tf_seconds = int(INTERVALS.get(interval, 60))
+    result = analyze_signal(
+        candles=candles,
+        timeframe_seconds=tf_seconds,
+        higher_timeframes=mtf or {},
+    )
+    direction = str(result.get("signal") or "WAIT").upper()
+    confirmed = direction in ("CALL", "PUT")
+    if not confirmed:
+        direction = "NEUTRO"
+
+    reasons = result.get("reasons")
+    reason = (
+        " • ".join(str(x) for x in reasons if x)
+        if isinstance(reasons, list) and reasons
+        else str(result.get("reason") or "SMC FVG + HL monitorando FVG, estrutura e suporte/resistência.")
+    )
+    confidence = float(result.get("confidence") or 0.0)
+    return {
+        "available": True,
+        "confirmed": confirmed,
+        "direction": direction,
+        "confidence": confidence,
+        "risk": "LOW" if confirmed and confidence >= 80 else ("MEDIUM" if confirmed else "HIGH"),
+        "strategy": "SMC FVG + HL",
+        "mode": "SMC_FVG_HL_NEXT",
+        "reason": reason,
+        "non_repaint": True,
+        "next_candle_entry": True,
+        "direct_win_only": True,
+        "gale_signal": False,
+        "fvg": result.get("fvg"),
+        "structure": result.get("structure"),
+        "mtf_context": result.get("mtf_context"),
+        "source_engine": ENGINE_NAME,
+    }
+
+
 def app_signal_payload(
     candles: Sequence[Dict[str, Any]],
     symbol: str,
@@ -27056,7 +27263,7 @@ def app_signal_payload(
 
 
 # -----------------------------------------------------------------------------
-# MEGA IA 3.88.1 — SMC/FVG + HL REVERSALS
+# MEGA IA 3.88.2 — SMC/FVG + HL REVERSALS
 # Motor incorporado ao main completo. Usa apenas candles fechados e, quando
 # confirma CALL/PUT, a entrada indicada é a PRÓXIMA VELA.
 # -----------------------------------------------------------------------------
