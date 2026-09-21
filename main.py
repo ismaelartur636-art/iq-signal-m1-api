@@ -167,20 +167,19 @@ PRESIDEN_MAX_RANGE_ATR = max(1.20, min(6.00, float(os.getenv("PRESIDEN_MAX_RANGE
 PRESIDEN_ATR_PERIOD = max(5, min(30, int(os.getenv("PRESIDEN_ATR_PERIOD", "14"))))
 PRESIDEN_REVERSE_MODE = os.getenv("PRESIDEN_REVERSE_MODE", "0").strip().lower() in ("1", "true", "on", "yes")
 
-# MEGA IA 3.88 — SMART GOLD HUNTER adaptado do EA MQ5 recebido.
-# O arquivo original visível depende de SGH_SignalEngine.mqh/SGH_TradeEngine.mqh,
-# que não vieram junto. Por isso preservamos apenas o comportamento verificável:
-# swing/ZigZag -> rompimento direcional, convertido para opções binárias.
-# Para eliminar o repaint do último ZigZag, só usamos pivôs CONFIRMADOS com barras
-# dos dois lados. O gatilho exige fechamento além do swing e entra na PRÓXIMA vela.
-SGH_PIVOT_LEN = max(2, min(10, int(os.getenv("SGH_PIVOT_LEN", "3"))))
-SGH_ATR_PERIOD = max(7, min(30, int(os.getenv("SGH_ATR_PERIOD", "14"))))
-SGH_BREAK_BUFFER_ATR = max(0.0, min(0.30, float(os.getenv("SGH_BREAK_BUFFER_ATR", "0.03"))))
-SGH_MIN_BODY_RATIO = max(0.20, min(0.80, float(os.getenv("SGH_MIN_BODY_RATIO", "0.38"))))
-SGH_CLOSE_POS = max(0.55, min(0.90, float(os.getenv("SGH_CLOSE_POS", "0.66"))))
-SGH_MAX_RANGE_ATR = max(1.20, min(6.00, float(os.getenv("SGH_MAX_RANGE_ATR", "3.00"))))
-SGH_MAX_CLEARANCE_ATR = max(0.20, min(2.50, float(os.getenv("SGH_MAX_CLEARANCE_ATR", "1.10"))))
-SGH_COOLDOWN_SECONDS = max(60, min(1800, int(os.getenv("SGH_COOLDOWN_SECONDS", "300"))))
+# MEGA IA 3.88.1 — SMART GOLD HUNTER com os módulos SGH recuperados.
+# Port direto do SGH_SignalEngine.mqh clean-room: 300 candles, ZigZag Depth/Deviation/Backstep,
+# leitura dos dois últimos extremos e fórmulas de BUY_STOP/SELL_STOP. Para opções binárias,
+# a ordem pendente é convertida em CALL/PUT somente quando uma vela FECHADA cruza o preço
+# de entrada reconstruído; a entrada é na vela imediatamente seguinte. O SGH_TradeEngine.mqh
+# permanece apenas como referência de proteção Forex/MT5 e não envia ordens MT5 pelo app.
+SGH_COPY_RATES_COUNT = 300
+SGH_EXTREMA_SCAN_LIMIT = 100
+SGH_ZIGZAG_DEVIATION_POINTS = 10
+SGH_ZIGZAG_BACKSTEP = 3
+SGH_TRIGGER_DISTANCE_POINTS = 10
+SGH_PROFILE_MODE = str(os.getenv("SGH_PROFILE_MODE", "SCALPER") or "SCALPER").strip().upper()
+SGH_COOLDOWN_SECONDS = max(60, min(1800, int(os.getenv("SGH_COOLDOWN_SECONDS", "60"))))
 
 # Sniper Pro MEGA — adaptação do indicador MQ5 para opções binárias.
 # Usa somente candles fechados e libera CALL/PUT para a próxima vela.
@@ -7941,145 +7940,324 @@ def range_compression_breakout_strategy(cs, timeframe="1min", market="OPEN"):
 
 
 
-def _sgh_confirmed_swings(rows, pivot_len=SGH_PIVOT_LEN):
-    """Retorna swings confirmados, sem usar o pivô móvel da ponta do ZigZag."""
-    rows = list(rows or [])
-    highs, lows = [], []
-    n = len(rows)
-    p = max(2, int(pivot_len))
-    if n < (p * 2 + 5):
-        return highs, lows
-    for i in range(p, n - p):
-        hv = float(rows[i]["high"]); lv = float(rows[i]["low"])
-        left_h = [float(rows[j]["high"]) for j in range(i-p, i)]
-        right_h = [float(rows[j]["high"]) for j in range(i+1, i+p+1)]
-        left_l = [float(rows[j]["low"]) for j in range(i-p, i)]
-        right_l = [float(rows[j]["low"]) for j in range(i+1, i+p+1)]
-        if all(hv > x for x in left_h) and all(hv > x for x in right_h):
-            highs.append((i, hv))
-        if all(lv < x for x in left_l) and all(lv < x for x in right_l):
-            lows.append((i, lv))
-    return highs[-12:], lows[-12:]
+def _sgh_profile(mode=SGH_PROFILE_MODE):
+    """Valores efetivos recuperados no SGH_SignalEngine.mqh."""
+    key = str(mode or "SCALPER").strip().upper().replace(" ", "_")
+    profiles = {
+        "SCALPER": {
+            "name": "Scalper", "native_timeframe": "M15", "swing_depth": 18,
+            "take_profit_points": 1500.0, "stop_loss_points": 300.0,
+            "trail_start_points": 140.0, "trail_distance_points": 40.0,
+            "entry_offset_points": -160.0, "pause_seconds": 60,
+            "pending_expiry_hours": 12,
+        },
+        "SWINGER": {
+            "name": "Swinger", "native_timeframe": "M15", "swing_depth": 12,
+            "take_profit_points": 4500.0, "stop_loss_points": 2500.0,
+            "trail_start_points": 1500.0, "trail_distance_points": 500.0,
+            "entry_offset_points": -50.0, "pause_seconds": 60,
+            "pending_expiry_hours": 27000,
+        },
+        "POSITIVE_RR": {
+            "name": "Positive RR", "native_timeframe": "M30", "swing_depth": 18,
+            "take_profit_points": 2250.0, "stop_loss_points": 325.0,
+            "trail_start_points": 575.0, "trail_distance_points": 165.0,
+            "entry_offset_points": -175.0, "pause_seconds": 60,
+            "pending_expiry_hours": 12,
+        },
+        "PROP_SCALPER": {
+            "name": "Prop Scalper", "native_timeframe": "M15", "swing_depth": 18,
+            "take_profit_points": 2500.0, "stop_loss_points": 350.0,
+            "trail_start_points": 165.0, "trail_distance_points": 40.0,
+            "entry_offset_points": -150.0, "pause_seconds": 60,
+            "pending_expiry_hours": 12, "prop_hold_seconds": 120,
+            "initial_take_profit_points": 5000.0, "initial_stop_loss_points": 700.0,
+        },
+    }
+    return dict(profiles.get(key, profiles["SCALPER"]))
 
 
-def sgh_next_candle_strategy(cs, timeframe="1min", market="OPEN"):
-    """SMART GOLD HUNTER — adaptação causal para CALL/PUT na próxima vela.
+def _sgh_symbol_points(symbol, rows=None):
+    """Aproxima SYMBOL_POINT/point normalizado para os ativos usados pelo app."""
+    raw = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper().replace("OTC", ""))
+    if len(raw) == 6 and raw.isalpha():
+        raw_point = 0.001 if raw.endswith("JPY") else 0.00001
+        normalized_point = raw_point * 10.0
+        return raw_point, normalized_point
+    if raw.startswith(("XAU", "XAG", "BTC", "ETH", "LTC")):
+        return 0.01, 0.01
+    # Fallback conservador para símbolos não mapeados: infere a menor casa útil
+    # observada nos candles, sem transformar ruído subdecimal em um ponto impossível.
+    vals = []
+    for row in list(rows or [])[-40:]:
+        for k in ("open", "high", "low", "close"):
+            try:
+                vals.append(abs(float(row.get(k))))
+            except Exception:
+                pass
+    if vals:
+        max_dec = 0
+        for v in vals:
+            txt = f"{v:.8f}".rstrip("0")
+            if "." in txt:
+                max_dec = max(max_dec, len(txt.split(".", 1)[1]))
+        max_dec = max(0, min(8, max_dec))
+        point = 10.0 ** (-max_dec) if max_dec else 1.0
+        return point, point * (10.0 if max_dec in (3, 5) else 1.0)
+    return 0.00001, 0.0001
 
-    A parte verificável do MQ5 trabalha com direção de swing/ZigZag e BUY_STOP /
-    SELL_STOP. Como os módulos SGH_*.mqh não foram fornecidos, esta adaptação não
-    afirma reproduzir a fórmula privada original. Ela converte o conceito visível
-    para binárias: swing confirmado -> fechamento rompe o nível -> próxima vela.
+
+def _sgh_window_lowest(series, start, count):
+    end = min(len(series), int(start) + int(count))
+    if start < 0 or start >= len(series) or count <= 0:
+        return -1
+    return min(range(start, end), key=lambda i: float(series[i]["low"]))
+
+
+def _sgh_window_highest(series, start, count):
+    end = min(len(series), int(start) + int(count))
+    if start < 0 or start >= len(series) or count <= 0:
+        return -1
+    return max(range(start, end), key=lambda i: float(series[i]["high"]))
+
+
+def _sgh_build_zigzag(series, depth, deviation_price, backstep):
+    """Port linha-a-linha da reconstrução ZigZag do SGH_SignalEngine.mqh."""
+    bars = len(series)
+    if depth < 2 or backstep < 0 or bars < depth + 2:
+        return None
+    high_buffer = [0.0] * bars
+    low_buffer = [0.0] * bars
+    zigzag_buffer = [0.0] * bars
+    last_low = 0.0
+    last_high = 0.0
+    oldest_calculable = bars - depth
+
+    for shift in range(oldest_calculable, -1, -1):
+        idx = _sgh_window_lowest(series, shift, depth)
+        value = float(series[idx]["low"]) if idx >= 0 else 0.0
+        if value == last_low:
+            value = 0.0
+        else:
+            last_low = value
+            if (float(series[shift]["low"]) - value) > deviation_price:
+                value = 0.0
+            else:
+                for back in range(1, backstep + 1):
+                    old_shift = shift + back
+                    if old_shift >= bars:
+                        break
+                    old_value = low_buffer[old_shift]
+                    if old_value != 0.0 and old_value > value:
+                        low_buffer[old_shift] = 0.0
+        if value != 0.0 and float(series[shift]["low"]) == value:
+            low_buffer[shift] = value
+
+        idx = _sgh_window_highest(series, shift, depth)
+        value = float(series[idx]["high"]) if idx >= 0 else 0.0
+        if value == last_high:
+            value = 0.0
+        else:
+            last_high = value
+            if (value - float(series[shift]["high"])) > deviation_price:
+                value = 0.0
+            else:
+                for back in range(1, backstep + 1):
+                    old_shift = shift + back
+                    if old_shift >= bars:
+                        break
+                    old_value = high_buffer[old_shift]
+                    if old_value != 0.0 and old_value < value:
+                        high_buffer[old_shift] = 0.0
+        if value != 0.0 and float(series[shift]["high"]) == value:
+            high_buffer[shift] = value
+
+    what_to_find = 0
+    last_low_position = -1
+    last_high_position = -1
+    last_low = 0.0
+    last_high = 0.0
+
+    for shift in range(oldest_calculable, -1, -1):
+        high = high_buffer[shift]
+        low = low_buffer[shift]
+        if what_to_find == 0:
+            if high != 0.0:
+                last_high = high
+                last_high_position = shift
+                zigzag_buffer[shift] = high
+                what_to_find = -1
+            if low != 0.0:
+                last_low = low
+                last_low_position = shift
+                zigzag_buffer[shift] = low
+                what_to_find = 1
+            continue
+        if what_to_find == 1:
+            if low != 0.0 and low < last_low and high == 0.0:
+                if last_low_position >= 0:
+                    zigzag_buffer[last_low_position] = 0.0
+                last_low = low
+                last_low_position = shift
+                zigzag_buffer[shift] = low
+            if high != 0.0 and low == 0.0:
+                last_high = high
+                last_high_position = shift
+                zigzag_buffer[shift] = high
+                what_to_find = -1
+            continue
+        if high != 0.0 and high > last_high and low == 0.0:
+            if last_high_position >= 0:
+                zigzag_buffer[last_high_position] = 0.0
+            last_high = high
+            last_high_position = shift
+            zigzag_buffer[shift] = high
+        if low != 0.0 and high == 0.0:
+            last_low = low
+            last_low_position = shift
+            zigzag_buffer[shift] = low
+            what_to_find = 1
+    return high_buffer, low_buffer, zigzag_buffer
+
+
+def _sgh_latest_two_extrema(series, high_buffer, low_buffer, zigzag_buffer, scan_limit=SGH_EXTREMA_SCAN_LIMIT):
+    latest = None
+    previous = None
+    limit = min(int(scan_limit), len(series), len(zigzag_buffer))
+    # O módulo original ignora shift 0 (vela atual) e varre 1..99.
+    for shift in range(1, limit):
+        value = float(zigzag_buffer[shift])
+        if value == 0.0:
+            continue
+        typ = "NONE"
+        if high_buffer[shift] != 0.0 and value == high_buffer[shift]:
+            typ = "HIGH"
+        elif low_buffer[shift] != 0.0 and value == low_buffer[shift]:
+            typ = "LOW"
+        ext = {"type": typ, "price": value, "shift": shift}
+        if latest is None:
+            latest = ext
+            continue
+        previous = ext
+        break
+    return latest, previous
+
+
+def sgh_next_candle_strategy(cs, timeframe="1min", market="OPEN", symbol=""):
+    """SMART GOLD HUNTER — port do SignalEngine + adaptação binária causal.
+
+    O SGH original arma BUY_STOP/SELL_STOP a partir dos dois últimos extremos do
+    ZigZag. No app não criamos a ordem pendente MT5: reconstruímos o mesmo nível e
+    liberamos CALL/PUT apenas quando uma vela fechada cruza esse nível. Assim a
+    entrada fica para a próxima vela e o sinal liberado não depende da vela em formação.
     """
     rows = list(cs or [])
+    profile = _sgh_profile()
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30", "1h":"H1"}.get(timeframe, timeframe)
-    name = f"SMART GOLD HUNTER {tf_label}"
-    need = max(45, SGH_ATR_PERIOD + SGH_PIVOT_LEN * 2 + 12)
+    name = f"SMART GOLD HUNTER {profile['name'].upper()} {tf_label}"
+    need = SGH_COPY_RATES_COUNT
     if len(rows) < need:
         return {
             "available": True, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "strategy": name,
-            "engine": "SMART_GOLD_HUNTER", "provider": "LOCAL_SGH_CONFIRMED_SWING",
-            "reason": f"SMART GOLD HUNTER coletando candles fechados ({len(rows)}/{need}).",
+            "engine": "SMART_GOLD_HUNTER", "provider": "LOCAL_SGH_SIGNAL_ENGINE_PORT",
+            "reason": f"SMART GOLD HUNTER coletando histórico ({len(rows)}/{need}) para reproduzir a janela de 300 candles do módulo.",
             "non_repaint": True, "next_candle_entry": True, "gale_signal": False,
             "grid": False, "martingale": False, "direct_win_only": True,
-            "source_reconstruction": "VISIBLE_MQ5_ONLY_MISSING_MQH",
+            "source_reconstruction": "SGH_SIGNAL_ENGINE_MQH_PORT",
         }
 
-    # A última vela fechada é o gatilho. Os swings são calculados SEM ela, para
-    # que a própria vela de rompimento nunca crie o nível que está rompendo.
-    last = rows[-1]
-    prev = rows[-2]
-    structure = rows[:-1]
-    highs, lows = _sgh_confirmed_swings(structure, SGH_PIVOT_LEN)
-    if not highs or not lows:
+    rates = rows[-need:]
+    # raw normalmente contém a vela atual em formação na ponta; isso corresponde ao
+    # CopyRates(..., 0, 300). O ZigZag ignora shift 0 ao escolher os dois extremos.
+    series = list(reversed(rates))
+    raw_point, normalized_point = _sgh_symbol_points(symbol, rates)
+    deviation_price = SGH_ZIGZAG_DEVIATION_POINTS * normalized_point
+    built = _sgh_build_zigzag(series, int(profile["swing_depth"]), deviation_price, SGH_ZIGZAG_BACKSTEP)
+    if not built:
         return {
             "available": True, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "strategy": name,
-            "engine": "SMART_GOLD_HUNTER", "provider": "LOCAL_SGH_CONFIRMED_SWING",
-            "reason": "SMART GOLD HUNTER aguardando swing alto e swing baixo já confirmados.",
+            "engine": "SMART_GOLD_HUNTER", "provider": "LOCAL_SGH_SIGNAL_ENGINE_PORT",
+            "reason": "SMART GOLD HUNTER aguardando estrutura ZigZag válida.",
             "non_repaint": True, "next_candle_entry": True, "gale_signal": False,
             "grid": False, "martingale": False, "direct_win_only": True,
-            "source_reconstruction": "VISIBLE_MQ5_ONLY_MISSING_MQH",
+            "source_reconstruction": "SGH_SIGNAL_ENGINE_MQH_PORT",
+        }
+    high_buffer, low_buffer, zigzag_buffer = built
+    latest, previous = _sgh_latest_two_extrema(series, high_buffer, low_buffer, zigzag_buffer)
+    if not latest or not previous:
+        return {
+            "available": True, "direction": "NEUTRO", "confidence": 0.0,
+            "confirmed": False, "risk": "HIGH", "strategy": name,
+            "engine": "SMART_GOLD_HUNTER", "provider": "LOCAL_SGH_SIGNAL_ENGINE_PORT",
+            "reason": "SMART GOLD HUNTER aguardando os dois extremos necessários do ZigZag.",
+            "non_repaint": True, "next_candle_entry": True, "gale_signal": False,
+            "grid": False, "martingale": False, "direct_win_only": True,
+            "source_reconstruction": "SGH_SIGNAL_ENGINE_MQH_PORT",
         }
 
-    swing_hi_i, swing_hi = highs[-1]
-    swing_lo_i, swing_lo = lows[-1]
-    o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"])
-    pc = float(prev["close"])
-    candle_range = max(h - l, 1e-12)
-    body = abs(c - o)
-    body_ratio = body / candle_range
-    close_pos = (c - l) / candle_range
-    a = atr(rows, SGH_ATR_PERIOD)
-    if a is None or a <= 0:
-        recent = rows[-min(12, len(rows)):]
-        a = sum(max(float(x["high"]) - float(x["low"]), 0.0) for x in recent) / max(1, len(recent))
-    a = max(float(a or 0.0), 1e-12)
-    buffer = a * SGH_BREAK_BUFFER_ATR
+    actionable = previous
+    trigger_distance = SGH_TRIGGER_DISTANCE_POINTS * normalized_point
+    offset = float(profile["entry_offset_points"]) * raw_point
+    original_side = "NONE"
+    entry_price = 0.0
+    if float(previous["price"]) > float(latest["price"]):
+        original_side = "BUY_STOP"
+        entry_price = float(actionable["price"]) + offset
+    elif float(latest["price"]) > float(previous["price"]):
+        original_side = "SELL_STOP"
+        entry_price = float(actionable["price"]) - offset
 
-    upper_trigger = float(swing_hi) + buffer
-    lower_trigger = float(swing_lo) - buffer
-    # fresh_cross impede repetir CALL/PUT em toda vela enquanto o preço permanece
-    # do mesmo lado do swing; equivale à memória oneShot/sticky do EA, sem ordens.
-    fresh_call = pc <= upper_trigger and c > upper_trigger
-    fresh_put = pc >= lower_trigger and c < lower_trigger
-    broke_both = h > upper_trigger and l < lower_trigger
-    bullish = c > o
-    bearish = c < o
-    body_ok = body_ratio >= SGH_MIN_BODY_RATIO
-    not_exhausted = candle_range <= a * SGH_MAX_RANGE_ATR
-    call_close_ok = close_pos >= SGH_CLOSE_POS
-    put_close_ok = close_pos <= (1.0 - SGH_CLOSE_POS)
-    call_clearance = max(0.0, (c - upper_trigger) / a)
-    put_clearance = max(0.0, (lower_trigger - c) / a)
-    call_not_late = call_clearance <= SGH_MAX_CLEARANCE_ATR
-    put_not_late = put_clearance <= SGH_MAX_CLEARANCE_ATR
+    # rows[-1] é a vela atual; rows[-2] e rows[-3] são as duas fechadas usadas no
+    # gatilho binário. Exigimos cruzamento novo para não repetir sinal após o nível.
+    last_closed = rates[-2]
+    prev_closed = rates[-3]
+    last_close = float(last_closed["close"])
+    prev_close = float(prev_closed["close"])
+    direction = "NEUTRO"
+    armed = False
+    fresh_cross = False
+    if original_side == "BUY_STOP":
+        armed = (float(actionable["price"]) - prev_close) > trigger_distance
+        fresh_cross = prev_close < entry_price <= last_close
+        if armed and fresh_cross:
+            direction = "CALL"
+    elif original_side == "SELL_STOP":
+        armed = (prev_close - float(actionable["price"])) > trigger_distance
+        fresh_cross = prev_close > entry_price >= last_close
+        if armed and fresh_cross:
+            direction = "PUT"
 
-    call_ok = bool(fresh_call and bullish and body_ok and not_exhausted and call_close_ok and call_not_late and not broke_both)
-    put_ok = bool(fresh_put and bearish and body_ok and not_exhausted and put_close_ok and put_not_late and not broke_both)
-    direction = "CALL" if call_ok else ("PUT" if put_ok else "NEUTRO")
-
-    confidence = 0.0
     if direction in ("CALL", "PUT"):
-        clearance = call_clearance if direction == "CALL" else put_clearance
-        confidence = 70.0
-        confidence += min(9.0, max(0.0, body_ratio - SGH_MIN_BODY_RATIO) * 25.0)
-        confidence += min(7.0, clearance * 18.0)
-        edge_pos = close_pos if direction == "CALL" else (1.0 - close_pos)
-        confidence += min(6.0, max(0.0, edge_pos - SGH_CLOSE_POS) * 20.0)
-        confidence = clamp(confidence, 70.0, 92.0)
-
-    if direction == "CALL":
+        overshoot = abs(last_close - entry_price)
+        sep = abs(float(previous["price"]) - float(latest["price"]))
+        base = 76.0
+        base += min(7.0, (overshoot / max(trigger_distance, raw_point, 1e-12)) * 1.5)
+        base += min(5.0, (sep / max(trigger_distance, raw_point, 1e-12)) * 0.15)
+        confidence = clamp(base, 76.0, 88.0)
         reason = (
-            f"Swing alto confirmado em {swing_hi:.6g}; a última vela fechou acima do nível + buffer ATR, "
-            f"com corpo {body_ratio*100:.0f}% e fechamento forte. CALL na próxima vela."
-        )
-    elif direction == "PUT":
-        reason = (
-            f"Swing baixo confirmado em {swing_lo:.6g}; a última vela fechou abaixo do nível - buffer ATR, "
-            f"com corpo {body_ratio*100:.0f}% e fechamento forte. PUT na próxima vela."
+            f"SGH {profile['name']}: {original_side} reconstruído em {entry_price:.8g}; "
+            f"a última vela fechada cruzou o nível. {direction} na próxima vela."
         )
     else:
-        blockers = []
-        if broke_both: blockers.append("vela atravessou os dois swings")
-        if not (fresh_call or fresh_put): blockers.append("sem rompimento novo de swing")
-        if not body_ok: blockers.append(f"corpo abaixo de {SGH_MIN_BODY_RATIO*100:.0f}%")
-        if not not_exhausted: blockers.append("vela esticada demais")
-        if fresh_call and not call_close_ok: blockers.append("fechamento comprador fraco")
-        if fresh_put and not put_close_ok: blockers.append("fechamento vendedor fraco")
-        if fresh_call and not call_not_late: blockers.append("CALL já distante demais do swing")
-        if fresh_put and not put_not_late: blockers.append("PUT já distante demais do swing")
-        reason = "SMART GOLD HUNTER monitorando: " + (", ".join(blockers) if blockers else "aguardando rompimento confirmado") + "."
+        confidence = 0.0
+        if original_side == "NONE":
+            reason = "SMART GOLD HUNTER monitorando: os dois extremos estão sem direção de preço válida."
+        elif not armed:
+            reason = f"SMART GOLD HUNTER monitorando: {original_side} existe, mas ainda não havia distância mínima de 10 pontos normalizados para armar o nível."
+        else:
+            reason = f"SMART GOLD HUNTER monitorando: {original_side} armado em {entry_price:.8g}; aguardando cruzamento confirmado por vela fechada."
 
     return {
         "available": True,
         "direction": direction,
         "confidence": round(float(confidence), 1),
         "confirmed": direction in ("CALL", "PUT"),
-        "risk": "LOW" if confidence >= 82 else ("MEDIUM" if direction != "NEUTRO" else "HIGH"),
+        "risk": "MEDIUM" if direction in ("CALL", "PUT") else "HIGH",
         "strategy": name,
         "engine": "SMART_GOLD_HUNTER",
-        "provider": "LOCAL_SGH_CONFIRMED_SWING",
+        "provider": "LOCAL_SGH_SIGNAL_ENGINE_PORT",
         "reason": reason[:460],
         "external_ai_disabled": True,
         "gale_signal": False,
@@ -8089,16 +8267,27 @@ def sgh_next_candle_strategy(cs, timeframe="1min", market="OPEN"):
         "grid": False,
         "martingale": False,
         "direct_win_only": True,
-        "source_reconstruction": "VISIBLE_MQ5_ONLY_MISSING_MQH",
+        "source_reconstruction": "SGH_SIGNAL_ENGINE_MQH_PORT",
         "diagnostics": {
-            "pivot_len": SGH_PIVOT_LEN,
-            "swing_high_index": int(swing_hi_i), "swing_high": round(float(swing_hi), 10),
-            "swing_low_index": int(swing_lo_i), "swing_low": round(float(swing_lo), 10),
-            "atr": round(a, 10), "buffer": round(buffer, 10),
-            "body_ratio": round(body_ratio, 4), "close_position": round(close_pos, 4),
-            "fresh_call_break": fresh_call, "fresh_put_break": fresh_put,
-            "dual_swing_break_blocked": broke_both,
+            "profile": profile["name"],
+            "native_profile_timeframe": profile["native_timeframe"],
+            "app_timeframe": tf_label,
+            "copy_rates_count": SGH_COPY_RATES_COUNT,
+            "swing_depth": int(profile["swing_depth"]),
+            "zigzag_deviation_points": SGH_ZIGZAG_DEVIATION_POINTS,
+            "zigzag_backstep": SGH_ZIGZAG_BACKSTEP,
+            "latest_extremum": latest,
+            "previous_extremum": previous,
+            "original_side": original_side,
+            "entry_offset_points": float(profile["entry_offset_points"]),
+            "entry_price": round(float(entry_price), 10),
+            "raw_point": raw_point,
+            "normalized_point": normalized_point,
+            "trigger_distance": trigger_distance,
+            "armed": bool(armed),
+            "fresh_closed_cross": bool(fresh_cross),
             "cooldown_seconds": SGH_COOLDOWN_SECONDS,
+            "trade_engine_used_for_execution": False,
         },
     }
 
@@ -12637,7 +12826,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             else:
                 raw = await candles(symbol, interval, SUPERZ_HISTORY_BARS, "OPEN", None, request=request)
         elif engine == "SGH":
-            # SMART GOLD HUNTER: pivôs confirmados + rompimento fechado; próxima vela.
+            # SMART GOLD HUNTER: SGH_SignalEngine portado + cruzamento fechado do nível pendente; próxima vela.
             if market == "IQ_OTC":
                 if not iq_state:
                     out = neutral_signal(
@@ -12654,9 +12843,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     })
                     cache[key] = (time.time(), out)
                     return out
-                raw = await iq_ea_candles(iq_state, symbol, interval, 140, regular_market=False)
+                raw = await iq_ea_candles(iq_state, symbol, interval, SGH_COPY_RATES_COUNT, regular_market=False)
             else:
-                raw = await candles(symbol, interval, 140, "OPEN", None, request=request)
+                raw = await candles(symbol, interval, SGH_COPY_RATES_COUNT, "OPEN", None, request=request)
         elif engine == "SMC":
             # SMC FVG + HL: candle fechado, retorno ao FVG + estrutura/SR, próxima vela.
             if market == "IQ_OTC":
@@ -13072,7 +13261,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "SNIPER": "LOCAL_SUPER_Z_PMAX",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
-                    "SGH": "LOCAL_SGH_CONFIRMED_SWING",
+                    "SGH": "LOCAL_SGH_SIGNAL_ENGINE_PORT",
                 "SMC": "LOCAL_SMC_FVG_HL",
                 "VTOB": "LOCAL_VOLUME_TREND_OB",
                     "RAPID": "LOCAL_RAPID_EAS",
@@ -13126,7 +13315,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "PRESIDEN":
                 analysis = presiden_breakout_strategy(engine_closed, interval, market=market)
             elif engine == "SGH":
-                analysis = sgh_next_candle_strategy(engine_closed, interval, market=market)
+                analysis = sgh_next_candle_strategy(raw[-SGH_COPY_RATES_COUNT:], interval, market=market, symbol=symbol)
             elif engine == "SMC":
                 base_sec = int(INTERVALS.get(interval, 60))
                 smc_mtf = {}
@@ -13359,7 +13548,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "SNIPER": "LOCAL_SUPER_Z_PMAX",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
-                    "SGH": "LOCAL_SGH_CONFIRMED_SWING",
+                    "SGH": "LOCAL_SGH_SIGNAL_ENGINE_PORT",
                 "SMC": "LOCAL_SMC_FVG_HL",
                 "VTOB": "LOCAL_VOLUME_TREND_OB",
                     "RAPID": "LOCAL_RAPID_EAS",
@@ -13853,12 +14042,17 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     base["rsi_pure"] = {"period": 9, "timeframes": (["M1","M5","M15","M30"] if interval == "1min" else ["M5","M15","M30","H1"]), "lower": 40, "upper": 60, "applied_price": "TYPICAL", "adx_min": RSI_ADX_MIN, "di_edge": RSI_ADX_DI_EDGE, "cooldown_seconds": RSI_ADX_COOLDOWN_SECONDS}
                 if engine == "SGH":
                     base["non_repaint_after_release"] = True
-                    base["signal_snapshot"] = "LAST_CLOSED_CANDLE_CONFIRMED_SWING"
+                    base["signal_snapshot"] = "SGH_PENDING_LEVEL_CROSSED_BY_LAST_CLOSED_CANDLE"
                     base["sgh"] = {
-                        "pivot_len": SGH_PIVOT_LEN, "atr_period": SGH_ATR_PERIOD,
-                        "break_buffer_atr": SGH_BREAK_BUFFER_ATR, "cooldown_seconds": SGH_COOLDOWN_SECONDS,
-                        "source": "Smart Gold Hunter v2.0 MQ5 visible shell",
-                        "missing_modules": ["SGH_SignalEngine.mqh", "SGH_TradeEngine.mqh"],
+                        "copy_rates_count": SGH_COPY_RATES_COUNT,
+                        "extrema_scan_limit": SGH_EXTREMA_SCAN_LIMIT,
+                        "zigzag_deviation_points": SGH_ZIGZAG_DEVIATION_POINTS,
+                        "zigzag_backstep": SGH_ZIGZAG_BACKSTEP,
+                        "trigger_distance_points": SGH_TRIGGER_DISTANCE_POINTS,
+                        "profile": SGH_PROFILE_MODE,
+                        "cooldown_seconds": SGH_COOLDOWN_SECONDS,
+                        "source": "SGH_SignalEngine.mqh clean-room port",
+                        "trade_engine": "SGH_TradeEngine.mqh reviewed; MT5 order execution not used by binary engine",
                     }
 
                 if engine == "SMART" and moment_gate.get("confirmed"):
@@ -13986,7 +14180,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "SNIPER": "LOCAL_SUPER_Z_PMAX",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
-                    "SGH": "LOCAL_SGH_CONFIRMED_SWING",
+                    "SGH": "LOCAL_SGH_SIGNAL_ENGINE_PORT",
                 "SMC": "LOCAL_SMC_FVG_HL",
                 "VTOB": "LOCAL_VOLUME_TREND_OB",
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
@@ -18356,7 +18550,7 @@ async def pre_signals(
     if engine == "SGH":
         return {
             "ok": True,
-            "message": "SMART GOLD HUNTER usa somente swings já confirmados e rompimento em candle fechado; não usa pré-sinal intrabar. CALL/PUT vale para a vela imediatamente seguinte.",
+            "message": "SMART GOLD HUNTER usa o ZigZag e os níveis BUY_STOP/SELL_STOP reconstruídos do SGH_SignalEngine; o CALL/PUT só libera após cruzamento em vela fechada e vale para a vela seguinte.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -19067,9 +19261,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             if market == "IQ_OTC":
                 if not iq_state:
                     raise RuntimeError("Conecte a IQ Option para o SMART GOLD HUNTER analisar OTC.")
-                raw = await iq_ea_candles(iq_state, sym, interval, 140, regular_market=False)
+                raw = await iq_ea_candles(iq_state, sym, interval, SGH_COPY_RATES_COUNT, regular_market=False)
             else:
-                raw = await candles(sym, interval, 140, "OPEN", None, request=request)
+                raw = await candles(sym, interval, SGH_COPY_RATES_COUNT, "OPEN", None, request=request)
         elif engine == "SMC":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -19219,7 +19413,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     else f"{engine_label} • MONITORANDO • {why}"
                 )
             elif engine == "SGH":
-                tech = sgh_next_candle_strategy(closed, interval, market=market)
+                tech = sgh_next_candle_strategy(raw[-SGH_COPY_RATES_COUNT:], interval, market=market, symbol=sym)
                 engine_label = "SMART GOLD HUNTER"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why = str(tech.get("reason") or "SMART GOLD HUNTER monitorando").replace("\n", " ")[:88]
@@ -20483,7 +20677,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Smart Gold Hunter">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🎯 SMART GOLD HUNTER</div>
-      <div class="robot-mode-desc" id="sghModeDesc">Swing/ZigZag confirmado • rompimento por candle fechado • sem ordem pendente • CALL/PUT na próxima vela • sem Gale.</div>
+      <div class="robot-mode-desc" id="sghModeDesc">ZigZag SGH original • nível BUY_STOP/SELL_STOP reconstruído • cruzamento em vela fechada • CALL/PUT na próxima vela • sem Gale.</div>
     </div>
     <button id="sghPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
