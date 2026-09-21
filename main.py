@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.90.1"
+APP_VERSION = "3.90.2"
 PWA_VERSION = "v151"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -11905,6 +11905,151 @@ def _chart_ai_timeframe_summary(rows, label="TF"):
     }
 
 
+def _chart_ai_volume_strength_map(rows):
+    """Mapa de força por volume para a IA LEITURA DO GRÁFICO.
+
+    IMPORTANTE: esta camada nunca é confirmação obrigatória e nunca bloqueia um
+    sinal sozinha. Ela reaproveita o perfil OHLCV/POC já existente para dizer à IA
+    se há concentração de volume, reação no POC, absorção, delta estimado ou
+    imbalance alinhados. Se a fonte não tiver volume confiável, retorna available=False
+    e a leitura segue normalmente apenas com price action/MTF/XGBoost.
+    """
+    data = list(rows or [])
+    base = {
+        "available": False,
+        "mandatory": False,
+        "hard_block": False,
+        "direction": "NEUTRO",
+        "level": "NORMAL",
+        "strength_score": 0,
+        "volume_ratio": None,
+        "poc": None,
+        "near_poc": False,
+        "delta_ratio": None,
+        "evidence": [],
+        "source": "OHLCV_VOLUME_PROFILE_PROXY",
+        "delta_method": "OHLCV_PROXY_NOT_TRUE_BID_ASK",
+    }
+    if len(data) < max(VOLUME_POC_LOOKBACK + 2, 44):
+        base["reason"] = "Histórico insuficiente para mapa de volume; camada ignorada."
+        return base
+
+    try:
+        snap = _volume_poc_snapshot(data, early_signal=False, use_ai=False, mtf=None)
+    except Exception as exc:
+        base["reason"] = f"Mapa de volume indisponível: {str(exc)[:120]}"
+        return base
+
+    if not snap:
+        base["reason"] = "Sem perfil de volume utilizável; camada ignorada."
+        return base
+
+    coverage = float(snap.get("volume_coverage") or 0.0)
+    volume_ratio = float(snap.get("volume_ratio") or 0.0)
+    if not bool(snap.get("coverage_ok")) or float(snap.get("volume") or 0.0) <= 0:
+        base.update({
+            "volume_coverage": round(coverage, 3),
+            "volume_ratio": round(volume_ratio, 2) if volume_ratio > 0 else None,
+            "reason": "Fonte sem volume confiável suficiente; camada ignorada sem bloquear sinal.",
+        })
+        return base
+
+    call_score = int(snap.get("call_score") or 0)
+    put_score = int(snap.get("put_score") or 0)
+    edge = call_score - put_score
+    direction = "CALL" if edge >= 1 else ("PUT" if edge <= -1 else "NEUTRO")
+
+    if direction == "CALL":
+        evidence = list(snap.get("call_checks") or [])
+        absorption = bool(snap.get("bull_absorption"))
+        stacked = bool(snap.get("bull_stacked"))
+        divergence = bool(snap.get("bull_divergence"))
+        poc_reaction = bool(snap.get("poc_call"))
+        first_trigger = bool(snap.get("first_trigger_call"))
+        structure_release = bool(snap.get("structure_release_call"))
+    elif direction == "PUT":
+        evidence = list(snap.get("put_checks") or [])
+        absorption = bool(snap.get("bear_absorption"))
+        stacked = bool(snap.get("bear_stacked"))
+        divergence = bool(snap.get("bear_divergence"))
+        poc_reaction = bool(snap.get("poc_put"))
+        first_trigger = bool(snap.get("first_trigger_put"))
+        structure_release = bool(snap.get("structure_release_put"))
+    else:
+        evidence = []
+        absorption = stacked = divergence = poc_reaction = first_trigger = structure_release = False
+
+    delta_ratio = float(snap.get("delta_ratio") or 0.0)
+    strength = min(3, abs(edge))
+    if volume_ratio >= 1.10:
+        strength += 1
+    if volume_ratio >= 1.50:
+        strength += 1
+    if absorption:
+        strength += 2
+    if stacked:
+        strength += 2
+    if poc_reaction:
+        strength += 2
+    if first_trigger:
+        strength += 2
+    elif structure_release:
+        strength += 1
+    if divergence:
+        strength += 1
+    if abs(delta_ratio) >= 0.18:
+        strength += 1
+
+    if direction == "NEUTRO":
+        level = "NORMAL"
+        strength = 0
+    elif strength >= 7:
+        level = "MUITO_FORTE"
+    elif strength >= 4:
+        level = "FORTE"
+    else:
+        level = "NORMAL"
+
+    poc_low = snap.get("poc_low")
+    poc_high = snap.get("poc_high")
+    last = data[-1]
+    low = float(last.get("low") or 0.0)
+    high = float(last.get("high") or 0.0)
+    near_poc = bool(
+        poc_low is not None and poc_high is not None
+        and high >= float(poc_low) and low <= float(poc_high)
+    )
+
+    return {
+        **base,
+        "available": True,
+        "direction": direction,
+        "level": level,
+        "strength_score": int(strength),
+        "call_score": call_score,
+        "put_score": put_score,
+        "score_edge": abs(edge),
+        "volume_ratio": round(volume_ratio, 2),
+        "volume_coverage": round(coverage, 3),
+        "poc": snap.get("poc"),
+        "poc_low": poc_low,
+        "poc_high": poc_high,
+        "near_poc": near_poc,
+        "delta_ratio": round(delta_ratio, 3),
+        "absorption": absorption,
+        "stacked_imbalance": stacked,
+        "divergence": divergence,
+        "poc_reaction": poc_reaction,
+        "structure_release": structure_release,
+        "evidence": evidence[:6],
+        "reason": (
+            f"Volume {level.replace('_',' ')} {direction} como bônus de contexto."
+            if direction in ("CALL", "PUT")
+            else "Volume disponível, mas sem lado dominante; não interfere no sinal."
+        ),
+    }
+
+
 async def _chart_ai_mtf_context(symbol, interval, base_rows, market="OPEN", request=None, iq_state=None):
     """Busca/resume timeframes maiores e calcula consenso direcional.
 
@@ -12060,6 +12205,10 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
             "errors": {"MTF": str(exc)[:140]}, "source": "BASE_ONLY",
         }
 
+    # Mapa de força por volume: SOMENTE bônus. Nunca é requisito e nunca veta
+    # um sinal sozinho. Se a fonte não tiver volume confiável, é ignorado.
+    volume_strength_map = _chart_ai_volume_strength_map(rows)
+
     # GATILHO 1 — padrão de vela independente.
     candle_pattern_filter = _pure_ai_candle_pattern_filter(rows, "NEUTRO")
 
@@ -12168,6 +12317,7 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
             "smart_scan": True, "api_called": False, "provider": "LOCAL_TRIGGER_CONFLICT",
             "fallback": False, "api_available": bool(GEMINI_KEY or OAI_KEY),
             "h1_filter": h1_filter, "candle_pattern_filter": candle_pattern_filter,
+            "volume_strength_map": volume_strength_map,
             "independent_trigger": True,
         }
         st["last_call"] = now_ts
@@ -12185,6 +12335,7 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
             "independent_trigger": False,
             "xgboost": xgb_signal,
             "local_trigger_hint": local_trigger_hint,
+            "volume_strength_map": volume_strength_map,
         })
         st["last_call"] = now_ts
         st["last_result"] = dict(out)
@@ -12215,6 +12366,7 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
             },
             "xgboost": xgb_signal,
             "local_trigger_hint": local_trigger_hint,
+            "volume_strength_map": volume_strength_map,
         }
         st["last_call"] = now_ts
         st["last_result"] = dict(out)
@@ -12232,6 +12384,7 @@ Este é o MODO LEITURA PROFISSIONAL DO GRÁFICO: não use RSI, MACD, Bollinger, 
 Use SOMENTE dados de candles OHLCV FECHADOS e os RESUMOS MTF causais fornecidos. Não há candle futuro e nenhuma informação posterior à decisão.
 
 Avalie price action de curto prazo: sequência de altas/baixas, corpos, pavios, rejeição, continuidade, rompimento real, falso rompimento, estrutura recente, aceleração/desaceleração, alternância/lateralização, localização dentro do range recente e volume apenas se estiver disponível.
+O volume é SOMENTE uma camada de reforço: ausência, neutralidade ou volume comum NÃO pode bloquear CALL/PUT se price action + XGBoost estiverem bons.
 A previsão é para UMA vela à frente, não para a tendência geral.
 
 REGRAS DE QUALIDADE:
@@ -12252,6 +12405,15 @@ REGRAS MTF:
 - Se dois ou mais timeframes maiores estiverem fortemente contra a direção proposta, prefira NEUTRO.
 - Uma reação clara em suporte/resistência pode justificar reversão mesmo contra a tendência maior, mas exija rejeição forte no timeframe de entrada.
 - Não transforme tendência geral em sinal automático para a próxima vela.
+
+MAPA DE FORÇA POR VOLUME/POC (BÔNUS, NUNCA OBRIGATÓRIO):
+{json.dumps(volume_strength_map, ensure_ascii=False)}
+REGRAS DO VOLUME:
+- Use POC, absorção, delta estimado, imbalance e volume relativo somente como confirmação adicional.
+- Se available=false ou direction=NEUTRO, IGNORE essa camada e continue a leitura normalmente.
+- Se o mapa estiver alinhado com a leitura, ele pode reforçar confiança/qualidade.
+- Se estiver contrário, não neutralize por causa do volume sozinho; só considere conflito quando o próprio price action também mostrar fraqueza.
+- Delta é proxy OHLCV, não fluxo bid/ask real.
 
 CAMADA ESTATÍSTICA XGBOOST (não copie cegamente; use como evidência quantitativa):
 {json.dumps(xgb_signal, ensure_ascii=False)}
@@ -12287,6 +12449,17 @@ Candles do timeframe de entrada: {json.dumps(data, ensure_ascii=False)}"""
         xgb_direction = str(xgb_signal.get("direction") or "NEUTRO").upper()
         xgb_confidence = float(xgb_signal.get("confidence") or 0.0)
         xgb_agrees = bool(direction in ("CALL", "PUT") and xgb_direction == direction)
+
+        # Volume/POC é bônus, nunca trava. Até uma leitura oposta não cria veto
+        # automático; apenas deixamos a IA/price action decidirem o conflito real.
+        volume_available = bool(volume_strength_map.get("available"))
+        volume_direction = str(volume_strength_map.get("direction") or "NEUTRO").upper()
+        volume_level = str(volume_strength_map.get("level") or "NORMAL").upper()
+        volume_aligned = bool(volume_available and direction in ("CALL", "PUT") and volume_direction == direction)
+        volume_opposes = bool(volume_available and direction in ("CALL", "PUT") and volume_direction in ("CALL", "PUT") and volume_direction != direction)
+        volume_quality_bonus = 0.0
+        if volume_aligned:
+            volume_quality_bonus = {"NORMAL": 1.0, "FORTE": 2.5, "MUITO_FORTE": 4.0}.get(volume_level, 1.0)
 
         # v3.43 — modo equilibrado: mais frequência sem abrir mão da análise cruzada.
         # A confiança bruta deixa de ser uma trava excessiva. O sinal ainda precisa
@@ -12362,6 +12535,8 @@ Candles do timeframe de entrada: {json.dumps(data, ensure_ascii=False)}"""
             analysis_quality += min(5.0, 2.0 + (mtf_strength - CHART_AI_MIN_MTF_STRENGTH) * 0.08)
         elif mtf_opposes:
             analysis_quality -= min(8.0, 4.0 + (mtf_strength - CHART_AI_MTF_BLOCK_OPPOSITE) * 0.10)
+        # Volume só SOMA quando alinhado. Neutro/oposto não tira pontos e não veta.
+        analysis_quality += volume_quality_bonus
         analysis_quality = round(max(0.0, min(100.0, analysis_quality)), 1)
 
         # Quando a EA Vela Atual confirma ticks reais fortes na mesma direção,
@@ -12400,13 +12575,18 @@ Candles do timeframe de entrada: {json.dumps(data, ensure_ascii=False)}"""
 
         if direction in ("CALL", "PUT") and xgb_ready and xgb_confirmed and xgb_agrees:
             confidence = round(min(97.0, confidence * 0.65 + xgb_confidence * 0.35), 1)
+        if direction in ("CALL", "PUT") and volume_aligned:
+            confidence = round(min(97.0, confidence + min(2.5, volume_quality_bonus * 0.55)), 1)
 
         if blocked_reason:
             direction, confirmed = "NEUTRO", False
             reason = f"Filtro WIN DIRETO bloqueou a entrada: {blocked_reason}. Leitura IA: {original_reason}"[:300]
         elif direction in ("CALL", "PUT"):
             confirmed = True
-            reason = f"{original_reason} • Filtro WIN DIRETO: {gate_reason}."[:300]
+            volume_note = ""
+            if volume_aligned and volume_level in ("FORTE", "MUITO_FORTE"):
+                volume_note = f" • Volume {volume_level.replace('_',' ')} alinhado como bônus."
+            reason = f"{original_reason} • Filtro WIN DIRETO: {gate_reason}.{volume_note}"[:340]
         else:
             confirmed = False
             reason = original_reason or "Sem vantagem clara para a próxima vela."
@@ -12435,7 +12615,9 @@ Candles do timeframe de entrada: {json.dumps(data, ensure_ascii=False)}"""
                 "invalidation": invalidation,
                 "input": "CLOSED_OHLCV",
                 "next_candle": True,
+                "volume_strength_map": volume_strength_map,
             },
+            "volume_strength_map": volume_strength_map,
             "xgboost": xgb_signal,
             "ensemble": {
                 "xgb_ready": xgb_ready,
@@ -12451,6 +12633,13 @@ Candles do timeframe de entrada: {json.dumps(data, ensure_ascii=False)}"""
                 "mtf_strength": round(mtf_strength, 1),
                 "mtf_agrees": bool(mtf_agrees),
                 "mtf_opposes": bool(mtf_opposes),
+                "volume_available": bool(volume_available),
+                "volume_direction": volume_direction,
+                "volume_level": volume_level,
+                "volume_aligned": bool(volume_aligned),
+                "volume_opposes": bool(volume_opposes),
+                "volume_quality_bonus": round(volume_quality_bonus, 1),
+                "volume_can_block": False,
                 "gate_override": bool(gate_override),
                 "required_confidence": round(required_conf, 1),
                 "openai_primary": bool(OAI_KEY),
@@ -12478,6 +12667,7 @@ Candles do timeframe de entrada: {json.dumps(data, ensure_ascii=False)}"""
         out["candle_pattern_filter"] = candle_pattern_filter
         out["xgboost"] = xgb_signal
         out["local_trigger_hint"] = local_trigger_hint
+        out["volume_strength_map"] = volume_strength_map
         out["independent_trigger"] = False
         st["last_call"] = now_ts
         st["last_result"] = dict(out)
@@ -21094,7 +21284,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • IA LEITURA DO GRÁFICO MTF + XGBoost • RSX/SMC/AlphaX • cTrader/IQ</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • IA LEITURA DO GRÁFICO MTF + XGBoost + Volume bônus • RSX/SMC/AlphaX • cTrader/IQ</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -21155,7 +21345,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Inteligência Artificial">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧠 IA LEITURA DO GRÁFICO</div>
-      <div class="robot-mode-desc" id="aiModeDesc">Leitura profissional do gráfico • M1 + contexto M5/M15/H1/H4 • OpenAI/Gemini + XGBoost • CALL/PUT/AGUARDAR • próxima vela.</div>
+      <div class="robot-mode-desc" id="aiModeDesc">Leitura profissional • M1 + M5/M15/H1/H4 • OpenAI/Gemini + XGBoost • mapa de força por Volume/POC como bônus, nunca obrigatório • próxima vela.</div>
     </div>
     <button id="aiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -25772,9 +25962,9 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar EA Tripla ativo • RSI + Value Chart + XGBoost • OPEN/OTC</div>';
     rad();
   }else if(engine==='SMART'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA LEITURA DO GRÁFICO ONLINE • MTF + XGBOOST + IA EXTERNA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Leitura do Gráfico selecionada • próxima vela.</div>';
-    if(radar) radar.innerHTML='<div>📡 IA Leitura do Gráfico ativa • MTF + price action + XGBoost</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA LEITURA DO GRÁFICO ONLINE • MTF + XGBOOST + VOLUME/POC BÔNUS + IA EXTERNA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Leitura do Gráfico selecionada • Volume/POC reforça sem travar • próxima vela.</div>';
+    if(radar) radar.innerHTML='<div>📡 IA Leitura do Gráfico ativa • MTF + price action + XGBoost + Volume/POC bônus</div>';
     rad();
   }else if(engine==='GRAPH_AI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA GRÁFICA ONLINE • PADRÕES + H1 + DOW H4 + LTA/LTB';
