@@ -377,11 +377,16 @@ BACKGROUND_DEFAULT_ENABLED = os.getenv("BACKGROUND_SIGNALS_ENABLED", "0").strip(
 BACKGROUND_DEFAULT_ENGINE = os.getenv("BACKGROUND_ENGINE", "ALPHAX").strip().upper() or "ALPHAX"
 BACKGROUND_DEFAULT_MARKET = os.getenv("BACKGROUND_MARKET", "OPEN").strip().upper() or "OPEN"
 BACKGROUND_DEFAULT_INTERVAL = os.getenv("BACKGROUND_INTERVAL", "1min").strip() or "1min"
+# Telegram do robô 24h é um estado do SERVIDOR. Por segurança começa OFF
+# quando não existe estado persistido explícito.
+BACKGROUND_DEFAULT_TELEGRAM_ENABLED = os.getenv("BACKGROUND_TELEGRAM_ENABLED", "0").strip().lower() in ("1", "true", "on", "yes")
 
 background_bot_task = None
 background_bot_lock = asyncio.Lock()
 background_bot_state: Dict[str, Any] = {
     "enabled": BACKGROUND_DEFAULT_ENABLED,
+    # Chave independente do motor. OFF aqui = NENHUMA mensagem automática.
+    "telegram_enabled": BACKGROUND_DEFAULT_TELEGRAM_ENABLED,
     "engine": BACKGROUND_DEFAULT_ENGINE,
     "market": BACKGROUND_DEFAULT_MARKET,
     "interval": BACKGROUND_DEFAULT_INTERVAL,
@@ -15190,6 +15195,7 @@ async def telegram_status():
         "configured": bool(TELEGRAM_BOT_TOKEN),
         "default_chat_configured": bool(TELEGRAM_CHAT_ID),
         "default_chat_id": TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID else None,
+        "enabled": bool(background_bot_state.get("telegram_enabled")),
     }
 
 
@@ -15234,6 +15240,10 @@ async def telegram_send(body: TelegramSignalBody):
     direction = str(body.direction or "NEUTRO").upper()
     result_label = str(body.result or "").upper().strip()
     if not body.test:
+        # Trava no servidor: o botão OFF do painel precisa impedir qualquer
+        # envio automático, mesmo se algum JavaScript antigo ainda tentar chamar.
+        if not bool(background_bot_state.get("telegram_enabled")):
+            raise HTTPException(409, "Telegram automático está OFF no painel.")
         if result_label:
             if result_label not in ("WIN", "LOSS", "WIN G1", "WIN G2", "LOSS G2"):
                 raise HTTPException(400, "Somente resultados finais WIN/LOSS/WIN G1/WIN G2/LOSS G2 podem ser enviados automaticamente ao Telegram.")
@@ -15255,6 +15265,7 @@ def _background_state_snapshot() -> Dict[str, Any]:
     pending = list(background_bot_state.get("pending_trades") or [])
     return {
         "enabled": bool(background_bot_state.get("enabled")),
+        "telegram_enabled": bool(background_bot_state.get("telegram_enabled")),
         "engine": str(background_bot_state.get("engine") or "ALPHAX"),
         "market": str(background_bot_state.get("market") or "OPEN"),
         "interval": str(background_bot_state.get("interval") or "1min"),
@@ -15279,6 +15290,7 @@ def _background_save_state() -> None:
     try:
         data = {
             "enabled": bool(background_bot_state.get("enabled")),
+            "telegram_enabled": bool(background_bot_state.get("telegram_enabled")),
             "engine": str(background_bot_state.get("engine") or "ALPHAX"),
             "market": str(background_bot_state.get("market") or "OPEN"),
             "interval": str(background_bot_state.get("interval") or "1min"),
@@ -15324,6 +15336,8 @@ def _background_load_state() -> None:
         symbols = [str(x).upper() for x in raw_symbols if str(x).upper() in allowed]
         background_bot_state.update({
             "enabled": bool(data.get("enabled", BACKGROUND_DEFAULT_ENABLED)),
+            # Arquivos de estado antigos não tinham essa chave: nesse caso OFF.
+            "telegram_enabled": bool(data.get("telegram_enabled", BACKGROUND_DEFAULT_TELEGRAM_ENABLED)),
             "engine": engine,
             "market": market,
             "interval": interval,
@@ -15446,6 +15460,8 @@ def _background_accounting_finish(trade: Dict[str, Any], result_label: str, cand
 
 
 async def _background_send_signal(payload: Dict[str, Any]) -> None:
+    if not bool(background_bot_state.get("telegram_enabled")):
+        return
     await _tg_send(TelegramSignalBody(
         chat_id=str(background_bot_state.get("chat_id") or "").strip() or None,
         symbol=str(payload.get("symbol") or "--"),
@@ -15460,6 +15476,10 @@ async def _background_send_signal(payload: Dict[str, Any]) -> None:
 
 
 async def _background_send_result(trade: Dict[str, Any], result_label: str) -> None:
+    if not bool(background_bot_state.get("telegram_enabled")):
+        return
+    if not bool(trade.get("telegram_notify", True)):
+        return
     await _tg_send(TelegramSignalBody(
         chat_id=str(background_bot_state.get("chat_id") or "").strip() or None,
         symbol=str(trade.get("symbol") or "--"),
@@ -15540,7 +15560,11 @@ async def _background_settle_pending() -> None:
                 continue
             # Telegram atual só aceita WIN/LOSS. Empate é contabilizado, mas não
             # dispara mensagem de perda falsa.
-            if result_label in ("WIN", "LOSS"):
+            if (
+                result_label in ("WIN", "LOSS")
+                and bool(background_bot_state.get("telegram_enabled"))
+                and bool(trade.get("telegram_notify", True))
+            ):
                 await _background_send_result(trade, result_label)
             _background_accounting_finish(trade, result_label, candle, iq_state)
             _release_ai_asset_cycle_lock(
@@ -15590,6 +15614,14 @@ async def _background_bot_loop() -> None:
             await _background_settle_pending()
             if not bool(background_bot_state.get("enabled")):
                 background_bot_state["status"] = "OFFLINE • SERVIDOR AGUARDANDO"
+                await asyncio.sleep(max(5.0, BACKGROUND_SCAN_SECONDS))
+                continue
+
+            # Motor pode continuar selecionado/ONLINE, mas Telegram OFF bloqueia
+            # a criação de novos sinais em segundo plano e qualquer mensagem.
+            if not bool(background_bot_state.get("telegram_enabled")):
+                current_engine = str(background_bot_state.get("engine") or "ALPHAX").upper()
+                background_bot_state["status"] = f"ONLINE • {current_engine} • TELEGRAM OFF"
                 await asyncio.sleep(max(5.0, BACKGROUND_SCAN_SECONDS))
                 continue
 
@@ -15659,6 +15691,7 @@ async def _background_bot_loop() -> None:
                             "confidence": float(payload.get("confidence") or 0.0),
                             "risk": str(payload.get("risk") or "--"),
                             "strategy": str(payload.get("strategy") or engine),
+                            "telegram_notify": True,
                             "entry_time": payload.get("entry_time"),
                             "expiry_time": payload.get("expiry_time"),
                             "sent_at": iso(now()),
@@ -15727,13 +15760,17 @@ async def background_bot_set_state(body: BackgroundBotStateBody):
             background_bot_state["chat_id"] = chat
 
         if action == "ACTIVATE_ENGINE":
+            tg_on = bool(background_bot_state.get("telegram_enabled"))
             background_bot_state.update({
                 "enabled": True,
                 "engine": requested_engine,
                 "market": market,
                 "interval": interval,
                 "symbols": symbols,
-                "status": f"ONLINE • {requested_engine} • {market} • FILA ATIVA",
+                "status": (
+                    f"ONLINE • {requested_engine} • {market} • FILA ATIVA"
+                    if tg_on else f"ONLINE • {requested_engine} • TELEGRAM OFF"
+                ),
                 "last_error": "",
             })
             print(
@@ -15754,19 +15791,34 @@ async def background_bot_set_state(body: BackgroundBotStateBody):
                 )
 
         elif action == "TELEGRAM_TOGGLE":
-            if body.telegram_enabled is False:
-                background_bot_state["enabled"] = False
-                background_bot_state["status"] = "OFFLINE • TELEGRAM DESLIGADO"
-            elif body.telegram_enabled is True:
-                current_engine = str(background_bot_state.get("engine") or BACKGROUND_DEFAULT_ENGINE).upper()
-                if current_engine not in _BACKGROUND_ENGINES:
-                    current_engine = "ALPHAX"
-                    background_bot_state["engine"] = current_engine
-                background_bot_state["enabled"] = True
-                background_bot_state["status"] = (
-                    f"ONLINE • {current_engine} • "
-                    f"{background_bot_state.get('market') or 'OPEN'} • FILA ATIVA"
-                )
+            if body.telegram_enabled is None:
+                raise HTTPException(400, "Informe telegram_enabled no botão Telegram.")
+
+            tg_on = bool(body.telegram_enabled)
+            background_bot_state["telegram_enabled"] = tg_on
+            current_engine = str(background_bot_state.get("engine") or BACKGROUND_DEFAULT_ENGINE).upper()
+            if current_engine not in _BACKGROUND_ENGINES:
+                current_engine = "ALPHAX"
+                background_bot_state["engine"] = current_engine
+
+            if not tg_on:
+                # Operações já abertas podem continuar sendo contabilizadas, mas
+                # nunca devem mandar WIN/LOSS depois que o usuário apertou OFF.
+                for trade in background_bot_state.get("pending_trades") or []:
+                    if isinstance(trade, dict):
+                        trade["telegram_notify"] = False
+                if bool(background_bot_state.get("enabled")):
+                    background_bot_state["status"] = f"ONLINE • {current_engine} • TELEGRAM OFF"
+                else:
+                    background_bot_state["status"] = "OFFLINE • TELEGRAM OFF"
+            else:
+                if bool(background_bot_state.get("enabled")):
+                    background_bot_state["status"] = (
+                        f"ONLINE • {current_engine} • "
+                        f"{background_bot_state.get('market') or 'OPEN'} • FILA ATIVA"
+                    )
+                else:
+                    background_bot_state["status"] = "OFFLINE • MOTOR DESLIGADO"
             background_bot_state["last_error"] = ""
 
         elif action == "PASSIVE":
@@ -19465,7 +19517,15 @@ function selectedRobotEngine(){
 }
 
 function adoptBackgroundEngineState(d){
-  if(!d || !d.server_side || !d.enabled) return;
+  if(!d || !d.server_side) return;
+  // O servidor é a fonte de verdade do Telegram. Isso impede a tela mostrar
+  // OFF enquanto o worker 24h continua ON.
+  if(typeof d.telegram_enabled==='boolean'){
+    telegramEnabled=!!d.telegram_enabled;
+    try{ localStorage.setItem(TELEGRAM_ENABLED_KEY,telegramEnabled?'1':'0'); }catch(_){}
+    if(typeof paintTelegramSettings==='function') paintTelegramSettings();
+  }
+  if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
   robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
   forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false;
@@ -22132,22 +22192,47 @@ if(telegramChatSelect){
   });
 }
 if(telegramToggle){
-  telegramToggle.onclick=()=>{
+  telegramToggle.onclick=async()=>{
     const chat_id=saveTelegramChatId();
-    if(!telegramEnabled && !chat_id){
+    const requested=!telegramEnabled;
+    if(requested && !chat_id){
       if(telegramSendStatus) telegramSendStatus.textContent='⚠️ Escolha primeiro o grupo que vai receber os sinais.';
       return;
     }
-    telegramEnabled=!telegramEnabled;
-    try{ localStorage.setItem(TELEGRAM_ENABLED_KEY,telegramEnabled?'1':'0'); }catch(_){ }
+
+    const previous=telegramEnabled;
+    telegramEnabled=requested;
     paintTelegramSettings();
-    syncBackgroundBotState({action:'TELEGRAM_TOGGLE'});
-    if(telegramSendStatus) telegramSendStatus.textContent=telegramEnabled?'🟢 Envio automático de sinais para o grupo ativado neste aparelho.':'🔴 Envio de sinais para o Telegram desligado.';
+    telegramToggle.disabled=true;
+    if(telegramSendStatus) telegramSendStatus.textContent=requested?'⏳ Ativando Telegram no servidor...':'⏳ Desligando Telegram no servidor...';
+
+    try{
+      const d=await syncBackgroundBotState({action:'TELEGRAM_TOGGLE'});
+      if(!d || typeof d.telegram_enabled!=='boolean' || !!d.telegram_enabled!==requested){
+        throw new Error('Servidor não confirmou a alteração do Telegram.');
+      }
+      telegramEnabled=!!d.telegram_enabled;
+      try{ localStorage.setItem(TELEGRAM_ENABLED_KEY,telegramEnabled?'1':'0'); }catch(_){ }
+      paintTelegramSettings();
+      if(telegramSendStatus) telegramSendStatus.textContent=telegramEnabled
+        ?'🟢 Telegram ON no servidor • sinais e resultados autorizados.'
+        :'🔴 Telegram OFF no servidor • nenhum sinal ou resultado será enviado.';
+    }catch(e){
+      telegramEnabled=previous;
+      try{ localStorage.setItem(TELEGRAM_ENABLED_KEY,telegramEnabled?'1':'0'); }catch(_){ }
+      paintTelegramSettings();
+      if(telegramSendStatus) telegramSendStatus.textContent='⚠️ Não foi possível confirmar no servidor: '+String(e&&e.message?e.message:e);
+    }finally{
+      telegramToggle.disabled=false;
+    }
   };
 }
 if(telegramFindBtn) telegramFindBtn.onclick=findTelegramGroups;
 if(telegramTestBtn) telegramTestBtn.onclick=testTelegram;
 loadTelegramSettings();
+// Assim que o painel abre, busca o estado real do worker no servidor.
+// Não depende mais apenas do localStorage deste celular.
+syncBackgroundBotState();
 
 function showTab(which){
   const main=which==='main';
