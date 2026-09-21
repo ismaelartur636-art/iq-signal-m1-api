@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.90.0"
-PWA_VERSION = "v149"
+APP_VERSION = "3.92.0"
+PWA_VERSION = "v151"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -17481,7 +17481,16 @@ ATIVOS E CANDLES EXTERNOS (mais antigo -> mais recente):
             "analyzed_at": iso(now()),
             "notice": "A IA compara os ativos externos; confiança não é garantia nem probabilidade estatística de WIN.",
             "cached": False,
+            "source": "IA EXTERNA",
+            "strategy": "IA EXTERNA • VARREDURA",
+            "engine": "EXTERNAL_AI",
+            "direct_only": True,
+            "external_ai": True,
         }
+        # Todo CALL/PUT confirmado entra na contabilidade do servidor. Como a IA
+        # Externa não usa Gale, WIN/LOSS da própria vela já é o resultado final.
+        if confirmed:
+            _remember_accounting_signal(request, result)
         external_scan_cache[target_key] = {"ts": time.time(), "result": result}
 
         if len(external_scan_cache) > 120:
@@ -19608,6 +19617,12 @@ def _remember_accounting_signal(request: Request, payload: Dict[str, Any]):
         "entry_time": payload.get("entry_time"),
         "expiry_time": payload.get("expiry_time"),
         "source": payload.get("source") or payload.get("strategy") or "SIGNAL",
+        "strategy": payload.get("strategy") or payload.get("source") or "SIGNAL",
+        "engine": payload.get("engine") or payload.get("mode") or "",
+        "confidence": float(payload.get("confidence") or 0.0),
+        "risk": str(payload.get("risk") or ""),
+        "direct_only": bool(payload.get("direct_only", False)),
+        "external_ai": bool(payload.get("external_ai", False)),
     }
     key = _accounting_key(item)
     if key and key not in done and key not in pending:
@@ -19706,8 +19721,12 @@ async def performance(request: Request, interval="1min", market="OPEN"):
     # o resultado da primeira vela. LOSS da primeira vela não é LOSS final.
     final_ops = {}
     for x in done.values():
-        if x.get("result") == "WIN":
+        r_done = str(x.get("result") or "").upper()
+        if r_done == "WIN":
             final_ops[_result_operation_key(x, market)] = "WIN"
+        elif r_done == "LOSS" and bool(x.get("direct_only")):
+            # Motores sem Gale (ex.: IA EXTERNA) encerram a operação na primeira vela.
+            final_ops[_result_operation_key(x, market)] = "LOSS"
 
     for x in direct_store.values():
         r = str(x.get("result") or "").upper()
@@ -19729,6 +19748,16 @@ async def performance(request: Request, interval="1min", market="OPEN"):
     losses = loss_g2 + loss_direct_final
     total = wins + losses
 
+    recent_results = []
+    for x in done.values():
+        r = str(x.get("result") or "").upper()
+        if r not in ("WIN", "LOSS", "DRAW"):
+            continue
+        row = dict(x)
+        row["operation_key"] = _result_operation_key(row, market)
+        recent_results.append(row)
+    recent_results.sort(key=lambda x: str(x.get("settled_at") or x.get("entry_time") or ""), reverse=True)
+
     return {
         "wins": wins,
         "losses": losses,
@@ -19741,6 +19770,8 @@ async def performance(request: Request, interval="1min", market="OPEN"):
         "win_g1": win_g1,
         "win_g2": win_g2,
         "loss_g2": loss_g2,
+        "loss_direct_final": loss_direct_final,
+        "recent_results": recent_results[:120],
     }
 
 
@@ -22304,6 +22335,61 @@ function mergeServerPerformance(p,m){
   const b=persistentResults[m]||emptyResultBucket();
   persistentResults[m]=b;
 
+  // Resultados automáticos do servidor (principalmente IA EXTERNA) precisam
+  // entrar também no histórico local, mesmo quando este celular já possui
+  // resultados de outros motores. operation_key impede contagem duplicada.
+  const recent=Array.isArray(p.recent_results)?p.recent_results:[];
+  const latestServerDirect=recent.find(x=>x && x.direct_only && ['WIN','LOSS'].includes(String(x.result||'').toUpperCase()));
+  if(latestServerDirect && result){
+    const rr=String(latestServerDirect.result||'').toUpperCase();
+    result.textContent=rr+(latestServerDirect.external_ai?' • IA EXTERNA':'');
+    result.className='big '+(rr==='WIN'?'call':'put');
+  }
+  let imported=false;
+  recent.forEach(x=>{
+    if(!x || !x.direct_only) return;
+    const r=String(x.result||'').toUpperCase();
+    if(r!=='WIN' && r!=='LOSS') return;
+    const t={
+      market:m,
+      symbol:String(x.symbol||''),
+      interval:String(x.interval||''),
+      direction:String(x.direction||'').toUpperCase(),
+      entry_time:x.entry_time,
+      expiry_time:x.expiry_time,
+      confidence:Number(x.confidence||0),
+      risk:String(x.risk||''),
+      strategy:String(x.strategy||x.source||''),
+      engine:String(x.engine||''),
+      direct_only:true
+    };
+    const opKey=String(x.operation_key||resultOperationKey(t));
+    if(!opKey) return;
+    b.final_ops=b.final_ops||{};
+    if(!b.final_ops[opKey]){
+      b.final_ops[opKey]=r;
+      imported=true;
+    }
+    const exists=(b.history||[]).some(h=>h && (h.op_key===opKey));
+    if(!exists){
+      b.history=b.history||[];
+      b.history.push({
+        key:resultTradeKey(t),op_key:opKey,
+        timestamp:x.entry_time||x.settled_at||new Date().toISOString(),
+        symbol:t.symbol,interval:t.interval,direction:t.direction,market:m,
+        result:r,entry_result:r,confidence:t.confidence,risk:t.risk,
+        strategy:t.strategy,engine:t.engine,entry_mode:'BIRTH',external_ai:!!x.external_ai
+      });
+      imported=true;
+    }
+  });
+  if(imported){
+    pruneHistory(b);
+    recountFinalBucket(b);
+    savePersistentResults();
+    return;
+  }
+
   // 33.77.1: depois que este aparelho registrou uma operação, o histórico
   // local passa a ser a fonte do placar. Assim uma resposta duplicada do
   // servidor nunca transforma 1 WIN em 2 WIN.
@@ -22319,7 +22405,7 @@ function mergeServerPerformance(p,m){
   b.win_g1=Math.max(0,Number(p.win_g1||0));
   b.win_g2=Math.max(0,Number(p.win_g2||0));
   b.loss_direct=Math.max(0,Number(p.loss_direct||0));
-  b.loss_g2=Math.max(0,Number(p.loss_g2||0));
+  b.loss_g2=Math.max(0,Number(p.loss_g2||0))+Math.max(0,Number(p.loss_direct_final||0));
   savePersistentResults();
 }
 
@@ -24123,8 +24209,35 @@ function paintExternalAiPower(){
     if(externalMainProvider) externalMainProvider.textContent='--';
     if(externalMainStatus) externalMainStatus.textContent='IA EXTERNA DESLIGADA • ative o monitor na aba IA Externa.';
   }else{
-    if(externalMainStatus && !externalAiLast) externalMainStatus.textContent='IA EXTERNA VARRENDO • procurando oportunidade nos ativos externos...';
+    // Se o botão está ON, nunca deixe a aba dizendo "MONITOR DESLIGADO".
+    if(!externalAiLast){
+      if(externalStatus) externalStatus.textContent='🌐 VARRENDO ATIVOS EXTERNOS...';
+      if(externalReason) externalReason.textContent='Monitor ligado • buscando cotações externas e comparando as melhores oportunidades.';
+      if(externalMainStatus) externalMainStatus.textContent='IA EXTERNA VARRENDO • procurando oportunidade nos ativos externos...';
+    }
   }
+}
+
+function paintExternalSignalAsPrimary(d){
+  if(!d || !d.confirmed) return false;
+  const dir=String(d.direction||'NEUTRO').toUpperCase();
+  if(dir!=='CALL' && dir!=='PUT') return false;
+  const entryMs=Date.parse(String(d.entry_time||''));
+  const expiryMs=Date.parse(String(d.expiry_time||''));
+  // Mantém o sinal visível desde a liberação até o fechamento da vela.
+  if(Number.isFinite(expiryMs) && Date.now()>expiryMs+4000) return false;
+  const sym=String(d.symbol||'--');
+  if(direction){direction.textContent=dir;direction.className='big '+(dir==='CALL'?'call':'put');}
+  if(signalAsset) paintSignalAsset(sym);
+  if(confidence) confidence.textContent='Confiança: '+Number(d.confidence||0).toFixed(0)+'% • IA EXTERNA';
+  if(entry) entry.textContent=externalClock(d.entry_time);
+  if(countdown){
+    const sec=Number.isFinite(entryMs)?Math.ceil((entryMs-Date.now())/1000):0;
+    countdown.textContent=sec>0?`IA EXTERNA • ENTRA EM ${sec}s`:'IA EXTERNA • ENTRADA LIBERADA';
+  }
+  if(statusBox) statusBox.textContent='🌐 IA EXTERNA • '+dir+' • '+sym+' • '+String(d.status||'SINAL CONFIRMADO');
+  if(risk) risk.textContent='Risco: '+String(d.risk||'--')+' • sem Gale';
+  return true;
 }
 
 function renderExternalAiOnMain(d){
@@ -24149,6 +24262,7 @@ function renderExternalAiOnMain(d){
     const why=String(d.reason||'Aguardando leitura externa mais clara.').replace(/\s+/g,' ').slice(0,220);
     externalMainStatus.textContent=state+scan+' • '+why;
   }
+  paintExternalSignalAsPrimary(d);
   updateExternalCountdown();
 }
 
@@ -24221,6 +24335,12 @@ if(externalAiPowerBtn) externalAiPowerBtn.onclick=async()=>{
   if(externalAiEnabled) await loadExternalAi(true);
 };
 paintExternalAiPower();
+// Se o monitor ficou salvo como ONLINE, inicia a varredura imediatamente ao abrir/recarregar
+// a página. Antes, o botão podia aparecer verde enquanto a primeira análise ainda não havia
+// sido disparada, deixando o texto antigo "MONITOR DESLIGADO" na tela.
+if(externalAiEnabled){
+  setTimeout(()=>loadExternalAi(true),250);
+}
 setInterval(updateExternalCountdown,1000);
 setInterval(()=>{
   if(externalAiEnabled && !document.hidden) loadExternalAi(false);
@@ -25953,14 +26073,17 @@ async function sig(announce=false){
     const engine=selectedRobotEngine();
     if(engine==='OFF'){
       cur={direction:'NEUTRO',confidence:0,status:'MOTORES OFFLINE • SINAIS PAUSADOS',risk:'--',source_state:'READY'};
-      direction.textContent='NEUTRO';
-      direction.className='big neutral';
-      confidence.textContent='Confiança: 0%';
-      entry.textContent='AGUARDANDO SINAL';
-      countdown.textContent='Sem entrada confirmada';
-      statusBox.textContent=cur.status;
-      risk.textContent='Risco: --';
-      if(dataFeedText) dataFeedText.textContent='MOTORES OFFLINE • nenhuma análise solicitada';
+      const externalPainted=externalAiEnabled && paintExternalSignalAsPrimary(externalAiLast);
+      if(!externalPainted){
+        direction.textContent='NEUTRO';
+        direction.className='big neutral';
+        confidence.textContent='Confiança: 0%';
+        entry.textContent='AGUARDANDO SINAL';
+        countdown.textContent='Sem entrada confirmada';
+        statusBox.textContent=cur.status;
+        risk.textContent='Risco: --';
+      }
+      if(dataFeedText) dataFeedText.textContent=externalPainted?'IA EXTERNA • fonte externa ativa':'MOTORES OFFLINE • nenhuma análise solicitada';
       return;
     }
     cur=await get(
@@ -26023,6 +26146,12 @@ async function sig(announce=false){
       const src=String(cur.feed_label||cur.feed_source||'MULTIFONTE').replaceAll('_',' ');
       const fb=cur.feed_fallback===true?' • FALLBACK ATIVO':'';
       dataFeedText.textContent=src+fb;
+    }
+
+    // Quando o motor selecionado ainda está neutro, um CALL/PUT confirmado da
+    // IA Externa também ocupa o cartão SINAL ATUAL do Painel principal.
+    if(String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO' && externalAiEnabled){
+      paintExternalSignalAsPrimary(externalAiLast);
     }
 
     // No Velocity, um rompimento isolado é apenas pré-sinal.
