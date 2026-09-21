@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.80.1"
-PWA_VERSION = "v139"
+APP_VERSION = "3.80.3"
+PWA_VERSION = "v140"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -91,6 +91,23 @@ LARRY_BREAK_BUFFER_ATR = max(0.0, min(0.30, float(os.getenv("LARRY_BREAK_BUFFER_
 LARRY_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("LARRY_MIN_BODY_RATIO", "0.48"))))
 LARRY_MIN_RANGE_EXPANSION = max(0.70, min(2.00, float(os.getenv("LARRY_MIN_RANGE_EXPANSION", "0.90"))))
 LARRY_MAX_RANGE_ATR = max(1.20, min(6.00, float(os.getenv("LARRY_MAX_RANGE_ATR", "3.00"))))
+
+
+# MEGA IA 3.80.3 — RANGE COMPRESSION BREAKOUT v4 adaptado para opções binárias.
+# Preserva o núcleo do Pine: compressão adaptativa (percentil), ATR/buffer, breakout
+# e reversão por pavio. O bug original da reversão foi corrigido: o pavio é testado
+# contra os limites ANTERIORES da faixa antes da caixa absorver a vela atual.
+# Apenas candles fechados geram CALL/PUT; a entrada é sempre na próxima vela.
+RANGE_LEN = max(3, min(30, int(os.getenv("RANGE_LEN", "10"))))
+RANGE_PCT_RANK = max(1.0, min(60.0, float(os.getenv("RANGE_PCT_RANK", "20"))))
+RANGE_PCT_WIN = max(30, min(500, int(os.getenv("RANGE_PCT_WIN", "200"))))
+RANGE_ATR_PERIOD = max(5, min(60, int(os.getenv("RANGE_ATR_PERIOD", "25"))))
+RANGE_BREAK_BUFFER_ATR = max(0.0, min(0.30, float(os.getenv("RANGE_BREAK_BUFFER_ATR", "0.05"))))
+RANGE_MIN_BARS = max(2, min(30, int(os.getenv("RANGE_MIN_BARS", "5"))))
+RANGE_COOLDOWN_BARS = max(0, min(100, int(os.getenv("RANGE_COOLDOWN_BARS", "15"))))
+RANGE_CONFIRM_BARS = max(1, min(5, int(os.getenv("RANGE_CONFIRM_BARS", "1"))))
+RANGE_WICK_RATIO = max(0.10, min(0.90, float(os.getenv("RANGE_WICK_RATIO", "0.50"))))
+RANGE_MIN_BODY_RATIO = max(0.20, min(0.85, float(os.getenv("RANGE_MIN_BODY_RATIO", "0.38"))))
 
 # MEGA IA 3.68 — Velocity Flow mais solto, porém ainda confirmado em vela fechada.
 # Rompimento de 1 fechamento, ADX mínimo 18, RSI 7 mais amplo e cooldown curto.
@@ -176,38 +193,6 @@ RAPID_AI_GEN_HARD_BLOCK = max(20.0, min(RAPID_AI_GEN_QUALITY_MIN, float(os.geten
 RAPID_AI_GEN_MAX_RANGE_RATIO = max(1.50, min(6.00, float(os.getenv("RAPID_AI_GEN_MAX_RANGE_RATIO", "2.80"))))
 RAPID_AI_GEN_MIN_RANGE_RATIO = max(0.05, min(0.60, float(os.getenv("RAPID_AI_GEN_MIN_RANGE_RATIO", "0.18"))))
 RAPID_AI_GEN_MAX_WICK_RATIO = max(0.55, min(0.95, float(os.getenv("RAPID_AI_GEN_MAX_WICK_RATIO", "0.78"))))
-
-# 3.78 — Algo Samurai adaptado para treinamento no app.
-# O EA original trabalha com ordens STOP a uma distância fixa (step=90 pontos).
-# No app, a distância vira fração do ATR/range para funcionar entre Forex, JPY e BTC
-# sem depender do número de dígitos do broker. O sinal é congelado após a liberação.
-SAMURAI_ATR_PERIOD = max(7, min(30, int(os.getenv("SAMURAI_ATR_PERIOD", "14"))))
-SAMURAI_LOOKBACK = max(3, min(20, int(os.getenv("SAMURAI_LOOKBACK", "6"))))
-SAMURAI_STEP_ATR = max(0.05, min(0.60, float(os.getenv("SAMURAI_STEP_ATR", "0.18"))))
-SAMURAI_MIN_BODY_RATIO = max(0.30, min(0.85, float(os.getenv("SAMURAI_MIN_BODY_RATIO", "0.52"))))
-SAMURAI_MIN_RANGE_ATR = max(0.30, min(1.80, float(os.getenv("SAMURAI_MIN_RANGE_ATR", "0.62"))))
-SAMURAI_MAX_WICK_RATIO = max(0.25, min(0.80, float(os.getenv("SAMURAI_MAX_WICK_RATIO", "0.42"))))
-SAMURAI_COOLDOWN_BARS = max(1, min(12, int(os.getenv("SAMURAI_COOLDOWN_BARS", "2"))))
-SAMURAI_MIN_CONFIDENCE = max(60.0, min(92.0, float(os.getenv("SAMURAI_MIN_CONFIDENCE", "72"))))
-SAMURAI_EARLY_SIGNAL_SECONDS = max(20, min(45, int(os.getenv("SAMURAI_EARLY_SIGNAL_SECONDS", "30"))))
-SAMURAI_EARLY_WINDOW_BEFORE = max(SAMURAI_EARLY_SIGNAL_SECONDS, min(50, int(os.getenv("SAMURAI_EARLY_WINDOW_BEFORE", "35"))))
-SAMURAI_EARLY_MIN_REMAINING = max(12, min(SAMURAI_EARLY_SIGNAL_SECONDS, int(os.getenv("SAMURAI_EARLY_MIN_REMAINING", "18"))))
-
-
-RSI_MONITOR_PERIOD = max(5, min(50, int(os.getenv("RSI_MONITOR_PERIOD", "14"))))
-RSI_MONITOR_OVERSOLD = max(10.0, min(45.0, float(os.getenv("RSI_MONITOR_OVERSOLD", "30"))))
-RSI_MONITOR_OVERBOUGHT = max(55.0, min(90.0, float(os.getenv("RSI_MONITOR_OVERBOUGHT", "70"))))
-RSI_MONITOR_EXTREME_OS = max(5.0, min(RSI_MONITOR_OVERSOLD, float(os.getenv("RSI_MONITOR_EXTREME_OS", "20"))))
-RSI_MONITOR_EXTREME_OB = min(95.0, max(RSI_MONITOR_OVERBOUGHT, float(os.getenv("RSI_MONITOR_EXTREME_OB", "80"))))
-RSI_MONITOR_TREND_BARS = max(2, min(8, int(os.getenv("RSI_MONITOR_TREND_BARS", "3"))))
-RSI_MONITOR_DIVERGENCE_LOOKBACK = max(6, min(30, int(os.getenv("RSI_MONITOR_DIVERGENCE_LOOKBACK", "10"))))
-RSI_MONITOR_MIN_REACTION = max(0.1, min(5.0, float(os.getenv("RSI_MONITOR_MIN_REACTION", "0.6"))))
-RSI_MONITOR_MIN_SCORE = max(3, min(7, int(os.getenv("RSI_MONITOR_MIN_SCORE", "4"))))
-RSI_MONITOR_EARLY_SIGNAL_SECONDS = 20
-# O frontend consulta a cada 5 s; a janela tolera pequena latência sem liberar em cima da abertura.
-RSI_MONITOR_EARLY_WINDOW_BEFORE = max(20, min(26, int(os.getenv("RSI_MONITOR_EARLY_WINDOW_BEFORE", "23"))))
-RSI_MONITOR_EARLY_MIN_REMAINING = max(12, min(20, int(os.getenv("RSI_MONITOR_EARLY_MIN_REMAINING", "16"))))
-RSI_MONITOR_COOLDOWN_BARS = max(1, min(8, int(os.getenv("RSI_MONITOR_COOLDOWN_BARS", "2"))))
 
 # 3.80 — Volume POC rápido: snapshot nos 20s finais para a PRÓXIMA vela.
 # O delta continua sendo estimado por OHLCV quando a fonte não entrega agressor bid/ask real.
@@ -7557,6 +7542,194 @@ def btc_force_next_candle_strategy(cs, timeframe="1min", market="OPEN", h1=None,
         },
     }
 
+def range_compression_breakout_strategy(cs, timeframe="1min", market="OPEN"):
+    """Range Compression Breakout v4 adaptado para CALL/PUT da próxima vela.
+
+    Reconstrói a faixa usando somente candles fechados. A compressão segue o
+    modo Adaptive Percentile do Pine original: o range de RANGE_LEN barras deve
+    estar entre os RANGE_PCT_RANK% ranges mais quietos da janela histórica.
+    O rompimento exige fechamento além do limite + buffer ATR. A reversão por
+    pavio foi corrigida avaliando a máxima/mínima contra top/bot ANTES de a
+    faixa ser expandida pela vela corrente.
+    """
+    rows=list(cs or [])
+    tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30"}.get(timeframe,timeframe)
+    name=f"RANGE COMPRESSION BREAKOUT {tf_label}"
+    need=max(RANGE_PCT_WIN + RANGE_LEN + 5, RANGE_ATR_PERIOD + RANGE_LEN + 10)
+    if len(rows) < need:
+        return {
+            "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
+            "risk":"HIGH","strategy":name,"engine":"RANGE_COMPRESSION_BREAKOUT",
+            "provider":"LOCAL_RANGE_COMPRESSION_BREAKOUT",
+            "reason":f"Coletando candles fechados para calibrar a compressão ({len(rows)}/{need}).",
+            "non_repaint":True,"next_candle_entry":True,"gale_signal":False,
+        }
+
+    def nr_percentile(vals,pct):
+        vals=sorted(float(v) for v in vals if v is not None)
+        if not vals: return None
+        import math as _math
+        rank=max(1,min(len(vals),int(_math.ceil((pct/100.0)*len(vals)))))
+        return vals[rank-1]
+
+    # ATR RMA (compatível com a ideia de ta.atr) para cada barra.
+    trs=[]
+    atrs=[]
+    rma=None
+    for i,r in enumerate(rows):
+        h=float(r["high"]); l=float(r["low"])
+        if i==0:
+            tr=max(h-l,0.0)
+        else:
+            pc=float(rows[i-1]["close"])
+            tr=max(h-l,abs(h-pc),abs(l-pc))
+        trs.append(tr)
+        if i+1 < RANGE_ATR_PERIOD:
+            atrs.append(None)
+        elif i+1 == RANGE_ATR_PERIOD:
+            rma=sum(trs[-RANGE_ATR_PERIOD:])/RANGE_ATR_PERIOD
+            atrs.append(rma)
+        else:
+            rma=((rma*(RANGE_ATR_PERIOD-1))+tr)/RANGE_ATR_PERIOD
+            atrs.append(rma)
+
+    ranges=[None]*len(rows)
+    for i in range(RANGE_LEN-1,len(rows)):
+        w=rows[i-RANGE_LEN+1:i+1]
+        ranges[i]=max(float(x["high"]) for x in w)-min(float(x["low"]) for x in w)
+
+    in_range=False
+    top=bot=None
+    bars_in=0
+    out_up=out_dn=0
+    cool_left=0
+    armed_up=armed_dn=False
+    current_thresh=None
+    last_event=None
+    last_diag={}
+
+    start=max(RANGE_PCT_WIN + RANGE_LEN - 2, RANGE_ATR_PERIOD)
+    for i in range(start,len(rows)):
+        if cool_left>0:
+            cool_left-=1
+        rng=ranges[i]
+        a=atrs[i]
+        hist=[x for x in ranges[max(RANGE_LEN-1,i-RANGE_PCT_WIN+1):i+1] if x is not None]
+        thresh=nr_percentile(hist,RANGE_PCT_RANK) if len(hist)>=30 else None
+        is_tight=(rng is not None and thresh is not None and rng<=thresh)
+        r=rows[i]
+        o=float(r["open"]); h=float(r["high"]); l=float(r["low"]); c=float(r["close"])
+        brk_up=brk_dn=rev_up=rev_dn=False
+
+        if not in_range:
+            if is_tight and cool_left==0:
+                w=rows[i-RANGE_LEN+1:i+1]
+                top=max(float(x["high"]) for x in w)
+                bot=min(float(x["low"]) for x in w)
+                bars_in=RANGE_LEN
+                out_up=out_dn=0
+                armed_up=armed_dn=False
+                in_range=True
+        else:
+            bars_in+=1
+            old_top=float(top); old_bot=float(bot)
+            buf=(float(a or 0.0)*RANGE_BREAK_BUFFER_ATR)
+            above_ok=c > old_top + buf
+            below_ok=c < old_bot - buf
+            out_up=(out_up+1) if above_ok else 0
+            out_dn=(out_dn+1) if below_ok else 0
+
+            if out_up>=RANGE_CONFIRM_BARS and bars_in>=RANGE_MIN_BARS:
+                brk_up=True
+            elif out_dn>=RANGE_CONFIRM_BARS and bars_in>=RANGE_MIN_BARS:
+                brk_dn=True
+            else:
+                # FIX do Pine recebido: testa wick nos limites anteriores,
+                # antes de top/bot absorverem a máxima/mínima atual.
+                bar_range=max(h-l,1e-12)
+                up_wick=h-max(o,c)
+                dn_wick=min(o,c)-l
+                if h>old_top and c<=old_top and up_wick/bar_range>=RANGE_WICK_RATIO:
+                    armed_up=True; armed_dn=False
+                elif l<old_bot and c>=old_bot and dn_wick/bar_range>=RANGE_WICK_RATIO:
+                    armed_dn=True; armed_up=False
+                else:
+                    prev_close=float(rows[i-1]["close"]) if i>0 else c
+                    if armed_up and c<prev_close:
+                        rev_dn=True; armed_up=False
+                    elif armed_dn and c>prev_close:
+                        rev_up=True; armed_dn=False
+
+                if not above_ok and not below_ok:
+                    top=max(old_top,h)
+                    bot=min(old_bot,l)
+
+            if brk_up or brk_dn:
+                in_range=False
+                bars_in=0; out_up=out_dn=0
+                armed_up=armed_dn=False
+                cool_left=RANGE_COOLDOWN_BARS
+
+        if i==len(rows)-1:
+            current_thresh=thresh
+            body=abs(c-o); bar_range=max(h-l,1e-12)
+            body_ratio=body/bar_range
+            last_diag={
+                "range_size":round(float(rng or 0.0),10),
+                "adaptive_threshold":round(float(thresh or 0.0),10),
+                "atr":round(float(a or 0.0),10),
+                "body_ratio":round(body_ratio,4),
+                "in_range":bool(in_range),
+                "top":round(float(top or 0.0),10) if top is not None else None,
+                "bottom":round(float(bot or 0.0),10) if bot is not None else None,
+                "bars_in_range":int(bars_in),
+                "cooldown_left":int(cool_left),
+            }
+            if brk_up: last_event="BREAK_UP"
+            elif brk_dn: last_event="BREAK_DOWN"
+            elif rev_up: last_event="REV_UP"
+            elif rev_dn: last_event="REV_DOWN"
+
+    last=rows[-1]
+    o=float(last["open"]); h=float(last["high"]); l=float(last["low"]); c=float(last["close"])
+    bar_range=max(h-l,1e-12); body_ratio=abs(c-o)/bar_range
+    a=float(atrs[-1] or 0.0)
+    direction="NEUTRO"; confidence=0.0
+
+    if last_event=="BREAK_UP" and c>o and body_ratio>=RANGE_MIN_BODY_RATIO:
+        direction="CALL"
+        confidence=72.0 + min(12.0,max(0.0,body_ratio-RANGE_MIN_BODY_RATIO)*30.0)
+        reason=f"Compressão adaptativa rompida para cima; fechamento confirmado além do topo + buffer ATR, corpo {body_ratio*100:.0f}%. Entrada na próxima vela."
+    elif last_event=="BREAK_DOWN" and c<o and body_ratio>=RANGE_MIN_BODY_RATIO:
+        direction="PUT"
+        confidence=72.0 + min(12.0,max(0.0,body_ratio-RANGE_MIN_BODY_RATIO)*30.0)
+        reason=f"Compressão adaptativa rompida para baixo; fechamento confirmado além do fundo + buffer ATR, corpo {body_ratio*100:.0f}%. Entrada na próxima vela."
+    elif last_event=="REV_UP":
+        direction="CALL"; confidence=70.0
+        reason="Rejeição por pavio abaixo da faixa confirmada pela vela fechada seguinte. Entrada CALL na próxima vela."
+    elif last_event=="REV_DOWN":
+        direction="PUT"; confidence=70.0
+        reason="Rejeição por pavio acima da faixa confirmada pela vela fechada seguinte. Entrada PUT na próxima vela."
+    else:
+        if in_range:
+            reason="Range Compression monitorando: compressão ativa; aguardando fechamento confirmado fora da faixa ou reversão por pavio."
+        else:
+            reason="Range Compression monitorando: aguardando uma nova zona entre os 20% ranges mais quietos do histórico."
+
+    confidence=min(92.0,max(0.0,confidence))
+    return {
+        "available":True,"direction":direction,"confidence":round(confidence,1),
+        "confirmed":direction in ("CALL","PUT"),
+        "risk":"LOW" if confidence>=82 else ("MEDIUM" if direction!="NEUTRO" else "HIGH"),
+        "strategy":name,"engine":"RANGE_COMPRESSION_BREAKOUT",
+        "provider":"LOCAL_RANGE_COMPRESSION_BREAKOUT","reason":reason[:420],
+        "non_repaint":True,"next_candle_entry":True,"gale_signal":False,
+        "grid":False,"martingale":False,"direct_win_only":True,
+        "wick_reversal_fixed":True,"adaptive_percentile":True,
+        "diagnostics":last_diag,
+    }
+
+
 def larry_breakout_strategy(cs, timeframe="1min", market="OPEN"):
     """LARRY BREAKOUT — adaptação do Larry FX para CALL/PUT sem Grid/Martingale.
 
@@ -8970,240 +9143,6 @@ def volume_poc_strategy(cs, timeframe="1min", market="OPEN", early_signal=False)
                         "source_indicator":"Foot Print X-Ray.mq5", "adaptation":"LIGHTWEIGHT_OHLCV_VOLUME_PROFILE"},
     }
 
-
-def _rsi_monitor_values(rows, period=RSI_MONITOR_PERIOD):
-    closes=[float(x["close"]) for x in list(rows or [])]
-    if len(closes) < period + 3:
-        return None
-    vals=[]
-    start=max(period+1, len(closes)-24)
-    for end in range(start, len(closes)+1):
-        v=rsi(closes[:end], period)
-        if v is not None:
-            vals.append((end-1,float(v)))
-    if len(vals) < 2:
-        return None
-    return vals
-
-
-def _rsi_monitor_divergence(rows, period=RSI_MONITOR_PERIOD, lookback=RSI_MONITOR_DIVERGENCE_LOOKBACK):
-    rows=list(rows or [])
-    if len(rows) < period + lookback + 5:
-        return {"bullish":False,"bearish":False}
-    start=max(1,len(rows)-lookback-1)
-    lows=[]; highs=[]
-    closes=[float(x["close"]) for x in rows]
-    for i in range(start,len(rows)-1):
-        if i < 1 or i >= len(rows)-1:
-            continue
-        rv=rsi(closes[:i+1],period)
-        if rv is None:
-            continue
-        lo=float(rows[i]["low"]); hi=float(rows[i]["high"])
-        if lo <= float(rows[i-1]["low"]) and lo <= float(rows[i+1]["low"]):
-            lows.append((i,lo,float(rv)))
-        if hi >= float(rows[i-1]["high"]) and hi >= float(rows[i+1]["high"]):
-            highs.append((i,hi,float(rv)))
-    bullish=False; bearish=False
-    if len(lows)>=2:
-        a,b=lows[-2],lows[-1]
-        bullish=bool(b[1] < a[1] and b[2] > a[2] + 2.0 and a[2] <= RSI_MONITOR_OVERSOLD + 8)
-    if len(highs)>=2:
-        a,b=highs[-2],highs[-1]
-        bearish=bool(b[1] > a[1] and b[2] < a[2] - 2.0 and a[2] >= RSI_MONITOR_OVERBOUGHT - 8)
-    return {"bullish":bullish,"bearish":bearish}
-
-
-def rsi_monitor_strategy(cs, timeframe="1min", market="OPEN", early_signal=False):
-    """RSI Monitor adaptado: decisão ~20 s antes e entrada na próxima vela.
-
-    A janela antecipada usa o snapshot atual da vela em formação. Depois que o
-    servidor libera CALL/PUT, active_signal congela a decisão até a expiração.
-    """
-    rows=list(cs or [])
-    tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30"}.get(timeframe,timeframe)
-    name=f"RSI MONITOR 20S {tf_label}"
-    need=max(36,RSI_MONITOR_PERIOD+RSI_MONITOR_DIVERGENCE_LOOKBACK+8)
-    if len(rows)<need:
-        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
-                "strategy":name,"engine":"RSI_MONITOR_20S","provider":"LOCAL_RSI_MONITOR",
-                "reason":f"Coletando candles para o RSI Monitor ({len(rows)}/{need}).",
-                "non_repaint":True,"non_repaint_after_release":True,"next_candle":True,"gale_signal":False}
-
-    vals=_rsi_monitor_values(rows)
-    if not vals or len(vals)<2:
-        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
-                "strategy":name,"engine":"RSI_MONITOR_20S","provider":"LOCAL_RSI_MONITOR",
-                "reason":"RSI ainda sem histórico suficiente.","non_repaint":True,"next_candle":True,"gale_signal":False}
-
-    r_now=float(vals[-1][1]); r_prev=float(vals[-2][1])
-    look=max(1,RSI_MONITOR_TREND_BARS)
-    r_trend=float(vals[-1-look][1]) if len(vals)>look else r_prev
-    delta=r_now-r_prev
-    trend_delta=r_now-r_trend
-    div=_rsi_monitor_divergence(rows)
-
-    call_score=0; put_score=0; call_reasons=[]; put_reasons=[]
-    # Zona + reação: evita comprar apenas porque está abaixo de 30 / vender apenas porque está acima de 70.
-    call_zone=(r_now <= RSI_MONITOR_OVERSOLD or r_prev <= RSI_MONITOR_OVERSOLD or min(r_now,r_prev) <= RSI_MONITOR_EXTREME_OS)
-    put_zone=(r_now >= RSI_MONITOR_OVERBOUGHT or r_prev >= RSI_MONITOR_OVERBOUGHT or max(r_now,r_prev) >= RSI_MONITOR_EXTREME_OB)
-    if call_zone: call_score+=2; call_reasons.append("sobrevenda")
-    if put_zone: put_score+=2; put_reasons.append("sobrecompra")
-    if min(r_now,r_prev) <= RSI_MONITOR_EXTREME_OS: call_score+=1; call_reasons.append("extremo 20")
-    if max(r_now,r_prev) >= RSI_MONITOR_EXTREME_OB: put_score+=1; put_reasons.append("extremo 80")
-    if delta >= RSI_MONITOR_MIN_REACTION: call_score+=2; call_reasons.append("RSI reagindo para cima")
-    if delta <= -RSI_MONITOR_MIN_REACTION: put_score+=2; put_reasons.append("RSI reagindo para baixo")
-    if trend_delta > 0.8: call_score+=1; call_reasons.append("tendência curta do RSI subindo")
-    if trend_delta < -0.8: put_score+=1; put_reasons.append("tendência curta do RSI caindo")
-    if div.get("bullish"): call_score+=2; call_reasons.append("divergência bullish")
-    if div.get("bearish"): put_score+=2; put_reasons.append("divergência bearish")
-
-    # Confirmação exige zona e reação; divergência/extremo ajudam, mas não substituem a reação.
-    call_ok=bool(call_zone and delta >= RSI_MONITOR_MIN_REACTION and call_score>=RSI_MONITOR_MIN_SCORE and call_score>=put_score+2)
-    put_ok=bool(put_zone and delta <= -RSI_MONITOR_MIN_REACTION and put_score>=RSI_MONITOR_MIN_SCORE and put_score>=call_score+2)
-    direction="CALL" if call_ok else ("PUT" if put_ok else "NEUTRO")
-    score=call_score if direction=="CALL" else (put_score if direction=="PUT" else max(call_score,put_score))
-    confidence=0.0
-    if direction!="NEUTRO":
-        confidence=clamp(70.0+(score-RSI_MONITOR_MIN_SCORE)*5.0+min(8.0,abs(delta)*1.4),70.0,94.0)
-        if (direction=="CALL" and div.get("bullish")) or (direction=="PUT" and div.get("bearish")):
-            confidence=min(96.0,confidence+3.0)
-
-    if direction=="CALL": reasons=call_reasons
-    elif direction=="PUT": reasons=put_reasons
-    else:
-        dominant="CALL" if call_score>=put_score else "PUT"
-        reasons=[f"melhor lado {dominant}: {max(call_score,put_score)}/{RSI_MONITOR_MIN_SCORE}", f"RSI {r_now:.1f} (Δ {delta:+.1f})"]
-
-    return {
-        "available":True,"direction":direction,"confidence":round(float(confidence),1),"confirmed":direction in ("CALL","PUT"),
-        "risk":("LOW" if confidence>=84 else ("MEDIUM" if direction!="NEUTRO" else "HIGH")),
-        "strategy":name,"engine":"RSI_MONITOR_20S","provider":"LOCAL_RSI_MONITOR",
-        "reason":((f"{direction} confirmado • " if direction!="NEUTRO" else "RSI Monitor aguardando • ")+" + ".join(reasons))[:420],
-        "external_ai_disabled":True,"gale_signal":False,"martingale":False,"next_candle":True,
-        "non_repaint":True,"non_repaint_after_release":True,"early_signal":bool(early_signal),
-        "diagnostics":{"rsi":round(r_now,2),"rsi_prev":round(r_prev,2),"delta":round(delta,2),
-                       "trend_delta":round(trend_delta,2),"call_score":call_score,"put_score":put_score,
-                       "bullish_divergence":bool(div.get("bullish")),"bearish_divergence":bool(div.get("bearish")),
-                       "oversold":RSI_MONITOR_OVERSOLD,"overbought":RSI_MONITOR_OVERBOUGHT,
-                       "extreme_os":RSI_MONITOR_EXTREME_OS,"extreme_ob":RSI_MONITOR_EXTREME_OB}
-    }
-
-def _samurai_snapshot(rows):
-    """Adaptação não-repaint do conceito central do Algo Samurai.
-
-    O EA MT4 original arma BUY STOP e SELL STOP a `step` pontos do preço e
-    reposiciona as ordens quando o mercado se move. Para opções binárias não
-    copiamos lotes/SL/TP/ordens pendentes: medimos o rompimento equivalente
-    usando ATR + range recente e só classificamos a direção quando o impulso
-    já aconteceu. Isso mantém o núcleo do Samurai e evita dependência de digits.
-    """
-    rows=list(rows or [])
-    need=max(SAMURAI_ATR_PERIOD+SAMURAI_LOOKBACK+3, 28)
-    if len(rows)<need:
-        return None
-    a=atr(rows, SAMURAI_ATR_PERIOD)
-    if not a or float(a)<=0:
-        return None
-    a=float(a)
-    last=rows[-1]
-    o=float(last.get("open") or 0.0); h=float(last.get("high") or 0.0)
-    l=float(last.get("low") or 0.0); c=float(last.get("close") or 0.0)
-    rng=max(h-l,1e-12); body=abs(c-o)
-    body_ratio=body/rng
-    upper=max(0.0,h-max(o,c))/rng
-    lower=max(0.0,min(o,c)-l)/rng
-    history=rows[-(SAMURAI_LOOKBACK+1):-1]
-    if not history:
-        return None
-    recent_high=max(float(x.get("high") or x.get("close") or 0.0) for x in history)
-    recent_low=min(float(x.get("low") or x.get("close") or 0.0) for x in history)
-    ranges=[max(0.0,float(x.get("high") or 0.0)-float(x.get("low") or 0.0)) for x in history]
-    ranges=[x for x in ranges if x>0]
-    mean_range=(sum(ranges)/len(ranges)) if ranges else a
-    step=max(a*SAMURAI_STEP_ATR, mean_range*0.14, 1e-12)
-    range_atr=rng/max(a,1e-12)
-
-    call_break=c >= recent_high + step*0.05 and h >= recent_high + step*0.12
-    put_break=c <= recent_low - step*0.05 and l <= recent_low - step*0.12
-    call_quality=(c>o and body_ratio>=SAMURAI_MIN_BODY_RATIO and range_atr>=SAMURAI_MIN_RANGE_ATR and upper<=SAMURAI_MAX_WICK_RATIO)
-    put_quality=(c<o and body_ratio>=SAMURAI_MIN_BODY_RATIO and range_atr>=SAMURAI_MIN_RANGE_ATR and lower<=SAMURAI_MAX_WICK_RATIO)
-
-    direction="NEUTRO"; confirmed=False; confidence=0.0; reject=""
-    if call_break and call_quality and not put_break:
-        direction="CALL"; confirmed=True
-        confidence=clamp(66.0 + body_ratio*18.0 + min(8.0,max(0.0,(range_atr-0.6)*7.0)) + min(4.0,max(0.0,(c-recent_high)/step)*2.0), 60.0, 94.0)
-    elif put_break and put_quality and not call_break:
-        direction="PUT"; confirmed=True
-        confidence=clamp(66.0 + body_ratio*18.0 + min(8.0,max(0.0,(range_atr-0.6)*7.0)) + min(4.0,max(0.0,(recent_low-c)/step)*2.0), 60.0, 94.0)
-    else:
-        if call_break or put_break:
-            reject=(f"rompimento sem força suficiente: corpo {body_ratio*100:.0f}% / range {range_atr:.2f} ATR / "
-                    f"pavio limite {SAMURAI_MAX_WICK_RATIO*100:.0f}%")
-        else:
-            dist_up=max(0.0,recent_high-c)/max(step,1e-12)
-            dist_dn=max(0.0,c-recent_low)/max(step,1e-12)
-            reject=f"aguardando rompimento Samurai • distância relativa CALL {dist_up:.2f} / PUT {dist_dn:.2f}"
-
-    if confirmed and confidence < SAMURAI_MIN_CONFIDENCE:
-        reject=f"rompimento detectado, mas confiança {confidence:.0f}% abaixo do mínimo {SAMURAI_MIN_CONFIDENCE:.0f}%"
-        direction="NEUTRO"; confirmed=False
-    dt=str(last.get("datetime") or len(rows))
-    return {
-        "direction":direction,"confirmed":confirmed,"confidence":round(float(confidence if confirmed else 0.0),1),
-        "event_key":f"SAMURAI:{direction}:{dt}" if confirmed else "",
-        "atr":a,"step_adaptive":step,"recent_high":recent_high,"recent_low":recent_low,
-        "body_ratio":body_ratio,"range_atr":range_atr,"upper_wick_ratio":upper,"lower_wick_ratio":lower,
-        "reject_reason":reject,"original_step_points":90,"original_stoploss_points":150,"original_takeprofit_points":1250,
-    }
-
-
-def algo_samurai_strategy(cs, timeframe="1min", market="OPEN", early_signal=False):
-    """Motor de treinamento inspirado no Algo Samurai.mq4, sem lotes/SL/TP e sem repaint após liberação."""
-    rows=list(cs or [])
-    tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30"}.get(timeframe,timeframe)
-    name=f"ALGO SAMURAI • TREINAMENTO {tf_label}"
-    need=max(SAMURAI_ATR_PERIOD+SAMURAI_LOOKBACK+3,28)
-    if len(rows)<need:
-        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
-                "strategy":name,"engine":"SAMURAI_TRAINING","provider":"LOCAL_ALGO_SAMURAI",
-                "reason":f"Coletando candles para o Algo Samurai ({len(rows)}/{need}).",
-                "non_repaint":True,"training_mode":True,"gale_signal":False,"martingale":False,"direct_win_only":True,"next_candle":True}
-    start=max(need-1,len(rows)-24)
-    last_fired=None; last_snap=None; seen=set()
-    for i in range(start,len(rows)):
-        snap=_samurai_snapshot(rows[:i+1])
-        if not snap: continue
-        if i==len(rows)-1: last_snap=snap
-        if snap.get("confirmed") and snap.get("direction") in ("CALL","PUT"):
-            key=str(snap.get("event_key") or f"SAMURAI:{snap.get('direction')}:{i}")
-            is_new=key not in seen; seen.add(key)
-            if is_new and (last_fired is None or (i-last_fired)>SAMURAI_COOLDOWN_BARS):
-                last_fired=i
-    snap=last_snap or _samurai_snapshot(rows)
-    if not snap:
-        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
-                "strategy":name,"engine":"SAMURAI_TRAINING","provider":"LOCAL_ALGO_SAMURAI",
-                "reason":"Algo Samurai aguardando histórico suficiente.","non_repaint":True,"training_mode":True,
-                "gale_signal":False,"martingale":False,"direct_win_only":True,"next_candle":True}
-    direction=snap.get("direction") if last_fired==len(rows)-1 else "NEUTRO"
-    confirmed=direction in ("CALL","PUT")
-    if confirmed:
-        reason=(f"{direction} • rompimento Samurai confirmado • corpo {float(snap.get('body_ratio') or 0)*100:.0f}% • "
-                f"range {float(snap.get('range_atr') or 0):.2f} ATR • step adaptativo {float(snap.get('step_adaptive') or 0):.6g} • "
-                f"entrada na próxima vela" + (" • snapshot ~30s antes." if early_signal else "."))
-    elif snap.get("confirmed"):
-        reason=f"Rompimento Samurai já apareceu, mas o cooldown de {SAMURAI_COOLDOWN_BARS} velas evitou repetição."
-    else:
-        reason=f"Algo Samurai monitorando: {snap.get('reject_reason') or 'aguardando rompimento válido'}."
-    return {
-        "available":True,"direction":direction,"confidence":round(float(snap.get("confidence") if confirmed else 0.0),1),
-        "confirmed":confirmed,"risk":("MEDIUM" if confirmed else "HIGH"),"strategy":name,
-        "engine":"SAMURAI_TRAINING","provider":"LOCAL_ALGO_SAMURAI","reason":reason[:520],
-        "external_ai_disabled":True,"gale_signal":False,"martingale":False,"non_repaint":True,"direct_win_only":True,
-        "training_mode":True,"auto_trade_allowed":False,"next_candle":True,"cooldown_bars":SAMURAI_COOLDOWN_BARS,
-        "diagnostics":{**snap,"early_signal":bool(early_signal),"original_logic":"BUY_STOP/SELL_STOP_BREAKOUT","adaptation":"ATR_NORMALIZED_STEP"}
-    }
 
 def _alphax_snapshot(rows):
     rows=list(rows or [])
@@ -11299,7 +11238,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         entry_mode = "MIDDLE"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
@@ -11430,6 +11369,26 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 raw = await iq_ea_candles(iq_state, symbol, interval, 120, regular_market=False)
             else:
                 raw = await candles(symbol, interval, 120, "OPEN", None, request=request)
+        elif engine == "RANGE":
+            # Range Compression Breakout: precisa da janela adaptativa de ~200 candles fechados.
+            if market == "IQ_OTC":
+                if not iq_state:
+                    out = neutral_signal(
+                        symbol, interval, market,
+                        "RANGE COMPRESSION • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para o Range Compression analisar candles OTC reais.",
+                        source_state="WAITING",
+                    )
+                    out.update({
+                        "strategy":"RANGE COMPRESSION BREAKOUT","mode":"RANGE_COMPRESSION_BREAKOUT",
+                        "selected_engine":engine,"feed_source":"IQ_OPTION_OTC",
+                        "non_repaint":True,"next_candle_entry":True,"gale_signal":False,
+                    })
+                    cache[key]=(time.time(),out)
+                    return out
+                raw = await iq_ea_candles(iq_state, symbol, interval, 260, regular_market=False)
+            else:
+                raw = await candles(symbol, interval, 260, "OPEN", None, request=request)
         elif engine == "VELOCITY":
             # Velocity Flow / MR Mt4: OPEN multifuente; OTC exclusivamente IQ Option real.
             if market == "IQ_OTC":
@@ -11450,6 +11409,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 raw = await iq_ea_candles(iq_state, symbol, interval, 120, regular_market=False)
             else:
                 raw = await candles(symbol, interval, 120, "OPEN", None, request=request)
+        elif engine == "RANGE":
+            if market == "IQ_OTC":
+                if not iq_state:
+                    raise RuntimeError("Conecte a IQ Option para o Range Compression analisar OTC.")
+                raw = await iq_ea_candles(iq_state, sym, interval, 260, regular_market=False)
+            else:
+                raw = await candles(sym, interval, 260, "OPEN", None, request=request)
         elif engine == "SNIPER":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -11613,6 +11579,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "ROBÔ RUBIK • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION EM ESPERA"
         elif engine == "LARRY":
             status = "LARRY BREAKOUT • FONTE EM ESPERA" if market == "OPEN" else "LARRY BREAKOUT • IQ OPTION EM ESPERA"
+        elif engine == "RANGE":
+            status = "RANGE COMPRESSION • FONTE EM ESPERA" if market == "OPEN" else "RANGE COMPRESSION • IQ OPTION EM ESPERA"
         elif engine == "VELOCITY":
             status = "VELOCITY FLOW • FONTE EM ESPERA" if market == "OPEN" else "VELOCITY FLOW • IQ OPTION EM ESPERA"
         elif engine == "SNIPER":
@@ -11645,6 +11613,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "ROBÔ RUBIK • FONTE RECONECTANDO" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION RECONECTANDO"
         elif engine == "LARRY":
             status = "LARRY BREAKOUT • FONTE RECONECTANDO" if market == "OPEN" else "LARRY BREAKOUT • IQ OPTION RECONECTANDO"
+        elif engine == "RANGE":
+            status = "RANGE COMPRESSION • FONTE RECONECTANDO" if market == "OPEN" else "RANGE COMPRESSION • IQ OPTION RECONECTANDO"
         elif engine == "VELOCITY":
             status = "VELOCITY FLOW • FONTE RECONECTANDO" if market == "OPEN" else "VELOCITY FLOW • IQ OPTION RECONECTANDO"
         elif engine == "SNIPER":
@@ -11718,6 +11688,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "LARRY":
             engine_title = "LARRY BREAKOUT"
             engine_mode = "LARRY_BREAKOUT"
+        elif engine == "RANGE":
+            engine_title = "RANGE COMPRESSION BREAKOUT"
+            engine_mode = "RANGE_COMPRESSION_BREAKOUT"
         elif engine == "VELOCITY":
             engine_title = "VELOCITY FLOW • MR MT4"
             engine_mode = "VELOCITY_FLOW"
@@ -11752,7 +11725,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON"):
+        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -11767,13 +11740,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "EA": "XGBOOST_RSI_VALUE_CHART",
                     "RUBIK": "LOCAL_RUBIK_ADAPTED",
                     "LARRY": "LOCAL_LARRY_BREAKOUT",
+                    "RANGE": "LOCAL_RANGE_COMPRESSION_BREAKOUT",
                     "VELOCITY": "LOCAL_VELOCITY_FLOW",
                     "SNIPER": "LOCAL_SNIPER_PRO_MEGA",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "RAPID": "LOCAL_RAPID_EAS",
-                    "SAMURAI": "LOCAL_ALGO_SAMURAI",
                     "VOLUME": "LOCAL_VOLUME_POC",
-                    "RSIMON": "LOCAL_RSI_MONITOR",
                     "ICT": "LOCAL_ICT_SMC_INSTITUTIONAL",
                     "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
                 }.get(engine, "DISABLED")),
@@ -11792,7 +11764,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON") else (closed[-90:] if len(closed) > 90 else closed)))
+            engine_closed = (closed[-260:] if engine == "RANGE" else (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME") else (closed[-90:] if len(closed) > 90 else closed))))
             if engine == "SMART":
                 moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
                 analysis = await openai_direct_signal(
@@ -11806,6 +11778,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis = rubik_adapted_strategy(engine_closed, interval, market=market)
             elif engine == "LARRY":
                 analysis = larry_breakout_strategy(engine_closed, interval, market=market)
+            elif engine == "RANGE":
+                analysis = range_compression_breakout_strategy(engine_closed, interval, market=market)
             elif engine == "VELOCITY":
                 analysis = velocity_flow_strategy(engine_closed, interval, market=market)
             elif engine == "SNIPER":
@@ -11987,28 +11961,28 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON") and analysis.get("confirmed")),
+            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME") and analysis.get("confirmed")),
             "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                 "EA": "XGBOOST_RSI_VALUE_CHART",
                 "RUBIK": "LOCAL_RUBIK_ADAPTED",
                 "LARRY": "LOCAL_LARRY_BREAKOUT",
+                    "RANGE": "LOCAL_RANGE_COMPRESSION_BREAKOUT",
                 "VELOCITY": "LOCAL_VELOCITY_FLOW",
                 "SNIPER": "LOCAL_SNIPER_PRO_MEGA",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "RAPID": "LOCAL_RAPID_EAS",
-                    "SAMURAI": "LOCAL_ALGO_SAMURAI",
                     "VOLUME": "LOCAL_VOLUME_POC",
-                    "RSIMON": "LOCAL_RSI_MONITOR",
                 "ICT": "LOCAL_ICT_SMC_INSTITUTIONAL",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON") else "HIGH").upper(),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME") else "HIGH").upper(),
             "strategy": (
                 "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
                 else (analysis.get("strategy") or (
                     "EA RSI + VALUE CHART + XGBOOST" if engine == "EA"
                     else "ROBÔ RUBIK ADAPTADO" if engine == "RUBIK"
                     else "LARRY BREAKOUT" if engine == "LARRY"
+                    else "RANGE COMPRESSION BREAKOUT" if engine == "RANGE"
                     else "VELOCITY FLOW • MR MT4" if engine == "VELOCITY"
                     else "ALPHAX RELAY" if engine == "ALPHAX"
                     else "NÚCLEO RÁPIDO EAs" if engine == "RAPID"
@@ -12184,6 +12158,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "EA": "ea_fingerprint",
                 "RUBIK": "rubik_fingerprint",
                 "LARRY": "larry_fingerprint",
+                "RANGE": "range_compression_fingerprint",
                 "VELOCITY": "velocity_fingerprint",
                 "SNIPER": "sniper_fingerprint",
                 "ALPHAX": "alphax_fingerprint",
@@ -12352,7 +12327,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key] = (time.time(), base)
                         return base
 
-                if engine in ("RSIMON", "VOLUME"):
+                if engine in ("VOLUME"):
                     entry = next_boundary(interval)
                     _lead = RSI_MONITOR_EARLY_SIGNAL_SECONDS if engine == "RSIMON" else VOLUME_POC_EARLY_SIGNAL_SECONDS
                     announce = entry - timedelta(seconds=_lead)
@@ -12369,6 +12344,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "EA": "SINAL TRIPLA CONFIRMAÇÃO LIBERADO",
                         "RUBIK": "SINAL ROBÔ RUBIK ADAPTADO LIBERADO",
                         "LARRY": "SINAL LARRY BREAKOUT LIBERADO",
+                        "RANGE": "SINAL RANGE COMPRESSION LIBERADO",
                         "VELOCITY": "SINAL VELOCITY FLOW LIBERADO",
                         "SNIPER": "SINAL SNIPER PRO MEGA LIBERADO",
                         "ALPHAX": "SINAL ALPHAX RELAY LIBERADO",
@@ -12380,7 +12356,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "FORCE": "SINAL EA FORÇA DO MOVIMENTO LIBERADO",
                         "BIGRISE": "SINAL BTC FORCE + DOM LIBERADO",
                     }.get(engine, "SINAL IA GRÁFICA LIBERADO")),
-                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON") else "MEDIUM").upper(),
+                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME") else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
                     "expiry_time": iso(expiry),
@@ -12430,7 +12406,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("EA", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON"):
+                if engine not in ("EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -12534,12 +12510,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "EA": "XGBOOST_RSI_VALUE_CHART",
                 "RUBIK": "LOCAL_RUBIK_ADAPTED",
                 "LARRY": "LOCAL_LARRY_BREAKOUT",
+                    "RANGE": "LOCAL_RANGE_COMPRESSION_BREAKOUT",
                 "VELOCITY": "LOCAL_VELOCITY_FLOW",
                 "SNIPER": "LOCAL_SNIPER_PRO_MEGA",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
-                "SAMURAI": "LOCAL_ALGO_SAMURAI",
                     "VOLUME": "LOCAL_VOLUME_POC",
-                    "RSIMON": "LOCAL_RSI_MONITOR",
                 "ICT": "LOCAL_ICT_SMC_INSTITUTIONAL",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
@@ -15272,7 +15247,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     "GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE",
-    "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON",
+    "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME",
 }
 
 
@@ -15963,6 +15938,13 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
                        "Rompimento + força/expansão da vela em candles OTC reais; no OTC exige conexão ativa com a IQ Option.")
         },
         {
+            "key":"RANGE","name":"RANGE COMPRESSION BREAKOUT","score":autonomous,
+            "supported":True,"operational":bool(market=="OPEN" or iq_ready),
+            "reason": ("Compressão adaptativa por percentil + rompimento confirmado em candle fechado; usa o roteador multifuente no mercado aberto."
+                       if market=="OPEN" else
+                       "Compressão adaptativa + rompimento/reversão por pavio em candles OTC reais; exige conexão ativa com a IQ Option."),
+        },
+        {
             "key":"ICT","name":"ICT/SMC INSTITUCIONAL","score":ict,
             "supported":True,"operational":bool(market=="OPEN" or iq_ready),
             "reason": ("Favorece estrutura limpa, reação em extremos e continuidade/reversão com confluência; o sinal real ainda exige H1/H4, pivôs confirmados e score institucional."
@@ -16071,11 +16053,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, VELOCITY, ICT, SNIPER, ALPHAX, RAPID, SAMURAI, VOLUME ou RSIMON.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, RANGE, VELOCITY, ICT, SNIPER, ALPHAX, RAPID, VOLUME.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON"):
+    if engine in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -16136,6 +16118,19 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
                     data["feed_message"] = "Larry Breakout usando candles OTC reais da sessão IQ Option."
+            elif engine == "RANGE":
+                if requested_market == "OPEN":
+                    feed_info = _current_open_feed_info(symbol, interval)
+                    feed_src = str(feed_info.get("source") or "MULTIFEED")
+                    data["feed_source"] = feed_src
+                    data["feed_label"] = _feed_source_label(feed_src)
+                    data["feed_fallback"] = bool(feed_info.get("fallback"))
+                    data["feed_message"] = "Range Compression usando candles fechados do mercado aberto via roteador cTrader/multifuente."
+                else:
+                    data["feed_source"] = "IQ_OPTION_OTC"
+                    data["feed_label"] = _feed_source_label(data["feed_source"])
+                    data["feed_fallback"] = False
+                    data["feed_message"] = "Range Compression usando candles OTC reais da sessão IQ Option."
             elif engine == "VELOCITY":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -16712,7 +16707,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -16735,6 +16730,14 @@ async def pre_signals(
         return {
             "ok": True,
             "message": "LARRY BREAKOUT usa somente candle fechado; pré-sinal na vela em formação fica desativado para não repintar.",
+            "items": [],
+            "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
+        }
+
+    if engine == "RANGE":
+        return {
+            "ok": True,
+            "message": "RANGE COMPRESSION usa somente candles fechados; CALL/PUT é confirmado para a próxima vela e não usa pré-sinal intrabar.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -16801,14 +16804,15 @@ async def pre_signals(
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME")
     if fallback_twelve:
         market = "OPEN"
-    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON") and not iq_state:
+    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME") and not iq_state:
         wait_label = {
             "EA": "EA Tripla",
             "RUBIK": "Robô Rubik Adaptado",
             "LARRY": "Larry Breakout",
+            "RANGE": "Range Compression Breakout",
             "VELOCITY": "Velocity Flow",
             "SNIPER": "Sniper Pro MEGA",
             "ALPHAX": "AlphaX RELAY",
@@ -16881,7 +16885,7 @@ async def pre_signals(
         key = f"{group_key}|{symbol}"
         try:
             pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (120 if engine == "RUBIK" else 90))
-            if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON") and requested_market == "IQ_OTC":
+            if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
                 )
@@ -17275,12 +17279,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON"):
-        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, VELOCITY, ICT, SNIPER, ALPHAX, RAPID, SAMURAI, VOLUME ou RSIMON.")
+    if engine not in ("GRAPH_AI", "SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME"):
+        raise HTTPException(400, "Motor inválido. Use GRAPH_AI, SMART, EA, FORCE, RUBIK, BIGRISE, LARRY, VELOCITY, ICT, SNIPER, ALPHAX, RAPID, VOLUME.")
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME")
     if fallback_twelve:
         market = "OPEN"
 
@@ -17442,6 +17446,16 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     if direction != "NEUTRO"
                     else f"{engine_label} • MONITORANDO • {why}"
                 )
+            elif engine == "RANGE":
+                tech = range_compression_breakout_strategy(closed, interval, market=market)
+                engine_label = "RANGE COMPRESSION BREAKOUT"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "Range Compression monitorando").replace("\n", " ")[:88]
+                status_text = (
+                    f"{engine_label} • OPORTUNIDADE ENCONTRADA"
+                    if direction != "NEUTRO"
+                    else f"{engine_label} • MONITORANDO • {why}"
+                )
             elif engine == "VELOCITY":
                 tech = velocity_flow_strategy(closed, interval, market=market)
                 engine_label = "VELOCITY FLOW"
@@ -17584,18 +17598,18 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if (engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON") or (engine == "FORCE" and market == "IQ_OTC"))
+                    status_text if (engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME") or (engine == "FORCE" and market == "IQ_OTC"))
                     else (((_feed_source_label(_feed_source_from_rows(raw)) + " • " + status_text) if market == "OPEN" else status_text))
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
+                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
                 "strategy": str(tech.get("strategy") or ""),
             }
-            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON"):
+            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME"):
                 radar_probe = {
                     "symbol": sym, "market": market, "interval": interval,
                     "direction": item.get("direction"), "confidence": item.get("confidence"),
@@ -17626,6 +17640,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             source_status = "ROBÔ RUBIK • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION OTC EM ESPERA"
         elif engine == "LARRY":
             source_status = "LARRY BREAKOUT • FONTE EM ESPERA" if market == "OPEN" else "LARRY BREAKOUT • IQ OPTION OTC EM ESPERA"
+        elif engine == "RANGE":
+            source_status = "RANGE COMPRESSION • FONTE EM ESPERA" if market == "OPEN" else "RANGE COMPRESSION • IQ OPTION OTC EM ESPERA"
         elif engine == "VELOCITY":
             source_status = "VELOCITY FLOW • FONTE EM ESPERA" if market == "OPEN" else "VELOCITY FLOW • IQ OPTION OTC EM ESPERA"
         elif engine == "SNIPER":
@@ -17663,7 +17679,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
+            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -18037,7 +18053,7 @@ async def result(
     engine = str(engine or "").upper()
     # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
-    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "SAMURAI", "VOLUME", "RSIMON")
+    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "RANGE", "VELOCITY", "ICT", "SNIPER", "ALPHAX", "RAPID", "VOLUME")
 
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
@@ -18445,7 +18461,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .robot-mode-copy{min-width:150px}
 .robot-mode-title{font-weight:900;font-size:13px;letter-spacing:.4px}
 .robot-mode-desc{font-size:11px;color:#9fb2ca;margin-top:3px;max-width:245px}
-#robotPowerBtn,#aiPowerBtn,#larryPowerBtn,#sniperPowerBtn,#alphaxPowerBtn,#rapidPowerBtn,#samuraiPowerBtn,#volumePocPowerBtn,#forcePowerBtn,#bigrisePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+#robotPowerBtn,#aiPowerBtn,#larryPowerBtn,#rangePowerBtn,#sniperPowerBtn,#alphaxPowerBtn,#rapidPowerBtn,#volumePocPowerBtn,#forcePowerBtn,#bigrisePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
 
 .daily-engine-board{margin-top:14px;border-color:#1c82c9;background:linear-gradient(180deg,#0b1b2e,#071321);box-shadow:0 0 24px #00aaff22}
 .daily-engine-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
@@ -18533,7 +18549,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • AlphaX + Núcleo Rápido + RSI Monitor 20S + Samurai + Volume POC • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • AlphaX + Núcleo Rápido + Range Compression • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -18608,6 +18624,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="larryPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
+  <div class="robot-mode-card" id="rangeModeCard">
+    <img src="__MEGA_IMAGE__" alt="Range Compression Breakout">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">📦 RANGE COMPRESSION BREAKOUT</div>
+      <div class="robot-mode-desc" id="rangeModeDesc">Compressão adaptativa • ATR/buffer • breakout confirmado • reversão por pavio corrigida • candle fechado • próxima vela • sem Gale.</div>
+    </div>
+    <button id="rangePowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
   <div class="robot-mode-card" id="sniperModeCard">
     <img src="__MEGA_IMAGE__" alt="Sniper Pro MEGA">
     <div class="robot-mode-copy">
@@ -18634,24 +18659,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-desc" id="rapidModeDesc">CRIPTOBOT + Scalper FX + Russian Bear + Big Figures + AI Gen XII • filtro reforçado • SINAL FINAL INVERTIDO (CALL↔PUT) • independente do AlphaX • sinal ~30s antes • próxima vela.</div>
     </div>
     <button id="rapidPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-  <div class="robot-mode-card" id="rsiMonModeCard">
-    <img src="__MEGA_IMAGE__" alt="RSI Monitor 20S">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">📈 RSI MONITOR 20S</div>
-      <div class="robot-mode-desc" id="rsiMonModeDesc">RSI 14 • 30/70 + extremos 20/80 • reação + tendência + divergência • sinal ~20s antes • entrada na próxima vela.</div>
-    </div>
-    <button id="rsiMonPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-  <div class="robot-mode-card" id="samuraiModeCard">
-    <img src="__MEGA_IMAGE__" alt="Algo Samurai Treinamento">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🥷 ALGO SAMURAI • TREINAMENTO</div>
-      <div class="robot-mode-desc" id="samuraiModeDesc">Rompimento/impulso inspirado no EA original • step adaptativo por volatilidade • sinal ~30s antes • próxima vela • sem repaint após liberar • autoentrada real bloqueada no treino.</div>
-    </div>
-    <button id="samuraiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
   <div class="robot-mode-card" id="volumePocModeCard">
@@ -19329,16 +19336,18 @@ const rubikPowerBtn=null;
 const rubikModeDesc=null;
 const larryPowerBtn=document.getElementById('larryPowerBtn');
 const larryModeDesc=document.getElementById('larryModeDesc');
+const rangePowerBtn=document.getElementById('rangePowerBtn');
+const rangeModeDesc=document.getElementById('rangeModeDesc');
 const sniperPowerBtn=document.getElementById('sniperPowerBtn');
 const sniperModeDesc=document.getElementById('sniperModeDesc');
 const alphaxPowerBtn=document.getElementById('alphaxPowerBtn');
 const alphaxModeDesc=document.getElementById('alphaxModeDesc');
 const rapidPowerBtn=document.getElementById('rapidPowerBtn');
 const rapidModeDesc=document.getElementById('rapidModeDesc');
-const rsiMonPowerBtn=document.getElementById('rsiMonPowerBtn');
-const rsiMonModeDesc=document.getElementById('rsiMonModeDesc');
-const samuraiPowerBtn=document.getElementById('samuraiPowerBtn');
-const samuraiModeDesc=document.getElementById('samuraiModeDesc');
+const rsiMonPowerBtn=null;
+const rsiMonModeDesc=null;
+const samuraiPowerBtn=null;
+const samuraiModeDesc=null;
 const volumePocPowerBtn=document.getElementById('volumePocPowerBtn');
 const volumePocModeDesc=document.getElementById('volumePocModeDesc');
 const ictPowerBtn=document.getElementById('ictPowerBtn');
@@ -19391,6 +19400,7 @@ let rubikEnabled=false;
 let forceEnabled=false;
 let bigriseEnabled=false;
 let larryEnabled=false;
+let rangeEnabled=false;
 let velocityEnabled=false;
 let sniperEnabled=false;
 let alphaxEnabled=false;
@@ -19407,36 +19417,40 @@ try{
   eaEnabled=false;
   rubikEnabled=false;
   larryEnabled=localStorage.getItem('mega_larry_power')==='ONLINE' || legacyEaOnline || legacyRubikOnline;
+  rangeEnabled=localStorage.getItem('mega_range_power')==='ONLINE';
   velocityEnabled=localStorage.getItem('mega_velocity_power')==='ONLINE';
   sniperEnabled=localStorage.getItem('mega_sniper_power')==='ONLINE';
   alphaxEnabled=localStorage.getItem('mega_alphax_power')==='ONLINE';
   rapidEnabled=localStorage.getItem('mega_rapid_power')==='ONLINE';
-  samuraiEnabled=localStorage.getItem('mega_samurai_power')==='ONLINE';
+  samuraiEnabled=false;
+  localStorage.removeItem('mega_samurai_power');
   volumePocEnabled=localStorage.getItem('mega_volume_poc_power')==='ONLINE';
-  rsiMonEnabled=localStorage.getItem('mega_rsi_monitor_power')==='ONLINE';
+  rsiMonEnabled=false;
+  localStorage.removeItem('mega_rsi_monitor_power');
   ictEnabled=localStorage.getItem('mega_ict_power')==='ONLINE';
   localStorage.setItem('mega_ea_power','OFFLINE');
   localStorage.setItem('mega_rubik_power','OFFLINE');
   localStorage.setItem('mega_larry_power',larryEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_range_power',rangeEnabled?'ONLINE':'OFFLINE');
   forceEnabled=localStorage.getItem('mega_force_power')==='ONLINE';
   bigriseEnabled=localStorage.getItem('mega_bigrise_power')==='ONLINE';
-  if(volumePocEnabled){ rsiMonEnabled=false; samuraiEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; }
-  else if(rsiMonEnabled){ volumePocEnabled=false; samuraiEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; }
-  else if(samuraiEnabled){ volumePocEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; }
-  else if(alphaxEnabled){ volumePocEnabled=false; rapidEnabled=false; samuraiEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; samuraiEnabled=false; }
-  else if(rapidEnabled){ volumePocEnabled=false; samuraiEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
-  else if(sniperEnabled){ volumePocEnabled=false; rapidEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; alphaxEnabled=false; }
-  else if(ictEnabled){ volumePocEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
-  else if(velocityEnabled){ volumePocEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
-  else if(bigriseEnabled){ volumePocEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
-  else if(forceEnabled){ volumePocEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
-  else if(larryEnabled){ volumePocEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  if(rangeEnabled){ volumePocEnabled=false; rsiMonEnabled=false; samuraiEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; }
+  else if(volumePocEnabled){ rangeEnabled=false; rsiMonEnabled=false; samuraiEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; }
+  else if(rsiMonEnabled){ rangeEnabled=false; volumePocEnabled=false; samuraiEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; }
+  else if(samuraiEnabled){ rangeEnabled=false; volumePocEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; }
+  else if(alphaxEnabled){ rangeEnabled=false; volumePocEnabled=false; rapidEnabled=false; samuraiEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; samuraiEnabled=false; }
+  else if(rapidEnabled){ rangeEnabled=false; volumePocEnabled=false; samuraiEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  else if(sniperEnabled){ rangeEnabled=false; volumePocEnabled=false; rapidEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; alphaxEnabled=false; }
+  else if(ictEnabled){ rangeEnabled=false; volumePocEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  else if(velocityEnabled){ rangeEnabled=false; volumePocEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  else if(bigriseEnabled){ rangeEnabled=false; volumePocEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  else if(forceEnabled){ rangeEnabled=false; volumePocEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  else if(larryEnabled){ rangeEnabled=false; volumePocEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
+  if(rangeEnabled) return 'RANGE';
   if(volumePocEnabled) return 'VOLUME';
-  if(rsiMonEnabled) return 'RSIMON';
-  if(samuraiEnabled) return 'SAMURAI';
   if(alphaxEnabled) return 'ALPHAX';
   if(rapidEnabled) return 'RAPID';
   if(sniperEnabled) return 'SNIPER';
@@ -19455,10 +19469,9 @@ function adoptBackgroundEngineState(d){
   const e=String(d.engine||'').toUpperCase();
   robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
   forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false;
-  ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; rapidEnabled=false; samuraiEnabled=false; volumePocEnabled=false; rsiMonEnabled=false;
-  if(e==='VOLUME') volumePocEnabled=true;
-  else if(e==='RSIMON') rsiMonEnabled=true;
-  else if(e==='SAMURAI') samuraiEnabled=true;
+  ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; rapidEnabled=false; samuraiEnabled=false; volumePocEnabled=false; rsiMonEnabled=false; rangeEnabled=false;
+  if(e==='RANGE') rangeEnabled=true;
+  else if(e==='VOLUME') volumePocEnabled=true;
   else if(e==='ALPHAX') alphaxEnabled=true;
   else if(e==='RAPID') rapidEnabled=true;
   else if(e==='SNIPER') sniperEnabled=true;
@@ -19479,6 +19492,7 @@ function adoptBackgroundEngineState(d){
     localStorage.setItem('mega_force_power',forceEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_bigrise_power',bigriseEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_larry_power',larryEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power',velocityEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_ict_power',ictEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_sniper_power',sniperEnabled?'ONLINE':'OFFLINE');
@@ -20410,6 +20424,7 @@ function normalizeEngineKey(value){
   if(e==='EA' || e==='EA_AUTONOMOUS_IQ' || e==='EA_XGBOOST' || e==='EA_XGBOOST_AUTONOMOUS') return 'EA';
   if(e==='FORCE' || e==='EA_FORCE_MOVEMENT') return 'FORCE';
   if(e==='LARRY' || e==='LARRY_BREAKOUT') return 'LARRY';
+  if(e==='RANGE' || e==='RANGE_COMPRESSION_BREAKOUT') return 'RANGE';
   if(e==='VELOCITY' || e==='VELOCITY_FLOW' || e==='MR_MT4') return 'VELOCITY';
   if(e==='SNIPER' || e==='SNIPER_PRO' || e==='SNIPER_PRO_MEGA') return 'SNIPER';
   if(e==='ALPHAX' || e==='ALPHAX_RELAY' || e==='ALPHA_X') return 'ALPHAX';
@@ -20755,10 +20770,10 @@ function rememberPendingTrade(sig){
   if(!sig.expiry_time || !sig.entry_time) return;
 
   const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
-  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='ICT'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('ICT'));
+  const isDirectEa=(engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='RANGE'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='ICT'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('RANGE')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('ICT'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
-    // Motores de entrada direta (AlphaX/Núcleo Rápido/Samurai/Sniper/ICT/Larry/EA/Força/BigRise/Velocity) são apurados na primeira vela; outros preservam G1/G2.
+    // Motores de entrada direta (AlphaX/Núcleo Rápido/Samurai/Sniper/ICT/Larry/Range/EA/Força/BigRise/Velocity) são apurados na primeira vela; outros preservam G1/G2.
     direct_only:isDirectEa,
     market:signalResultMarket(sig),
     requested_market:sig.requested_market || (market&&market.value) || 'OPEN',
@@ -20772,7 +20787,7 @@ function rememberPendingTrade(sig){
     confidence:Number(sig.confidence||0),
     risk:String(sig.risk||''),
     strategy:String(sig.strategy||''),
-    engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('BIGRISE')?'BIGRISE':(engineKey.includes('LARRY')?'LARRY':(engineKey.includes('VELOCITY')?'VELOCITY':(engineKey.includes('SNIPER')?'SNIPER':(engineKey.includes('ALPHAX')?'ALPHAX':(engineKey.includes('RAPID')?'RAPID':(engineKey.includes('SAMURAI')?'SAMURAI':(engineKey.includes('VOLUME')?'VOLUME':(engineKey.includes('ICT')?'ICT':String(sig.selected_engine||sig.mode||'')))))))))))),
+    engine:(engineKey.includes('EA_XGBOOST')?'EA':(engineKey.includes('EA_FORCE')?'FORCE':(engineKey.includes('BIGRISE')?'BIGRISE':(engineKey.includes('LARRY')?'LARRY':(engineKey.includes('RANGE')?'RANGE':(engineKey.includes('VELOCITY')?'VELOCITY':(engineKey.includes('SNIPER')?'SNIPER':(engineKey.includes('ALPHAX')?'ALPHAX':(engineKey.includes('RAPID')?'RAPID':(engineKey.includes('SAMURAI')?'SAMURAI':(engineKey.includes('VOLUME')?'VOLUME':(engineKey.includes('ICT')?'ICT':String(sig.selected_engine||sig.mode||''))))))))))))),
     entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH')),
     value_stake:currentValueStake(),
     value_payout:currentValuePayout()
@@ -22828,6 +22843,12 @@ function applyRobotPowerState(){
     larryPowerBtn.style.color='#fff';
     larryPowerBtn.style.borderColor=larryEnabled?'#16c56b':'#ff5252';
   }
+  if(rangePowerBtn){
+    rangePowerBtn.textContent=rangeEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    rangePowerBtn.style.background=rangeEnabled?'#0b7a3d':'#7d1d1d';
+    rangePowerBtn.style.color='#fff';
+    rangePowerBtn.style.borderColor=rangeEnabled?'#16c56b':'#ff5252';
+  }
   if(velocityPowerBtn){
     velocityPowerBtn.textContent=velocityEnabled?'🟢 ONLINE':'🔴 OFFLINE';
     velocityPowerBtn.style.background=velocityEnabled?'#0b7a3d':'#7d1d1d';
@@ -22903,6 +22924,9 @@ function applyRobotPowerState(){
   if(rubikModeDesc) rubikModeDesc.textContent=rubikEnabled
     ? 'ONLINE: Heikin-Ashi + EMA 9/21 + RSI 14 + MACD • OPEN/OTC • próxima vela.'
     : 'OFFLINE: Robô Rubik Adaptado pausado.';
+  if(rangeModeDesc) rangeModeDesc.textContent=rangeEnabled
+    ? 'ONLINE: compressão adaptativa + breakout/reversão corrigida • candle fechado • entrada na próxima vela.'
+    : 'OFFLINE: Range Compression pausado.';
   if(larryModeDesc) larryModeDesc.textContent=larryEnabled
     ? 'ONLINE: rompimento + força/expansão de vela • candles fechados • OPEN/OTC • sem Grid, Martingale ou Gale.'
     : 'OFFLINE: Larry Breakout pausado.';
@@ -22983,6 +23007,11 @@ function applyRobotPowerState(){
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">₿ BTC FORCE selecionado • lê somente BTC/USD fechado e prepara a próxima vela • sem pré-sinal para não repintar.</div>';
     if(radar) radar.innerHTML='<div>📡 BTC FORCE ativo • procurando força compradora ou vendedora somente no BTC/USD</div>';
     rad();
+  }else if(engine==='RANGE'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RANGE COMPRESSION ONLINE • COMPRESSÃO ADAPTATIVA + BREAKOUT • CANDLE FECHADO • PRÓXIMA VELA • SEM GALE';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📦 Range Compression selecionado • sem pré-sinal intrabar • confirmação somente no fechamento para evitar repaint.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar Range Compression ativo • procurando compressão, rompimento e rejeição por pavio</div>';
+    rad();
   }else if(engine==='LARRY'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='LARRY BREAKOUT ONLINE • ROMPIMENTO + FORÇA DE VELA • OPEN + OTC • SEM GALE';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Larry Breakout selecionado • somente candles fechados para não repintar.</div>';
@@ -23015,7 +23044,7 @@ function applyRobotPowerState(){
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ AlphaX, Núcleo Rápido, RSI Monitor, Algo Samurai, Sniper Pro, ICT/SMC, IA Gráfica, Inteligência Artificial, Velocity Flow, Larry Breakout, EA Força e BIGRISE estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ AlphaX, Núcleo Rápido, Volume POC, Sniper Pro, ICT/SMC, IA Gráfica, Inteligência Artificial, Velocity Flow, Larry Breakout, Range Compression, EA Força e BTC Force estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -23036,7 +23065,7 @@ function resetEngineVisualState(){
 async function setRobotPower(enabled){
   robotEnabled=!!enabled;
   if(robotEnabled) rapidEnabled=false;
-  if(robotEnabled){ rsiMonEnabled=false; volumePocEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  if(robotEnabled){ rangeEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23045,6 +23074,7 @@ async function setRobotPower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23066,7 +23096,7 @@ async function setRobotPower(enabled){
 async function setAiPower(enabled){
   aiEnabled=!!enabled;
   if(aiEnabled) rapidEnabled=false;
-  if(aiEnabled){ rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  if(aiEnabled){ rangeEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23075,6 +23105,7 @@ async function setAiPower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23096,7 +23127,7 @@ async function setAiPower(enabled){
 async function setEaPower(enabled){
   eaEnabled=!!enabled;
   if(eaEnabled) rapidEnabled=false;
-  if(eaEnabled){ volumePocEnabled=false; robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  if(eaEnabled){ rangeEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23105,6 +23136,7 @@ async function setEaPower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23126,7 +23158,7 @@ async function setEaPower(enabled){
 async function setRubikPower(enabled){
   rubikEnabled=!!enabled;
   if(rubikEnabled) rapidEnabled=false;
-  if(rubikEnabled){ volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  if(rubikEnabled){ rangeEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23135,6 +23167,7 @@ async function setRubikPower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23153,12 +23186,46 @@ async function setRubikPower(enabled){
   if(voiceEnabled) speak(rubikEnabled ? 'Robô Rubik Adaptado online.' : 'Robô Rubik Adaptado offline.');
 }
 
+async function setRangePower(enabled){
+  rangeEnabled=!!enabled;
+  if(rangeEnabled){
+    rsiMonEnabled=false; volumePocEnabled=false; samuraiEnabled=false; robotEnabled=false; aiEnabled=false;
+    eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false;
+    velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; rapidEnabled=false;
+  }
+  try{
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_rapid_power', rapidEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_volume_poc_power', volumePocEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_ea_power','OFFLINE');
+    localStorage.setItem('mega_rubik_power','OFFLINE');
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'RANGE'});
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(rangeEnabled ? 'Range Compression Breakout online.' : 'Range Compression Breakout offline.');
+}
+
 async function setLarryPower(enabled){
   larryEnabled=!!enabled;
   if(larryEnabled) rapidEnabled=false;
-  if(larryEnabled){ rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  if(larryEnabled){ rangeEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23186,11 +23253,12 @@ async function setLarryPower(enabled){
 async function setForcePower(enabled){
   forceEnabled=!!enabled;
   if(forceEnabled) rapidEnabled=false;
-  if(forceEnabled){ rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  if(forceEnabled){ rangeEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23216,10 +23284,11 @@ async function setForcePower(enabled){
 async function setBigrisePower(enabled){
   bigriseEnabled=!!enabled;
   if(bigriseEnabled) rapidEnabled=false;
-  if(bigriseEnabled){ rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  if(bigriseEnabled){ rangeEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23246,7 +23315,7 @@ async function setBigrisePower(enabled){
 async function setVelocityPower(enabled){
   velocityEnabled=!!enabled;
   if(velocityEnabled) rapidEnabled=false;
-  if(velocityEnabled){ rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  if(velocityEnabled){ rangeEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23257,6 +23326,7 @@ async function setVelocityPower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_rapid_power', rapidEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23276,7 +23346,7 @@ async function setVelocityPower(enabled){
 async function setIctPower(enabled){
   ictEnabled=!!enabled;
   if(ictEnabled) rapidEnabled=false;
-  if(ictEnabled){ rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  if(ictEnabled){ rangeEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', robotEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23286,6 +23356,7 @@ async function setIctPower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23306,7 +23377,7 @@ async function setIctPower(enabled){
 async function setSniperPower(enabled){
   sniperEnabled=!!enabled;
   if(sniperEnabled) rapidEnabled=false;
-  if(sniperEnabled){ rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; samuraiEnabled=false; }
+  if(sniperEnabled){ rangeEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_sniper_power', sniperEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23321,6 +23392,7 @@ async function setSniperPower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
@@ -23337,7 +23409,7 @@ async function setSniperPower(enabled){
 
 async function setVolumePocPower(enabled){
   volumePocEnabled=!!enabled;
-  if(volumePocEnabled){ rsiMonEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; rapidEnabled=false; samuraiEnabled=false; }
+  if(volumePocEnabled){ rangeEnabled=false; rsiMonEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; rapidEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_volume_poc_power', volumePocEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_rsi_monitor_power', rsiMonEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23352,6 +23424,7 @@ async function setVolumePocPower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
@@ -23366,7 +23439,7 @@ async function setVolumePocPower(enabled){
 
 async function setRsiMonPower(enabled){
   rsiMonEnabled=!!enabled;
-  if(rsiMonEnabled){ volumePocEnabled=false; samuraiEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; rapidEnabled=false; }
+  if(rsiMonEnabled){ rangeEnabled=false; volumePocEnabled=false; samuraiEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; rapidEnabled=false; }
   try{
     localStorage.setItem('mega_rsi_monitor_power', rsiMonEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_volume_poc_power', volumePocEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23381,6 +23454,7 @@ async function setRsiMonPower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
@@ -23410,6 +23484,7 @@ async function setSamuraiPower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
@@ -23424,7 +23499,7 @@ async function setSamuraiPower(enabled){
 
 async function setRapidPower(enabled){
   rapidEnabled=!!enabled;
-  if(rapidEnabled){ rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  if(rapidEnabled){ rangeEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_rapid_power', rapidEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_samurai_power', samuraiEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23439,6 +23514,7 @@ async function setRapidPower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
@@ -23454,7 +23530,7 @@ async function setRapidPower(enabled){
 async function setAlphaxPower(enabled){
   alphaxEnabled=!!enabled;
   if(alphaxEnabled) rapidEnabled=false;
-  if(alphaxEnabled){ rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; samuraiEnabled=false; }
+  if(alphaxEnabled){ rangeEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; ictEnabled=false; sniperEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_alphax_power', alphaxEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_rapid_power', rapidEnabled ? 'ONLINE' : 'OFFLINE');
@@ -23468,6 +23544,7 @@ async function setAlphaxPower(enabled){
     localStorage.setItem('mega_force_power', forceEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_bigrise_power', bigriseEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_larry_power', larryEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_range_power', rangeEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_velocity_power', velocityEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_ict_power', ictEnabled ? 'ONLINE' : 'OFFLINE');
   }catch(_){}
@@ -23485,13 +23562,12 @@ if(aiPowerBtn) aiPowerBtn.onclick=()=>{ setAiPower(!aiEnabled); };
 if(eaPowerBtn) eaPowerBtn.onclick=()=>{ setEaPower(!eaEnabled); };
 if(rubikPowerBtn) rubikPowerBtn.onclick=()=>{ setRubikPower(!rubikEnabled); };
 if(larryPowerBtn) larryPowerBtn.onclick=()=>{ setLarryPower(!larryEnabled); };
+if(rangePowerBtn) rangePowerBtn.onclick=()=>{ setRangePower(!rangeEnabled); };
 if(velocityPowerBtn) velocityPowerBtn.onclick=()=>{ setVelocityPower(!velocityEnabled); };
 if(sniperPowerBtn) sniperPowerBtn.onclick=()=>{ setSniperPower(!sniperEnabled); };
 if(alphaxPowerBtn) alphaxPowerBtn.onclick=()=>{ setAlphaxPower(!alphaxEnabled); };
 if(rapidPowerBtn) rapidPowerBtn.onclick=()=>{ setRapidPower(!rapidEnabled); };
-if(samuraiPowerBtn) samuraiPowerBtn.onclick=()=>{ setSamuraiPower(!samuraiEnabled); };
 if(volumePocPowerBtn) volumePocPowerBtn.onclick=()=>{ setVolumePocPower(!volumePocEnabled); };
-if(rsiMonPowerBtn) rsiMonPowerBtn.onclick=()=>{ setRsiMonPower(!rsiMonEnabled); };
 if(ictPowerBtn) ictPowerBtn.onclick=()=>{ setIctPower(!ictEnabled); };
 if(ictTabPowerBtn) ictTabPowerBtn.onclick=()=>{ setIctPower(!ictEnabled); };
 if(ictOpenPanelBtn) ictOpenPanelBtn.onclick=()=>showTab('main');
@@ -23939,7 +24015,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='ALPHAX'?'ALPHAX RELAY':ek==='RAPID'?'NÚCLEO RÁPIDO EAs':ek==='SAMURAI'?'ALGO SAMURAI • TREINAMENTO':ek==='VOLUME'?'VOLUME POC':ek==='RSIMON'?'RSI MONITOR 20S':ek==='SNIPER'?'SNIPER PRO MEGA':ek==='ICT'?'ICT/SMC INSTITUCIONAL':ek==='SMART'?'INTELIGÊNCIA ARTIFICIAL':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='ALPHAX'?'ALPHAX RELAY':ek==='RAPID'?'NÚCLEO RÁPIDO EAs':ek==='VOLUME'?'VOLUME POC':ek==='SNIPER'?'SNIPER PRO MEGA':ek==='ICT'?'ICT/SMC INSTITUCIONAL':ek==='SMART'?'INTELIGÊNCIA ARTIFICIAL':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
