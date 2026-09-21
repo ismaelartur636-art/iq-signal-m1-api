@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.93.0"
-PWA_VERSION = "v152"
+APP_VERSION = "3.94.0"
+PWA_VERSION = "v153"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -251,21 +251,21 @@ RAPID_AI_GEN_MAX_WICK_RATIO = max(0.55, min(0.95, float(os.getenv("RAPID_AI_GEN_
 # O delta continua sendo estimado por OHLCV quando a fonte não entrega agressor bid/ask real.
 # Os filtros foram levemente afrouxados para aumentar a frequência sem liberar um lado
 # sem vantagem mínima sobre o lado oposto. Depois da liberação, active_signal congela o sinal.
-VOLUME_POC_LOOKBACK = max(24, min(90, int(os.getenv("VOLUME_POC_LOOKBACK", "40"))))
+VOLUME_POC_LOOKBACK = max(20, min(90, int(os.getenv("VOLUME_POC_LOOKBACK", "28"))))
 VOLUME_POC_BINS = max(12, min(40, int(os.getenv("VOLUME_POC_BINS", "20"))))
-VOLUME_POC_DELTA_LOOKBACK = max(5, min(25, int(os.getenv("VOLUME_POC_DELTA_LOOKBACK", "8"))))
-VOLUME_POC_IMBALANCE_THRESHOLD = max(0.20, min(0.80, float(os.getenv("VOLUME_POC_IMBALANCE_THRESHOLD", "0.30"))))
+VOLUME_POC_DELTA_LOOKBACK = max(4, min(25, int(os.getenv("VOLUME_POC_DELTA_LOOKBACK", "6"))))
+VOLUME_POC_IMBALANCE_THRESHOLD = max(0.12, min(0.80, float(os.getenv("VOLUME_POC_IMBALANCE_THRESHOLD", "0.18"))))
 VOLUME_POC_STACKED_ROWS = max(2, min(5, int(os.getenv("VOLUME_POC_STACKED_ROWS", "2"))))
-VOLUME_POC_ABSORPTION_VOL = max(0.90, min(3.00, float(os.getenv("VOLUME_POC_ABSORPTION_VOL", "1.08"))))
-VOLUME_POC_EXHAUSTION_VOL = max(1.10, min(4.00, float(os.getenv("VOLUME_POC_EXHAUSTION_VOL", "1.55"))))
-VOLUME_POC_EXHAUSTION_DELTA = max(0.05, min(0.35, float(os.getenv("VOLUME_POC_EXHAUSTION_DELTA", "0.18"))))
-VOLUME_POC_MIN_SCORE = max(3, min(9, int(os.getenv("VOLUME_POC_MIN_SCORE", "4"))))
+VOLUME_POC_ABSORPTION_VOL = max(0.65, min(3.00, float(os.getenv("VOLUME_POC_ABSORPTION_VOL", "0.78"))))
+VOLUME_POC_EXHAUSTION_VOL = max(0.80, min(4.00, float(os.getenv("VOLUME_POC_EXHAUSTION_VOL", "1.00"))))
+VOLUME_POC_EXHAUSTION_DELTA = max(0.03, min(0.35, float(os.getenv("VOLUME_POC_EXHAUSTION_DELTA", "0.10"))))
+VOLUME_POC_MIN_SCORE = max(2, min(3, int(os.getenv("VOLUME_POC_MIN_SCORE", "2"))))
 VOLUME_POC_SCORE_EDGE = max(1, min(5, int(os.getenv("VOLUME_POC_SCORE_EDGE", "1"))))
 VOLUME_POC_COOLDOWN_BARS = max(1, min(10, int(os.getenv("VOLUME_POC_COOLDOWN_BARS", "1"))))
-VOLUME_POC_MIN_VOLUME_COVERAGE = max(0.35, min(1.00, float(os.getenv("VOLUME_POC_MIN_VOLUME_COVERAGE", "0.50"))))
-VOLUME_POC_EARLY_SIGNAL_SECONDS = 20
-VOLUME_POC_EARLY_WINDOW_BEFORE = max(20, min(26, int(os.getenv("VOLUME_POC_EARLY_WINDOW_BEFORE", "23"))))
-VOLUME_POC_EARLY_MIN_REMAINING = max(12, min(20, int(os.getenv("VOLUME_POC_EARLY_MIN_REMAINING", "16"))))
+VOLUME_POC_MIN_VOLUME_COVERAGE = max(0.15, min(0.30, float(os.getenv("VOLUME_POC_MIN_VOLUME_COVERAGE", "0.20"))))
+VOLUME_POC_EARLY_SIGNAL_SECONDS = 55
+VOLUME_POC_EARLY_WINDOW_BEFORE = max(30, min(58, int(os.getenv("VOLUME_POC_EARLY_WINDOW_BEFORE", "55"))))
+VOLUME_POC_EARLY_MIN_REMAINING = max(3, min(12, int(os.getenv("VOLUME_POC_EARLY_MIN_REMAINING", "5"))))
 # S/R multi-timeframe do Volume POC. Timeframes maiores têm mais peso, mas nenhum
 # deles é obrigatório isoladamente. M30 é agregado do M15 e H4 é agregado do H1.
 VOLUME_POC_MTF_WEIGHTS = {"M15": 1, "M30": 1, "H1": 2, "H4": 3}
@@ -290,21 +290,7 @@ external_ai_runtime: Dict[str, Any] = {
     "last_error": "",
 }
 
-# MEGA IA 3.90 — IA EXTERNA com VARREDURA DE OPORTUNIDADES.
-# O navegador não calcula indicadores: o servidor busca OHLCV externo de vários ativos
-# e envia o conjunto bruto em uma única análise para OpenAI/Gemini escolher a oportunidade mais forte.
-EXTERNAL_TAB_MIN_CONFIDENCE = max(55.0, min(95.0, float(os.getenv("EXTERNAL_TAB_MIN_CONFIDENCE", "72"))))
-EXTERNAL_TAB_RECHECK_SECONDS = max(8.0, min(45.0, float(os.getenv("EXTERNAL_TAB_RECHECK_SECONDS", "15"))))
-EXTERNAL_TAB_MIN_LEAD_SECONDS = max(2.0, min(20.0, float(os.getenv("EXTERNAL_TAB_MIN_LEAD_SECONDS", "8"))))
-EXTERNAL_TAB_CANDLES = max(30, min(90, int(os.getenv("EXTERNAL_TAB_CANDLES", "55"))))
-EXTERNAL_SCAN_CANDLES = max(22, min(55, int(os.getenv("EXTERNAL_SCAN_CANDLES", "32"))))
-EXTERNAL_SCAN_CONCURRENCY = max(1, min(6, int(os.getenv("EXTERNAL_SCAN_CONCURRENCY", "4"))))
-_external_scan_env = [x.strip().upper() for x in os.getenv("EXTERNAL_SCAN_SYMBOLS", "").split(",") if x.strip()]
-EXTERNAL_SCAN_SYMBOLS = []  # preenchido após a lista SYMBOLS ser criada
-external_tab_cache: Dict[str, Dict[str, Any]] = {}
-external_tab_locks: Dict[str, asyncio.Lock] = {}
-external_scan_cache: Dict[str, Dict[str, Any]] = {}
-external_scan_locks: Dict[str, asyncio.Lock] = {}
+# OpenAI/Gemini continuam disponíveis apenas para IA LEITURA DO GRÁFICO e IA + VOLUME POC.
 
 # Gemini permanece como fallback com proteção de quota.
 # Defaults deixam margem abaixo do limite observado no projeto (5 RPM / 50 RPD).
@@ -313,7 +299,7 @@ GEMINI_DAILY_BUDGET = max(1, int(os.getenv("GEMINI_DAILY_BUDGET", "45")))
 GEMINI_PREFILTER_MIN = float(os.getenv("GEMINI_PREFILTER_MIN", "64"))
 # 3.35: triagem da IA principal um pouco menos rígida que antes.
 # A saída final continua protegida por confiança, risco, XGBoost e gate de price action.
-SMART_PREFILTER_MIN = float(os.getenv("SMART_PREFILTER_MIN", "55"))
+SMART_PREFILTER_MIN = min(50.0, max(35.0, float(os.getenv("SMART_PREFILTER_MIN", "42"))))
 GEMINI_QUOTA_TZ = ZoneInfo("America/Los_Angeles")
 _gemini_quota_lock = threading.RLock()
 _gemini_quota_state = {
@@ -445,7 +431,6 @@ SYMBOLS = [
     BINOMO_CRYPTO_IDX_SYMBOL,
 ]
 OTC_SYMBOLS = [s for s in SYMBOLS if s != BINOMO_CRYPTO_IDX_SYMBOL]
-EXTERNAL_SCAN_SYMBOLS = [sym for sym in (_external_scan_env or SYMBOLS) if sym in SYMBOLS and sym != BINOMO_CRYPTO_IDX_SYMBOL]
 
 # MEGA IA 3.72 — robô de sinais em segundo plano com motor travado por ação explícita.
 # O navegador deixa de ser responsável por manter a análise viva: o servidor
@@ -9752,7 +9737,7 @@ def _volume_poc_structure_context(rows, mtf=None):
         rr=[max(float(x.get("high") or 0)-float(x.get("low") or 0),1e-12) for x in sample[-20:]]
         a=sum(rr)/max(1,len(rr))
     levels=_support_resistance_levels(sample,"local")
-    radius=max(float(levels.get("tolerance") or 0.0)*1.6, a*0.38, abs(c)*0.00028)
+    radius=max(float(levels.get("tolerance") or 0.0)*2.2, a*0.55, abs(c)*0.00038)
     sups=list(levels.get("supports") or [])
     ress=list(levels.get("resistances") or [])
     ns=min(sups,key=lambda x:abs(c-float(x.get("price") or c)),default=None)
@@ -9763,7 +9748,7 @@ def _volume_poc_structure_context(rows, mtf=None):
     line_sample=sample[-90:]
     highs,lows=_otc_swing_points(line_sample,2,2)
     avg_range=sum(max(float(x.get("high") or 0)-float(x.get("low") or 0),1e-12) for x in line_sample[-20:])/max(1,min(20,len(line_sample)))
-    line_tol=max(a*0.48,avg_range*0.32,abs(c)*0.00032)
+    line_tol=max(a*0.70,avg_range*0.48,abs(c)*0.00045)
     current_idx=len(line_sample)-1
     near_lta=False; near_ltb=False; lta=None; ltb=None
     if len(lows)>=2:
@@ -9800,7 +9785,7 @@ def _volume_poc_structure_context(rows, mtf=None):
         tol=float(lv.get("tolerance") or 0.0)
         # Mantém a própria largura da zona do timeframe e uma tolerância mínima
         # baseada no ATR do gráfico de entrada para não perder reação por poucos ticks.
-        zone_radius=max(tol*1.25, a*0.30, abs(c)*0.00020)
+        zone_radius=max(tol*1.70, a*0.45, abs(c)*0.00030)
         tf_sups=list(lv.get("supports") or [])
         tf_ress=list(lv.get("resistances") or [])
         ts=min(tf_sups,key=lambda x:abs(c-float(x.get("price") or c)),default=None)
@@ -9852,7 +9837,7 @@ def _volume_poc_structure_context(rows, mtf=None):
 def _volume_poc_snapshot(rows, early_signal=False, use_ai=False, mtf=None):
     use_ai = False  # Volume POC Estrutural removido; legado cai no motor estrutural.
     rows = list(rows or [])
-    need = max(VOLUME_POC_LOOKBACK + 2, 44)
+    need = max(VOLUME_POC_LOOKBACK + 2, 30)
     if len(rows) < need:
         return None
     profile = _volume_poc_profile(rows)
@@ -9888,18 +9873,18 @@ def _volume_poc_snapshot(rows, early_signal=False, use_ai=False, mtf=None):
     # Na janela antecipada a vela ainda está formando, portanto o volume acumulado
     # naturalmente é menor. Compensamos isso apenas nos limiares de volume, sem
     # inventar volume futuro nem alterar o preço/delta observado.
-    absorption_vol = max(0.78, VOLUME_POC_ABSORPTION_VOL * (0.80 if early_signal else 1.0))
-    exhaustion_vol = max(1.00, VOLUME_POC_EXHAUSTION_VOL * (0.82 if early_signal else 1.0))
-    bull_abs = bool(vratio >= absorption_vol and lower >= 0.30 and dr <= -0.06 and close_pos >= 0.51)
-    bear_abs = bool(vratio >= absorption_vol and upper >= 0.30 and dr >= 0.06 and close_pos <= 0.49)
+    absorption_vol = max(0.55, VOLUME_POC_ABSORPTION_VOL * (0.72 if early_signal else 0.90))
+    exhaustion_vol = max(0.75, VOLUME_POC_EXHAUSTION_VOL * (0.78 if early_signal else 0.95))
+    bull_abs = bool(vratio >= absorption_vol and lower >= 0.20 and dr <= -0.03 and close_pos >= 0.49)
+    bear_abs = bool(vratio >= absorption_vol and upper >= 0.20 and dr >= 0.03 and close_pos <= 0.51)
     exhaustion = bool(vratio >= exhaustion_vol and abs(dr) <= VOLUME_POC_EXHAUSTION_DELTA)
     delta_flip_call = dcur > 0 and dprev <= 0
     delta_flip_put = dcur < 0 and dprev >= 0
 
     poc = float(profile["poc"])
-    near_poc = (l <= float(profile["poc_high"]) + a * 0.18 and h >= float(profile["poc_low"]) - a * 0.18)
-    poc_call = bool(near_poc and c > poc and c > o and dr > 0.04)
-    poc_put = bool(near_poc and c < poc and c < o and dr < -0.04)
+    near_poc = (l <= float(profile["poc_high"]) + a * 0.35 and h >= float(profile["poc_low"]) - a * 0.35)
+    poc_call = bool(near_poc and c >= poc and c >= o and dr > 0.015)
+    poc_put = bool(near_poc and c <= poc and c <= o and dr < -0.015)
 
     ub = _volume_poc_unfinished_zone(rows)
     ub_call = bool(ub and ub.get("side") == "BULL" and abs(c - float(ub.get("price") or c)) <= a * 0.35 and c >= o)
@@ -9931,8 +9916,8 @@ def _volume_poc_snapshot(rows, early_signal=False, use_ai=False, mtf=None):
         elif upper > lower * 1.15 and close_pos <= 0.48:
             add_put(1, "EXAUSTÃO COMPRADORA")
     # Volume forte with directional close is a light confirmation, never a trigger alone.
-    strong_vol = 0.82 if early_signal else 0.95
-    strong_delta = 0.12 if early_signal else 0.14
+    strong_vol = 0.58 if early_signal else 0.72
+    strong_delta = 0.055 if early_signal else 0.075
     if vratio >= strong_vol and dr >= strong_delta and c > o: add_call(1, "VOLUME + DELTA")
     if vratio >= strong_vol and dr <= -strong_delta and c < o: add_put(1, "VOLUME + DELTA")
 
@@ -10010,17 +9995,17 @@ def _volume_poc_snapshot(rows, early_signal=False, use_ai=False, mtf=None):
     # O gatilho direto não espera atingir o score mínimo: POC+SUPORTE ou POC+LTA
     # (e o equivalente vendedor) é uma condição completa por si só. Mantemos apenas
     # a cobertura mínima de volume como proteção da qualidade da fonte.
-    call_release = bool(call_first_trigger or (not structure_conflict and structure.get("call_structure") and raw_flow_call >= 1 and c >= o and dr >= 0.04))
-    put_release = bool(put_first_trigger or (not structure_conflict and structure.get("put_structure") and raw_flow_put >= 1 and c <= o and dr <= -0.04))
+    call_release = bool(call_first_trigger or (not structure_conflict and structure.get("call_structure") and raw_flow_call >= 1 and c >= o and dr >= 0.015))
+    put_release = bool(put_first_trigger or (not structure_conflict and structure.get("put_structure") and raw_flow_put >= 1 and c <= o and dr <= -0.015))
     call_ok = coverage_ok and (
         (call_first_trigger and not put_first_trigger) or
         (call >= VOLUME_POC_MIN_SCORE and (call - put) >= VOLUME_POC_SCORE_EDGE) or
-        (call_release and call >= 3 and (call - put) >= 1)
+        (call_release and call >= 2 and (call - put) >= 1)
     )
     put_ok = coverage_ok and (
         (put_first_trigger and not call_first_trigger) or
         (put >= VOLUME_POC_MIN_SCORE and (put - call) >= VOLUME_POC_SCORE_EDGE) or
-        (put_release and put >= 3 and (put - call) >= 1)
+        (put_release and put >= 2 and (put - call) >= 1)
     )
     direction = "CALL" if call_ok else ("PUT" if put_ok else "NEUTRO")
     score = call if direction == "CALL" else (put if direction == "PUT" else max(call, put))
@@ -10073,7 +10058,7 @@ def volume_poc_strategy(cs, timeframe="1min", market="OPEN", early_signal=False,
     name = f"VOLUME POC ESTRUTURAL {tf_label}"
     engine_code = "VOLUME_POC"
     provider_code = "LOCAL_VOLUME_POC_STRUCTURE"
-    need = max(VOLUME_POC_LOOKBACK + 2, 44)
+    need = max(VOLUME_POC_LOOKBACK + 2, 30)
     if len(rows) < need:
         return {"available":True, "direction":"NEUTRO", "confidence":0.0, "confirmed":False, "risk":"HIGH",
                 "strategy":name, "engine":engine_code, "provider":provider_code,
@@ -10821,7 +10806,7 @@ def _gemini_candidate_prefilter(cs, interval="1min"):
     # Ela recebe penalidade e só chega à IA externa se o restante do contexto for forte.
     # O gate final ainda bloqueia lateralização comum e só aceita exceções claras.
     if ctx.get("choppy"):
-        score -= 8.0
+        score -= 3.0
 
     score = clamp(score, 0, 100)
     threshold = float(SMART_PREFILTER_MIN)
@@ -11495,7 +11480,7 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
 
     prompt = f"""Você é a inteligência artificial autônoma da MEGA IA, especializada em prever SOMENTE a direção da PRÓXIMA vela completa.
 Ativo: {symbol}. Timeframe: {interval}. Mercado: {market}.
-OBJETIVO PRINCIPAL: aumentar WIN DIRETO e reduzir dependência de Gale. Não use NEUTRO por excesso de cautela: quando houver duas evidências coerentes de price action e nenhuma contradição forte, escolha CALL ou PUT; use NEUTRO quando o contexto estiver realmente ambíguo.
+OBJETIVO PRINCIPAL: encontrar oportunidades para a próxima vela sem ficar preso em NEUTRO. Escolha CALL ou PUT quando houver uma evidência forte ou duas evidências moderadas na mesma direção; use NEUTRO somente quando houver conflito forte ou ausência real de direção.
 Este é o MODO IA PURA: NÃO use RSI, MACD, Bollinger, médias móveis, ATR, estocástico, ADX, score técnico ou qualquer indicador calculado pelo aplicativo.
 Use SOMENTE os candles OHLCV FECHADOS fornecidos. Não há candle em formação nesta entrada.
 
@@ -11503,11 +11488,11 @@ Avalie price action de curto prazo: sequência de altas/baixas, corpos, pavios, 
 A previsão é para UMA vela à frente, não para a tendência geral.
 
 REGRAS DE QUALIDADE:
-- Se houver alternância frequente, corpos pequenos, pavios dos dois lados, compressão ou direção pouco clara: prefira NEUTRO. EXCEÇÃO: se o micro-momento ao vivo da EA Vela Atual e o XGBoost apontarem o MESMO lado com força razoável, avalie CALL/PUT pela continuidade curta em vez de neutralizar automaticamente.
+- Alternância leve, corpos menores ou compressão isolada NÃO devem gerar NEUTRO automaticamente. Use NEUTRO apenas quando os sinais de alta e baixa estiverem realmente equilibrados ou contraditórios.
 - Não persiga movimento já esticado sem nova confirmação.
-- CALL/PUT exige pelo menos duas evidências independentes de price action para a próxima vela.
+- CALL/PUT pode ser liberado com uma evidência forte ou duas evidências moderadas de price action para a próxima vela.
 - Região H1 e padrão de vela são motores independentes e NÃO precisam concordar com esta análise.
-- Para M1 seja especialmente rigoroso.
+- Para M1 priorize o micro-movimento mais recente e a direção da próxima vela; não neutralize apenas pelo ruído normal do timeframe.
 - Gale, recuperação e resultados anteriores NÃO podem influenciar a decisão.
 - Marque risk LOW ou MEDIUM quando houver vantagem razoável e coerente. Use HIGH + NEUTRO quando houver conflito real, lateralização forte ou ausência de direção.
 
@@ -11553,16 +11538,16 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         # 3.44 — mais frequência, mas preservando análise cruzada.
         # A confiança bruta deixa de bloquear sozinha setups em que Luna,
         # XGBoost e a EA Vela Atual convergem. HIGH continua mais seletivo.
-        low_min = 68.0 if interval == "1min" else 68.0
+        low_min = 58.0 if interval == "1min" else 58.0
         if risk == "LOW":
             required_conf = low_min
-            quality_min = 63.0
+            quality_min = 54.0
         elif risk == "MEDIUM":
-            required_conf = 69.0
-            quality_min = 64.0
+            required_conf = 60.0
+            quality_min = 55.0
         else:
-            required_conf = 74.0
-            quality_min = 68.0
+            required_conf = 66.0
+            quality_min = 60.0
 
         moment_aligned = bool(
             moment_hint.get("confirmed")
@@ -11571,8 +11556,8 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             and float(moment_hint.get("score") or 0.0) >= MOMENT_EA_CONFIRM_SCORE
         )
         if moment_aligned:
-            required_conf = max(66.0, required_conf - 2.0)
-            quality_min = max(60.0, quality_min - 3.0)
+            required_conf = max(54.0, required_conf - 4.0)
+            quality_min = max(50.0, quality_min - 4.0)
 
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
 
@@ -11628,17 +11613,13 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
                 blocked_reason = "IA não confirmou a própria leitura"
             elif confidence < required_conf:
                 blocked_reason = f"confiança {confidence:.0f}% abaixo do mínimo seletivo {required_conf:.0f}%"
-            elif xgb_ready and not xgb_confirmed and not xgb_soft_confirmed:
-                blocked_reason = "XGBoost sem vantagem estatística/validação suficiente"
-            elif xgb_ready and not xgb_agrees:
-                blocked_reason = f"IA e XGBoost discordaram ({direction} x {xgb_direction})"
-            elif not xgb_ready and risk in ("MEDIUM", "HIGH"):
-                blocked_reason = "risco médio/alto exige XGBoost pronto"
-            elif risk == "HIGH" and (not xgb_confirmed or xgb_confidence < 64.0 or xgb_validation < 54.0):
-                blocked_reason = "risco alto exige XGBoost forte e validação temporal maior"
+            elif xgb_ready and xgb_direction in ("CALL", "PUT") and xgb_direction != direction and xgb_confidence >= 68.0 and xgb_validation >= 54.0:
+                blocked_reason = f"XGBoost fortemente contrário ({direction} x {xgb_direction})"
+            elif risk == "HIGH" and confidence < 70.0:
+                blocked_reason = "risco alto exige confiança mínima de 70%"
             elif analysis_quality < quality_min:
-                blocked_reason = f"qualidade combinada {analysis_quality:.0f}% abaixo do mínimo {quality_min:.0f}%"
-            elif not gate_ok:
+                blocked_reason = f"qualidade combinada {analysis_quality:.0f}% abaixo do mínimo flex {quality_min:.0f}%"
+            elif not gate_ok and risk == "HIGH":
                 blocked_reason = gate_reason
 
         if direction in ("CALL", "PUT") and xgb_ready and xgb_confirmed and xgb_agrees:
@@ -11809,7 +11790,7 @@ async def ai_volume_poc_consensus_signal(
         ai_vote={"available":False,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","provider":"EXTERNAL_AI_UNAVAILABLE","reason":str(exc)[:180]}
     ai_dir=str(ai_vote.get("direction") or "NEUTRO").upper()
     ai_conf=float(ai_vote.get("confidence") or 0.0)
-    ai_ok=bool(ai_vote.get("available",True) and ai_vote.get("confirmed") and ai_dir in ("CALL","PUT"))
+    ai_ok=bool(ai_vote.get("available",True) and ai_dir in ("CALL","PUT") and ai_conf >= 54.0)
     agreed=bool(ai_ok and ai_dir==volume_dir)
     consensus={"required":True,"agreed":agreed,"stage":"CONFIRMED" if agreed else "DISAGREEMENT_OR_NEUTRAL","volume_direction":volume_dir,"volume_confidence":round(volume_conf,1),"ai_direction":ai_dir if ai_dir in ("CALL","PUT") else "NEUTRO","ai_confidence":round(ai_conf,1),"ai_called":True,"ai_provider":ai_vote.get("provider") or "EXTERNAL_AI"}
     if not agreed:
@@ -11820,7 +11801,7 @@ async def ai_volume_poc_consensus_signal(
     final_conf=round(clamp(volume_conf*0.45+ai_conf*0.55,0.0,96.0),1)
     risk=str(ai_vote.get("risk") or "MEDIUM").upper()
     if risk not in ("LOW","MEDIUM","HIGH"): risk="MEDIUM"
-    return {"available":True,"direction":volume_dir,"confidence":final_conf,"confirmed":True,"risk":risk,"strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":f"CONCORDÂNCIA: Volume POC {volume_dir} ({volume_conf:.0f}%) + IA {ai_dir} ({ai_conf:.0f}%). Entrada liberada porque os dois concordaram.","candidate_direction":volume_dir,"early_signal_window":True,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"event_key":volume_vote.get("event_key") or f"AI_VOLUME_POC:{volume_dir}:{raw_rows[-1].get('datetime') if raw_rows else ''}","volume_vote":volume_vote,"ai_vote":ai_vote,"consensus":consensus,"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"direct_win_only":True,"gale_signal":False}
+    return {"available":True,"direction":volume_dir,"confidence":final_conf,"confirmed":True,"risk":risk,"strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":f"CONCORDÂNCIA FLEX: Volume POC {volume_dir} ({volume_conf:.0f}%) + IA {ai_dir} ({ai_conf:.0f}%). Entrada liberada com voto na mesma direção.","candidate_direction":volume_dir,"early_signal_window":True,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"event_key":volume_vote.get("event_key") or f"AI_VOLUME_POC:{volume_dir}:{raw_rows[-1].get('datetime') if raw_rows else ''}","volume_vote":volume_vote,"ai_vote":ai_vote,"consensus":consensus,"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"direct_win_only":True,"gale_signal":False}
 
 
 def _adaptive_client_id(request: Request | None) -> str:
@@ -13242,15 +13223,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     release_state["active_signal"] = None
                     cache[key] = (time.time(), base)
                     return base
-                if moment_gate.get("required") and not moment_gate.get("confirmed"):
-                    base["status"] = "EA VELA ATUAL • AGUARDANDO CONFIRMAÇÃO DE MOMENTO"
-                    base["reason"] = (
-                        str(moment_gate.get("reason") or "Ticks reais ainda não confirmaram a direção da entrada.")[:280]
-                    )
-                    base["risk"] = "HIGH"
-                    release_state["active_signal"] = None
-                    cache[key] = (time.time(), base)
-                    return base
+                # MODO FLEX 3.94: tape real fraco/neutro não trava mais a IA.
+                # Apenas hard_veto (força realmente contrária) bloqueia a entrada.
 
             if engine == "RAPID":
                 # Russian Bear real-time fica somente no novo motor; o AlphaX não é tocado.
@@ -13571,7 +13545,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     base["announce_seconds_before"] = VOLUME_POC_EARLY_SIGNAL_SECONDS
                     base["early_signal_locked"] = True
                     base["non_repaint_after_release"] = True
-                    base["signal_snapshot"] = "FORMING_CANDLE_AT_20S"
+                    base["signal_snapshot"] = "FORMING_CANDLE_FLEX_55S_TO_5S"
                     base["volume_poc_fast"] = {"min_score": VOLUME_POC_MIN_SCORE, "score_edge": VOLUME_POC_SCORE_EDGE, "cooldown_bars": VOLUME_POC_COOLDOWN_BARS, "ai_context": engine == "VOLUME_AI"}
                 if engine == "SUNTZU":
                     base["announce_seconds_before"] = SUNTZU_EARLY_SIGNAL_SECONDS
@@ -13602,7 +13576,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -13745,7 +13719,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif "429" in low_reason or "rate limit" in low_reason or "quota" in low_reason:
                 base["status"] = "IA INDISPONÍVEL • LIMITE DA API"
             elif "503" in low_reason or "service unavailable" in low_reason or "temporariamente indisponível" in low_reason:
-                base["status"] = "IA EXTERNA • SERVIÇO TEMPORARIAMENTE INDISPONÍVEL"
+                base["status"] = "IA LEITURA • SERVIÇO TEMPORARIAMENTE INDISPONÍVEL"
             else:
                 base["status"] = "IA INDISPONÍVEL • ERRO DA API"
             base["reason"] = ai_reason[:300]
@@ -17287,447 +17261,7 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
     }
 
 
-def _external_tab_compact_candles(rows, limit: int = 55):
-    """Serializa somente dados crus do provedor externo; não calcula indicadores."""
-    out = []
-    for item in list(rows or [])[-max(10, int(limit)):]:
-        if not isinstance(item, dict):
-            continue
-        try:
-            out.append({
-                "time": str(item.get("datetime") or item.get("time") or item.get("timestamp") or ""),
-                "open": float(item.get("open")),
-                "high": float(item.get("high")),
-                "low": float(item.get("low")),
-                "close": float(item.get("close")),
-                "volume": float(item.get("volume") or 0.0),
-            })
-        except Exception:
-            continue
-    return out
-
-
-async def _external_scan_feed(symbol: str, interval: str, request: Request, semaphore: asyncio.Semaphore):
-    """Busca candles crus de um ativo externo para a varredura, sem calcular indicadores."""
-    async with semaphore:
-        try:
-            raw = await candles(symbol, interval, EXTERNAL_SCAN_CANDLES, "OPEN", None, request=request)
-        except Exception as exc:
-            return {"symbol": symbol, "ok": False, "error": str(exc)[:160]}
-
-    compact = _external_tab_compact_candles(raw, EXTERNAL_SCAN_CANDLES)
-    source = _feed_source_from_rows(raw)
-    source_label = _feed_source_label(source)
-    if len(compact) < 20:
-        return {
-            "symbol": symbol, "ok": False, "feed_source": source,
-            "feed_label": source_label,
-            "error": f"Somente {len(compact)} candles válidos.",
-        }
-    return {
-        "symbol": symbol, "ok": True, "feed_source": source,
-        "feed_label": source_label, "candles": compact,
-    }
-
-
-@app.get("/external-ai-scan")
-async def external_ai_scan(request: Request, interval: str = "1min"):
-    """Varre vários ativos externos e devolve a oportunidade mais forte para a próxima vela."""
-    if interval not in INTERVALS:
-        raise HTTPException(400, "Intervalo inválido.")
-
-    step_seconds = int(INTERVALS[interval])
-    br_now = now()
-    current_epoch = int(br_now.timestamp())
-    entry_epoch = ((current_epoch // step_seconds) + 1) * step_seconds
-    entry_dt = datetime.fromtimestamp(entry_epoch, tz=BR_TZ)
-    expiry_dt = entry_dt + timedelta(seconds=step_seconds)
-    target_key = f"SCAN|{interval}|{entry_epoch}"
-
-    cached = external_scan_cache.get(target_key) or {}
-    cached_result = cached.get("result") if isinstance(cached, dict) else None
-    cache_age = time.time() - float(cached.get("ts") or 0.0) if cached else 10**9
-    if isinstance(cached_result, dict):
-        if cached_result.get("confirmed") or cache_age < EXTERNAL_TAB_RECHECK_SECONDS:
-            out = dict(cached_result)
-            out["cached"] = True
-            out["cache_age_seconds"] = round(max(0.0, cache_age), 1)
-            return out
-
-    lock = external_scan_locks.setdefault(target_key, asyncio.Lock())
-    async with lock:
-        cached = external_scan_cache.get(target_key) or {}
-        cached_result = cached.get("result") if isinstance(cached, dict) else None
-        cache_age = time.time() - float(cached.get("ts") or 0.0) if cached else 10**9
-        if isinstance(cached_result, dict):
-            if cached_result.get("confirmed") or cache_age < EXTERNAL_TAB_RECHECK_SECONDS:
-                out = dict(cached_result)
-                out["cached"] = True
-                out["cache_age_seconds"] = round(max(0.0, cache_age), 1)
-                return out
-
-        if not (OAI_KEY or GEMINI_KEY):
-            return {
-                "ok": False, "available": False, "mode": "EXTERNAL_AI_SCANNER",
-                "market": "OPEN", "symbol": "VARREDURA", "interval": interval,
-                "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
-                "risk": "HIGH", "provider": "", "feed_source": "",
-                "feed_label": "--", "entry_time": iso(entry_dt), "expiry_time": iso(expiry_dt),
-                "status": "IA EXTERNA SEM CHAVE",
-                "reason": "Configure OPENAI_API_KEY ou GEMINI_API_KEY no Render.",
-                "scanned_symbols": 0, "scan_total": len(EXTERNAL_SCAN_SYMBOLS),
-                "local_indicator_analysis": False, "analysis_location": "EXTERNAL_PROVIDER",
-            }
-
-        semaphore = asyncio.Semaphore(EXTERNAL_SCAN_CONCURRENCY)
-        tasks = [_external_scan_feed(sym, interval, request, semaphore) for sym in EXTERNAL_SCAN_SYMBOLS]
-        rows = await asyncio.gather(*tasks, return_exceptions=True)
-        feeds = []
-        failures = []
-        for item in rows:
-            if isinstance(item, Exception):
-                failures.append(str(item)[:120])
-                continue
-            if isinstance(item, dict) and item.get("ok"):
-                feeds.append(item)
-            elif isinstance(item, dict):
-                failures.append(f"{item.get('symbol')}: {item.get('error')}")
-
-        if not feeds:
-            result = {
-                "ok": False, "available": False, "mode": "EXTERNAL_AI_SCANNER",
-                "market": "OPEN", "symbol": "VARREDURA", "interval": interval,
-                "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
-                "risk": "HIGH", "provider": "", "feed_source": "UNAVAILABLE",
-                "feed_label": "FONTES EXTERNAS INDISPONÍVEIS",
-                "entry_time": iso(entry_dt), "expiry_time": iso(expiry_dt),
-                "status": "VARREDURA EXTERNA EM ESPERA",
-                "reason": ("Nenhum ativo retornou candles externos suficientes. " + " | ".join(failures[:3]))[:320],
-                "scanned_symbols": 0, "scan_total": len(EXTERNAL_SCAN_SYMBOLS),
-                "local_indicator_analysis": False, "analysis_location": "EXTERNAL_PROVIDER",
-                "analyzed_at": iso(now()),
-            }
-            external_scan_cache[target_key] = {"ts": time.time(), "result": result}
-            return result
-
-        payload = [{
-            "symbol": f["symbol"],
-            "feed": f.get("feed_label") or f.get("feed_source") or "EXTERNAL",
-            "candles": f["candles"],
-        } for f in feeds]
-        available_symbols = [f["symbol"] for f in feeds]
-        prompt = f"""Você é o SCANNER DE OPORTUNIDADES da IA EXTERNA do MEGA IA.
-Você recebeu candles OHLCV crus de VÁRIOS ativos de mercado aberto.
-NÃO use indicadores calculados pelo aplicativo, NÃO suponha notícias e NÃO invente dados ausentes.
-
-OBJETIVO:
-- Compare TODOS os ativos recebidos.
-- Escolha APENAS a oportunidade direcional mais forte para a PRÓXIMA VELA.
-- Timeframe: {interval}
-- Próxima entrada: {iso(entry_dt)}
-- Expiração: 1 vela ({step_seconds}s)
-- Se nenhum ativo tiver direção realmente clara, retorne WAIT.
-- Não force sinal apenas para preencher a tela.
-- confidence é confiança da sua leitura (0-100), não garantia nem probabilidade estatística de WIN.
-
-Responda APENAS JSON válido:
-{{"symbol":"EUR/JPY|NONE","direction":"CALL|PUT|WAIT","confidence":0,"risk":"LOW|MEDIUM|HIGH","reason":"explicação curta baseada no preço bruto e comparação entre os ativos"}}
-
-ATIVOS E CANDLES EXTERNOS (mais antigo -> mais recente):
-{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"""
-
-        try:
-            decision, provider = await _external_ai_json(prompt)
-        except Exception as exc:
-            result = {
-                "ok": False, "available": False, "mode": "EXTERNAL_AI_SCANNER",
-                "market": "OPEN", "symbol": "VARREDURA", "interval": interval,
-                "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
-                "risk": "HIGH", "provider": "", "feed_source": "MULTI_EXTERNAL",
-                "feed_label": "VARREDURA DE FONTES EXTERNAS",
-                "entry_time": iso(entry_dt), "expiry_time": iso(expiry_dt),
-                "status": "IA EXTERNA EM ESPERA", "reason": str(exc)[:300],
-                "scanned_symbols": len(feeds), "scan_total": len(EXTERNAL_SCAN_SYMBOLS),
-                "local_indicator_analysis": False, "analysis_location": "EXTERNAL_PROVIDER",
-                "analyzed_at": iso(now()),
-            }
-            external_scan_cache[target_key] = {"ts": time.time(), "result": result}
-            return result
-
-        raw_symbol = str(decision.get("symbol") or "NONE").strip().upper()
-        symbol = raw_symbol if raw_symbol in available_symbols else "VARREDURA"
-        raw_direction = str(decision.get("direction") or "WAIT").strip().upper()
-        if raw_direction in ("BUY", "UP", "COMPRAR"):
-            raw_direction = "CALL"
-        elif raw_direction in ("SELL", "DOWN", "VENDER"):
-            raw_direction = "PUT"
-        if raw_direction not in ("CALL", "PUT", "WAIT"):
-            raw_direction = "WAIT"
-        if symbol == "VARREDURA" and raw_direction in ("CALL", "PUT"):
-            raw_direction = "WAIT"
-
-        try:
-            confidence = max(0.0, min(100.0, float(decision.get("confidence") or 0.0)))
-        except Exception:
-            confidence = 0.0
-        risk = str(decision.get("risk") or "HIGH").strip().upper()
-        if risk not in ("LOW", "MEDIUM", "HIGH"):
-            risk = "HIGH"
-
-        lead_seconds = max(0.0, (entry_dt - now()).total_seconds())
-        confirmed = bool(
-            symbol in available_symbols
-            and raw_direction in ("CALL", "PUT")
-            and confidence >= EXTERNAL_TAB_MIN_CONFIDENCE
-            and risk != "HIGH"
-            and lead_seconds >= EXTERNAL_TAB_MIN_LEAD_SECONDS
-        )
-        direction = raw_direction if confirmed else "NEUTRO"
-        reason = str(decision.get("reason") or "Varredura sem oportunidade forte neste ciclo.").strip()[:360]
-        if raw_direction in ("CALL", "PUT") and not confirmed:
-            if lead_seconds < EXTERNAL_TAB_MIN_LEAD_SECONDS:
-                reason = (f"{symbol} {raw_direction} apareceu tarde ({lead_seconds:.0f}s antes da abertura). "
-                          "Descartado; a varredura continua para a próxima vela.")
-            elif confidence < EXTERNAL_TAB_MIN_CONFIDENCE:
-                reason = (f"Melhor candidato: {symbol} {raw_direction} com {confidence:.0f}%, abaixo do mínimo "
-                          f"{EXTERNAL_TAB_MIN_CONFIDENCE:.0f}%. Continuando a varredura.")
-            elif risk == "HIGH":
-                reason = f"Melhor candidato: {symbol} {raw_direction}, porém a própria IA marcou risco HIGH. Continuando a varredura."
-
-        selected_feed = next((f for f in feeds if f["symbol"] == symbol), None)
-        feed_source = (selected_feed or {}).get("feed_source") or "MULTI_EXTERNAL"
-        feed_label = (selected_feed or {}).get("feed_label") or "VARREDURA DE FONTES EXTERNAS"
-        result = {
-            "ok": True, "available": True, "mode": "EXTERNAL_AI_SCANNER",
-            "market": "OPEN", "symbol": symbol, "interval": interval,
-            "direction": direction, "external_decision": raw_direction,
-            "confidence": round(confidence, 1), "minimum_confidence": EXTERNAL_TAB_MIN_CONFIDENCE,
-            "confirmed": confirmed, "risk": risk, "provider": provider,
-            "feed_source": feed_source, "feed_label": feed_label,
-            "entry_time": iso(entry_dt), "expiry_time": iso(expiry_dt),
-            "status": ("VARREDURA EXTERNA • SINAL ENCONTRADO" if confirmed else "VARREDURA EXTERNA • PROCURANDO OPORTUNIDADE"),
-            "reason": reason,
-            "next_candle": True, "locked": confirmed,
-            "lead_seconds": round(lead_seconds, 1),
-            "scanned_symbols": len(feeds), "scan_total": len(EXTERNAL_SCAN_SYMBOLS),
-            "scan_symbols": available_symbols,
-            "local_indicator_analysis": False,
-            "analysis_location": "EXTERNAL_AI_PROVIDER",
-            "candles_per_symbol": EXTERNAL_SCAN_CANDLES,
-            "analyzed_at": iso(now()),
-            "notice": "A IA compara os ativos externos; confiança não é garantia nem probabilidade estatística de WIN.",
-            "cached": False,
-            "source": "IA EXTERNA",
-            "strategy": "IA EXTERNA • VARREDURA",
-            "engine": "EXTERNAL_AI",
-            "direct_only": True,
-            "external_ai": True,
-        }
-        # Todo CALL/PUT confirmado entra na contabilidade do servidor. Como a IA
-        # Externa não usa Gale, WIN/LOSS da própria vela já é o resultado final.
-        if confirmed:
-            _remember_accounting_signal(request, result)
-        external_scan_cache[target_key] = {"ts": time.time(), "result": result}
-
-        if len(external_scan_cache) > 120:
-            oldest = sorted(external_scan_cache.items(), key=lambda kv: float((kv[1] or {}).get("ts") or 0.0))[:50]
-            for old_key, _ in oldest:
-                external_scan_cache.pop(old_key, None)
-                external_scan_locks.pop(old_key, None)
-        return result
-
-
-@app.get("/external-ai-signal")
-async def external_ai_signal(request: Request, symbol: str = "EUR/JPY", interval: str = "1min"):
-    """IA externa pura: fonte externa -> OpenAI/Gemini -> painel."""
-    if symbol not in SYMBOLS or interval not in INTERVALS:
-        raise HTTPException(400, "Ativo ou intervalo inválido.")
-
-    step_seconds = int(INTERVALS[interval])
-    br_now = now()
-    current_epoch = int(br_now.timestamp())
-    entry_epoch = ((current_epoch // step_seconds) + 1) * step_seconds
-    entry_dt = datetime.fromtimestamp(entry_epoch, tz=BR_TZ)
-    expiry_dt = entry_dt + timedelta(seconds=step_seconds)
-    target_key = f"{symbol}|{interval}|{entry_epoch}"
-
-    try:
-        raw = await candles(symbol, interval, EXTERNAL_TAB_CANDLES, "OPEN", None, request=request)
-    except Exception as exc:
-        return {
-            "ok": False, "available": False, "mode": "EXTERNAL_AI_ONLY",
-            "market": "OPEN", "symbol": symbol, "interval": interval,
-            "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
-            "risk": "HIGH", "provider": "", "feed_source": "UNAVAILABLE",
-            "feed_label": "FONTE EXTERNA INDISPONÍVEL",
-            "entry_time": iso(entry_dt), "expiry_time": iso(expiry_dt),
-            "status": "FONTE EXTERNA EM ESPERA",
-            "reason": str(exc)[:260],
-            "local_indicator_analysis": False,
-            "analysis_location": "EXTERNAL_PROVIDER",
-        }
-
-    compact = _external_tab_compact_candles(raw, EXTERNAL_TAB_CANDLES)
-    source = _feed_source_from_rows(raw)
-    source_label = _feed_source_label(source)
-    if len(compact) < 20:
-        return {
-            "ok": False, "available": False, "mode": "EXTERNAL_AI_ONLY",
-            "market": "OPEN", "symbol": symbol, "interval": interval,
-            "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
-            "risk": "HIGH", "provider": "", "feed_source": source,
-            "feed_label": source_label,
-            "entry_time": iso(entry_dt), "expiry_time": iso(expiry_dt),
-            "status": "COLETANDO DADOS EXTERNOS",
-            "reason": f"Fonte externa retornou apenas {len(compact)} candles válidos.",
-            "local_indicator_analysis": False,
-            "analysis_location": "EXTERNAL_PROVIDER",
-        }
-
-    cached = external_tab_cache.get(target_key) or {}
-    cached_result = cached.get("result") if isinstance(cached, dict) else None
-    cache_age = time.time() - float(cached.get("ts") or 0.0) if cached else 10**9
-    if isinstance(cached_result, dict):
-        if cached_result.get("confirmed") or cache_age < EXTERNAL_TAB_RECHECK_SECONDS:
-            out = dict(cached_result)
-            out["cached"] = True
-            out["cache_age_seconds"] = round(max(0.0, cache_age), 1)
-            return out
-
-    lock = external_tab_locks.setdefault(target_key, asyncio.Lock())
-    async with lock:
-        cached = external_tab_cache.get(target_key) or {}
-        cached_result = cached.get("result") if isinstance(cached, dict) else None
-        cache_age = time.time() - float(cached.get("ts") or 0.0) if cached else 10**9
-        if isinstance(cached_result, dict):
-            if cached_result.get("confirmed") or cache_age < EXTERNAL_TAB_RECHECK_SECONDS:
-                out = dict(cached_result)
-                out["cached"] = True
-                out["cache_age_seconds"] = round(max(0.0, cache_age), 1)
-                return out
-
-        if not (OAI_KEY or GEMINI_KEY):
-            return {
-                "ok": False, "available": False, "mode": "EXTERNAL_AI_ONLY",
-                "market": "OPEN", "symbol": symbol, "interval": interval,
-                "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
-                "risk": "HIGH", "provider": "", "feed_source": source,
-                "feed_label": source_label,
-                "entry_time": iso(entry_dt), "expiry_time": iso(expiry_dt),
-                "status": "IA EXTERNA SEM CHAVE",
-                "reason": "Configure OPENAI_API_KEY ou GEMINI_API_KEY no Render.",
-                "local_indicator_analysis": False,
-                "analysis_location": "EXTERNAL_PROVIDER",
-            }
-
-        prompt = f'''Você é o motor IA EXTERNA do MEGA IA.
-Analise SOMENTE os dados OHLCV crus recebidos de uma fonte de mercado externa.
-NÃO use indicadores calculados pelo aplicativo, NÃO suponha notícias, NÃO invente dados ausentes.
-
-OBJETIVO:
-- Ativo: {symbol}
-- Timeframe: {interval}
-- Mercado: ABERTO
-- Fonte: {source_label}
-- Decisão para a vela que abre em: {iso(entry_dt)}
-- Expiração: 1 vela ({step_seconds}s)
-
-Retorne CALL ou PUT somente quando a leitura direcional para a PRÓXIMA VELA estiver forte.
-Se houver lateralização, conflito, pouca clareza ou confiança insuficiente, retorne WAIT.
-A confiança é sua confiança de análise (0-100), NÃO uma garantia nem uma probabilidade estatística de WIN.
-
-Responda APENAS JSON válido no formato:
-{{"direction":"CALL|PUT|WAIT","confidence":0,"risk":"LOW|MEDIUM|HIGH","reason":"explicação curta baseada no preço bruto"}}
-
-CANDLES EXTERNOS (mais antigo -> mais recente):
-{json.dumps(compact, ensure_ascii=False, separators=(',', ':'))}'''
-
-        try:
-            decision, provider = await _external_ai_json(prompt)
-        except Exception as exc:
-            result = {
-                "ok": False, "available": False, "mode": "EXTERNAL_AI_ONLY",
-                "market": "OPEN", "symbol": symbol, "interval": interval,
-                "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
-                "risk": "HIGH", "provider": "", "feed_source": source,
-                "feed_label": source_label,
-                "entry_time": iso(entry_dt), "expiry_time": iso(expiry_dt),
-                "status": "IA EXTERNA EM ESPERA",
-                "reason": str(exc)[:300],
-                "local_indicator_analysis": False,
-                "analysis_location": "EXTERNAL_PROVIDER",
-                "candles_sent": len(compact),
-                "analyzed_at": iso(now()),
-            }
-            external_tab_cache[target_key] = {"ts": time.time(), "result": result}
-            return result
-
-        raw_direction = str(decision.get("direction") or "WAIT").strip().upper()
-        if raw_direction in ("BUY", "UP", "COMPRAR"):
-            raw_direction = "CALL"
-        elif raw_direction in ("SELL", "DOWN", "VENDER"):
-            raw_direction = "PUT"
-        if raw_direction not in ("CALL", "PUT", "WAIT"):
-            raw_direction = "WAIT"
-
-        try:
-            confidence = max(0.0, min(100.0, float(decision.get("confidence") or 0.0)))
-        except Exception:
-            confidence = 0.0
-        risk = str(decision.get("risk") or "HIGH").strip().upper()
-        if risk not in ("LOW", "MEDIUM", "HIGH"):
-            risk = "HIGH"
-
-        lead_seconds = max(0.0, (entry_dt - now()).total_seconds())
-        confirmed = bool(
-            raw_direction in ("CALL", "PUT")
-            and confidence >= EXTERNAL_TAB_MIN_CONFIDENCE
-            and risk != "HIGH"
-            and lead_seconds >= EXTERNAL_TAB_MIN_LEAD_SECONDS
-        )
-        direction = raw_direction if confirmed else "NEUTRO"
-        reason = str(decision.get("reason") or "IA externa aguardando leitura mais clara.").strip()[:320]
-        if raw_direction in ("CALL", "PUT") and not confirmed:
-            if lead_seconds < EXTERNAL_TAB_MIN_LEAD_SECONDS:
-                reason = (f"{raw_direction} chegou muito perto da abertura ({lead_seconds:.0f}s). "
-                          "Entrada descartada; a IA recalcula para a próxima vela.")
-            elif confidence < EXTERNAL_TAB_MIN_CONFIDENCE:
-                reason = (
-                    f"{raw_direction} sugerido pela IA externa com confiança {confidence:.0f}%, "
-                    f"abaixo do mínimo {EXTERNAL_TAB_MIN_CONFIDENCE:.0f}%. Aguardando."
-                )
-            elif risk == "HIGH":
-                reason = f"{raw_direction} sugerido, porém a própria IA marcou risco HIGH. Aguardando."
-
-        result = {
-            "ok": True, "available": True, "mode": "EXTERNAL_AI_ONLY",
-            "market": "OPEN", "symbol": symbol, "interval": interval,
-            "direction": direction, "external_decision": raw_direction,
-            "confidence": round(confidence, 1), "minimum_confidence": EXTERNAL_TAB_MIN_CONFIDENCE,
-            "confirmed": confirmed, "risk": risk, "provider": provider,
-            "feed_source": source, "feed_label": source_label,
-            "entry_time": iso(entry_dt), "expiry_time": iso(expiry_dt),
-            "status": ("SINAL EXTERNO LIBERADO" if confirmed else "IA EXTERNA MONITORANDO"),
-            "reason": reason,
-            "next_candle": True, "locked": confirmed,
-            "lead_seconds": round(lead_seconds, 1),
-            "local_indicator_analysis": False,
-            "analysis_location": "EXTERNAL_AI_PROVIDER",
-            "candles_sent": len(compact),
-            "analyzed_at": iso(now()),
-            "notice": "Confiança da IA não é garantia nem probabilidade estatística de WIN.",
-            "cached": False,
-        }
-        external_tab_cache[target_key] = {"ts": time.time(), "result": result}
-
-        if len(external_tab_cache) > 200:
-            oldest = sorted(external_tab_cache.items(), key=lambda kv: float((kv[1] or {}).get("ts") or 0.0))[:80]
-            for old_key, _ in oldest:
-                external_tab_cache.pop(old_key, None)
-                external_tab_locks.pop(old_key, None)
-
-        return result
-
+# Scanner dedicado removido; os sinais continuam pelos motores selecionáveis.
 
 @app.get("/signal-ai")
 async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH"):
@@ -19759,7 +19293,7 @@ async def performance(request: Request, interval="1min", market="OPEN"):
         if r_done == "WIN":
             final_ops[_result_operation_key(x, market)] = "WIN"
         elif r_done == "LOSS" and bool(x.get("direct_only")):
-            # Motores sem Gale (ex.: IA EXTERNA) encerram a operação na primeira vela.
+            # Motores configurados como direct_only encerram a operação na primeira vela.
             final_ops[_result_operation_key(x, market)] = "LOSS"
 
     for x in direct_store.values():
@@ -20375,31 +19909,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 @media(max-width:900px){.daily-engine-grid{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:480px){.daily-engine-grid{grid-template-columns:1fr 1fr;gap:7px}.daily-engine-item{padding:10px;min-height:116px}.daily-engine-pct{font-size:25px}}
 
-.external-ai-hero{border-color:#8d5cff;box-shadow:0 0 28px #8d5cff2a;background:linear-gradient(180deg,#11152b,#091220)}
-.external-ai-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.external-ai-title{font-size:24px;font-weight:1000;letter-spacing:.5px}
-.external-ai-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px}
-.external-ai-stat{padding:13px;border:1px solid #334d75;border-radius:15px;background:#091727;min-height:86px;box-sizing:border-box}
-.external-ai-value{font-size:20px;font-weight:1000;margin-top:8px;word-break:break-word}
-.external-ai-direction.call{color:#45ff9b;text-shadow:0 0 12px #45ff9b55}
-.external-ai-direction.put{color:#ff5c7a;text-shadow:0 0 12px #ff5c7a55}
-.external-ai-direction.neutral{color:#ffd166}
-.external-ai-reason{margin-top:12px;line-height:1.5;font-size:14px;color:#d7e6fa}
-.external-main-mirror{margin-top:10px;border-color:#7358d6;box-shadow:0 0 20px #7358d622;background:linear-gradient(180deg,#10172a,#091522)}
-.external-main-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
-.external-main-title{font-size:17px;font-weight:1000;letter-spacing:.3px}
-.external-main-badge{padding:6px 10px;border:1px solid #6750c7;border-radius:999px;background:#211b48;font-size:11px;font-weight:1000}
-.external-main-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px}
-.external-main-cell{border:1px solid #294369;border-radius:12px;background:#081726;padding:10px;min-height:64px;box-sizing:border-box}
-.external-main-cell .label{font-size:10px}
-.external-main-value{font-size:17px;font-weight:1000;margin-top:5px;word-break:break-word}
-.external-main-status{margin-top:9px;font-size:12px;color:#bed2eb;line-height:1.35}
-@media(max-width:850px){.external-main-grid{grid-template-columns:repeat(2,1fr)}}
-#externalAiPowerBtn{min-width:155px;font-weight:1000;border-color:#8d5cff}
-#externalAiPowerBtn.external-on{background:linear-gradient(180deg,#6546cc,#4930a5);border-color:#a88cff;box-shadow:0 0 18px #8d5cff55}
-@media(max-width:850px){.external-ai-grid{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:480px){.external-ai-grid{grid-template-columns:1fr 1fr;gap:7px}.external-ai-title{font-size:20px}}
-
 .app-power-card{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:14px 0 6px;padding:14px 16px;border:1px solid #227db5;border-radius:18px;background:linear-gradient(180deg,#0b1c30,#081523);box-shadow:0 0 22px #00aaff22}
 .app-power-copy{min-width:0}
 .app-power-title{font-size:14px;font-weight:900;letter-spacing:.5px}
@@ -20468,7 +19977,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • IA EXTERNA + IA LEITURA + IA/VOLUME + AlphaX • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • IA LEITURA + IA/VOLUME FLEX + AlphaX • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -20538,7 +20047,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="IA + Volume POC">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧠 IA + VOLUME POC</div>
-      <div class="robot-mode-desc" id="volumePocAiModeDesc">Volume POC detecta primeiro • IA Leitura do Gráfico confirma em segundos • CALL/PUT somente quando os dois concordam • próxima vela.</div>
+      <div class="robot-mode-desc" id="volumePocAiModeDesc">MODO FLEX MÁXIMO • Volume POC detecta cedo • IA vota na mesma direção • janela ampliada • próxima vela.</div>
     </div>
     <button id="volumePocAiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -20620,7 +20129,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
   <div class="tabs">
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
-    <button class="tabbtn" id="tabExternal">🌐 IA Externa</button>
     <button class="tabbtn" id="tabChart">📈 Gráfico</button>
     <button class="tabbtn" id="tabResults">🎯 Resultados</button>
     <button class="tabbtn" id="tabValues">💰 Valores</button>
@@ -20666,27 +20174,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
     </div>
 
-    <div class="card external-main-mirror" id="externalMainMirror">
-      <div class="external-main-head">
-        <div>
-          <div class="external-main-title">🌐 IA EXTERNA • ESPELHO NO PAINEL</div>
-          <div class="label" style="margin-top:3px">O mesmo sinal da aba IA Externa aparece aqui automaticamente.</div>
-        </div>
-        <div id="externalMainBadge" class="external-main-badge">MONITOR OFF</div>
-      </div>
-      <div class="external-main-grid">
-        <div class="external-main-cell"><div class="label">ATIVO</div><div id="externalMainAsset" class="external-main-value">--</div></div>
-        <div class="external-main-cell"><div class="label">DIREÇÃO</div><div id="externalMainDirection" class="external-main-value external-ai-direction neutral">AGUARDANDO</div></div>
-        <div class="external-main-cell"><div class="label">HORÁRIO DE ENTRADA</div><div id="externalMainEntry" class="external-main-value">--:--:--</div></div>
-        <div class="external-main-cell"><div class="label">CONTAGEM</div><div id="externalMainCountdown" class="external-main-value">--</div></div>
-        <div class="external-main-cell"><div class="label">CONFIANÇA</div><div id="externalMainConfidence" class="external-main-value">--</div></div>
-        <div class="external-main-cell"><div class="label">RISCO</div><div id="externalMainRisk" class="external-main-value">--</div></div>
-        <div class="external-main-cell"><div class="label">FONTE</div><div id="externalMainFeed" class="external-main-value" style="font-size:13px">--</div></div>
-        <div class="external-main-cell"><div class="label">IA</div><div id="externalMainProvider" class="external-main-value" style="font-size:13px">--</div></div>
-      </div>
-      <div id="externalMainStatus" class="external-main-status">IA EXTERNA DESLIGADA • ative o monitor na aba IA Externa.</div>
-    </div>
-
     <div class="card" id="dataFeedCard" style="margin-top:10px">
       <div class="label">🌐 FONTE DE DADOS • AUTOMÁTICA</div>
       <div id="dataFeedText" style="font-weight:900;margin-top:5px">Aguardando leitura do mercado...</div>
@@ -20728,44 +20215,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="label" style="margin-top:10px;line-height:1.45">
         O percentual abaixo é um <b>índice de compatibilidade com o momento atual</b>, calculado antes das entradas.
         Não é taxa de acerto, não usa WIN/LOSS anterior e o estudo não abre nenhuma operação.
-      </div>
-    </div>
-  </div>
-
-
-  <div id="externalTab" class="tab">
-    <div class="card external-ai-hero">
-      <div class="external-ai-head">
-        <div>
-          <div class="external-ai-title">🌐 IA EXTERNA</div>
-          <div class="label" style="margin-top:6px;line-height:1.45">
-            A IA varre os ativos do mercado aberto com dados de fontes externas e traz automaticamente a melhor oportunidade.
-            Esta aba não usa os indicadores nem os motores do painel para decidir.
-          </div>
-        </div>
-        <button id="externalAiPowerBtn" type="button">🔴 MONITOR OFF</button>
-      </div>
-
-      <div class="external-ai-grid">
-        <div class="external-ai-stat"><div class="label">ATIVO • PRÓXIMA VELA</div><div id="externalAsset" class="external-ai-value">--</div></div>
-        <div class="external-ai-stat"><div class="label">SINAL</div><div id="externalDirection" class="external-ai-value external-ai-direction neutral">AGUARDANDO</div></div>
-        <div class="external-ai-stat"><div class="label">CONFIANÇA DA IA</div><div id="externalConfidence" class="external-ai-value">--</div></div>
-        <div class="external-ai-stat"><div class="label">RISCO</div><div id="externalRisk" class="external-ai-value">--</div></div>
-        <div class="external-ai-stat"><div class="label">FONTE DOS DADOS</div><div id="externalFeed" class="external-ai-value" style="font-size:15px">--</div></div>
-        <div class="external-ai-stat"><div class="label">IA QUE ANALISOU</div><div id="externalProvider" class="external-ai-value" style="font-size:15px">--</div></div>
-        <div class="external-ai-stat"><div class="label">ENTRADA</div><div id="externalEntry" class="external-ai-value">--:--:--</div></div>
-        <div class="external-ai-stat"><div class="label">CONTAGEM</div><div id="externalCountdown" class="external-ai-value">--</div></div>
-      </div>
-
-      <div class="card" style="margin-top:12px;border-color:#4d3d86">
-        <div class="label">STATUS DA IA EXTERNA</div>
-        <div id="externalStatus" style="font-weight:1000;margin-top:7px">MONITOR DESLIGADO</div>
-        <div id="externalReason" class="external-ai-reason">Ative o monitor para varrer os ativos externos e procurar a melhor oportunidade para a próxima vela.</div>
-      </div>
-
-      <div class="label" style="margin-top:12px;line-height:1.5">
-        Funciona no <b>Mercado Aberto</b>. A IA compara os ativos externos e CALL/PUT só aparece quando encontra uma oportunidade que atinge o mínimo do servidor e o risco não é HIGH.
-        A confiança exibida é uma avaliação do modelo, não garantia nem probabilidade estatística de WIN.
       </div>
     </div>
   </div>
@@ -21517,7 +20966,6 @@ const entryArrowIcon=document.getElementById('entryArrowIcon');
 const entryArrowLabel=document.getElementById('entryArrowLabel');
 const analysisText=document.getElementById('analysisText');
 const mainTab=document.getElementById('mainTab');
-const externalTab=document.getElementById('externalTab');
 const chartTab=document.getElementById('chartTab');
 const velocityTab=document.getElementById('velocityTab');
 const accountTab=document.getElementById('accountTab');
@@ -21567,30 +21015,7 @@ const valueLosses=document.getElementById('valueLosses');
 const resetValuesBtn=document.getElementById('resetValuesBtn');
 const valueStakeBtns=[...document.querySelectorAll('.valueStakeBtn')];
 const tabMain=document.getElementById('tabMain');
-const tabExternal=document.getElementById('tabExternal');
 const tabChart=document.getElementById('tabChart');
-const externalAiPowerBtn=document.getElementById('externalAiPowerBtn');
-const externalAsset=document.getElementById('externalAsset');
-const externalDirection=document.getElementById('externalDirection');
-const externalConfidence=document.getElementById('externalConfidence');
-const externalRisk=document.getElementById('externalRisk');
-const externalFeed=document.getElementById('externalFeed');
-const externalProvider=document.getElementById('externalProvider');
-const externalEntry=document.getElementById('externalEntry');
-const externalCountdown=document.getElementById('externalCountdown');
-const externalStatus=document.getElementById('externalStatus');
-const externalReason=document.getElementById('externalReason');
-const externalMainMirror=document.getElementById('externalMainMirror');
-const externalMainBadge=document.getElementById('externalMainBadge');
-const externalMainAsset=document.getElementById('externalMainAsset');
-const externalMainDirection=document.getElementById('externalMainDirection');
-const externalMainEntry=document.getElementById('externalMainEntry');
-const externalMainCountdown=document.getElementById('externalMainCountdown');
-const externalMainConfidence=document.getElementById('externalMainConfidence');
-const externalMainRisk=document.getElementById('externalMainRisk');
-const externalMainFeed=document.getElementById('externalMainFeed');
-const externalMainProvider=document.getElementById('externalMainProvider');
-const externalMainStatus=document.getElementById('externalMainStatus');
 const tabVelocity=document.getElementById('tabVelocity');
 const tabAccount=document.getElementById('tabAccount');
 const iqEmail=document.getElementById('iqEmail');
@@ -22379,14 +21804,14 @@ function mergeServerPerformance(p,m){
   const b=persistentResults[m]||emptyResultBucket();
   persistentResults[m]=b;
 
-  // Resultados automáticos do servidor (principalmente IA EXTERNA) precisam
+  // Resultados automáticos do servidor precisam
   // entrar também no histórico local, mesmo quando este celular já possui
   // resultados de outros motores. operation_key impede contagem duplicada.
   const recent=Array.isArray(p.recent_results)?p.recent_results:[];
   const latestServerDirect=recent.find(x=>x && x.direct_only && ['WIN','LOSS'].includes(String(x.result||'').toUpperCase()));
   if(latestServerDirect && result){
     const rr=String(latestServerDirect.result||'').toUpperCase();
-    result.textContent=rr+(latestServerDirect.external_ai?' • IA EXTERNA':'');
+    result.textContent=rr;
     result.className='big '+(rr==='WIN'?'call':'put');
   }
   let imported=false;
@@ -24223,185 +23648,8 @@ loadTelegramSettings();
 // Não depende mais apenas do localStorage deste celular.
 syncBackgroundBotState();
 
-let externalAiEnabled=false;
-let externalAiBusy=false;
-let externalAiLast=null;
-let externalAiLastKey='';
-try{ externalAiEnabled=localStorage.getItem('mega_external_ai_power')==='ONLINE'; }catch(_){ }
-
-function externalClock(value){
-  if(!value) return '--:--:--';
-  const d=new Date(value);
-  if(!Number.isFinite(d.getTime())) return '--:--:--';
-  try{return d.toLocaleTimeString('pt-BR',{timeZone:'America/Sao_Paulo',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});}catch(_){return d.toLocaleTimeString('pt-BR');}
-}
-
-function paintExternalAiPower(){
-  if(!externalAiPowerBtn) return;
-  externalAiPowerBtn.textContent=externalAiEnabled?'🟢 MONITOR ON':'🔴 MONITOR OFF';
-  externalAiPowerBtn.classList.toggle('external-on',externalAiEnabled);
-  if(externalMainBadge) externalMainBadge.textContent=externalAiEnabled?'🟢 MONITOR ON':'🔴 MONITOR OFF';
-  if(!externalAiEnabled){
-    if(externalStatus) externalStatus.textContent='MONITOR DESLIGADO';
-    if(externalReason) externalReason.textContent='Ative o monitor para buscar os dados externos e analisar a próxima vela.';
-    if(externalMainDirection){externalMainDirection.textContent='AGUARDANDO';externalMainDirection.className='external-main-value external-ai-direction neutral';}
-    if(externalMainEntry) externalMainEntry.textContent='--:--:--';
-    if(externalMainCountdown) externalMainCountdown.textContent='--';
-    if(externalMainConfidence) externalMainConfidence.textContent='--';
-    if(externalMainRisk) externalMainRisk.textContent='--';
-    if(externalMainFeed) externalMainFeed.textContent='--';
-    if(externalMainProvider) externalMainProvider.textContent='--';
-    if(externalMainStatus) externalMainStatus.textContent='IA EXTERNA DESLIGADA • ative o monitor na aba IA Externa.';
-  }else{
-    // Se o botão está ON, nunca deixe a aba dizendo "MONITOR DESLIGADO".
-    if(!externalAiLast){
-      if(externalStatus) externalStatus.textContent='🌐 VARRENDO ATIVOS EXTERNOS...';
-      if(externalReason) externalReason.textContent='Monitor ligado • buscando cotações externas e comparando as melhores oportunidades.';
-      if(externalMainStatus) externalMainStatus.textContent='IA EXTERNA VARRENDO • procurando oportunidade nos ativos externos...';
-    }
-  }
-}
-
-function paintExternalSignalAsPrimary(d){
-  if(!d || !d.confirmed) return false;
-  const dir=String(d.direction||'NEUTRO').toUpperCase();
-  if(dir!=='CALL' && dir!=='PUT') return false;
-  const entryMs=Date.parse(String(d.entry_time||''));
-  const expiryMs=Date.parse(String(d.expiry_time||''));
-  // Mantém o sinal visível desde a liberação até o fechamento da vela.
-  if(Number.isFinite(expiryMs) && Date.now()>expiryMs+4000) return false;
-  const sym=String(d.symbol||'--');
-  if(direction){direction.textContent=dir;direction.className='big '+(dir==='CALL'?'call':'put');}
-  if(signalAsset) paintSignalAsset(sym);
-  if(confidence) confidence.textContent='Confiança: '+Number(d.confidence||0).toFixed(0)+'% • IA EXTERNA';
-  if(entry) entry.textContent=externalClock(d.entry_time);
-  if(countdown){
-    const sec=Number.isFinite(entryMs)?Math.ceil((entryMs-Date.now())/1000):0;
-    countdown.textContent=sec>0?`IA EXTERNA • ENTRA EM ${sec}s`:'IA EXTERNA • ENTRADA LIBERADA';
-  }
-  if(statusBox) statusBox.textContent='🌐 IA EXTERNA • '+dir+' • '+sym+' • '+String(d.status||'SINAL CONFIRMADO');
-  if(risk) risk.textContent='Risco: '+String(d.risk||'--')+' • sem Gale';
-  return true;
-}
-
-function renderExternalAiOnMain(d){
-  if(!d) return;
-  const sym=String(d.symbol||(S&&S.value)||'--');
-  const tf=String(d.interval||(interval&&interval.value)||'--').replace('min','M');
-  const dir=String(d.direction||'NEUTRO').toUpperCase();
-  if(externalMainBadge) externalMainBadge.textContent=externalAiEnabled?'🟢 MONITOR ON':'🔴 MONITOR OFF';
-  if(externalMainAsset) externalMainAsset.textContent=`${sym} • ${tf}`;
-  if(externalMainDirection){
-    externalMainDirection.className='external-main-value external-ai-direction '+(dir==='CALL'?'call':dir==='PUT'?'put':'neutral');
-    externalMainDirection.textContent=dir==='CALL'?'⬆ CALL':dir==='PUT'?'⬇ PUT':'AGUARDANDO';
-  }
-  if(externalMainEntry) externalMainEntry.textContent=externalClock(d.entry_time);
-  if(externalMainConfidence) externalMainConfidence.textContent=Number.isFinite(Number(d.confidence))?Number(d.confidence).toFixed(1)+'%':'--';
-  if(externalMainRisk) externalMainRisk.textContent=String(d.risk||'--');
-  if(externalMainFeed) externalMainFeed.textContent=String(d.feed_label||d.feed_source||'--');
-  if(externalMainProvider) externalMainProvider.textContent=String(d.provider||'--').replace('_FALLBACK','');
-  if(externalMainStatus){
-    const state=String(d.status||'IA EXTERNA MONITORANDO');
-    const scan=Number.isFinite(Number(d.scanned_symbols))?` • ${Number(d.scanned_symbols)}/${Number(d.scan_total||d.scanned_symbols)} ativos varridos`:'';
-    const why=String(d.reason||'Aguardando leitura externa mais clara.').replace(/\s+/g,' ').slice(0,220);
-    externalMainStatus.textContent=state+scan+' • '+why;
-  }
-  paintExternalSignalAsPrimary(d);
-  updateExternalCountdown();
-}
-
-function renderExternalAi(data){
-  const d=data||{};
-  externalAiLast=d;
-  const sym=String(d.symbol||(S&&S.value)||'--');
-  const tf=String(d.interval||(interval&&interval.value)||'--').replace('min','M');
-  if(externalAsset) externalAsset.textContent=`${sym} • ${tf}`;
-  const dir=String(d.direction||'NEUTRO').toUpperCase();
-  if(externalDirection){
-    externalDirection.classList.remove('call','put','neutral');
-    if(dir==='CALL'){externalDirection.textContent='⬆ CALL';externalDirection.classList.add('call');}
-    else if(dir==='PUT'){externalDirection.textContent='⬇ PUT';externalDirection.classList.add('put');}
-    else{externalDirection.textContent='AGUARDANDO';externalDirection.classList.add('neutral');}
-  }
-  if(externalConfidence) externalConfidence.textContent=(Number.isFinite(Number(d.confidence))?Number(d.confidence).toFixed(1)+'%':'--');
-  if(externalRisk) externalRisk.textContent=String(d.risk||'--');
-  if(externalFeed) externalFeed.textContent=String(d.feed_label||d.feed_source||'--');
-  if(externalProvider) externalProvider.textContent=String(d.provider||'--').replace('_FALLBACK','');
-  if(externalEntry) externalEntry.textContent=externalClock(d.entry_time);
-  if(externalStatus){
-    const scan=Number.isFinite(Number(d.scanned_symbols))?` • ${Number(d.scanned_symbols)}/${Number(d.scan_total||d.scanned_symbols)} ATIVOS`:'';
-    externalStatus.textContent=String(d.status||'IA EXTERNA MONITORANDO')+scan;
-  }
-  if(externalReason) externalReason.textContent=String(d.reason||'Aguardando leitura externa mais clara.');
-  renderExternalAiOnMain(d);
-  updateExternalCountdown();
-}
-
-function updateExternalCountdown(){
-  if(!externalCountdown) return;
-  const t=externalAiLast&&externalAiLast.entry_time?new Date(externalAiLast.entry_time).getTime():NaN;
-  if(!Number.isFinite(t)){
-    externalCountdown.textContent='--';
-    if(externalMainCountdown) externalMainCountdown.textContent='--';
-    return;
-  }
-  const sec=Math.max(0,Math.ceil((t-Date.now())/1000));
-  const txt=sec>0?`${sec}s`:'AGORA';
-  externalCountdown.textContent=txt;
-  if(externalMainCountdown) externalMainCountdown.textContent=txt;
-}
-
-async function loadExternalAi(force=false){
-  if(!externalAiEnabled || externalAiBusy || !interval) return;
-  const key=`SCAN|${interval.value}`;
-  const lastEntryMs=externalAiLast&&externalAiLast.entry_time?new Date(externalAiLast.entry_time).getTime():0;
-  if(!force && externalAiLastKey===key && externalAiLast && externalAiLast.confirmed===true && lastEntryMs>Date.now()+1000) return;
-  externalAiBusy=true;
-  if(externalStatus) externalStatus.textContent='🌐 VARRENDO ATIVOS EXTERNOS + IA...';
-  if(externalMainStatus) externalMainStatus.textContent='🌐 VARRENDO ATIVOS EXTERNOS + IA...';
-  try{
-    const d=await get(`/external-ai-scan?interval=${encodeURIComponent(interval.value)}`);
-    externalAiLastKey=key;
-    renderExternalAi(d);
-  }catch(e){
-    renderExternalAi({symbol:'VARREDURA',interval:interval.value,direction:'NEUTRO',confidence:0,risk:'HIGH',status:'VARREDURA EXTERNA EM ESPERA',reason:String((e&&e.message)||e)});
-  }finally{
-    externalAiBusy=false;
-  }
-}
-
-if(externalAiPowerBtn) externalAiPowerBtn.onclick=async()=>{
-  externalAiEnabled=!externalAiEnabled;
-  try{localStorage.setItem('mega_external_ai_power',externalAiEnabled?'ONLINE':'OFFLINE');}catch(_){ }
-  externalAiLast=null;
-  externalAiLastKey='';
-  paintExternalAiPower();
-  if(externalAiEnabled) await loadExternalAi(true);
-};
-paintExternalAiPower();
-// Se o monitor ficou salvo como ONLINE, inicia a varredura imediatamente ao abrir/recarregar
-// a página. Antes, o botão podia aparecer verde enquanto a primeira análise ainda não havia
-// sido disparada, deixando o texto antigo "MONITOR DESLIGADO" na tela.
-if(externalAiEnabled){
-  setTimeout(()=>loadExternalAi(true),250);
-}
-setInterval(updateExternalCountdown,1000);
-setInterval(()=>{
-  if(externalAiEnabled && !document.hidden) loadExternalAi(false);
-},5000);
-
-// A varredura externa é independente do ativo selecionado no painel principal.
-if(S) S.addEventListener('change',()=>{
-  if(externalAiEnabled && externalAiLast) renderExternalAi(externalAiLast);
-});
-if(interval) interval.addEventListener('change',()=>{
-  externalAiLast=null; externalAiLastKey='';
-  if(externalAiEnabled) loadExternalAi(true);
-});
-
 function showTab(which){
   const main=which==='main';
-  const external=which==='external';
   const chart=which==='chart';
   const velocity=which==='velocity';
   const results=which==='results';
@@ -24412,7 +23660,6 @@ function showTab(which){
   const account=which==='account';
 
   mainTab.classList.toggle('active',main);
-  externalTab.classList.toggle('active',external);
   chartTab.classList.toggle('active',chart);
   velocityTab.classList.toggle('active',velocity);
   resultsTab.classList.toggle('active',results);
@@ -24423,7 +23670,6 @@ function showTab(which){
   accountTab.classList.toggle('active',account);
 
   tabMain.classList.toggle('active',main);
-  tabExternal.classList.toggle('active',external);
   tabChart.classList.toggle('active',chart);
   if(tabVelocity) tabVelocity.classList.toggle('active',velocity);
   tabResults.classList.toggle('active',results);
@@ -24432,11 +23678,6 @@ function showTab(which){
   tabCompatibility.classList.toggle('active',compatibility);
   tabTelegram.classList.toggle('active',telegram);
   tabAccount.classList.toggle('active',account);
-
-  if(external){
-    paintExternalAiPower();
-    if(externalAiEnabled) loadExternalAi(true);
-  }
 
   if(chart){
     loadChart();
@@ -24474,7 +23715,6 @@ function showTab(which){
 }
 
 tabMain.onclick=()=>showTab('main');
-tabExternal.onclick=()=>showTab('external');
 tabChart.onclick=()=>showTab('chart');
 if(tabVelocity) tabVelocity.onclick=()=>showTab('velocity');
 tabResults.onclick=()=>showTab('results');
@@ -25190,7 +24430,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: IA Gráfica lendo padrões, H1, Dow H4 e LTA/LTB sem RSI.'
     : 'OFFLINE: IA Gráfica pausada.';
   if(aiModeDesc) aiModeDesc.textContent=aiEnabled
-    ? 'ONLINE: IA Leitura do Gráfico analisando candles fechados e price action para a próxima vela.'
+    ? 'ONLINE FLEX: IA Leitura do Gráfico com menos travas • IA decide com 1 evidência forte ou 2 moderadas • próxima vela.'
     : 'OFFLINE: IA Leitura do Gráfico pausada.';
   if(eaModeDesc) eaModeDesc.textContent=eaEnabled
     ? 'ONLINE: RSI 14 + Value Chart + XGBoost • sinal somente com tripla confirmação • OPEN/OTC.'
@@ -25226,7 +24466,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: VOLUME/POC + SUPORTE/RESISTÊNCIA + LTA/LTB • sem IA/EA • sinal ~20s antes • próxima vela.'
     : 'OFFLINE: Volume POC Estrutural pausado.';
   if(volumePocAiModeDesc) volumePocAiModeDesc.textContent=volumePocAiEnabled
-    ? 'ONLINE: Volume POC detecta primeiro • IA Leitura do Gráfico vota depois • CALL/PUT somente com concordância dos dois • próxima vela.'
+    ? 'ONLINE FLEX MÁXIMO: Volume POC detecta cedo • janela 55s→5s • IA vota na mesma direção com mínimo 54% • próxima vela.'
     : 'OFFLINE: IA + Volume POC pausado.';
   if(rsi5ModeDesc) rsi5ModeDesc.textContent=rsi5Enabled
     ? 'ONLINE: RSI9 4TF + ADX/DMI14 • ADX ≥25 • pullback a favor da tendência • próxima vela.'
@@ -25243,8 +24483,8 @@ function applyRobotPowerState(){
 
   const engine=selectedRobotEngine();
   if(engine==='VOLUME_AI'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA + VOLUME POC ONLINE • VOLUME DETECTA → IA CONFIRMA • SOMENTE COM CONCORDÂNCIA • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA + Volume POC selecionado • o Volume POC cria o candidato e a IA só libera quando concorda na mesma direção.</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA + VOLUME POC FLEX ONLINE • VOLUME DETECTA CEDO → IA VOTA • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA + Volume POC FLEX • candidato de volume aparece mais cedo e a IA vota na mesma direção com menos travas.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar IA + Volume POC ativo • procurando candidato de volume para chamar a IA</div>';
     rad();
   }else if(engine==='SUNTZU'){
@@ -25318,8 +24558,8 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar EA Tripla ativo • RSI + Value Chart + XGBoost • OPEN/OTC</div>';
     rad();
   }else if(engine==='SMART'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA LEITURA DO GRÁFICO ONLINE • PRICE ACTION + IA • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 Inteligência Artificial selecionada.</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA LEITURA DO GRÁFICO FLEX ONLINE • MENOS TRAVAS • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Leitura do Gráfico FLEX selecionada • filtros históricos e confirmação fraca de ticks não travam mais.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar IA pura ativo • analisando candles</div>';
     rad();
   }else if(engine==='GRAPH_AI'){
@@ -26146,17 +25386,14 @@ async function sig(announce=false){
     const engine=selectedRobotEngine();
     if(engine==='OFF'){
       cur={direction:'NEUTRO',confidence:0,status:'MOTORES OFFLINE • SINAIS PAUSADOS',risk:'--',source_state:'READY'};
-      const externalPainted=externalAiEnabled && paintExternalSignalAsPrimary(externalAiLast);
-      if(!externalPainted){
-        direction.textContent='NEUTRO';
-        direction.className='big neutral';
-        confidence.textContent='Confiança: 0%';
-        entry.textContent='AGUARDANDO SINAL';
-        countdown.textContent='Sem entrada confirmada';
-        statusBox.textContent=cur.status;
-        risk.textContent='Risco: --';
-      }
-      if(dataFeedText) dataFeedText.textContent=externalPainted?'IA EXTERNA • fonte externa ativa':'MOTORES OFFLINE • nenhuma análise solicitada';
+      direction.textContent='NEUTRO';
+      direction.className='big neutral';
+      confidence.textContent='Confiança: 0%';
+      entry.textContent='AGUARDANDO SINAL';
+      countdown.textContent='Sem entrada confirmada';
+      statusBox.textContent=cur.status;
+      risk.textContent='Risco: --';
+      if(dataFeedText) dataFeedText.textContent='MOTORES OFFLINE • nenhuma análise solicitada';
       return;
     }
     cur=await get(
@@ -26219,12 +25456,6 @@ async function sig(announce=false){
       const src=String(cur.feed_label||cur.feed_source||'MULTIFONTE').replaceAll('_',' ');
       const fb=cur.feed_fallback===true?' • FALLBACK ATIVO':'';
       dataFeedText.textContent=src+fb;
-    }
-
-    // Quando o motor selecionado ainda está neutro, um CALL/PUT confirmado da
-    // IA Externa também ocupa o cartão SINAL ATUAL do Painel principal.
-    if(String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO' && externalAiEnabled){
-      paintExternalSignalAsPrimary(externalAiLast);
     }
 
     // No Velocity, um rompimento isolado é apenas pré-sinal.
