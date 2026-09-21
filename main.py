@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.91.0"
-PWA_VERSION = "v152"
+APP_VERSION = "3.91.1"
+PWA_VERSION = "v153"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -301,6 +301,14 @@ VOLUME_POC_MIN_VOLUME_COVERAGE = max(0.35, min(1.00, float(os.getenv("VOLUME_POC
 VOLUME_POC_EARLY_SIGNAL_SECONDS = 20
 VOLUME_POC_EARLY_WINDOW_BEFORE = max(20, min(26, int(os.getenv("VOLUME_POC_EARLY_WINDOW_BEFORE", "23"))))
 VOLUME_POC_EARLY_MIN_REMAINING = max(12, min(20, int(os.getenv("VOLUME_POC_EARLY_MIN_REMAINING", "16"))))
+# 3.91.1 — IA + Volume POC tem uma janela própria, mais larga.
+# O Volume POC original continua intacto. Neste motor de consenso, o volume
+# funciona como detector de candidato e a IA continua sendo a confirmação final.
+VOLUME_AI_EARLY_SIGNAL_SECONDS = max(24, min(40, int(os.getenv("VOLUME_AI_EARLY_SIGNAL_SECONDS", "30"))))
+VOLUME_AI_EARLY_WINDOW_BEFORE = max(28, min(48, int(os.getenv("VOLUME_AI_EARLY_WINDOW_BEFORE", "35"))))
+VOLUME_AI_EARLY_MIN_REMAINING = max(6, min(18, int(os.getenv("VOLUME_AI_EARLY_MIN_REMAINING", "8"))))
+VOLUME_AI_TRIGGER_MIN_SCORE = max(2, min(5, int(os.getenv("VOLUME_AI_TRIGGER_MIN_SCORE", "3"))))
+VOLUME_AI_TRIGGER_EDGE = max(1, min(3, int(os.getenv("VOLUME_AI_TRIGGER_EDGE", "1"))))
 # S/R multi-timeframe do Volume POC. Timeframes maiores têm mais peso, mas nenhum
 # deles é obrigatório isoladamente. M30 é agregado do M15 e H4 é agregado do H1.
 VOLUME_POC_MTF_WEIGHTS = {"M15": 1, "M30": 1, "H1": 2, "H4": 3}
@@ -12762,9 +12770,9 @@ async def ai_volume_poc_consensus_signal(
     closed_rows = list(closed or [])
     seconds_to_entry = max(0.0, (next_boundary(interval) - now()).total_seconds())
     early_window = (
-        VOLUME_POC_EARLY_MIN_REMAINING
+        VOLUME_AI_EARLY_MIN_REMAINING
         <= seconds_to_entry
-        <= VOLUME_POC_EARLY_WINDOW_BEFORE
+        <= VOLUME_AI_EARLY_WINDOW_BEFORE
     )
 
     try:
@@ -12799,7 +12807,7 @@ async def ai_volume_poc_consensus_signal(
             "provider": "AI_VOLUME_POC_CONSENSUS",
             "reason": (
                 f"IA + Volume POC monitorando • a concordância final abre nos últimos "
-                f"{VOLUME_POC_EARLY_SIGNAL_SECONDS}s antes da próxima vela "
+                f"{VOLUME_AI_EARLY_SIGNAL_SECONDS}s antes da próxima vela "
                 f"(agora faltam {int(seconds_to_entry)}s)."
             ),
             "early_signal_window": False,
@@ -12826,6 +12834,38 @@ async def ai_volume_poc_consensus_signal(
     volume_dir = str(volume_vote.get("direction") or "NEUTRO").upper()
     volume_conf = float(volume_vote.get("confidence") or 0.0)
     volume_ok = bool(volume_vote.get("confirmed") and volume_dir in ("CALL", "PUT"))
+    volume_candidate_mode = "CONFIRMED_POC" if volume_ok else "NONE"
+
+    # 3.91.1 — no motor IA + Volume, o POC não precisa esperar o setup completo
+    # do motor Volume POC original. Ele pode encaminhar um CANDIDATO um pouco mais
+    # cedo quando já existe vantagem de fluxo (3 pontos por padrão). A IA é quem
+    # decide se esse candidato vira entrada. Assim aumentamos a frequência sem
+    # retirar a concordância obrigatória dos dois.
+    if not volume_ok:
+        call_score = int(volume_vote.get("call_score") or 0)
+        put_score = int(volume_vote.get("put_score") or 0)
+        coverage_ok = bool(volume_vote.get("coverage_ok"))
+        struct = volume_vote.get("structure") if isinstance(volume_vote.get("structure"), dict) else {}
+        structure_conflict = bool(struct.get("conflict"))
+        call_edge = call_score - put_score
+        put_edge = put_score - call_score
+        call_candidate = bool(
+            coverage_ok and not structure_conflict
+            and call_score >= VOLUME_AI_TRIGGER_MIN_SCORE
+            and call_edge >= VOLUME_AI_TRIGGER_EDGE
+        )
+        put_candidate = bool(
+            coverage_ok and not structure_conflict
+            and put_score >= VOLUME_AI_TRIGGER_MIN_SCORE
+            and put_edge >= VOLUME_AI_TRIGGER_EDGE
+        )
+        if call_candidate ^ put_candidate:
+            volume_dir = "CALL" if call_candidate else "PUT"
+            best_score = call_score if call_candidate else put_score
+            best_edge = call_edge if call_candidate else put_edge
+            volume_conf = round(clamp(58.0 + best_score * 4.0 + best_edge * 2.0, 60.0, 78.0), 1)
+            volume_ok = True
+            volume_candidate_mode = "EARLY_FLOW_CANDIDATE"
 
     if not volume_ok:
         return {
@@ -12837,7 +12877,9 @@ async def ai_volume_poc_consensus_signal(
             "strategy": "IA + VOLUME POC",
             "engine": "VOLUME_AI",
             "provider": "AI_VOLUME_POC_CONSENSUS",
-            "reason": "Volume POC ainda não encontrou CALL/PUT válido; a IA permanece em espera para economizar processamento.",
+            "reason": (f"Volume POC ainda não formou candidato com vantagem mínima de fluxo "
+                       f"({VOLUME_AI_TRIGGER_MIN_SCORE} pts / vantagem {VOLUME_AI_TRIGGER_EDGE}); "
+                       "a IA permanece em espera para economizar processamento."),
             "early_signal_window": True,
             "seconds_to_entry_snapshot": round(seconds_to_entry, 1),
             "candidate_direction": "NEUTRO",
@@ -12893,6 +12935,7 @@ async def ai_volume_poc_consensus_signal(
         "stage": "CONFIRMED" if agreed else "DISAGREEMENT_OR_NEUTRAL",
         "volume_direction": volume_dir,
         "volume_confidence": round(volume_conf, 1),
+        "volume_candidate_mode": volume_candidate_mode,
         "ai_direction": ai_dir if ai_dir in ("CALL", "PUT") else "NEUTRO",
         "ai_confidence": round(ai_conf, 1),
         "ai_called": True,
@@ -12944,10 +12987,11 @@ async def ai_volume_poc_consensus_signal(
         "engine": "VOLUME_AI",
         "provider": "AI_VOLUME_POC_CONSENSUS",
         "reason": (
-            f"CONCORDÂNCIA: Volume POC {volume_dir} ({volume_conf:.0f}%) + "
+            f"CONCORDÂNCIA: Volume {volume_dir} ({volume_conf:.0f}%, {volume_candidate_mode}) + "
             f"IA {ai_dir} ({ai_conf:.0f}%). Entrada autorizada somente porque os dois concordaram."
         ),
         "candidate_direction": volume_dir,
+        "volume_candidate_mode": volume_candidate_mode,
         "early_signal_window": True,
         "seconds_to_entry_snapshot": round(seconds_to_entry, 1),
         "event_key": volume_vote.get("event_key") or f"AI_VOLUME_POC:{volume_dir}:{raw_rows[-1].get('datetime') if raw_rows else ''}",
@@ -14813,8 +14857,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 if engine in ("VOLUME", "VOLUME_AI"):
                     _vp_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
                     _vp_label = "IA + VOLUME POC" if engine == "VOLUME_AI" else "VOLUME POC ESTRUTURAL"
-                    if not (VOLUME_POC_EARLY_MIN_REMAINING <= _vp_remaining <= VOLUME_POC_EARLY_WINDOW_BEFORE):
-                        base["status"] = f"ONLINE • {_vp_label} • AGUARDANDO JANELA DE 20S"
+                    _vp_min = VOLUME_AI_EARLY_MIN_REMAINING if engine == "VOLUME_AI" else VOLUME_POC_EARLY_MIN_REMAINING
+                    _vp_max = VOLUME_AI_EARLY_WINDOW_BEFORE if engine == "VOLUME_AI" else VOLUME_POC_EARLY_WINDOW_BEFORE
+                    _vp_nominal = VOLUME_AI_EARLY_SIGNAL_SECONDS if engine == "VOLUME_AI" else VOLUME_POC_EARLY_SIGNAL_SECONDS
+                    if not (_vp_min <= _vp_remaining <= _vp_max):
+                        base["status"] = f"ONLINE • {_vp_label} • AGUARDANDO JANELA DE {_vp_nominal}S"
                         base["reason"] = f"{_vp_label} aguardando a janela antecipada; faltam {int(_vp_remaining)}s para a próxima vela."
                         base["direction"] = "NEUTRO"
                         base["entry_time"] = None
@@ -14874,7 +14921,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
                 if engine in ("VOLUME", "VOLUME_AI", "SUNTZU"):
                     entry = next_boundary(interval)
-                    _lead = SUNTZU_EARLY_SIGNAL_SECONDS if engine == "SUNTZU" else VOLUME_POC_EARLY_SIGNAL_SECONDS
+                    _lead = (SUNTZU_EARLY_SIGNAL_SECONDS if engine == "SUNTZU"
+                             else VOLUME_AI_EARLY_SIGNAL_SECONDS if engine == "VOLUME_AI"
+                             else VOLUME_POC_EARLY_SIGNAL_SECONDS)
                     announce = entry - timedelta(seconds=_lead)
                     expiry = entry + timedelta(seconds=INTERVALS[interval])
                 else:
@@ -14932,11 +14981,18 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     base["auto_trade_allowed"] = False
                     base["samurai_source"] = "Algo Samurai.mq4"
                 if engine in ("VOLUME", "VOLUME_AI"):
-                    base["announce_seconds_before"] = VOLUME_POC_EARLY_SIGNAL_SECONDS
+                    base["announce_seconds_before"] = VOLUME_AI_EARLY_SIGNAL_SECONDS if engine == "VOLUME_AI" else VOLUME_POC_EARLY_SIGNAL_SECONDS
                     base["early_signal_locked"] = True
                     base["non_repaint_after_release"] = True
-                    base["signal_snapshot"] = "FORMING_CANDLE_AT_20S"
-                    base["volume_poc_fast"] = {"min_score": VOLUME_POC_MIN_SCORE, "score_edge": VOLUME_POC_SCORE_EDGE, "cooldown_bars": VOLUME_POC_COOLDOWN_BARS, "ai_consensus_required": engine == "VOLUME_AI"}
+                    base["signal_snapshot"] = "FORMING_CANDLE_IA_VOLUME_WINDOW" if engine == "VOLUME_AI" else "FORMING_CANDLE_AT_20S"
+                    base["volume_poc_fast"] = {
+                        "min_score": VOLUME_AI_TRIGGER_MIN_SCORE if engine == "VOLUME_AI" else VOLUME_POC_MIN_SCORE,
+                        "score_edge": VOLUME_AI_TRIGGER_EDGE if engine == "VOLUME_AI" else VOLUME_POC_SCORE_EDGE,
+                        "cooldown_bars": VOLUME_POC_COOLDOWN_BARS,
+                        "ai_consensus_required": engine == "VOLUME_AI",
+                        "early_window_before": VOLUME_AI_EARLY_WINDOW_BEFORE if engine == "VOLUME_AI" else VOLUME_POC_EARLY_WINDOW_BEFORE,
+                        "early_min_remaining": VOLUME_AI_EARLY_MIN_REMAINING if engine == "VOLUME_AI" else VOLUME_POC_EARLY_MIN_REMAINING,
+                    }
                 if engine == "SUNTZU":
                     base["announce_seconds_before"] = SUNTZU_EARLY_SIGNAL_SECONDS
                     base["early_signal_locked"] = True
@@ -21597,7 +21653,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="IA + Volume POC">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧠 IA + VOLUME POC</div>
-      <div class="robot-mode-desc" id="volumePocAiModeDesc">Volume POC detecta primeiro • IA LEITURA DO GRÁFICO confirma em segundos • CALL/PUT só é liberado quando os dois concordam • próxima vela.</div>
+      <div class="robot-mode-desc" id="volumePocAiModeDesc">Volume detecta candidato mais cedo • IA LEITURA DO GRÁFICO confirma em segundos • CALL/PUT só é liberado quando os dois concordam • próxima vela.</div>
     </div>
     <button id="volumePocAiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -26073,7 +26129,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: VOLUME/POC + SUPORTE/RESISTÊNCIA + LTA/LTB • sem IA/EA • sinal ~20s antes • próxima vela.'
     : 'OFFLINE: Volume POC Estrutural pausado.';
   if(volumePocAiModeDesc) volumePocAiModeDesc.textContent=volumePocAiEnabled
-    ? 'ONLINE: Volume POC detecta primeiro • IA LEITURA DO GRÁFICO vota depois • CALL/PUT somente com concordância dos dois • próxima vela.'
+    ? 'ONLINE: Volume detecta candidato mais cedo • IA LEITURA DO GRÁFICO vota depois • CALL/PUT somente com concordância dos dois • próxima vela.'
     : 'OFFLINE: IA + Volume POC pausado.';
   if(rsi5ModeDesc) rsi5ModeDesc.textContent=rsi5Enabled
     ? 'ONLINE: RSI9 4TF + ADX/DMI14 • ADX ≥25 • pullback a favor da tendência • próxima vela.'
