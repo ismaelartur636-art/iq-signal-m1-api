@@ -228,6 +228,11 @@ VOLUME_POC_MIN_VOLUME_COVERAGE = max(0.35, min(1.00, float(os.getenv("VOLUME_POC
 VOLUME_POC_EARLY_SIGNAL_SECONDS = 20
 VOLUME_POC_EARLY_WINDOW_BEFORE = max(20, min(26, int(os.getenv("VOLUME_POC_EARLY_WINDOW_BEFORE", "23"))))
 VOLUME_POC_EARLY_MIN_REMAINING = max(12, min(20, int(os.getenv("VOLUME_POC_EARLY_MIN_REMAINING", "16"))))
+# S/R multi-timeframe do Volume POC. Timeframes maiores têm mais peso, mas nenhum
+# deles é obrigatório isoladamente. M30 é agregado do M15 e H4 é agregado do H1.
+VOLUME_POC_MTF_WEIGHTS = {"M15": 1, "M30": 1, "H1": 2, "H4": 3}
+VOLUME_POC_MTF_CACHE_TTL = max(30.0, min(300.0, float(os.getenv("VOLUME_POC_MTF_CACHE_TTL", "90"))))
+volume_poc_mtf_cache: Dict[str, Any] = {}
 # MEGA IA 3.80.6 — IA contextual leve do Volume POC.
 # Ela NÃO é confirmação obrigatória: melhora setups marginais quando concorda e
 # só protege contra o caso mais fraco (POC exatamente no mínimo + IA fortemente contrária).
@@ -9199,11 +9204,87 @@ def _volume_poc_ai_context(rows):
     }
 
 
-def _volume_poc_structure_context(rows):
-    """Suporte/Resistência + LTA/LTB local para confirmar o Volume POC sem IA/EA."""
+async def _volume_poc_fetch_mtf(symbol, market="OPEN", request=None, iq_state=None,
+                                current_closed=None, current_interval="1min"):
+    """Carrega S/R M15/M30/H1/H4 sem exigir quatro chamadas externas.
+
+    M30 é agregado dos candles M15 fechados e H4 dos candles H1 fechados. Isso
+    reduz carga no Render e mantém as zonas baseadas apenas em candles fechados.
+    """
+    symbol = str(symbol or "").strip()
+    market = str(market or "OPEN").upper()
+    cache_key = f"{market}|{symbol}|VOLUME_POC_MTF"
+    cached = volume_poc_mtf_cache.get(cache_key)
+    now_ts = time.time()
+    if cached and now_ts - float(cached[0]) < VOLUME_POC_MTF_CACHE_TTL:
+        return dict(cached[1])
+
+    current_closed = list(current_closed or [])
+    m15 = current_closed[-110:] if current_interval == "15min" and len(current_closed) >= 25 else None
+    h1 = current_closed[-110:] if current_interval == "1h" and len(current_closed) >= 25 else None
+
+    async def _fetch(tf, count):
+        try:
+            if market == "IQ_OTC":
+                if not iq_state:
+                    return []
+                data = await iq_ea_candles(iq_state, symbol, tf, count, regular_market=False)
+            else:
+                data = await candles(symbol, tf, count, "OPEN", None, request=request)
+            data = list(data or [])
+            return (data[:-1] if len(data) > 1 else data)[-count:]
+        except Exception:
+            return []
+
+    tasks = []
+    labels = []
+    if not m15:
+        tasks.append(_fetch("15min", 110)); labels.append("m15")
+    if not h1:
+        tasks.append(_fetch("1h", 110)); labels.append("h1")
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for label, result in zip(labels, results):
+            rows = [] if isinstance(result, Exception) else list(result or [])
+            if label == "m15" and rows:
+                m15 = rows
+            elif label == "h1" and rows:
+                h1 = rows
+
+    out = {}
+    if m15 and len(m15) >= 25:
+        out["M15"] = m15[-100:]
+        m30 = _aggregate_closed_candles(m15, 30 * 60)
+        if len(m30) >= 25:
+            out["M30"] = m30[-100:]
+    if h1 and len(h1) >= 25:
+        out["H1"] = h1[-100:]
+        h4 = _aggregate_closed_candles(h1, 4 * 60 * 60)
+        if len(h4) >= 25:
+            out["H4"] = h4[-100:]
+
+    if out:
+        volume_poc_mtf_cache[cache_key] = (time.time(), dict(out))
+        # Evita crescimento indefinido do cache em execução longa.
+        if len(volume_poc_mtf_cache) > 180:
+            oldest = sorted(volume_poc_mtf_cache.items(), key=lambda kv: float(kv[1][0]))[:40]
+            for k, _ in oldest:
+                volume_poc_mtf_cache.pop(k, None)
+    return out
+
+
+def _volume_poc_structure_context(rows, mtf=None):
+    """Suporte/Resistência + LTA/LTB local e S/R M15/M30/H1/H4.
+
+    Pesos: M15=1, M30=1, H1=2, H4=3. Não exige alinhamento de todos os
+    timeframes. Quando os dois lados aparecem ao mesmo tempo, o lado de maior
+    peso estrutural prevalece; só há conflito se os pesos ficarem muito próximos.
+    """
     rows=list(rows or [])
     if len(rows) < 30:
-        return {"near_support":False,"near_resistance":False,"near_lta":False,"near_ltb":False,"conflict":False}
+        return {"near_support":False,"near_resistance":False,"near_lta":False,"near_ltb":False,
+                "call_structure":False,"put_structure":False,"conflict":False,
+                "call_weight":0,"put_weight":0,"mtf":{}}
     sample=rows[-120:]
     last=sample[-1]
     c=float(last.get("close") or 0.0); h=float(last.get("high") or c); l=float(last.get("low") or c)
@@ -9238,16 +9319,78 @@ def _volume_poc_structure_context(rows):
         projected=float(p2["price"])+slope*(current_idx-int(p2["index"]))
         near_ltb=bool(slope<0 and h>=projected-line_tol and c<=projected+line_tol)
         ltb={"projected":projected,"slope":slope,"near":near_ltb,"tolerance":line_tol}
-    call_structure=near_support or near_lta
-    put_structure=near_resistance or near_ltb
+
+    # Estrutura local vale 2 pontos: mais forte que M15/M30, equivalente a H1.
+    local_call_weight = 2 if (near_support or near_lta) else 0
+    local_put_weight = 2 if (near_resistance or near_ltb) else 0
+    call_weight = local_call_weight
+    put_weight = local_put_weight
+    mtf_diag = {}
+    call_labels=[]; put_labels=[]
+    if near_support: call_labels.append("SUPORTE LOCAL")
+    if near_lta: call_labels.append("LTA")
+    if near_resistance: put_labels.append("RESISTÊNCIA LOCAL")
+    if near_ltb: put_labels.append("LTB")
+
+    for tf in ("M15","M30","H1","H4"):
+        data=list((mtf or {}).get(tf) or [])
+        if len(data) < 25:
+            continue
+        tf_name={"M15":"15min","M30":"30min","H1":"1h","H4":"4h"}[tf]
+        lv=_support_resistance_levels(data, tf_name)
+        tol=float(lv.get("tolerance") or 0.0)
+        # Mantém a própria largura da zona do timeframe e uma tolerância mínima
+        # baseada no ATR do gráfico de entrada para não perder reação por poucos ticks.
+        zone_radius=max(tol*1.25, a*0.30, abs(c)*0.00020)
+        tf_sups=list(lv.get("supports") or [])
+        tf_ress=list(lv.get("resistances") or [])
+        ts=min(tf_sups,key=lambda x:abs(c-float(x.get("price") or c)),default=None)
+        tr=min(tf_ress,key=lambda x:abs(c-float(x.get("price") or c)),default=None)
+        hit_s=bool(ts and l <= float(ts.get("price"))+zone_radius and c >= float(ts.get("price"))-zone_radius)
+        hit_r=bool(tr and h >= float(tr.get("price"))-zone_radius and c <= float(tr.get("price"))+zone_radius)
+        w=int(VOLUME_POC_MTF_WEIGHTS.get(tf,1))
+        if hit_s:
+            call_weight += w
+            call_labels.append(f"SUPORTE {tf}")
+        if hit_r:
+            put_weight += w
+            put_labels.append(f"RESISTÊNCIA {tf}")
+        mtf_diag[tf]={
+            "weight":w,"near_support":hit_s,"near_resistance":hit_r,
+            "support":ts,"resistance":tr,"radius":zone_radius,
+        }
+
+    # Flags independentes para o gatilho "primeira condição válida vence" do Volume POC.
+    # Qualquer suporte (local/M15/M30/H1/H4) é suficiente como braço estrutural
+    # do CALL; qualquer resistência é suficiente como braço estrutural do PUT.
+    support_hit_any = bool(near_support or any(bool(x.get("near_support")) for x in mtf_diag.values()))
+    resistance_hit_any = bool(near_resistance or any(bool(x.get("near_resistance")) for x in mtf_diag.values()))
+
+    # Se H4/H1 apontarem para um lado e um TF menor tocar o lado oposto, o lado
+    # mais pesado prevalece no modo por pontuação. O gatilho direto POC+estrutura
+    # é tratado separadamente no snapshot e não espera essa votação estrutural.
+    conflict=bool(call_weight>0 and put_weight>0 and abs(call_weight-put_weight)<=1)
+    if conflict:
+        call_structure=False; put_structure=False
+    elif call_weight > put_weight:
+        call_structure=call_weight>0; put_structure=False
+    elif put_weight > call_weight:
+        call_structure=False; put_structure=put_weight>0
+    else:
+        call_structure=call_weight>0 and put_weight==0
+        put_structure=put_weight>0 and call_weight==0
+
     return {
         "near_support":near_support,"near_resistance":near_resistance,"near_lta":near_lta,"near_ltb":near_ltb,
-        "call_structure":call_structure,"put_structure":put_structure,"conflict":bool(call_structure and put_structure),
-        "support":ns,"resistance":nr,"lta":lta,"ltb":ltb,"radius":radius,
+        "call_structure":call_structure,"put_structure":put_structure,"conflict":conflict,
+        "call_weight":call_weight,"put_weight":put_weight,
+        "support_hit_any":support_hit_any,"resistance_hit_any":resistance_hit_any,
+        "call_labels":call_labels,"put_labels":put_labels,
+        "support":ns,"resistance":nr,"lta":lta,"ltb":ltb,"radius":radius,"mtf":mtf_diag,
     }
 
 
-def _volume_poc_snapshot(rows, early_signal=False, use_ai=False):
+def _volume_poc_snapshot(rows, early_signal=False, use_ai=False, mtf=None):
     use_ai = False  # Volume POC Estrutural removido; legado cai no motor estrutural.
     rows = list(rows or [])
     need = max(VOLUME_POC_LOOKBACK + 2, 44)
@@ -9336,13 +9479,50 @@ def _volume_poc_snapshot(rows, early_signal=False, use_ai=False):
 
     # Estrutura independente: o Volume POC não depende de IA/EA.
     # Volume comprador em suporte/LTA favorece CALL; volume vendedor em resistência/LTB favorece PUT.
-    structure = _volume_poc_structure_context(rows)
+    structure = _volume_poc_structure_context(rows, mtf=mtf)
     structure_conflict = bool(structure.get("conflict"))
     raw_flow_call = call; raw_flow_put = put
+    call_struct_weight = int(structure.get("call_weight") or 0)
+    put_struct_weight = int(structure.get("put_weight") or 0)
+
+    # GATILHO DIRETO — primeira condição válida vence.
+    # CALL: reação compradora no POC + (qualquer SUPORTE OU LTA).
+    # PUT : reação vendedora no POC + (qualquer RESISTÊNCIA OU LTB).
+    # Não espera suporte+LTA juntos, nem resistência+LTB juntos. O primeiro braço
+    # estrutural que aparecer com o POC já pode liberar e o estado externo congela
+    # o sinal para a próxima vela.
+    support_hit_any = bool(structure.get("support_hit_any"))
+    resistance_hit_any = bool(structure.get("resistance_hit_any"))
+    lta_hit = bool(structure.get("near_lta"))
+    ltb_hit = bool(structure.get("near_ltb"))
+
+    call_first_trigger = bool(poc_call and (support_hit_any or lta_hit))
+    put_first_trigger = bool(poc_put and (resistance_hit_any or ltb_hit))
+
+    mtf_diag = structure.get("mtf") or {}
+    support_names = (["SUPORTE LOCAL"] if structure.get("near_support") else []) + [
+        f"SUPORTE {tf}" for tf, d in mtf_diag.items() if bool((d or {}).get("near_support"))
+    ]
+    resistance_names = (["RESISTÊNCIA LOCAL"] if structure.get("near_resistance") else []) + [
+        f"RESISTÊNCIA {tf}" for tf, d in mtf_diag.items() if bool((d or {}).get("near_resistance"))
+    ]
+    if call_first_trigger:
+        arm = support_names[0] if support_names else "LTA"
+        add_call(2, f"GATILHO DIRETO POC + {arm}")
+    if put_first_trigger:
+        arm = resistance_names[0] if resistance_names else "LTB"
+        add_put(2, f"GATILHO DIRETO POC + {arm}")
+
+    # A pontuação estrutural antiga continua como caminho alternativo para setups
+    # que não acionaram o gatilho direto acima.
     if not structure_conflict and structure.get("call_structure") and raw_flow_call >= 1:
-        add_call(2, "SUPORTE/LTA + VOLUME")
+        bonus = max(1, min(4, call_struct_weight))
+        labels = "/".join((structure.get("call_labels") or [])[:3]) or "SUPORTE/LTA"
+        add_call(bonus, f"{labels} + VOLUME")
     if not structure_conflict and structure.get("put_structure") and raw_flow_put >= 1:
-        add_put(2, "RESISTÊNCIA/LTB + VOLUME")
+        bonus = max(1, min(4, put_struct_weight))
+        labels = "/".join((structure.get("put_labels") or [])[:3]) or "RESISTÊNCIA/LTB"
+        add_put(bonus, f"{labels} + VOLUME")
 
     coverage = float(profile.get("volume_coverage") or 0.0)
     coverage_ok = coverage >= VOLUME_POC_MIN_VOLUME_COVERAGE
@@ -9368,10 +9548,21 @@ def _volume_poc_snapshot(rows, early_signal=False, use_ai=False):
             put = max(0, put - 1); put_checks.append("IA CONTRÁRIA: PROTEÇÃO BORDERLINE")
 
     edge = abs(call - put)
-    call_release = (not structure_conflict and structure.get("call_structure") and raw_flow_call >= 1 and c >= o and dr >= 0.04)
-    put_release = (not structure_conflict and structure.get("put_structure") and raw_flow_put >= 1 and c <= o and dr <= -0.04)
-    call_ok = coverage_ok and ((call >= VOLUME_POC_MIN_SCORE and (call - put) >= VOLUME_POC_SCORE_EDGE) or (call_release and call >= 3 and (call - put) >= 1))
-    put_ok = coverage_ok and ((put >= VOLUME_POC_MIN_SCORE and (put - call) >= VOLUME_POC_SCORE_EDGE) or (put_release and put >= 3 and (put - call) >= 1))
+    # O gatilho direto não espera atingir o score mínimo: POC+SUPORTE ou POC+LTA
+    # (e o equivalente vendedor) é uma condição completa por si só. Mantemos apenas
+    # a cobertura mínima de volume como proteção da qualidade da fonte.
+    call_release = bool(call_first_trigger or (not structure_conflict and structure.get("call_structure") and raw_flow_call >= 1 and c >= o and dr >= 0.04))
+    put_release = bool(put_first_trigger or (not structure_conflict and structure.get("put_structure") and raw_flow_put >= 1 and c <= o and dr <= -0.04))
+    call_ok = coverage_ok and (
+        (call_first_trigger and not put_first_trigger) or
+        (call >= VOLUME_POC_MIN_SCORE and (call - put) >= VOLUME_POC_SCORE_EDGE) or
+        (call_release and call >= 3 and (call - put) >= 1)
+    )
+    put_ok = coverage_ok and (
+        (put_first_trigger and not call_first_trigger) or
+        (put >= VOLUME_POC_MIN_SCORE and (put - call) >= VOLUME_POC_SCORE_EDGE) or
+        (put_release and put >= 3 and (put - call) >= 1)
+    )
     direction = "CALL" if call_ok else ("PUT" if put_ok else "NEUTRO")
     score = call if direction == "CALL" else (put if direction == "PUT" else max(call, put))
     confidence = 0.0
@@ -9403,17 +9594,19 @@ def _volume_poc_snapshot(rows, early_signal=False, use_ai=False):
         "ai_context": ai_ctx, "ai_direction": ai_dir, "ai_confidence": ai_conf,
         "raw_call_score": raw_flow_call, "raw_put_score": raw_flow_put,
         "structure": structure, "structure_release_call": bool(call_release), "structure_release_put": bool(put_release),
+        "first_trigger_call": bool(call_first_trigger), "first_trigger_put": bool(put_first_trigger),
+        "first_trigger_rule": "POC+SUPORTE_OR_LTA / POC+RESISTENCIA_OR_LTB",
         "event_key": f"VOLUME_POC:{direction}:{dt}" if direction in ("CALL", "PUT") else "",
         "delta_method": "OHLCV_PROXY_NOT_TRUE_BID_ASK",
     }
 
 
-def volume_poc_strategy(cs, timeframe="1min", market="OPEN", early_signal=False, use_ai=False):
+def volume_poc_strategy(cs, timeframe="1min", market="OPEN", early_signal=False, use_ai=False, mtf=None):
     """VOLUME POC ESTRUTURAL — volume/POC + Suporte/Resistência + LTA/LTB, sem IA/EA.
 
-    In normal mode it reads closed candles. In early_signal mode it takes one
-    snapshot of the forming candle inside the final ~20s window. Once released,
-    the outer signal state locks that CALL/PUT for the immediately following candle.
+    Regra rápida: POC+SUPORTE OU POC+LTA libera CALL; POC+RESISTÊNCIA OU
+    POC+LTB libera PUT. É lógica OR: o primeiro braço estrutural válido que aparecer
+    com a reação do POC libera e o estado externo trava o sinal para a próxima vela.
     """
     use_ai = False
     rows = list(cs or [])
@@ -9434,7 +9627,7 @@ def volume_poc_strategy(cs, timeframe="1min", market="OPEN", early_signal=False,
     # é calculado só até a vela anterior; o snapshot atual usa os limiares intrabar.
     history_end = len(rows) - 1 if early_signal else len(rows)
     for i in range(start, history_end):
-        snap_hist = _volume_poc_snapshot(rows[:i+1], early_signal=False, use_ai=use_ai)
+        snap_hist = _volume_poc_snapshot(rows[:i+1], early_signal=False, use_ai=use_ai, mtf=None)
         if not snap_hist:
             continue
         if i == len(rows) - 1:
@@ -9446,15 +9639,21 @@ def volume_poc_strategy(cs, timeframe="1min", market="OPEN", early_signal=False,
                 last_fired = i
 
     if early_signal:
-        snap = _volume_poc_snapshot(rows, early_signal=True, use_ai=use_ai)
+        snap = _volume_poc_snapshot(rows, early_signal=True, use_ai=use_ai, mtf=mtf)
         current_i = len(rows) - 1
         current_allowed = bool(
             snap and snap.get("confirmed") and snap.get("direction") in ("CALL", "PUT")
             and (last_fired is None or (current_i - last_fired) > VOLUME_POC_COOLDOWN_BARS)
         )
     else:
-        snap = last_snap or _volume_poc_snapshot(rows, early_signal=False, use_ai=use_ai)
-        current_allowed = bool(last_fired == len(rows) - 1)
+        # Reavalia a vela atual com S/R M15/M30/H1/H4. O histórico acima não usa
+        # os níveis atuais para evitar look-ahead no cálculo do cooldown.
+        snap = _volume_poc_snapshot(rows, early_signal=False, use_ai=use_ai, mtf=mtf)
+        current_i = len(rows) - 1
+        current_allowed = bool(
+            snap and snap.get("confirmed") and snap.get("direction") in ("CALL", "PUT")
+            and (last_fired is None or last_fired == current_i or (current_i - last_fired) > VOLUME_POC_COOLDOWN_BARS)
+        )
     if not snap:
         return {"available":True, "direction":"NEUTRO", "confidence":0.0, "confirmed":False, "risk":"HIGH",
                 "strategy":name, "engine":engine_code, "provider":provider_code,
@@ -12176,12 +12375,16 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 volume_early_window=(VOLUME_POC_EARLY_MIN_REMAINING <= volume_seconds_to_entry <= VOLUME_POC_EARLY_WINDOW_BEFORE)
                 volume_use_ai=(engine == "VOLUME_AI")
                 volume_label=("Volume POC Estrutural" if volume_use_ai else "Volume POC Estrutural")
+                volume_mtf = await _volume_poc_fetch_mtf(
+                    symbol, market=market, request=request, iq_state=iq_state,
+                    current_closed=engine_closed, current_interval=interval
+                )
                 if volume_early_window:
-                    analysis = volume_poc_strategy(raw[-120:], interval, market=market, early_signal=True, use_ai=volume_use_ai)
+                    analysis = volume_poc_strategy(raw[-120:], interval, market=market, early_signal=True, use_ai=volume_use_ai, mtf=volume_mtf)
                     analysis["early_signal_window"] = True
                     analysis["seconds_to_entry_snapshot"] = round(volume_seconds_to_entry,1)
                 else:
-                    analysis = volume_poc_strategy(engine_closed, interval, market=market, early_signal=False, use_ai=volume_use_ai)
+                    analysis = volume_poc_strategy(engine_closed, interval, market=market, early_signal=False, use_ai=volume_use_ai, mtf=volume_mtf)
                     if analysis.get("confirmed"):
                         analysis["preview_direction"] = analysis.get("direction")
                         analysis["preview_confidence"] = analysis.get("confidence")
@@ -17939,7 +18142,11 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 )
             elif engine in ("VOLUME", "VOLUME_AI"):
                 volume_use_ai = engine == "VOLUME_AI"
-                tech = volume_poc_strategy(closed, interval, market=market, use_ai=volume_use_ai)
+                volume_mtf = await _volume_poc_fetch_mtf(
+                    sym, market=market, request=request, iq_state=iq_state,
+                    current_closed=closed, current_interval=interval
+                )
+                tech = volume_poc_strategy(closed, interval, market=market, use_ai=volume_use_ai, mtf=volume_mtf)
                 engine_label = "VOLUME POC ESTRUTURAL" if volume_use_ai else "VOLUME POC ESTRUTURAL"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why = str(tech.get("reason") or f"{engine_label} monitorando").replace("\n", " ")[:88]
@@ -19074,7 +19281,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="robot-mode-card" id="volumePocModeCard">
     <img src="__MEGA_IMAGE__" alt="Volume POC Estrutural">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">📊 VOLUME POC ESTRUTURAL</div>
+      <div class="robot-mode-title">📊 VOLUME POC ESTRUTURAL • S/R MULTI-TF</div>
       <div class="robot-mode-desc" id="volumePocModeDesc">Volume/POC + suporte/resistência + LTA/LTB • CALL em apoio comprador • PUT em resistência vendedora • sem IA/EA.</div>
     </div>
     <button id="volumePocPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
@@ -23399,7 +23606,7 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar SUNTZU ativo • procurando 2 de 3 confirmações</div>';
     rad();
   }else if(engine==='VOLUME'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='VOLUME POC ESTRUTURAL ONLINE • S/R + LTA/LTB • SINAL ~20S ANTES • PRÓXIMA VELA';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='VOLUME POC ESTRUTURAL ONLINE • S/R M15/M30/H1/H4 + LTA/LTB • SINAL ~20S ANTES • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📊 Volume POC Estrutural • volume + suporte/resistência + LTA/LTB • sem IA/EA • sinal congelado após disparo.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Volume POC Estrutural ativo • procurando volume em suporte/LTA ou resistência/LTB</div>';
     rad();
