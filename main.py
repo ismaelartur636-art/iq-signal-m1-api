@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.86.0"
+APP_VERSION = "3.86.1"
 PWA_VERSION = "v145"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -137,22 +137,23 @@ VELOCITY_RSI_BUY_MAX = max(VELOCITY_RSI_BUY_MIN + 1.0, min(85.0, float(os.getenv
 VELOCITY_RSI_SELL_MIN = max(15.0, min(55.0, float(os.getenv("VELOCITY_RSI_SELL_MIN", "28"))))
 VELOCITY_RSI_SELL_MAX = max(VELOCITY_RSI_SELL_MIN + 1.0, min(80.0, float(os.getenv("VELOCITY_RSI_SELL_MAX", "62"))))
 
-# RSI + ADX 4TF — perfil AFIADO para próxima vela, sempre com candle fechado.
-# RSI 9 mantém o timing do 4Period_RSI_Arrows; ADX/DMI atua somente como filtro
+# RSI + ADX 4TF — perfil AFIADO FLEX para próxima vela, sempre com candle fechado.
+# RSI 9 mantém a base do 4Period_RSI_Arrows; ADX/DMI atua como filtro
 # de força/direção. O motor prioriza pullbacks A FAVOR da tendência e não tenta
 # adivinhar reversão contra ADX forte. Engine key RSI5 é preservada por compatibilidade.
 RSI_ADX_PERIOD = max(7, min(30, int(os.getenv("RSI_ADX_PERIOD", "14"))))
 RSI_ADX_SMOOTH = max(7, min(30, int(os.getenv("RSI_ADX_SMOOTH", "14"))))
-RSI_ADX_MIN = max(15.0, min(40.0, float(os.getenv("RSI_ADX_MIN", "25"))))
-RSI_ADX_STRONG = max(RSI_ADX_MIN + 5.0, min(60.0, float(os.getenv("RSI_ADX_STRONG", "40"))))
-RSI_ADX_DI_EDGE = max(0.0, min(15.0, float(os.getenv("RSI_ADX_DI_EDGE", "2.0"))))
-RSI_PULLBACK_CALL_MIN = max(20.0, min(40.0, float(os.getenv("RSI_PULLBACK_CALL_MIN", "30"))))
-RSI_PULLBACK_CALL_MAX = max(RSI_PULLBACK_CALL_MIN + 2.0, min(55.0, float(os.getenv("RSI_PULLBACK_CALL_MAX", "48"))))
-RSI_PULLBACK_PUT_MIN = max(45.0, min(75.0, float(os.getenv("RSI_PULLBACK_PUT_MIN", "52"))))
-RSI_PULLBACK_PUT_MAX = max(RSI_PULLBACK_PUT_MIN + 2.0, min(85.0, float(os.getenv("RSI_PULLBACK_PUT_MAX", "70"))))
+RSI_ADX_MIN = max(15.0, min(40.0, float(os.getenv("RSI_ADX_MIN", "19"))))
+RSI_ADX_STRONG = max(RSI_ADX_MIN + 5.0, min(60.0, float(os.getenv("RSI_ADX_STRONG", "34"))))
+RSI_ADX_DI_EDGE = max(0.0, min(15.0, float(os.getenv("RSI_ADX_DI_EDGE", "0.8"))))
+RSI_PULLBACK_CALL_MIN = max(20.0, min(40.0, float(os.getenv("RSI_PULLBACK_CALL_MIN", "28"))))
+RSI_PULLBACK_CALL_MAX = max(RSI_PULLBACK_CALL_MIN + 2.0, min(55.0, float(os.getenv("RSI_PULLBACK_CALL_MAX", "52"))))
+RSI_PULLBACK_PUT_MIN = max(45.0, min(75.0, float(os.getenv("RSI_PULLBACK_PUT_MIN", "48"))))
+RSI_PULLBACK_PUT_MAX = max(RSI_PULLBACK_PUT_MIN + 2.0, min(85.0, float(os.getenv("RSI_PULLBACK_PUT_MAX", "72"))))
 RSI_EXTREME_LOW = max(10.0, min(35.0, float(os.getenv("RSI_EXTREME_LOW", "30"))))
 RSI_EXTREME_HIGH = max(65.0, min(90.0, float(os.getenv("RSI_EXTREME_HIGH", "70"))))
 RSI_ADX_PREALERT_SECONDS = max(15, min(40, int(os.getenv("RSI_ADX_PREALERT_SECONDS", "25"))))
+RSI_ADX_COOLDOWN_SECONDS = max(60, min(600, int(os.getenv("RSI_ADX_COOLDOWN_SECONDS", "120"))))
 
 # Sniper Pro MEGA — adaptação do indicador MQ5 para opções binárias.
 # Usa somente candles fechados e libera CALL/PUT para a próxima vela.
@@ -170,6 +171,7 @@ SNIPER_COOLDOWN_BARS = max(1, min(12, int(os.getenv("SNIPER_COOLDOWN_BARS", "2")
 
 
 # MEGA IA 3.86 — SUPER Z PMAX (modo de teste).
+# MEGA IA 3.86.1 — RSI + ADX AFIADO FLEX: ADX 19, DI 0.8, RSI mais amplo; M1 gatilha no M1.
 # Reconstrução equivalente baseada na especificação recebida: PMAX com cascata EMA 5/18,
 # multiplicador Supertrend adaptado por Z-Score, confirmação de volume, ADX/DMI e
 # autoavaliação causal. O slot interno SNIPER é reutilizado apenas por compatibilidade.
@@ -10281,19 +10283,19 @@ def _rsi_pure_frame(rows, label, seconds, period=9):
 
     # O MQ4 original apenas pintava enquanto RSI<38 ou RSI>62, inclusive em vela
     # aberta. Aqui o sinal nasce na recuperação/virada do extremo em candle fechado.
-    call_cross = bool(float(prev) < 38.0 <= float(cur))
-    put_cross = bool(float(prev) > 62.0 >= float(cur))
-    call_turn = bool(float(prev) <= 40.0 and slope >= 0.70)
-    put_turn = bool(float(prev) >= 60.0 and slope <= -0.70)
-    call_curve = bool(float(prev2) < float(prev) < float(cur) and min(float(prev2), float(prev)) <= 38.0 and float(cur) <= 48.0)
-    put_curve = bool(float(prev2) > float(prev) > float(cur) and max(float(prev2), float(prev)) >= 62.0 and float(cur) >= 52.0)
+    call_cross = bool(float(prev) < 40.0 <= float(cur))
+    put_cross = bool(float(prev) > 60.0 >= float(cur))
+    call_turn = bool(float(prev) <= 44.0 and slope >= 0.35)
+    put_turn = bool(float(prev) >= 56.0 and slope <= -0.35)
+    call_curve = bool(float(prev2) < float(prev) < float(cur) and min(float(prev2), float(prev)) <= 40.0 and float(cur) <= 52.0)
+    put_curve = bool(float(prev2) > float(prev) > float(cur) and max(float(prev2), float(prev)) >= 60.0 and float(cur) >= 48.0)
 
     call_trigger = call_cross or call_turn or call_curve
     put_trigger = put_cross or put_turn or put_curve
 
     # Viés bem leve: só RSI, sem preço/EMA/POC/volume.
-    call_support = bool(float(cur) <= 50.0 or (float(cur) <= 54.0 and slope > 0.0))
-    put_support = bool(float(cur) >= 50.0 or (float(cur) >= 46.0 and slope < 0.0))
+    call_support = bool(float(cur) <= 54.0 or (float(cur) <= 57.0 and slope > 0.0))
+    put_support = bool(float(cur) >= 46.0 or (float(cur) >= 43.0 and slope < 0.0))
 
     last_dt = rows[-1].get("datetime")
     return {
@@ -10338,16 +10340,21 @@ def _rsi_adx_snapshot(rows):
     }
 
 
-def rsi_pure_4tf_strategy(tf_rows, market="OPEN"):
-    """RSI + ADX 4TF — pullback a favor da tendência, causal e não-repaint.
+def rsi_pure_4tf_strategy(tf_rows, market="OPEN", trigger_interval="5min"):
+    """RSI + ADX 4TF FLEX — causal, não-repaint e para a próxima vela.
 
-    RSI 9 / PRICE_TYPICAL em M5/M15/M30/H1 fornece o timing. ADX 14 + DMI no M5
-    valida força e direção: CALL exige +DI dominante; PUT exige -DI dominante.
-    ADX abaixo de 25 não libera entrada. ADX muito alto não dispara reversão contra
-    a tendência; apenas marca possível exaustão e aguarda o RSI recuperar do extremo.
+    No M1, o próprio M1 vira o gatilho para não ficar esperando o fechamento do M5;
+    M5/M15/M30 servem como contexto. Nos demais tempos, preserva o perfil clássico
+    M5/M15/M30/H1. ADX/DMI é calculado no timeframe-gatilho.
     """
     data = dict(tf_rows or {})
-    specs = (("M5", "5min", 300), ("M15", "15min", 900), ("M30", "30min", 1800), ("H1", "1h", 3600))
+    use_m1 = str(trigger_interval or "").lower() in ("1min", "1m", "60", "m1")
+    specs = (
+        (("M1", "1min", 60), ("M5", "5min", 300), ("M15", "15min", 900), ("M30", "30min", 1800))
+        if use_m1
+        else (("M5", "5min", 300), ("M15", "15min", 900), ("M30", "30min", 1800), ("H1", "1h", 3600))
+    )
+    trigger_label, trigger_key, _ = specs[0]
     frames = []
     missing = []
     for label, key, secs in specs:
@@ -10357,14 +10364,14 @@ def rsi_pure_4tf_strategy(tf_rows, market="OPEN"):
         else:
             frames.append(f)
 
-    adx_ctx = _rsi_adx_snapshot(data.get("5min"))
-    name = "RSI + ADX AFIADO • 4TF • 9/14"
+    adx_ctx = _rsi_adx_snapshot(data.get(trigger_key))
+    name = "RSI + ADX AFIADO FLEX • 4TF • 9/14"
     if missing or len(frames) < 4 or adx_ctx is None:
         extra = []
         if missing:
             extra.append("RSI " + ", ".join(missing))
         if adx_ctx is None:
-            extra.append("ADX/DMI M5")
+            extra.append(f"ADX/DMI {trigger_label}")
         return {
             "available": True, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "strategy": name,
@@ -10376,29 +10383,29 @@ def rsi_pure_4tf_strategy(tf_rows, market="OPEN"):
         }
 
     by = {x["label"]: x for x in frames}
-    m5 = by["M5"]
-    higher = [by["M15"], by["M30"], by["H1"]]
-    r_now = float(m5["rsi"])
-    r_prev = float(m5["prev"])
-    slope = float(m5["slope"])
+    trigger = by[trigger_label]
+    higher = [by[label] for label, _, _ in specs[1:]]
+    r_now = float(trigger["rsi"])
+    r_prev = float(trigger["prev"])
+    slope = float(trigger["slope"])
 
     call_supports = sum(1 for x in higher if x["call_support"])
     put_supports = sum(1 for x in higher if x["put_support"])
 
     # Pullback afiado: RSI precisa estar retornando da região baixa/alta, não apenas
-    # permanecer extremo. Mantemos 38/62 como gatilho-base e aceitamos 30–48/52–70
-    # como faixa operacional para não perder o respiro dentro da tendência.
+    # permanecer extremo. O perfil FLEX abre o gatilho para 40/60 e usa zonas
+    # 28–52/48–72 para aumentar a frequência sem aceitar RSI totalmente neutro.
     call_pullback = bool(
-        m5["call_trigger"]
+        trigger["call_trigger"]
         and RSI_PULLBACK_CALL_MIN <= r_now <= RSI_PULLBACK_CALL_MAX
         and r_now > r_prev
-        and slope >= 0.70
+        and slope >= 0.35
     )
     put_pullback = bool(
-        m5["put_trigger"]
+        trigger["put_trigger"]
         and RSI_PULLBACK_PUT_MIN <= r_now <= RSI_PULLBACK_PUT_MAX
         and r_now < r_prev
-        and slope <= -0.70
+        and slope <= -0.35
     )
 
     adx_ok = bool(adx_ctx["trend_strong"])
@@ -10420,7 +10427,7 @@ def rsi_pure_4tf_strategy(tf_rows, market="OPEN"):
         di_gap = abs(float(adx_ctx["plus_di"]) - float(adx_ctx["minus_di"]))
         adx_bonus = min(8.0, max(0.0, float(adx_ctx["adx"]) - RSI_ADX_MIN) * 0.45)
         di_bonus = min(7.0, max(0.0, di_gap - RSI_ADX_DI_EDGE) * 0.30)
-        cross_bonus = 5.0 if (m5["call_cross"] if direction == "CALL" else m5["put_cross"]) else 2.0
+        cross_bonus = 5.0 if (trigger["call_cross"] if direction == "CALL" else trigger["put_cross"]) else 2.0
         confidence = 72.0 + supports * 4.0 + adx_bonus + di_bonus + cross_bonus
         if adx_ctx["adx_rising"]:
             confidence += 2.0
@@ -10430,18 +10437,18 @@ def rsi_pure_4tf_strategy(tf_rows, market="OPEN"):
         supporters = [x["label"] for x in higher if x["call_support"]]
         reason = (
             f"RSI+ADX CALL: tendência forte ADX {adx_ctx['adx']:.1f}, +DI {adx_ctx['plus_di']:.1f} > -DI {adx_ctx['minus_di']:.1f}; "
-            f"RSI9 M5 recuperou {r_prev:.1f}→{r_now:.1f} e {', '.join(supporters)} apoia(m) o pullback. Próxima vela."
+            f"RSI9 {trigger_label} recuperou {r_prev:.1f}→{r_now:.1f} e {', '.join(supporters)} apoia(m) o pullback. Próxima vela."
         )
     elif direction == "PUT":
         supporters = [x["label"] for x in higher if x["put_support"]]
         reason = (
             f"RSI+ADX PUT: tendência forte ADX {adx_ctx['adx']:.1f}, -DI {adx_ctx['minus_di']:.1f} > +DI {adx_ctx['plus_di']:.1f}; "
-            f"RSI9 M5 recuou {r_prev:.1f}→{r_now:.1f} e {', '.join(supporters)} apoia(m) o pullback. Próxima vela."
+            f"RSI9 {trigger_label} recuou {r_prev:.1f}→{r_now:.1f} e {', '.join(supporters)} apoia(m) o pullback. Próxima vela."
         )
     else:
         blockers = []
         if not adx_ok:
-            blockers.append(f"ADX {adx_ctx['adx']:.1f}<25")
+            blockers.append(f"ADX {adx_ctx['adx']:.1f}<{RSI_ADX_MIN:.0f}")
         elif not call_trend and not put_trend:
             blockers.append(f"DI sem direção (+DI {adx_ctx['plus_di']:.1f}/-DI {adx_ctx['minus_di']:.1f})")
         if exhaustion_low:
@@ -10449,22 +10456,23 @@ def rsi_pure_4tf_strategy(tf_rows, market="OPEN"):
         elif exhaustion_high:
             blockers.append("exaustão alta: aguarda RSI recuar")
         if adx_ok and call_trend and not call_pullback:
-            blockers.append(f"aguarda pullback CALL RSI 30–48 (M5 {r_now:.1f})")
+            blockers.append(f"aguarda pullback CALL RSI {RSI_PULLBACK_CALL_MIN:.0f}–{RSI_PULLBACK_CALL_MAX:.0f} ({trigger_label} {r_now:.1f})")
         elif adx_ok and put_trend and not put_pullback:
-            blockers.append(f"aguarda pullback PUT RSI 52–70 (M5 {r_now:.1f})")
+            blockers.append(f"aguarda pullback PUT RSI {RSI_PULLBACK_PUT_MIN:.0f}–{RSI_PULLBACK_PUT_MAX:.0f} ({trigger_label} {r_now:.1f})")
         if call_pullback and call_supports < 1:
             blockers.append("CALL sem apoio RSI dos TF maiores")
         if put_pullback and put_supports < 1:
             blockers.append("PUT sem apoio RSI dos TF maiores")
+        frame_text = " • ".join(f"{x['label']} {x['rsi']:.1f}" for x in frames)
         reason = (
             f"RSI+ADX monitorando • ADX {adx_ctx['adx']:.1f} • +DI {adx_ctx['plus_di']:.1f} • -DI {adx_ctx['minus_di']:.1f} • "
-            f"RSI M5 {r_now:.1f} • M15 {by['M15']['rsi']:.1f} • M30 {by['M30']['rsi']:.1f} • H1 {by['H1']['rsi']:.1f}. "
+            f"RSI {frame_text}. "
             + (" • ".join(blockers[:3]) if blockers else "Aguardando confluência.")
         )
 
     event_key = ""
     if direction in ("CALL", "PUT"):
-        event_key = f"RSI_ADX:{direction}:{m5.get('datetime')}"
+        event_key = f"RSI_ADX:{direction}:{trigger.get('datetime')}"
 
     return {
         "available": True,
@@ -10497,7 +10505,7 @@ def rsi_pure_4tf_strategy(tf_rows, market="OPEN"):
             "adx_min": RSI_ADX_MIN,
             "adx_extreme": RSI_ADX_STRONG,
             "di_edge": RSI_ADX_DI_EDGE,
-            "trigger_timeframe": "M5",
+            "trigger_timeframe": trigger_label,
             "min_higher_rsi_supports": 1,
             "adx": round(float(adx_ctx["adx"]), 2),
             "plus_di": round(float(adx_ctx["plus_di"]), 2),
@@ -10506,7 +10514,7 @@ def rsi_pure_4tf_strategy(tf_rows, market="OPEN"):
             "trend_extreme": bool(adx_ctx["trend_extreme"]),
             "frames": frames,
             "source_indicator": "4Period_RSI_Arrows.mq4",
-            "adaptation": "RSI9_4TF_PLUS_ADX14_DMI_PULLBACK_CLOSED_CANDLE",
+            "adaptation": "RSI9_4TF_FLEX_PLUS_ADX14_DMI_PULLBACK_CLOSED_CANDLE",
         },
     }
 
@@ -12811,15 +12819,16 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     analysis["early_signal_window"] = False
                     analysis["seconds_to_entry_snapshot"] = round(samurai_seconds_to_entry,1)
             elif engine == "RSI5":
-                # RSI PURO baseado no 4Period_RSI_Arrows: M5/M15/M30/H1, RSI 9, PRICE_TYPICAL.
+                # RSI + ADX FLEX: no M1 usa M1 como gatilho e M5/M15/M30 como contexto.
                 rsi_tf_rows = {}
-                for _tf in ("5min", "15min", "30min", "1h"):
+                _rsi_tfs = (("1min", "5min", "15min", "30min") if interval == "1min" else ("5min", "15min", "30min", "1h"))
+                for _tf in _rsi_tfs:
                     if market == "IQ_OTC":
                         _raw_tf = await iq_ea_candles(iq_state, symbol, _tf, 90, regular_market=False)
                     else:
                         _raw_tf = await candles(symbol, _tf, 90, "OPEN", None, request=request)
                     rsi_tf_rows[_tf] = _raw_tf[:-1] if len(_raw_tf) > 1 else _raw_tf
-                analysis = rsi_pure_4tf_strategy(rsi_tf_rows, market=market)
+                analysis = rsi_pure_4tf_strategy(rsi_tf_rows, market=market, trigger_interval=interval)
             elif engine == "BIGRISE":
                 # BTC FORCE MULTIATIVOS: S/R e LTA/LTB são bônus; DOM só existe para BTC/USD OPEN.
                 if market == "IQ_OTC":
@@ -13231,6 +13240,23 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         return base
 
                 if engine == "RSI5":
+                    # Evita metralhar sinais: no M1 o gatilho pode mudar a cada minuto,
+                    # mas mantemos um cooldown curto por ativo/timeframe entre entradas.
+                    last_rsi5_ts = float(release_state.get("last_rsi_adx_signal_ts", 0.0) or 0.0)
+                    rsi5_remaining = max(0, int(RSI_ADX_COOLDOWN_SECONDS - (time.time() - last_rsi5_ts))) if last_rsi5_ts else 0
+                    if rsi5_remaining > 0:
+                        base["status"] = "ONLINE • RSI + ADX AFIADO • COOLDOWN CURTO"
+                        base["reason"] = f"Nova oportunidade encontrada, mas aguarda mais {rsi5_remaining}s para evitar sinais repetidos no mesmo ativo."
+                        base["rsi_adx_cooldown_seconds"] = RSI_ADX_COOLDOWN_SECONDS
+                        base["rsi_adx_cooldown_remaining"] = rsi5_remaining
+                        base["direction"] = "NEUTRO"
+                        base["entry_time"] = None
+                        base["expiry_time"] = None
+                        base["risk"] = "HIGH"
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
+
                     # O gatilho pertence ao último candle FECHADO. Só entra na abertura
                     # imediatamente seguinte; não carregamos um sinal velho para outra vela.
                     rsi5_age = max(0.0, (now() - current_boundary(interval)).total_seconds())
@@ -13325,7 +13351,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 if engine == "RSI5":
                     base["non_repaint_after_release"] = True
                     base["signal_snapshot"] = "LAST_CLOSED_CANDLE"
-                    base["rsi_pure"] = {"period": 9, "timeframes": ["M5","M15","M30","H1"], "lower": 38, "upper": 62, "applied_price": "TYPICAL"}
+                    base["rsi_pure"] = {"period": 9, "timeframes": (["M1","M5","M15","M30"] if interval == "1min" else ["M5","M15","M30","H1"]), "lower": 40, "upper": 60, "applied_price": "TYPICAL", "adx_min": RSI_ADX_MIN, "di_edge": RSI_ADX_DI_EDGE, "cooldown_seconds": RSI_ADX_COOLDOWN_SECONDS}
 
                 if engine == "SMART" and moment_gate.get("confirmed"):
                     base["reason"] = (str(base.get("reason") or "") +
@@ -13355,6 +13381,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     release_state["last_btc_force_signal_ts"] = time.time()
                     base["btc_force_signal_gap_seconds"] = BTC_FORCE_SIGNAL_COOLDOWN_SECONDS
                     base["btc_force_signal_gap_remaining"] = 0
+                if engine == "RSI5":
+                    release_state["last_rsi_adx_signal_ts"] = time.time()
+                    base["rsi_adx_cooldown_seconds"] = RSI_ADX_COOLDOWN_SECONDS
+                    base["rsi_adx_cooldown_remaining"] = 0
 
                 # Só as IAs entram no ciclo com Gale. EAs continuam com sua
                 # regra própria de entrada direta/sem Gale. Fallback local da IA
@@ -17217,7 +17247,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = feed_src
                     data["feed_label"] = _feed_source_label(feed_src)
                     data["feed_fallback"] = bool(feed_info.get("fallback"))
-                    data["feed_message"] = "RSI + ADX Afiado usando RSI9 4TF com ADX/DMI14 no M5; ADX mínimo 25 e entrada a favor da tendência."
+                    data["feed_message"] = "RSI + ADX Afiado FLEX: no M1 usa gatilho M1; ADX/DMI14 mínimo 19, RSI mais solto e entrada na próxima vela."
                 else:
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
@@ -17971,7 +18001,8 @@ async def pre_signals(
                 # como aviso. A entrada oficial continua dependendo do fechamento e
                 # da confirmação RSI9 4TF + ADX/DMI14 no /signal-ai.
                 rsi_preview_rows = {}
-                for _tf in ("5min", "15min", "30min", "1h"):
+                _rsi_tfs = (("1min", "5min", "15min", "30min") if interval == "1min" else ("5min", "15min", "30min", "1h"))
+                for _tf in _rsi_tfs:
                     if requested_market == "IQ_OTC":
                         _tf_rows = await iq_ea_candles(
                             iq_state, symbol, _tf, 90, regular_market=False
@@ -17981,7 +18012,7 @@ async def pre_signals(
                             symbol, _tf, 90, "OPEN", None, request=request
                         )
                     rsi_preview_rows[_tf] = list(_tf_rows or [])
-                rsi_preview = rsi_pure_4tf_strategy(rsi_preview_rows, market=requested_market)
+                rsi_preview = rsi_pure_4tf_strategy(rsi_preview_rows, market=requested_market, trigger_interval=interval)
                 preview = (
                     {
                         "direction": rsi_preview.get("direction"),
@@ -18628,13 +18659,14 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 )
             elif engine == "RSI5":
                 rsi_tf_rows = {}
-                for _tf in ("5min", "15min", "30min", "1h"):
+                _rsi_tfs = (("1min", "5min", "15min", "30min") if interval == "1min" else ("5min", "15min", "30min", "1h"))
+                for _tf in _rsi_tfs:
                     if market == "IQ_OTC":
                         _raw_tf = await iq_ea_candles(iq_state, sym, _tf, 80, regular_market=False)
                     else:
                         _raw_tf = await candles(sym, _tf, 80, "OPEN", None, request=request)
                     rsi_tf_rows[_tf] = _raw_tf[:-1] if len(_raw_tf) > 1 else _raw_tf
-                tech = rsi_pure_4tf_strategy(rsi_tf_rows, market=market)
+                tech = rsi_pure_4tf_strategy(rsi_tf_rows, market=market, trigger_interval=interval)
                 engine_label = "RSI + ADX AFIADO"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why = str(tech.get("reason") or "RSI + ADX Afiado monitorando").replace("\n", " ")[:88]
