@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.89.1"
-PWA_VERSION = "v149"
+APP_VERSION = "3.89.2"
+PWA_VERSION = "v150"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -8109,7 +8109,7 @@ def rsx7_next_candle_strategy(cs, timeframe="1min", market="OPEN"):
     }
 
 
-def _sgh_confirmed_swings(rows, pivot_len=SGH_PIVOT_LEN):
+def _sgh_confirmed_swings(rows, pivot_len=3):
     """Retorna swings confirmados, sem usar o pivô móvel da ponta do ZigZag."""
     rows = list(rows or [])
     highs, lows = [], []
