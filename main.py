@@ -8,7 +8,7 @@ import threading
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import httpx
 
@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.90.0"
+APP_VERSION = "3.90.1"
 PWA_VERSION = "v151"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
