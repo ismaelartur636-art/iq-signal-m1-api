@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.89.2"
-PWA_VERSION = "v150"
+APP_VERSION = "3.90.0"
+PWA_VERSION = "v151"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -333,6 +333,13 @@ GEMINI_PREFILTER_MIN = float(os.getenv("GEMINI_PREFILTER_MIN", "64"))
 # 3.35: triagem da IA principal um pouco menos rígida que antes.
 # A saída final continua protegida por confiança, risco, XGBoost e gate de price action.
 SMART_PREFILTER_MIN = float(os.getenv("SMART_PREFILTER_MIN", "55"))
+# MEGA IA 3.90 — IA LEITURA DO GRÁFICO PROFISSIONAL.
+# A IA externa lê OHLCV fechado, recebe um resumo causal de múltiplos timeframes
+# e só libera a próxima vela quando a leitura, o XGBoost e o price action forem coerentes.
+CHART_AI_MIN_MTF_STRENGTH = max(25.0, min(80.0, float(os.getenv("CHART_AI_MIN_MTF_STRENGTH", "42"))))
+CHART_AI_MTF_BLOCK_OPPOSITE = max(55.0, min(95.0, float(os.getenv("CHART_AI_MTF_BLOCK_OPPOSITE", "68"))))
+CHART_AI_MTF_CACHE_TTL = max(20.0, min(180.0, float(os.getenv("CHART_AI_MTF_CACHE_TTL", "45"))))
+CHART_AI_HISTORY_BARS = max(60, min(120, int(os.getenv("CHART_AI_HISTORY_BARS", "72"))))
 GEMINI_QUOTA_TZ = ZoneInfo("America/Los_Angeles")
 _gemini_quota_lock = threading.RLock()
 _gemini_quota_state = {
@@ -11797,8 +11804,167 @@ def _pure_ai_candle_pattern_filter(cs, expected_direction="NEUTRO"):
     }
 
 
-async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=None):
-    """IA PURA com gatilhos independentes + micro-momento real da vela atual.
+
+_chart_ai_mtf_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def _chart_ai_timeframe_summary(rows, label="TF"):
+    """Resumo causal do gráfico para a IA: estrutura, força, localização e S/R.
+
+    Usa somente candles já fechados. Não tenta prever por conta própria; o resumo
+    apenas fornece contexto numérico compacto para a IA e para o gate MTF.
+    """
+    data = list(rows or [])
+    if len(data) < 10:
+        return {"label": label, "ready": False, "trend": "NEUTRO", "strength": 0.0}
+
+    def fv(x, default=0.0):
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+    data = data[-80:]
+    recent = data[-20:]
+    closes = [fv(x.get("close")) for x in recent]
+    highs = [fv(x.get("high")) for x in recent]
+    lows = [fv(x.get("low")) for x in recent]
+    opens = [fv(x.get("open")) for x in recent]
+    vols = [max(0.0, fv(x.get("volume"))) for x in recent]
+    ranges = [max(h-l, 1e-12) for h, l in zip(highs, lows)]
+    bodies = [abs(c-o) for o, c in zip(opens, closes)]
+    body_ratios = [b/r for b, r in zip(bodies, ranges)]
+
+    moves = [closes[i]-closes[i-1] for i in range(1, len(closes))]
+    travel = sum(abs(x) for x in moves)
+    efficiency = abs(closes[-1]-closes[0]) / max(travel, 1e-12)
+    drift = closes[-1]-closes[0]
+
+    half = max(4, len(recent)//2)
+    old = recent[:-half] or recent[:half]
+    new = recent[-half:]
+    old_hi = max(fv(x.get("high")) for x in old)
+    old_lo = min(fv(x.get("low")) for x in old)
+    new_hi = max(fv(x.get("high")) for x in new)
+    new_lo = min(fv(x.get("low")) for x in new)
+    hh = new_hi > old_hi
+    hl = new_lo > old_lo
+    lh = new_hi < old_hi
+    ll = new_lo < old_lo
+
+    bull = sum(1 for x in recent[-8:] if fv(x.get("close")) > fv(x.get("open")))
+    bear = sum(1 for x in recent[-8:] if fv(x.get("close")) < fv(x.get("open")))
+    trend = "NEUTRO"
+    if drift > 0 and (hh or hl) and bull >= bear:
+        trend = "BULL"
+    elif drift < 0 and (lh or ll) and bear >= bull:
+        trend = "BEAR"
+
+    structure_points = (int(hh) + int(hl)) if trend == "BULL" else ((int(lh) + int(ll)) if trend == "BEAR" else 0)
+    dominance = abs(bull-bear) / 8.0
+    strength = 24.0 + efficiency*42.0 + dominance*20.0 + structure_points*7.0
+    strength = round(clamp(strength, 0, 100), 1)
+
+    price = closes[-1]
+    support = resistance = None
+    zone_radius = 0.0
+    try:
+        levels = _support_resistance_levels(data, str(label))
+        supports = [float(x.get("price")) for x in levels.get("supports", []) if x.get("price") is not None]
+        resistances = [float(x.get("price")) for x in levels.get("resistances", []) if x.get("price") is not None]
+        support = min(supports, key=lambda x: abs(price-x)) if supports else None
+        resistance = min(resistances, key=lambda x: abs(price-x)) if resistances else None
+        zone_radius = float(levels.get("tolerance") or 0.0)
+    except Exception:
+        pass
+
+    avg_vol = sum(vols[-10:-1]) / max(1, len(vols[-10:-1])) if len(vols) > 1 else 0.0
+    vol_ratio = (vols[-1] / avg_vol) if avg_vol > 0 else 0.0
+    hi20, lo20 = max(highs), min(lows)
+    position = (price-lo20) / max(hi20-lo20, 1e-12)
+
+    return {
+        "label": label,
+        "ready": True,
+        "trend": trend,
+        "strength": strength,
+        "efficiency": round(efficiency, 3),
+        "bull_8": bull,
+        "bear_8": bear,
+        "structure": {"HH": hh, "HL": hl, "LH": lh, "LL": ll},
+        "avg_body_ratio": round(sum(body_ratios[-6:]) / max(1, len(body_ratios[-6:])), 3),
+        "last_body_ratio": round(body_ratios[-1], 3),
+        "range_position": round(position, 3),
+        "support": support,
+        "resistance": resistance,
+        "distance_support": (abs(price-support) if support is not None else None),
+        "distance_resistance": (abs(price-resistance) if resistance is not None else None),
+        "zone_radius": zone_radius,
+        "volume_ratio": round(vol_ratio, 2),
+        "last_close": price,
+    }
+
+
+async def _chart_ai_mtf_context(symbol, interval, base_rows, market="OPEN", request=None, iq_state=None):
+    """Busca/resume timeframes maiores e calcula consenso direcional.
+
+    OPEN usa o mesmo roteador de candles do app. IQ_OTC usa exclusivamente a sessão
+    IQ Option recebida pelo usuário. Falha de um TF não derruba a análise principal.
+    """
+    cache_key = f"{market}|{symbol}|{interval}|CHART_AI_MTF"
+    cached = _chart_ai_mtf_cache.get(cache_key)
+    if cached and (time.time() - float(cached[0])) < CHART_AI_MTF_CACHE_TTL:
+        return dict(cached[1])
+
+    base_sec = int(INTERVALS.get(interval, 60))
+    targets = [("M5", "5min"), ("M15", "15min"), ("H1", "1h"), ("H4", "4h")]
+    summaries = {"BASE": _chart_ai_timeframe_summary(base_rows, interval)}
+    errors = {}
+
+    for label, tf in targets:
+        tf_sec = int(INTERVALS.get(tf, 0) or 0)
+        if tf_sec <= base_sec:
+            continue
+        try:
+            if market == "IQ_OTC":
+                if not iq_state:
+                    raise RuntimeError("sessão IQ Option ausente")
+                raw_tf = await iq_ea_candles(iq_state, symbol, tf, 100, regular_market=False)
+            else:
+                raw_tf = await candles(symbol, tf, 100, "OPEN", None, request=request)
+            closed_tf = raw_tf[:-1] if len(raw_tf) > 1 else raw_tf
+            summaries[label] = _chart_ai_timeframe_summary(closed_tf, label)
+        except Exception as exc:
+            errors[label] = str(exc)[:120]
+
+    usable = [x for k, x in summaries.items() if k != "BASE" and x.get("ready")]
+    bull = sum(float(x.get("strength") or 0.0) for x in usable if x.get("trend") == "BULL")
+    bear = sum(float(x.get("strength") or 0.0) for x in usable if x.get("trend") == "BEAR")
+    bull_n = sum(1 for x in usable if x.get("trend") == "BULL")
+    bear_n = sum(1 for x in usable if x.get("trend") == "BEAR")
+    dominant = "NEUTRO"
+    if bull_n and bull > bear * 1.12:
+        dominant = "CALL"
+    elif bear_n and bear > bull * 1.12:
+        dominant = "PUT"
+    total = bull + bear
+    consensus_strength = round((max(bull, bear) / total * 100.0) if total > 0 else 0.0, 1)
+
+    out = {
+        "summaries": summaries,
+        "dominant_direction": dominant,
+        "consensus_strength": consensus_strength,
+        "bull_timeframes": bull_n,
+        "bear_timeframes": bear_n,
+        "errors": errors,
+        "source": "CLOSED_OHLCV_MTF",
+    }
+    _chart_ai_mtf_cache[cache_key] = (time.time(), dict(out))
+    return out
+
+
+async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=None, request=None, iq_state=None):
+    """IA LEITURA DO GRÁFICO PROFISSIONAL com ensemble e contexto MTF.
 
     Gatilhos independentes:
       1) padrão de vela forte em OHLC fechado;
@@ -11880,6 +12046,18 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
             "available": False, "ready": False, "confirmed": False,
             "direction": "NEUTRO", "confidence": 0.0,
             "reason": f"XGBoost falhou: {str(exc)[:160]}",
+        }
+
+    # Contexto profissional do próprio gráfico em múltiplos timeframes.
+    try:
+        mtf_context = await _chart_ai_mtf_context(
+            symbol, interval, rows, market=market, request=request, iq_state=iq_state
+        )
+    except Exception as exc:
+        mtf_context = {
+            "summaries": {"BASE": _chart_ai_timeframe_summary(rows, interval)},
+            "dominant_direction": "NEUTRO", "consensus_strength": 0.0,
+            "errors": {"MTF": str(exc)[:140]}, "source": "BASE_ONLY",
         }
 
     # GATILHO 1 — padrão de vela independente.
@@ -12044,14 +12222,14 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
 
     data = [
         {"time": x["datetime"], "o": x["open"], "h": x["high"], "l": x["low"], "c": x["close"], "v": x.get("volume", 0)}
-        for x in rows[-60:]
+        for x in rows[-CHART_AI_HISTORY_BARS:]
     ]
 
-    prompt = f"""Você é a inteligência artificial autônoma da MEGA IA, especializada em prever SOMENTE a direção da PRÓXIMA vela completa.
+    prompt = f"""Você é o motor profissional IA LEITURA DO GRÁFICO da MEGA IA. Sua tarefa é analisar o gráfico como um analista quantitativo de price action e prever SOMENTE a direção da PRÓXIMA vela completa.
 Ativo: {symbol}. Timeframe: {interval}. Mercado: {market}.
 OBJETIVO PRINCIPAL: aumentar WIN DIRETO e reduzir dependência de Gale. Não use NEUTRO por excesso de cautela: quando houver duas evidências coerentes de price action e nenhuma contradição forte, escolha CALL ou PUT; use NEUTRO quando o contexto estiver realmente ambíguo.
-Este é o MODO IA PURA: NÃO use RSI, MACD, Bollinger, médias móveis, ATR, estocástico, ADX, score técnico ou qualquer indicador calculado pelo aplicativo.
-Use SOMENTE os candles OHLCV FECHADOS fornecidos. Não há candle em formação nesta entrada.
+Este é o MODO LEITURA PROFISSIONAL DO GRÁFICO: não use RSI, MACD, Bollinger, médias móveis, ATR, estocástico, ADX ou outros indicadores como atalho. Baseie a leitura em OHLCV fechado, estrutura, zonas, price action, contexto MTF e a camada estatística fornecida.
+Use SOMENTE dados de candles OHLCV FECHADOS e os RESUMOS MTF causais fornecidos. Não há candle futuro e nenhuma informação posterior à decisão.
 
 Avalie price action de curto prazo: sequência de altas/baixas, corpos, pavios, rejeição, continuidade, rompimento real, falso rompimento, estrutura recente, aceleração/desaceleração, alternância/lateralização, localização dentro do range recente e volume apenas se estiver disponível.
 A previsão é para UMA vela à frente, não para a tendência geral.
@@ -12067,6 +12245,14 @@ REGRAS DE QUALIDADE:
 
 Classifique o setup como TREND, REVERSAL, BREAKOUT, REJECTION ou NONE.
 
+CONTEXTO MULTI-TIMEFRAME DO GRÁFICO (M5/M15/H1/H4 conforme disponível):
+{json.dumps(mtf_context, ensure_ascii=False)}
+REGRAS MTF:
+- O timeframe de entrada decide o timing; timeframes maiores servem para contexto e zonas.
+- Se dois ou mais timeframes maiores estiverem fortemente contra a direção proposta, prefira NEUTRO.
+- Uma reação clara em suporte/resistência pode justificar reversão mesmo contra a tendência maior, mas exija rejeição forte no timeframe de entrada.
+- Não transforme tendência geral em sinal automático para a próxima vela.
+
 CAMADA ESTATÍSTICA XGBOOST (não copie cegamente; use como evidência quantitativa):
 {json.dumps(xgb_signal, ensure_ascii=False)}
 CONTEXTO LOCAL FORTE, se houver:
@@ -12075,8 +12261,8 @@ MICRO-MOMENTO AO VIVO DA EA VELA ATUAL, se confirmado por ticks reais (use como 
 {json.dumps(moment_hint if moment_fp else {}, ensure_ascii=False)}
 
 Retorne SOMENTE JSON válido:
-{{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"setup":"TREND|REVERSAL|BREAKOUT|REJECTION|NONE","reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
-Candles: {json.dumps(data, ensure_ascii=False)}"""
+{{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"setup":"TREND|REVERSAL|BREAKOUT|REJECTION|NONE","reason":"curto","risk":"LOW|MEDIUM|HIGH","entry_logic":"por que a próxima vela tem vantagem","invalidation":"o que invalidaria esta leitura"}}
+Candles do timeframe de entrada: {json.dumps(data, ensure_ascii=False)}"""
 
     try:
         parsed, provider = await _external_ai_json(prompt)
@@ -12092,6 +12278,8 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             risk = "HIGH"
         confirmed = bool(parsed.get("confirmed", False))
         original_reason = str(parsed.get("reason", ""))[:220]
+        entry_logic = str(parsed.get("entry_logic", ""))[:220]
+        invalidation = str(parsed.get("invalidation", ""))[:220]
 
         # Ensemble: quando o XGBoost está pronto, GPT e XGBoost precisam concordar.
         xgb_ready = bool(xgb_signal.get("ready"))
@@ -12130,6 +12318,15 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
 
         gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
 
+        # Gate MTF: não força tendência, apenas veta oposição estrutural forte.
+        mtf_dom = str(mtf_context.get("dominant_direction") or "NEUTRO").upper()
+        mtf_strength = float(mtf_context.get("consensus_strength") or 0.0)
+        mtf_agrees = bool(direction in ("CALL", "PUT") and mtf_dom == direction)
+        mtf_opposes = bool(
+            direction in ("CALL", "PUT") and mtf_dom in ("CALL", "PUT")
+            and mtf_dom != direction and mtf_strength >= CHART_AI_MTF_BLOCK_OPPOSITE
+        )
+
         # 3.44: alternância leve não veta automaticamente quando as três camadas
         # independentes apontam o mesmo lado. O override NÃO vale para HIGH e
         # NÃO ignora discordância do XGBoost.
@@ -12145,7 +12342,7 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         ):
             gate_ok = True
             gate_override = True
-            gate_reason = "alternância leve aceita por alinhamento Luna + XGBoost + EA Vela Atual"
+            gate_reason = "alternância leve aceita por alinhamento IA + XGBoost + EA Vela Atual"
 
         xgb_validation = float(xgb_signal.get("validation_accuracy") or 0.0)
         # Score de qualidade: a confiança da IA pesa mais, mas a estatística do
@@ -12161,6 +12358,10 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         if moment_aligned:
             moment_bonus = min(6.0, 3.0 + max(0.0, float(moment_hint.get("score") or 0.0) - MOMENT_EA_CONFIRM_SCORE) * 0.15)
             analysis_quality += moment_bonus
+        if mtf_agrees and mtf_strength >= CHART_AI_MIN_MTF_STRENGTH:
+            analysis_quality += min(5.0, 2.0 + (mtf_strength - CHART_AI_MIN_MTF_STRENGTH) * 0.08)
+        elif mtf_opposes:
+            analysis_quality -= min(8.0, 4.0 + (mtf_strength - CHART_AI_MTF_BLOCK_OPPOSITE) * 0.10)
         analysis_quality = round(max(0.0, min(100.0, analysis_quality)), 1)
 
         # Quando a EA Vela Atual confirma ticks reais fortes na mesma direção,
@@ -12190,6 +12391,8 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
                 blocked_reason = "risco médio/alto exige XGBoost pronto"
             elif risk == "HIGH" and (not xgb_confirmed or xgb_confidence < 64.0 or xgb_validation < 54.0):
                 blocked_reason = "risco alto exige XGBoost forte e validação temporal maior"
+            elif mtf_opposes and setup not in ("REVERSAL", "REJECTION"):
+                blocked_reason = f"contexto MTF forte aponta {mtf_dom} ({mtf_strength:.0f}%) contra a leitura {direction}"
             elif analysis_quality < quality_min:
                 blocked_reason = f"qualidade combinada {analysis_quality:.0f}% abaixo do mínimo {quality_min:.0f}%"
             elif not gate_ok:
@@ -12225,6 +12428,14 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             "candle_pattern_filter": candle_pattern_filter,
             "local_trigger_hint": local_trigger_hint,
             "moment_ea_hint": moment_hint if moment_fp else {},
+            "chart_reading": {
+                "mode": "PROFESSIONAL_MTF_NEXT_CANDLE",
+                "mtf": mtf_context,
+                "entry_logic": entry_logic,
+                "invalidation": invalidation,
+                "input": "CLOSED_OHLCV",
+                "next_candle": True,
+            },
             "xgboost": xgb_signal,
             "ensemble": {
                 "xgb_ready": xgb_ready,
@@ -12236,6 +12447,10 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
                 "analysis_quality": analysis_quality,
                 "quality_min": quality_min,
                 "moment_aligned": bool(moment_aligned),
+                "mtf_direction": mtf_dom,
+                "mtf_strength": round(mtf_strength, 1),
+                "mtf_agrees": bool(mtf_agrees),
+                "mtf_opposes": bool(mtf_opposes),
                 "gate_override": bool(gate_override),
                 "required_confidence": round(required_conf, 1),
                 "openai_primary": bool(OAI_KEY),
@@ -13274,9 +13489,19 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 iq_state, symbol, interval, 150, regular_market=False
             )
         else:
-            # SMART pede histórico maior para treinar/validar o XGBoost.
-            # Os demais motores mantêm a janela anterior para reduzir carga.
-            request_n = 240 if (engine == "SMART" and market == "OPEN") else 150
+            # IA LEITURA DO GRÁFICO pede histórico maior para treinar/validar o XGBoost.
+            # No OTC ela usa exclusivamente a sessão IQ Option real.
+            request_n = 240 if engine == "SMART" else 150
+            if engine == "SMART" and market == "IQ_OTC" and not iq_state:
+                out = neutral_signal(
+                    symbol, interval, market,
+                    "IA LEITURA DO GRÁFICO • IQ OPTION OFFLINE",
+                    "Conecte a IQ Option para a IA profissional analisar candles OTC reais.",
+                    source_state="WAITING",
+                )
+                out.update({"strategy":"IA LEITURA DO GRÁFICO","mode":"PROFESSIONAL_MTF_NEXT_CANDLE","selected_engine":"SMART","feed_source":"IQ_OPTION_OTC"})
+                cache[key] = (time.time(), out)
+                return out
             raw = await candles(symbol, interval, request_n, market, iq_state, request=request)
     except HTTPException as exc:
         if engine == "EA":
@@ -13405,8 +13630,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     if ai_only and SELECTABLE_ENGINES_ENABLED:
         tf_label = {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval)
         if engine == "SMART":
-            engine_title = "INTELIGÊNCIA ARTIFICIAL"
-            engine_mode = "PURE_AI"
+            engine_title = "IA LEITURA DO GRÁFICO"
+            engine_mode = "PROFESSIONAL_MTF_NEXT_CANDLE"
         elif engine == "EA":
             engine_title = "EA RSI + VALUE CHART + XGBOOST"
             engine_mode = "EA_XGBOOST_AUTONOMOUS"
@@ -13471,7 +13696,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "RSX7", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "VTOB", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+        if market != "OPEN" and engine not in ("SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "RSX7", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "VTOB", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -13479,7 +13704,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 source_state="READY",
             )
             out.update({
-                "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
+                "strategy": "IA LEITURA DO GRÁFICO" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
                 "mode": engine_mode,
                 "selected_engine": engine,
                 "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
@@ -13503,7 +13728,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
                 }.get(engine, "DISABLED")),
                 "technical": (
-                    {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
+                    {"input": "OHLCV_CLOSED_CANDLES", "mode": "PROFESSIONAL_MTF_NEXT_CANDLE", "layers": ["PRICE_ACTION", "MTF_STRUCTURE", "XGBOOST", "EXTERNAL_AI", "ADAPTIVE_RESULTS"]}
                     if engine == "SMART"
                     else ({"triple_confirmation": True, "inputs": ["RSI_14", "VALUE_CHART", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]}))
                 ),
@@ -13521,7 +13746,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             if engine == "SMART":
                 moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
                 analysis = await openai_direct_signal(
-                    symbol, interval, engine_closed, market, moment_hint=moment_hint
+                    symbol, interval, engine_closed, market, moment_hint=moment_hint,
+                    request=request, iq_state=iq_state
                 )
             elif engine == "EA":
                 analysis = await ea_xgboost_strategy(
@@ -13756,7 +13982,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 source_state="WAITING",
             )
             out.update({
-                "strategy": "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
+                "strategy": "IA LEITURA DO GRÁFICO" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
                 "mode": engine_mode,
                 "selected_engine": engine,
             })
@@ -13794,7 +14020,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             }.get(engine, "DISABLED")),
             "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "RSX7", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "VTOB", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "HIGH").upper(),
             "strategy": (
-                "INTELIGÊNCIA ARTIFICIAL PURA" if engine == "SMART"
+                "IA LEITURA DO GRÁFICO" if engine == "SMART"
                 else (analysis.get("strategy") or (
                     "EA RSI + VALUE CHART + XGBOOST" if engine == "EA"
                     else "ROBÔ RUBIK ADAPTADO" if engine == "RUBIK"
@@ -13821,7 +14047,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
             "technical": (
-                {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI", "direct_win_filter": analysis.get("direct_win_filter", {}), "setup": analysis.get("setup", "NONE")}
+                {
+                    "input": "OHLCV_CLOSED_CANDLES",
+                    "mode": "PROFESSIONAL_MTF_NEXT_CANDLE",
+                    "layers": ["PRICE_ACTION", "MTF_STRUCTURE", "XGBOOST", "EXTERNAL_AI", "ADAPTIVE_RESULTS"],
+                    "direct_win_filter": analysis.get("direct_win_filter", {}),
+                    "setup": analysis.get("setup", "NONE"),
+                    "chart_reading": analysis.get("chart_reading", {}),
+                    "ensemble": analysis.get("ensemble", {}),
+                }
                 if engine == "SMART"
                 else ({"config_hidden": True, "mode": "EA_FORCE_MOVEMENT", "non_repaint": True} if engine == "FORCE" else analysis)
             ),
@@ -13835,6 +14069,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "auto_trade_allowed": bool(engine != "SAMURAI"),
         }
 
+        if engine == "SMART":
+            base["chart_reading"] = analysis.get("chart_reading", {})
+            base["ensemble"] = analysis.get("ensemble", {})
+
         if engine == "SMART" and analysis.get("fallback"):
             base["status"] = "FALLBACK LOCAL • SOMENTE MONITORAMENTO"
             base["source_state"] = "READY_FALLBACK"
@@ -13843,13 +14081,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             reason = str(analysis.get("reason") or "IA temporariamente indisponível.")
             low = reason.lower()
             if "api_key" in low or "api key" in low or "não configurada" in low:
-                base["status"] = "IA PURA • CONFIGURAÇÃO DA API AUSENTE"
+                base["status"] = "IA LEITURA DO GRÁFICO • CONFIGURAÇÃO DA API AUSENTE"
             elif "429" in low or "quota" in low or "rate limit" in low:
-                base["status"] = "IA PURA • LIMITE DA API"
+                base["status"] = "IA LEITURA DO GRÁFICO • LIMITE DA API"
             elif "timeout" in low or "timed out" in low:
-                base["status"] = "IA PURA • TIMEOUT"
+                base["status"] = "IA LEITURA DO GRÁFICO • TIMEOUT"
             else:
-                base["status"] = "IA PURA • TEMPORARIAMENTE INDISPONÍVEL"
+                base["status"] = "IA LEITURA DO GRÁFICO • TEMPORARIAMENTE INDISPONÍVEL"
 
         if analysis.get("confirmed") and analysis.get("direction") in ("CALL", "PUT"):
             direction_now = analysis["direction"]
@@ -13874,7 +14112,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # MEGA IA 3.39 — confirmação invisível da vela em formação.
             # Quando houve tape REAL de ticks durante o pré-alerta para esta mesma
             # entrada, ele vira uma confirmação adicional. Sem tape real, a EA é
-            # apenas contexto e não bloqueia o ensemble Luna + XGBoost.
+            # apenas contexto e não bloqueia o ensemble IA + XGBoost.
             moment_gate = {"available": False, "required": False, "confirmed": False}
             if engine == "SMART":
                 try:
@@ -14209,7 +14447,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     announce, entry, expiry = entry_window(interval, entry_mode)
                 smart_status = (
                     "FALLBACK LOCAL • BLOQUEADO PARA ENTRADA" if analysis.get("fallback")
-                    else ("SINAL IA + EA VELA CONFIRMADO" if (engine == "SMART" and moment_gate.get("confirmed")) else "SINAL IA PURA LIBERADO")
+                    else ("SINAL IA + EA VELA CONFIRMADO" if (engine == "SMART" and moment_gate.get("confirmed")) else "SINAL IA LEITURA DO GRÁFICO LIBERADO")
                 )
                 base.update({
                     "direction": direction_now,
@@ -14398,16 +14636,16 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     pass
             out = neutral_signal(
                 symbol, interval, market,
-                "IA PURA • NOVO CICLO EM %02d:%02d" % divmod(ai_cycle_remaining, 60),
+                "IA LEITURA DO GRÁFICO • NOVO CICLO EM %02d:%02d" % divmod(ai_cycle_remaining, 60),
                 "A IA já liberou um sinal neste ciclo e continua aguardando a próxima janela de 5 minutos.",
                 source_state="READY",
             )
-            out.update({"strategy":"IA PURA", "mode":"AI_ONLY", "technical":{"disabled":True,"mode":"AI_ONLY"},
+            out.update({"strategy":"IA LEITURA DO GRÁFICO", "mode":"PROFESSIONAL_MTF_NEXT_CANDLE", "technical":{"input":"OHLCV_CLOSED_CANDLES","mtf":True},
                         "ai_cycle_remaining":ai_cycle_remaining, "ai_cycle_seconds":ai_cycle_seconds})
             cache[key] = (time.time(), out)
             return out
 
-        ai = await openai_direct_signal(symbol, interval, raw, market)
+        ai = await openai_direct_signal(symbol, interval, raw, market, request=request, iq_state=iq_state)
         base = {
             "symbol": symbol,
             "interval": interval,
@@ -14417,10 +14655,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "entry_time": None,
             "announce_time": None,
             "expiry_time": None,
-            "status": "IA PURA • VARREDURA 5s • ANÁLISE INTELIGENTE",
+            "status": "IA LEITURA DO GRÁFICO • VARREDURA 5s • ANÁLISE MTF",
             "ai_confirmed": bool(ai.get("confirmed", False)),
             "risk": ai.get("risk", "HIGH"),
-            "strategy": "IA PURA",
+            "strategy": "IA LEITURA DO GRÁFICO",
             "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                 "EA": "XGBOOST_RSI_VALUE_CHART",
                 "RUBIK": "LOCAL_RUBIK_ADAPTED",
@@ -14450,7 +14688,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
         if ai.get("available") and ai.get("confirmed") and ai.get("direction") in ("CALL", "PUT"):
             base["direction"] = ai["direction"]
-            base["status"] = "SINAL IA PURA LIBERADO"
+            base["status"] = "SINAL IA LEITURA DO GRÁFICO LIBERADO"
             announce, entry, expiry = entry_window(interval, entry_mode)
             base["entry_time"] = iso(entry)
             base["announce_time"] = iso(announce)
@@ -14489,13 +14727,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             if locked_direction == base["direction"]:
                 base.update(
                     direction="NEUTRO", entry_time=None, announce_time=None, expiry_time=None,
-                    status="IA PURA • AGUARDANDO NOVO SINAL",
+                    status="IA LEITURA DO GRÁFICO • AGUARDANDO NOVO SINAL",
                     reason="O sinal anterior da IA já foi utilizado; aguardando uma nova decisão.",
                     risk="HIGH",
                 )
             else:
                 release_state["locked_direction"] = base["direction"]
-                release_state["locked_strategy"] = "IA PURA"
+                release_state["locked_strategy"] = "IA LEITURA DO GRÁFICO"
                 release_state["active_signal"] = dict(base)
                 release_state["last_ai_signal_ts"] = time.time()
         else:
@@ -17913,7 +18151,7 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
             "reason": "Boa quando a estrutura e o price action estão organizados; perde qualidade em ruído/lateralização."
         },
         {
-            "key":"SMART","name":"INTELIGÊNCIA ARTIFICIAL","score":smart,
+            "key":"SMART","name":"IA LEITURA DO GRÁFICO","score":smart,
             "supported":market=="OPEN","operational":market=="OPEN" and ai_ready,
             "reason": "Mais flexível em cenários mistos, desde que o preço não esteja excessivamente lateral e a IA externa esteja disponível."
         },
@@ -18044,7 +18282,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Motor inválido.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "RSX7", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "VTOB", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+    if engine in ("SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "RSX7", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "VTOB", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -18892,11 +19130,12 @@ async def pre_signals(
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "RSX7", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "VTOB", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "RSX7", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "VTOB", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
     if fallback_twelve:
         market = "OPEN"
-    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "RSX7", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "VTOB", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and not iq_state:
+    if requested_market == "IQ_OTC" and engine in ("SMART", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "RSX7", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "VTOB", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and not iq_state:
         wait_label = {
+            "SMART": "IA Leitura do Gráfico",
             "EA": "EA Tripla",
             "RUBIK": "Robô Rubik Adaptado",
             "LARRY": "Larry Breakout",
@@ -18976,8 +19215,8 @@ async def pre_signals(
     for symbol in batch:
         key = f"{group_key}|{symbol}"
         try:
-            pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (180 if engine == "SNIPER" else (120 if engine == "RUBIK" else 90)))
-            if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "RSX7", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "VTOB", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and requested_market == "IQ_OTC":
+            pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (180 if engine == "SNIPER" else (150 if engine == "SMART" else (120 if engine == "RUBIK" else 90))))
+            if engine in ("SMART", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "RSX7", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "VTOB", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
                 )
@@ -19085,7 +19324,7 @@ async def pre_signals(
 
             # 3.40: no SMART a EA Vela Atual varre os ticks MESMO quando o antigo
             # pré-sinal técnico ainda não apareceu. Um micro-momento forte cria
-            # somente um CANDIDATO; o sinal final ainda depende de Luna + XGBoost.
+            # somente um CANDIDATO; o sinal final ainda depende de IA + XGBoost.
             if engine == "SMART":
                 try:
                     requested_direction = preview["direction"] if preview else "AUTO"
@@ -19103,7 +19342,7 @@ async def pre_signals(
                         preview = {
                             "direction": moment_ea["direction"],
                             "confidence": round(max(74.0, min(88.0, 70.0 + max(0.0, mscore - 60.0) * 0.45)), 1),
-                            "strategy": "EA VELA ATUAL + LUNA + XGBOOST",
+                            "strategy": "EA VELA ATUAL + IA + XGBOOST",
                             "reason": (
                                 f"Ticks reais detectaram micro-momento {moment_ea['direction']} "
                                 f"com força {mscore:.0f}%; candidato enviado para confirmação da IA."
@@ -19207,7 +19446,7 @@ async def pre_signals(
                     else (
                         "Pré-sinais calculados com a vela em formação. "
                         "Na Inteligência Artificial, a EA Vela Atual mede força/micro-momento antes da entrada; "
-                        "o CALL/PUT final ainda passa por Luna + XGBoost + filtros de risco."
+                        "o CALL/PUT final ainda passa por IA + XGBoost + filtros de risco."
                     )
                 )
             )
@@ -19437,7 +19676,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "RSX7", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "VTOB", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("SMART", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "RSX7", "SNIPER", "ALPHAX", "PRESIDEN", "SGH", "SMC", "VTOB", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
     if fallback_twelve:
         market = "OPEN"
 
@@ -19861,21 +20100,21 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     if direction != "NEUTRO"
                     else f"{engine_label} • MONITORANDO"
                 )
-            elif market == "OPEN":
+            elif market == "OPEN" or engine == "SMART":
                 if engine == "SMART":
-                    tech = await openai_direct_signal(sym, interval, closed, market)
+                    tech = await openai_direct_signal(sym, interval, closed, market, request=request, iq_state=iq_state)
                     direction = tech.get("direction", "NEUTRO") if tech.get("available") and tech.get("confirmed") else "NEUTRO"
-                    engine_label = "IA PURA"
+                    engine_label = "IA LEITURA DO GRÁFICO"
                     is_fallback = bool(tech.get("fallback"))
                     if not tech.get("available"):
-                        status_text = "IA PURA • INDISPONÍVEL"
+                        status_text = "IA LEITURA DO GRÁFICO • INDISPONÍVEL"
                     elif direction != "NEUTRO":
-                        status_text = ("FALLBACK LOCAL OHLCV • OPORTUNIDADE ENCONTRADA" if is_fallback else "IA PURA • OPORTUNIDADE ENCONTRADA")
+                        status_text = ("FALLBACK LOCAL OHLCV • OPORTUNIDADE ENCONTRADA" if is_fallback else "IA LEITURA DO GRÁFICO • OPORTUNIDADE ENCONTRADA")
                     else:
                         # Mostra no próprio radar por que a IA não liberou sinal.
                         # Facilita distinguir falta de oportunidade de erro/API.
                         why = str(tech.get("reason") or "sem vantagem clara").replace("\n", " ")[:78]
-                        status_text = (("FALLBACK LOCAL OHLCV • MONITORANDO • " if is_fallback else "IA PURA • MONITORANDO • ") + why)
+                        status_text = (("FALLBACK LOCAL OHLCV • MONITORANDO • " if is_fallback else "IA LEITURA DO GRÁFICO • MONITORANDO • ") + why)
                 else:
                     tech = await graphic_ai_strategy(sym, interval, closed, market, request=request, iq_state=iq_state, fetch_htf=False)
                     direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
@@ -20855,7 +21094,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • VOLUME-TREND OB + SMC FLEX • SUPER Z PMAX + RSI/ADX + AlphaX • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • IA LEITURA DO GRÁFICO MTF + XGBoost • RSX/SMC/AlphaX • cTrader/IQ</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -20915,8 +21154,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="robot-mode-card" id="aiModeCard">
     <img src="__MEGA_IMAGE__" alt="Inteligência Artificial">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">🧠 INTELIGÊNCIA ARTIFICIAL</div>
-      <div class="robot-mode-desc" id="aiModeDesc">IA pura • lê somente os candles do gráfico e decide CALL, PUT ou NEUTRO por preço.</div>
+      <div class="robot-mode-title">🧠 IA LEITURA DO GRÁFICO</div>
+      <div class="robot-mode-desc" id="aiModeDesc">Leitura profissional do gráfico • M1 + contexto M5/M15/H1/H4 • OpenAI/Gemini + XGBoost • CALL/PUT/AGUARDAR • próxima vela.</div>
     </div>
     <button id="aiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -22828,7 +23067,7 @@ let momentStudyUpdatedAt=0;
 function momentStudyEngineName(key){
   const names={
     GRAPH_AI:'🧠 IA GRÁFICA',
-    SMART:'🤖 INTELIGÊNCIA ARTIFICIAL',
+    SMART:'🧠 IA LEITURA DO GRÁFICO',
     LARRY:'⚡ LARRY BREAKOUT',
     VELOCITY:'⚡ VELOCITY FLOW',
     ALPHAX:'🧬 ALPHAX RELAY',
@@ -24129,7 +24368,12 @@ function drawChart(a,force=false){
       }
       if(!Number.isFinite(v)) v=Number(data[currentIndex]&&data[currentIndex].close);
       if(!Number.isFinite(v)) return null;
-      return {dir,idx,x,v,future};
+      let timeLabel='';
+      if(Number.isFinite(entryMs)){
+        const ed=new Date(entryMs);
+        if(!Number.isNaN(ed.getTime())) timeLabel=ed.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+      }
+      return {dir,idx,x,v,future,timeLabel};
     }
 
     function paintEntryMarker(marker,large){
@@ -24162,7 +24406,10 @@ function drawChart(a,force=false){
       chartCtx.fillText(marker.dir,x+9,y-8);
       if(marker.future){
         chartCtx.font='bold 9px Arial';
-        chartCtx.fillText('ENTRADA',x+9,y+6);
+        chartCtx.fillText('ENTRADA'+(marker.timeLabel?' '+marker.timeLabel:''),x+9,y+6);
+      }else if(marker.timeLabel){
+        chartCtx.font='bold 9px Arial';
+        chartCtx.fillText(marker.timeLabel,x+9,y+6);
       }
       chartCtx.restore();
     }
@@ -25525,9 +25772,9 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar EA Tripla ativo • RSI + Value Chart + XGBoost • OPEN/OTC</div>';
     rad();
   }else if(engine==='SMART'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='INTELIGÊNCIA ARTIFICIAL ONLINE • IA PURA ANALISANDO CANDLES';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 Inteligência Artificial selecionada.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar IA pura ativo • analisando candles</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA LEITURA DO GRÁFICO ONLINE • MTF + XGBOOST + IA EXTERNA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Leitura do Gráfico selecionada • próxima vela.</div>';
+    if(radar) radar.innerHTML='<div>📡 IA Leitura do Gráfico ativa • MTF + price action + XGBoost</div>';
     rad();
   }else if(engine==='GRAPH_AI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA GRÁFICA ONLINE • PADRÕES + H1 + DOW H4 + LTA/LTB';
@@ -26740,7 +26987,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='RSX7'?'RSX 7':ek==='VTOB'?'VOLUME-TREND ORDER BLOCK':ek==='SMC'?'SMC FVG + HL':ek==='SGH'?'SMART GOLD HUNTER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='SNIPER'?'SUPER Z PMAX':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'INTELIGÊNCIA ARTIFICIAL':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='RSX7'?'RSX 7':ek==='VTOB'?'VOLUME-TREND ORDER BLOCK':ek==='SMC'?'SMC FVG + HL':ek==='SGH'?'SMART GOLD HUNTER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='SNIPER'?'SUPER Z PMAX':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
