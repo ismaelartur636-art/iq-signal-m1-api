@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.94.1"
-PWA_VERSION = "v154"
+APP_VERSION = "3.94.2"
+PWA_VERSION = "v155"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -10668,6 +10668,53 @@ def rsi_pure_4tf_strategy(tf_rows, market="OPEN", trigger_interval="5min"):
     }
 
 
+def _smart_trend_filter(cs):
+    """Trend Filter exclusivo da IA LEITURA DO GRÁFICO.
+
+    Usa somente candles fechados. Verde = viés comprador; vermelho = viés vendedor.
+    A cor é definida pelo alinhamento EMA 9/21 e o preço em relação à EMA rápida.
+    O filtro NÃO cria sinal: ele apenas autoriza a direção já escolhida pela IA.
+    """
+    rows = list(cs or [])
+    if len(rows) < 24:
+        return {
+            "enabled": True, "ready": False, "color": "NEUTRO",
+            "direction": "NEUTRO", "aligned": False,
+            "reason": "Trend Filter aguardando candles fechados suficientes.",
+        }
+    try:
+        closes = [float(x.get("close", 0) or 0) for x in rows]
+        e9 = ema(closes, 9)
+        e21 = ema(closes, 21)
+        price = float(closes[-1])
+        if e9 is None or e21 is None or price <= 0:
+            raise ValueError("EMA indisponível")
+
+        if float(e9) > float(e21) and price >= float(e9):
+            color, direction = "VERDE", "CALL"
+            reason = "Trend Filter VERDE: somente CALL permitido."
+        elif float(e9) < float(e21) and price <= float(e9):
+            color, direction = "VERMELHO", "PUT"
+            reason = "Trend Filter VERMELHO: somente PUT permitido."
+        else:
+            color, direction = "NEUTRO", "NEUTRO"
+            reason = "Trend Filter sem alinhamento completo; entrada bloqueada."
+
+        return {
+            "enabled": True, "ready": True, "color": color,
+            "direction": direction, "aligned": direction in ("CALL", "PUT"),
+            "ema9": round(float(e9), 10), "ema21": round(float(e21), 10),
+            "price": round(price, 10), "reason": reason,
+            "closed_candle_only": True,
+        }
+    except Exception as exc:
+        return {
+            "enabled": True, "ready": False, "color": "NEUTRO",
+            "direction": "NEUTRO", "aligned": False,
+            "reason": f"Trend Filter indisponível: {str(exc)[:120]}",
+        }
+
+
 def _pure_ai_price_context(cs):
     """Resume somente price action/OHLCV para filtrar entradas fracas da IA PURA.
 
@@ -11299,8 +11346,18 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
         cached["next_review_seconds"] = max(0, int(min(heartbeat, max(min_gap, heartbeat - (now_ts - last_call)))))
         return cached
 
-    # Contexto de price action usado somente pela IA externa e pelo gate final dela.
+    # Contexto de price action usado pela IA e pelo gate final.
     prefilter_ok, prefilter_score, prefilter_reason, price_ctx = _gemini_candidate_prefilter(rows, interval)
+
+    # 3.94.2 — Trend Filter OBRIGATÓRIO somente na IA LEITURA DO GRÁFICO.
+    # VERDE autoriza apenas CALL; VERMELHO autoriza apenas PUT.
+    # O IA + Volume POC continua exatamente com o FLEX anterior.
+    smart_namespace = str(state_namespace or "SMART").upper() == "SMART"
+    trend_filter = _smart_trend_filter(rows) if smart_namespace else {
+        "enabled": False, "ready": True, "color": "IGNORADO",
+        "direction": "NEUTRO", "aligned": True,
+        "reason": "Trend Filter exclusivo da IA LEITURA DO GRÁFICO.",
+    }
 
     # Camada 1: XGBoost calcula uma probabilidade independente da próxima vela.
     # O treino roda fora do event loop e o resultado nunca libera entrada sozinho.
@@ -11505,6 +11562,10 @@ CONTEXTO LOCAL FORTE, se houver:
 MICRO-MOMENTO AO VIVO DA EA VELA ATUAL, se confirmado por ticks reais (use como evidência adicional, nunca cegamente):
 {json.dumps(moment_hint if moment_fp else {}, ensure_ascii=False)}
 
+TREND FILTER OBRIGATÓRIO (somente quando enabled=true):
+{json.dumps(trend_filter, ensure_ascii=False)}
+REGRA: se estiver VERDE, somente CALL pode ser escolhido; se estiver VERMELHO, somente PUT; se NEUTRO, responda NEUTRO.
+
 Retorne SOMENTE JSON válido:
 {{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"setup":"TREND|REVERSAL|BREAKOUT|REJECTION|NONE","reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
 Candles: {json.dumps(data, ensure_ascii=False)}"""
@@ -11540,7 +11601,7 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         # XGBoost e a EA Vela Atual convergem. HIGH continua mais seletivo.
         # 3.94.1 — pequena trava somente na IA LEITURA DO GRÁFICO.
         # O motor IA + Volume POC continua com os limites FLEX da 3.94.0.
-        main_smart_tight = str(state_namespace or "SMART").upper() == "SMART"
+        main_smart_tight = smart_namespace
         low_min = 60.0 if main_smart_tight else 58.0
         if risk == "LOW":
             required_conf = low_min
@@ -11614,6 +11675,12 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         if direction in ("CALL", "PUT"):
             if not confirmed:
                 blocked_reason = "IA não confirmou a própria leitura"
+            elif smart_namespace and not bool(trend_filter.get("ready")):
+                blocked_reason = "Trend Filter ainda sem dados suficientes"
+            elif smart_namespace and str(trend_filter.get("direction") or "NEUTRO").upper() != direction:
+                tf_color = str(trend_filter.get("color") or "NEUTRO").upper()
+                tf_dir = str(trend_filter.get("direction") or "NEUTRO").upper()
+                blocked_reason = f"Trend Filter {tf_color} não autoriza {direction}; direção permitida: {tf_dir}"
             elif confidence < required_conf:
                 blocked_reason = f"confiança {confidence:.0f}% abaixo do mínimo seletivo {required_conf:.0f}%"
             elif xgb_ready and xgb_direction in ("CALL", "PUT") and xgb_direction != direction and xgb_confidence >= 68.0 and xgb_validation >= 54.0:
@@ -11656,6 +11723,7 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             "local_trigger_hint": local_trigger_hint,
             "moment_ea_hint": moment_hint if moment_fp else {},
             "xgboost": xgb_signal,
+            "trend_filter": trend_filter,
             "ensemble": {
                 "xgb_ready": xgb_ready,
                 "xgb_confirmed": xgb_confirmed,
@@ -11680,6 +11748,7 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
                 "gate_ok": bool(gate_ok),
                 "blocked": bool(blocked_reason),
                 "price_context": price_ctx,
+                "trend_filter": trend_filter,
             },
         }
         st["last_call"] = now_ts
@@ -13167,6 +13236,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "training_mode": bool(engine == "SAMURAI"),
             "auto_trade_allowed": bool(engine != "SAMURAI"),
         }
+
+        if engine == "SMART":
+            base["trend_filter"] = analysis.get("trend_filter", {})
 
         if engine == "SMART" and analysis.get("fallback"):
             base["status"] = "FALLBACK LOCAL • SOMENTE MONITORAMENTO"
@@ -20041,7 +20113,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="IA Leitura do Gráfico">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧠 IA LEITURA DO GRÁFICO</div>
-      <div class="robot-mode-desc" id="aiModeDesc">Leitura do gráfico por price action + IA • candles fechados • CALL, PUT ou NEUTRO • próxima vela.</div>
+      <div class="robot-mode-desc" id="aiModeDesc">ONLINE FLEX • IA decide com 1 evidência • Trend Filter obrigatório: VERDE só CALL / VERMELHO só PUT • próxima vela.</div>
     </div>
     <button id="aiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -24433,7 +24505,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: IA Gráfica lendo padrões, H1, Dow H4 e LTA/LTB sem RSI.'
     : 'OFFLINE: IA Gráfica pausada.';
   if(aiModeDesc) aiModeDesc.textContent=aiEnabled
-    ? 'ONLINE FLEX: IA Leitura do Gráfico com menos travas • IA decide com 1 evidência forte ou 2 moderadas • próxima vela.'
+    ? 'ONLINE FLEX: IA Leitura do Gráfico • Trend Filter obrigatório: 🟢 só CALL / 🔴 só PUT • próxima vela.'
     : 'OFFLINE: IA Leitura do Gráfico pausada.';
   if(eaModeDesc) eaModeDesc.textContent=eaEnabled
     ? 'ONLINE: RSI 14 + Value Chart + XGBoost • sinal somente com tripla confirmação • OPEN/OTC.'
@@ -24561,9 +24633,9 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar EA Tripla ativo • RSI + Value Chart + XGBoost • OPEN/OTC</div>';
     rad();
   }else if(engine==='SMART'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA LEITURA DO GRÁFICO FLEX ONLINE • MENOS TRAVAS • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Leitura do Gráfico FLEX selecionada • filtros históricos e confirmação fraca de ticks não travam mais.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar IA pura ativo • analisando candles</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA LEITURA DO GRÁFICO FLEX ONLINE • TREND FILTER OBRIGATÓRIO • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Leitura do Gráfico FLEX • Trend Filter alinhado obrigatório: 🟢 só CALL / 🔴 só PUT.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar IA Leitura ativo • aguardando IA + Trend Filter na mesma direção</div>';
     rad();
   }else if(engine==='GRAPH_AI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA GRÁFICA ONLINE • PADRÕES + H1 + DOW H4 + LTA/LTB';
@@ -25419,6 +25491,15 @@ async function sig(announce=false){
     }
 
     if(engine==='VELOCITY' && velocityTab && velocityTab.classList.contains('active')) renderVelocityTab(cur);
+
+    if(engine==='SMART' && aiModeDesc){
+      const tf=(cur&&cur.trend_filter)||{};
+      const tfColor=String(tf.color||'NEUTRO').toUpperCase();
+      const tfDir=String(tf.direction||'NEUTRO').toUpperCase();
+      const tfEmoji=tfColor==='VERDE'?'🟢':(tfColor==='VERMELHO'?'🔴':'⚪');
+      const permit=tfDir==='CALL'?'só CALL':(tfDir==='PUT'?'só PUT':'sem entrada');
+      aiModeDesc.textContent=`ONLINE FLEX • IA decide com 1 evidência • Trend Filter: ${tfEmoji} ${tfColor} → ${permit} • precisa estar alinhado.`;
+    }
 
     if(announce){
       showRobot();
