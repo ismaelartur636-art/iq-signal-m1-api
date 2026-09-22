@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.94.2"
-PWA_VERSION = "v155"
+APP_VERSION = "3.94.3"
+PWA_VERSION = "v156"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -10669,11 +10669,11 @@ def rsi_pure_4tf_strategy(tf_rows, market="OPEN", trigger_interval="5min"):
 
 
 def _smart_trend_filter(cs):
-    """Trend Filter exclusivo da IA LEITURA DO GRÁFICO.
+    """Trend Filter compartilhado pela IA LEITURA DO GRÁFICO e IA + VOLUME POC.
 
     Usa somente candles fechados. Verde = viés comprador; vermelho = viés vendedor.
     A cor é definida pelo alinhamento EMA 9/21 e o preço em relação à EMA rápida.
-    O filtro NÃO cria sinal: ele apenas autoriza a direção já escolhida pela IA.
+    O filtro NÃO cria sinal: ele apenas autoriza sinais já apontados pelos motores.
     """
     rows = list(cs or [])
     if len(rows) < 24:
@@ -11839,6 +11839,9 @@ async def ai_volume_poc_consensus_signal(
     """Volume POC cria o candidato; IA Leitura do Gráfico precisa concordar."""
     raw_rows=list(raw or [])
     closed_rows=list(closed or [])
+    # 3.94.3 — Trend Filter também é obrigatório no IA + Volume POC.
+    # VERDE autoriza somente CALL; VERMELHO autoriza somente PUT; NEUTRO bloqueia.
+    trend_filter = _smart_trend_filter(closed_rows)
     seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
     early_window=VOLUME_POC_EARLY_MIN_REMAINING <= seconds_to_entry <= VOLUME_POC_EARLY_WINDOW_BEFORE
     try:
@@ -11850,12 +11853,39 @@ async def ai_volume_poc_consensus_signal(
     if not early_window:
         monitor=volume_poc_strategy(closed_rows,interval,market=market,early_signal=False,use_ai=False,mtf=mtf)
         preview=str(monitor.get("direction") or "NEUTRO").upper()
-        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":f"IA + Volume POC monitorando • confirmação final nos últimos {VOLUME_POC_EARLY_SIGNAL_SECONDS}s antes da próxima vela (faltam {int(seconds_to_entry)}s).","early_signal_window":False,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"candidate_direction":preview if preview in ("CALL","PUT") else "NEUTRO","consensus":{"required":True,"agreed":False,"stage":"WAITING_VOLUME_WINDOW","volume_direction":preview if preview in ("CALL","PUT") else "NEUTRO","ai_direction":"AGUARDANDO","ai_called":False},"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"gale_signal":False}
+        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":f"IA + Volume POC monitorando • Volume + IA + Trend Filter precisam alinhar • confirmação final nos últimos {VOLUME_POC_EARLY_SIGNAL_SECONDS}s antes da próxima vela (faltam {int(seconds_to_entry)}s).","early_signal_window":False,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"candidate_direction":preview if preview in ("CALL","PUT") else "NEUTRO","trend_filter":trend_filter,"consensus":{"required":True,"agreed":False,"stage":"WAITING_VOLUME_WINDOW","volume_direction":preview if preview in ("CALL","PUT") else "NEUTRO","trend_direction":str(trend_filter.get("direction") or "NEUTRO").upper(),"trend_color":str(trend_filter.get("color") or "NEUTRO").upper(),"ai_direction":"AGUARDANDO","ai_called":False},"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"gale_signal":False}
     volume_vote=volume_poc_strategy(raw_rows[-120:],interval,market=market,early_signal=True,use_ai=False,mtf=mtf)
     volume_dir=str(volume_vote.get("direction") or "NEUTRO").upper()
     volume_conf=float(volume_vote.get("confidence") or 0.0)
     if not (volume_vote.get("confirmed") and volume_dir in ("CALL","PUT")):
-        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":"Volume POC ainda não encontrou CALL/PUT válido; a IA fica em espera até existir candidato.","early_signal_window":True,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"candidate_direction":"NEUTRO","volume_vote":volume_vote,"consensus":{"required":True,"agreed":False,"stage":"WAITING_VOLUME_TRIGGER","volume_direction":"NEUTRO","volume_confidence":round(volume_conf,1),"ai_direction":"AGUARDANDO","ai_called":False},"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"gale_signal":False}
+        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":"Volume POC ainda não encontrou CALL/PUT válido; IA e Trend Filter ficam em espera até existir candidato.","early_signal_window":True,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"candidate_direction":"NEUTRO","volume_vote":volume_vote,"trend_filter":trend_filter,"consensus":{"required":True,"agreed":False,"stage":"WAITING_VOLUME_TRIGGER","volume_direction":"NEUTRO","volume_confidence":round(volume_conf,1),"trend_direction":str(trend_filter.get("direction") or "NEUTRO").upper(),"trend_color":str(trend_filter.get("color") or "NEUTRO").upper(),"ai_direction":"AGUARDANDO","ai_called":False},"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"gale_signal":False}
+    # Antes de chamar a IA, o candidato do Volume POC precisa estar alinhado ao Trend Filter.
+    trend_ready = bool(trend_filter.get("ready"))
+    trend_dir = str(trend_filter.get("direction") or "NEUTRO").upper()
+    trend_color = str(trend_filter.get("color") or "NEUTRO").upper()
+    trend_agreed = bool(trend_ready and trend_dir in ("CALL", "PUT") and trend_dir == volume_dir)
+    if not trend_agreed:
+        if not trend_ready:
+            why = "Trend Filter ainda sem dados suficientes; candidato do Volume POC bloqueado."
+        elif trend_dir not in ("CALL", "PUT"):
+            why = "Trend Filter NEUTRO; candidato do Volume POC bloqueado até surgir direção verde/vermelha."
+        else:
+            why = f"Volume POC apontou {volume_dir}, mas Trend Filter está {trend_color} e autoriza somente {trend_dir}; entrada cancelada."
+        return {
+            "available": True, "direction": "NEUTRO", "confidence": 0.0, "confirmed": False, "risk": "HIGH",
+            "strategy": "IA + VOLUME POC", "engine": "VOLUME_AI", "provider": "AI_VOLUME_POC_CONSENSUS",
+            "reason": why, "candidate_direction": volume_dir, "preview_direction": volume_dir,
+            "preview_confidence": round(volume_conf,1), "early_signal_window": True,
+            "seconds_to_entry_snapshot": round(seconds_to_entry,1), "volume_vote": volume_vote,
+            "trend_filter": trend_filter,
+            "consensus": {
+                "required": True, "agreed": False, "stage": "TREND_FILTER_BLOCK",
+                "volume_direction": volume_dir, "volume_confidence": round(volume_conf,1),
+                "trend_direction": trend_dir, "trend_color": trend_color, "trend_agreed": False,
+                "ai_direction": "AGUARDANDO", "ai_called": False,
+            },
+            "mtf_error": mtf_error, "non_repaint_after_release": True, "next_candle": True, "gale_signal": False,
+        }
     try:
         ai_vote=await openai_direct_signal(symbol,interval,closed_rows[-220:] if len(closed_rows)>220 else closed_rows,market,moment_hint=None,state_namespace="VOLUME_POC_CONSENSUS")
     except Exception as exc:
@@ -11864,16 +11894,16 @@ async def ai_volume_poc_consensus_signal(
     ai_conf=float(ai_vote.get("confidence") or 0.0)
     ai_ok=bool(ai_vote.get("available",True) and ai_dir in ("CALL","PUT") and ai_conf >= 54.0)
     agreed=bool(ai_ok and ai_dir==volume_dir)
-    consensus={"required":True,"agreed":agreed,"stage":"CONFIRMED" if agreed else "DISAGREEMENT_OR_NEUTRAL","volume_direction":volume_dir,"volume_confidence":round(volume_conf,1),"ai_direction":ai_dir if ai_dir in ("CALL","PUT") else "NEUTRO","ai_confidence":round(ai_conf,1),"ai_called":True,"ai_provider":ai_vote.get("provider") or "EXTERNAL_AI"}
+    consensus={"required":True,"agreed":agreed,"stage":"CONFIRMED" if agreed else "DISAGREEMENT_OR_NEUTRAL","volume_direction":volume_dir,"volume_confidence":round(volume_conf,1),"trend_direction":trend_dir,"trend_color":trend_color,"trend_agreed":True,"ai_direction":ai_dir if ai_dir in ("CALL","PUT") else "NEUTRO","ai_confidence":round(ai_conf,1),"ai_called":True,"ai_provider":ai_vote.get("provider") or "EXTERNAL_AI"}
     if not agreed:
         if not ai_vote.get("available",True): why="IA Leitura do Gráfico indisponível; candidato do Volume POC não foi liberado."
         elif ai_dir in ("CALL","PUT") and ai_dir!=volume_dir: why=f"Volume POC apontou {volume_dir}, mas a IA apontou {ai_dir}; entrada cancelada."
         else: why=f"Volume POC apontou {volume_dir}, mas a IA ficou NEUTRO; entrada cancelada."
-        return {"available":bool(ai_vote.get("available",True)),"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":why,"candidate_direction":volume_dir,"preview_direction":volume_dir,"preview_confidence":round(volume_conf,1),"early_signal_window":True,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"volume_vote":volume_vote,"ai_vote":ai_vote,"consensus":consensus,"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"gale_signal":False}
+        return {"available":bool(ai_vote.get("available",True)),"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":why,"candidate_direction":volume_dir,"preview_direction":volume_dir,"preview_confidence":round(volume_conf,1),"early_signal_window":True,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"volume_vote":volume_vote,"ai_vote":ai_vote,"trend_filter":trend_filter,"consensus":consensus,"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"gale_signal":False}
     final_conf=round(clamp(volume_conf*0.45+ai_conf*0.55,0.0,96.0),1)
     risk=str(ai_vote.get("risk") or "MEDIUM").upper()
     if risk not in ("LOW","MEDIUM","HIGH"): risk="MEDIUM"
-    return {"available":True,"direction":volume_dir,"confidence":final_conf,"confirmed":True,"risk":risk,"strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":f"CONCORDÂNCIA FLEX: Volume POC {volume_dir} ({volume_conf:.0f}%) + IA {ai_dir} ({ai_conf:.0f}%). Entrada liberada com voto na mesma direção.","candidate_direction":volume_dir,"early_signal_window":True,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"event_key":volume_vote.get("event_key") or f"AI_VOLUME_POC:{volume_dir}:{raw_rows[-1].get('datetime') if raw_rows else ''}","volume_vote":volume_vote,"ai_vote":ai_vote,"consensus":consensus,"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"direct_win_only":True,"gale_signal":False}
+    return {"available":True,"direction":volume_dir,"confidence":final_conf,"confirmed":True,"risk":risk,"strategy":"IA + VOLUME POC","engine":"VOLUME_AI","provider":"AI_VOLUME_POC_CONSENSUS","reason":f"CONCORDÂNCIA TRIPLA: Volume POC {volume_dir} ({volume_conf:.0f}%) + IA {ai_dir} ({ai_conf:.0f}%) + Trend Filter {trend_color} ({trend_dir}). Entrada liberada.","candidate_direction":volume_dir,"early_signal_window":True,"seconds_to_entry_snapshot":round(seconds_to_entry,1),"event_key":volume_vote.get("event_key") or f"AI_VOLUME_POC:{volume_dir}:{raw_rows[-1].get('datetime') if raw_rows else ''}","volume_vote":volume_vote,"ai_vote":ai_vote,"trend_filter":trend_filter,"consensus":consensus,"mtf_error":mtf_error,"non_repaint_after_release":True,"next_candle":True,"direct_win_only":True,"gale_signal":False}
 
 
 def _adaptive_client_id(request: Request | None) -> str:
@@ -20122,7 +20152,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="IA + Volume POC">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧠 IA + VOLUME POC</div>
-      <div class="robot-mode-desc" id="volumePocAiModeDesc">MODO FLEX MÁXIMO • Volume POC detecta cedo • IA vota na mesma direção • janela ampliada • próxima vela.</div>
+      <div class="robot-mode-desc" id="volumePocAiModeDesc">MODO FLEX • Volume POC + IA + Trend Filter obrigatoriamente alinhados • VERDE só CALL / VERMELHO só PUT • próxima vela.</div>
     </div>
     <button id="volumePocAiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -24541,7 +24571,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: VOLUME/POC + SUPORTE/RESISTÊNCIA + LTA/LTB • sem IA/EA • sinal ~20s antes • próxima vela.'
     : 'OFFLINE: Volume POC Estrutural pausado.';
   if(volumePocAiModeDesc) volumePocAiModeDesc.textContent=volumePocAiEnabled
-    ? 'ONLINE FLEX MÁXIMO: Volume POC detecta cedo • janela 55s→5s • IA vota na mesma direção com mínimo 54% • próxima vela.'
+    ? 'ONLINE FLEX: Volume POC detecta cedo • IA + Trend Filter precisam concordar • VERDE só CALL / VERMELHO só PUT • próxima vela.'
     : 'OFFLINE: IA + Volume POC pausado.';
   if(rsi5ModeDesc) rsi5ModeDesc.textContent=rsi5Enabled
     ? 'ONLINE: RSI9 4TF + ADX/DMI14 • ADX ≥25 • pullback a favor da tendência • próxima vela.'
@@ -24558,9 +24588,9 @@ function applyRobotPowerState(){
 
   const engine=selectedRobotEngine();
   if(engine==='VOLUME_AI'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA + VOLUME POC FLEX ONLINE • VOLUME DETECTA CEDO → IA VOTA • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA + Volume POC FLEX • candidato de volume aparece mais cedo e a IA vota na mesma direção com menos travas.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar IA + Volume POC ativo • procurando candidato de volume para chamar a IA</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA + VOLUME POC FLEX ONLINE • VOLUME + IA + TREND FILTER ALINHADOS • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA + Volume POC FLEX • só libera quando Volume POC + IA + Trend Filter apontam a mesma direção.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar IA + Volume POC ativo • buscando alinhamento Volume + IA + Trend Filter</div>';
     rad();
   }else if(engine==='SUNTZU'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='SUNTZU FLEX 2/3 ONLINE • 2 DE 3 • SINAL ~20S ANTES • PRÓXIMA VELA • SEM GALE';
