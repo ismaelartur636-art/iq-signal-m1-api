@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.94.9"
-PWA_VERSION = "v162"
+APP_VERSION = "3.95.0"
+PWA_VERSION = "v163"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -250,6 +250,86 @@ ROBOFIBO_RSI_CALL_MAX = max(35.0, min(60.0, float(os.getenv("ROBOFIBO_RSI_CALL_M
 ROBOFIBO_RSI_PUT_MIN = max(40.0, min(65.0, float(os.getenv("ROBOFIBO_RSI_PUT_MIN", "48"))))
 ROBOFIBO_MIN_SCORE = max(4.5, min(8.5, float(os.getenv("ROBOFIBO_MIN_SCORE", "5.6"))))
 ROBOFIBO_SCORE_EDGE = max(0.3, min(3.0, float(os.getenv("ROBOFIBO_SCORE_EDGE", "0.8"))))
+
+# MEGA IA 3.95.0 — RSI TRIPLO 7/14/28.
+# O sinal oficial é avaliado perto de 10 s antes do fechamento da vela atual
+# para entrada na abertura da próxima. Depois de liberado, o snapshot fica travado.
+TRIPRSI_FAST = max(3, min(14, int(os.getenv("TRIPRSI_FAST", "7"))))
+TRIPRSI_MID = max(7, min(28, int(os.getenv("TRIPRSI_MID", "14"))))
+TRIPRSI_SLOW = max(14, min(60, int(os.getenv("TRIPRSI_SLOW", "28"))))
+TRIPRSI_CALL_FAST = max(50.0, min(70.0, float(os.getenv("TRIPRSI_CALL_FAST", "55"))))
+TRIPRSI_CALL_MID = max(50.0, min(70.0, float(os.getenv("TRIPRSI_CALL_MID", "53"))))
+TRIPRSI_CALL_SLOW = max(50.0, min(70.0, float(os.getenv("TRIPRSI_CALL_SLOW", "52"))))
+TRIPRSI_PUT_FAST = max(30.0, min(50.0, float(os.getenv("TRIPRSI_PUT_FAST", "45"))))
+TRIPRSI_PUT_MID = max(30.0, min(50.0, float(os.getenv("TRIPRSI_PUT_MID", "47"))))
+TRIPRSI_PUT_SLOW = max(30.0, min(50.0, float(os.getenv("TRIPRSI_PUT_SLOW", "48"))))
+TRIPRSI_EARLY_SIGNAL_SECONDS = 10
+# O frontend normalmente consulta a cada ~5 s; 5..12 s captura o ponto de 10 s sem sinal tardio.
+TRIPRSI_EARLY_MIN_REMAINING = max(3, min(8, int(os.getenv("TRIPRSI_EARLY_MIN_REMAINING", "5"))))
+TRIPRSI_EARLY_WINDOW_BEFORE = max(10, min(15, int(os.getenv("TRIPRSI_EARLY_WINDOW_BEFORE", "12"))))
+TRIPRSI_HISTORY_BARS = max(60, min(220, int(os.getenv("TRIPRSI_HISTORY_BARS", "120"))))
+
+
+def triple_rsi_strategy(cs, timeframe="1min", market="OPEN", early_signal=False):
+    """RSI Triplo 7/14/28 para a próxima vela.
+
+    CALL: RSI rápido >55, médio >53, lento >52 e os três subindo.
+    PUT: RSI rápido <45, médio <47, lento <48 e os três caindo.
+    A faixa neutra do RSI lento (48..52) bloqueia entradas laterais.
+    """
+    rows=list(cs or [])
+    tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30","1h":"H1"}.get(timeframe,timeframe)
+    name=f"RSI TRIPLO 7/14/28 {tf_label}"
+    need=max(40,TRIPRSI_SLOW+8)
+    if len(rows)<need:
+        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
+                "strategy":name,"engine":"TRIPRSI","provider":"LOCAL_TRIPLE_RSI",
+                "reason":f"RSI Triplo coletando candles ({len(rows)}/{need}).",
+                "next_candle_entry":True,"gale_signal":False,"non_repaint_after_release":True}
+    rows=rows[-TRIPRSI_HISTORY_BARS:]
+    closes=[float(x.get("close",0) or 0) for x in rows]
+    vals={}
+    for label,period in (("r7",TRIPRSI_FAST),("r14",TRIPRSI_MID),("r28",TRIPRSI_SLOW)):
+        cur=rsi(closes,period)
+        prev=rsi(closes[:-1],period) if len(closes)>period+1 else None
+        vals[label]=(cur,prev)
+    if any(v is None for pair in vals.values() for v in pair):
+        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
+                "strategy":name,"engine":"TRIPRSI","provider":"LOCAL_TRIPLE_RSI",
+                "reason":"RSI Triplo aguardando histórico suficiente.","next_candle_entry":True,"gale_signal":False}
+    r7,p7=map(float,vals["r7"]); r14,p14=map(float,vals["r14"]); r28,p28=map(float,vals["r28"])
+    d7=r7-p7; d14=r14-p14; d28=r28-p28
+    # RSI7 precisa liderar; RSI14/28 podem ficar praticamente estáveis por causa
+    # da janela mais longa, mas não podem divergir materialmente do movimento.
+    up=(d7>0.0 and d14>=-0.10 and d28>=-0.10 and (d7+d14+d28)>0.15)
+    down=(d7<0.0 and d14<=0.10 and d28<=0.10 and (d7+d14+d28)<-0.15)
+    neutral_slow=(TRIPRSI_PUT_SLOW <= r28 <= TRIPRSI_CALL_SLOW)
+    call=(not neutral_slow and r7>TRIPRSI_CALL_FAST and r14>TRIPRSI_CALL_MID and r28>TRIPRSI_CALL_SLOW and up)
+    put=(not neutral_slow and r7<TRIPRSI_PUT_FAST and r14<TRIPRSI_PUT_MID and r28<TRIPRSI_PUT_SLOW and down)
+    direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
+    if direction=="CALL":
+        strength=min(r7-TRIPRSI_CALL_FAST,r14-TRIPRSI_CALL_MID,r28-TRIPRSI_CALL_SLOW)
+        confidence=clamp(70.0+max(0.0,strength)*2.0+min(8.0,(r7-p7)+(r14-p14)+(r28-p28)),70.0,94.0)
+        reason=f"CALL RSI TRIPLO: RSI7 {r7:.1f}↑ + RSI14 {r14:.1f}↑ + RSI28 {r28:.1f}↑ alinhados. Entrada na próxima vela."
+    elif direction=="PUT":
+        strength=min(TRIPRSI_PUT_FAST-r7,TRIPRSI_PUT_MID-r14,TRIPRSI_PUT_SLOW-r28)
+        confidence=clamp(70.0+max(0.0,strength)*2.0+min(8.0,(p7-r7)+(p14-r14)+(p28-r28)),70.0,94.0)
+        reason=f"PUT RSI TRIPLO: RSI7 {r7:.1f}↓ + RSI14 {r14:.1f}↓ + RSI28 {r28:.1f}↓ alinhados. Entrada na próxima vela."
+    else:
+        confidence=0.0
+        reason=(f"RSI Triplo monitorando • RSI7 {r7:.1f} • RSI14 {r14:.1f} • RSI28 {r28:.1f} • "
+                + ("RSI28 em zona neutra 48–52." if neutral_slow else "aguardando alinhamento dos 3 RSIs."))
+    return {
+        "available":True,"direction":direction,"confidence":round(float(confidence),1),
+        "confirmed":direction in ("CALL","PUT"),"risk":(("LOW" if confidence>=84 else "MEDIUM") if direction!="NEUTRO" else "HIGH"),
+        "strategy":name,"engine":"TRIPRSI","provider":"LOCAL_TRIPLE_RSI","reason":reason[:440],
+        "next_candle_entry":True,"direct_win_only":True,"gale_signal":False,
+        "closed_candles_only":not bool(early_signal),"forming_candle_snapshot":bool(early_signal),
+        "non_repaint_after_release":True,
+        "diagnostics":{"rsi7":round(r7,2),"rsi14":round(r14,2),"rsi28":round(r28,2),
+                       "prev7":round(p7,2),"prev14":round(p14,2),"prev28":round(p28,2),
+                       "all_rising":up,"all_falling":down,"slow_neutral":neutral_slow}
+    }
 
 
 def combiner_flow_rsi_strategy(cs, timeframe="1min", market="OPEN"):
@@ -12957,6 +13037,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     elif engine == "FIBORSI":
         # RoboFibo usa range Fibonacci causal e confirma apenas no candle fechado.
         entry_mode = "BIRTH"
+    elif engine == "TRIPRSI":
+        # RSI Triplo prepara o CALL/PUT perto de 10 s antes e entra na próxima abertura.
+        entry_mode = "MIDDLE"
     elif engine == "PRESIDEN":
         # PRESIDEN confirma a vela fechada e entra somente na abertura seguinte.
         entry_mode = "BIRTH"
@@ -12974,7 +13057,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         entry_mode = "MIDDLE"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "VOLUME_AI"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     fibo_poc_key = int(bool(robofibo_poc)) if engine == "FIBORSI" else 0
@@ -13205,6 +13288,16 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 raw=await iq_ea_candles(iq_state,symbol,interval,TLBRSI_HISTORY_BARS,regular_market=False)
             else:
                 raw=await candles(symbol,interval,TLBRSI_HISTORY_BARS,"OPEN",None,request=request)
+        elif engine == "TRIPRSI":
+            # RSI Triplo: snapshot intrabar perto de 10 s; OPEN multifuente/cTrader e OTC real pela IQ.
+            if market == "IQ_OTC":
+                if not iq_state:
+                    out=neutral_signal(symbol,interval,market,"RSI TRIPLO • IQ OPTION OFFLINE","Conecte a IQ Option para o RSI Triplo analisar candles OTC reais.",source_state="WAITING")
+                    out.update({"strategy":"RSI TRIPLO 7/14/28","mode":"TRIPLE_RSI_10S","selected_engine":engine,"feed_source":"IQ_OPTION_OTC","next_candle_entry":True,"direct_win_only":True,"gale_signal":False})
+                    cache[key]=(time.time(),out); return out
+                raw=await iq_ea_candles(iq_state,symbol,interval,TRIPRSI_HISTORY_BARS,regular_market=False)
+            else:
+                raw=await candles(symbol,interval,TRIPRSI_HISTORY_BARS,"OPEN",None,request=request)
         elif engine == "FIBORSI":
             # RoboFibo causal: OPEN multifuente/cTrader; OTC real pela IQ Option.
             if market == "IQ_OTC":
@@ -13416,6 +13509,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "3 LINE BREAK + RSI • FONTE EM ESPERA" if market == "OPEN" else "3 LINE BREAK + RSI • IQ OPTION EM ESPERA"
         elif engine == "FIBORSI":
             status = "ROBO FIBO • FONTE EM ESPERA" if market == "OPEN" else "ROBO FIBO • IQ OPTION EM ESPERA"
+        elif engine == "TRIPRSI":
+            status = "RSI TRIPLO • FONTE EM ESPERA" if market == "OPEN" else "RSI TRIPLO • IQ OPTION EM ESPERA"
         elif engine == "ALPHAX":
             status = "ALPHAX RELAY • FONTE EM ESPERA" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION EM ESPERA"
         elif engine == "SAMURAI":
@@ -13461,6 +13556,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "3 LINE BREAK + RSI • FONTE RECONECTANDO" if market == "OPEN" else "3 LINE BREAK + RSI • IQ OPTION RECONECTANDO"
         elif engine == "FIBORSI":
             status = "ROBO FIBO • FONTE RECONECTANDO" if market == "OPEN" else "ROBO FIBO • IQ OPTION RECONECTANDO"
+        elif engine == "TRIPRSI":
+            status = "RSI TRIPLO • FONTE RECONECTANDO" if market == "OPEN" else "RSI TRIPLO • IQ OPTION RECONECTANDO"
         elif engine == "ALPHAX":
             status = "ALPHAX RELAY • FONTE RECONECTANDO" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION RECONECTANDO"
         elif engine == "SAMURAI":
@@ -13554,6 +13651,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "FIBORSI":
             engine_title = "ROBO FIBO + RSI + EMA"
             engine_mode = "ROBO_FIBO_NEXT_CANDLE"
+        elif engine == "TRIPRSI":
+            engine_title = "RSI TRIPLO 7/14/28"
+            engine_mode = "TRIPLE_RSI_10S"
         elif engine == "ALPHAX":
             engine_title = "ALPHAX RELAY"
             engine_mode = "ALPHAX_RELAY"
@@ -13588,7 +13688,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+        if market != "OPEN" and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -13610,6 +13710,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "RSIDIVBB": "LOCAL_RSI_DIVERGENCE_BOLLINGER",
                     "TLBRSI": "LOCAL_3_LINE_BREAK_RSI",
                     "FIBORSI": "LOCAL_ROBO_FIBO",
+                    "TRIPRSI": "LOCAL_TRIPLE_RSI",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
                     "RAPID": "LOCAL_RAPID_EAS",
@@ -13642,6 +13743,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 engine_closed = closed[-min(TLBRSI_HISTORY_BARS, len(closed)):]
             elif engine == "FIBORSI":
                 engine_closed = closed[-min(ROBOFIBO_HISTORY_BARS, len(closed)):]
+            elif engine == "TRIPRSI":
+                engine_closed = closed[-min(TRIPRSI_HISTORY_BARS, len(closed)):]
             elif engine in ("COMBINER", "RSIDIVBB"):
                 engine_closed = closed[-180:]
             elif engine in ("SMART", "EA"):
@@ -13678,6 +13781,23 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis = three_line_break_rsi_strategy(engine_closed, interval, market=market)
             elif engine == "FIBORSI":
                 analysis = robo_fibo_strategy(engine_closed, interval, market=market, use_poc=robofibo_poc)
+            elif engine == "TRIPRSI":
+                triple_seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                triple_early_window=(TRIPRSI_EARLY_MIN_REMAINING <= triple_seconds_to_entry <= TRIPRSI_EARLY_WINDOW_BEFORE)
+                if triple_early_window:
+                    analysis=triple_rsi_strategy(raw[-TRIPRSI_HISTORY_BARS:],interval,market=market,early_signal=True)
+                    analysis["early_signal_window"]=True
+                    analysis["seconds_to_entry_snapshot"]=round(triple_seconds_to_entry,1)
+                else:
+                    analysis=triple_rsi_strategy(engine_closed,interval,market=market,early_signal=False)
+                    if analysis.get("confirmed"):
+                        analysis["preview_direction"]=analysis.get("direction")
+                        analysis["preview_confidence"]=analysis.get("confidence")
+                    analysis["confirmed"]=False; analysis["direction"]="NEUTRO"; analysis["confidence"]=0.0
+                    analysis["reason"]=(f"RSI Triplo monitorando • sinal oficial será avaliado cerca de {TRIPRSI_EARLY_SIGNAL_SECONDS}s antes da próxima vela "
+                                        f"(agora faltam {int(triple_seconds_to_entry)}s).")
+                    analysis["early_signal_window"]=False
+                    analysis["seconds_to_entry_snapshot"]=round(triple_seconds_to_entry,1)
             elif engine == "PRESIDEN":
                 analysis = presiden_breakout_strategy(engine_closed, interval, market=market)
             elif engine == "ALPHAX":
@@ -13888,7 +14008,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and analysis.get("confirmed")),
+            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and analysis.get("confirmed")),
             "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                 "EA": "XGBOOST_RSI_VALUE_CHART",
                 "RUBIK": "LOCAL_RUBIK_ADAPTED",
@@ -13900,6 +14020,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "RSIDIVBB": "LOCAL_RSI_DIVERGENCE_BOLLINGER",
                     "TLBRSI": "LOCAL_3_LINE_BREAK_RSI",
                     "FIBORSI": "LOCAL_ROBO_FIBO",
+                    "TRIPRSI": "LOCAL_TRIPLE_RSI",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
                     "RAPID": "LOCAL_RAPID_EAS",
@@ -13909,7 +14030,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "RSI5": "LOCAL_RSI_ADX_4TF",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "HIGH").upper(),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "HIGH").upper(),
             "strategy": (
                 "IA LEITURA DO GRÁFICO" if engine == "SMART"
                 else (analysis.get("strategy") or (
@@ -13922,6 +14043,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "RSI DIVERGENCE + BOLLINGER 20/2" if engine == "RSIDIVBB"
                     else "3 LINE BREAK + RSI" if engine == "TLBRSI"
                     else "ROBO FIBO + RSI + EMA" if engine == "FIBORSI"
+                    else "RSI TRIPLO 7/14/28" if engine == "TRIPRSI"
                     else "ALPHAX RELAY" if engine == "ALPHAX"
                     else "PRESIDEN BREAKOUT" if engine == "PRESIDEN"
                     else "NÚCLEO RÁPIDO EAs" if engine == "RAPID"
@@ -14201,6 +14323,16 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key]=(time.time(),base)
                         return base
 
+                if engine == "TRIPRSI":
+                    _tr_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                    if not (TRIPRSI_EARLY_MIN_REMAINING <= _tr_remaining <= TRIPRSI_EARLY_WINDOW_BEFORE):
+                        base["status"]="ONLINE • RSI TRIPLO • AGUARDANDO JANELA DE 10S"
+                        base["reason"]=f"RSI Triplo aguardando a janela antecipada; faltam {int(_tr_remaining)}s para a próxima vela."
+                        base["direction"]="NEUTRO"; base["entry_time"]=None; base["expiry_time"]=None; base["risk"]="HIGH"
+                        release_state["active_signal"]=None
+                        cache[key]=(time.time(),base)
+                        return base
+
                 if engine == "ALPHAX":
                     # AlphaX nunca solta o CALL/PUT em cima da abertura. O sinal só é
                     # oficializado na janela antecipada e entra na próxima vela.
@@ -14328,6 +14460,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "RSIDIVBB": "SINAL RSI DIVERGENCE + BOLLINGER LIBERADO",
                         "TLBRSI": "SINAL 3 LINE BREAK + RSI LIBERADO",
                         "FIBORSI": "SINAL ROBO FIBO LIBERADO",
+                        "TRIPRSI": "SINAL RSI TRIPLO 7/14/28 LIBERADO",
                         "ALPHAX": "SINAL ALPHAX RELAY LIBERADO",
                         "PRESIDEN": "SINAL PRESIDEN BREAKOUT LIBERADO",
                         "RAPID": "SINAL NÚCLEO RÁPIDO EAs LIBERADO",
@@ -14340,12 +14473,18 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "FORCE": "SINAL EA FORÇA DO MOVIMENTO LIBERADO",
                         "BIGRISE": "SINAL BTC FORCE MULTIATIVOS LIBERADO",
                     }.get(engine, "SINAL IA GRÁFICA LIBERADO")),
-                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "MEDIUM").upper(),
+                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
                     "expiry_time": iso(expiry),
                     "reference_candle": reference_candle,
                 })
+                if engine == "TRIPRSI":
+                    base["announce_seconds_before"]=TRIPRSI_EARLY_SIGNAL_SECONDS
+                    base["early_signal_locked"]=True
+                    base["non_repaint_after_release"]=True
+                    base["signal_snapshot"]="FORMING_CANDLE_AT_10S"
+                    base["triple_rsi"]={"periods":[TRIPRSI_FAST,TRIPRSI_MID,TRIPRSI_SLOW],"call":[TRIPRSI_CALL_FAST,TRIPRSI_CALL_MID,TRIPRSI_CALL_SLOW],"put":[TRIPRSI_PUT_FAST,TRIPRSI_PUT_MID,TRIPRSI_PUT_SLOW]}
                 if engine == "ALPHAX":
                     base["announce_seconds_before"] = ALPHAX_EARLY_SIGNAL_SECONDS
                     base["early_signal_locked"] = True
@@ -14400,7 +14539,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -14511,6 +14650,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "RSIDIVBB": "LOCAL_RSI_DIVERGENCE_BOLLINGER",
                     "TLBRSI": "LOCAL_3_LINE_BREAK_RSI",
                     "FIBORSI": "LOCAL_ROBO_FIBO",
+                    "TRIPRSI": "LOCAL_TRIPLE_RSI",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
@@ -17253,7 +17393,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     "GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY",
-    "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "VOLUME_AI",
+    "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI",
 }
 
 
@@ -18093,11 +18233,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "VOLUME_AI"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI"):
         raise HTTPException(400, "Motor inválido.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+    if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -18784,7 +18924,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "VOLUME_AI"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -18847,6 +18987,14 @@ async def pre_signals(
         return {
             "ok": True,
             "message": "3 Line Break + RSI usa LB=3 + RSI 14 em candles fechados. A zona é congelada antes da vela de confirmação; CALL/PUT vale para a próxima vela.",
+            "items": [],
+            "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
+        }
+
+    if engine == "TRIPRSI":
+        return {
+            "ok": True,
+            "message": "RSI Triplo 7/14/28 monitora os 3 RSIs e só libera CALL/PUT na janela de ~10s antes da próxima vela; após liberar, o snapshot fica congelado.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -18939,10 +19087,10 @@ async def pre_signals(
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
     if fallback_twelve:
         market = "OPEN"
-    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and not iq_state:
+    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and not iq_state:
         wait_label = {
             "EA": "EA Tripla",
             "RUBIK": "Robô Rubik Adaptado",
@@ -18954,6 +19102,7 @@ async def pre_signals(
             "RSIDIVBB": "RSI Divergence + Bollinger",
             "TLBRSI": "3 Line Break + RSI",
             "FIBORSI": "RoboFibo + RSI + EMA",
+            "TRIPRSI": "RSI Triplo 7/14/28",
             "ALPHAX": "AlphaX RELAY",
             "RAPID": "Núcleo Rápido EAs",
             "SAMURAI": "Algo Samurai • Treinamento",
@@ -19026,7 +19175,7 @@ async def pre_signals(
         key = f"{group_key}|{symbol}"
         try:
             pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (180 if engine == "SNIPER" else (120 if engine == "RUBIK" else 90)))
-            if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and requested_market == "IQ_OTC":
+            if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
                 )
@@ -19481,12 +19630,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "VOLUME_AI"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI"):
         raise HTTPException(400, "Motor inválido.")
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
     if fallback_twelve:
         market = "OPEN"
 
@@ -19587,6 +19736,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 raw=await iq_ea_candles(iq_state,sym,interval,TLBRSI_HISTORY_BARS,regular_market=False)
             else:
                 raw=await candles(sym,interval,TLBRSI_HISTORY_BARS,"OPEN",None,request=request)
+        elif engine == "TRIPRSI":
+            if market == "IQ_OTC":
+                if not iq_state: raise RuntimeError("Conecte a IQ Option para o RSI Triplo analisar OTC.")
+                raw=await iq_ea_candles(iq_state,sym,interval,TRIPRSI_HISTORY_BARS,regular_market=False)
+            else:
+                raw=await candles(sym,interval,TRIPRSI_HISTORY_BARS,"OPEN",None,request=request)
         elif engine == "FIBORSI":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -19758,6 +19913,14 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     status_text=f"{engine_label} • OPORTUNIDADE PASSOU • aguardando próximo fechamento"
                 else:
                     status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction!="NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
+            elif engine == "TRIPRSI":
+                _tr_rem=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                _tr_early=(TRIPRSI_EARLY_MIN_REMAINING <= _tr_rem <= TRIPRSI_EARLY_WINDOW_BEFORE)
+                tech=triple_rsi_strategy((raw if _tr_early else closed),interval,market=market,early_signal=_tr_early)
+                engine_label="RSI TRIPLO 7/14/28"
+                direction=tech.get("direction","NEUTRO") if (_tr_early and tech.get("confirmed")) else "NEUTRO"
+                why=str(tech.get("reason") or "RSI Triplo monitorando").replace("\n"," ")[:88]
+                status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA • ~10S" if direction!="NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "FIBORSI":
                 tech=robo_fibo_strategy(closed,interval,market=market,use_poc=bool(robofibo_poc))
                 engine_label="ROBO FIBO + RSI + EMA"
@@ -19937,18 +20100,18 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if (engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") or (engine == "FORCE" and market == "IQ_OTC"))
+                    status_text if (engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") or (engine == "FORCE" and market == "IQ_OTC"))
                     else (((_feed_source_label(_feed_source_from_rows(raw)) + " • " + status_text) if market == "OPEN" else status_text))
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
+                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
                 "strategy": str(tech.get("strategy") or ""),
             }
-            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
                 radar_probe = {
                     "symbol": sym, "market": market, "interval": interval,
                     "direction": item.get("direction"), "confidence": item.get("confidence"),
@@ -19993,6 +20156,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             source_status = "3 LINE BREAK + RSI • FONTE EM ESPERA" if market == "OPEN" else "3 LINE BREAK + RSI • IQ OPTION OTC EM ESPERA"
         elif engine == "FIBORSI":
             source_status = "ROBO FIBO • FONTE EM ESPERA" if market == "OPEN" else "ROBO FIBO • IQ OPTION OTC EM ESPERA"
+        elif engine == "TRIPRSI":
+            source_status = "RSI TRIPLO • FONTE EM ESPERA" if market == "OPEN" else "RSI TRIPLO • IQ OPTION OTC EM ESPERA"
         elif engine == "PRESIDEN":
             source_status = "PRESIDEN BREAKOUT • FONTE EM ESPERA" if market == "OPEN" else "PRESIDEN BREAKOUT • IQ OPTION OTC EM ESPERA"
         elif engine == "ALPHAX":
@@ -20031,7 +20196,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
+            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -20427,7 +20592,7 @@ async def result(
     engine = str(engine or "").upper()
     # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
-    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
+    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
 
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
@@ -20923,7 +21088,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • ROBO FIBO + RSI + EMA • 3 LINE BREAK + RSI • RSI DIVERGENCE + BOLLINGER • COMBINER + SSC FLEX • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • RSI TRIPLO 7/14/28 • ROBO FIBO + RSI + EMA • 3 LINE BREAK + RSI • RSI DIVERGENCE + BOLLINGER • COMBINER + SSC FLEX • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -21047,6 +21212,16 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-desc" id="tlbRsiModeDesc">Zonas 3 Line Break LB=3 + RSI 14 • nível causal congelado antes da confirmação • candle fechado • próxima vela • sem repaint.</div>
     </div>
     <button id="tlbRsiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
+
+  <div class="robot-mode-card" id="tripleRsiModeCard">
+    <img src="__MEGA_IMAGE__" alt="RSI Triplo 7 14 28">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">🔥 RSI TRIPLO 7/14/28</div>
+      <div class="robot-mode-desc" id="tripleRsiModeDesc">RSI 7 rápido + RSI 14 confirmação + RSI 28 direção • 3 alinhados • sinal ~10s antes • entrada na próxima vela.</div>
+    </div>
+    <button id="tripleRsiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
 
@@ -21697,6 +21872,8 @@ const rsiDivBbPowerBtn=document.getElementById('rsiDivBbPowerBtn');
 const rsiDivBbModeDesc=document.getElementById('rsiDivBbModeDesc');
 const tlbRsiPowerBtn=document.getElementById('tlbRsiPowerBtn');
 const tlbRsiModeDesc=document.getElementById('tlbRsiModeDesc');
+const tripleRsiPowerBtn=document.getElementById('tripleRsiPowerBtn');
+const tripleRsiModeDesc=document.getElementById('tripleRsiModeDesc');
 const roboFiboPowerBtn=document.getElementById('roboFiboPowerBtn');
 const roboFiboModeDesc=document.getElementById('roboFiboModeDesc');
 const roboFiboPocBtn=document.getElementById('roboFiboPocBtn');
@@ -21763,6 +21940,7 @@ let sniperEnabled=false;
 let combinerEnabled=false;
 let rsiDivBbEnabled=false;
 let tlbRsiEnabled=false;
+let tripleRsiEnabled=false;
 let roboFiboEnabled=false;
 let roboFiboPocEnabled=false;
 let alphaxEnabled=false;
@@ -21788,6 +21966,7 @@ try{
   combinerEnabled=localStorage.getItem('mega_combiner_power')==='ONLINE';
   rsiDivBbEnabled=localStorage.getItem('mega_rsidivbb_power')==='ONLINE';
   tlbRsiEnabled=localStorage.getItem('mega_tlbrsi_power')==='ONLINE';
+  tripleRsiEnabled=localStorage.getItem('mega_triprsi_power')==='ONLINE';
   roboFiboEnabled=localStorage.getItem('mega_robofibo_power')==='ONLINE';
   roboFiboPocEnabled=localStorage.getItem('mega_robofibo_poc')==='ON';
   alphaxEnabled=localStorage.getItem('mega_alphax_power')==='ONLINE';
@@ -21804,7 +21983,8 @@ try{
   localStorage.removeItem('mega_rsi_monitor_power');
   rsi5Enabled=false; localStorage.removeItem('mega_rsi_pure_power'); localStorage.removeItem('mega_rsi5_power');
   presidenEnabled=false; localStorage.removeItem('mega_presiden_power');
-  if(roboFiboEnabled){ tlbRsiEnabled=false; rsiDivBbEnabled=false; robotEnabled=false; aiEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; combinerEnabled=false; alphaxEnabled=false; volumePocAiEnabled=false; }
+  if(tripleRsiEnabled){ roboFiboEnabled=false; tlbRsiEnabled=false; rsiDivBbEnabled=false; robotEnabled=false; aiEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; combinerEnabled=false; alphaxEnabled=false; volumePocAiEnabled=false; }
+  else if(roboFiboEnabled){ tlbRsiEnabled=false; rsiDivBbEnabled=false; robotEnabled=false; aiEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; combinerEnabled=false; alphaxEnabled=false; volumePocAiEnabled=false; }
   else if(tlbRsiEnabled){ rsiDivBbEnabled=false; robotEnabled=false; aiEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; combinerEnabled=false; alphaxEnabled=false; volumePocAiEnabled=false; }
   else if(rsiDivBbEnabled){ robotEnabled=false; aiEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; combinerEnabled=false; alphaxEnabled=false; volumePocAiEnabled=false; }
   else if(combinerEnabled){ robotEnabled=false; aiEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false; volumePocAiEnabled=false; }
@@ -21832,6 +22012,7 @@ try{
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
+  if(tripleRsiEnabled) return 'TRIPRSI';
   if(roboFiboEnabled) return 'FIBORSI';
   if(tlbRsiEnabled) return 'TLBRSI';
   if(rsiDivBbEnabled) return 'RSIDIVBB';
@@ -21865,13 +22046,14 @@ function adoptBackgroundEngineState(d){
   if(['RAPID','SUNTZU','RANGE','PRESIDEN','RSI5','FORCE','BIGRISE'].includes(e)) return;
   robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
   forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false;
-  rsi5Enabled=false; sniperEnabled=false; combinerEnabled=false; rsiDivBbEnabled=false; tlbRsiEnabled=false; roboFiboEnabled=false; alphaxEnabled=false; presidenEnabled=false; rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false; rangeEnabled=false;
+  rsi5Enabled=false; sniperEnabled=false; combinerEnabled=false; rsiDivBbEnabled=false; tlbRsiEnabled=false; tripleRsiEnabled=false; roboFiboEnabled=false; alphaxEnabled=false; presidenEnabled=false; rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false; rangeEnabled=false;
   if(e==='VOLUME_AI') volumePocAiEnabled=true;
   else if(e==='PRESIDEN') presidenEnabled=true;
   else if(e==='SNIPER') sniperEnabled=true;
   else if(e==='COMBINER') combinerEnabled=true;
   else if(e==='RSIDIVBB') rsiDivBbEnabled=true;
   else if(e==='TLBRSI') tlbRsiEnabled=true;
+  else if(e==='TRIPRSI') tripleRsiEnabled=true;
   else if(e==='FIBORSI') roboFiboEnabled=true;
   else if(e==='RANGE') rangeEnabled=true;
   else if(e==='ALPHAX') alphaxEnabled=true;
@@ -21898,6 +22080,7 @@ function adoptBackgroundEngineState(d){
     localStorage.setItem('mega_sniper_power',sniperEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_rsidivbb_power',rsiDivBbEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_tlbrsi_power',tlbRsiEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_triprsi_power',tripleRsiEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_robofibo_power',roboFiboEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_robofibo_poc',roboFiboPocEnabled?'ON':'OFF');
     localStorage.setItem('mega_alphax_power',alphaxEnabled?'ONLINE':'OFFLINE');
@@ -22888,6 +23071,7 @@ function normalizeEngineKey(value){
   if(e==='RANGE' || e==='RANGE_COMPRESSION_BREAKOUT') return 'RANGE';
   if(e==='VELOCITY' || e==='VELOCITY_FLOW' || e==='MR_MT4') return 'VELOCITY';
   if(e==='COMBINER' || e==='COMBINER_FLOW_RSI' || e==='FLOW_RSI') return 'COMBINER';
+  if(e==='TRIPRSI' || e==='TRIPLE_RSI' || e==='RSI_TRIPLO') return 'TRIPRSI';
   if(e==='FIBORSI' || e==='ROBOFIBO' || e==='ROBO_FIBO') return 'FIBORSI';
   if(e==='ALPHAX' || e==='ALPHAX_RELAY' || e==='ALPHA_X') return 'ALPHAX';
   if(e==='RSI5' || e==='RSI_PURE' || e==='RSI_PURO' || e==='RSI_PURE_4TF') return 'RSI5';
@@ -22911,7 +23095,8 @@ function momentStudyEngineName(key){
     COMBINER:'🔀 COMBINER FLOW + RSI',
     RSIDIVBB:'📉 RSI DIVERGENCE + BOLLINGER',
     TLBRSI:'🧱 3 LINE BREAK + RSI',
-    FIBORSI:'🌀 ROBO FIBO + RSI + EMA'
+    FIBORSI:'🌀 ROBO FIBO + RSI + EMA',
+    TRIPRSI:'🔥 RSI TRIPLO 7/14/28'
   };
   return names[String(key||'').toUpperCase()]||String(key||'MOTOR');
 }
@@ -23232,8 +23417,8 @@ function rememberPendingTrade(sig){
   if(!sig.expiry_time || !sig.entry_time) return;
 
   const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
-  const canonicalResultEngine=(()=>{ if(engineKey.includes('FIBORSI')||engineKey.includes('ROBO_FIBO')||engineKey.includes('ROBOFIBO')) return 'FIBORSI'; if(engineKey.includes('TLBRSI')||engineKey.includes('THREE_LINE_BREAK_RSI')||engineKey.includes('3 LINE BREAK + RSI')) return 'TLBRSI'; if(engineKey.includes('RSIDIVBB')||engineKey.includes('RSI_DIV_BB')||engineKey.includes('DIVERGENCE + BOLLINGER')) return 'RSIDIVBB'; if(engineKey.includes('COMBINER')) return 'COMBINER'; if(engineKey.includes('AI_VOLUME_POC_CONSENSUS')||engineKey==='VOLUME_AI') return 'VOLUME_AI'; if(engineKey.includes('EA_XGBOOST')) return 'EA'; if(engineKey.includes('EA_FORCE')) return 'FORCE'; if(engineKey.includes('BIGRISE')) return 'BIGRISE'; if(engineKey.includes('LARRY')) return 'LARRY'; if(engineKey.includes('RANGE')) return 'RANGE'; if(engineKey.includes('VELOCITY')) return 'VELOCITY'; if(engineKey.includes('SNIPER')) return 'SNIPER'; if(engineKey.includes('ALPHAX')) return 'ALPHAX'; if(engineKey.includes('RAPID')) return 'RAPID'; if(engineKey.includes('SAMURAI')) return 'SAMURAI'; if(engineKey.includes('VOLUME')) return 'VOLUME'; if(engineKey.includes('RSI5')) return 'RSI5'; return String(sig.selected_engine||sig.mode||''); })();
-  const isDirectEa=(engineKey==='FIBORSI'||engineKey.includes('FIBORSI')||engineKey.includes('ROBO_FIBO')||engineKey==='TLBRSI'||engineKey.includes('TLBRSI')||engineKey.includes('THREE_LINE_BREAK_RSI')||engineKey==='RSIDIVBB'||engineKey.includes('RSIDIVBB')||engineKey.includes('RSI_DIV_BB')||engineKey==='COMBINER'||engineKey.includes('COMBINER')||engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='RANGE'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='SUNTZU'||engineKey==='RSI5'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('RANGE')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('SUNTZU')||engineKey.includes('RSI5'));
+  const canonicalResultEngine=(()=>{ if(engineKey.includes('TRIPRSI')||engineKey.includes('TRIPLE_RSI')||engineKey.includes('RSI TRIPLO')) return 'TRIPRSI'; if(engineKey.includes('FIBORSI')||engineKey.includes('ROBO_FIBO')||engineKey.includes('ROBOFIBO')) return 'FIBORSI'; if(engineKey.includes('TLBRSI')||engineKey.includes('THREE_LINE_BREAK_RSI')||engineKey.includes('3 LINE BREAK + RSI')) return 'TLBRSI'; if(engineKey.includes('RSIDIVBB')||engineKey.includes('RSI_DIV_BB')||engineKey.includes('DIVERGENCE + BOLLINGER')) return 'RSIDIVBB'; if(engineKey.includes('COMBINER')) return 'COMBINER'; if(engineKey.includes('AI_VOLUME_POC_CONSENSUS')||engineKey==='VOLUME_AI') return 'VOLUME_AI'; if(engineKey.includes('EA_XGBOOST')) return 'EA'; if(engineKey.includes('EA_FORCE')) return 'FORCE'; if(engineKey.includes('BIGRISE')) return 'BIGRISE'; if(engineKey.includes('LARRY')) return 'LARRY'; if(engineKey.includes('RANGE')) return 'RANGE'; if(engineKey.includes('VELOCITY')) return 'VELOCITY'; if(engineKey.includes('SNIPER')) return 'SNIPER'; if(engineKey.includes('ALPHAX')) return 'ALPHAX'; if(engineKey.includes('RAPID')) return 'RAPID'; if(engineKey.includes('SAMURAI')) return 'SAMURAI'; if(engineKey.includes('VOLUME')) return 'VOLUME'; if(engineKey.includes('RSI5')) return 'RSI5'; return String(sig.selected_engine||sig.mode||''); })();
+  const isDirectEa=(engineKey==='TRIPRSI'||engineKey.includes('TRIPRSI')||engineKey.includes('TRIPLE_RSI')||engineKey==='FIBORSI'||engineKey.includes('FIBORSI')||engineKey.includes('ROBO_FIBO')||engineKey==='TLBRSI'||engineKey.includes('TLBRSI')||engineKey.includes('THREE_LINE_BREAK_RSI')||engineKey==='RSIDIVBB'||engineKey.includes('RSIDIVBB')||engineKey.includes('RSI_DIV_BB')||engineKey==='COMBINER'||engineKey.includes('COMBINER')||engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='RANGE'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='SUNTZU'||engineKey==='RSI5'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('RANGE')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('SUNTZU')||engineKey.includes('RSI5'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
     // Motores de entrada direta (AlphaX/Núcleo Rápido/Samurai/Sniper/RSI+ADX/Larry/Range/EA/Força/BigRise/Velocity) são apurados na primeira vela; outros preservam G1/G2.
@@ -25359,6 +25544,12 @@ function applyRobotPowerState(){
     tlbRsiPowerBtn.style.color='#fff';
     tlbRsiPowerBtn.style.borderColor=tlbRsiEnabled?'#16c56b':'#ff5252';
   }
+  if(tripleRsiPowerBtn){
+    tripleRsiPowerBtn.textContent=tripleRsiEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    tripleRsiPowerBtn.style.background=tripleRsiEnabled?'#0b7a3d':'#7d1d1d';
+    tripleRsiPowerBtn.style.color='#fff';
+    tripleRsiPowerBtn.style.borderColor=tripleRsiEnabled?'#16c56b':'#ff5252';
+  }
   if(roboFiboPowerBtn){
     roboFiboPowerBtn.textContent=roboFiboEnabled?'🟢 ONLINE':'🔴 OFFLINE';
     roboFiboPowerBtn.style.background=roboFiboEnabled?'#0b7a3d':'#7d1d1d';
@@ -25506,6 +25697,9 @@ function applyRobotPowerState(){
   if(tlbRsiModeDesc) tlbRsiModeDesc.textContent=tlbRsiEnabled
     ? 'ONLINE: 3 Line Break LB=3 + RSI14 • zona congelada antes da vela de confirmação • candle fechado • próxima vela • sem repaint e sem Gale.'
     : 'OFFLINE: 3 Line Break + RSI pausado.';
+  if(tripleRsiModeDesc) tripleRsiModeDesc.textContent=tripleRsiEnabled
+    ? 'ONLINE: RSI 7/14/28 alinhados • CALL >55/>53/>52 e subindo • PUT <45/<47/<48 e caindo • snapshot ~10s antes • próxima vela.'
+    : 'OFFLINE: RSI Triplo 7/14/28 pausado.';
   if(roboFiboModeDesc) roboFiboModeDesc.textContent=roboFiboEnabled
     ? ('ONLINE: Fibonacci 23,6/76,4 + RSI14 + EMA60 • '+(roboFiboPocEnabled?'Volume POC ON: confluência obrigatória na mesma direção':'Volume POC OFF: RoboFibo opera sozinho')+' • candle fechado • próxima vela • sem repaint e sem Gale.')
     : ('OFFLINE: RoboFibo pausado • Volume POC '+(roboFiboPocEnabled?'ON':'OFF')+'.');
@@ -25514,7 +25708,12 @@ function applyRobotPowerState(){
     : 'OFFLINE: COMBINER FLOW + RSI pausado.';
 
   const engine=selectedRobotEngine();
-  if(engine==='FIBORSI'){
+  if(engine==='TRIPRSI'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI TRIPLO ONLINE • 7/14/28 ALINHADOS • SINAL ~10S ANTES • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔥 RSI Triplo • RSI7 rápido + RSI14 confirmação + RSI28 direção • precisa dos 3 na mesma direção.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar RSI Triplo ativo • aguardando alinhamento 7/14/28 na janela de ~10s</div>';
+    rad();
+  }else if(engine==='FIBORSI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBO FIBO ONLINE • FIBO 23,6/76,4 + RSI14 + EMA60 • '+(roboFiboPocEnabled?'POC ON • CONFLUÊNCIA OBRIGATÓRIA':'POC OFF • FIBO SOLO')+' • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🌀 RoboFibo • range de 20 candles congelado antes da confirmação • '+(roboFiboPocEnabled?'Volume POC precisa confirmar a direção.':'Volume POC desligado.')+'</div>';
     if(radar) radar.innerHTML='<div>📡 Radar RoboFibo ativo • '+(roboFiboPocEnabled?'Fibo + Volume POC':'Fibo sem POC')+' • procurando rejeição nas zonas 23,6% / 76,4%</div>';
@@ -26039,6 +26238,32 @@ async function setSniperPower(enabled){
 
 
 
+function disableTripleRsiForOtherEngine(){
+  if(!tripleRsiEnabled) return;
+  tripleRsiEnabled=false;
+  try{ localStorage.setItem('mega_triprsi_power','OFFLINE'); }catch(_){}
+}
+
+async function setTripleRsiPower(enabled){
+  tripleRsiEnabled=!!enabled;
+  if(tripleRsiEnabled){
+    robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; rangeEnabled=false; velocityEnabled=false; sniperEnabled=false; combinerEnabled=false; rsiDivBbEnabled=false; tlbRsiEnabled=false; roboFiboEnabled=false; alphaxEnabled=false; presidenEnabled=false; rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false; rsi5Enabled=false;
+  }
+  try{
+    localStorage.setItem('mega_triprsi_power',tripleRsiEnabled?'ONLINE':'OFFLINE');
+    if(tripleRsiEnabled){
+      ['mega_robot_power','mega_ai_power','mega_ea_power','mega_rubik_power','mega_force_power','mega_bigrise_power','mega_larry_power','mega_range_power','mega_velocity_power','mega_sniper_power','mega_combiner_power','mega_alphax_power','mega_presiden_power','mega_rapid_power','mega_suntzu_power','mega_samurai_power','mega_volume_poc_power','mega_volume_poc_ai_power','mega_rsi_monitor_power','mega_rsi_pure_power','mega_rsidivbb_power','mega_tlbrsi_power','mega_robofibo_power'].forEach(k=>localStorage.setItem(k,'OFFLINE'));
+    }
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'TRIPRSI'});
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(tripleRsiEnabled?'RSI Triplo online.':'RSI Triplo offline.');
+}
+
 async function setRoboFiboPoc(enabled){
   roboFiboPocEnabled=!!enabled;
   try{ localStorage.setItem('mega_robofibo_poc',roboFiboPocEnabled?'ON':'OFF'); }catch(_){}
@@ -26387,6 +26612,11 @@ async function setAlphaxPower(enabled){
   if(voiceEnabled) speak(alphaxEnabled ? 'AlphaX Relay online.' : 'AlphaX Relay offline.');
 }
 
+document.addEventListener('click',(ev)=>{
+  const b=ev.target && ev.target.closest ? ev.target.closest('button') : null;
+  if(b && b.id && b.id.endsWith('PowerBtn') && b.id!=='tripleRsiPowerBtn' && tripleRsiEnabled) disableTripleRsiForOtherEngine();
+},true);
+if(tripleRsiPowerBtn) tripleRsiPowerBtn.onclick=()=>setTripleRsiPower(!tripleRsiEnabled);
 if(robotPowerBtn) robotPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); disablePresidenForOtherEngine(); setRobotPower(!robotEnabled); };
 if(aiPowerBtn) aiPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); disablePresidenForOtherEngine(); setAiPower(!aiEnabled); };
 if(eaPowerBtn) eaPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); setEaPower(!eaEnabled); };
@@ -26822,7 +27052,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
@@ -27492,10 +27722,10 @@ setInterval(()=>{
 // Pré-alerta geral permanece leve. No RSI + ADX usamos um relógio mais curto
 // para capturar a janela de 25 s com precisão sem aumentar a carga dos outros motores.
 setInterval(()=>{
-  if(megaCanPoll() && selectedRobotEngine()!=='OFF' && !['RSI5','SNIPER','COMBINER','RSIDIVBB','TLBRSI','FIBORSI'].includes(selectedRobotEngine())) loadPreSignals();
+  if(megaCanPoll() && selectedRobotEngine()!=='OFF' && !['RSI5','SNIPER','COMBINER','RSIDIVBB','TLBRSI','FIBORSI','TRIPRSI'].includes(selectedRobotEngine())) loadPreSignals();
 },10000);
 setInterval(()=>{
-  if(megaCanPoll() && ['RSI5','SNIPER','COMBINER','RSIDIVBB','TLBRSI','FIBORSI'].includes(selectedRobotEngine())) loadPreSignals();
+  if(megaCanPoll() && ['RSI5','SNIPER','COMBINER','RSIDIVBB','TLBRSI','FIBORSI','TRIPRSI'].includes(selectedRobotEngine())) loadPreSignals();
 },2000);
 
 // Resultado das operações abertas.
