@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.94.0"
-PWA_VERSION = "v153"
+APP_VERSION = "3.94.1"
+PWA_VERSION = "v154"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -11538,16 +11538,19 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         # 3.44 — mais frequência, mas preservando análise cruzada.
         # A confiança bruta deixa de bloquear sozinha setups em que Luna,
         # XGBoost e a EA Vela Atual convergem. HIGH continua mais seletivo.
-        low_min = 58.0 if interval == "1min" else 58.0
+        # 3.94.1 — pequena trava somente na IA LEITURA DO GRÁFICO.
+        # O motor IA + Volume POC continua com os limites FLEX da 3.94.0.
+        main_smart_tight = str(state_namespace or "SMART").upper() == "SMART"
+        low_min = 60.0 if main_smart_tight else 58.0
         if risk == "LOW":
             required_conf = low_min
-            quality_min = 54.0
+            quality_min = 55.0 if main_smart_tight else 54.0
         elif risk == "MEDIUM":
-            required_conf = 60.0
-            quality_min = 55.0
+            required_conf = 62.0 if main_smart_tight else 60.0
+            quality_min = 56.0 if main_smart_tight else 55.0
         else:
-            required_conf = 66.0
-            quality_min = 60.0
+            required_conf = 68.0 if main_smart_tight else 66.0
+            quality_min = 61.0 if main_smart_tight else 60.0
 
         moment_aligned = bool(
             moment_hint.get("confirmed")
