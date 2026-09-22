@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.95.3"
-PWA_VERSION = "v166"
+APP_VERSION = "3.95.4"
+PWA_VERSION = "v167"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -228,18 +228,23 @@ RSIDIVBB_MIN_RSI_DELTA = max(0.0, min(12.0, float(os.getenv("RSIDIVBB_MIN_RSI_DE
 RSIDIVBB_MAX_PIVOT_AGE = max(1, min(4, int(os.getenv("RSIDIVBB_MAX_PIVOT_AGE", "2"))))
 
 
-# MEGA IA 3.95.1 — EXTREME TMA + RSI + TREND FILTER.
+# MEGA IA 3.95.4 — EXTREME TMA + RSI + TREND FILTER • FLEX.
 # Adaptação causal do Extreme TMA System recebido. O indicador MT4 original usa
 # TMA centralizado e pode recalcular o histórico. No app, o endpoint do TMA usa
 # somente candles já disponíveis (pesos 18..1 para TMAPeriod=17), evitando candle
-# futuro. A entrada exige TMA + RSI 7 + Trend Filter EMA 9/21 na MESMA direção.
+# futuro. FLEX: banda ATR mais próxima, RSI 40/60 e rejeição de candle como gatilho
+# alternativo. O Trend Filter EMA 9/21 continua OBRIGATÓRIO na mesma direção.
 TMARSI_TMA_PERIOD = max(5, min(40, int(os.getenv("TMARSI_TMA_PERIOD", "17"))))
 TMARSI_ATR_PERIOD = max(20, min(200, int(os.getenv("TMARSI_ATR_PERIOD", "100"))))
-TMARSI_ATR_MULTIPLIER = max(0.5, min(4.0, float(os.getenv("TMARSI_ATR_MULTIPLIER", "1.7"))))
+TMARSI_ATR_MULTIPLIER = max(0.5, min(4.0, float(os.getenv("TMARSI_ATR_MULTIPLIER", "1.40"))))
 TMARSI_RSI_PERIOD = max(3, min(21, int(os.getenv("TMARSI_RSI_PERIOD", "7"))))
-TMARSI_RSI_CALL_MAX = max(20.0, min(45.0, float(os.getenv("TMARSI_RSI_CALL_MAX", "35"))))
-TMARSI_RSI_PUT_MIN = max(55.0, min(80.0, float(os.getenv("TMARSI_RSI_PUT_MIN", "65"))))
-TMARSI_REQUIRE_RSI_TURN = os.getenv("TMARSI_REQUIRE_RSI_TURN", "1").strip().lower() not in ("0", "false", "off", "no")
+TMARSI_RSI_CALL_MAX = max(20.0, min(45.0, float(os.getenv("TMARSI_RSI_CALL_MAX", "40"))))
+TMARSI_RSI_PUT_MIN = max(55.0, min(80.0, float(os.getenv("TMARSI_RSI_PUT_MIN", "60"))))
+# O giro do RSI não é mais obrigatório. Pode ser reativado por variável de ambiente.
+TMARSI_REQUIRE_RSI_TURN = os.getenv("TMARSI_REQUIRE_RSI_TURN", "0").strip().lower() not in ("0", "false", "off", "no")
+TMARSI_ALLOW_CANDLE_REJECTION = os.getenv("TMARSI_ALLOW_CANDLE_REJECTION", "1").strip().lower() not in ("0", "false", "off", "no")
+TMARSI_REJECTION_WICK_RATIO = max(0.35, min(2.5, float(os.getenv("TMARSI_REJECTION_WICK_RATIO", "0.70"))))
+TMARSI_REJECTION_MIN_RANGE = max(0.10, min(0.45, float(os.getenv("TMARSI_REJECTION_MIN_RANGE", "0.20"))))
 TMARSI_HISTORY_BARS = max(TMARSI_ATR_PERIOD + 25, min(500, int(os.getenv("TMARSI_HISTORY_BARS", "180"))))
 
 # MEGA IA 3.94.7 — 3 LINE BREAK + RSI.
@@ -594,11 +599,13 @@ def _causal_extreme_tma_endpoint(values, period=17):
 
 
 def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
-    """Extreme TMA + RSI 7 + Trend Filter — candle fechado, próxima vela.
+    """Extreme TMA FLEX + RSI 7 + Trend Filter — candle fechado, próxima vela.
 
-    CALL = toque/penetração da banda inferior + RSI <=35 iniciando giro para cima
-    + Trend Filter VERDE/CALL. PUT é o inverso na banda superior com RSI >=65
-    girando para baixo + Trend Filter VERMELHO/PUT.
+    CALL = toque/penetração da banda inferior + (RSI <=40 OU rejeição compradora)
+    + Trend Filter VERDE/CALL. PUT é o inverso na banda superior com RSI >=60
+    OU rejeição vendedora + Trend Filter VERMELHO/PUT.
+
+    O giro do RSI não é obrigatório por padrão; pode ser reativado via env.
     """
     rows=list(cs or [])
     tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30","1h":"H1"}.get(timeframe,timeframe)
@@ -608,8 +615,8 @@ def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
         return {
             "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
             "risk":"HIGH","strategy":name,"engine":"TMARSI","provider":"LOCAL_EXTREME_TMA_RSI_TREND",
-            "reason":f"Extreme TMA + RSI + Trend Filter coletando candles fechados ({len(rows)}/{need}).",
-            "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
+            "reason":f"Extreme TMA FLEX coletando candles fechados ({len(rows)}/{need}). BLOQUEADO POR: HISTÓRICO.",
+            "blocked_by":["HISTORICO"],"non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
             "direct_win_only":True,"gale_signal":False,
         }
 
@@ -625,8 +632,8 @@ def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
         return {
             "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
             "risk":"HIGH","strategy":name,"engine":"TMARSI","provider":"LOCAL_EXTREME_TMA_RSI_TREND",
-            "reason":"Extreme TMA + RSI aguardando TMA/ATR/RSI suficientes.",
-            "trend_filter":trend_filter,"non_repaint":True,"closed_candles_only":True,
+            "reason":"Extreme TMA FLEX aguardando TMA/ATR/RSI suficientes. BLOQUEADO POR: DADOS.",
+            "blocked_by":["DADOS"],"trend_filter":trend_filter,"non_repaint":True,"closed_candles_only":True,
             "next_candle_entry":True,"direct_win_only":True,"gale_signal":False,
         }
 
@@ -634,70 +641,134 @@ def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
     upper=float(tma_val)+band_range
     lower=float(tma_val)-band_range
     last=rows[-1]
-    lo=float(last.get("low",0) or 0); hi=float(last.get("high",0) or 0)
-    close=float(last.get("close",0) or 0)
+    op=float(last.get("open",0) or 0); lo=float(last.get("low",0) or 0)
+    hi=float(last.get("high",0) or 0); close=float(last.get("close",0) or 0)
 
     touch_lower=lo<=lower
     touch_upper=hi>=upper
-    rsi_call=float(r_now)<=TMARSI_RSI_CALL_MAX
-    rsi_put=float(r_now)>=TMARSI_RSI_PUT_MIN
-    if TMARSI_REQUIRE_RSI_TURN:
-        rsi_call=rsi_call and float(r_now)>float(r_prev)
-        rsi_put=rsi_put and float(r_now)<float(r_prev)
 
-    candidate="CALL" if (touch_lower and rsi_call) else ("PUT" if (touch_upper and rsi_put) else "NEUTRO")
+    # RSI FLEX: 40/60. O giro do RSI é opcional; por padrão o nível já pode disparar.
+    rsi_turn_up=float(r_now)>float(r_prev)
+    rsi_turn_down=float(r_now)<float(r_prev)
+    rsi_level_call=float(r_now)<=TMARSI_RSI_CALL_MAX
+    rsi_level_put=float(r_now)>=TMARSI_RSI_PUT_MIN
+    rsi_call=bool(rsi_level_call and (rsi_turn_up if TMARSI_REQUIRE_RSI_TURN else True))
+    rsi_put=bool(rsi_level_put and (rsi_turn_down if TMARSI_REQUIRE_RSI_TURN else True))
+
+    # Rejeição causal do último candle fechado: pavio dominante e fechamento de volta
+    # para dentro da faixa. Serve como gatilho ALTERNATIVO ao RSI, não substitui Trend.
+    candle_range=max(hi-lo,1e-12)
+    body=abs(close-op)
+    lower_wick=max(0.0,min(op,close)-lo)
+    upper_wick=max(0.0,hi-max(op,close))
+    bullish_rejection=bool(
+        TMARSI_ALLOW_CANDLE_REJECTION and touch_lower
+        and lower_wick>=max(body*TMARSI_REJECTION_WICK_RATIO,candle_range*TMARSI_REJECTION_MIN_RANGE)
+        and close>=lo+(candle_range*0.55)
+    )
+    bearish_rejection=bool(
+        TMARSI_ALLOW_CANDLE_REJECTION and touch_upper
+        and upper_wick>=max(body*TMARSI_REJECTION_WICK_RATIO,candle_range*TMARSI_REJECTION_MIN_RANGE)
+        and close<=lo+(candle_range*0.45)
+    )
+
+    call_trigger=bool(touch_lower and (rsi_call or bullish_rejection))
+    put_trigger=bool(touch_upper and (rsi_put or bearish_rejection))
+    # Candle que atravessa as duas bandas e confirma os dois lados é ambíguo: não entra.
+    if call_trigger and put_trigger:
+        candidate="NEUTRO"
+        ambiguous=True
+    else:
+        candidate="CALL" if call_trigger else ("PUT" if put_trigger else "NEUTRO")
+        ambiguous=False
+
     trend_ready=bool(trend_filter.get("ready"))
     trend_dir=str(trend_filter.get("direction") or "NEUTRO").upper()
     trend_color=str(trend_filter.get("color") or "NEUTRO").upper()
     aligned=bool(candidate in ("CALL","PUT") and trend_ready and trend_dir==candidate)
 
+    diagnostics={
+        "touch_lower":touch_lower,"touch_upper":touch_upper,
+        "rsi_call":rsi_call,"rsi_put":rsi_put,"rsi_turn_up":rsi_turn_up,"rsi_turn_down":rsi_turn_down,
+        "bullish_rejection":bullish_rejection,"bearish_rejection":bearish_rejection,
+        "trend_ready":trend_ready,"trend_direction":trend_dir,"trend_color":trend_color,
+    }
+
     if candidate=="NEUTRO":
-        reason=(f"Extreme TMA + RSI monitorando • banda {lower:.8g} / {upper:.8g} • RSI7 {float(r_now):.1f} "
-                f"(anterior {float(r_prev):.1f}) • Trend Filter {trend_color} → {trend_dir}.")
+        blockers=[]
+        if ambiguous:
+            blockers.append("AMBIGUO")
+        elif not (touch_lower or touch_upper):
+            blockers.append("TMA")
+        else:
+            if touch_lower and not (rsi_call or bullish_rejection): blockers.append("RSI/GIRO CALL")
+            if touch_upper and not (rsi_put or bearish_rejection): blockers.append("RSI/GIRO PUT")
+        if not blockers:
+            blockers.append("GATILHO")
+        block_txt=" / ".join(blockers)
+        reason=(f"Extreme TMA FLEX monitorando • banda {lower:.8g} / {upper:.8g} • RSI7 {float(r_now):.1f} "
+                f"(anterior {float(r_prev):.1f}) • Trend Filter {trend_color} → {trend_dir} • BLOQUEADO POR: {block_txt}.")
         return {
             "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
             "risk":"HIGH","strategy":name,"engine":"TMARSI","provider":"LOCAL_EXTREME_TMA_RSI_TREND",
-            "reason":reason[:460],"trend_filter":trend_filter,"candidate_direction":"NEUTRO",
+            "reason":reason[:460],"blocked_by":blockers,"diagnostics":diagnostics,
+            "trend_filter":trend_filter,"candidate_direction":"NEUTRO",
             "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
             "direct_win_only":True,"gale_signal":False,
             "tma":{"period":TMARSI_TMA_PERIOD,"value":round(float(tma_val),10),"upper":round(upper,10),"lower":round(lower,10),"atr_period":TMARSI_ATR_PERIOD,"atr_multiplier":TMARSI_ATR_MULTIPLIER},
-            "rsi":{"period":TMARSI_RSI_PERIOD,"value":round(float(r_now),2),"previous":round(float(r_prev),2),"call_max":TMARSI_RSI_CALL_MAX,"put_min":TMARSI_RSI_PUT_MIN},
+            "rsi":{"period":TMARSI_RSI_PERIOD,"value":round(float(r_now),2),"previous":round(float(r_prev),2),"call_max":TMARSI_RSI_CALL_MAX,"put_min":TMARSI_RSI_PUT_MIN,"turn_required":TMARSI_REQUIRE_RSI_TURN},
+            "rejection":{"enabled":TMARSI_ALLOW_CANDLE_REJECTION,"bullish":bullish_rejection,"bearish":bearish_rejection,"wick_ratio":TMARSI_REJECTION_WICK_RATIO},
         }
 
     if not aligned:
         if not trend_ready:
-            why=f"{candidate} candidato no TMA + RSI, mas o Trend Filter ainda não está pronto. Entrada bloqueada."
+            why=f"{candidate} candidato no TMA FLEX, mas o Trend Filter ainda não está pronto. BLOQUEADO POR: TREND."
         elif trend_dir=="NEUTRO":
-            why=f"{candidate} candidato no TMA + RSI, mas o Trend Filter está NEUTRO. Entrada bloqueada."
+            why=f"{candidate} candidato no TMA FLEX, mas o Trend Filter está NEUTRO. BLOQUEADO POR: TREND."
         else:
-            why=f"{candidate} candidato no TMA + RSI, porém Trend Filter {trend_color} autoriza somente {trend_dir}. Entrada bloqueada."
+            why=f"{candidate} candidato no TMA FLEX, porém Trend Filter {trend_color} autoriza somente {trend_dir}. BLOQUEADO POR: TREND."
         return {
             "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
             "risk":"HIGH","strategy":name,"engine":"TMARSI","provider":"LOCAL_EXTREME_TMA_RSI_TREND",
-            "reason":why,"trend_filter":trend_filter,"candidate_direction":candidate,
+            "reason":why,"blocked_by":["TREND"],"diagnostics":diagnostics,
+            "trend_filter":trend_filter,"candidate_direction":candidate,
             "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
             "direct_win_only":True,"gale_signal":False,
             "tma":{"period":TMARSI_TMA_PERIOD,"value":round(float(tma_val),10),"upper":round(upper,10),"lower":round(lower,10),"atr_period":TMARSI_ATR_PERIOD,"atr_multiplier":TMARSI_ATR_MULTIPLIER},
-            "rsi":{"period":TMARSI_RSI_PERIOD,"value":round(float(r_now),2),"previous":round(float(r_prev),2),"call_max":TMARSI_RSI_CALL_MAX,"put_min":TMARSI_RSI_PUT_MIN},
+            "rsi":{"period":TMARSI_RSI_PERIOD,"value":round(float(r_now),2),"previous":round(float(r_prev),2),"call_max":TMARSI_RSI_CALL_MAX,"put_min":TMARSI_RSI_PUT_MIN,"turn_required":TMARSI_REQUIRE_RSI_TURN},
+            "rejection":{"enabled":TMARSI_ALLOW_CANDLE_REJECTION,"bullish":bullish_rejection,"bearish":bearish_rejection,"wick_ratio":TMARSI_REJECTION_WICK_RATIO},
         }
 
     penetration=((lower-lo)/band_range if candidate=="CALL" else (hi-upper)/band_range)
     turn_strength=((float(r_now)-float(r_prev)) if candidate=="CALL" else (float(r_prev)-float(r_now)))
     ema_gap=abs(float(trend_filter.get("ema9") or close)-float(trend_filter.get("ema21") or close))/max(abs(close),1e-12)
-    confidence=clamp(74.0+min(8.0,max(0.0,penetration)*35.0)+min(6.0,max(0.0,turn_strength)*1.5)+min(5.0,ema_gap*12000.0),74.0,93.0)
+    used_rsi=rsi_call if candidate=="CALL" else rsi_put
+    used_rejection=bullish_rejection if candidate=="CALL" else bearish_rejection
+    confidence=clamp(
+        71.0 + min(8.0,max(0.0,penetration)*35.0)
+        + (4.0 if used_rsi else 0.0) + (3.0 if used_rejection else 0.0)
+        + min(3.0,max(0.0,turn_strength)*1.0) + min(4.0,ema_gap*10000.0),
+        71.0,92.0
+    )
     evt=str(last.get("datetime") or last.get("timestamp") or len(rows)-1)
-    reason=(f"{candidate} LIBERADO: TMA17 banda {'inferior' if candidate=='CALL' else 'superior'} tocada + "
-            f"RSI7 {float(r_now):.1f} girando {'para cima' if candidate=='CALL' else 'para baixo'} + "
+    trigger_bits=[]
+    if used_rsi: trigger_bits.append(f"RSI7 {float(r_now):.1f}")
+    if used_rejection: trigger_bits.append("rejeição de candle")
+    trigger_txt=" + ".join(trigger_bits) if trigger_bits else "gatilho FLEX"
+    reason=(f"{candidate} LIBERADO: TMA17/ATR×{TMARSI_ATR_MULTIPLIER:g} banda "
+            f"{'inferior' if candidate=='CALL' else 'superior'} tocada + {trigger_txt} + "
             f"Trend Filter {trend_color} ({trend_dir}) alinhado. Entrada na próxima vela.")
     return {
         "available":True,"direction":candidate,"confidence":round(float(confidence),1),"confirmed":True,
         "risk":"MEDIUM","strategy":name,"engine":"TMARSI","provider":"LOCAL_EXTREME_TMA_RSI_TREND",
-        "reason":reason[:460],"trend_filter":trend_filter,"candidate_direction":candidate,
+        "reason":reason[:460],"blocked_by":[],"diagnostics":diagnostics,
+        "trend_filter":trend_filter,"candidate_direction":candidate,
         "non_repaint":True,"non_repaint_after_release":True,"closed_candles_only":True,
         "next_candle_entry":True,"direct_win_only":True,"gale_signal":False,"martingale":False,
         "event_key":f"TMARSI:{candidate}:{evt}",
         "tma":{"period":TMARSI_TMA_PERIOD,"value":round(float(tma_val),10),"upper":round(upper,10),"lower":round(lower,10),"atr_period":TMARSI_ATR_PERIOD,"atr_multiplier":TMARSI_ATR_MULTIPLIER,"causal_endpoint":True},
         "rsi":{"period":TMARSI_RSI_PERIOD,"value":round(float(r_now),2),"previous":round(float(r_prev),2),"call_max":TMARSI_RSI_CALL_MAX,"put_min":TMARSI_RSI_PUT_MIN,"turn_required":TMARSI_REQUIRE_RSI_TURN},
+        "rejection":{"enabled":TMARSI_ALLOW_CANDLE_REJECTION,"bullish":bullish_rejection,"bearish":bearish_rejection,"wick_ratio":TMARSI_REJECTION_WICK_RATIO},
     }
 
 def _three_line_break_profile(closes, lb=3):
@@ -19465,7 +19536,7 @@ async def pre_signals(
     if engine == "TMARSI":
         return {
             "ok": True,
-            "message": "Extreme TMA + RSI + Trend Filter usa somente candle fechado: TMA 17 causal + ATR 100 x1,7 + RSI 7 (35/65) + Trend Filter EMA 9/21 obrigatoriamente alinhado. CALL/PUT vale para a próxima vela.",
+            "message": "Extreme TMA FLEX usa somente candle fechado: TMA 17 causal + ATR 100 x1,40 + RSI 7 (40/60) OU rejeição de candle + Trend Filter EMA 9/21 obrigatoriamente alinhado. CALL/PUT vale para a próxima vela.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -21715,7 +21786,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Extreme TMA + RSI + Trend Filter">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🎯 EXTREME TMA + RSI + TREND FILTER</div>
-      <div class="robot-mode-desc" id="tmaRsiModeDesc">TMA 17 causal + ATR 100×1,7 + RSI 7 (35/65) • Trend Filter EMA 9/21 obrigatório • candle fechado • próxima vela • sem repaint.</div>
+      <div class="robot-mode-desc" id="tmaRsiModeDesc">TMA 17 causal + ATR 100×1,40 + RSI 7 (40/60) OU rejeição • Trend Filter EMA 9/21 obrigatório • candle fechado • próxima vela • sem repaint.</div>
     </div>
     <button id="tmaRsiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -26227,7 +26298,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: divergência RSI14 confirmada + Bollinger 20/2 na zona extrema • candle fechado • próxima vela • sem repaint e sem Gale.'
     : 'OFFLINE: RSI Divergence + Bollinger pausado.';
   if(tmaRsiModeDesc) tmaRsiModeDesc.textContent=tmaRsiEnabled
-    ? 'ONLINE: TMA17 causal + ATR100×1,7 + RSI7 35/65 + giro • Trend Filter EMA9/21 obrigatório: 🟢 só CALL / 🔴 só PUT • candle fechado • próxima vela.'
+    ? 'ONLINE FLEX: TMA17 causal + ATR100×1,40 + RSI7 40/60 OU rejeição • Trend Filter EMA9/21 obrigatório: 🟢 só CALL / 🔴 só PUT • candle fechado • próxima vela.'
     : 'OFFLINE: Extreme TMA + RSI + Trend Filter pausado.';
   if(tlbRsiModeDesc) tlbRsiModeDesc.textContent=tlbRsiEnabled
     ? 'ONLINE: 3 Line Break LB=3 + RSI14 • zona congelada antes da vela de confirmação • candle fechado • próxima vela • sem repaint e sem Gale.'
@@ -26244,7 +26315,7 @@ function applyRobotPowerState(){
 
   const engine=selectedRobotEngine();
   if(engine==='TMARSI'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EXTREME TMA + RSI ONLINE • TMA17 + RSI7 + TREND FILTER ALINHADOS • PRÓXIMA VELA';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EXTREME TMA FLEX ONLINE • TMA17 + RSI7 40/60 OU REJEIÇÃO + TREND FILTER • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 Extreme TMA + RSI • banda TMA + RSI 7 precisam concordar com o Trend Filter: 🟢 CALL / 🔴 PUT.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Extreme TMA + RSI ativo • procurando TMA + RSI + Trend Filter na mesma direção</div>';
     rad();
