@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.94.5"
-PWA_VERSION = "v158"
+APP_VERSION = "3.94.6"
+PWA_VERSION = "v159"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -208,6 +208,19 @@ COMBINER_RSI_PUT_MIN = max(42.0, min(65.0, float(os.getenv("COMBINER_RSI_PUT_MIN
 COMBINER_MIN_SCORE = max(3.5, min(8.0, float(os.getenv("COMBINER_MIN_SCORE", "5.0"))))
 COMBINER_SCORE_EDGE = max(0.5, min(4.0, float(os.getenv("COMBINER_SCORE_EDGE", "1.0"))))
 
+# MEGA IA 3.94.6 — RSI DIVERGENCE + BOLLINGER.
+# Divergência em RSI 14 entre pivôs confirmados + Bollinger 20/2 como zona de confluência.
+# Usa exclusivamente candles fechados e libera a entrada somente na vela imediatamente seguinte.
+RSIDIVBB_RSI_PERIOD = max(7, min(30, int(os.getenv("RSIDIVBB_RSI_PERIOD", "14"))))
+RSIDIVBB_BB_PERIOD = max(12, min(60, int(os.getenv("RSIDIVBB_BB_PERIOD", "20"))))
+RSIDIVBB_BB_DEVIATION = max(1.2, min(4.0, float(os.getenv("RSIDIVBB_BB_DEVIATION", "2.0"))))
+RSIDIVBB_HISTORY_BARS = max(80, min(300, int(os.getenv("RSIDIVBB_HISTORY_BARS", "150"))))
+RSIDIVBB_LOOKBACK = max(16, min(80, int(os.getenv("RSIDIVBB_LOOKBACK", "34"))))
+RSIDIVBB_PIVOT_SIDE = max(1, min(4, int(os.getenv("RSIDIVBB_PIVOT_SIDE", "1"))))
+RSIDIVBB_BAND_TOLERANCE = max(0.0, min(0.25, float(os.getenv("RSIDIVBB_BAND_TOLERANCE", "0.08"))))
+RSIDIVBB_MIN_RSI_DELTA = max(0.0, min(12.0, float(os.getenv("RSIDIVBB_MIN_RSI_DELTA", "1.0"))))
+RSIDIVBB_MAX_PIVOT_AGE = max(1, min(4, int(os.getenv("RSIDIVBB_MAX_PIVOT_AGE", "2"))))
+
 
 def combiner_flow_rsi_strategy(cs, timeframe="1min", market="OPEN"):
     """COMBINER FLOW + RSI — suporte/resistência causal + reação + RSI 14.
@@ -316,6 +329,112 @@ def combiner_flow_rsi_strategy(cs, timeframe="1min", market="OPEN"):
             "zone": round(float(zone),10), "near_support": near_support, "near_resistance": near_resistance,
             "lower_wick_ratio": round(lower_wr,4), "upper_wick_ratio": round(upper_wr,4),
         },
+    }
+
+
+def rsi_divergence_bollinger_strategy(cs, timeframe="1min", market="OPEN"):
+    """RSI Divergence + Bollinger 20/2 — causal, candle fechado e próxima vela.
+
+    CALL: preço faz fundo mais baixo entre dois pivôs confirmados, RSI 14 faz fundo
+    mais alto e o segundo pivô toca/rompe (ou fica na pequena tolerância) da banda inferior.
+    PUT: preço faz topo mais alto, RSI 14 faz topo mais baixo e o segundo pivô fica
+    na zona da banda superior. Nenhum pivô usa candle futuro ainda aberto.
+    """
+    rows=list(cs or [])
+    tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30","1h":"H1"}.get(timeframe,timeframe)
+    name=f"RSI DIVERGENCE + BOLLINGER {tf_label}"
+    need=max(55, RSIDIVBB_RSI_PERIOD+RSIDIVBB_BB_PERIOD+12, RSIDIVBB_LOOKBACK+12)
+    if len(rows)<need:
+        return {
+            "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
+            "risk":"HIGH","strategy":name,"engine":"RSIDIVBB","provider":"LOCAL_RSI_DIVERGENCE_BOLLINGER",
+            "reason":f"RSI Divergence + Bollinger coletando candles fechados ({len(rows)}/{need}).",
+            "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,"direct_win_only":True,"gale_signal":False,
+        }
+
+    rows=rows[-RSIDIVBB_HISTORY_BARS:]
+    closes=[float(x.get("close",0) or 0) for x in rows]
+    n=len(rows)
+    rvals=[None]*n
+    for i in range(RSIDIVBB_RSI_PERIOD,n):
+        rvals[i]=rsi(closes[:i+1],RSIDIVBB_RSI_PERIOD)
+
+    side=RSIDIVBB_PIVOT_SIDE
+    start=max(side, n-RSIDIVBB_LOOKBACK-8, RSIDIVBB_RSI_PERIOD)
+    lows=[]; highs=[]
+    # O limite n-side garante que todos os candles à direita do pivô já fecharam.
+    for i in range(start,n-side):
+        rv=rvals[i]
+        if rv is None: continue
+        lo=float(rows[i].get("low",0) or 0); hi=float(rows[i].get("high",0) or 0)
+        low_ok=all(lo <= float(rows[j].get("low",0) or 0) for j in range(i-side,i+side+1) if j!=i)
+        high_ok=all(hi >= float(rows[j].get("high",0) or 0) for j in range(i-side,i+side+1) if j!=i)
+        if low_ok: lows.append((i,lo,float(rv)))
+        if high_ok: highs.append((i,hi,float(rv)))
+
+    def bb_at(i):
+        if i+1<RSIDIVBB_BB_PERIOD: return None
+        return bollinger(closes[:i+1],RSIDIVBB_BB_PERIOD,RSIDIVBB_BB_DEVIATION)
+
+    candidates=[]
+    if len(lows)>=2:
+        a,b=lows[-2],lows[-1]
+        age=(n-1)-b[0]
+        bb=bb_at(b[0])
+        if bb:
+            width=max(float(bb["upper"])-float(bb["lower"]),1e-12)
+            tol=width*RSIDIVBB_BAND_TOLERANCE
+            rdelta=b[2]-a[2]
+            divergence=b[1] < a[1] and rdelta>=RSIDIVBB_MIN_RSI_DELTA
+            near_band=b[1] <= float(bb["lower"])+tol
+            if divergence and near_band and age<=RSIDIVBB_MAX_PIVOT_AGE:
+                pierced=b[1]<=float(bb["lower"])
+                pstrength=max(0.0,(a[1]-b[1])/width)
+                conf=clamp(72.0+min(11.0,rdelta*1.5)+min(7.0,pstrength*120.0)+(3.0 if pierced else 1.0),72.0,94.0)
+                candidates.append({"direction":"CALL","confidence":conf,"a":a,"b":b,"bb":bb,"age":age,"pierced":pierced,"rdelta":rdelta})
+
+    if len(highs)>=2:
+        a,b=highs[-2],highs[-1]
+        age=(n-1)-b[0]
+        bb=bb_at(b[0])
+        if bb:
+            width=max(float(bb["upper"])-float(bb["lower"]),1e-12)
+            tol=width*RSIDIVBB_BAND_TOLERANCE
+            rdelta=a[2]-b[2]
+            divergence=b[1] > a[1] and rdelta>=RSIDIVBB_MIN_RSI_DELTA
+            near_band=b[1] >= float(bb["upper"])-tol
+            if divergence and near_band and age<=RSIDIVBB_MAX_PIVOT_AGE:
+                pierced=b[1]>=float(bb["upper"])
+                pstrength=max(0.0,(b[1]-a[1])/width)
+                conf=clamp(72.0+min(11.0,rdelta*1.5)+min(7.0,pstrength*120.0)+(3.0 if pierced else 1.0),72.0,94.0)
+                candidates.append({"direction":"PUT","confidence":conf,"a":a,"b":b,"bb":bb,"age":age,"pierced":pierced,"rdelta":rdelta})
+
+    if not candidates:
+        rr=rvals[-1]
+        return {
+            "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
+            "risk":"HIGH","strategy":name,"engine":"RSIDIVBB","provider":"LOCAL_RSI_DIVERGENCE_BOLLINGER",
+            "reason":f"RSI Divergence + Bollinger monitorando • RSI14 {float(rr):.1f} • aguardando divergência confirmada em banda extrema." if rr is not None else "RSI Divergence + Bollinger aguardando estrutura.",
+            "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,"direct_win_only":True,"gale_signal":False,
+        }
+
+    chosen=max(candidates,key=lambda x:(x["b"][0],x["confidence"]))
+    direction=chosen["direction"]; a=chosen["a"]; b=chosen["b"]; bb=chosen["bb"]
+    evt=str(rows[b[0]].get("datetime") or rows[b[0]].get("timestamp") or b[0])
+    if direction=="CALL":
+        reason=(f"CALL divergência altista: preço {a[1]:.8g} → {b[1]:.8g} (fundo mais baixo), "
+                f"RSI14 {a[2]:.1f} → {b[2]:.1f} (fundo mais alto) + banda inferior BB20/2. Próxima vela.")
+    else:
+        reason=(f"PUT divergência baixista: preço {a[1]:.8g} → {b[1]:.8g} (topo mais alto), "
+                f"RSI14 {a[2]:.1f} → {b[2]:.1f} (topo mais baixo) + banda superior BB20/2. Próxima vela.")
+    return {
+        "available":True,"direction":direction,"confidence":round(float(chosen["confidence"]),1),"confirmed":True,
+        "risk":"MEDIUM","strategy":name,"engine":"RSIDIVBB","provider":"LOCAL_RSI_DIVERGENCE_BOLLINGER",
+        "reason":reason[:460],"non_repaint":True,"non_repaint_after_release":True,"closed_candles_only":True,
+        "next_candle_entry":True,"direct_win_only":True,"gale_signal":False,"martingale":False,
+        "event_key":f"RSIDIVBB:{direction}:{evt}","pivot_age_bars":int(chosen["age"]),
+        "rsi":round(float(b[2]),2),"rsi_previous_pivot":round(float(a[2]),2),"rsi_delta":round(float(chosen["rdelta"]),2),
+        "bollinger":{"period":RSIDIVBB_BB_PERIOD,"deviation":RSIDIVBB_BB_DEVIATION,"upper":float(bb["upper"]),"middle":float(bb["middle"]),"lower":float(bb["lower"]),"tolerance_ratio":RSIDIVBB_BAND_TOLERANCE},
     }
 
 
@@ -12360,6 +12479,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     elif engine == "COMBINER":
         # COMBINER FLOW + RSI confirma candle fechado e entra somente na abertura seguinte.
         entry_mode = "BIRTH"
+    elif engine == "RSIDIVBB":
+        # Divergência + Bollinger é confirmada somente em candles fechados.
+        entry_mode = "BIRTH"
     elif engine == "PRESIDEN":
         # PRESIDEN confirma a vela fechada e entra somente na abertura seguinte.
         entry_mode = "BIRTH"
@@ -12377,7 +12499,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         entry_mode = "MIDDLE"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "ALPHAX", "VOLUME_AI"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "VOLUME_AI"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
@@ -12585,6 +12707,17 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 raw = await iq_ea_candles(iq_state, symbol, interval, 180, regular_market=False)
             else:
                 raw = await candles(symbol, interval, 180, "OPEN", None, request=request)
+        elif engine == "RSIDIVBB":
+            # RSI Divergence + Bollinger: OPEN multifuente/cTrader; OTC real pela IQ Option.
+            if market == "IQ_OTC":
+                if not iq_state:
+                    out = neutral_signal(symbol, interval, market, "RSI DIVERGENCE + BOLLINGER • IQ OPTION OFFLINE", "Conecte a IQ Option para analisar divergência + Bollinger no OTC real.", source_state="WAITING")
+                    out.update({"strategy":"RSI DIVERGENCE + BOLLINGER 20/2","mode":"RSI_DIV_BB_NEXT_CANDLE","selected_engine":engine,"feed_source":"IQ_OPTION_OTC","non_repaint":True,"next_candle_entry":True,"direct_win_only":True,"gale_signal":False})
+                    cache[key]=(time.time(),out)
+                    return out
+                raw=await iq_ea_candles(iq_state,symbol,interval,RSIDIVBB_HISTORY_BARS,regular_market=False)
+            else:
+                raw=await candles(symbol,interval,RSIDIVBB_HISTORY_BARS,"OPEN",None,request=request)
         elif engine == "PRESIDEN":
             # PRESIDEN BREAKOUT: somente candles fechados; entrada na próxima vela.
             if market == "IQ_OTC":
@@ -12779,6 +12912,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "SUPER SIGNALS CHANNEL NR • FONTE EM ESPERA" if market == "OPEN" else "SUPER SIGNALS CHANNEL NR • IQ OPTION EM ESPERA"
         elif engine == "COMBINER":
             status = "COMBINER FLOW + RSI • FONTE EM ESPERA" if market == "OPEN" else "COMBINER FLOW + RSI • IQ OPTION EM ESPERA"
+        elif engine == "RSIDIVBB":
+            status = "RSI DIVERGENCE + BOLLINGER • FONTE EM ESPERA" if market == "OPEN" else "RSI DIVERGENCE + BOLLINGER • IQ OPTION EM ESPERA"
         elif engine == "ALPHAX":
             status = "ALPHAX RELAY • FONTE EM ESPERA" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION EM ESPERA"
         elif engine == "SAMURAI":
@@ -12818,6 +12953,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "SUPER SIGNALS CHANNEL NR • FONTE RECONECTANDO" if market == "OPEN" else "SUPER SIGNALS CHANNEL NR • IQ OPTION RECONECTANDO"
         elif engine == "COMBINER":
             status = "COMBINER FLOW + RSI • FONTE RECONECTANDO" if market == "OPEN" else "COMBINER FLOW + RSI • IQ OPTION RECONECTANDO"
+        elif engine == "RSIDIVBB":
+            status = "RSI DIVERGENCE + BOLLINGER • FONTE RECONECTANDO" if market == "OPEN" else "RSI DIVERGENCE + BOLLINGER • IQ OPTION RECONECTANDO"
         elif engine == "ALPHAX":
             status = "ALPHAX RELAY • FONTE RECONECTANDO" if market == "OPEN" else "ALPHAX RELAY • IQ OPTION RECONECTANDO"
         elif engine == "SAMURAI":
@@ -12902,6 +13039,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "COMBINER":
             engine_title = "COMBINER FLOW + RSI"
             engine_mode = "COMBINER_FLOW_RSI"
+        elif engine == "RSIDIVBB":
+            engine_title = "RSI DIVERGENCE + BOLLINGER"
+            engine_mode = "RSI_DIV_BB_NEXT_CANDLE"
         elif engine == "ALPHAX":
             engine_title = "ALPHAX RELAY"
             engine_mode = "ALPHAX_RELAY"
@@ -12936,7 +13076,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+        if market != "OPEN" and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -12955,6 +13095,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "VELOCITY": "LOCAL_VELOCITY_FLOW",
                     "SNIPER": "LOCAL_SUPER_SIGNALS_CHANNEL_NR",
                     "COMBINER": "LOCAL_COMBINER_FLOW_RSI",
+                    "RSIDIVBB": "LOCAL_RSI_DIVERGENCE_BOLLINGER",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
                     "RAPID": "LOCAL_RAPID_EAS",
@@ -12979,7 +13120,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
             # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
             # decisão independente do Robô Principal.
-            engine_closed = (closed[-260:] if engine == "RANGE" else (closed[-min(SSC_HISTORY_BARS, len(closed)):] if engine == "SNIPER" else (closed[-180:] if engine == "COMBINER" else (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "RSI5", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else (closed[-90:] if len(closed) > 90 else closed))))))
+            engine_closed = (closed[-260:] if engine == "RANGE" else (closed[-min(SSC_HISTORY_BARS, len(closed)):] if engine == "SNIPER" else (closed[-180:] if engine in ("COMBINER", "RSIDIVBB") else (closed[-220:] if engine in ("SMART", "EA") else (closed[-120:] if engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "RSI5", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else (closed[-90:] if len(closed) > 90 else closed))))))
             if engine == "SMART":
                 moment_hint = _moment_ea_context_for_ai(market, symbol, interval)
                 analysis = await openai_direct_signal(
@@ -13002,6 +13143,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis = super_signals_channel_nr_strategy(engine_closed, interval, market=market)
             elif engine == "COMBINER":
                 analysis = combiner_flow_rsi_strategy(engine_closed, interval, market=market)
+            elif engine == "RSIDIVBB":
+                analysis = rsi_divergence_bollinger_strategy(engine_closed, interval, market=market)
             elif engine == "PRESIDEN":
                 analysis = presiden_breakout_strategy(engine_closed, interval, market=market)
             elif engine == "ALPHAX":
@@ -13212,7 +13355,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and analysis.get("confirmed")),
+            "ai_confirmed": bool(engine in ("SMART", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and analysis.get("confirmed")),
             "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                 "EA": "XGBOOST_RSI_VALUE_CHART",
                 "RUBIK": "LOCAL_RUBIK_ADAPTED",
@@ -13221,6 +13364,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "VELOCITY": "LOCAL_VELOCITY_FLOW",
                 "SNIPER": "LOCAL_SUPER_SIGNALS_CHANNEL_NR",
                     "COMBINER": "LOCAL_COMBINER_FLOW_RSI",
+                    "RSIDIVBB": "LOCAL_RSI_DIVERGENCE_BOLLINGER",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
                     "RAPID": "LOCAL_RAPID_EAS",
@@ -13230,7 +13374,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "RSI5": "LOCAL_RSI_ADX_4TF",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "HIGH").upper(),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "HIGH").upper(),
             "strategy": (
                 "IA LEITURA DO GRÁFICO" if engine == "SMART"
                 else (analysis.get("strategy") or (
@@ -13240,6 +13384,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "RANGE COMPRESSION BREAKOUT" if engine == "RANGE"
                     else "VELOCITY FLOW • MR MT4" if engine == "VELOCITY"
                     else "COMBINER FLOW + RSI" if engine == "COMBINER"
+                    else "RSI DIVERGENCE + BOLLINGER 20/2" if engine == "RSIDIVBB"
                     else "ALPHAX RELAY" if engine == "ALPHAX"
                     else "PRESIDEN BREAKOUT" if engine == "PRESIDEN"
                     else "NÚCLEO RÁPIDO EAs" if engine == "RAPID"
@@ -13489,6 +13634,16 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key] = (time.time(), base)
                         return base
 
+                if engine == "RSIDIVBB":
+                    rsidivbb_age=max(0.0,(now()-current_boundary(interval)).total_seconds())
+                    if rsidivbb_age>10.0:
+                        base["status"]="ONLINE • RSI DIVERGENCE + BOLLINGER • AGUARDANDO PRÓXIMO FECHAMENTO"
+                        base["reason"]="Divergência + Bollinger confirmada, mas a abertura imediatamente seguinte já passou. A entrada tardia foi descartada."
+                        base["direction"]="NEUTRO"; base["entry_time"]=None; base["expiry_time"]=None; base["risk"]="HIGH"
+                        release_state["active_signal"]=None
+                        cache[key]=(time.time(),base)
+                        return base
+
                 if engine == "ALPHAX":
                     # AlphaX nunca solta o CALL/PUT em cima da abertura. O sinal só é
                     # oficializado na janela antecipada e entra na próxima vela.
@@ -13613,6 +13768,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "VELOCITY": "SINAL VELOCITY FLOW LIBERADO",
                         "SNIPER": "SINAL SUPER SIGNALS CHANNEL NR LIBERADO",
                         "COMBINER": "SINAL COMBINER FLOW + RSI LIBERADO",
+                        "RSIDIVBB": "SINAL RSI DIVERGENCE + BOLLINGER LIBERADO",
                         "ALPHAX": "SINAL ALPHAX RELAY LIBERADO",
                         "PRESIDEN": "SINAL PRESIDEN BREAKOUT LIBERADO",
                         "RAPID": "SINAL NÚCLEO RÁPIDO EAs LIBERADO",
@@ -13625,7 +13781,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "FORCE": "SINAL EA FORÇA DO MOVIMENTO LIBERADO",
                         "BIGRISE": "SINAL BTC FORCE MULTIATIVOS LIBERADO",
                     }.get(engine, "SINAL IA GRÁFICA LIBERADO")),
-                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "RSI5", "SNIPER", "COMBINER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "MEDIUM").upper(),
+                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
                     "expiry_time": iso(expiry),
@@ -13685,7 +13841,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -13793,6 +13949,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "VELOCITY": "LOCAL_VELOCITY_FLOW",
                 "SNIPER": "LOCAL_SUPER_SIGNALS_CHANNEL_NR",
                     "COMBINER": "LOCAL_COMBINER_FLOW_RSI",
+                    "RSIDIVBB": "LOCAL_RSI_DIVERGENCE_BOLLINGER",
                     "ALPHAX": "LOCAL_ALPHAX_RELAY",
                     "PRESIDEN": "LOCAL_PRESIDEN_BREAKOUT",
                     "VOLUME": "LOCAL_VOLUME_POC_ORIGINAL",
@@ -16535,7 +16692,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     "GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY",
-    "SNIPER", "COMBINER", "ALPHAX", "VOLUME_AI",
+    "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "VOLUME_AI",
 }
 
 
@@ -17369,11 +17526,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "ALPHAX", "VOLUME_AI"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "VOLUME_AI"):
         raise HTTPException(400, "Motor inválido.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+    if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -18058,7 +18215,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "ALPHAX", "VOLUME_AI"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "VOLUME_AI"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -18105,6 +18262,14 @@ async def pre_signals(
         return {
             "ok": True,
             "message": "COMBINER FLOW + RSI usa suporte/resistência confirmados + reação da vela + RSI 14. Somente candle fechado; entrada na próxima vela e sem repaint após a liberação.",
+            "items": [],
+            "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
+        }
+
+    if engine == "RSIDIVBB":
+        return {
+            "ok": True,
+            "message": "RSI Divergence + Bollinger usa RSI 14 + BB 20/2 somente em pivôs/candles fechados. Não há pré-sinal intrabar; CALL/PUT vale apenas para a vela imediatamente seguinte.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -18187,10 +18352,10 @@ async def pre_signals(
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
     if fallback_twelve:
         market = "OPEN"
-    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and not iq_state:
+    if requested_market == "IQ_OTC" and engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and not iq_state:
         wait_label = {
             "EA": "EA Tripla",
             "RUBIK": "Robô Rubik Adaptado",
@@ -18199,6 +18364,7 @@ async def pre_signals(
             "VELOCITY": "Velocity Flow",
             "SNIPER": "SUPER SIGNALS CHANNEL NR",
             "COMBINER": "COMBINER FLOW + RSI",
+            "RSIDIVBB": "RSI Divergence + Bollinger",
             "ALPHAX": "AlphaX RELAY",
             "RAPID": "Núcleo Rápido EAs",
             "SAMURAI": "Algo Samurai • Treinamento",
@@ -18271,7 +18437,7 @@ async def pre_signals(
         key = f"{group_key}|{symbol}"
         try:
             pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (180 if engine == "SNIPER" else (120 if engine == "RUBIK" else 90)))
-            if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and requested_market == "IQ_OTC":
+            if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
                 )
@@ -18726,12 +18892,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "ALPHAX", "VOLUME_AI"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "VOLUME_AI"):
         raise HTTPException(400, "Motor inválido.")
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
     if fallback_twelve:
         market = "OPEN"
 
@@ -18818,6 +18984,13 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 raw = await iq_ea_candles(iq_state, sym, interval, 180, regular_market=False)
             else:
                 raw = await candles(sym, interval, 180, "OPEN", None, request=request)
+        elif engine == "RSIDIVBB":
+            if market == "IQ_OTC":
+                if not iq_state:
+                    raise RuntimeError("Conecte a IQ Option para o RSI Divergence + Bollinger analisar OTC.")
+                raw=await iq_ea_candles(iq_state,sym,interval,RSIDIVBB_HISTORY_BARS,regular_market=False)
+            else:
+                raw=await candles(sym,interval,RSIDIVBB_HISTORY_BARS,"OPEN",None,request=request)
         elif engine == "PRESIDEN":
             if market == "IQ_OTC":
                 if not iq_state:
@@ -18962,6 +19135,16 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     if direction != "NEUTRO"
                     else f"{engine_label} • MONITORANDO • {why}"
                 )
+            elif engine == "RSIDIVBB":
+                tech=rsi_divergence_bollinger_strategy(closed,interval,market=market)
+                engine_label="RSI DIVERGENCE + BOLLINGER"
+                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why=str(tech.get("reason") or "RSI Divergence + Bollinger monitorando").replace("\n"," ")[:88]
+                if direction!="NEUTRO" and max(0.0,(now()-current_boundary(interval)).total_seconds())>10.0:
+                    direction="NEUTRO"
+                    status_text=f"{engine_label} • OPORTUNIDADE PASSOU • aguardando próximo fechamento"
+                else:
+                    status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction!="NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "PRESIDEN":
                 tech = presiden_breakout_strategy(closed, interval, market=market)
                 engine_label = "PRESIDEN BREAKOUT"
@@ -19131,18 +19314,18 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if (engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") or (engine == "FORCE" and market == "IQ_OTC"))
+                    status_text if (engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") or (engine == "FORCE" and market == "IQ_OTC"))
                     else (((_feed_source_label(_feed_source_from_rows(raw)) + " • " + status_text) if market == "OPEN" else status_text))
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
+                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
                 "strategy": str(tech.get("strategy") or ""),
             }
-            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
+            if item.get("direction") in ("CALL", "PUT") and engine not in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU"):
                 radar_probe = {
                     "symbol": sym, "market": market, "interval": interval,
                     "direction": item.get("direction"), "confidence": item.get("confidence"),
@@ -19181,6 +19364,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             source_status = "SUPER SIGNALS CHANNEL NR • FONTE EM ESPERA" if market == "OPEN" else "SUPER SIGNALS CHANNEL NR • IQ OPTION OTC EM ESPERA"
         elif engine == "COMBINER":
             source_status = "COMBINER FLOW + RSI • FONTE EM ESPERA" if market == "OPEN" else "COMBINER FLOW + RSI • IQ OPTION OTC EM ESPERA"
+        elif engine == "RSIDIVBB":
+            source_status = "RSI DIVERGENCE + BOLLINGER • FONTE EM ESPERA" if market == "OPEN" else "RSI DIVERGENCE + BOLLINGER • IQ OPTION OTC EM ESPERA"
         elif engine == "PRESIDEN":
             source_status = "PRESIDEN BREAKOUT • FONTE EM ESPERA" if market == "OPEN" else "PRESIDEN BREAKOUT • IQ OPTION OTC EM ESPERA"
         elif engine == "ALPHAX":
@@ -19219,7 +19404,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
+            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -19615,7 +19800,7 @@ async def result(
     engine = str(engine or "").upper()
     # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
-    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
+    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU")
 
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
@@ -20023,7 +20208,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .robot-mode-copy{min-width:150px}
 .robot-mode-title{font-weight:900;font-size:13px;letter-spacing:.4px}
 .robot-mode-desc{font-size:11px;color:#9fb2ca;margin-top:3px;max-width:245px}
-#robotPowerBtn,#aiPowerBtn,#larryPowerBtn,#rangePowerBtn,#presidenPowerBtn,#alphaxPowerBtn,#sniperPowerBtn,#combinerPowerBtn,#volumePocPowerBtn,#volumePocAiPowerBtn,#forcePowerBtn,#bigrisePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+#robotPowerBtn,#aiPowerBtn,#larryPowerBtn,#rangePowerBtn,#presidenPowerBtn,#alphaxPowerBtn,#sniperPowerBtn,#rsiDivBbPowerBtn,#combinerPowerBtn,#volumePocPowerBtn,#volumePocAiPowerBtn,#forcePowerBtn,#bigrisePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
 
 .daily-engine-board{margin-top:14px;border-color:#1c82c9;background:linear-gradient(180deg,#0b1b2e,#071321);box-shadow:0 0 24px #00aaff22}
 .daily-engine-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
@@ -20111,7 +20296,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • COMBINER FLOW + RSI + SSC FLEX • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • RSI DIVERGENCE + BOLLINGER • COMBINER + SSC FLEX • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -20215,6 +20400,16 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-desc" id="sniperModeDesc">Canal causal mais solto de 18 candles • rejeição em suporte/resistência • somente candle fechado • CALL/PUT para a próxima vela • sem repaint.</div>
     </div>
     <button id="sniperPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
+
+  <div class="robot-mode-card" id="rsiDivBbModeCard">
+    <img src="__MEGA_IMAGE__" alt="RSI Divergence + Bollinger">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">📉 RSI DIVERGENCE + BOLLINGER</div>
+      <div class="robot-mode-desc" id="rsiDivBbModeDesc">RSI 14 detecta divergência • Bollinger 20/2 confirma a zona • candle fechado • entrada na próxima vela • sem repaint.</div>
+    </div>
+    <button id="rsiDivBbPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
 
@@ -20848,6 +21043,8 @@ const sniperPowerBtn=document.getElementById('sniperPowerBtn');
 const sniperModeDesc=document.getElementById('sniperModeDesc');
 const combinerPowerBtn=document.getElementById('combinerPowerBtn');
 const combinerModeDesc=document.getElementById('combinerModeDesc');
+const rsiDivBbPowerBtn=document.getElementById('rsiDivBbPowerBtn');
+const rsiDivBbModeDesc=document.getElementById('rsiDivBbModeDesc');
 const presidenPowerBtn=document.getElementById('presidenPowerBtn');
 const presidenModeDesc=document.getElementById('presidenModeDesc');
 const alphaxPowerBtn=document.getElementById('alphaxPowerBtn');
@@ -20909,6 +21106,7 @@ let rangeEnabled=false;
 let velocityEnabled=false;
 let sniperEnabled=false;
 let combinerEnabled=false;
+let rsiDivBbEnabled=false;
 let alphaxEnabled=false;
 let rapidEnabled=false;
 let suntzuEnabled=false;
@@ -20930,6 +21128,7 @@ try{
   velocityEnabled=localStorage.getItem('mega_velocity_power')==='ONLINE';
   sniperEnabled=localStorage.getItem('mega_sniper_power')==='ONLINE';
   combinerEnabled=localStorage.getItem('mega_combiner_power')==='ONLINE';
+  rsiDivBbEnabled=localStorage.getItem('mega_rsidivbb_power')==='ONLINE';
   alphaxEnabled=localStorage.getItem('mega_alphax_power')==='ONLINE';
   rapidEnabled=false;
   localStorage.removeItem('mega_rapid_power');
@@ -20944,7 +21143,8 @@ try{
   localStorage.removeItem('mega_rsi_monitor_power');
   rsi5Enabled=false; localStorage.removeItem('mega_rsi_pure_power'); localStorage.removeItem('mega_rsi5_power');
   presidenEnabled=false; localStorage.removeItem('mega_presiden_power');
-  if(combinerEnabled){ robotEnabled=false; aiEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false; volumePocAiEnabled=false; }
+  if(rsiDivBbEnabled){ robotEnabled=false; aiEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; combinerEnabled=false; alphaxEnabled=false; volumePocAiEnabled=false; }
+  else if(combinerEnabled){ robotEnabled=false; aiEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; alphaxEnabled=false; volumePocAiEnabled=false; }
   localStorage.setItem('mega_ea_power','OFFLINE');
   localStorage.setItem('mega_rubik_power','OFFLINE');
   localStorage.setItem('mega_larry_power',larryEnabled?'ONLINE':'OFFLINE');
@@ -20969,6 +21169,7 @@ try{
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
+  if(rsiDivBbEnabled) return 'RSIDIVBB';
   if(combinerEnabled) return 'COMBINER';
   if(volumePocAiEnabled) return 'VOLUME_AI';
   if(presidenEnabled) return 'PRESIDEN';
@@ -20999,11 +21200,12 @@ function adoptBackgroundEngineState(d){
   if(['RAPID','SUNTZU','RANGE','PRESIDEN','RSI5','FORCE','BIGRISE'].includes(e)) return;
   robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
   forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false;
-  rsi5Enabled=false; sniperEnabled=false; combinerEnabled=false; alphaxEnabled=false; presidenEnabled=false; rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false; rangeEnabled=false;
+  rsi5Enabled=false; sniperEnabled=false; combinerEnabled=false; rsiDivBbEnabled=false; alphaxEnabled=false; presidenEnabled=false; rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false; rangeEnabled=false;
   if(e==='VOLUME_AI') volumePocAiEnabled=true;
   else if(e==='PRESIDEN') presidenEnabled=true;
   else if(e==='SNIPER') sniperEnabled=true;
   else if(e==='COMBINER') combinerEnabled=true;
+  else if(e==='RSIDIVBB') rsiDivBbEnabled=true;
   else if(e==='RANGE') rangeEnabled=true;
   else if(e==='ALPHAX') alphaxEnabled=true;
   else if(e==='RSI5') rsi5Enabled=true;
@@ -21027,6 +21229,7 @@ function adoptBackgroundEngineState(d){
     localStorage.setItem('mega_velocity_power',velocityEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_rsi_pure_power',rsi5Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_sniper_power',sniperEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_rsidivbb_power',rsiDivBbEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_alphax_power',alphaxEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_presiden_power',presidenEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_rapid_power',rapidEnabled?'ONLINE':'OFFLINE');
@@ -22033,7 +22236,8 @@ function momentStudyEngineName(key){
     VELOCITY:'⚡ VELOCITY FLOW',
     ALPHAX:'🧬 ALPHAX RELAY',
     SNIPER:'🎯 SUPER SIGNALS CHANNEL NR',
-    COMBINER:'🔀 COMBINER FLOW + RSI'
+    COMBINER:'🔀 COMBINER FLOW + RSI',
+    RSIDIVBB:'📉 RSI DIVERGENCE + BOLLINGER'
   };
   return names[String(key||'').toUpperCase()]||String(key||'MOTOR');
 }
@@ -22354,8 +22558,8 @@ function rememberPendingTrade(sig){
   if(!sig.expiry_time || !sig.entry_time) return;
 
   const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
-  const canonicalResultEngine=(()=>{ if(engineKey.includes('COMBINER')) return 'COMBINER'; if(engineKey.includes('AI_VOLUME_POC_CONSENSUS')||engineKey==='VOLUME_AI') return 'VOLUME_AI'; if(engineKey.includes('EA_XGBOOST')) return 'EA'; if(engineKey.includes('EA_FORCE')) return 'FORCE'; if(engineKey.includes('BIGRISE')) return 'BIGRISE'; if(engineKey.includes('LARRY')) return 'LARRY'; if(engineKey.includes('RANGE')) return 'RANGE'; if(engineKey.includes('VELOCITY')) return 'VELOCITY'; if(engineKey.includes('SNIPER')) return 'SNIPER'; if(engineKey.includes('ALPHAX')) return 'ALPHAX'; if(engineKey.includes('RAPID')) return 'RAPID'; if(engineKey.includes('SAMURAI')) return 'SAMURAI'; if(engineKey.includes('VOLUME')) return 'VOLUME'; if(engineKey.includes('RSI5')) return 'RSI5'; return String(sig.selected_engine||sig.mode||''); })();
-  const isDirectEa=(engineKey==='COMBINER'||engineKey.includes('COMBINER')||engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='RANGE'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='SUNTZU'||engineKey==='RSI5'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('RANGE')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('SUNTZU')||engineKey.includes('RSI5'));
+  const canonicalResultEngine=(()=>{ if(engineKey.includes('RSIDIVBB')||engineKey.includes('RSI_DIV_BB')||engineKey.includes('DIVERGENCE + BOLLINGER')) return 'RSIDIVBB'; if(engineKey.includes('COMBINER')) return 'COMBINER'; if(engineKey.includes('AI_VOLUME_POC_CONSENSUS')||engineKey==='VOLUME_AI') return 'VOLUME_AI'; if(engineKey.includes('EA_XGBOOST')) return 'EA'; if(engineKey.includes('EA_FORCE')) return 'FORCE'; if(engineKey.includes('BIGRISE')) return 'BIGRISE'; if(engineKey.includes('LARRY')) return 'LARRY'; if(engineKey.includes('RANGE')) return 'RANGE'; if(engineKey.includes('VELOCITY')) return 'VELOCITY'; if(engineKey.includes('SNIPER')) return 'SNIPER'; if(engineKey.includes('ALPHAX')) return 'ALPHAX'; if(engineKey.includes('RAPID')) return 'RAPID'; if(engineKey.includes('SAMURAI')) return 'SAMURAI'; if(engineKey.includes('VOLUME')) return 'VOLUME'; if(engineKey.includes('RSI5')) return 'RSI5'; return String(sig.selected_engine||sig.mode||''); })();
+  const isDirectEa=(engineKey==='RSIDIVBB'||engineKey.includes('RSIDIVBB')||engineKey.includes('RSI_DIV_BB')||engineKey==='COMBINER'||engineKey.includes('COMBINER')||engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='RANGE'||engineKey==='VELOCITY'||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='SUNTZU'||engineKey==='RSI5'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('RANGE')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('SUNTZU')||engineKey.includes('RSI5'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
     // Motores de entrada direta (AlphaX/Núcleo Rápido/Samurai/Sniper/RSI+ADX/Larry/Range/EA/Força/BigRise/Velocity) são apurados na primeira vela; outros preservam G1/G2.
@@ -24416,6 +24620,7 @@ if(appPowerBtn){
 
 function applyRobotPowerState(){
   try{ localStorage.setItem('mega_presiden_power',presidenEnabled?'ONLINE':'OFFLINE'); }catch(_){}
+  try{ localStorage.setItem('mega_rsidivbb_power',rsiDivBbEnabled?'ONLINE':'OFFLINE'); }catch(_){}
   try{
     localStorage.setItem('mega_volume_poc_power',volumePocEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_volume_poc_ai_power',volumePocAiEnabled?'ONLINE':'OFFLINE');
@@ -24467,6 +24672,12 @@ function applyRobotPowerState(){
     sniperPowerBtn.style.background=sniperEnabled?'#0b7a3d':'#7d1d1d';
     sniperPowerBtn.style.color='#fff';
     sniperPowerBtn.style.borderColor=sniperEnabled?'#16c56b':'#ff5252';
+  }
+  if(rsiDivBbPowerBtn){
+    rsiDivBbPowerBtn.textContent=rsiDivBbEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    rsiDivBbPowerBtn.style.background=rsiDivBbEnabled?'#0b7a3d':'#7d1d1d';
+    rsiDivBbPowerBtn.style.color='#fff';
+    rsiDivBbPowerBtn.style.borderColor=rsiDivBbEnabled?'#16c56b':'#ff5252';
   }
   if(combinerPowerBtn){
     combinerPowerBtn.textContent=combinerEnabled?'🟢 ONLINE':'🔴 OFFLINE';
@@ -24597,12 +24808,20 @@ function applyRobotPowerState(){
   if(bigriseModeDesc) bigriseModeDesc.textContent=bigriseEnabled
     ? 'ONLINE: TODOS OS ATIVOS • força direta bem solta • S/R e LTA/LTB são bônus • DOM só acrescenta no BTC • próxima vela.'
     : 'OFFLINE: BTC FORCE MULTIATIVOS pausado.';
+  if(rsiDivBbModeDesc) rsiDivBbModeDesc.textContent=rsiDivBbEnabled
+    ? 'ONLINE: divergência RSI14 confirmada + Bollinger 20/2 na zona extrema • candle fechado • próxima vela • sem repaint e sem Gale.'
+    : 'OFFLINE: RSI Divergence + Bollinger pausado.';
   if(combinerModeDesc) combinerModeDesc.textContent=combinerEnabled
     ? 'ONLINE: suporte/resistência confirmado + reação da vela + RSI 14 • próxima vela • sem repaint.'
     : 'OFFLINE: COMBINER FLOW + RSI pausado.';
 
   const engine=selectedRobotEngine();
-  if(engine==='VOLUME_AI'){
+  if(engine==='RSIDIVBB'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI DIVERGENCE + BOLLINGER ONLINE • RSI14 + BB20/2 • CANDLE FECHADO • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📉 Divergência RSI confirmada + Bollinger 20/2 como zona de confluência • sem repaint.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar RSI Divergence + Bollinger ativo • procurando divergência em banda extrema</div>';
+    rad();
+  }else if(engine==='VOLUME_AI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA + VOLUME POC FLEX ONLINE • VOLUME + IA + TREND FILTER ALINHADOS • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA + Volume POC FLEX • só libera quando Volume POC + IA + Trend Filter apontam a mesma direção.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar IA + Volume POC ativo • buscando alinhamento Volume + IA + Trend Filter</div>';
@@ -25112,6 +25331,34 @@ async function setSniperPower(enabled){
 
 
 
+function disableRsiDivBbForOtherEngine(){
+  if(!rsiDivBbEnabled) return;
+  rsiDivBbEnabled=false;
+  try{ localStorage.setItem('mega_rsidivbb_power','OFFLINE'); }catch(_){}
+}
+
+async function setRsiDivBbPower(enabled){
+  rsiDivBbEnabled=!!enabled;
+  if(rsiDivBbEnabled){
+    robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false;
+    larryEnabled=false; rangeEnabled=false; velocityEnabled=false; sniperEnabled=false; combinerEnabled=false; alphaxEnabled=false;
+    presidenEnabled=false; rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false; rsi5Enabled=false;
+  }
+  try{
+    localStorage.setItem('mega_rsidivbb_power',rsiDivBbEnabled?'ONLINE':'OFFLINE');
+    if(rsiDivBbEnabled){
+      ['mega_robot_power','mega_ai_power','mega_ea_power','mega_rubik_power','mega_force_power','mega_bigrise_power','mega_larry_power','mega_range_power','mega_velocity_power','mega_sniper_power','mega_combiner_power','mega_alphax_power','mega_presiden_power','mega_rapid_power','mega_suntzu_power','mega_samurai_power','mega_volume_poc_power','mega_volume_poc_ai_power','mega_rsi_monitor_power','mega_rsi_pure_power'].forEach(k=>localStorage.setItem(k,'OFFLINE'));
+    }
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'RSIDIVBB'});
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(rsiDivBbEnabled?'RSI Divergence mais Bollinger online.':'RSI Divergence mais Bollinger offline.');
+}
+
 async function setCombinerPower(enabled){
   combinerEnabled=!!enabled;
   if(combinerEnabled){
@@ -25359,25 +25606,26 @@ async function setAlphaxPower(enabled){
   if(voiceEnabled) speak(alphaxEnabled ? 'AlphaX Relay online.' : 'AlphaX Relay offline.');
 }
 
-if(robotPowerBtn) robotPowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setRobotPower(!robotEnabled); };
-if(aiPowerBtn) aiPowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setAiPower(!aiEnabled); };
-if(eaPowerBtn) eaPowerBtn.onclick=()=>{ setEaPower(!eaEnabled); };
-if(rubikPowerBtn) rubikPowerBtn.onclick=()=>{ setRubikPower(!rubikEnabled); };
-if(larryPowerBtn) larryPowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setLarryPower(!larryEnabled); };
-if(rangePowerBtn) rangePowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setRangePower(!rangeEnabled); };
-if(presidenPowerBtn) presidenPowerBtn.onclick=()=>{ setPresidenPower(!presidenEnabled); };
-if(velocityPowerBtn) velocityPowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setVelocityPower(!velocityEnabled); };
-if(sniperPowerBtn) sniperPowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setSniperPower(!sniperEnabled); };
-if(combinerPowerBtn) combinerPowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setCombinerPower(!combinerEnabled); };
-if(alphaxPowerBtn) alphaxPowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setAlphaxPower(!alphaxEnabled); };
-if(rapidPowerBtn) rapidPowerBtn.onclick=()=>{ setRapidPower(!rapidEnabled); };
-if(suntzuPowerBtn) suntzuPowerBtn.onclick=()=>{ setSuntzuPower(!suntzuEnabled); };
-if(volumePocPowerBtn) volumePocPowerBtn.onclick=()=>{ setVolumePocPower(!volumePocEnabled); };
-if(volumePocAiPowerBtn) volumePocAiPowerBtn.onclick=()=>{ setVolumePocAiPower(!volumePocAiEnabled); };
-if(rsi5PowerBtn) rsi5PowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setRsi5Power(!rsi5Enabled); };
+if(robotPowerBtn) robotPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); disablePresidenForOtherEngine(); setRobotPower(!robotEnabled); };
+if(aiPowerBtn) aiPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); disablePresidenForOtherEngine(); setAiPower(!aiEnabled); };
+if(eaPowerBtn) eaPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); setEaPower(!eaEnabled); };
+if(rubikPowerBtn) rubikPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); setRubikPower(!rubikEnabled); };
+if(larryPowerBtn) larryPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); disablePresidenForOtherEngine(); setLarryPower(!larryEnabled); };
+if(rangePowerBtn) rangePowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); disablePresidenForOtherEngine(); setRangePower(!rangeEnabled); };
+if(presidenPowerBtn) presidenPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); setPresidenPower(!presidenEnabled); };
+if(velocityPowerBtn) velocityPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); disablePresidenForOtherEngine(); setVelocityPower(!velocityEnabled); };
+if(sniperPowerBtn) sniperPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); disablePresidenForOtherEngine(); setSniperPower(!sniperEnabled); };
+if(combinerPowerBtn) combinerPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); disablePresidenForOtherEngine(); setCombinerPower(!combinerEnabled); };
+if(rsiDivBbPowerBtn) rsiDivBbPowerBtn.onclick=()=>{ setRsiDivBbPower(!rsiDivBbEnabled); };
+if(alphaxPowerBtn) alphaxPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); disablePresidenForOtherEngine(); setAlphaxPower(!alphaxEnabled); };
+if(rapidPowerBtn) rapidPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); setRapidPower(!rapidEnabled); };
+if(suntzuPowerBtn) suntzuPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); setSuntzuPower(!suntzuEnabled); };
+if(volumePocPowerBtn) volumePocPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); setVolumePocPower(!volumePocEnabled); };
+if(volumePocAiPowerBtn) volumePocAiPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); setVolumePocAiPower(!volumePocAiEnabled); };
+if(rsi5PowerBtn) rsi5PowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); disablePresidenForOtherEngine(); setRsi5Power(!rsi5Enabled); };
 if(velocityOpenPanelBtn) velocityOpenPanelBtn.onclick=()=>showTab('main');
-if(forcePowerBtn) forcePowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setForcePower(!forceEnabled); };
-if(bigrisePowerBtn) bigrisePowerBtn.onclick=()=>{ disablePresidenForOtherEngine(); setBigrisePower(!bigriseEnabled); };
+if(forcePowerBtn) forcePowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); disablePresidenForOtherEngine(); setForcePower(!forceEnabled); };
+if(bigrisePowerBtn) bigrisePowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); disablePresidenForOtherEngine(); setBigrisePower(!bigriseEnabled); };
 function showVelocitySignalOnRobot(signal){
   if(!signal) return;
   const dir=String(signal.direction||'').toUpperCase();
@@ -25790,7 +26038,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='ALPHAX'?'ALPHAX RELAY':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
@@ -26460,10 +26708,10 @@ setInterval(()=>{
 // Pré-alerta geral permanece leve. No RSI + ADX usamos um relógio mais curto
 // para capturar a janela de 25 s com precisão sem aumentar a carga dos outros motores.
 setInterval(()=>{
-  if(megaCanPoll() && selectedRobotEngine()!=='OFF' && !['RSI5','SNIPER','COMBINER'].includes(selectedRobotEngine())) loadPreSignals();
+  if(megaCanPoll() && selectedRobotEngine()!=='OFF' && !['RSI5','SNIPER','COMBINER','RSIDIVBB'].includes(selectedRobotEngine())) loadPreSignals();
 },10000);
 setInterval(()=>{
-  if(megaCanPoll() && ['RSI5','SNIPER','COMBINER'].includes(selectedRobotEngine())) loadPreSignals();
+  if(megaCanPoll() && ['RSI5','SNIPER','COMBINER','RSIDIVBB'].includes(selectedRobotEngine())) loadPreSignals();
 },2000);
 
 // Resultado das operações abertas.
