@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.95.1"
-PWA_VERSION = "v164"
+APP_VERSION = "3.95.2"
+PWA_VERSION = "v165"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -11502,6 +11502,217 @@ def _smart_trend_filter(cs):
         }
 
 
+def _smart_chart_confluence(cs, interval="1min", h1_filter=None, trend_filter=None, candle_pattern_filter=None):
+    """Leitura do gráfico equivalente à análise visual feita a partir de uma imagem.
+
+    Conflui seis blocos usando somente dados disponíveis/fechados:
+      1) estrutura (HH/HL ou LH/LL),
+      2) suporte/resistência e localização do preço,
+      3) price action/padrões de vela,
+      4) força/momentum das últimas velas,
+      5) volume + POC (quando a fonte tem volume utilizável),
+      6) Trend Filter.
+
+    Nenhum bloco isolado libera sinal. O retorno apenas cria o candidato que a IA
+    externa ainda precisa confirmar para a próxima vela. Sem confluência mínima,
+    a direção fica NEUTRO.
+    """
+    rows = list(cs or [])
+    if len(rows) < 30:
+        return {
+            "ready": False, "confirmed": False, "direction": "NEUTRO",
+            "confidence": 0.0, "call_score": 0.0, "put_score": 0.0,
+            "reason": f"Leitura visual aguardando candles fechados ({len(rows)}/30).",
+            "layers": {}, "min_score": 5.0, "min_edge": 1.5,
+        }
+
+    def fv(row, key, default=0.0):
+        try:
+            return float(row.get(key, default) or default)
+        except Exception:
+            return float(default)
+
+    call = 0.0
+    put = 0.0
+    call_reasons = []
+    put_reasons = []
+    layers = {}
+
+    # 1) Estrutura recente: compara dois blocos iguais para detectar HH/HL ou LH/LL.
+    prev = rows[-12:-6]
+    cur = rows[-6:]
+    prev_hi = max(fv(x, "high") for x in prev)
+    prev_lo = min(fv(x, "low") for x in prev)
+    cur_hi = max(fv(x, "high") for x in cur)
+    cur_lo = min(fv(x, "low") for x in cur)
+    structure_dir = "NEUTRO"
+    if cur_hi > prev_hi and cur_lo > prev_lo:
+        structure_dir = "CALL"; call += 2.0; call_reasons.append("estrutura HH/HL")
+    elif cur_hi < prev_hi and cur_lo < prev_lo:
+        structure_dir = "PUT"; put += 2.0; put_reasons.append("estrutura LH/LL")
+    layers["structure"] = {
+        "direction": structure_dir,
+        "previous_high": prev_hi, "previous_low": prev_lo,
+        "current_high": cur_hi, "current_low": cur_lo,
+    }
+
+    # 2) Suporte/resistência: H1 tem prioridade; sem toque H1, usa localização no range local.
+    h1 = dict(h1_filter or {})
+    region = str(h1.get("region") or "UNAVAILABLE").upper()
+    sr_dir = "NEUTRO"
+    if region == "SUPPORT":
+        sr_dir = "CALL"; call += 2.0; call_reasons.append("suporte H1")
+    elif region == "RESISTANCE":
+        sr_dir = "PUT"; put += 2.0; put_reasons.append("resistência H1")
+    elif region == "CONFLICT":
+        call += 0.25; put += 0.25
+
+    recent20 = rows[-20:]
+    local_hi = max(fv(x, "high") for x in recent20)
+    local_lo = min(fv(x, "low") for x in recent20)
+    last = rows[-1]
+    close = fv(last, "close")
+    local_pos = (close - local_lo) / max(local_hi - local_lo, 1e-12)
+    if sr_dir == "NEUTRO":
+        if local_pos <= 0.22:
+            sr_dir = "CALL"; call += 1.0; call_reasons.append("preço em zona baixa do range")
+        elif local_pos >= 0.78:
+            sr_dir = "PUT"; put += 1.0; put_reasons.append("preço em zona alta do range")
+    layers["support_resistance"] = {
+        "direction": sr_dir, "h1_region": region,
+        "local_position": round(local_pos, 3),
+        "local_low": local_lo, "local_high": local_hi,
+        "support": h1.get("support"), "resistance": h1.get("resistance"),
+    }
+
+    # 3) Price action: padrão forte já calculado pelo motor + rejeição da última vela.
+    pattern = dict(candle_pattern_filter or {})
+    pa_dir = str(pattern.get("direction") or "NEUTRO").upper() if pattern.get("passed") else "NEUTRO"
+    if pa_dir == "CALL":
+        call += 2.0; call_reasons.append("price action comprador")
+    elif pa_dir == "PUT":
+        put += 2.0; put_reasons.append("price action vendedor")
+
+    o = fv(last, "open"); h = fv(last, "high"); l = fv(last, "low"); c = close
+    rng = max(h - l, 1e-12)
+    body_ratio = abs(c - o) / rng
+    lower_wick = max(min(o, c) - l, 0.0) / rng
+    upper_wick = max(h - max(o, c), 0.0) / rng
+    if lower_wick >= 0.45 and c >= o and local_pos <= 0.40:
+        call += 1.0; call_reasons.append("rejeição inferior")
+        if pa_dir == "NEUTRO": pa_dir = "CALL"
+    if upper_wick >= 0.45 and c <= o and local_pos >= 0.60:
+        put += 1.0; put_reasons.append("rejeição superior")
+        if pa_dir == "NEUTRO": pa_dir = "PUT"
+    layers["price_action"] = {
+        "direction": pa_dir, "patterns": pattern.get("patterns", []),
+        "body_ratio": round(body_ratio, 3),
+        "lower_wick_ratio": round(lower_wick, 3),
+        "upper_wick_ratio": round(upper_wick, 3),
+    }
+
+    # 4) Força/momentum: deslocamento curto, predominância e corpo da última vela.
+    last14 = rows[-14:]
+    avg_range = sum(max(fv(x, "high") - fv(x, "low"), 1e-12) for x in last14) / len(last14)
+    closes = [fv(x, "close") for x in rows[-7:]]
+    opens6 = [fv(x, "open") for x in rows[-6:]]
+    closes6 = [fv(x, "close") for x in rows[-6:]]
+    move3 = (closes[-1] - closes[-4]) / max(avg_range, 1e-12)
+    bulls = sum(1 for oo, cc in zip(opens6, closes6) if cc > oo)
+    bears = sum(1 for oo, cc in zip(opens6, closes6) if cc < oo)
+    momentum_dir = "NEUTRO"
+    if move3 >= 0.55 and bulls >= 3:
+        momentum_dir = "CALL"; call += 2.0; call_reasons.append("força/momentum comprador")
+    elif move3 <= -0.55 and bears >= 3:
+        momentum_dir = "PUT"; put += 2.0; put_reasons.append("força/momentum vendedor")
+    elif body_ratio >= 0.58:
+        if c > o:
+            momentum_dir = "CALL"; call += 1.0; call_reasons.append("vela de força compradora")
+        elif c < o:
+            momentum_dir = "PUT"; put += 1.0; put_reasons.append("vela de força vendedora")
+    layers["momentum"] = {
+        "direction": momentum_dir, "move_3_ranges": round(move3, 3),
+        "bull_count_6": bulls, "bear_count_6": bears,
+        "avg_range": avg_range,
+    }
+
+    # 5) Volume + POC: é confirmação, não gatilho obrigatório quando a fonte não tem volume.
+    profile = _volume_poc_profile(rows[-VOLUME_POC_LOOKBACK:])
+    volume_dir = "NEUTRO"
+    volume_available = bool(profile and float(profile.get("volume_coverage") or 0.0) >= VOLUME_POC_MIN_VOLUME_COVERAGE)
+    dcur, vcur, dr = _volume_poc_bar_delta(last)
+    prev_vols = [_volume_poc_volume(x) for x in rows[-11:-1]]
+    prev_pos_vols = [x for x in prev_vols if x > 0]
+    vma = (sum(prev_pos_vols) / len(prev_pos_vols)) if prev_pos_vols else 0.0
+    vratio = (vcur / vma) if vma > 0 else 0.0
+    if volume_available:
+        poc = float(profile.get("poc") or close)
+        if close >= poc and dr >= 0.08:
+            volume_dir = "CALL"; call += 1.25; call_reasons.append("volume/POC comprador")
+        elif close <= poc and dr <= -0.08:
+            volume_dir = "PUT"; put += 1.25; put_reasons.append("volume/POC vendedor")
+        if vratio >= 1.35 and body_ratio >= 0.50:
+            if c > o:
+                call += 0.75; call_reasons.append("volume confirma vela de força")
+            elif c < o:
+                put += 0.75; put_reasons.append("volume confirma vela de força")
+    layers["volume_poc"] = {
+        "available": volume_available, "direction": volume_dir,
+        "poc": (float(profile.get("poc")) if profile else None),
+        "delta_ratio": round(float(dr), 3), "volume_ratio": round(float(vratio), 3),
+        "coverage": round(float(profile.get("volume_coverage") or 0.0), 3) if profile else 0.0,
+    }
+
+    # 6) Trend Filter: obrigatório para o motor SMART e vale como uma camada forte.
+    tf = dict(trend_filter or {})
+    tf_ready = bool(tf.get("ready"))
+    tf_dir = str(tf.get("direction") or "NEUTRO").upper()
+    if tf_ready and tf_dir == "CALL":
+        call += 2.0; call_reasons.append("Trend Filter verde")
+    elif tf_ready and tf_dir == "PUT":
+        put += 2.0; put_reasons.append("Trend Filter vermelho")
+    layers["trend_filter"] = {
+        "ready": tf_ready, "direction": tf_dir, "color": tf.get("color", "NEUTRO"),
+    }
+
+    min_score = 5.0
+    min_edge = 1.5
+    edge = call - put
+    direction = "NEUTRO"
+    confirmed = False
+    # O filtro de tendência é a última autorização; sem ele não há entrada.
+    if tf_ready and tf_dir == "CALL" and call >= min_score and edge >= min_edge:
+        direction = "CALL"; confirmed = True
+    elif tf_ready and tf_dir == "PUT" and put >= min_score and edge <= -min_edge:
+        direction = "PUT"; confirmed = True
+
+    top = call if direction == "CALL" else (put if direction == "PUT" else max(call, put))
+    edge_abs = abs(edge)
+    confidence = 0.0
+    if confirmed:
+        confidence = clamp(54.0 + top * 4.2 + edge_abs * 2.3, 60.0, 94.0)
+
+    if confirmed:
+        reasons = call_reasons if direction == "CALL" else put_reasons
+        reason = f"{direction} por confluência visual: " + ", ".join(reasons[:6])
+    elif not tf_ready or tf_dir == "NEUTRO":
+        reason = "Sem entrada: Trend Filter ainda não autoriza uma direção."
+    elif top < min_score:
+        reason = f"Sem entrada: confluência insuficiente ({top:.1f}/{min_score:.1f})."
+    else:
+        reason = f"Sem entrada: conflito entre CALL {call:.1f} e PUT {put:.1f}; vantagem mínima {min_edge:.1f}."
+
+    return {
+        "ready": True, "confirmed": confirmed, "direction": direction,
+        "confidence": round(float(confidence), 1),
+        "call_score": round(call, 2), "put_score": round(put, 2),
+        "edge": round(edge, 2), "min_score": min_score, "min_edge": min_edge,
+        "reason": reason[:420], "layers": layers,
+        "call_reasons": call_reasons[:8], "put_reasons": put_reasons[:8],
+        "closed_candle_only": True, "next_candle": True,
+    }
+
+
 def _pure_ai_price_context(cs):
     """Resume somente price action/OHLCV para filtrar entradas fracas da IA PURA.
 
@@ -12063,15 +12274,12 @@ def _pure_ai_candle_pattern_filter(cs, expected_direction="NEUTRO"):
 
 
 async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=None, state_namespace="SMART"):
-    """IA PURA com gatilhos independentes + micro-momento real da vela atual.
+    """IA LEITURA DO GRÁFICO por confluência, para a próxima vela.
 
-    Gatilhos independentes:
-      1) padrão de vela forte em OHLC fechado;
-      2) toque em suporte/resistência H1 validado;
-      3) análise externa Gemini/OpenAI por price action puro.
-
-    O primeiro gatilho válido pode liberar CALL/PUT sem exigir alinhamento entre eles.
-    Fallback local continua apenas como monitor quando a IA externa não responde.
+    O motor replica a análise visual feita em uma foto do gráfico: estrutura,
+    suporte/resistência, price action, força/momentum, volume/POC e Trend Filter.
+    A IA externa recebe esse contexto + candles fechados e só confirma CALL/PUT
+    quando a confluência local mínima aponta o mesmo lado.
     """
     rows = list(cs or [])
     if not rows:
@@ -12207,6 +12415,20 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
         except Exception as exc:
             h1_filter["error"] = str(exc)[:180]
 
+    # 3.95.2 — Leitura visual por confluência. Esta camada existe somente no SMART.
+    # IA + Volume POC e os demais motores permanecem com suas próprias regras.
+    chart_confluence = (
+        _smart_chart_confluence(
+            rows, interval=interval, h1_filter=h1_filter,
+            trend_filter=trend_filter, candle_pattern_filter=candle_pattern_filter,
+        )
+        if smart_namespace else {
+            "ready": True, "confirmed": True, "direction": "NEUTRO",
+            "confidence": 0.0, "reason": "Confluência visual exclusiva da IA LEITURA DO GRÁFICO.",
+            "layers": {},
+        }
+    )
+
     # Cada gatilho local trabalha sozinho. Se os dois aparecerem na mesma leitura e
     # apontarem lados opostos, bloqueamos por segurança em vez de escolher no escuro.
     local_triggers = []
@@ -12265,13 +12487,38 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
             "smart_scan": True, "api_called": False, "provider": "LOCAL_TRIGGER_CONFLICT",
             "fallback": False, "api_available": bool(GEMINI_KEY or OAI_KEY),
             "h1_filter": h1_filter, "candle_pattern_filter": candle_pattern_filter,
-            "independent_trigger": True,
+            "chart_confluence": chart_confluence,
+            "independent_trigger": False,
         }
         st["last_call"] = now_ts
         st["last_result"] = dict(out)
         return out
 
-    # GATILHO 3 — IA externa independente. Ela não precisa concordar com H1/padrão.
+    # 3.95.2 — Se a própria leitura visual não atingiu confluência mínima,
+    # não força CALL/PUT e nem gasta uma chamada externa.
+    if smart_namespace and not bool(chart_confluence.get("confirmed")):
+        out = {
+            "available": True, "direction": "NEUTRO",
+            "confidence": float(chart_confluence.get("confidence") or 0.0),
+            "confirmed": False, "risk": "HIGH", "setup": "NONE",
+            "reason": str(chart_confluence.get("reason") or "Sem confluência suficiente para entrada."),
+            "smart_scan": True, "api_called": False,
+            "provider": "LOCAL_VISUAL_CONFLUENCE", "fallback": False,
+            "api_available": bool(OAI_KEY or GEMINI_KEY),
+            "h1_filter": h1_filter, "candle_pattern_filter": candle_pattern_filter,
+            "trend_filter": trend_filter, "chart_confluence": chart_confluence,
+            "xgboost": xgb_signal, "local_trigger_hint": local_trigger_hint,
+            "independent_trigger": False,
+            "direct_win_filter": {
+                "enabled": True, "blocked": True, "visual_confluence": chart_confluence,
+                "price_context": price_ctx, "trend_filter": trend_filter,
+            },
+        }
+        st["last_call"] = now_ts
+        st["last_result"] = dict(out)
+        return out
+
+    # A IA externa confirma a MESMA direção encontrada pela leitura visual.
     if not OAI_KEY and not GEMINI_KEY:
         out = _local_ohlcv_fallback_signal(
             rows, interval, "Nenhuma IA externa configurada (OPENAI_API_KEY/GEMINI_API_KEY). Fallback em modo monitor."
@@ -12282,6 +12529,7 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
             "independent_trigger": False,
             "xgboost": xgb_signal,
             "local_trigger_hint": local_trigger_hint,
+            "chart_confluence": chart_confluence,
         })
         st["last_call"] = now_ts
         st["last_result"] = dict(out)
@@ -12306,7 +12554,8 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
             "prefilter_score": prefilter_score,
             "h1_filter": h1_filter,
             "candle_pattern_filter": candle_pattern_filter,
-            "independent_trigger": True,
+            "chart_confluence": chart_confluence,
+            "independent_trigger": False,
             "direct_win_filter": {
                 "enabled": True, "blocked": True, "prefilter": True, "price_context": price_ctx,
             },
@@ -12322,37 +12571,37 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
         for x in rows[-60:]
     ]
 
-    prompt = f"""Você é a inteligência artificial autônoma da MEGA IA, especializada em prever SOMENTE a direção da PRÓXIMA vela completa.
+    prompt = f"""Você é a IA LEITURA DO GRÁFICO da MEGA IA. Analise como faria ao receber uma FOTO de um gráfico e ter de decidir SOMENTE a direção da PRÓXIMA vela completa.
 Ativo: {symbol}. Timeframe: {interval}. Mercado: {market}.
-OBJETIVO PRINCIPAL: encontrar oportunidades para a próxima vela sem ficar preso em NEUTRO. Escolha CALL ou PUT quando houver uma evidência forte ou duas evidências moderadas na mesma direção; use NEUTRO somente quando houver conflito forte ou ausência real de direção.
-Este é o MODO IA PURA: NÃO use RSI, MACD, Bollinger, médias móveis, ATR, estocástico, ADX, score técnico ou qualquer indicador calculado pelo aplicativo.
-Use SOMENTE os candles OHLCV FECHADOS fornecidos. Não há candle em formação nesta entrada.
 
-Avalie price action de curto prazo: sequência de altas/baixas, corpos, pavios, rejeição, continuidade, rompimento real, falso rompimento, estrutura recente, aceleração/desaceleração, alternância/lateralização, localização dentro do range recente e volume apenas se estiver disponível.
-A previsão é para UMA vela à frente, não para a tendência geral.
+A leitura obrigatória já foi pré-calculada em seis blocos: ESTRUTURA, SUPORTE/RESISTÊNCIA + LOCALIZAÇÃO, PRICE ACTION, FORÇA/MOMENTUM, VOLUME/POC e TREND FILTER.
+Não force sinal. CALL/PUT só pode ser confirmado quando a confluência local tiver candidato e sua leitura dos candles concordar com o MESMO lado. Em conflito relevante, responda NEUTRO.
 
-REGRAS DE QUALIDADE:
-- Alternância leve, corpos menores ou compressão isolada NÃO devem gerar NEUTRO automaticamente. Use NEUTRO apenas quando os sinais de alta e baixa estiverem realmente equilibrados ou contraditórios.
-- Não persiga movimento já esticado sem nova confirmação.
-- CALL/PUT pode ser liberado com uma evidência forte ou duas evidências moderadas de price action para a próxima vela.
-- Região H1 e padrão de vela são motores independentes e NÃO precisam concordar com esta análise.
-- Para M1 priorize o micro-movimento mais recente e a direção da próxima vela; não neutralize apenas pelo ruído normal do timeframe.
-- Gale, recuperação e resultados anteriores NÃO podem influenciar a decisão.
-- Marque risk LOW ou MEDIUM quando houver vantagem razoável e coerente. Use HIGH + NEUTRO quando houver conflito real, lateralização forte ou ausência de direção.
+REGRAS:
+- A previsão é para UMA vela à frente, não para a tendência geral.
+- Use somente candles OHLCV fechados; não invente informação da vela futura.
+- Priorize os últimos candles para M1, mas respeite a estrutura e as zonas.
+- Em suporte, procure rejeição/força compradora; em resistência, procure rejeição/força vendedora.
+- Rompimento precisa de deslocamento/força; pavio contra o rompimento reduz a qualidade.
+- Volume/POC é confirmação quando disponível; ausência de volume não deve ser tratada como volume zero confiável.
+- Trend Filter é obrigatório: VERDE só autoriza CALL; VERMELHO só autoriza PUT; NEUTRO bloqueia.
+- Gale, recuperação e resultados anteriores NÃO influenciam a direção.
+- Se a confluência local estiver NEUTRO, responda NEUTRO.
+- Se a confluência local apontar CALL, não responda PUT. Se apontar PUT, não responda CALL.
 
-Classifique o setup como TREND, REVERSAL, BREAKOUT, REJECTION ou NONE.
+CONFLUÊNCIA VISUAL OBRIGATÓRIA:
+{json.dumps(chart_confluence, ensure_ascii=False)}
 
-CAMADA ESTATÍSTICA XGBOOST (não copie cegamente; use como evidência quantitativa):
+CAMADA ESTATÍSTICA XGBOOST (evidência adicional, nunca acima da confluência visual):
 {json.dumps(xgb_signal, ensure_ascii=False)}
 CONTEXTO LOCAL FORTE, se houver:
 {json.dumps(local_trigger_hint, ensure_ascii=False)}
-MICRO-MOMENTO AO VIVO DA EA VELA ATUAL, se confirmado por ticks reais (use como evidência adicional, nunca cegamente):
+MICRO-MOMENTO AO VIVO DA EA VELA ATUAL, se confirmado por ticks reais:
 {json.dumps(moment_hint if moment_fp else {}, ensure_ascii=False)}
-
-TREND FILTER OBRIGATÓRIO (somente quando enabled=true):
+TREND FILTER:
 {json.dumps(trend_filter, ensure_ascii=False)}
-REGRA: se estiver VERDE, somente CALL pode ser escolhido; se estiver VERMELHO, somente PUT; se NEUTRO, responda NEUTRO.
 
+Classifique o setup como TREND, REVERSAL, BREAKOUT, REJECTION ou NONE.
 Retorne SOMENTE JSON válido:
 {{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"setup":"TREND|REVERSAL|BREAKOUT|REJECTION|NONE","reason":"curto","risk":"LOW|MEDIUM|HIGH"}}
 Candles: {json.dumps(data, ensure_ascii=False)}"""
@@ -12443,6 +12692,9 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         if moment_aligned:
             moment_bonus = min(6.0, 3.0 + max(0.0, float(moment_hint.get("score") or 0.0) - MOMENT_EA_CONFIRM_SCORE) * 0.15)
             analysis_quality += moment_bonus
+        if smart_namespace and bool(chart_confluence.get("confirmed")):
+            visual_conf = float(chart_confluence.get("confidence") or 0.0)
+            analysis_quality = analysis_quality * 0.82 + visual_conf * 0.18
         analysis_quality = round(max(0.0, min(100.0, analysis_quality)), 1)
 
         # Quando a EA Vela Atual confirma ticks reais fortes na mesma direção,
@@ -12468,6 +12720,13 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
                 tf_color = str(trend_filter.get("color") or "NEUTRO").upper()
                 tf_dir = str(trend_filter.get("direction") or "NEUTRO").upper()
                 blocked_reason = f"Trend Filter {tf_color} não autoriza {direction}; direção permitida: {tf_dir}"
+            elif smart_namespace and not bool(chart_confluence.get("confirmed")):
+                blocked_reason = "confluência visual local não confirmou entrada"
+            elif smart_namespace and str(chart_confluence.get("direction") or "NEUTRO").upper() != direction:
+                blocked_reason = (
+                    f"IA {direction} divergiu da confluência visual "
+                    f"{str(chart_confluence.get('direction') or 'NEUTRO').upper()}"
+                )
             elif confidence < required_conf:
                 blocked_reason = f"confiança {confidence:.0f}% abaixo do mínimo seletivo {required_conf:.0f}%"
             elif xgb_ready and xgb_direction in ("CALL", "PUT") and xgb_direction != direction and xgb_confidence >= 68.0 and xgb_validation >= 54.0:
@@ -12481,6 +12740,9 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
 
         if direction in ("CALL", "PUT") and xgb_ready and xgb_confirmed and xgb_agrees:
             confidence = round(min(97.0, confidence * 0.65 + xgb_confidence * 0.35), 1)
+        if direction in ("CALL", "PUT") and smart_namespace and bool(chart_confluence.get("confirmed")):
+            visual_conf = float(chart_confluence.get("confidence") or confidence)
+            confidence = round(min(97.0, confidence * 0.78 + visual_conf * 0.22), 1)
 
         if blocked_reason:
             direction, confirmed = "NEUTRO", False
@@ -12511,6 +12773,7 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
             "moment_ea_hint": moment_hint if moment_fp else {},
             "xgboost": xgb_signal,
             "trend_filter": trend_filter,
+            "chart_confluence": chart_confluence,
             "ensemble": {
                 "xgb_ready": xgb_ready,
                 "xgb_confirmed": xgb_confirmed,
@@ -12536,6 +12799,7 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
                 "blocked": bool(blocked_reason),
                 "price_context": price_ctx,
                 "trend_filter": trend_filter,
+                "visual_confluence": chart_confluence,
             },
         }
         st["last_call"] = now_ts
@@ -12549,6 +12813,7 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         out["candle_pattern_filter"] = candle_pattern_filter
         out["xgboost"] = xgb_signal
         out["local_trigger_hint"] = local_trigger_hint
+        out["chart_confluence"] = chart_confluence
         out["independent_trigger"] = False
         st["last_call"] = now_ts
         st["last_result"] = dict(out)
@@ -13776,14 +14041,14 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     # 33.78.0: dois motores independentes e selecionáveis no painel.
     # IA GRÁFICA substitui o antigo Robô Principal/RSI e usa somente leitura estrutural de preço.
-    # IA LEITURA DO GRÁFICO recebe candles OHLCV fechados e usa IA para a próxima vela
-    # e decide CALL, PUT ou NEUTRO sem usar RSI, médias, MACD, Bollinger, ATR
-    # ou qualquer outro indicador/score interno na decisão.
+    # IA LEITURA DO GRÁFICO recebe candles OHLCV fechados e replica a leitura visual:
+    # estrutura + S/R + price action + força/momentum + Volume/POC + Trend Filter,
+    # com IA externa confirmando a direção para a próxima vela.
     if ai_only and SELECTABLE_ENGINES_ENABLED:
         tf_label = {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval)
         if engine == "SMART":
             engine_title = "IA LEITURA DO GRÁFICO"
-            engine_mode = "PURE_AI"
+            engine_mode = "VISUAL_CONFLUENCE_AI"
         elif engine == "EA":
             engine_title = "EA RSI + VALUE CHART + XGBOOST"
             engine_mode = "EA_XGBOOST_AUTONOMOUS"
@@ -13888,7 +14153,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
                 }.get(engine, "DISABLED")),
                 "technical": (
-                    {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI"}
+                    {"visual_confluence": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "VISUAL_CONFLUENCE_AI", "layers": ["STRUCTURE", "SUPPORT_RESISTANCE", "PRICE_ACTION", "MOMENTUM", "VOLUME_POC", "TREND_FILTER"]}
                     if engine == "SMART"
                     else ({"triple_confirmation": True, "inputs": ["RSI_14", "VALUE_CHART", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]}))
                 ),
@@ -13899,9 +14164,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             return out
 
         try:
-            # A IA PURA recebe somente candles fechados. Nenhum indicador calculado
-            # pelo aplicativo é enviado para ela. Isso reduz repaint e mantém a
-            # decisão independente do Robô Principal.
+            # A IA LEITURA DO GRÁFICO recebe somente candles fechados e o resumo
+            # causal da confluência visual. Isso reduz repaint e mantém a entrada
+            # direcionada exclusivamente para a próxima vela.
             if engine == "RANGE":
                 engine_closed = closed[-260:]
             elif engine == "SNIPER":
@@ -14233,7 +14498,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
             "technical": (
-                {"indicators_disabled": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "PURE_AI", "direct_win_filter": analysis.get("direct_win_filter", {}), "setup": analysis.get("setup", "NONE")}
+                {"visual_confluence": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "VISUAL_CONFLUENCE_AI", "layers": ["STRUCTURE", "SUPPORT_RESISTANCE", "PRICE_ACTION", "MOMENTUM", "VOLUME_POC", "TREND_FILTER"], "chart_confluence": analysis.get("chart_confluence", {}), "direct_win_filter": analysis.get("direct_win_filter", {}), "setup": analysis.get("setup", "NONE")}
                 if engine == "SMART"
                 else ({"config_hidden": True, "mode": "EA_FORCE_MOVEMENT", "non_repaint": True} if engine == "FORCE" else analysis)
             ),
@@ -26060,7 +26325,7 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar EA Tripla ativo • RSI + Value Chart + XGBoost • OPEN/OTC</div>';
     rad();
   }else if(engine==='SMART'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA LEITURA DO GRÁFICO FLEX ONLINE • TREND FILTER OBRIGATÓRIO • PRÓXIMA VELA';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA LEITURA DO GRÁFICO ONLINE • ESTRUTURA + S/R + PRICE ACTION + FORÇA + VOLUME/POC + TREND • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Leitura do Gráfico FLEX • Trend Filter alinhado obrigatório: 🟢 só CALL / 🔴 só PUT.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar IA Leitura ativo • aguardando IA + Trend Filter na mesma direção</div>';
     rad();
