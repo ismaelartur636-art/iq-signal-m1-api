@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.94.8"
-PWA_VERSION = "v161"
+APP_VERSION = "3.94.9"
+PWA_VERSION = "v162"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -235,7 +235,7 @@ TLBRSI_RSI_PUT_MIN = max(42.0, min(65.0, float(os.getenv("TLBRSI_RSI_PUT_MIN", "
 TLBRSI_MIN_SCORE = max(4.0, min(8.0, float(os.getenv("TLBRSI_MIN_SCORE", "5.2"))))
 TLBRSI_SCORE_EDGE = max(0.3, min(3.0, float(os.getenv("TLBRSI_SCORE_EDGE", "0.8"))))
 
-# MEGA IA 3.94.8 — ROBO FIBO + RSI + EMA.
+# MEGA IA 3.94.9 — ROBO FIBO + RSI + EMA + Volume POC opcional.
 # Conversão causal do EA RoboFibo v.11.2: mantém o núcleo Fibonacci 23.6/76.4,
 # RSI 14 e EMA 60, mas remove lotes, grid, ordens pendentes, TP/SL e martingale.
 # O range de Fibonacci é calculado SOMENTE com candles anteriores à vela de
@@ -686,7 +686,7 @@ def three_line_break_rsi_strategy(cs, timeframe="1min", market="OPEN"):
     }
 
 
-def robo_fibo_strategy(cs, timeframe="1min", market="OPEN"):
+def robo_fibo_strategy(cs, timeframe="1min", market="OPEN", use_poc=False):
     """ROBO FIBO — Fibonacci 23.6/76.4 + RSI14 + EMA60, sem repaint.
 
     O range Fibonacci usa apenas candles ANTERIORES ao candle de confirmação.
@@ -695,7 +695,8 @@ def robo_fibo_strategy(cs, timeframe="1min", market="OPEN"):
     """
     rows = list(cs or [])
     tf_label = {"1min":"M1","5min":"M5","15min":"M15","30min":"M30","1h":"H1"}.get(timeframe, timeframe)
-    name = f"ROBO FIBO + RSI + EMA {tf_label}"
+    use_poc = bool(use_poc)
+    name = f"ROBO FIBO + RSI + EMA{' + POC' if use_poc else ''} {tf_label}"
     need = max(ROBOFIBO_EMA_PERIOD + 8, ROBOFIBO_BARS_BACK + 8, ROBOFIBO_RSI_PERIOD + 8, ROBOFIBO_ATR_PERIOD + 8)
     if len(rows) < need:
         return {
@@ -815,15 +816,55 @@ def robo_fibo_strategy(cs, timeframe="1min", market="OPEN"):
         elif put - call >= ROBOFIBO_SCORE_EDGE:
             direction = "PUT"
 
+    # Confluência opcional do Volume POC. O botão do painel não cria outro motor:
+    # apenas filtra o candidato do RoboFibo. OFF = lógica Fibo original;
+    # ON = o POC precisa confirmar a MESMA direção no mesmo candle fechado.
+    fibo_candidate = direction
+    poc_snapshot = None
+    poc_direction = "NEUTRO"
+    poc_confluence = not use_poc
+    poc_reason = "POC OFF" if not use_poc else "POC aguardando confirmação"
+    if use_poc:
+        try:
+            poc_snapshot = _volume_poc_snapshot(rows, early_signal=False, use_ai=False, mtf=None)
+        except Exception:
+            poc_snapshot = None
+        if isinstance(poc_snapshot, dict):
+            poc_direction = str(poc_snapshot.get("direction") or "NEUTRO").upper()
+            coverage_ok = bool(poc_snapshot.get("coverage_ok"))
+            poc_call = bool(poc_snapshot.get("poc_call"))
+            poc_put = bool(poc_snapshot.get("poc_put"))
+            if fibo_candidate == "CALL":
+                poc_confluence = coverage_ok and (poc_direction == "CALL" or poc_call)
+            elif fibo_candidate == "PUT":
+                poc_confluence = coverage_ok and (poc_direction == "PUT" or poc_put)
+            else:
+                poc_confluence = False
+            poc_reason = (
+                f"POC {poc_direction} • cobertura {float(poc_snapshot.get('volume_coverage') or 0.0)*100:.0f}%"
+                + (" • CONFIRMOU" if poc_confluence else " • NÃO CONFIRMOU")
+            )
+        if fibo_candidate in ("CALL", "PUT") and not poc_confluence:
+            direction = "NEUTRO"
+
     score = call if direction == "CALL" else (put if direction == "PUT" else max(call, put))
     confidence = 0.0
     if direction != "NEUTRO":
         confidence = clamp(64.0 + max(0.0, score - ROBOFIBO_MIN_SCORE) * 7.0 + min(8.0, abs(call - put) * 1.8), 64.0, 93.0)
         reasons = call_reasons if direction == "CALL" else put_reasons
-        reason = f"{direction} ROBO FIBO: " + ", ".join(reasons[:5]) + ". Entrada na próxima vela."
+        reason = f"{direction} ROBO FIBO: " + ", ".join(reasons[:5])
+        if use_poc:
+            reason += f" • {poc_reason}"
+        reason += ". Entrada na próxima vela."
     else:
         reason = (f"ROBO FIBO monitorando • RSI14 {r_now_f:.1f} • EMA60 {float(ema_now):.8g} • "
-                  f"Fibo23.6 {fib236:.8g} • Fibo76.4 {fib764:.8g}.")
+                  f"Fibo23.6 {fib236:.8g} • Fibo76.4 {fib764:.8g}")
+        if use_poc:
+            if fibo_candidate in ("CALL", "PUT"):
+                reason += f" • candidato {fibo_candidate} bloqueado: {poc_reason}"
+            else:
+                reason += f" • {poc_reason}"
+        reason += "."
 
     evt = str(last.get("datetime") or last.get("timestamp") or len(rows))
     return {
@@ -842,6 +883,18 @@ def robo_fibo_strategy(cs, timeframe="1min", market="OPEN"):
         },
         "rsi": round(r_now_f, 2), "rsi_previous": round(r_prev_f, 2),
         "ema60": float(ema_now), "ema60_previous": float(ema_prev),
+        "poc_filter_enabled": bool(use_poc),
+        "poc_confluence": bool(poc_confluence),
+        "poc_direction": poc_direction,
+        "poc_candidate_direction": fibo_candidate,
+        "volume_poc": ({
+            "direction": poc_direction,
+            "confidence": round(float((poc_snapshot or {}).get("confidence") or 0.0), 1),
+            "poc": float((poc_snapshot or {}).get("poc") or 0.0),
+            "volume_coverage": round(float((poc_snapshot or {}).get("volume_coverage") or 0.0), 4),
+            "poc_call": bool((poc_snapshot or {}).get("poc_call")),
+            "poc_put": bool((poc_snapshot or {}).get("poc_put")),
+        } if use_poc and isinstance(poc_snapshot, dict) else None),
         "diagnostics": {
             "call_score": round(call, 2), "put_score": round(put, 2), "min_score": ROBOFIBO_MIN_SCORE,
             "near_low_zone": near_low_zone, "near_high_zone": near_high_zone,
@@ -1119,6 +1172,7 @@ background_bot_state: Dict[str, Any] = {
     "last_error": "",
     "status": "INICIANDO",
     "pending_trades": [],
+    "robofibo_poc": False,
 }
 
 
@@ -1939,6 +1993,7 @@ class BackgroundBotStateBody(BaseModel):
     # no botão ONLINE/OFFLINE do motor.
     action: str = "PASSIVE"
     telegram_enabled: bool | None = None
+    robofibo_poc: bool | None = None
 
 
 
@@ -12880,7 +12935,7 @@ def _ai_asset_cycle_block_signal(symbol: str, interval: str, market: str, engine
     return out
 
 
-async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH"):
+async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH", robofibo_poc: bool = False):
     market = (market or "OPEN").upper()
     if not _symbol_allowed(symbol, market) or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
@@ -12922,9 +12977,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TLBRSI", "FIBORSI", "ALPHAX", "VOLUME_AI"):
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
-    key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
+    fibo_poc_key = int(bool(robofibo_poc)) if engine == "FIBORSI" else 0
+    key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}|FIBO_POC={fibo_poc_key}"
 
-    release_key = f"{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}"
+    release_key = f"{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}|FIBO_POC={fibo_poc_key}"
     release_state = signal_release_state.get(release_key) or {}
 
     active_signal = release_state.get("active_signal")
@@ -13621,7 +13677,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "TLBRSI":
                 analysis = three_line_break_rsi_strategy(engine_closed, interval, market=market)
             elif engine == "FIBORSI":
-                analysis = robo_fibo_strategy(engine_closed, interval, market=market)
+                analysis = robo_fibo_strategy(engine_closed, interval, market=market, use_poc=robofibo_poc)
             elif engine == "PRESIDEN":
                 analysis = presiden_breakout_strategy(engine_closed, interval, market=market)
             elif engine == "ALPHAX":
@@ -17209,6 +17265,7 @@ def _background_state_snapshot() -> Dict[str, Any]:
         "engine": str(background_bot_state.get("engine") or "ALPHAX"),
         "market": str(background_bot_state.get("market") or "OPEN"),
         "interval": str(background_bot_state.get("interval") or "1min"),
+        "robofibo_poc": bool(background_bot_state.get("robofibo_poc")),
         "symbols": list(background_bot_state.get("symbols") or []),
         "chat_id": str(background_bot_state.get("chat_id") or ""),
         "status": str(background_bot_state.get("status") or "OFFLINE"),
@@ -17234,6 +17291,7 @@ def _background_save_state() -> None:
             "engine": str(background_bot_state.get("engine") or "ALPHAX"),
             "market": str(background_bot_state.get("market") or "OPEN"),
             "interval": str(background_bot_state.get("interval") or "1min"),
+            "robofibo_poc": bool(background_bot_state.get("robofibo_poc")),
             "symbols": list(background_bot_state.get("symbols") or []),
             "chat_id": str(background_bot_state.get("chat_id") or ""),
             "scan_index": int(background_bot_state.get("scan_index") or 0),
@@ -17282,6 +17340,7 @@ def _background_load_state() -> None:
             "engine": engine,
             "market": market,
             "interval": interval,
+            "robofibo_poc": bool(data.get("robofibo_poc", False)),
             "symbols": symbols,
             "chat_id": str(data.get("chat_id") or TELEGRAM_CHAT_ID or "").strip(),
             "scan_index": max(0, int(data.get("scan_index") or 0)),
@@ -17610,6 +17669,7 @@ async def _background_bot_loop() -> None:
                 ai_only=True,
                 engine=engine,
                 entry_mode="BIRTH",
+                robofibo_poc=bool(background_bot_state.get("robofibo_poc")),
             )
             if isinstance(payload, dict):
                 payload["market"] = market
@@ -17697,6 +17757,8 @@ async def background_bot_set_state(body: BackgroundBotStateBody):
         chat = str(body.chat_id or "").strip()
         if chat:
             background_bot_state["chat_id"] = chat
+        if body.robofibo_poc is not None:
+            background_bot_state["robofibo_poc"] = bool(body.robofibo_poc)
 
         if action == "ACTIVATE_ENGINE":
             tg_on = bool(background_bot_state.get("telegram_enabled"))
@@ -18022,7 +18084,7 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
 # Scanner dedicado removido; os sinais continuam pelos motores selecionáveis.
 
 @app.get("/signal-ai")
-async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH"):
+async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH", robofibo_poc: bool = False):
     requested_market = (market or "OPEN").upper()
     engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
@@ -18052,6 +18114,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             ai_only=ai_only,
             engine=engine,
             entry_mode=entry_mode,
+            robofibo_poc=bool(robofibo_poc),
         )
         if isinstance(data, dict):
             # Sempre informa ao frontend qual mercado foi pedido e qual fonte
@@ -18717,6 +18780,7 @@ async def pre_signals(
     limit: int = 4,
     symbol: str | None = None,
     engine: str = "GRAPH_AI",
+    robofibo_poc: bool = False,
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
@@ -18790,7 +18854,9 @@ async def pre_signals(
     if engine == "FIBORSI":
         return {
             "ok": True,
-            "message": "RoboFibo usa Fibonacci 23.6/76.4 + RSI 14 + EMA 60 em candles fechados. O range é congelado antes da confirmação; CALL/PUT vale apenas para a próxima vela.",
+            "message": ("RoboFibo usa Fibonacci 23.6/76.4 + RSI 14 + EMA 60 em candles fechados"
+                        + (" + confluência obrigatória com Volume POC." if robofibo_poc else ". Volume POC está desligado.")
+                        + " O range é congelado antes da confirmação; CALL/PUT vale apenas para a próxima vela."),
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -19404,7 +19470,7 @@ async def chart_pre_signal(
         }
 
 @app.get("/radar")
-async def radar(request: Request, interval="1min", market="OPEN", engine: str = "GRAPH_AI", symbol: str = ""):
+async def radar(request: Request, interval="1min", market="OPEN", engine: str = "GRAPH_AI", symbol: str = "", robofibo_poc: bool = False):
     market = (market or "OPEN").upper()
     engine = (engine or "GRAPH_AI").upper()
     symbol = str(symbol or "").strip().upper()
@@ -19424,7 +19490,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     if fallback_twelve:
         market = "OPEN"
 
-    rkey = f"{market}|{interval}|{engine}|{symbol or 'ALL'}"
+    rkey = f"{market}|{interval}|{engine}|{symbol or 'ALL'}|FIBO_POC={int(bool(robofibo_poc)) if engine == 'FIBORSI' else 0}"
     previous = radar_cache.get(rkey)
     # Snapshot curto: evita chamadas duplicadas quando a tela dispara o radar
     # várias vezes quase ao mesmo tempo, mas permite que o índice avance de
@@ -19693,7 +19759,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 else:
                     status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction!="NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "FIBORSI":
-                tech=robo_fibo_strategy(closed,interval,market=market)
+                tech=robo_fibo_strategy(closed,interval,market=market,use_poc=bool(robofibo_poc))
                 engine_label="ROBO FIBO + RSI + EMA"
                 direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why=str(tech.get("reason") or "RoboFibo monitorando").replace("\n"," ")[:88]
@@ -20769,7 +20835,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .robot-mode-copy{min-width:150px}
 .robot-mode-title{font-weight:900;font-size:13px;letter-spacing:.4px}
 .robot-mode-desc{font-size:11px;color:#9fb2ca;margin-top:3px;max-width:245px}
-#robotPowerBtn,#aiPowerBtn,#larryPowerBtn,#rangePowerBtn,#presidenPowerBtn,#alphaxPowerBtn,#sniperPowerBtn,#rsiDivBbPowerBtn,#tlbRsiPowerBtn,#roboFiboPowerBtn,#combinerPowerBtn,#volumePocPowerBtn,#volumePocAiPowerBtn,#forcePowerBtn,#bigrisePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+#robotPowerBtn,#aiPowerBtn,#larryPowerBtn,#rangePowerBtn,#presidenPowerBtn,#alphaxPowerBtn,#sniperPowerBtn,#rsiDivBbPowerBtn,#tlbRsiPowerBtn,#roboFiboPowerBtn,#roboFiboPocBtn,#combinerPowerBtn,#volumePocPowerBtn,#volumePocAiPowerBtn,#forcePowerBtn,#bigrisePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
 
 .daily-engine-board{margin-top:14px;border-color:#1c82c9;background:linear-gradient(180deg,#0b1b2e,#071321);box-shadow:0 0 24px #00aaff22}
 .daily-engine-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
@@ -20990,7 +21056,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-title">🌀 ROBO FIBO + RSI + EMA</div>
       <div class="robot-mode-desc" id="roboFiboModeDesc">Fibonacci 23,6/76,4 de 20 candles + RSI 14 + EMA 60 • rejeição em candle fechado • entrada na próxima vela • sem repaint.</div>
     </div>
-    <button id="roboFiboPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+    <div style="display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end">
+      <button id="roboFiboPocBtn" type="button" style="font-weight:900">📊 POC OFF</button>
+      <button id="roboFiboPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+    </div>
   </div>
 
 
@@ -21630,6 +21699,7 @@ const tlbRsiPowerBtn=document.getElementById('tlbRsiPowerBtn');
 const tlbRsiModeDesc=document.getElementById('tlbRsiModeDesc');
 const roboFiboPowerBtn=document.getElementById('roboFiboPowerBtn');
 const roboFiboModeDesc=document.getElementById('roboFiboModeDesc');
+const roboFiboPocBtn=document.getElementById('roboFiboPocBtn');
 const presidenPowerBtn=document.getElementById('presidenPowerBtn');
 const presidenModeDesc=document.getElementById('presidenModeDesc');
 const alphaxPowerBtn=document.getElementById('alphaxPowerBtn');
@@ -21694,6 +21764,7 @@ let combinerEnabled=false;
 let rsiDivBbEnabled=false;
 let tlbRsiEnabled=false;
 let roboFiboEnabled=false;
+let roboFiboPocEnabled=false;
 let alphaxEnabled=false;
 let rapidEnabled=false;
 let suntzuEnabled=false;
@@ -21718,6 +21789,7 @@ try{
   rsiDivBbEnabled=localStorage.getItem('mega_rsidivbb_power')==='ONLINE';
   tlbRsiEnabled=localStorage.getItem('mega_tlbrsi_power')==='ONLINE';
   roboFiboEnabled=localStorage.getItem('mega_robofibo_power')==='ONLINE';
+  roboFiboPocEnabled=localStorage.getItem('mega_robofibo_poc')==='ON';
   alphaxEnabled=localStorage.getItem('mega_alphax_power')==='ONLINE';
   rapidEnabled=false;
   localStorage.removeItem('mega_rapid_power');
@@ -21827,6 +21899,7 @@ function adoptBackgroundEngineState(d){
     localStorage.setItem('mega_rsidivbb_power',rsiDivBbEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_tlbrsi_power',tlbRsiEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_robofibo_power',roboFiboEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_robofibo_poc',roboFiboPocEnabled?'ON':'OFF');
     localStorage.setItem('mega_alphax_power',alphaxEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_presiden_power',presidenEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_rapid_power',rapidEnabled?'ONLINE':'OFFLINE');
@@ -21852,7 +21925,8 @@ async function syncBackgroundBotState(opts={}){
     symbols:(btcOnlyEnabled ? ['BTC/USD'] : []),
     chat_id:chat||null,
     action:action,
-    telegram_enabled:(action==='TELEGRAM_TOGGLE' ? !!telegramEnabled : null)
+    telegram_enabled:(action==='TELEGRAM_TOGGLE' ? !!telegramEnabled : null),
+    robofibo_poc:!!roboFiboPocEnabled
   };
   try{
     const d=await post('/background-bot/state',payload);
@@ -25291,6 +25365,12 @@ function applyRobotPowerState(){
     roboFiboPowerBtn.style.color='#fff';
     roboFiboPowerBtn.style.borderColor=roboFiboEnabled?'#16c56b':'#ff5252';
   }
+  if(roboFiboPocBtn){
+    roboFiboPocBtn.textContent=roboFiboPocEnabled?'📊 POC ON':'📊 POC OFF';
+    roboFiboPocBtn.style.background=roboFiboPocEnabled?'#0b7a3d':'#3a4654';
+    roboFiboPocBtn.style.color='#fff';
+    roboFiboPocBtn.style.borderColor=roboFiboPocEnabled?'#16c56b':'#75879a';
+  }
   if(combinerPowerBtn){
     combinerPowerBtn.textContent=combinerEnabled?'🟢 ONLINE':'🔴 OFFLINE';
     combinerPowerBtn.style.background=combinerEnabled?'#0b7a3d':'#7d1d1d';
@@ -25427,17 +25507,17 @@ function applyRobotPowerState(){
     ? 'ONLINE: 3 Line Break LB=3 + RSI14 • zona congelada antes da vela de confirmação • candle fechado • próxima vela • sem repaint e sem Gale.'
     : 'OFFLINE: 3 Line Break + RSI pausado.';
   if(roboFiboModeDesc) roboFiboModeDesc.textContent=roboFiboEnabled
-    ? 'ONLINE: Fibonacci 23,6/76,4 de 20 candles + RSI14 + EMA60 • rejeição confirmada em candle fechado • próxima vela • sem repaint e sem Gale.'
-    : 'OFFLINE: RoboFibo pausado.';
+    ? ('ONLINE: Fibonacci 23,6/76,4 + RSI14 + EMA60 • '+(roboFiboPocEnabled?'Volume POC ON: confluência obrigatória na mesma direção':'Volume POC OFF: RoboFibo opera sozinho')+' • candle fechado • próxima vela • sem repaint e sem Gale.')
+    : ('OFFLINE: RoboFibo pausado • Volume POC '+(roboFiboPocEnabled?'ON':'OFF')+'.');
   if(combinerModeDesc) combinerModeDesc.textContent=combinerEnabled
     ? 'ONLINE: suporte/resistência confirmado + reação da vela + RSI 14 • próxima vela • sem repaint.'
     : 'OFFLINE: COMBINER FLOW + RSI pausado.';
 
   const engine=selectedRobotEngine();
   if(engine==='FIBORSI'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBO FIBO ONLINE • FIBO 23,6/76,4 + RSI14 + EMA60 • CANDLE FECHADO • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🌀 RoboFibo • range de 20 candles congelado antes da confirmação • sem repaint.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar RoboFibo ativo • procurando rejeição nas zonas 23,6% / 76,4%</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ROBO FIBO ONLINE • FIBO 23,6/76,4 + RSI14 + EMA60 • '+(roboFiboPocEnabled?'POC ON • CONFLUÊNCIA OBRIGATÓRIA':'POC OFF • FIBO SOLO')+' • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🌀 RoboFibo • range de 20 candles congelado antes da confirmação • '+(roboFiboPocEnabled?'Volume POC precisa confirmar a direção.':'Volume POC desligado.')+'</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar RoboFibo ativo • '+(roboFiboPocEnabled?'Fibo + Volume POC':'Fibo sem POC')+' • procurando rejeição nas zonas 23,6% / 76,4%</div>';
     rad();
   }else if(engine==='TLBRSI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='3 LINE BREAK + RSI ONLINE • LB3 + RSI14 • CANDLE FECHADO • PRÓXIMA VELA';
@@ -25959,6 +26039,17 @@ async function setSniperPower(enabled){
 
 
 
+async function setRoboFiboPoc(enabled){
+  roboFiboPocEnabled=!!enabled;
+  try{ localStorage.setItem('mega_robofibo_poc',roboFiboPocEnabled?'ON':'OFF'); }catch(_){}
+  applyRobotPowerState();
+  await syncBackgroundBotState({action:'PASSIVE',engine:'FIBORSI'});
+  if(roboFiboEnabled){
+    await Promise.allSettled([sig(true),rad(),loadPreSignals()]);
+  }
+  if(voiceEnabled) speak(roboFiboPocEnabled?'Volume POC ligado no Robo Fibo.':'Volume POC desligado. Robo Fibo operando sozinho.');
+}
+
 function disableRoboFiboForOtherEngine(){
   if(!roboFiboEnabled) return;
   roboFiboEnabled=false;
@@ -26308,6 +26399,7 @@ if(sniperPowerBtn) sniperPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine();
 if(combinerPowerBtn) combinerPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); disablePresidenForOtherEngine(); setCombinerPower(!combinerEnabled); };
 if(rsiDivBbPowerBtn) rsiDivBbPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableTlbRsiForOtherEngine(); setRsiDivBbPower(!rsiDivBbEnabled); };
 if(tlbRsiPowerBtn) tlbRsiPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); setTlbRsiPower(!tlbRsiEnabled); };
+if(roboFiboPocBtn) roboFiboPocBtn.onclick=()=>setRoboFiboPoc(!roboFiboPocEnabled);
 if(roboFiboPowerBtn) roboFiboPowerBtn.onclick=()=>{ disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); setRoboFiboPower(!roboFiboEnabled); };
 if(alphaxPowerBtn) alphaxPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); disablePresidenForOtherEngine(); setAlphaxPower(!alphaxEnabled); };
 if(rapidPowerBtn) rapidPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); setRapidPower(!rapidEnabled); };
@@ -26500,7 +26592,7 @@ async function sig(announce=false){
       return;
     }
     cur=await get(
-      `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent((entryMode&&entryMode.value)||'BIRTH')}`
+      `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent((entryMode&&entryMode.value)||'BIRTH')}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`
     );
 
     // 3.64: quando o pré-alerta completo do Velocity já foi promovido a ALERTA,
@@ -26808,7 +26900,7 @@ async function rad(){
     const engine=selectedRobotEngine();
     if(engine==='OFF'){ radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>'; return; }
     const onlySymbol=btcOnlyEnabled?'&symbol='+encodeURIComponent('BTC/USD'):'';
-    const items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}${onlySymbol}`);
+    const items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}${onlySymbol}`);
     const list=Array.isArray(items)?items:[];
     if(!list.length){
       radar.innerHTML='<div>📡 Radar ativo • aguardando leitura</div>';
@@ -26856,7 +26948,7 @@ async function loadPreSignals(){
   try{
     const lim=preSignalLimit ? Math.max(1,Math.min(4,Number(preSignalLimit.value||1))) : 1;
     const sym=(S&&S.value) ? S.value : '';
-    const url=`/pre-signals?market=${encodeURIComponent(market.value)}&interval=${encodeURIComponent(interval.value)}&limit=${encodeURIComponent(lim)}&symbol=${encodeURIComponent(sym)}&engine=${encodeURIComponent(engine)}`;
+    const url=`/pre-signals?market=${encodeURIComponent(market.value)}&interval=${encodeURIComponent(interval.value)}&limit=${encodeURIComponent(lim)}&symbol=${encodeURIComponent(sym)}&engine=${encodeURIComponent(engine)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`;
     const data=await get(url);
     const items=Array.isArray(data&&data.items)?data.items:[];
     const remain=Math.max(0,Number((data&&data.seconds_to_entry)||0));
