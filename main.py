@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.95.2"
-PWA_VERSION = "v165"
+APP_VERSION = "3.95.3"
+PWA_VERSION = "v166"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -193,6 +193,12 @@ SSC_ATR_TOUCH = max(0.10, min(1.20, float(os.getenv("SSC_ATR_TOUCH", "0.45"))))
 SSC_MIN_WICK_RATIO = max(0.08, min(0.60, float(os.getenv("SSC_MIN_WICK_RATIO", "0.12"))))
 SSC_MIN_CLOSE_POS = max(0.52, min(0.82, float(os.getenv("SSC_MIN_CLOSE_POS", "0.54"))))
 SSC_MIN_CONFIDENCE = max(55.0, min(85.0, float(os.getenv("SSC_MIN_CONFIDENCE", "58"))))
+# 3.95.3 — RSI interno do Super Signals. É filtro de direção, não gatilho principal.
+# Faixa propositalmente flexível para M1: evita a trava clássica de 30/70.
+SSC_RSI_PERIOD = max(7, min(30, int(os.getenv("SSC_RSI_PERIOD", "14"))))
+SSC_RSI_CALL_MIN = max(40.0, min(55.0, float(os.getenv("SSC_RSI_CALL_MIN", "45"))))
+SSC_RSI_PUT_MAX = max(45.0, min(60.0, float(os.getenv("SSC_RSI_PUT_MAX", "55"))))
+SSC_RSI_MIN_SLOPE = max(0.0, min(5.0, float(os.getenv("SSC_RSI_MIN_SLOPE", "0.20"))))
 SSC_PREALERT_SECONDS = 0  # intrabar desativado: somente candle fechado
 
 # MEGA IA 3.94.5 — COMBINER FLOW + RSI.
@@ -9589,6 +9595,15 @@ def super_signals_channel_nr_strategy(cs, timeframe="1min", market="OPEN"):
     close_pos = (c - l) / candle_range
     body_ratio = body / candle_range
 
+    # RSI interno: confirma que a reação do canal tem momentum na mesma direção.
+    # Usa somente fechamentos já concluídos para manter o motor causal/não-repaint.
+    closes = [float(x.get("close", 0) or 0) for x in rows]
+    rsi_now = rsi(closes, SSC_RSI_PERIOD)
+    rsi_prev = rsi(closes[:-1], SSC_RSI_PERIOD) if len(closes) > SSC_RSI_PERIOD + 1 else None
+    rsi_slope = (float(rsi_now) - float(rsi_prev)) if rsi_now is not None and rsi_prev is not None else 0.0
+    rsi_call_ok = bool(rsi_now is not None and rsi_prev is not None and float(rsi_now) >= SSC_RSI_CALL_MIN and rsi_slope >= SSC_RSI_MIN_SLOPE)
+    rsi_put_ok = bool(rsi_now is not None and rsi_prev is not None and float(rsi_now) <= SSC_RSI_PUT_MAX and rsi_slope <= -SSC_RSI_MIN_SLOPE)
+
     touch_lower = l <= (lower + tolerance)
     touch_upper = h >= (upper - tolerance)
     reclaimed_lower = c > lower and close_pos >= SSC_MIN_CLOSE_POS
@@ -9618,8 +9633,8 @@ def super_signals_channel_nr_strategy(cs, timeframe="1min", market="OPEN"):
     if c <= upper - channel_width * 0.10:
         put_strength += 0.6
 
-    call_ok = touch_lower and reclaimed_lower and call_strength >= 3.6 and (lower_wick_ratio >= SSC_MIN_WICK_RATIO or c > o)
-    put_ok = touch_upper and rejected_upper and put_strength >= 3.6 and (upper_wick_ratio >= SSC_MIN_WICK_RATIO or c < o)
+    call_ok = touch_lower and reclaimed_lower and call_strength >= 3.6 and (lower_wick_ratio >= SSC_MIN_WICK_RATIO or c > o) and rsi_call_ok
+    put_ok = touch_upper and rejected_upper and put_strength >= 3.6 and (upper_wick_ratio >= SSC_MIN_WICK_RATIO or c < o) and rsi_put_ok
 
     direction = "NEUTRO"
     strength = 0.0
@@ -9640,22 +9655,25 @@ def super_signals_channel_nr_strategy(cs, timeframe="1min", market="OPEN"):
         rejection_bonus = min(14.0, max(0.0, (wick - SSC_MIN_WICK_RATIO) * 45.0))
         body_bonus = min(8.0, body_ratio * 12.0)
         strength_bonus = min(12.0, max(0.0, strength - 3.6) * 6.0)
-        confidence = max(SSC_MIN_CONFIDENCE, min(92.0, 58.0 + rejection_bonus + body_bonus + strength_bonus))
+        rsi_bonus = min(7.0, max(0.0, abs(rsi_slope)) * 1.7)
+        confidence = max(SSC_MIN_CONFIDENCE, min(94.0, 58.0 + rejection_bonus + body_bonus + strength_bonus + rsi_bonus))
 
     confirmed = direction in ("CALL", "PUT") and confidence >= SSC_MIN_CONFIDENCE
     if confirmed:
         side_txt = "suporte/canal inferior" if direction == "CALL" else "resistência/canal superior"
         wick_txt = lower_wick_ratio if direction == "CALL" else upper_wick_ratio
         reason = (
-            f"{direction} Super Signals Channel NR: último candle fechado rejeitou {side_txt}; "
-            f"pavio {wick_txt:.0%}, corpo {body_ratio:.0%}, canal {lower:.8g}–{upper:.8g}. "
+            f"{direction} Super Signals Channel NR + RSI: último candle fechado rejeitou {side_txt}; "
+            f"pavio {wick_txt:.0%}, corpo {body_ratio:.0%}, RSI {float(rsi_now):.1f} "
+            f"({'subindo' if rsi_slope > 0 else 'caindo'} {abs(rsi_slope):.1f}), canal {lower:.8g}–{upper:.8g}. "
             "Entrada preparada para a próxima vela."
         )
     else:
+        rsi_txt = "indisponível" if rsi_now is None else f"{float(rsi_now):.1f} ({'↑' if rsi_slope > 0 else '↓' if rsi_slope < 0 else '→'})"
         reason = (
-            f"Super Signals Channel NR monitorando • canal {lower:.8g}–{upper:.8g}; "
-            f"toque inferior={'sim' if touch_lower else 'não'}, superior={'sim' if touch_upper else 'não'}. "
-            "Aguardando rejeição confirmada em candle fechado."
+            f"Super Signals Channel NR + RSI monitorando • canal {lower:.8g}–{upper:.8g}; "
+            f"toque inferior={'sim' if touch_lower else 'não'}, superior={'sim' if touch_upper else 'não'}, RSI={rsi_txt}. "
+            "Aguardando rejeição + RSI na mesma direção em candle fechado."
         )
 
     return {
@@ -9685,6 +9703,12 @@ def super_signals_channel_nr_strategy(cs, timeframe="1min", market="OPEN"):
             "body_ratio": round(body_ratio, 4),
             "call_strength": round(call_strength, 3),
             "put_strength": round(put_strength, 3),
+            "rsi_period": SSC_RSI_PERIOD,
+            "rsi": round(float(rsi_now), 2) if rsi_now is not None else None,
+            "rsi_prev": round(float(rsi_prev), 2) if rsi_prev is not None else None,
+            "rsi_slope": round(float(rsi_slope), 3),
+            "rsi_call_ok": rsi_call_ok,
+            "rsi_put_ok": rsi_put_ok,
             "future_bars_used": 0,
         },
     }
@@ -21571,7 +21595,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • EXTREME TMA + RSI + TREND • RSI TRIPLO 7/14/28 • ROBO FIBO + RSI + EMA • 3 LINE BREAK + RSI • RSI DIVERGENCE + BOLLINGER • COMBINER + SSC FLEX • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • EXTREME TMA + RSI + TREND • RSI TRIPLO 7/14/28 • ROBO FIBO + RSI + EMA • 3 LINE BREAK + RSI • RSI DIVERGENCE + BOLLINGER • COMBINER + SUPER SIGNAL RSI • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
