@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.2"
+APP_VERSION = "3.96.3"
 PWA_VERSION = "v173"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -284,23 +284,23 @@ RSIDIVBB_MIN_RSI_DELTA = max(0.0, min(12.0, float(os.getenv("RSIDIVBB_MIN_RSI_DE
 RSIDIVBB_MAX_PIVOT_AGE = max(1, min(4, int(os.getenv("RSIDIVBB_MAX_PIVOT_AGE", "2"))))
 
 
-# MEGA IA 3.96.0 — EXTREME TMA + RSI + TREND FILTER • FLEX++. 
+# MEGA IA 3.96.3 — EXTREME TMA + RSI + TREND FILTER • FLEX+++.
 # Adaptação causal do Extreme TMA System recebido. O indicador MT4 original usa
 # TMA centralizado e pode recalcular o histórico. No app, o endpoint do TMA usa
 # somente candles já disponíveis (pesos 18..1 para TMAPeriod=17), evitando candle
-# futuro. FLEX++: banda ATR mais próxima, RSI 44/56 e rejeição de candle mais permissiva como gatilho
+# futuro. FLEX+++: banda ATR ainda mais próxima, RSI 46/54 e rejeição de candle mais permissiva como gatilho
 # alternativo. O Trend Filter EMA 9/21 continua OBRIGATÓRIO na mesma direção.
 TMARSI_TMA_PERIOD = max(5, min(40, int(os.getenv("TMARSI_TMA_PERIOD", "17"))))
 TMARSI_ATR_PERIOD = max(20, min(200, int(os.getenv("TMARSI_ATR_PERIOD", "100"))))
-TMARSI_ATR_MULTIPLIER = max(0.5, min(4.0, float(os.getenv("TMARSI_ATR_MULTIPLIER", "1.20"))))
+TMARSI_ATR_MULTIPLIER = max(0.5, min(4.0, float(os.getenv("TMARSI_ATR_MULTIPLIER", "1.10"))))
 TMARSI_RSI_PERIOD = max(3, min(21, int(os.getenv("TMARSI_RSI_PERIOD", "7"))))
-TMARSI_RSI_CALL_MAX = max(20.0, min(45.0, float(os.getenv("TMARSI_RSI_CALL_MAX", "44"))))
-TMARSI_RSI_PUT_MIN = max(55.0, min(80.0, float(os.getenv("TMARSI_RSI_PUT_MIN", "56"))))
+TMARSI_RSI_CALL_MAX = max(20.0, min(49.0, float(os.getenv("TMARSI_RSI_CALL_MAX", "46"))))
+TMARSI_RSI_PUT_MIN = max(51.0, min(80.0, float(os.getenv("TMARSI_RSI_PUT_MIN", "54"))))
 # O giro do RSI não é mais obrigatório. Pode ser reativado por variável de ambiente.
 TMARSI_REQUIRE_RSI_TURN = os.getenv("TMARSI_REQUIRE_RSI_TURN", "0").strip().lower() not in ("0", "false", "off", "no")
 TMARSI_ALLOW_CANDLE_REJECTION = os.getenv("TMARSI_ALLOW_CANDLE_REJECTION", "1").strip().lower() not in ("0", "false", "off", "no")
-TMARSI_REJECTION_WICK_RATIO = max(0.35, min(2.5, float(os.getenv("TMARSI_REJECTION_WICK_RATIO", "0.60"))))
-TMARSI_REJECTION_MIN_RANGE = max(0.10, min(0.45, float(os.getenv("TMARSI_REJECTION_MIN_RANGE", "0.16"))))
+TMARSI_REJECTION_WICK_RATIO = max(0.30, min(2.5, float(os.getenv("TMARSI_REJECTION_WICK_RATIO", "0.50"))))
+TMARSI_REJECTION_MIN_RANGE = max(0.08, min(0.45, float(os.getenv("TMARSI_REJECTION_MIN_RANGE", "0.13"))))
 TMARSI_HISTORY_BARS = max(TMARSI_ATR_PERIOD + 25, min(500, int(os.getenv("TMARSI_HISTORY_BARS", "180"))))
 
 # MEGA IA 3.96.0 — MR ULTRA FAST.
@@ -1279,8 +1279,8 @@ def _causal_extreme_tma_endpoint(values, period=17):
 def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
     """Extreme TMA FLEX + RSI 7 + Trend Filter — candle fechado, próxima vela.
 
-    CALL = toque/penetração da banda inferior + (RSI <=44 OU rejeição compradora)
-    + Trend Filter VERDE/CALL. PUT é o inverso na banda superior com RSI >=56
+    CALL = toque/penetração da banda inferior + (RSI <=46 OU rejeição compradora)
+    + Trend Filter VERDE/CALL. PUT é o inverso na banda superior com RSI >=54
     OU rejeição vendedora + Trend Filter VERMELHO/PUT.
 
     O giro do RSI não é obrigatório por padrão; pode ser reativado via env.
@@ -1325,7 +1325,7 @@ def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
     touch_lower=lo<=lower
     touch_upper=hi>=upper
 
-    # RSI FLEX++: 44/56. O giro do RSI é opcional; por padrão o nível já pode disparar.
+    # RSI FLEX+++: 46/54. O giro do RSI é opcional; por padrão o nível já pode disparar.
     rsi_turn_up=float(r_now)>float(r_prev)
     rsi_turn_down=float(r_now)<float(r_prev)
     rsi_level_call=float(r_now)<=TMARSI_RSI_CALL_MAX
@@ -1342,12 +1342,12 @@ def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
     bullish_rejection=bool(
         TMARSI_ALLOW_CANDLE_REJECTION and touch_lower
         and lower_wick>=max(body*TMARSI_REJECTION_WICK_RATIO,candle_range*TMARSI_REJECTION_MIN_RANGE)
-        and close>=lo+(candle_range*0.55)
+        and close>=lo+(candle_range*0.52)
     )
     bearish_rejection=bool(
         TMARSI_ALLOW_CANDLE_REJECTION and touch_upper
         and upper_wick>=max(body*TMARSI_REJECTION_WICK_RATIO,candle_range*TMARSI_REJECTION_MIN_RANGE)
-        and close<=lo+(candle_range*0.45)
+        and close<=lo+(candle_range*0.48)
     )
 
     call_trigger=bool(touch_lower and (rsi_call or bullish_rejection))
@@ -20569,7 +20569,7 @@ async def pre_signals(
     if engine == "TMARSI":
         return {
             "ok": True,
-            "message": "Extreme TMA FLEX++ usa somente candle fechado: TMA 17 causal + ATR 100 x1,20 + RSI 7 (44/56) OU rejeição de candle mais permissiva + Trend Filter EMA 9/21 alinhado. CALL/PUT vale para a próxima vela.",
+            "message": "Extreme TMA FLEX+++ usa somente candle fechado: TMA 17 causal + ATR 100 x1,10 + RSI 7 (46/54) OU rejeição de candle mais permissiva + Trend Filter EMA 9/21 alinhado. CALL/PUT vale para a próxima vela.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -22916,7 +22916,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Extreme TMA + RSI + Trend Filter">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🎯 EXTREME TMA + RSI + TREND FILTER</div>
-      <div class="robot-mode-desc" id="tmaRsiModeDesc">TMA 17 causal + ATR 100×1,20 + RSI 7 (44/56) OU rejeição FLEX++ • Trend Filter EMA 9/21 obrigatório • candle fechado • próxima vela • sem repaint.</div>
+      <div class="robot-mode-desc" id="tmaRsiModeDesc">TMA 17 causal + ATR 100×1,10 + RSI 7 (46/54) OU rejeição FLEX+++ • Trend Filter EMA 9/21 obrigatório • candle fechado • próxima vela • sem repaint.</div>
     </div>
     <button id="tmaRsiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -27527,7 +27527,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: divergência RSI14 confirmada + Bollinger 20/2 na zona extrema • candle fechado • próxima vela • sem repaint e sem Gale.'
     : 'OFFLINE: RSI Divergence + Bollinger pausado.';
   if(tmaRsiModeDesc) tmaRsiModeDesc.textContent=tmaRsiEnabled
-    ? 'ONLINE FLEX++: TMA17 causal + ATR100×1,20 + RSI7 44/56 OU rejeição • Trend Filter EMA9/21 obrigatório: 🟢 só CALL / 🔴 só PUT • candle fechado • próxima vela.'
+    ? 'ONLINE FLEX+++: TMA17 causal + ATR100×1,10 + RSI7 46/54 OU rejeição • Trend Filter EMA9/21 obrigatório: 🟢 só CALL / 🔴 só PUT • candle fechado • próxima vela.'
     : 'OFFLINE: Extreme TMA + RSI + Trend Filter pausado.';
   if(tlbRsiModeDesc) tlbRsiModeDesc.textContent=tlbRsiEnabled
     ? 'ONLINE: 3 Line Break LB=3 + RSI14 • zona congelada antes da vela de confirmação • candle fechado • próxima vela • sem repaint e sem Gale.'
@@ -27558,7 +27558,7 @@ function applyRobotPowerState(){
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ MR ULTRA FAST selecionado • candle fechado • entrada na próxima vela • sem repaint.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar MR ULTRA FAST ativo • procurando candle de força + momentum + range/ATR</div>';
   }else if(engine==='TMARSI'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EXTREME TMA FLEX++ ONLINE • TMA17 + RSI7 44/56 OU REJEIÇÃO + TREND FILTER • PRÓXIMA VELA';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EXTREME TMA FLEX+++ ONLINE • TMA17 + RSI7 46/54 OU REJEIÇÃO + TREND FILTER • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 Extreme TMA + RSI • banda TMA + RSI 7 precisam concordar com o Trend Filter: 🟢 CALL / 🔴 PUT.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Extreme TMA + RSI ativo • procurando TMA + RSI + Trend Filter na mesma direção</div>';
     rad();
