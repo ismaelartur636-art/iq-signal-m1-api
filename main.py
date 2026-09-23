@@ -239,14 +239,14 @@ FERRU_TF_WEIGHTS = {"1min": 1.25, "5min": 1.25, "15min": 1.00, "1h": 0.75}
 # Price Action Concepts + Signals & Overlays + Matrix Oscillator.
 # Usa apenas candles fechados para o sinal oficial e entra na próxima vela.
 FUSION_HISTORY_BARS = max(120, min(400, int(os.getenv("FUSION_HISTORY_BARS", "220"))))
-FUSION_MIN_SCORE = max(55.0, min(85.0, float(os.getenv("FUSION_MIN_SCORE", "66"))))
-FUSION_MIN_EDGE = max(5.0, min(30.0, float(os.getenv("FUSION_MIN_EDGE", "10"))))
+FUSION_MIN_SCORE = max(45.0, min(52.0, float(os.getenv("FUSION_MIN_SCORE", "52"))))
+FUSION_MIN_EDGE = max(2.0, min(3.0, float(os.getenv("FUSION_MIN_EDGE", "3"))))
 FUSION_PIVOT_SIDE = max(2, min(5, int(os.getenv("FUSION_PIVOT_SIDE", "2"))))
 FUSION_HYPER_LENGTH = max(5, min(30, int(os.getenv("FUSION_HYPER_LENGTH", "7"))))
 FUSION_MFI_LENGTH = max(10, min(55, int(os.getenv("FUSION_MFI_LENGTH", "35"))))
 FUSION_MFI_SMOOTH = max(2, min(10, int(os.getenv("FUSION_MFI_SMOOTH", "6"))))
-FUSION_ADX_MIN = max(12.0, min(35.0, float(os.getenv("FUSION_ADX_MIN", "18"))))
-FUSION_VOLUME_FACTOR = max(1.05, min(2.50, float(os.getenv("FUSION_VOLUME_FACTOR", "1.35"))))
+FUSION_ADX_MIN = max(10.0, min(14.0, float(os.getenv("FUSION_ADX_MIN", "14"))))
+FUSION_VOLUME_FACTOR = max(1.00, min(1.15, float(os.getenv("FUSION_VOLUME_FACTOR", "1.15"))))
 
 # MEGA IA 3.94.6 — RSI DIVERGENCE + BOLLINGER.
 # Divergência em RSI 14 entre pivôs confirmados + Bollinger 20/2 como zona de confluência.
@@ -22481,7 +22481,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="MEGA FUSION X">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🔥 MEGA FUSION X</div>
-      <div class="robot-mode-desc" id="fusionModeDesc">Price Action BOS/CHoCH/FVG + tendência/força + Hyper Wave/Money Flow • score 0–100 • candle fechado • próxima vela • sem repaint após liberação.</div>
+      <div class="robot-mode-desc" id="fusionModeDesc">Price Action BOS/CHoCH/FVG + tendência/força + Hyper Wave/Money Flow • score flexível 52+ • candle fechado • próxima vela • sem repaint após liberação.</div>
     </div>
     <button id="fusionPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
