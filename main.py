@@ -238,15 +238,15 @@ FERRU_TF_WEIGHTS = {"1min": 1.25, "5min": 1.25, "15min": 1.00, "1h": 0.75}
 # MEGA FUSION X — fusão causal dos três módulos LuxAlgo recebidos.
 # Price Action Concepts + Signals & Overlays + Matrix Oscillator.
 # Usa apenas candles fechados para o sinal oficial e entra na próxima vela.
-FUSION_HISTORY_BARS = max(120, min(400, int(os.getenv("FUSION_HISTORY_BARS", "220"))))
-FUSION_MIN_SCORE = max(45.0, min(52.0, float(os.getenv("FUSION_MIN_SCORE", "52"))))
-FUSION_MIN_EDGE = max(2.0, min(3.0, float(os.getenv("FUSION_MIN_EDGE", "3"))))
+FUSION_HISTORY_BARS = max(120, min(150, int(os.getenv("FUSION_HISTORY_BARS", "150"))))
+FUSION_MIN_SCORE = max(42.0, min(50.0, float(os.getenv("FUSION_MIN_SCORE", "45"))))
+FUSION_MIN_EDGE = max(1.0, min(3.0, float(os.getenv("FUSION_MIN_EDGE", "2"))))
 FUSION_PIVOT_SIDE = max(2, min(5, int(os.getenv("FUSION_PIVOT_SIDE", "2"))))
 FUSION_HYPER_LENGTH = max(5, min(30, int(os.getenv("FUSION_HYPER_LENGTH", "7"))))
 FUSION_MFI_LENGTH = max(10, min(55, int(os.getenv("FUSION_MFI_LENGTH", "35"))))
 FUSION_MFI_SMOOTH = max(2, min(10, int(os.getenv("FUSION_MFI_SMOOTH", "6"))))
-FUSION_ADX_MIN = max(10.0, min(14.0, float(os.getenv("FUSION_ADX_MIN", "14"))))
-FUSION_VOLUME_FACTOR = max(1.00, min(1.15, float(os.getenv("FUSION_VOLUME_FACTOR", "1.15"))))
+FUSION_ADX_MIN = max(8.0, min(14.0, float(os.getenv("FUSION_ADX_MIN", "12"))))
+FUSION_VOLUME_FACTOR = max(1.00, min(1.15, float(os.getenv("FUSION_VOLUME_FACTOR", "1.05"))))
 
 # MEGA IA 3.94.6 — RSI DIVERGENCE + BOLLINGER.
 # Divergência em RSI 14 entre pivôs confirmados + Bollinger 20/2 como zona de confluência.
@@ -884,6 +884,11 @@ def _fusion_trend_module(rows):
     if e50 is not None and e200 is not None:
         if closes[-1]>e50>e200 and (e50p is None or e50>=e50p): call+=10; rc.append("EMA50/200 alta")
         elif closes[-1]<e50<e200 and (e50p is None or e50<=e50p): put+=10; rp.append("EMA50/200 baixa")
+    elif e50 is not None:
+        # Com histórico curto (máx. 150 candles no feed do app), usa preço + inclinação
+        # da EMA50 como confirmação reduzida, sem bloquear todo o módulo de tendência.
+        if closes[-1]>e50 and (e50p is None or e50>=e50p): call+=7; rc.append("EMA50 alta")
+        elif closes[-1]<e50 and (e50p is None or e50<=e50p): put+=7; rp.append("EMA50 baixa")
 
     # Smart Trail inspirado no Signals & Overlays: trailing ATR causal.
     a=atr(rows,10)
@@ -948,7 +953,9 @@ def mega_fusion_x_strategy(cs, timeframe="1min", market="OPEN"):
     """MEGA FUSION X: Price Action + Signals/Trend + Matrix, candle fechado -> próxima vela."""
     rows=list(cs or [])
     name="MEGA FUSION X"
-    need=max(120,FUSION_MFI_LENGTH+20,205)
+    # As fontes OPEN/IQ deste app trabalham com até 150 candles neste fluxo.
+    # O FUSION foi adaptado para aquecer com 120 candles em vez de exigir 205.
+    need=max(120,FUSION_MFI_LENGTH+20)
     if len(rows)<need:
         return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","strategy":name,"engine":"FUSION","provider":"LOCAL_MEGA_FUSION_X","reason":f"MEGA FUSION X coletando candles fechados ({len(rows)}/{need}).","non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,"direct_win_only":True,"gale_signal":False}
     rows=rows[-FUSION_HISTORY_BARS:]
@@ -974,7 +981,7 @@ def mega_fusion_x_strategy(cs, timeframe="1min", market="OPEN"):
         reason=f"{direction} MEGA FUSION X • score {dominant:.0f}/100 • vantagem {edge:.0f} • " + ", ".join(reasons[:7]) + ". Candle fechado; entrada na próxima vela."
     else:
         reason=f"MEGA FUSION X monitorando • CALL {call:.0f} x PUT {put:.0f} • mínimo {FUSION_MIN_SCORE:.0f} + vantagem {FUSION_MIN_EDGE:.0f} + 2/3 módulos."
-    return {"available":True,"direction":direction,"confidence":round(confidence,1),"confirmed":direction in ("CALL","PUT"),"risk":risk,"strategy":name,"engine":"FUSION","provider":"LOCAL_MEGA_FUSION_X","reason":reason[:520],"non_repaint":True,"non_repaint_after_release":True,"closed_candles_only":True,"next_candle_entry":True,"direct_win_only":True,"gale_signal":False,"fusion_score":{"call":round(call,1),"put":round(put,1),"edge":round(edge,1),"min_score":FUSION_MIN_SCORE,"min_edge":FUSION_MIN_EDGE,"modules_call":modules_call,"modules_put":modules_put},"price_action":pa,"trend_module":tr,"matrix_module":mx}
+    return {"available":True,"direction":direction,"confidence":round(confidence,1),"confirmed":direction in ("CALL","PUT"),"risk":risk,"strategy":name,"engine":"FUSION","provider":"LOCAL_MEGA_FUSION_X","reason":reason[:520],"non_repaint":True,"non_repaint_after_release":True,"closed_candles_only":True,"next_candle_entry":True,"direct_win_only":True,"gale_signal":False,"fusion_score":{"call":round(call,1),"put":round(put,1),"edge":round(edge,1),"min_score":FUSION_MIN_SCORE,"min_edge":FUSION_MIN_EDGE,"modules_call":modules_call,"modules_put":modules_put,"history_bars":len(rows),"history_need":need},"price_action":pa,"trend_module":tr,"matrix_module":mx}
 
 
 def rsi_divergence_bollinger_strategy(cs, timeframe="1min", market="OPEN"):
