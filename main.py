@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.1"
-PWA_VERSION = "v172"
+APP_VERSION = "3.96.2"
+PWA_VERSION = "v173"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -263,6 +263,11 @@ FERRU_TF_WEIGHTS = {"1min": 1.25, "5min": 1.25, "15min": 1.00, "1h": 0.75}
 ALLCLUSTER_HISTORY_BARS = max(40, min(300, int(os.getenv("ALLCLUSTER_HISTORY_BARS", "120"))))
 ALLCLUSTER_EMA_PERIOD = 2
 ALLCLUSTER_SMA_PERIOD = 2
+# Filtro Ratio: qualidade mínima do corpo da vela que confirma a virada.
+# 0.28 mantém o motor relativamente solto, mas bloqueia doji/microcorpo.
+ALLCLUSTER_MIN_BODY_RATIO = max(0.10, min(0.75, float(os.getenv("ALLCLUSTER_MIN_BODY_RATIO", "0.28"))))
+# Trend Filter compartilhado: VERDE autoriza somente CALL; VERMELHO somente PUT.
+ALLCLUSTER_USE_TREND_FILTER = str(os.getenv("ALLCLUSTER_USE_TREND_FILTER", "true")).strip().lower() not in ("0", "false", "off", "no")
 
 
 # MEGA IA 3.94.6 — RSI DIVERGENCE + BOLLINGER.
@@ -955,8 +960,42 @@ def _allcluster_strength(rows, delta: float) -> float:
     return max(0.0, min(1.0, abs(float(delta)) / max(avg_range * 0.55, 1e-12)))
 
 
+def _allcluster_ratio_filter(candle, direction: str):
+    """Filtro Ratio (corpo/range) aplicado à vela que confirma o setup.
+
+    Evita liberar virada do Cluster em doji/microcorpo. Além do tamanho mínimo,
+    o corpo precisa fechar na mesma direção do CALL/PUT candidato.
+    """
+    direction = str(direction or "").upper()
+    try:
+        o = float(candle.get("open", 0) or 0)
+        h = float(candle.get("high", 0) or 0)
+        l = float(candle.get("low", 0) or 0)
+        c = float(candle.get("close", 0) or 0)
+        rng = max(h - l, 1e-12)
+        body = abs(c - o)
+        ratio = max(0.0, min(1.0, body / rng))
+        directional = ((direction == "CALL" and c > o) or (direction == "PUT" and c < o))
+        passed = bool(directional and ratio >= ALLCLUSTER_MIN_BODY_RATIO)
+        return {
+            "enabled": True, "passed": passed, "directional": directional,
+            "body_ratio": round(ratio, 4), "minimum": round(ALLCLUSTER_MIN_BODY_RATIO, 4),
+            "reason": (
+                f"Ratio OK: corpo {ratio*100:.0f}% na direção {direction}."
+                if passed else
+                f"Ratio bloqueou: corpo {ratio*100:.0f}% (mínimo {ALLCLUSTER_MIN_BODY_RATIO*100:.0f}%) e precisa fechar na direção {direction}."
+            ),
+        }
+    except Exception as exc:
+        return {
+            "enabled": True, "passed": False, "directional": False,
+            "body_ratio": 0.0, "minimum": round(ALLCLUSTER_MIN_BODY_RATIO, 4),
+            "reason": f"Ratio indisponível: {str(exc)[:100]}",
+        }
+
+
 def allcluster_filter_strategy(cs, timeframe="1min", market="OPEN"):
-    """Sinal oficial: virada do Cluster confirmada no último candle fechado."""
+    """Sinal oficial: Cluster + Ratio + Trend Filter no último candle fechado."""
     name = "ALL CLUSTER FILTER 2/2"
     rows = list(cs or [])[-ALLCLUSTER_HISTORY_BARS:]
     series = _allcluster_series(rows)
@@ -971,38 +1010,70 @@ def allcluster_filter_strategy(cs, timeframe="1min", market="OPEN"):
 
     cur_t = int(series["trend"][-1] or 0)
     prev_t = int(series["trend"][-2] or 0)
-    confirmed = cur_t in (-1, 1) and prev_t in (-1, 1) and cur_t != prev_t
-    direction = "CALL" if (confirmed and cur_t > 0) else ("PUT" if (confirmed and cur_t < 0) else "NEUTRO")
+    cluster_flip = cur_t in (-1, 1) and prev_t in (-1, 1) and cur_t != prev_t
+    candidate = "CALL" if (cluster_flip and cur_t > 0) else ("PUT" if (cluster_flip and cur_t < 0) else "NEUTRO")
     delta = float(series["cluster"][-1]) - float(series["cluster"][-2])
     strength = _allcluster_strength(rows, delta)
+
+    trend_filter = _smart_trend_filter(rows) if ALLCLUSTER_USE_TREND_FILTER else {
+        "enabled": False, "ready": True, "color": "OFF", "direction": candidate, "aligned": True,
+        "reason": "Trend Filter desligado por configuração.",
+    }
+    ratio_filter = _allcluster_ratio_filter(rows[-1], candidate) if candidate in ("CALL", "PUT") else {
+        "enabled": True, "passed": False, "directional": False, "body_ratio": 0.0,
+        "minimum": round(ALLCLUSTER_MIN_BODY_RATIO, 4), "reason": "Ratio aguardando nova virada do Cluster.",
+    }
+
+    trend_ready = bool(trend_filter.get("ready"))
+    trend_dir = str(trend_filter.get("direction") or "NEUTRO").upper()
+    trend_color = str(trend_filter.get("color") or "NEUTRO").upper()
+    trend_ok = (not ALLCLUSTER_USE_TREND_FILTER) or (trend_ready and trend_dir == candidate)
+    ratio_ok = bool(ratio_filter.get("passed"))
+    confirmed = bool(cluster_flip and candidate in ("CALL", "PUT") and trend_ok and ratio_ok)
+    direction = candidate if confirmed else "NEUTRO"
     confidence = round(72.0 + 18.0 * strength, 1) if confirmed else 0.0
 
-    if confirmed:
-        side_text = "baixa → alta" if direction == "CALL" else "alta → baixa"
-        reason = (
-            f"{direction} confirmado: Cluster virou {side_text} no fechamento. "
-            "A seta/entrada pertence à próxima vela; sem entrada atrasada."
-        )
+    if cluster_flip and candidate in ("CALL", "PUT"):
+        side_text = "baixa → alta" if candidate == "CALL" else "alta → baixa"
+        if not trend_ok:
+            if not trend_ready:
+                reason = f"{candidate} candidato: Cluster virou {side_text}, mas Trend Filter ainda não está pronto. Entrada bloqueada."
+            elif trend_dir == "NEUTRO":
+                reason = f"{candidate} candidato: Cluster virou {side_text}, mas Trend Filter está NEUTRO. Entrada bloqueada."
+            else:
+                reason = f"{candidate} candidato: Cluster virou {side_text}, porém Trend Filter {trend_color} autoriza somente {trend_dir}. Entrada bloqueada."
+        elif not ratio_ok:
+            reason = f"{candidate} candidato: Cluster virou {side_text} e Trend Filter {trend_color} alinhou, mas {ratio_filter.get('reason')}"
+        else:
+            reason = (
+                f"{candidate} confirmado: Cluster virou {side_text} no fechamento + "
+                f"Ratio {float(ratio_filter.get('body_ratio') or 0)*100:.0f}% + Trend Filter {trend_color}. "
+                "A entrada pertence à próxima vela; sem entrada atrasada."
+            )
     else:
         trend_text = "alta" if cur_t > 0 else ("baixa" if cur_t < 0 else "neutra")
-        reason = f"ALL CLUSTER monitorando; direção confirmada atual: {trend_text}. Aguardando nova virada."
+        reason = (
+            f"ALL CLUSTER monitorando; Cluster atual {trend_text} • Trend Filter {trend_color} → {trend_dir}. "
+            "Aguardando nova virada com Ratio válido."
+        )
 
     return {
-        "direction": direction, "confidence": confidence, "confirmed": confirmed,
+        "direction": direction, "candidate_direction": candidate, "confidence": confidence, "confirmed": confirmed,
         "risk": "MEDIUM" if confirmed else "HIGH", "strategy": name,
         "engine": "ALLCLUSTER", "provider": "LOCAL_ALLCLUSTER_FILTER",
         "reason": reason, "non_repaint": True, "closed_candles_only": True,
         "next_candle_entry": True, "direct_win_only": True, "gale_signal": False,
         "cluster_value": round(float(series["cluster"][-1]), 8),
         "cluster_trend": cur_t, "previous_cluster_trend": prev_t,
+        "trend_filter": trend_filter, "ratio_filter": ratio_filter,
     }
 
 
 def allcluster_prealert_strategy(raw, timeframe="1min", market="OPEN"):
-    """Pré-alerta causal: vela em formação sugere a virada que, se fechar, gera entrada na próxima vela."""
+    """Pré-alerta causal: Cluster provisório + Ratio + Trend Filter confirmado."""
     name = "ALL CLUSTER FILTER 2/2"
     rows = list(raw or [])
-    if len(rows) < 7:
+    if len(rows) < 24:
         return None
     closed = rows[:-1]
     live = rows[-1]
@@ -1038,6 +1109,21 @@ def allcluster_prealert_strategy(raw, timeframe="1min", market="OPEN"):
         return None
 
     direction = "CALL" if live_trend > 0 else "PUT"
+    trend_filter = _smart_trend_filter(closed) if ALLCLUSTER_USE_TREND_FILTER else {
+        "enabled": False, "ready": True, "color": "OFF", "direction": direction, "aligned": True,
+        "reason": "Trend Filter desligado por configuração.",
+    }
+    trend_ready = bool(trend_filter.get("ready"))
+    trend_dir = str(trend_filter.get("direction") or "NEUTRO").upper()
+    trend_color = str(trend_filter.get("color") or "NEUTRO").upper()
+    if ALLCLUSTER_USE_TREND_FILTER and (not trend_ready or trend_dir != direction):
+        return None
+
+    # O Ratio do pré-alerta é provisório porque a vela ainda está em formação.
+    ratio_filter = _allcluster_ratio_filter(live, direction)
+    if not ratio_filter.get("passed"):
+        return None
+
     delta = live_cluster - float(series["cluster"][-1])
     strength = _allcluster_strength(rows[-14:], delta)
     confidence = round(66.0 + 18.0 * strength, 1)
@@ -1048,13 +1134,15 @@ def allcluster_prealert_strategy(raw, timeframe="1min", market="OPEN"):
         "prealert_only": True, "strategy": name, "engine": "ALLCLUSTER",
         "provider": "LOCAL_ALLCLUSTER_FILTER_LIVE",
         "reason": (
-            f"Pré-alerta {direction}: Cluster está virando provisoriamente de {old_text} para {new_text} "
-            "na vela em formação. Se fechar assim, a entrada será na próxima vela."
+            f"Pré-alerta {direction}: Cluster está virando provisoriamente de {old_text} para {new_text} • "
+            f"Ratio {float(ratio_filter.get('body_ratio') or 0)*100:.0f}% • Trend Filter {trend_color} alinhado. "
+            "Se fechar assim, a entrada será na próxima vela."
         ),
         "non_repaint_after_confirmation": True,
         "entry_on_next_candle": True,
         "cluster_live": round(float(live_cluster), 8),
         "cluster_confirmed": round(float(series["cluster"][-1]), 8),
+        "trend_filter": trend_filter, "ratio_filter": ratio_filter,
     }
 
 
@@ -15439,12 +15527,16 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "legacy_ai_disabled": engine != "SMART",
             "legacy_technical_strategies_disabled": True,
             "entry_mode": entry_mode,
+            "direct_win_only": bool(analysis.get("direct_win_only", False)),
+            "direct_only": bool(analysis.get("direct_win_only", False)),
             "training_mode": bool(engine == "SAMURAI"),
             "auto_trade_allowed": bool(engine != "SAMURAI"),
         }
 
-        if engine in ("SMART", "TMARSI"):
+        if engine in ("SMART", "TMARSI", "ALLCLUSTER"):
             base["trend_filter"] = analysis.get("trend_filter", {})
+        if engine == "ALLCLUSTER":
+            base["ratio_filter"] = analysis.get("ratio_filter", {})
 
         if engine == "SMART" and analysis.get("fallback"):
             base["status"] = "FALLBACK LOCAL • SOMENTE MONITORAMENTO"
@@ -15880,7 +15972,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "COMBINER": "SINAL COMBINER FLOW + RSI LIBERADO",
                         "KEYLEVELS": "SINAL KEY LEVELS LIBERADO",
                         "FERRU": "SINAL FERRU MULTI LIBERADO",
-                        "ALLCLUSTER": "SINAL ALL CLUSTER LIBERADO • ENTRADA NA VELA DA SETA",
+                        "ALLCLUSTER": "SINAL ALL CLUSTER LIBERADO • RATIO + TREND ALINHADOS • ENTRADA NA VELA DA SETA",
                         "RSIDIVBB": "SINAL RSI DIVERGENCE + BOLLINGER LIBERADO",
                         "TMARSI": "SINAL EXTREME TMA + RSI + TREND FILTER LIBERADO",
                         "MRULTRA": "SINAL MR ULTRA FAST LIBERADO",
@@ -15905,6 +15997,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "expiry_time": iso(expiry),
                     "reference_candle": reference_candle,
                 })
+                base["signal_id"] = _result_operation_key(base, market)
                 if engine == "ALLCLUSTER":
                     base["non_repaint_after_release"] = True
                     base["signal_snapshot"] = "LAST_CLOSED_CANDLE"
@@ -18994,6 +19087,11 @@ def _background_accounting_remember(payload: Dict[str, Any], iq_state: Dict[str,
         "entry_time": payload.get("entry_time"),
         "expiry_time": payload.get("expiry_time"),
         "source": payload.get("strategy") or "BACKGROUND",
+        "strategy": payload.get("strategy") or "BACKGROUND",
+        "engine": payload.get("selected_engine") or payload.get("engine") or payload.get("mode") or "",
+        "confidence": float(payload.get("confidence") or 0.0),
+        "risk": str(payload.get("risk") or ""),
+        "direct_only": bool(payload.get("direct_only", payload.get("direct_win_only", False))),
     }
     key = _accounting_key(item)
     if not key:
@@ -19031,11 +19129,17 @@ def _background_accounting_finish(trade: Dict[str, Any], result_label: str, cand
     else:
         pending = accounting_pending.setdefault(market, {})
         done = accounting_results.setdefault(market, {})
+    remembered = dict(pending.get(key) or {})
     done[key] = {
+        **remembered,
         **item,
         "result": result_label,
         "final_result": result_label,
+        "direct_only": bool(remembered.get("direct_only", trade.get("direct_only", False))),
+        "engine": remembered.get("engine") or trade.get("engine") or "",
+        "strategy": remembered.get("strategy") or trade.get("strategy") or "BACKGROUND",
         "candle_time": candle.get("datetime") if isinstance(candle, dict) else None,
+        "settled_at": iso(now()),
         "background": True,
     }
     pending.pop(key, None)
@@ -19140,15 +19244,19 @@ async def _background_settle_pending() -> None:
             if not result_label:
                 keep.append(trade)
                 continue
-            # Telegram atual só aceita WIN/LOSS. Empate é contabilizado, mas não
-            # dispara mensagem de perda falsa.
+            # Primeiro grava o resultado. Falha do Telegram nunca mais impede
+            # WIN/LOSS de entrar na contabilidade do painel.
+            _background_accounting_finish(trade, result_label, candle, iq_state)
             if (
                 result_label in ("WIN", "LOSS")
                 and bool(background_bot_state.get("telegram_enabled"))
                 and bool(trade.get("telegram_notify", True))
             ):
-                await _background_send_result(trade, result_label)
-            _background_accounting_finish(trade, result_label, candle, iq_state)
+                try:
+                    await _background_send_result(trade, result_label)
+                except Exception as tg_exc:
+                    trade["telegram_result_error"] = str(tg_exc)[:180]
+                    background_bot_state["last_error"] = f"resultado salvo; Telegram: {str(tg_exc)[:160]}"
             _release_ai_asset_cycle_lock(
                 str(trade.get("market") or "OPEN").upper(),
                 str(trade.get("symbol") or ""),
@@ -19274,6 +19382,8 @@ async def _background_bot_loop() -> None:
                             "confidence": float(payload.get("confidence") or 0.0),
                             "risk": str(payload.get("risk") or "--"),
                             "strategy": str(payload.get("strategy") or engine),
+                            "direct_only": bool(payload.get("direct_only", payload.get("direct_win_only", False))),
+                            "signal_id": sig_key,
                             "telegram_notify": True,
                             "entry_time": payload.get("entry_time"),
                             "expiry_time": payload.get("expiry_time"),
@@ -19789,12 +19899,12 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = feed_src
                     data["feed_label"] = _feed_source_label(feed_src)
                     data["feed_fallback"] = bool(feed_info.get("fallback"))
-                    data["feed_message"] = "ALL CLUSTER usando candles do mercado aberto; pré-alerta na vela em formação e confirmação no fechamento."
+                    data["feed_message"] = "ALL CLUSTER usando candles do mercado aberto; pré-alerta multiativos com Ratio + Trend Filter e confirmação no fechamento."
                 else:
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                    data["feed_message"] = "ALL CLUSTER usando candles OTC reais da IQ Option; entrada na próxima vela após confirmação."
+                    data["feed_message"] = "ALL CLUSTER usando candles OTC reais da IQ Option; Ratio + Trend Filter obrigatórios e entrada na próxima vela após confirmação."
             elif engine == "COMBINER":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -20632,12 +20742,14 @@ async def pre_signals(
     pointer = int(cache.get(pointer_key, (0, 0))[1] or 0) % len(SYMBOLS)
 
     if symbol:
-        # Para o pré-alerta do painel, analisa primeiro o ativo que o usuário
-        # realmente está acompanhando. Isso evita girar outros pares e reduz carga.
+        # Para motores comuns, prioriza o ativo selecionado. O ALL CLUSTER no
+        # painel chama este endpoint sem symbol para acompanhar o mesmo universo do radar.
         batch_size = 1
         batch = [symbol]
     else:
-        batch_size = min(len(SYMBOLS), max(PRE_SIGNAL_BATCH, limit))
+        # ALL CLUSTER precisa percorrer vários pares dentro da própria vela; não
+        # amarra o tamanho da varredura à quantidade de cartões visíveis.
+        batch_size = min(len(SYMBOLS), max(4 if engine == "ALLCLUSTER" else PRE_SIGNAL_BATCH, limit))
         batch = [
             SYMBOLS[(pointer + i) % len(SYMBOLS)]
             for i in range(batch_size)
@@ -20901,7 +21013,7 @@ async def pre_signals(
                 "SUPER SIGNALS CHANNEL NR usa somente candle fechado; sem pré-alerta intrabar para preservar o não-repaint. O sinal confirmado vale para a próxima vela."
                 if engine == "SNIPER"
                 else (
-                    "ALL CLUSTER: o pré-alerta usa a vela atual em formação, uma vela antes da entrada. A entrada só é confirmada no fechamento e acontece na próxima vela; o pré-alerta pode cancelar antes do fechamento."
+                    "ALL CLUSTER: pré-alerta multiativos na vela em formação. Só aparece quando Cluster + Ratio + Trend Filter concordam (VERDE só CALL / VERMELHO só PUT); confirmação final no fechamento e entrada na próxima vela."
                     if engine == "ALLCLUSTER"
                     else (
                     f"RSI + ADX Afiado: pré-alerta provisório nos últimos {RSI_ADX_PREALERT_SECONDS}s; "
@@ -21896,7 +22008,7 @@ def _remember_accounting_signal(request: Request, payload: Dict[str, Any]):
         "engine": payload.get("engine") or payload.get("mode") or "",
         "confidence": float(payload.get("confidence") or 0.0),
         "risk": str(payload.get("risk") or ""),
-        "direct_only": bool(payload.get("direct_only", False)),
+        "direct_only": bool(payload.get("direct_only", payload.get("direct_win_only", False))),
         "external_ai": bool(payload.get("external_ai", False)),
     }
     key = _accounting_key(item)
@@ -22884,7 +22996,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="ALL CLUSTER FILTER">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🔀 ALL CLUSTER FILTER</div>
-      <div class="robot-mode-desc" id="allClusterModeDesc">EMA 2 + SMA 2 • pré-alerta na vela anterior à entrada • confirmação no fechamento • entrada na próxima vela.</div>
+      <div class="robot-mode-desc" id="allClusterModeDesc">EMA 2 + SMA 2 + Ratio de corpo • Trend Filter obrigatório: 🟢 só CALL / 🔴 só PUT • pré-alerta na vela anterior • entrada na próxima vela.</div>
     </div>
     <button id="allClusterPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -27436,7 +27548,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: M1 + M5 + M15 + H1 • EMA 9/21/50 + CCI14 + MACD 12/26/9 + ADX/DMI14 + Bulls/Bears13 • confluência ≥70% • próxima vela.'
     : 'OFFLINE: FERRU MULTI pausado.';
   if(allClusterModeDesc) allClusterModeDesc.textContent=allClusterEnabled
-    ? 'ONLINE: EMA2 + SMA2 • pré-alerta na vela anterior à entrada • confirma no fechamento • seta/entrada na próxima vela.'
+    ? 'ONLINE: EMA2 + SMA2 + Ratio • Trend Filter obrigatório: 🟢 só CALL / 🔴 só PUT • pré-alerta 1 vela antes • confirma no fechamento • próxima vela.'
     : 'OFFLINE: ALL CLUSTER FILTER pausado.';
 
   const engine=selectedRobotEngine();
@@ -27506,9 +27618,9 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar KEY LEVELS ativo • procurando rompimentos confirmados em todos os pares</div>';
     rad();
   }else if(engine==='ALLCLUSTER'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ALL CLUSTER ONLINE • PRÉ-ALERTA 1 VELA ANTES • CONFIRMA NO FECHAMENTO • ENTRADA NA PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔀 ALL CLUSTER • o aviso nasce na vela anterior à entrada; só vira CALL/PUT oficial se a virada permanecer até o fechamento.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar ALL CLUSTER ativo • procurando virada EMA2 + SMA2 do Cluster Filter</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ALL CLUSTER ONLINE • EMA2+SMA2 + RATIO + TREND FILTER • 🟢 CALL / 🔴 PUT • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔀 ALL CLUSTER • pré-alerta multiativos • Ratio filtra microcorpo • Trend Filter: 🟢 só CALL / 🔴 só PUT • confirmação no fechamento.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar ALL CLUSTER ativo • EMA2 + SMA2 + Ratio + Trend Filter na mesma direção</div>';
     rad();
   }else if(engine==='FERRU'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='FERRU MULTI ONLINE • M1/M5/M15/H1 • CONFLUÊNCIA ≥70% • CANDLE FECHADO • PRÓXIMA VELA';
@@ -29106,7 +29218,10 @@ async function loadPreSignals(){
   try{
     const lim=preSignalLimit ? Math.max(1,Math.min(4,Number(preSignalLimit.value||1))) : 1;
     const sym=(S&&S.value) ? S.value : '';
-    const url=`/pre-signals?market=${encodeURIComponent(market.value)}&interval=${encodeURIComponent(interval.value)}&limit=${encodeURIComponent(lim)}&symbol=${encodeURIComponent(sym)}&engine=${encodeURIComponent(engine)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`;
+    // ALL CLUSTER acompanha todos os pares do radar. Nos demais motores, mantém
+    // o comportamento leve de consultar somente o ativo selecionado.
+    const preAlertSymbol=(engine==='ALLCLUSTER')?'':sym;
+    const url=`/pre-signals?market=${encodeURIComponent(market.value)}&interval=${encodeURIComponent(interval.value)}&limit=${encodeURIComponent(lim)}&symbol=${encodeURIComponent(preAlertSymbol)}&engine=${encodeURIComponent(engine)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`;
     const data=await get(url);
     const items=Array.isArray(data&&data.items)?data.items:[];
     const remain=Math.max(0,Number((data&&data.seconds_to_entry)||0));
