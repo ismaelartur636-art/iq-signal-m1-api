@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.95.8"
-PWA_VERSION = "v170"
+APP_VERSION = "3.95.9"
+PWA_VERSION = "v171"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -214,25 +214,25 @@ COMBINER_RSI_PUT_MIN = max(42.0, min(65.0, float(os.getenv("COMBINER_RSI_PUT_MIN
 COMBINER_MIN_SCORE = max(3.5, min(8.0, float(os.getenv("COMBINER_MIN_SCORE", "5.0"))))
 COMBINER_SCORE_EDGE = max(0.5, min(4.0, float(os.getenv("COMBINER_SCORE_EDGE", "1.0"))))
 
-# MEGA IA 3.95.8 — KEY LEVELS BREAKOUT MULTIATIVOS.
+# MEGA IA 3.95.9 — KEY LEVELS BREAKOUT FLEX MULTIATIVOS.
 # Conversão do XAUUSD_KeyLevels_EA.mq5 para gerador de CALL/PUT.
-# A geometria original 20/5 foi preservada, mas os valores fixos em dólar foram
+# A geometria original foi adaptada para 12/3 no modo FLEX, e os valores fixos em dólar foram
 # substituídos por ATR para que a mesma lógica escale em Forex, metais e cripto.
 # O rompimento só libera sinal se a vela FECHAR além da zona; pavio que atravessa
 # e retorna é classificado como falso rompimento e bloqueado.
-KEYLEVELS_PIVOT_LEFT = max(5, min(40, int(os.getenv("KEYLEVELS_PIVOT_LEFT", "20"))))
-KEYLEVELS_PIVOT_RIGHT = max(2, min(10, int(os.getenv("KEYLEVELS_PIVOT_RIGHT", "5"))))
+KEYLEVELS_PIVOT_LEFT = max(5, min(40, int(os.getenv("KEYLEVELS_PIVOT_LEFT", "12"))))
+KEYLEVELS_PIVOT_RIGHT = max(2, min(10, int(os.getenv("KEYLEVELS_PIVOT_RIGHT", "3"))))
 KEYLEVELS_ATR_PERIOD = max(7, min(30, int(os.getenv("KEYLEVELS_ATR_PERIOD", "14"))))
 KEYLEVELS_HISTORY_BARS = max(90, min(150, int(os.getenv("KEYLEVELS_HISTORY_BARS", "150"))))
-KEYLEVELS_MAX_LEVELS = max(2, min(8, int(os.getenv("KEYLEVELS_MAX_LEVELS", "5"))))
-KEYLEVELS_MIN_PUSH_ATR = max(0.60, min(3.00, float(os.getenv("KEYLEVELS_MIN_PUSH_ATR", "1.35"))))
-KEYLEVELS_ZONE_ATR = max(0.08, min(0.80, float(os.getenv("KEYLEVELS_ZONE_ATR", "0.28"))))
-KEYLEVELS_BREAK_BUFFER_ATR = max(0.01, min(0.40, float(os.getenv("KEYLEVELS_BREAK_BUFFER_ATR", "0.08"))))
-KEYLEVELS_MIN_BODY_ATR = max(0.05, min(0.80, float(os.getenv("KEYLEVELS_MIN_BODY_ATR", "0.20"))))
-KEYLEVELS_MIN_BODY_RATIO = max(0.20, min(0.80, float(os.getenv("KEYLEVELS_MIN_BODY_RATIO", "0.42"))))
-KEYLEVELS_MIN_CLOSE_POS = max(0.52, min(0.90, float(os.getenv("KEYLEVELS_MIN_CLOSE_POS", "0.64"))))
-KEYLEVELS_MAX_RANGE_ATR = max(1.10, min(4.00, float(os.getenv("KEYLEVELS_MAX_RANGE_ATR", "2.20"))))
-KEYLEVELS_MAX_EXTENSION_ATR = max(0.25, min(2.00, float(os.getenv("KEYLEVELS_MAX_EXTENSION_ATR", "1.00"))))
+KEYLEVELS_MAX_LEVELS = max(2, min(8, int(os.getenv("KEYLEVELS_MAX_LEVELS", "6"))))
+KEYLEVELS_MIN_PUSH_ATR = max(0.60, min(3.00, float(os.getenv("KEYLEVELS_MIN_PUSH_ATR", "0.85"))))
+KEYLEVELS_ZONE_ATR = max(0.08, min(0.80, float(os.getenv("KEYLEVELS_ZONE_ATR", "0.20"))))
+KEYLEVELS_BREAK_BUFFER_ATR = max(0.01, min(0.40, float(os.getenv("KEYLEVELS_BREAK_BUFFER_ATR", "0.03"))))
+KEYLEVELS_MIN_BODY_ATR = max(0.05, min(0.80, float(os.getenv("KEYLEVELS_MIN_BODY_ATR", "0.12"))))
+KEYLEVELS_MIN_BODY_RATIO = max(0.20, min(0.80, float(os.getenv("KEYLEVELS_MIN_BODY_RATIO", "0.32"))))
+KEYLEVELS_MIN_CLOSE_POS = max(0.52, min(0.90, float(os.getenv("KEYLEVELS_MIN_CLOSE_POS", "0.58"))))
+KEYLEVELS_MAX_RANGE_ATR = max(1.10, min(4.00, float(os.getenv("KEYLEVELS_MAX_RANGE_ATR", "2.80"))))
+KEYLEVELS_MAX_EXTENSION_ATR = max(0.25, min(2.00, float(os.getenv("KEYLEVELS_MAX_EXTENSION_ATR", "1.30"))))
 
 # MEGA IA 3.95.5 — FERRU MULTI SIGNAL GENERATOR.
 # Adaptação causal do FerruFx_Multi_info+.mq4 para sinais CALL/PUT na próxima vela.
@@ -402,7 +402,7 @@ def triple_rsi_strategy(cs, timeframe="1min", market="OPEN", early_signal=False)
 def keylevels_breakout_strategy(cs, timeframe="1min", market="OPEN"):
     """KEY LEVELS BREAKOUT multiativos, causal e sem repaint.
 
-    Baseado no XAUUSD_KeyLevels_EA.mq5 recebido: pivô 20/5 e até 5 níveis por lado.
+    Baseado no XAUUSD_KeyLevels_EA.mq5 recebido: pivôs confirmados e níveis estruturais; no modo FLEX o padrão é 12/3 e até 6 níveis por lado.
     A adaptação usa ATR em vez de distâncias fixas em dólar. O último candle fechado
     é apenas o candle de confirmação; os níveis são construídos sem ele. Assim um
     pavio que ultrapassa e fecha de volta na zona vira FALSO ROMPIMENTO e não sinaliza.
@@ -429,7 +429,7 @@ def keylevels_breakout_strategy(cs, timeframe="1min", market="OPEN"):
     base = rows[:-1]
     last = rows[-1]
     if len(base) < KEYLEVELS_PIVOT_LEFT + KEYLEVELS_PIVOT_RIGHT + 10:
-        return neutral("KEY LEVELS aguardando histórico suficiente para confirmar pivôs 20/5.")
+        return neutral(f"KEY LEVELS aguardando histórico suficiente para confirmar pivôs {KEYLEVELS_PIVOT_LEFT}/{KEYLEVELS_PIVOT_RIGHT}.")
 
     a = atr(rows, KEYLEVELS_ATR_PERIOD)
     if a is None or float(a) <= 0:
