@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.3"
+APP_VERSION = "3.96.4"
 PWA_VERSION = "v173"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -284,7 +284,7 @@ RSIDIVBB_MIN_RSI_DELTA = max(0.0, min(12.0, float(os.getenv("RSIDIVBB_MIN_RSI_DE
 RSIDIVBB_MAX_PIVOT_AGE = max(1, min(4, int(os.getenv("RSIDIVBB_MAX_PIVOT_AGE", "2"))))
 
 
-# MEGA IA 3.96.3 — EXTREME TMA + RSI + TREND FILTER • FLEX+++.
+# MEGA IA 3.96.4 — EXTREME TMA + RSI + TREND FILTER • FLEX+++.
 # Adaptação causal do Extreme TMA System recebido. O indicador MT4 original usa
 # TMA centralizado e pode recalcular o histórico. No app, o endpoint do TMA usa
 # somente candles já disponíveis (pesos 18..1 para TMAPeriod=17), evitando candle
@@ -1276,7 +1276,7 @@ def _causal_extreme_tma_endpoint(values, period=17):
     return sum(v*w for v,w in zip(window,weights))/denom if denom>0 else None
 
 
-def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
+def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN", trend_filter_enabled: bool = True):
     """Extreme TMA FLEX + RSI 7 + Trend Filter — candle fechado, próxima vela.
 
     CALL = toque/penetração da banda inferior + (RSI <=46 OU rejeição compradora)
@@ -1305,6 +1305,8 @@ def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
     r_now=rsi(closes,TMARSI_RSI_PERIOD)
     r_prev=rsi(closes[:-1],TMARSI_RSI_PERIOD) if len(closes)>TMARSI_RSI_PERIOD+1 else None
     trend_filter=_smart_trend_filter(rows)
+    trend_filter=dict(trend_filter or {})
+    trend_filter["enabled"]=bool(trend_filter_enabled)
 
     if tma_val is None or atr_val is None or r_now is None or r_prev is None:
         return {
@@ -1363,12 +1365,13 @@ def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
     trend_ready=bool(trend_filter.get("ready"))
     trend_dir=str(trend_filter.get("direction") or "NEUTRO").upper()
     trend_color=str(trend_filter.get("color") or "NEUTRO").upper()
-    aligned=bool(candidate in ("CALL","PUT") and trend_ready and trend_dir==candidate)
+    aligned=bool(candidate in ("CALL","PUT") and (not trend_filter_enabled or (trend_ready and trend_dir==candidate)))
 
     diagnostics={
         "touch_lower":touch_lower,"touch_upper":touch_upper,
         "rsi_call":rsi_call,"rsi_put":rsi_put,"rsi_turn_up":rsi_turn_up,"rsi_turn_down":rsi_turn_down,
         "bullish_rejection":bullish_rejection,"bearish_rejection":bearish_rejection,
+        "trend_filter_enabled":bool(trend_filter_enabled),
         "trend_ready":trend_ready,"trend_direction":trend_dir,"trend_color":trend_color,
     }
 
@@ -1384,8 +1387,9 @@ def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
         if not blockers:
             blockers.append("GATILHO")
         block_txt=" / ".join(blockers)
+        trend_txt=(f"Trend Filter {trend_color} → {trend_dir}" if trend_filter_enabled else "Trend Filter OFFLINE")
         reason=(f"Extreme TMA FLEX monitorando • banda {lower:.8g} / {upper:.8g} • RSI7 {float(r_now):.1f} "
-                f"(anterior {float(r_prev):.1f}) • Trend Filter {trend_color} → {trend_dir} • BLOQUEADO POR: {block_txt}.")
+                f"(anterior {float(r_prev):.1f}) • {trend_txt} • BLOQUEADO POR: {block_txt}.")
         return {
             "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
             "risk":"HIGH","strategy":name,"engine":"TMARSI","provider":"LOCAL_EXTREME_TMA_RSI_TREND",
@@ -1398,7 +1402,7 @@ def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
             "rejection":{"enabled":TMARSI_ALLOW_CANDLE_REJECTION,"bullish":bullish_rejection,"bearish":bearish_rejection,"wick_ratio":TMARSI_REJECTION_WICK_RATIO},
         }
 
-    if not aligned:
+    if trend_filter_enabled and not aligned:
         if not trend_ready:
             why=f"{candidate} candidato no TMA FLEX, mas o Trend Filter ainda não está pronto. BLOQUEADO POR: TREND."
         elif trend_dir=="NEUTRO":
@@ -1419,7 +1423,7 @@ def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
 
     penetration=((lower-lo)/band_range if candidate=="CALL" else (hi-upper)/band_range)
     turn_strength=((float(r_now)-float(r_prev)) if candidate=="CALL" else (float(r_prev)-float(r_now)))
-    ema_gap=abs(float(trend_filter.get("ema9") or close)-float(trend_filter.get("ema21") or close))/max(abs(close),1e-12)
+    ema_gap=(abs(float(trend_filter.get("ema9") or close)-float(trend_filter.get("ema21") or close))/max(abs(close),1e-12)) if trend_filter_enabled else 0.0
     used_rsi=rsi_call if candidate=="CALL" else rsi_put
     used_rejection=bullish_rejection if candidate=="CALL" else bearish_rejection
     confidence=clamp(
@@ -1433,9 +1437,10 @@ def extreme_tma_rsi_trend_strategy(cs, timeframe="1min", market="OPEN"):
     if used_rsi: trigger_bits.append(f"RSI7 {float(r_now):.1f}")
     if used_rejection: trigger_bits.append("rejeição de candle")
     trigger_txt=" + ".join(trigger_bits) if trigger_bits else "gatilho FLEX"
+    trend_release=(f"Trend Filter {trend_color} ({trend_dir}) alinhado" if trend_filter_enabled else "Trend Filter OFFLINE — não bloqueia")
     reason=(f"{candidate} LIBERADO: TMA17/ATR×{TMARSI_ATR_MULTIPLIER:g} banda "
             f"{'inferior' if candidate=='CALL' else 'superior'} tocada + {trigger_txt} + "
-            f"Trend Filter {trend_color} ({trend_dir}) alinhado. Entrada na próxima vela.")
+            f"{trend_release}. Entrada na próxima vela.")
     return {
         "available":True,"direction":candidate,"confidence":round(float(confidence),1),"confirmed":True,
         "risk":"MEDIUM","strategy":name,"engine":"TMARSI","provider":"LOCAL_EXTREME_TMA_RSI_TREND",
@@ -14316,7 +14321,7 @@ def _ai_asset_cycle_block_signal(symbol: str, interval: str, market: str, engine
     return out
 
 
-async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH", robofibo_poc: bool = False):
+async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH", robofibo_poc: bool = False, tmarsi_trend_filter: bool = True):
     market = (market or "OPEN").upper()
     if not _symbol_allowed(symbol, market) or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
@@ -14377,9 +14382,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         engine = "GRAPH_AI"
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     fibo_poc_key = int(bool(robofibo_poc)) if engine == "FIBORSI" else 0
-    key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}|FIBO_POC={fibo_poc_key}"
+    tmarsi_trend_key = int(bool(tmarsi_trend_filter)) if engine == "TMARSI" else 1
+    key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}|FIBO_POC={fibo_poc_key}|TMARSI_TREND={tmarsi_trend_key}"
 
-    release_key = f"{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}|FIBO_POC={fibo_poc_key}"
+    release_key = f"{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}|FIBO_POC={fibo_poc_key}|TMARSI_TREND={tmarsi_trend_key}"
     release_state = signal_release_state.get(release_key) or {}
 
     active_signal = release_state.get("active_signal")
@@ -15221,7 +15227,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "RSIDIVBB":
                 analysis = rsi_divergence_bollinger_strategy(engine_closed, interval, market=market)
             elif engine == "TMARSI":
-                analysis = extreme_tma_rsi_trend_strategy(engine_closed, interval, market=market)
+                analysis = extreme_tma_rsi_trend_strategy(engine_closed, interval, market=market, trend_filter_enabled=bool(tmarsi_trend_filter))
             elif engine == "MRULTRA":
                 analysis = mr_ultra_fast_strategy(engine_closed, interval, market=market)
             elif engine == "TLBRSI":
@@ -19778,7 +19784,7 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
 # Scanner dedicado removido; os sinais continuam pelos motores selecionáveis.
 
 @app.get("/signal-ai")
-async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH", robofibo_poc: bool = False):
+async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH", robofibo_poc: bool = False, tmarsi_trend_filter: bool = True):
     requested_market = (market or "OPEN").upper()
     engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
@@ -19809,6 +19815,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             engine=engine,
             entry_mode=entry_mode,
             robofibo_poc=bool(robofibo_poc),
+            tmarsi_trend_filter=bool(tmarsi_trend_filter),
         )
         if isinstance(data, dict):
             # Sempre informa ao frontend qual mercado foi pedido e qual fonte
@@ -21237,7 +21244,7 @@ async def chart_pre_signal(
         }
 
 @app.get("/radar")
-async def radar(request: Request, interval="1min", market="OPEN", engine: str = "GRAPH_AI", symbol: str = "", robofibo_poc: bool = False):
+async def radar(request: Request, interval="1min", market="OPEN", engine: str = "GRAPH_AI", symbol: str = "", robofibo_poc: bool = False, tmarsi_trend_filter: bool = True):
     market = (market or "OPEN").upper()
     engine = (engine or "GRAPH_AI").upper()
     symbol = str(symbol or "").strip().upper()
@@ -21257,7 +21264,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     if fallback_twelve:
         market = "OPEN"
 
-    rkey = f"{market}|{interval}|{engine}|{symbol or 'ALL'}|FIBO_POC={int(bool(robofibo_poc)) if engine == 'FIBORSI' else 0}"
+    rkey = f"{market}|{interval}|{engine}|{symbol or 'ALL'}|FIBO_POC={int(bool(robofibo_poc)) if engine == 'FIBORSI' else 0}|TMARSI_TREND={int(bool(tmarsi_trend_filter)) if engine == 'TMARSI' else 1}"
     previous = radar_cache.get(rkey)
     # Snapshot curto: evita chamadas duplicadas quando a tela dispara o radar
     # várias vezes quase ao mesmo tempo, mas permite que o índice avance de
@@ -21588,7 +21595,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 else:
                     status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction!="NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "TMARSI":
-                tech=extreme_tma_rsi_trend_strategy(closed,interval,market=market)
+                tech=extreme_tma_rsi_trend_strategy(closed,interval,market=market,trend_filter_enabled=bool(tmarsi_trend_filter))
                 engine_label="EXTREME TMA + RSI + TREND FILTER"
                 direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why=str(tech.get("reason") or "Extreme TMA + RSI monitorando").replace("\n"," ")[:88]
@@ -22918,7 +22925,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-title">🎯 EXTREME TMA + RSI + TREND FILTER</div>
       <div class="robot-mode-desc" id="tmaRsiModeDesc">TMA 17 causal + ATR 100×1,10 + RSI 7 (46/54) OU rejeição FLEX+++ • Trend Filter EMA 9/21 obrigatório • candle fechado • próxima vela • sem repaint.</div>
     </div>
-    <button id="tmaRsiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+    <div style="display:flex;flex-direction:column;gap:8px;min-width:142px">
+      <button id="tmaRsiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+      <button id="tmaTrendFilterBtn" type="button" style="font-weight:900">🟢 FILTER ONLINE</button>
+    </div>
   </div>
 
 
@@ -23631,6 +23641,7 @@ const allClusterModeDesc=document.getElementById('allClusterModeDesc');
 const rsiDivBbPowerBtn=document.getElementById('rsiDivBbPowerBtn');
 const rsiDivBbModeDesc=document.getElementById('rsiDivBbModeDesc');
 const tmaRsiPowerBtn=document.getElementById('tmaRsiPowerBtn');
+const tmaTrendFilterBtn=document.getElementById('tmaTrendFilterBtn');
 const tmaRsiModeDesc=document.getElementById('tmaRsiModeDesc');
 const mrUltraPowerBtn=document.getElementById('mrUltraPowerBtn');
 const mrUltraModeDesc=document.getElementById('mrUltraModeDesc');
@@ -23707,6 +23718,7 @@ let ferruEnabled=false;
 let allClusterEnabled=false;
 let rsiDivBbEnabled=false;
 let tmaRsiEnabled=false;
+let tmaTrendFilterEnabled=true;
 let mrUltraEnabled=false;
 let tlbRsiEnabled=false;
 let tripleRsiEnabled=false;
@@ -23738,6 +23750,7 @@ try{
   allClusterEnabled=localStorage.getItem('mega_allcluster_power')==='ONLINE';
   rsiDivBbEnabled=localStorage.getItem('mega_rsidivbb_power')==='ONLINE';
   tmaRsiEnabled=localStorage.getItem('mega_tmarsi_power')==='ONLINE';
+  tmaTrendFilterEnabled=localStorage.getItem('mega_tmarsi_trend_filter')!=='OFFLINE';
   mrUltraEnabled=localStorage.getItem('mega_mrultra_power')==='ONLINE';
   tlbRsiEnabled=localStorage.getItem('mega_tlbrsi_power')==='ONLINE';
   tripleRsiEnabled=localStorage.getItem('mega_triprsi_power')==='ONLINE';
@@ -27346,6 +27359,12 @@ function applyRobotPowerState(){
     tmaRsiPowerBtn.style.color='#fff';
     tmaRsiPowerBtn.style.borderColor=tmaRsiEnabled?'#16c56b':'#ff5252';
   }
+  if(tmaTrendFilterBtn){
+    tmaTrendFilterBtn.textContent=tmaTrendFilterEnabled?'🟢 FILTER ONLINE':'🔴 FILTER OFFLINE';
+    tmaTrendFilterBtn.style.background=tmaTrendFilterEnabled?'#0b7a3d':'#7d1d1d';
+    tmaTrendFilterBtn.style.color='#fff';
+    tmaTrendFilterBtn.style.borderColor=tmaTrendFilterEnabled?'#16c56b':'#ff5252';
+  }
   if(mrUltraPowerBtn){
     mrUltraPowerBtn.textContent=mrUltraEnabled?'🟢 ONLINE':'🔴 OFFLINE';
     mrUltraPowerBtn.style.background=mrUltraEnabled?'#0b7a3d':'#7d1d1d';
@@ -27527,8 +27546,8 @@ function applyRobotPowerState(){
     ? 'ONLINE: divergência RSI14 confirmada + Bollinger 20/2 na zona extrema • candle fechado • próxima vela • sem repaint e sem Gale.'
     : 'OFFLINE: RSI Divergence + Bollinger pausado.';
   if(tmaRsiModeDesc) tmaRsiModeDesc.textContent=tmaRsiEnabled
-    ? 'ONLINE FLEX+++: TMA17 causal + ATR100×1,10 + RSI7 46/54 OU rejeição • Trend Filter EMA9/21 obrigatório: 🟢 só CALL / 🔴 só PUT • candle fechado • próxima vela.'
-    : 'OFFLINE: Extreme TMA + RSI + Trend Filter pausado.';
+    ? ('ONLINE FLEX+++: TMA17 causal + ATR100×1,10 + RSI7 46/54 OU rejeição • '+(tmaTrendFilterEnabled?'Trend Filter ONLINE: 🟢 só CALL / 🔴 só PUT':'Trend Filter OFFLINE: TMA + RSI/rejeição podem liberar sem bloqueio de tendência')+' • candle fechado • próxima vela.')
+    : ('OFFLINE: Extreme TMA + RSI pausado • Trend Filter '+(tmaTrendFilterEnabled?'ONLINE':'OFFLINE')+'.');
   if(tlbRsiModeDesc) tlbRsiModeDesc.textContent=tlbRsiEnabled
     ? 'ONLINE: 3 Line Break LB=3 + RSI14 • zona congelada antes da vela de confirmação • candle fechado • próxima vela • sem repaint e sem Gale.'
     : 'OFFLINE: 3 Line Break + RSI pausado.';
@@ -27558,9 +27577,9 @@ function applyRobotPowerState(){
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ MR ULTRA FAST selecionado • candle fechado • entrada na próxima vela • sem repaint.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar MR ULTRA FAST ativo • procurando candle de força + momentum + range/ATR</div>';
   }else if(engine==='TMARSI'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EXTREME TMA FLEX+++ ONLINE • TMA17 + RSI7 46/54 OU REJEIÇÃO + TREND FILTER • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 Extreme TMA + RSI • banda TMA + RSI 7 precisam concordar com o Trend Filter: 🟢 CALL / 🔴 PUT.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar Extreme TMA + RSI ativo • procurando TMA + RSI + Trend Filter na mesma direção</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EXTREME TMA FLEX+++ ONLINE • TMA17 + RSI7 46/54 OU REJEIÇÃO • TREND FILTER '+(tmaTrendFilterEnabled?'ONLINE':'OFFLINE')+' • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 Extreme TMA + RSI • '+(tmaTrendFilterEnabled?'Trend Filter ONLINE: 🟢 permite CALL / 🔴 permite PUT.':'Trend Filter OFFLINE: sinal depende apenas do TMA + RSI/rejeição.')+'</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar Extreme TMA + RSI ativo • Trend Filter '+(tmaTrendFilterEnabled?'ONLINE':'OFFLINE')+'</div>';
     rad();
   }else if(engine==='TRIPRSI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI TRIPLO ONLINE • 7/14/28 ALINHADOS • SINAL ~10S ANTES • PRÓXIMA VELA';
@@ -28246,6 +28265,15 @@ function disableTmaRsiForOtherEngine(){
   try{ localStorage.setItem('mega_tmarsi_power','OFFLINE'); }catch(_){}
 }
 
+async function setTmaTrendFilterPower(enabled){
+  tmaTrendFilterEnabled=!!enabled;
+  try{ localStorage.setItem('mega_tmarsi_trend_filter',tmaTrendFilterEnabled?'ONLINE':'OFFLINE'); }catch(_){}
+  applyRobotPowerState();
+  if(selectedRobotEngine()==='TMARSI') await Promise.allSettled([sig(true),rad()]);
+  if(chartTab && chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(tmaTrendFilterEnabled?'Filtro de tendência online.':'Filtro de tendência offline.');
+}
+
 async function setTmaRsiPower(enabled){
   tmaRsiEnabled=!!enabled;
   if(tmaRsiEnabled){
@@ -28652,6 +28680,7 @@ document.addEventListener('click',(ev)=>{
   if(b && b.id && b.id.endsWith('PowerBtn') && b.id!=='allClusterPowerBtn' && allClusterEnabled) disableAllClusterForOtherEngine();
 },true);
 if(tmaRsiPowerBtn) tmaRsiPowerBtn.onclick=()=>setTmaRsiPower(!tmaRsiEnabled);
+if(tmaTrendFilterBtn) tmaTrendFilterBtn.onclick=()=>setTmaTrendFilterPower(!tmaTrendFilterEnabled);
 if(mrUltraPowerBtn) mrUltraPowerBtn.onclick=()=>setMrUltraPower(!mrUltraEnabled);
 if(tripleRsiPowerBtn) tripleRsiPowerBtn.onclick=()=>setTripleRsiPower(!tripleRsiEnabled);
 if(robotPowerBtn) robotPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); disablePresidenForOtherEngine(); setRobotPower(!robotEnabled); };
@@ -28862,7 +28891,7 @@ async function sig(announce=false){
       return;
     }
     cur=await get(
-      `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent((entryMode&&entryMode.value)||'BIRTH')}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`
+      `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent((entryMode&&entryMode.value)||'BIRTH')}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}&tmarsi_trend_filter=${tmaTrendFilterEnabled?'true':'false'}`
     );
 
     // 3.64: quando o pré-alerta completo do Velocity já foi promovido a ALERTA,
@@ -29170,7 +29199,7 @@ async function rad(){
     const engine=selectedRobotEngine();
     if(engine==='OFF'){ radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>'; return; }
     const onlySymbol=btcOnlyEnabled?'&symbol='+encodeURIComponent('BTC/USD'):'';
-    const items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}${onlySymbol}`);
+    const items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}&tmarsi_trend_filter=${tmaTrendFilterEnabled?'true':'false'}${onlySymbol}`);
     const list=Array.isArray(items)?items:[];
     if(!list.length){
       radar.innerHTML='<div>📡 Radar ativo • aguardando leitura</div>';
