@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.9"
+APP_VERSION = "3.96.10"
 PWA_VERSION = "v175"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -270,18 +270,19 @@ ALLCLUSTER_MIN_BODY_RATIO = max(0.10, min(0.75, float(os.getenv("ALLCLUSTER_MIN_
 ALLCLUSTER_USE_TREND_FILTER = str(os.getenv("ALLCLUSTER_USE_TREND_FILTER", "true")).strip().lower() not in ("0", "false", "off", "no")
 
 
-# MEGA IA 3.96.9 — VALUE CHART dual expiry + placar corrigido (parâmetros recebidos em 23/09/2026).
+# MEGA IA 3.96.10 — VALUE CHART M1/5 velas + modo 5M + placar corrigido (23/09/2026).
 # Período 5, zonas +8/-8, escala operacional +/-15. O sinal oficial usa somente
 # candle fechado e não repinta. Há pré-alerta PROVISÓRIO 20s antes da entrada;
-# no fechamento a condição é confirmada/cancelada. Expiração fixa de 1 minuto.
+# no fechamento a condição é confirmada/cancelada. No modo VALUECHART, a entrada é M1 e o resultado fecha após 5 velas M1.
 VALUECHART_PERIOD = max(2, min(30, int(os.getenv("VALUECHART_PERIOD", "5"))))
 VALUECHART_UPPER = float(os.getenv("VALUECHART_UPPER", "8.0"))
 VALUECHART_LOWER = float(os.getenv("VALUECHART_LOWER", "-8.0"))
 VALUECHART_SCALE = max(5.0, min(30.0, float(os.getenv("VALUECHART_SCALE", "15.0"))))
 VALUECHART_HISTORY_BARS = max(40, min(300, int(os.getenv("VALUECHART_HISTORY_BARS", "120"))))
-VALUECHART_1M_EXPIRY_SECONDS = 60
+VALUECHART_1M_EXPIRY_SECONDS = 300
+VALUECHART_1M_HOLD_CANDLES = 5
 VALUECHART_5M_EXPIRY_SECONDS = 300
-# Alias legado: o VALUECHART original continua sendo a opção de 1 minuto.
+# Alias legado: VALUECHART é o modo M1, agora com fechamento após 5 velas M1.
 VALUECHART_EXPIRY_SECONDS = VALUECHART_1M_EXPIRY_SECONDS
 VALUECHART_PREALERT_SECONDS = 20
 
@@ -292,7 +293,7 @@ def _valuechart_expiry_seconds(engine: str | None) -> int:
     return VALUECHART_5M_EXPIRY_SECONDS if str(engine or "").upper() == "VALUECHART5" else VALUECHART_1M_EXPIRY_SECONDS
 
 def _valuechart_label(engine: str | None) -> str:
-    return "VALUE CHART 5 ±8 • EXP 5M" if str(engine or "").upper() == "VALUECHART5" else "VALUE CHART 5 ±8 • EXP 1M"
+    return "VALUE CHART 5 ±8 • EXP 5M" if str(engine or "").upper() == "VALUECHART5" else "VALUE CHART 5 ±8 • M1 • 5 VELAS"
 
 
 # MEGA IA 3.94.6 — RSI DIVERGENCE + BOLLINGER.
@@ -1239,7 +1240,7 @@ def _valuechart_series(rows, period=VALUECHART_PERIOD, scale=VALUECHART_SCALE):
 
 
 def value_chart_next_candle_strategy(cs, timeframe="1min", market="OPEN", engine_code="VALUECHART"):
-    """VALUE CHART 5 +/-8: fechamento confirma, próxima vela entra; expiração 1M ou 5M."""
+    """VALUE CHART 5 +/-8: fechamento confirma; VALUECHART entra em M1 e fecha após 5 velas M1."""
     engine_code = "VALUECHART5" if str(engine_code or "").upper() == "VALUECHART5" else "VALUECHART"
     expiry_seconds = _valuechart_expiry_seconds(engine_code)
     expiry_minutes = max(1, int(expiry_seconds // 60))
@@ -1265,11 +1266,19 @@ def value_chart_next_candle_strategy(cs, timeframe="1min", market="OPEN", engine
     reaction=min(1.0,abs(delta)/4.0)
     confidence=round((0.65*extremity+0.35*reaction)*100.0,1) if confirmed else 0.0
     if direction=="CALL":
-        reason=(f"CALL confirmado: Value Chart tocou/rompeu {VALUECHART_LOWER:.0f} ({prev:.2f}) e reagiu para cima ({cur:.2f}). "
-                f"Entrada na próxima vela; expiração fixa em {expiry_minutes} minuto{'s' if expiry_minutes != 1 else ''}.")
+        hold_text = (
+            "Entrada na próxima vela M1; resultado no fechamento da 5ª vela M1."
+            if engine_code == "VALUECHART"
+            else f"Entrada na próxima vela; expiração fixa em {expiry_minutes} minutos."
+        )
+        reason=(f"CALL confirmado: Value Chart tocou/rompeu {VALUECHART_LOWER:.0f} ({prev:.2f}) e reagiu para cima ({cur:.2f}). " + hold_text)
     elif direction=="PUT":
-        reason=(f"PUT confirmado: Value Chart tocou/rompeu +{VALUECHART_UPPER:.0f} ({prev:.2f}) e reagiu para baixo ({cur:.2f}). "
-                f"Entrada na próxima vela; expiração fixa em {expiry_minutes} minuto{'s' if expiry_minutes != 1 else ''}.")
+        hold_text = (
+            "Entrada na próxima vela M1; resultado no fechamento da 5ª vela M1."
+            if engine_code == "VALUECHART"
+            else f"Entrada na próxima vela; expiração fixa em {expiry_minutes} minutos."
+        )
+        reason=(f"PUT confirmado: Value Chart tocou/rompeu +{VALUECHART_UPPER:.0f} ({prev:.2f}) e reagiu para baixo ({cur:.2f}). " + hold_text)
     else:
         reason=(f"VALUE CHART monitorando • atual {cur:.2f} • anterior {prev:.2f} • zonas "
                 f"{VALUECHART_LOWER:.0f}/+{VALUECHART_UPPER:.0f}. Aguardando reação em extremo.")
@@ -14494,6 +14503,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
+    # VALUECHART (primeira opção) é um modo M1 dedicado: entra na próxima vela M1 e fecha após 5 velas M1.
+    if engine == "VALUECHART":
+        interval = "1min"
     if engine == "RSI5":
         # RSI + ADX AFIADO usa somente candles fechados e entra na abertura seguinte.
         entry_mode = "BIRTH"
@@ -14793,7 +14805,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 if not iq_state:
                     out = neutral_signal(symbol, interval, market, "VALUE CHART • IQ OPTION OFFLINE", "Conecte a IQ Option para o VALUE CHART analisar candles OTC reais.", source_state="WAITING")
                     _vc_exp=_valuechart_expiry_seconds(engine)
-                    out.update({"strategy":_valuechart_label(engine),"mode":("VALUE_CHART_20S_NEXT_CANDLE_5M" if engine=="VALUECHART5" else "VALUE_CHART_20S_NEXT_CANDLE_1M"),"selected_engine":engine,"feed_source":"IQ_OPTION_OTC","non_repaint":True,"next_candle_entry":True,"fixed_expiry_seconds":_vc_exp,"direct_win_only":True,"gale_signal":False})
+                    out.update({"strategy":_valuechart_label(engine),"mode":("VALUE_CHART_20S_NEXT_CANDLE_5M" if engine=="VALUECHART5" else "VALUE_CHART_M1_20S_HOLD_5_CANDLES"),"selected_engine":engine,"feed_source":"IQ_OPTION_OTC","non_repaint":True,"next_candle_entry":True,"fixed_expiry_seconds":_vc_exp,"direct_win_only":True,"gale_signal":False})
                     cache[key]=(time.time(),out); return out
                 raw=await iq_ea_candles(iq_state,symbol,interval,VALUECHART_HISTORY_BARS,regular_market=False)
             else:
@@ -15244,7 +15256,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_mode = "ALLCLUSTER_NEXT_CANDLE"
         elif engine in ("VALUECHART", "VALUECHART5"):
             engine_title = _valuechart_label(engine)
-            engine_mode = "VALUE_CHART_20S_NEXT_CANDLE_5M" if engine == "VALUECHART5" else "VALUE_CHART_20S_NEXT_CANDLE_1M"
+            engine_mode = "VALUE_CHART_20S_NEXT_CANDLE_5M" if engine == "VALUECHART5" else "VALUE_CHART_M1_20S_HOLD_5_CANDLES"
         elif engine == "COMBINER":
             engine_title = "COMBINER FLOW + RSI"
             engine_mode = "COMBINER_FLOW_RSI"
@@ -16189,7 +16201,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "KEYLEVELS": "SINAL KEY LEVELS LIBERADO",
                         "FERRU": "SINAL FERRU MULTI LIBERADO",
                         "ALLCLUSTER": "SINAL ALL CLUSTER LIBERADO • RATIO + TREND ALINHADOS • ENTRADA NA VELA DA SETA",
-                        "VALUECHART": "SINAL VALUE CHART LIBERADO • PRÓXIMA VELA • EXPIRAÇÃO 1 MIN",
+                        "VALUECHART": "SINAL VALUE CHART M1 LIBERADO • PRÓXIMA VELA M1 • FINALIZA NA 5ª VELA",
                         "VALUECHART5": "SINAL VALUE CHART LIBERADO • PRÓXIMA VELA • EXPIRAÇÃO 5 MIN",
                         "RSIDIVBB": "SINAL RSI DIVERGENCE + BOLLINGER LIBERADO",
                         "TMARSI": "SINAL EXTREME TMA + RSI + TREND FILTER LIBERADO",
@@ -20029,6 +20041,8 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
     requested_market = (market or "OPEN").upper()
     engine = (engine or "GRAPH_AI").upper()
     entry_mode = normalize_entry_mode(entry_mode)
+    if engine == "VALUECHART":
+        interval = "1min"
 
     if not _symbol_allowed(symbol, requested_market) or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
@@ -20752,6 +20766,8 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
+    if engine == "VALUECHART":
+        interval = "1min"
     if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "KEYLEVELS", "FERRU", "ALLCLUSTER", "VALUECHART", "VALUECHART5", "RSIDIVBB", "TMARSI", "MRULTRA", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
@@ -20962,7 +20978,7 @@ async def pre_signals(
             "KEYLEVELS": "KEY LEVELS BREAKOUT",
             "FERRU": "FERRU MULTI",
             "ALLCLUSTER": "ALL CLUSTER FILTER",
-            "VALUECHART": "VALUE CHART 5 ±8 • EXP 1M",
+            "VALUECHART": "VALUE CHART 5 ±8 • M1 • 5 VELAS",
             "VALUECHART5": "VALUE CHART 5 ±8 • EXP 5M",
             "RSIDIVBB": "RSI Divergence + Bollinger",
             "TMARSI": "Extreme TMA + RSI + Trend Filter",
@@ -23346,10 +23362,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   <div class="robot-mode-card" id="valueChartModeCard">
-    <img src="__MEGA_IMAGE__" alt="Value Chart 1 minuto">
+    <img src="__MEGA_IMAGE__" alt="Value Chart M1 5 velas">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">📊 VALUE CHART 5 ±8 • EXP 1M</div>
-      <div class="robot-mode-desc" id="valueChartModeDesc">Período 5 • zonas +8/-8 • escala ±15 • pré-alerta 20s • entrada na próxima vela • expiração fixa 1 minuto • placar por preço real de entrada/vencimento.</div>
+      <div class="robot-mode-title">📊 VALUE CHART 5 ±8 • M1 • 5 VELAS</div>
+      <div class="robot-mode-desc" id="valueChartModeDesc">Período 5 • zonas +8/-8 • escala ±15 • pré-alerta 20s • entrada na próxima vela M1 • finaliza após 5 velas M1 (5 minutos) • placar pelo preço real da entrada e fechamento da 5ª vela.</div>
     </div>
     <button id="valueChartPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -25276,7 +25292,7 @@ function momentStudyEngineName(key){
     KEYLEVELS:'🧱 KEY LEVELS BREAKOUT',
     FERRU:'🧭 FERRU MULTI',
     ALLCLUSTER:'🔀 ALL CLUSTER FILTER',
-    VALUECHART:'📊 VALUE CHART 5 ±8 • EXP 1M',
+    VALUECHART:'📊 VALUE CHART 5 ±8 • M1 • 5 VELAS',
     VALUECHART5:'📊 VALUE CHART 5 ±8 • EXP 5M',
     RSIDIVBB:'📉 RSI DIVERGENCE + BOLLINGER',
     TMARSI:'🎯 EXTREME TMA + RSI + TREND FILTER',
@@ -29577,7 +29593,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='MRULTRA'?'MR ULTRA FAST':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='KEYLEVELS'?'KEY LEVELS BREAKOUT':ek==='VALUECHART5'?'VALUE CHART 5 ±8 • EXP 5M':ek==='VALUECHART'?'VALUE CHART 5 ±8 • EXP 1M':ek==='ALLCLUSTER'?'ALL CLUSTER FILTER':ek==='FERRU'?'FERRU MULTI':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='MRULTRA'?'MR ULTRA FAST':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='KEYLEVELS'?'KEY LEVELS BREAKOUT':ek==='VALUECHART5'?'VALUE CHART 5 ±8 • EXP 5M':ek==='VALUECHART'?'VALUE CHART 5 ±8 • M1 • 5 VELAS':ek==='ALLCLUSTER'?'ALL CLUSTER FILTER':ek==='FERRU'?'FERRU MULTI':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
