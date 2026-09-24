@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.2"
-PWA_VERSION = "v168"
+APP_VERSION = "3.96.3"
+PWA_VERSION = "v169"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -2439,6 +2439,121 @@ RTM_PRICE_MIN_EDGE = max(1, min(3, int(os.getenv("RTM_PRICE_MIN_EDGE", "1"))))
 RTM_PRICE_MIN_CONSENSUS = max(55.0, min(100.0, float(os.getenv("RTM_PRICE_MIN_CONSENSUS", "66"))))
 RTM_SUPPORT_BLOCK_BONUS = max(0.0, min(10.0, float(os.getenv("RTM_SUPPORT_BLOCK_BONUS", "4"))))
 
+# MEGA IA 3.96.3 — RTM aprende o melhor gatilho por ATIVO.
+# Regra: primeiro opera livre; WIN trava aquele gatilho para o ativo; LOSS
+# destrava apenas aquele ativo e obriga a próxima tentativa a usar outro gatilho.
+RTM_INDICATOR_STATE_PATH = os.getenv(
+    "RTM_INDICATOR_STATE_PATH",
+    os.path.join(BASE_DIR, ".mega_rtm_indicator_state.json"),
+).strip()
+rtm_indicator_state: Dict[str, Dict[str, Any]] = {}
+rtm_indicator_state_lock = threading.RLock()
+
+
+def _rtm_indicator_asset_key(market: str, symbol: str) -> str:
+    compact = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
+    return f"{str(market or 'OPEN').upper()}|{compact}"
+
+
+def _rtm_indicator_state_save() -> None:
+    if not RTM_INDICATOR_STATE_PATH:
+        return
+    try:
+        with rtm_indicator_state_lock:
+            data = {k: dict(v) for k, v in rtm_indicator_state.items()}
+        tmp = RTM_INDICATOR_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, RTM_INDICATOR_STATE_PATH)
+    except Exception as exc:
+        print(f"[RTM ADAPTATIVO] falha ao salvar estado: {str(exc)[:160]}", flush=True)
+
+
+def _rtm_indicator_state_load() -> None:
+    if not RTM_INDICATOR_STATE_PATH or not os.path.exists(RTM_INDICATOR_STATE_PATH):
+        return
+    try:
+        with open(RTM_INDICATOR_STATE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return
+        with rtm_indicator_state_lock:
+            rtm_indicator_state.clear()
+            for key, value in data.items():
+                if isinstance(value, dict):
+                    rtm_indicator_state[str(key)] = dict(value)
+    except Exception as exc:
+        print(f"[RTM ADAPTATIVO] falha ao carregar estado: {str(exc)[:160]}", flush=True)
+
+
+def _rtm_indicator_snapshot(market: str, symbol: str) -> Dict[str, Any]:
+    key = _rtm_indicator_asset_key(market, symbol)
+    with rtm_indicator_state_lock:
+        state = dict(rtm_indicator_state.get(key) or {})
+    return {
+        "asset_key": key,
+        "locked_indicator": str(state.get("locked_indicator") or "").upper(),
+        "avoid_indicator": str(state.get("avoid_indicator") or "").upper(),
+        "last_indicator": str(state.get("last_indicator") or "").upper(),
+        "last_result": str(state.get("last_result") or "").upper(),
+        "wins": int(state.get("wins") or 0),
+        "losses": int(state.get("losses") or 0),
+        "consecutive_wins": int(state.get("consecutive_wins") or 0),
+        "switches": int(state.get("switches") or 0),
+        "updated_at": state.get("updated_at"),
+    }
+
+
+def _rtm_indicator_apply_result(market: str, symbol: str, trigger_indicator: Any, result_label: str, operation_key: str = "") -> Dict[str, Any]:
+    """Atualiza o indicador campeão apenas com WIN/LOSS direto da RTM.
+
+    WIN  -> trava o gatilho vencedor para esse ativo.
+    LOSS -> libera o ativo para procurar outro gatilho e evita repetir
+            imediatamente o gatilho que acabou de perder.
+    """
+    trigger = str(trigger_indicator or "").strip().upper()
+    result = str(result_label or "").strip().upper()
+    if not trigger or result not in ("WIN", "LOSS"):
+        return _rtm_indicator_snapshot(market, symbol)
+    key = _rtm_indicator_asset_key(market, symbol)
+    operation_key = str(operation_key or "").strip()
+    with rtm_indicator_state_lock:
+        old = dict(rtm_indicator_state.get(key) or {})
+        if operation_key and str(old.get("last_operation_key") or "") == operation_key:
+            return _rtm_indicator_snapshot(market, symbol)
+        previous_locked = str(old.get("locked_indicator") or "").upper()
+        if result == "WIN":
+            consecutive = int(old.get("consecutive_wins") or 0) + 1 if previous_locked == trigger else 1
+            old["locked_indicator"] = trigger
+            old["avoid_indicator"] = ""
+            old["wins"] = int(old.get("wins") or 0) + 1
+            old["consecutive_wins"] = consecutive
+            old["mode"] = "LOCKED_AFTER_WIN"
+        else:
+            old["locked_indicator"] = ""
+            old["avoid_indicator"] = trigger
+            old["losses"] = int(old.get("losses") or 0) + 1
+            old["consecutive_wins"] = 0
+            old["switches"] = int(old.get("switches") or 0) + 1
+            old["mode"] = "SEARCH_AFTER_LOSS"
+        old["last_indicator"] = trigger
+        old["last_result"] = result
+        if operation_key:
+            old["last_operation_key"] = operation_key
+        old["updated_at"] = iso(now())
+        rtm_indicator_state[key] = old
+    _rtm_indicator_state_save()
+    snap = _rtm_indicator_snapshot(market, symbol)
+    print(
+        f"[RTM ADAPTATIVO] {symbol} {result} {trigger} -> "
+        f"lock={snap.get('locked_indicator') or '-'} avoid={snap.get('avoid_indicator') or '-'}",
+        flush=True,
+    )
+    return snap
+
+
+_rtm_indicator_state_load()
+
 
 def _rtm_num(row, key, default=0.0):
     try:
@@ -2593,7 +2708,7 @@ def _rtm_block_result(key, label, bucket, min_votes, min_edge, min_consensus):
     }
 
 
-def _rtm_vote_strategy(rows, timeframe="1min", market="OPEN", early_signal=False):
+def _rtm_vote_strategy(rows, timeframe="1min", market="OPEN", early_signal=False, symbol=""):
     """RTM MULTI INDIVIDUAL: cada detector pode liberar sinal sozinho.
 
     Sem votação global e sem dependência de blocos. Os detectores usam gatilhos
@@ -2739,7 +2854,55 @@ def _rtm_vote_strategy(rows, timeframe="1min", market="OPEN", early_signal=False
                 "early_signal_window":bool(early_signal),"next_candle_entry":True,"gale_signal":False,
                 "non_repaint_after_release":True}
 
-    # Nao ha votacao nem confluencia: o gatilho individual de maior prioridade vence.
+    # MEGA IA 3.96.3 — seleção adaptativa POR ATIVO.
+    # Depois de um WIN, só o indicador campeão daquele ativo pode liberar novo
+    # sinal. Depois de um LOSS, o indicador perdedor é ignorado até que outro
+    # gatilho assuma o ativo. Outros pares mantêm seus próprios campeões.
+    adaptive = _rtm_indicator_snapshot(market, symbol) if symbol else {
+        "locked_indicator":"", "avoid_indicator":"", "last_result":"",
+        "wins":0, "losses":0, "consecutive_wins":0, "switches":0,
+    }
+    locked_indicator = str(adaptive.get("locked_indicator") or "").upper()
+    avoid_indicator = str(adaptive.get("avoid_indicator") or "").upper()
+    all_candidates = list(candidates)
+
+    if locked_indicator:
+        locked_candidates = [x for x in candidates if str(x.get("tag") or "").upper() == locked_indicator]
+        if not locked_candidates:
+            return {
+                "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"LOW",
+                "strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDIVIDUAL_TRIGGERS",
+                "reason":f"RTM ADAPTATIVO • {symbol or 'ATIVO'} travado em {locked_indicator} após WIN; aguardando esse gatilho disparar novamente.",
+                "detectors":[],"detectors_total":30,"independent_indicators":True,
+                "history_required":60,"history_available":len(data),
+                "detectors_triggered":all_candidates,"early_signal_window":bool(early_signal),
+                "next_candle_entry":True,"gale_signal":False,"non_repaint_after_release":True,
+                "rtm_indicator_mode":"LOCKED_WINNER","rtm_locked_indicator":locked_indicator,
+                "rtm_avoid_indicator":"","rtm_asset_wins":adaptive.get("wins",0),
+                "rtm_asset_losses":adaptive.get("losses",0),
+                "rtm_consecutive_wins":adaptive.get("consecutive_wins",0),
+            }
+        candidates = locked_candidates
+    elif avoid_indicator:
+        switched = [x for x in candidates if str(x.get("tag") or "").upper() != avoid_indicator]
+        if not switched:
+            return {
+                "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
+                "strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDIVIDUAL_TRIGGERS",
+                "reason":f"RTM ADAPTATIVO • {symbol or 'ATIVO'} perdeu com {avoid_indicator}; aguardando um indicador diferente para fazer a troca automática.",
+                "detectors":[],"detectors_total":30,"independent_indicators":True,
+                "history_required":60,"history_available":len(data),
+                "detectors_triggered":all_candidates,"early_signal_window":bool(early_signal),
+                "next_candle_entry":True,"gale_signal":False,"non_repaint_after_release":True,
+                "rtm_indicator_mode":"SEARCH_AFTER_LOSS","rtm_locked_indicator":"",
+                "rtm_avoid_indicator":avoid_indicator,"rtm_asset_wins":adaptive.get("wins",0),
+                "rtm_asset_losses":adaptive.get("losses",0),
+                "rtm_consecutive_wins":0,
+            }
+        candidates = switched
+
+    # Não há votação nem confluência: dentro da regra adaptativa, vence o
+    # gatilho individual de maior prioridade/força.
     candidates.sort(key=lambda x:x["score"], reverse=True)
     best=candidates[0]
     direction=best["direction"]
@@ -2747,16 +2910,26 @@ def _rtm_vote_strategy(rows, timeframe="1min", market="OPEN", early_signal=False
     opposite=[x for x in candidates if x["direction"]!=direction]
     confidence=float(best["score"])
     risk="LOW" if confidence>=86 else "MEDIUM"
-    reason=(f"RTM INDIVIDUAL {direction}: {best['tag']} liberou sozinho ({confidence:.0f}). "
-            f"{best['reason']}. Sem bloco e sem confluencia obrigatoria.")
+    mode = "LOCKED_WINNER" if locked_indicator else ("SWITCH_AFTER_LOSS" if avoid_indicator else "DISCOVERY")
+    if locked_indicator:
+        adaptive_text=f"{symbol or 'ATIVO'} mantém {best['tag']} porque esse indicador está ganhando neste ativo"
+    elif avoid_indicator:
+        adaptive_text=f"{symbol or 'ATIVO'} trocou {avoid_indicator} por {best['tag']} após LOSS"
+    else:
+        adaptive_text=f"{symbol or 'ATIVO'} ainda está descobrindo o indicador vencedor"
+    reason=(f"RTM ADAPTATIVO {direction}: {best['tag']} liberou ({confidence:.0f}). "
+            f"{adaptive_text}. {best['reason']}.")
     return {"available":True,"direction":direction,"raw_direction":direction,"confidence":round(confidence,1),
             "confirmed":True,"risk":risk,"strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDIVIDUAL_TRIGGERS",
             "reason":reason[:520],"independent_indicators":True,"trigger_indicator":best["tag"],
             "trigger_score":round(confidence,1),"simultaneous_same_side":[x["tag"] for x in same_time[1:]],
             "simultaneous_opposite":[x["tag"] for x in opposite],"detectors_total":30,"history_required":60,"history_available":len(data),
-            "detectors_triggered":candidates,"early_signal_window":bool(early_signal),
+            "detectors_triggered":all_candidates,"early_signal_window":bool(early_signal),
             "next_candle_entry":True,"direct_win_only":True,"gale_signal":False,
-            "non_repaint_after_release":True}
+            "non_repaint_after_release":True,"rtm_indicator_mode":mode,
+            "rtm_locked_indicator":locked_indicator,"rtm_avoid_indicator":avoid_indicator,
+            "rtm_asset_wins":adaptive.get("wins",0),"rtm_asset_losses":adaptive.get("losses",0),
+            "rtm_consecutive_wins":adaptive.get("consecutive_wins",0)}
 
 def _candle_time_candidates(value: str):
     """
@@ -15560,11 +15733,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 rtm_seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
                 rtm_early_window=(RTM_EARLY_MIN_REMAINING <= rtm_seconds_to_entry <= RTM_PREALERT_SECONDS)
                 if rtm_early_window:
-                    analysis=_rtm_vote_strategy(raw[-RTM_INTERNAL_HISTORY_BARS:],interval,market=market,early_signal=True)
+                    analysis=_rtm_vote_strategy(raw[-RTM_INTERNAL_HISTORY_BARS:],interval,market=market,early_signal=True,symbol=symbol)
                     analysis["early_signal_window"]=True
                     analysis["seconds_to_entry_snapshot"]=round(rtm_seconds_to_entry,1)
                 else:
-                    analysis=_rtm_vote_strategy(engine_closed,interval,market=market,early_signal=False)
+                    analysis=_rtm_vote_strategy(engine_closed,interval,market=market,early_signal=False,symbol=symbol)
                     if analysis.get("confirmed"):
                         analysis["preview_direction"]=analysis.get("direction")
                         analysis["preview_confidence"]=analysis.get("confidence")
@@ -16350,6 +16523,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     base["rtm_individual"] = {"detectors":30,"one_detector_can_release":True,"voting":False,"required_confluence":False,"trigger_indicator":analysis.get("trigger_indicator"),"trigger_score":analysis.get("trigger_score"),"adx_min":RTM_MIN_ADX,"breakout_lookback":RTM_BREAKOUT_LOOKBACK,"body_atr":RTM_MIN_BODY_ATR}
                     base["trigger_indicator"] = analysis.get("trigger_indicator")
                     base["trigger_score"] = analysis.get("trigger_score")
+                    base["rtm_indicator_mode"] = analysis.get("rtm_indicator_mode") or "DISCOVERY"
+                    base["rtm_locked_indicator"] = analysis.get("rtm_locked_indicator") or ""
+                    base["rtm_avoid_indicator"] = analysis.get("rtm_avoid_indicator") or ""
+                    base["rtm_asset_wins"] = int(analysis.get("rtm_asset_wins") or 0)
+                    base["rtm_asset_losses"] = int(analysis.get("rtm_asset_losses") or 0)
+                    base["rtm_consecutive_wins"] = int(analysis.get("rtm_consecutive_wins") or 0)
                 if engine == "BLACKBOOK":
                     base["non_repaint_after_release"] = True
                     base["signal_snapshot"] = "LAST_CLOSED_CANDLE"
@@ -19562,6 +19741,10 @@ def _background_accounting_finish(trade: Dict[str, Any], result_label: str, cand
         "background": True,
     }
     pending.pop(key, None)
+    if str(item.get("engine") or "").upper() == "RTM" and result_label in ("WIN", "LOSS"):
+        _rtm_indicator_apply_result(
+            market, str(item.get("symbol") or ""), item.get("trigger_indicator"), result_label, key
+        )
 
 
 async def _background_send_signal(payload: Dict[str, Any]) -> None:
@@ -22469,6 +22652,10 @@ async def _settle_accounting_pending(request: Request, market: str):
                 "settled_at": iso(now()),
             }
             pending.pop(key, None)
+            if str(t.get("engine") or "").upper() == "RTM" and result_value in ("WIN", "LOSS"):
+                _rtm_indicator_apply_result(
+                    market, str(t.get("symbol") or ""), t.get("trigger_indicator"), result_value, key
+                )
         except Exception:
             # Mantém pendente para tentar novamente no próximo ciclo.
             continue
@@ -22966,8 +23153,10 @@ async def result(
                 "expiry_time": expiry_time,
             }
             acc_key = _accounting_key(acc_item)
+            pending_meta = dict((pending_acc or {}).get(acc_key) or {})
             direct_value = "DRAW" if entry_result == "DRAW" else ("WIN" if entry_result == "WIN" else "LOSS")
             done_acc[acc_key] = {
+                **pending_meta,
                 **acc_item,
                 "result": direct_value,
                 "final_result": final_result,
@@ -22975,6 +23164,10 @@ async def result(
             }
             if pending_acc is not None:
                 pending_acc.pop(acc_key, None)
+            if engine == "RTM" and direct_value in ("WIN", "LOSS"):
+                _rtm_indicator_apply_result(
+                    market, symbol, pending_meta.get("trigger_indicator"), direct_value, acc_key
+                )
 
         print(
             f"[RESULTADO] {symbol} {interval} {direction} -> {final_result} "
