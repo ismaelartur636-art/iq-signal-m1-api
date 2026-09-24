@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.1"
+APP_VERSION = "3.96.2"
 PWA_VERSION = "v168"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -16342,6 +16342,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     base["early_signal_locked"] = True
                     base["non_repaint_after_release"] = True
                     base["signal_snapshot"] = "FORMING_CANDLE_AT_20S_INDIVIDUAL"
+                    base["direct_win_only"] = True
+                    base["gale_signal"] = False
+                    base["rtm_recovery_mode"] = "NEXT_RTM_SIGNAL"
+                    base["rtm_gale1"] = False
+                    base["rtm_gale2"] = False
                     base["rtm_individual"] = {"detectors":30,"one_detector_can_release":True,"voting":False,"required_confluence":False,"trigger_indicator":analysis.get("trigger_indicator"),"trigger_score":analysis.get("trigger_score"),"adx_min":RTM_MIN_ADX,"breakout_lookback":RTM_BREAKOUT_LOOKBACK,"body_atr":RTM_MIN_BODY_ATR}
                     base["trigger_indicator"] = analysis.get("trigger_indicator")
                     base["trigger_score"] = analysis.get("trigger_score")
@@ -22701,6 +22706,13 @@ async def result(
     market = (market or "OPEN").upper()
     direction = (direction or "CALL").upper()
     engine = str(engine or "").upper()
+
+    # MEGA IA 3.96.2 — regra EXCLUSIVA da RTM:
+    # nunca acompanha G1/G2. Um LOSS encerra a operação atual e a recuperação
+    # financeira, quando houver AUTO ENTRADA, fica somente para o próximo sinal RTM.
+    if engine == "RTM":
+        direct_only = True
+
     # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
     ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK")
@@ -24397,6 +24409,59 @@ let autoTradeEnabled=false;
 let autoOrderBusy=false;
 const autoExecutedKeys=new Set();
 const autoGaleRuns=new Set();
+const rtmRecoveryRuns=new Set();
+const RTM_RECOVERY_KEY='mega_rtm_next_signal_recovery_v1';
+let rtmRecoveryState={baseAmount:0,nextAmount:0,lossStreak:0,lastResult:''};
+
+function loadRtmRecoveryState(){
+  try{
+    const raw=localStorage.getItem(RTM_RECOVERY_KEY);
+    if(raw){
+      const x=JSON.parse(raw)||{};
+      rtmRecoveryState={
+        baseAmount:Math.max(0,Number(x.baseAmount||0)),
+        nextAmount:Math.max(0,Number(x.nextAmount||0)),
+        lossStreak:Math.max(0,Number(x.lossStreak||0)),
+        lastResult:String(x.lastResult||'')
+      };
+    }
+  }catch(_){ }
+}
+
+function saveRtmRecoveryState(){
+  try{ localStorage.setItem(RTM_RECOVERY_KEY,JSON.stringify(rtmRecoveryState)); }catch(_){ }
+}
+
+function rtmRecoveryAmount(baseAmount){
+  const base=Math.max(1,Math.min(1000,Number(baseAmount||1)));
+  if(!Number.isFinite(rtmRecoveryState.baseAmount) || Math.abs(Number(rtmRecoveryState.baseAmount||0)-base)>0.0001){
+    rtmRecoveryState={baseAmount:base,nextAmount:base,lossStreak:0,lastResult:''};
+    saveRtmRecoveryState();
+  }
+  const next=Math.max(base,Number(rtmRecoveryState.nextAmount||base));
+  return Math.max(1,Math.min(1000,Number(next.toFixed(2))));
+}
+
+function finishRtmRecovery(outcome,usedAmount,baseAmount){
+  const r=String(outcome||'').toUpperCase();
+  const base=Math.max(1,Math.min(1000,Number(baseAmount||1)));
+  const used=Math.max(1,Math.min(1000,Number(usedAmount||base)));
+  rtmRecoveryState.baseAmount=base;
+  rtmRecoveryState.lastResult=r;
+  if(r==='WIN'){
+    rtmRecoveryState.lossStreak=0;
+    rtmRecoveryState.nextAmount=base;
+  }else if(r==='LOSS'){
+    rtmRecoveryState.lossStreak=Math.max(0,Number(rtmRecoveryState.lossStreak||0))+1;
+    rtmRecoveryState.nextAmount=Math.max(1,Math.min(1000,Number((used*2).toFixed(2))));
+  }else if(r==='DRAW'){
+    // Empate não cria novo LOSS e mantém a recuperação pendente no mesmo valor.
+    rtmRecoveryState.nextAmount=used;
+  }
+  saveRtmRecoveryState();
+}
+
+loadRtmRecoveryState();
 const TELEGRAM_ENABLED_KEY='mega_telegram_enabled_v1';
 const TELEGRAM_CHAT_ID_KEY='mega_telegram_chat_id_v1';
 const TELEGRAM_LAST_SIGNAL_KEY='mega_telegram_last_signal_v1';
@@ -26254,6 +26319,23 @@ async function monitorAutoGale(sig, baseOrder, baseAmount, maxGale, multiplier, 
   }
 }
 
+async function monitorRtmNextSignalRecovery(sig, baseOrder, usedAmount, baseAmount, runKey){
+  try{
+    const outcome=await waitAutoOrderOutcome(baseOrder&&baseOrder.order_id, sig, sig.entry_time);
+    if(!outcome) return;
+    finishRtmRecovery(outcome,usedAmount,baseAmount);
+    if(outcome==='WIN'){
+      renderAutoTradeState('✅ RTM WIN • recuperação encerrada • próximo sinal volta para '+Number(baseAmount).toFixed(2)+'.');
+    }else if(outcome==='LOSS'){
+      renderAutoTradeState('❌ RTM LOSS • sem Gale • recuperação somente no próximo sinal RTM: '+Number(rtmRecoveryState.nextAmount).toFixed(2)+'.');
+    }else if(outcome==='DRAW'){
+      renderAutoTradeState('⚪ RTM EMPATE • sem Gale • mantém o valor para o próximo sinal RTM.');
+    }
+  }finally{
+    rtmRecoveryRuns.delete(runKey);
+  }
+}
+
 async function executeAutoTrade(sig){
   if(!autoTradeEnabled || autoOrderBusy) return;
   if(!brokerConnected.IQ_OPTION) return disableAutoTrade('🔴 IQ Option desconectada • AUTO DEMO desligada.');
@@ -26272,7 +26354,9 @@ async function executeAutoTrade(sig){
 
   try{
     const cfg=autoTradeSettings();
-    const amount=cfg.amount;
+    const engineKey=String(sig.selected_engine||sig.engine||sig.mode||'').toUpperCase();
+    const isRtm=(engineKey==='RTM'||engineKey.includes('RTM'));
+    const amount=isRtm ? rtmRecoveryAmount(cfg.amount) : cfg.amount;
     const d=await post('/iq-auto-order',{
       symbol:sig.symbol||S.value,
       interval:sig.interval||interval.value,
@@ -26285,11 +26369,18 @@ async function executeAutoTrade(sig){
     if(!d || d.ok!==true || d.status!=='PLACED') throw Error((d&&d.message)||'A IQ não confirmou a ordem.');
     const ativo=d.active||sig.symbol||S.value;
     const route=d.order_type?(' • '+d.order_type):'';
-    const galeTxt=cfg.gale===0?'sem Gale':('até G'+cfg.gale);
+    const galeTxt=isRtm ? 'RTM sem Gale • recuperação no próximo sinal' : (cfg.gale===0?'sem Gale':('até G'+cfg.gale));
     renderAutoTradeState('✅ ENTRADA DEMO ENVIADA'+route+' • '+ativo+' • '+sig.direction+' • valor '+amount.toFixed(2)+' • '+galeTxt);
     if(voiceEnabled) speak('Ordem demo enviada. '+(sig.direction==='CALL'?'Compra':'Venda')+'.');
 
-    if(cfg.gale>0 && !autoGaleRuns.has(key)){
+    if(isRtm){
+      // Exclusivo da RTM: nunca abre G1/G2 na mesma operação.
+      // O LOSS apenas prepara um valor maior para o PRÓXIMO sinal confirmado da RTM.
+      if(!rtmRecoveryRuns.has(key)){
+        rtmRecoveryRuns.add(key);
+        monitorRtmNextSignalRecovery(sig,d,amount,cfg.amount,key);
+      }
+    }else if(cfg.gale>0 && !autoGaleRuns.has(key)){
       autoGaleRuns.add(key);
       monitorAutoGale(sig,d,amount,cfg.gale,cfg.multiplier,key);
     }
