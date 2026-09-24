@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.95.9"
+APP_VERSION = "3.96.1"
 PWA_VERSION = "v168"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -1388,6 +1388,17 @@ SYMBOLS = [
 ]
 OTC_SYMBOLS = [s for s in SYMBOLS if s != BINOMO_CRYPTO_IDX_SYMBOL]
 
+# MEGA IA 3.96.1 — universo exclusivo da RTM.
+# A RTM só pode operar BTC/USD ou pares cujo nome contenha JPY.
+# A lista abaixo alimenta a varredura automática; a validação por regra também
+# aceita qualquer outro par JPY dinâmico que a fonte/cTrader disponibilizar.
+RTM_BTC_SYMBOL = "BTC/USD"
+RTM_JPY_SCAN_SYMBOLS = (
+    "USD/JPY", "EUR/JPY", "GBP/JPY", "AUD/JPY",
+    "CAD/JPY", "CHF/JPY", "NZD/JPY",
+)
+RTM_DEFAULT_SCAN_SYMBOLS = (RTM_BTC_SYMBOL,) + RTM_JPY_SCAN_SYMBOLS
+
 # MEGA IA 3.72 — robô de sinais em segundo plano com motor travado por ação explícita.
 # O navegador deixa de ser responsável por manter a análise viva: o servidor
 # varre um ativo por ciclo, envia CALL/PUT pelo Telegram e fecha WIN/LOSS.
@@ -1476,6 +1487,31 @@ def _symbol_allowed(symbol: str, market: str = "OPEN") -> bool:
     if not (1 <= len(sym) <= 64):
         return False
     return bool(re.fullmatch(r"[A-Z0-9][A-Z0-9 ._/#&+():-]{0,63}", sym))
+
+
+def _rtm_symbol_allowed(symbol: str) -> bool:
+    """RTM: somente BTC/USD e qualquer par que contenha JPY."""
+    compact = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
+    return compact == "BTCUSD" or "JPY" in compact
+
+
+def _rtm_scan_symbols(market: str = "OPEN", configured=None) -> list[str]:
+    """Lista automática da RTM, respeitando mercado e seleção opcional."""
+    market = str(market or "OPEN").upper()
+    source = list(configured or RTM_DEFAULT_SCAN_SYMBOLS)
+    out = []
+    seen = set()
+    for raw in source:
+        sym = str(raw or "").strip().upper()
+        if not sym or sym in seen:
+            continue
+        if not _rtm_symbol_allowed(sym):
+            continue
+        if not _symbol_allowed(sym, market):
+            continue
+        seen.add(sym)
+        out.append(sym)
+    return out
 
 
 def _ctrader_canonical_symbol_name(raw_name: str) -> str:
@@ -14695,6 +14731,20 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         engine = "GRAPH_AI"
     if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM"):
         engine = "GRAPH_AI"
+    if engine == "RTM" and not _rtm_symbol_allowed(symbol):
+        out = neutral_signal(
+            symbol, interval, market,
+            "RTM • ATIVO BLOQUEADO",
+            "A RTM opera somente BTC/USD e pares que contenham JPY.",
+            source_state="READY",
+        )
+        out.update({
+            "selected_engine": "RTM",
+            "strategy": "RTM MULTI • BTC/USD + JPY",
+            "rtm_symbol_restricted": True,
+            "rtm_allowed_rule": "BTC/USD_OR_JPY",
+        })
+        return out
     if engine == "RTM":
         # Se o MT4 enviou um sinal fresco, ele tem prioridade. Sem bridge, o motor
         # interno continua analisando normalmente pelos candles do próprio app.
@@ -16293,6 +16343,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     base["non_repaint_after_release"] = True
                     base["signal_snapshot"] = "FORMING_CANDLE_AT_20S_INDIVIDUAL"
                     base["rtm_individual"] = {"detectors":30,"one_detector_can_release":True,"voting":False,"required_confluence":False,"trigger_indicator":analysis.get("trigger_indicator"),"trigger_score":analysis.get("trigger_score"),"adx_min":RTM_MIN_ADX,"breakout_lookback":RTM_BREAKOUT_LOOKBACK,"body_atr":RTM_MIN_BODY_ATR}
+                    base["trigger_indicator"] = analysis.get("trigger_indicator")
+                    base["trigger_score"] = analysis.get("trigger_score")
                 if engine == "BLACKBOOK":
                     base["non_repaint_after_release"] = True
                     base["signal_snapshot"] = "LAST_CLOSED_CANDLE"
@@ -19358,8 +19410,11 @@ def _background_load_state() -> None:
         if interval not in INTERVALS:
             interval = "1min"
         raw_symbols = data.get("symbols") if isinstance(data.get("symbols"), list) else []
-        allowed = SYMBOLS if market == "OPEN" else OTC_SYMBOLS
-        symbols = [str(x).upper() for x in raw_symbols if str(x).upper() in allowed]
+        if engine == "RTM":
+            symbols = _rtm_scan_symbols(market, [str(x).upper() for x in raw_symbols]) if raw_symbols else []
+        else:
+            allowed = SYMBOLS if market == "OPEN" else OTC_SYMBOLS
+            symbols = [str(x).upper() for x in raw_symbols if str(x).upper() in allowed]
         background_bot_state.update({
             "enabled": False if invalid_saved_engine else bool(data.get("enabled", BACKGROUND_DEFAULT_ENABLED)),
             # Arquivos de estado antigos não tinham essa chave: nesse caso OFF.
@@ -19404,6 +19459,9 @@ def _background_symbols_for_state() -> list[str]:
     market = str(background_bot_state.get("market") or "OPEN").upper()
     engine = str(background_bot_state.get("engine") or "ALPHAX").upper()
     configured = [str(x).upper() for x in (background_bot_state.get("symbols") or [])]
+    if engine == "RTM":
+        # RTM nunca sai de BTC/USD + universo JPY, inclusive no robô 24h.
+        return _rtm_scan_symbols(market, configured if configured else None)
     base = list(SYMBOLS if market == "OPEN" else OTC_SYMBOLS)
     if configured:
         base = [x for x in base if x in configured]
@@ -19429,6 +19487,8 @@ def _background_accounting_remember(payload: Dict[str, Any], iq_state: Dict[str,
     if direction not in ("CALL", "PUT"):
         return
     market = str(payload.get("market") or "OPEN").upper()
+    rtm_meta = payload.get("rtm_individual") if isinstance(payload.get("rtm_individual"), dict) else {}
+    engine_name = str(payload.get("selected_engine") or payload.get("engine") or payload.get("mode") or "").upper()
     item = {
         "market": market,
         "symbol": payload.get("symbol"),
@@ -19437,6 +19497,13 @@ def _background_accounting_remember(payload: Dict[str, Any], iq_state: Dict[str,
         "entry_time": payload.get("entry_time"),
         "expiry_time": payload.get("expiry_time"),
         "source": payload.get("strategy") or "BACKGROUND",
+        "strategy": payload.get("strategy") or "BACKGROUND",
+        "engine": payload.get("selected_engine") or payload.get("engine") or payload.get("mode") or "",
+        "confidence": float(payload.get("confidence") or 0.0),
+        "risk": str(payload.get("risk") or ""),
+        "direct_only": bool(payload.get("direct_only", False) or payload.get("direct_win_only", False) or engine_name == "RTM"),
+        "trigger_indicator": payload.get("trigger_indicator") or rtm_meta.get("trigger_indicator"),
+        "trigger_score": payload.get("trigger_score") if payload.get("trigger_score") is not None else rtm_meta.get("trigger_score"),
     }
     key = _accounting_key(item)
     if not key:
@@ -19462,6 +19529,14 @@ def _background_accounting_finish(trade: Dict[str, Any], result_label: str, cand
         "direction": trade.get("direction"),
         "entry_time": trade.get("entry_time"),
         "expiry_time": trade.get("expiry_time"),
+        "source": trade.get("source") or trade.get("strategy") or "BACKGROUND",
+        "strategy": trade.get("strategy") or trade.get("source") or "BACKGROUND",
+        "engine": trade.get("engine") or "",
+        "confidence": float(trade.get("confidence") or 0.0),
+        "risk": str(trade.get("risk") or ""),
+        "direct_only": bool(trade.get("direct_only", False) or str(trade.get("engine") or "").upper() == "RTM"),
+        "trigger_indicator": trade.get("trigger_indicator"),
+        "trigger_score": trade.get("trigger_score"),
     }
     key = _accounting_key(item)
     if not key:
@@ -19717,6 +19792,9 @@ async def _background_bot_loop() -> None:
                             "confidence": float(payload.get("confidence") or 0.0),
                             "risk": str(payload.get("risk") or "--"),
                             "strategy": str(payload.get("strategy") or engine),
+                            "direct_only": bool(payload.get("direct_only", False) or payload.get("direct_win_only", False) or engine == "RTM"),
+                            "trigger_indicator": payload.get("trigger_indicator") or ((payload.get("rtm_individual") or {}).get("trigger_indicator") if isinstance(payload.get("rtm_individual"), dict) else None),
+                            "trigger_score": payload.get("trigger_score") if payload.get("trigger_score") is not None else (((payload.get("rtm_individual") or {}).get("trigger_score")) if isinstance(payload.get("rtm_individual"), dict) else None),
                             "telegram_notify": True,
                             "entry_time": payload.get("entry_time"),
                             "expiry_time": payload.get("expiry_time"),
@@ -19773,12 +19851,15 @@ async def background_bot_set_state(body: BackgroundBotStateBody):
     if interval not in INTERVALS:
         raise HTTPException(400, "Intervalo de segundo plano inválido.")
 
-    allowed = SYMBOLS if market == "OPEN" else OTC_SYMBOLS
     symbols = []
-    for raw in body.symbols or []:
-        sym = str(raw or "").upper().strip()
-        if sym in allowed and sym not in symbols:
-            symbols.append(sym)
+    if requested_engine == "RTM":
+        symbols = _rtm_scan_symbols(market, [str(x or "").upper().strip() for x in (body.symbols or [])]) if body.symbols else []
+    else:
+        allowed = SYMBOLS if market == "OPEN" else OTC_SYMBOLS
+        for raw in body.symbols or []:
+            sym = str(raw or "").upper().strip()
+            if sym in allowed and sym not in symbols:
+                symbols.append(sym)
 
     async with background_bot_lock:
         chat = str(body.chat_id or "").strip()
@@ -20850,7 +20931,7 @@ async def pre_signals(
     if engine == "RTM":
         return {
             "ok": True,
-            "message": f"RTM MULTI INDIVIDUAL: cada gatilho pode liberar CALL/PUT sozinho nos últimos {RTM_PREALERT_SECONDS}s; sem votação por blocos e sem confluência obrigatória. O MT4 é opcional.",
+            "message": f"RTM MULTI INDIVIDUAL: somente BTC/USD e pares JPY; cada gatilho pode liberar CALL/PUT sozinho nos últimos {RTM_PREALERT_SECONDS}s; sem votação por blocos e sem confluência obrigatória. O MT4 é opcional.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -21586,7 +21667,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Motor inválido.")
 
     if engine == "RTM":
-        scan = [symbol] if symbol else list(SYMBOLS if market == "OPEN" else OTC_SYMBOLS)
+        # Radar exclusivo: BTC/USD + pares JPY. Um símbolo manual fora da regra
+        # aparece bloqueado pelo próprio signal(), mas nunca entra na varredura automática.
+        scan = [symbol] if symbol else _rtm_scan_symbols(market)
         out = []
         iq_rtm = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
         for sym in scan:
@@ -22312,6 +22395,8 @@ def _remember_accounting_signal(request: Request, payload: Dict[str, Any]):
     pending, done = _accounting_buckets(request, market)
     if pending is None or done is None:
         return
+    rtm_meta = payload.get("rtm_individual") if isinstance(payload.get("rtm_individual"), dict) else {}
+    engine_name = str(payload.get("selected_engine") or payload.get("engine") or payload.get("mode") or "").upper()
     item = {
         "market": market,
         "symbol": payload.get("symbol"),
@@ -22321,11 +22406,13 @@ def _remember_accounting_signal(request: Request, payload: Dict[str, Any]):
         "expiry_time": payload.get("expiry_time"),
         "source": payload.get("source") or payload.get("strategy") or "SIGNAL",
         "strategy": payload.get("strategy") or payload.get("source") or "SIGNAL",
-        "engine": payload.get("engine") or payload.get("mode") or "",
+        "engine": payload.get("selected_engine") or payload.get("engine") or payload.get("mode") or "",
         "confidence": float(payload.get("confidence") or 0.0),
         "risk": str(payload.get("risk") or ""),
-        "direct_only": bool(payload.get("direct_only", False)),
+        "direct_only": bool(payload.get("direct_only", False) or payload.get("direct_win_only", False) or engine_name == "RTM"),
         "external_ai": bool(payload.get("external_ai", False)),
+        "trigger_indicator": payload.get("trigger_indicator") or rtm_meta.get("trigger_indicator"),
+        "trigger_score": payload.get("trigger_score") if payload.get("trigger_score") is not None else rtm_meta.get("trigger_score"),
     }
     key = _accounting_key(item)
     if key and key not in done and key not in pending:
@@ -23182,7 +23269,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="RTM Multi EA">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🤖 RTM MULTI INDIVIDUAL</div>
-      <div class="robot-mode-desc" id="rtmModeDesc">30 gatilhos individuais • cada indicador/padrão pode liberar sozinho • sem votação por blocos • sem confluência obrigatória • pré-alerta 20s.</div>
+      <div class="robot-mode-desc" id="rtmModeDesc">30 gatilhos individuais • somente BTC/USD + pares JPY • cada indicador/padrão pode liberar sozinho • sem votação por blocos • sem confluência obrigatória • pré-alerta 20s.</div>
     </div>
     <button id="rtmPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -24198,7 +24285,7 @@ async function syncBackgroundBotState(opts={}){
     engine:(explicitEngine==='OFF'?'ALPHAX':explicitEngine),
     market:String((market && market.value)||'OPEN'),
     interval:String((interval && interval.value)||'1min'),
-    symbols:(btcOnlyEnabled ? ['BTC/USD'] : []),
+    symbols:(explicitEngine==='RTM' ? [] : (btcOnlyEnabled ? ['BTC/USD'] : [])),
     chat_id:chat||null,
     action:action,
     telegram_enabled:(action==='TELEGRAM_TOGGLE' ? !!telegramEnabled : null),
@@ -24394,6 +24481,7 @@ const syms=[
   'EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF',
   'NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD','CRYPTO IDX'
 ];
+const rtmSeedSyms=['BTC/USD','USD/JPY','EUR/JPY','GBP/JPY','AUD/JPY','CAD/JPY','CHF/JPY','NZD/JPY'];
 
 const S=document.getElementById('symbol');
 
@@ -24842,6 +24930,11 @@ function renderHistoryAnalysis(items){
   const g1=items.filter(x=>String(x.result||'').toUpperCase()==='WIN G1').length;
   const g2=items.filter(x=>String(x.result||'').toUpperCase()==='WIN G2').length;
   const lossG2=items.filter(x=>String(x.result||'').toUpperCase()==='LOSS G2').length;
+  const rtmItems=items.filter(x=>String(x.trigger_indicator||'').trim());
+  const rtmFirst8Wins=[...rtmItems]
+    .filter(isWin)
+    .sort((a,b)=>Date.parse(String(a.timestamp||''))-Date.parse(String(b.timestamp||'')))
+    .slice(0,8);
 
   function statMap(keyFn){
     const map={};
@@ -24931,6 +25024,7 @@ function renderHistoryAnalysis(items){
       ${symbolRows}
     </div>
 
+    ${rtmItems.length ? `<div class="card" style="margin-top:10px;padding:10px"><div style="font-weight:900">🤖 Primeiros 8 WIN da RTM</div><div class="label" style="margin-top:5px">${rtmFirst8Wins.length?rtmFirst8Wins.map((x,i)=>`${i+1}º WIN • ${x.symbol||'--'} • ${x.trigger_indicator||'--'}`).join('<br>'):'Ainda não há WIN da RTM registrado com identificação do gatilho.'}</div><div class="label" style="margin-top:6px">Progresso: ${rtmFirst8Wins.length}/8 WIN identificados.</div></div>` : ''}
     <div class="label" style="margin-top:9px;line-height:1.45">${enough?'O aprendizado usa somente padrões estatísticos recentes e filtros conservadores; isso não garante resultado futuro.':'Amostra ainda pequena. O aprendizado continua coletando dados sem alterar sinais até atingir o mínimo necessário.'}</div>`;
 }
 
@@ -24962,12 +25056,16 @@ function renderHistory(){
     const resultStyle=isWin?'color:#31f58a':'color:#ff5577';
     const dir=String(h.direction||'').toUpperCase();
     const dirIcon=dir==='CALL'?'⬆️':(dir==='PUT'?'⬇️':'');
+    const trigger=String(h.trigger_indicator||'').trim();
+    const triggerScore=Number(h.trigger_score||0);
+    const triggerLine=trigger ? `<div class="label" style="margin-top:6px">🤖 RTM • Gatilho: <b>${trigger}</b>${triggerScore?` • ${Math.round(triggerScore)}%`:''}</div>` : '';
     return `<div class="card" style="padding:12px">
       <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap">
         <div><b>${date}</b><div class="label">${time} • Brasília</div></div>
         <div style="text-align:right"><b>${h.symbol||'--'} • ${h.interval||'--'}</b><div class="label">${dirIcon} ${dir||'--'}</div></div>
       </div>
       <div style="margin-top:8px;font-size:20px;font-weight:1000;${resultStyle}">${isWin?'✅':'❌'} ${r}</div>
+      ${triggerLine}
     </div>`;
   }).join('');
 }
@@ -25036,6 +25134,8 @@ function registerPersistentResult(t,x){
         risk:String(t.risk||''),
         strategy:String(t.strategy||''),
         engine:String(t.engine||''),
+        trigger_indicator:String(t.trigger_indicator||''),
+        trigger_score:Number(t.trigger_score||0),
         entry_mode:String(t.entry_mode||'')
       });
       pruneHistory(b);
@@ -25091,6 +25191,8 @@ function mergeServerPerformance(p,m){
       risk:String(x.risk||''),
       strategy:String(x.strategy||x.source||''),
       engine:String(x.engine||''),
+      trigger_indicator:String(x.trigger_indicator||''),
+      trigger_score:Number(x.trigger_score||0),
       direct_only:true
     };
     const opKey=String(x.operation_key||resultOperationKey(t));
@@ -25108,7 +25210,7 @@ function mergeServerPerformance(p,m){
         timestamp:x.entry_time||x.settled_at||new Date().toISOString(),
         symbol:t.symbol,interval:t.interval,direction:t.direction,market:m,
         result:r,entry_result:r,confidence:t.confidence,risk:t.risk,
-        strategy:t.strategy,engine:t.engine,entry_mode:'BIRTH',external_ai:!!x.external_ai
+        strategy:t.strategy,engine:t.engine,trigger_indicator:t.trigger_indicator,trigger_score:t.trigger_score,entry_mode:'BIRTH',external_ai:!!x.external_ai
       });
       imported=true;
     }
@@ -25516,7 +25618,7 @@ function rememberPendingTrade(sig){
 
   const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
   const canonicalResultEngine=(()=>{ if(engineKey.includes('TRIPRSI')||engineKey.includes('TRIPLE_RSI')||engineKey.includes('RSI TRIPLO')) return 'TRIPRSI'; if(engineKey.includes('FIBORSI')||engineKey.includes('ROBO_FIBO')||engineKey.includes('ROBOFIBO')) return 'FIBORSI'; if(engineKey.includes('TLBRSI')||engineKey.includes('THREE_LINE_BREAK_RSI')||engineKey.includes('3 LINE BREAK + RSI')) return 'TLBRSI'; if(engineKey.includes('TMARSI')||engineKey.includes('EXTREME_TMA_RSI_TREND')||engineKey.includes('EXTREME TMA')) return 'TMARSI'; if(engineKey.includes('RSIDIVBB')||engineKey.includes('RSI_DIV_BB')||engineKey.includes('DIVERGENCE + BOLLINGER')) return 'RSIDIVBB'; if(engineKey.includes('COMBINER')) return 'COMBINER'; if(engineKey.includes('AI_VOLUME_POC_CONSENSUS')||engineKey==='VOLUME_AI') return 'VOLUME_AI'; if(engineKey.includes('EA_XGBOOST')) return 'EA'; if(engineKey.includes('EA_FORCE')) return 'FORCE'; if(engineKey.includes('BIGRISE')) return 'BIGRISE'; if(engineKey.includes('LARRY')) return 'LARRY'; if(engineKey.includes('RANGE')) return 'RANGE'; if(engineKey.includes('VELOCITY')) return 'VELOCITY'; if(engineKey.includes('TAURUS_SUPER_SENEGAL')||engineKey.includes('TAURUSSENEGAL')) return 'TAURUSSENEGAL'; if(engineKey.includes('SNIPER')) return 'SNIPER'; if(engineKey.includes('ALPHAX')) return 'ALPHAX'; if(engineKey.includes('RAPID')) return 'RAPID'; if(engineKey.includes('SAMURAI')) return 'SAMURAI'; if(engineKey.includes('VOLUME')) return 'VOLUME'; if(engineKey.includes('RSI5')) return 'RSI5'; return String(sig.selected_engine||sig.mode||''); })();
-  const isDirectEa=(engineKey==='TRIPRSI'||engineKey.includes('TRIPRSI')||engineKey.includes('TRIPLE_RSI')||engineKey==='FIBORSI'||engineKey.includes('FIBORSI')||engineKey.includes('ROBO_FIBO')||engineKey==='TLBRSI'||engineKey.includes('TLBRSI')||engineKey.includes('THREE_LINE_BREAK_RSI')||engineKey==='TMARSI'||engineKey.includes('TMARSI')||engineKey.includes('EXTREME_TMA')||engineKey==='RSIDIVBB'||engineKey.includes('RSIDIVBB')||engineKey.includes('RSI_DIV_BB')||engineKey==='COMBINER'||engineKey.includes('COMBINER')||engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='RANGE'||engineKey==='VELOCITY'||engineKey==='TAURUSSENEGAL'||engineKey.includes('TAURUS_SUPER_SENEGAL')||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='SUNTZU'||engineKey==='RSI5'||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('RANGE')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('SUNTZU')||engineKey.includes('RSI5'));
+  const isDirectEa=(engineKey==='TRIPRSI'||engineKey.includes('TRIPRSI')||engineKey.includes('TRIPLE_RSI')||engineKey==='FIBORSI'||engineKey.includes('FIBORSI')||engineKey.includes('ROBO_FIBO')||engineKey==='TLBRSI'||engineKey.includes('TLBRSI')||engineKey.includes('THREE_LINE_BREAK_RSI')||engineKey==='TMARSI'||engineKey.includes('TMARSI')||engineKey.includes('EXTREME_TMA')||engineKey==='RSIDIVBB'||engineKey.includes('RSIDIVBB')||engineKey.includes('RSI_DIV_BB')||engineKey==='COMBINER'||engineKey.includes('COMBINER')||engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='RANGE'||engineKey==='VELOCITY'||engineKey==='TAURUSSENEGAL'||engineKey.includes('TAURUS_SUPER_SENEGAL')||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='SUNTZU'||engineKey==='RSI5'||engineKey==='RTM'||engineKey.includes('RTM')||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('RANGE')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('SUNTZU')||engineKey.includes('RSI5'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
     // Motores de entrada direta (AlphaX/Núcleo Rápido/Samurai/Sniper/RSI+ADX/Larry/Range/EA/Força/BigRise/Velocity) são apurados na primeira vela; outros preservam G1/G2.
@@ -25534,6 +25636,8 @@ function rememberPendingTrade(sig){
     risk:String(sig.risk||''),
     strategy:String(sig.strategy||''),
     engine:canonicalResultEngine,
+    trigger_indicator:String(sig.trigger_indicator||((sig.rtm_individual&&sig.rtm_individual.trigger_indicator)||'')),
+    trigger_score:Number(sig.trigger_score!=null?sig.trigger_score:((sig.rtm_individual&&sig.rtm_individual.trigger_score)||0)),
     entry_mode:String(sig.entry_mode||((entryMode&&entryMode.value)||'BIRTH')),
     value_stake:currentValueStake(),
     value_payout:currentValuePayout()
@@ -25608,8 +25712,9 @@ function renderBtcOnlyState(){
     btcOnlyNote.style.display=btcOnlyEnabled?'block':'none';
   }
   if(S){
-    S.disabled=!!btcOnlyEnabled;
-    S.title=btcOnlyEnabled?'Modo BTC/USD exclusivo ativo':'Selecione o ativo';
+    const rtmActive=(typeof selectedRobotEngine==='function' && selectedRobotEngine()==='RTM');
+    S.disabled=!!(btcOnlyEnabled && !rtmActive);
+    S.title=rtmActive?'RTM: somente BTC/USD e pares JPY':(btcOnlyEnabled?'Modo BTC/USD exclusivo ativo':'Selecione o ativo');
   }
 }
 
@@ -25625,7 +25730,15 @@ function fillSymbols(){
     .filter(x=>!baseSet.has(String(x).toUpperCase()) && String(x).toUpperCase()!=='CRYPTO IDX')
     .sort((a,b)=>String(a).localeCompare(String(b)));
   const openSymbols=[...syms.filter(x=>x!=='CRYPTO IDX'),...ctraderExtra,'CRYPTO IDX'];
-  const visibleSymbols=btcOnlyEnabled ? ['BTC/USD'] : (isOtc ? syms : openSymbols);
+  const engineNow=(typeof selectedRobotEngine==='function'?selectedRobotEngine():'');
+  let visibleSymbols=btcOnlyEnabled ? ['BTC/USD'] : (isOtc ? syms : openSymbols);
+  if(engineNow==='RTM'){
+    const source=isOtc ? syms : [...rtmSeedSyms,...ctraderExtra];
+    visibleSymbols=[...new Set(source)].filter(x=>{
+      const c=String(x||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+      return c==='BTCUSD' || c.includes('JPY');
+    });
+  }
 
   visibleSymbols.forEach(x=>{
     if(isOtc && x==='CRYPTO IDX') return;
@@ -25635,7 +25748,7 @@ function fillSymbols(){
     S.add(new Option(x+extra,x));
   });
 
-  if(btcOnlyEnabled){
+  if(btcOnlyEnabled && engineNow!=='RTM'){
     S.value='BTC/USD';
   }else if(previous && [...S.options].some(o=>o.value===previous)){
     S.value=previous;
@@ -27839,12 +27952,12 @@ function applyRobotPowerState(){
     ? 'ONLINE: suporte/resistência confirmado + reação da vela + RSI 14 • próxima vela • sem repaint.'
     : 'OFFLINE: COMBINER FLOW + RSI pausado.';
 
-  if(rtmModeDesc) rtmModeDesc.textContent=rtmEnabled ? 'ONLINE: 30 gatilhos individuais • qualquer gatilho válido pode liberar sozinho • sem blocos • sem confluência obrigatória • pré-alerta 20s.' : 'OFFLINE: RTM MULTI INDIVIDUAL pausado • BLACK BOOK permanece separado.';
+  if(rtmModeDesc) rtmModeDesc.textContent=rtmEnabled ? 'ONLINE: 30 gatilhos individuais • somente BTC/USD + pares JPY • qualquer gatilho válido pode liberar sozinho • sem blocos • sem confluência obrigatória • pré-alerta 20s.' : 'OFFLINE: RTM MULTI INDIVIDUAL pausado • BLACK BOOK permanece separado.';
   const engine=selectedRobotEngine();
   if(engine==='RTM'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RTM MULTI INDIVIDUAL ONLINE • GATILHOS ANALISANDO CANDLES NO APP';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 RTM MULTI INDIVIDUAL selecionado • 30 gatilhos autônomos • cada um pode liberar sozinho • pré-alerta 20s • próxima vela.</div>';
-    if(radar) radar.innerHTML='<div>📡 RTM MULTI INDIVIDUAL ativo • 30 gatilhos individuais analisando o mercado pelo próprio app</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RTM ONLINE • SOMENTE BTC/USD + PARES JPY • GATILHOS ANALISANDO CANDLES NO APP';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 RTM selecionado • somente BTC/USD + pares JPY • 30 gatilhos autônomos • cada um pode liberar sozinho • pré-alerta 20s • próxima vela.</div>';
+    if(radar) radar.innerHTML='<div>📡 RTM ativo • varredura exclusiva em BTC/USD + pares JPY • 30 gatilhos individuais</div>';
     rad();
   }else if(engine==='TMARSI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EXTREME TMA + RSI ONLINE • TMA17 + RSI7 + TREND FILTER ALINHADOS • PRÓXIMA VELA';
@@ -29429,7 +29542,7 @@ async function rad(){
   try{
     const engine=selectedRobotEngine();
     if(engine==='OFF'){ radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>'; return; }
-    const onlySymbol=btcOnlyEnabled?'&symbol='+encodeURIComponent('BTC/USD'):'';
+    const onlySymbol=(engine==='RTM')?'':(btcOnlyEnabled?'&symbol='+encodeURIComponent('BTC/USD'):'');
     const items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}${onlySymbol}`);
     const list=Array.isArray(items)?items:[];
     if(!list.length){
@@ -29474,8 +29587,8 @@ async function loadPreSignals(){
     return;
   }
   if(engine==='RTM'){
-    if(preSignalStatus) preSignalStatus.textContent='RTM MULTI INDIVIDUAL • pré-alerta calculado dentro do app • sem blocos • bridge MT4 opcional.';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 RTM MULTI INDIVIDUAL monitorando • 30 gatilhos independentes • 20s antes • entrada na próxima vela.</div>';
+    if(preSignalStatus) preSignalStatus.textContent='RTM MULTI INDIVIDUAL • somente BTC/USD + pares JPY • pré-alerta dentro do app • sem blocos.';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 RTM monitorando somente BTC/USD + pares JPY • 30 gatilhos independentes • 20s antes • próxima vela.</div>';
     return;
   }
 
