@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.3"
-PWA_VERSION = "v169"
+APP_VERSION = "3.96.4"
+PWA_VERSION = "v170"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -97,7 +97,7 @@ SUNTZU_EARLY_SIGNAL_SECONDS = 20
 SUNTZU_EARLY_WINDOW_BEFORE = max(20, min(28, int(os.getenv("SUNTZU_EARLY_WINDOW_BEFORE", "25"))))
 SUNTZU_EARLY_MIN_REMAINING = max(10, min(20, int(os.getenv("SUNTZU_EARLY_MIN_REMAINING", "12"))))
 
-# MEGA IA 3.52 — LARRY BREAKOUT para opções binárias.
+# MEGA IA 3.52 — LARRY BREAKOUT + TAURUS para opções binárias.
 # Adaptação do conceito de rompimento do Larry FX, sem Grid, sem Martingale,
 # sem aumento de mão e sem ordens pendentes. Só usa candles fechados.
 LARRY_LOOKBACK = max(6, min(30, int(os.getenv("LARRY_LOOKBACK", "12"))))
@@ -2710,17 +2710,17 @@ def _rtm_block_result(key, label, bucket, min_votes, min_edge, min_consensus):
 
 
 def _rtm_vote_strategy(rows, timeframe="1min", market="OPEN", early_signal=False, symbol=""):
-    """RTM MULTI INDIVIDUAL: cada detector pode liberar sinal sozinho.
+    """RTM MULTI + TAURUS: gatilhos individuais confirmados pela estrutura Taurus.
 
-    Sem votação global e sem dependência de blocos. Os detectores usam gatilhos
-    de evento (cruzamento, rejeição, rompimento, força etc.) para evitar que um
-    simples estado permanente gere sinal em toda vela. Se mais de um gatilho
-    aparecer no mesmo instante, o de maior prioridade/força é escolhido; não há
-    bônus por confluência.
+    Cada detector do RTM continua independente e pode ser o gatilho principal.
+    Não existe votação por blocos. Porém, antes de liberar CALL/PUT, o Taurus
+    precisa confirmar a mesma direção por Suporte/LTA (CALL) ou
+    Resistência/LTB (PUT) na vela atual ou em uma das 2 velas anteriores.
+    A seleção adaptativa por ativo (mantém após WIN e troca após LOSS) continua.
     """
     data=list(rows or [])
     tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30","1h":"H1","4h":"H4"}.get(timeframe,timeframe)
-    name=f"RTM MULTI • GATILHOS INDIVIDUAIS {tf_label}"
+    name=f"RTM MULTI + TAURUS • GATILHOS INDIVIDUAIS {tf_label}"
     if len(data) < 60:
         return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
                 "risk":"HIGH","strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDIVIDUAL_TRIGGERS",
@@ -2902,8 +2902,57 @@ def _rtm_vote_strategy(rows, timeframe="1min", market="OPEN", early_signal=False
             }
         candidates = switched
 
-    # Não há votação nem confluência: dentro da regra adaptativa, vence o
-    # gatilho individual de maior prioridade/força.
+    # Taurus entra como confirmação estrutural, sem transformar os 30 gatilhos
+    # do RTM em votação. Cada gatilho segue independente; só precisa concordar
+    # com a direção estrutural do Taurus. A confirmação vale na vela atual ou
+    # em uma das 2 velas anteriores para não prender demais o RTM.
+    ta_rows = data[-min(len(data), TAURUS_SENEGAL_HISTORY_BARS):]
+    ph, pl = _taurus_pivots(ta_rows)
+    ta_atr = _tsz_atr_full(ta_rows, TAURUS_SENEGAL_ATR_PERIOD)
+    taurus_checks = []
+    for age in range(0, min(3, len(ta_rows))):
+        idx = len(ta_rows) - 1 - age
+        call_reg, put_reg, reg = _taurus_region_state(ta_rows, idx, ph, pl, ta_atr)
+        flags = [k.upper() for k in ("support", "resistance", "lta", "ltb") if reg.get(k)]
+        taurus_checks.append({
+            "age": age, "call": bool(call_reg), "put": bool(put_reg),
+            "flags": flags, "region": reg,
+        })
+    call_hits = [x for x in taurus_checks if x["call"]]
+    put_hits = [x for x in taurus_checks if x["put"]]
+    taurus_call = bool(call_hits)
+    taurus_put = bool(put_hits)
+    aligned_candidates = [
+        x for x in candidates
+        if (x.get("direction") == "CALL" and taurus_call)
+        or (x.get("direction") == "PUT" and taurus_put)
+    ]
+    if not aligned_candidates:
+        fired = ", ".join(f"{x.get('tag')} {x.get('direction')}" for x in candidates[:6])
+        ta_state = ("CALL (SUPORTE/LTA)" if taurus_call else "")
+        if taurus_put:
+            ta_state += ((" + " if ta_state else "") + "PUT (RESISTÊNCIA/LTB)")
+        if not ta_state:
+            ta_state = "aguardando SUPORTE/LTA ou RESISTÊNCIA/LTB"
+        return {
+            "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
+            "strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDIVIDUAL_TRIGGERS",
+            "reason":f"RTM + TAURUS: gatilho RTM disparou ({fired}), mas o Taurus não confirmou a mesma direção. Taurus: {ta_state}.",
+            "detectors":[],"detectors_total":30,"independent_indicators":True,
+            "history_required":60,"history_available":len(data),
+            "detectors_triggered":all_candidates,"early_signal_window":bool(early_signal),
+            "next_candle_entry":True,"gale_signal":False,"non_repaint_after_release":True,
+            "taurus_confluence":True,"taurus_call_ready":taurus_call,"taurus_put_ready":taurus_put,
+            "taurus_lookback_bars":3,"taurus_checks":taurus_checks,
+            "rtm_indicator_mode":"LOCKED_WINNER" if locked_indicator else ("SEARCH_AFTER_LOSS" if avoid_indicator else "DISCOVERY"),
+            "rtm_locked_indicator":locked_indicator,"rtm_avoid_indicator":avoid_indicator,
+            "rtm_asset_wins":adaptive.get("wins",0),"rtm_asset_losses":adaptive.get("losses",0),
+            "rtm_consecutive_wins":adaptive.get("consecutive_wins",0),
+        }
+    candidates = aligned_candidates
+
+    # Não há votação entre indicadores: dentro da regra adaptativa, vence o
+    # gatilho individual de maior prioridade/força que também passou no Taurus.
     candidates.sort(key=lambda x:x["score"], reverse=True)
     best=candidates[0]
     direction=best["direction"]
@@ -2918,8 +2967,16 @@ def _rtm_vote_strategy(rows, timeframe="1min", market="OPEN", early_signal=False
         adaptive_text=f"{symbol or 'ATIVO'} trocou {avoid_indicator} por {best['tag']} após LOSS"
     else:
         adaptive_text=f"{symbol or 'ATIVO'} ainda está descobrindo o indicador vencedor"
-    reason=(f"RTM ADAPTATIVO {direction}: {best['tag']} liberou ({confidence:.0f}). "
-            f"{adaptive_text}. {best['reason']}.")
+    chosen_hits = call_hits if direction == "CALL" else put_hits
+    chosen_taurus = min(chosen_hits, key=lambda x:x["age"]) if chosen_hits else None
+    ta_flags = chosen_taurus.get("flags", []) if chosen_taurus else []
+    ta_flag_txt = " + ".join(ta_flags) if ta_flags else ("SUPORTE/LTA" if direction == "CALL" else "RESISTÊNCIA/LTB")
+    ta_age = int(chosen_taurus.get("age", 0)) if chosen_taurus else 0
+    ta_when = "na vela atual" if ta_age == 0 else ("1 vela antes" if ta_age == 1 else "2 velas antes")
+    confidence = min(95.0, confidence + (4.0 if ta_age == 0 else 3.0 if ta_age == 1 else 2.0))
+    risk="LOW" if confidence>=86 else "MEDIUM"
+    reason=(f"RTM + TAURUS {direction}: {best['tag']} liberou ({confidence:.0f}). "
+            f"Taurus confirmou {ta_flag_txt} {ta_when}. {adaptive_text}. {best['reason']}.")
     return {"available":True,"direction":direction,"raw_direction":direction,"confidence":round(confidence,1),
             "confirmed":True,"risk":risk,"strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDIVIDUAL_TRIGGERS",
             "reason":reason[:520],"independent_indicators":True,"trigger_indicator":best["tag"],
@@ -2927,7 +2984,10 @@ def _rtm_vote_strategy(rows, timeframe="1min", market="OPEN", early_signal=False
             "simultaneous_opposite":[x["tag"] for x in opposite],"detectors_total":30,"history_required":60,"history_available":len(data),
             "detectors_triggered":all_candidates,"early_signal_window":bool(early_signal),
             "next_candle_entry":True,"direct_win_only":True,"gale_signal":False,
-            "non_repaint_after_release":True,"rtm_indicator_mode":mode,
+            "non_repaint_after_release":True,"taurus_confluence":True,
+            "taurus_call_ready":taurus_call,"taurus_put_ready":taurus_put,
+            "taurus_lookback_bars":3,"taurus_checks":taurus_checks,
+            "rtm_indicator_mode":mode,
             "rtm_locked_indicator":locked_indicator,"rtm_avoid_indicator":avoid_indicator,
             "rtm_asset_wins":adaptive.get("wins",0),"rtm_asset_losses":adaptive.get("losses",0),
             "rtm_consecutive_wins":adaptive.get("consecutive_wins",0)}
@@ -10176,26 +10236,29 @@ def presiden_breakout_strategy(cs, timeframe="1min", market="OPEN"):
 
 
 def larry_breakout_strategy(cs, timeframe="1min", market="OPEN"):
-    """LARRY BREAKOUT — adaptação do Larry FX para CALL/PUT sem Grid/Martingale.
+    """LARRY BREAKOUT + TAURUS — confluência causal para CALL/PUT.
 
-    Usa apenas candles FECHADOS. A entrada só é liberada quando a última vela
-    fechada rompe a máxima/mínima da janela anterior e mostra corpo/fechamento
-    compatíveis com continuação. Não abre ordens em grade, não aumenta lote e
-    não usa Gale.
+    O Larry continua sendo o gatilho de rompimento em candle FECHADO. O Taurus
+    confirma a direção pela estrutura técnica: Suporte/LTA para CALL e
+    Resistência/LTB para PUT. Para não prender o motor, a confirmação Taurus
+    pode ter ocorrido na vela do rompimento ou em uma das 2 velas fechadas
+    imediatamente anteriores. Sem Grid, Martingale ou Gale.
     """
     rows = list(cs or [])
     tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"LARRY BREAKOUT {tf_label}"
-    need = max(28, LARRY_LOOKBACK + LARRY_ATR_PERIOD + 4)
+    name = f"LARRY BREAKOUT + TAURUS {tf_label}"
+    need = max(60, LARRY_LOOKBACK + LARRY_ATR_PERIOD + 8, TAURUS_SENEGAL_SR_LOOKBACK + 8)
     if len(rows) < need:
         return {
             "available": True, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "strategy": name,
             "engine": "LARRY_BREAKOUT", "provider": "LOCAL_LARRY_BREAKOUT",
-            "reason": f"Coletando candles fechados para o Larry Breakout ({len(rows)}/{need}).",
-            "non_repaint": True, "gale_signal": False, "grid": False, "martingale": False,
+            "reason": f"Coletando candles fechados para Larry Breakout + Taurus ({len(rows)}/{need}).",
+            "non_repaint": True, "closed_candles_only": True, "next_candle_entry": True,
+            "gale_signal": False, "grid": False, "martingale": False,
         }
 
+    # ---------------- Larry Breakout: gatilho principal ----------------
     last = rows[-1]
     history = rows[-(LARRY_LOOKBACK + 1):-1]
     recent_for_range = rows[-13:-1] if len(rows) >= 13 else rows[:-1]
@@ -10224,72 +10287,126 @@ def larry_breakout_strategy(cs, timeframe="1min", market="OPEN"):
     call_close_ok = close_pos >= 0.68 and c > o
     put_close_ok = close_pos <= 0.32 and c < o
 
-    # Contexto simples de continuidade, sem RSI/Value Chart/MACD.
     prev_closes = [float(x["close"]) for x in rows[-6:-1]]
     short_drift = (prev_closes[-1] - prev_closes[0]) if len(prev_closes) >= 2 else 0.0
     call_context = short_drift >= (-0.35 * a)
     put_context = short_drift <= (0.35 * a)
 
-    call_ok = call_break and body_ok and expansion_ok and not_exhausted and call_close_ok and call_context
-    put_ok = put_break and body_ok and expansion_ok and not_exhausted and put_close_ok and put_context
+    larry_call = bool(call_break and body_ok and expansion_ok and not_exhausted and call_close_ok and call_context)
+    larry_put = bool(put_break and body_ok and expansion_ok and not_exhausted and put_close_ok and put_context)
+    larry_direction = "CALL" if larry_call else ("PUT" if larry_put else "NEUTRO")
 
+    # ---------------- Taurus: confirmação estrutural ----------------
+    ta_rows = rows[-min(len(rows), TAURUS_SENEGAL_HISTORY_BARS):]
+    ph, pl = _taurus_pivots(ta_rows)
+    ta_atr = _tsz_atr_full(ta_rows, TAURUS_SENEGAL_ATR_PERIOD)
+    taurus_checks = []
+    for age in range(0, min(3, len(ta_rows))):
+        idx = len(ta_rows) - 1 - age
+        call_reg, put_reg, reg = _taurus_region_state(ta_rows, idx, ph, pl, ta_atr)
+        flags = [k.upper() for k in ("support", "resistance", "lta", "ltb") if reg.get(k)]
+        taurus_checks.append({
+            "age": age,
+            "call": bool(call_reg),
+            "put": bool(put_reg),
+            "flags": flags,
+            "region": reg,
+        })
+
+    call_hits = [x for x in taurus_checks if x["call"]]
+    put_hits = [x for x in taurus_checks if x["put"]]
+    taurus_call = bool(call_hits)
+    taurus_put = bool(put_hits)
+    best_call = min(call_hits, key=lambda x: x["age"]) if call_hits else None
+    best_put = min(put_hits, key=lambda x: x["age"]) if put_hits else None
+
+    call_ok = bool(larry_call and taurus_call)
+    put_ok = bool(larry_put and taurus_put)
     direction = "CALL" if call_ok else ("PUT" if put_ok else "NEUTRO")
-    clearance = call_clearance if direction == "CALL" else (put_clearance if direction == "PUT" else max(call_clearance, put_clearance))
-    confidence = 0.0
-    if direction != "NEUTRO":
-        confidence = 67.0
-        confidence += min(8.0, max(0.0, body_ratio - LARRY_MIN_BODY_RATIO) * 22.0)
-        confidence += min(7.0, max(0.0, expansion - LARRY_MIN_RANGE_EXPANSION) * 8.0)
-        confidence += min(6.0, max(0.0, clearance) * 12.0)
-        confidence += 4.0 if (close_pos >= 0.82 if direction == "CALL" else close_pos <= 0.18) else 1.5
-        confidence = clamp(confidence, 67.0, 92.0)
 
-    if direction == "CALL":
+    clearance = call_clearance if larry_direction == "CALL" else (put_clearance if larry_direction == "PUT" else max(call_clearance, put_clearance))
+    larry_conf = 0.0
+    if larry_direction != "NEUTRO":
+        larry_conf = 67.0
+        larry_conf += min(8.0, max(0.0, body_ratio - LARRY_MIN_BODY_RATIO) * 22.0)
+        larry_conf += min(7.0, max(0.0, expansion - LARRY_MIN_RANGE_EXPANSION) * 8.0)
+        larry_conf += min(6.0, max(0.0, clearance) * 12.0)
+        larry_conf += 4.0 if (close_pos >= 0.82 if larry_direction == "CALL" else close_pos <= 0.18) else 1.5
+        larry_conf = clamp(larry_conf, 67.0, 92.0)
+
+    confidence = 0.0
+    chosen_taurus = best_call if direction == "CALL" else (best_put if direction == "PUT" else None)
+    if direction != "NEUTRO":
+        # Taurus no próprio candle vale mais; até 2 candles atrás continua válido.
+        age = int(chosen_taurus["age"]) if chosen_taurus else 2
+        flags_n = len(chosen_taurus.get("flags", [])) if chosen_taurus else 0
+        taurus_bonus = (7.0 if age == 0 else 5.0 if age == 1 else 3.0) + (2.0 if flags_n >= 2 else 0.0)
+        confidence = clamp(larry_conf + taurus_bonus, 72.0, 95.0)
+
+    if direction in ("CALL", "PUT"):
+        flags = chosen_taurus.get("flags", []) if chosen_taurus else []
+        flag_txt = " + ".join(flags) if flags else ("SUPORTE/LTA" if direction == "CALL" else "RESISTÊNCIA/LTB")
+        age = chosen_taurus.get("age", 0) if chosen_taurus else 0
+        when_txt = "na vela do rompimento" if age == 0 else ("1 vela antes" if age == 1 else "2 velas antes")
         reason = (
-            f"Rompimento comprador confirmado acima da máxima de {LARRY_LOOKBACK} candles; "
-            f"corpo {body_ratio*100:.0f}%, expansão {expansion:.2f}x e fechamento próximo da máxima."
+            f"{direction} LARRY BREAKOUT + TAURUS confirmado • Larry rompeu com corpo {body_ratio*100:.0f}% "
+            f"e expansão {expansion:.2f}x • Taurus confirmou {flag_txt} {when_txt} • "
+            f"entrada na próxima vela • sem Gale."
         )
-    elif direction == "PUT":
-        reason = (
-            f"Rompimento vendedor confirmado abaixo da mínima de {LARRY_LOOKBACK} candles; "
-            f"corpo {body_ratio*100:.0f}%, expansão {expansion:.2f}x e fechamento próximo da mínima."
-        )
+    elif larry_direction == "CALL":
+        reason = "Larry confirmou rompimento comprador, mas o Taurus ainda não confirmou SUPORTE/LTA nas últimas 3 velas fechadas."
+    elif larry_direction == "PUT":
+        reason = "Larry confirmou rompimento vendedor, mas o Taurus ainda não confirmou RESISTÊNCIA/LTB nas últimas 3 velas fechadas."
     else:
         blockers = []
-        if not (call_break or put_break): blockers.append("sem rompimento confirmado")
+        if not (call_break or put_break): blockers.append("Larry sem rompimento confirmado")
         if not body_ok: blockers.append(f"corpo abaixo de {LARRY_MIN_BODY_RATIO*100:.0f}%")
         if not expansion_ok: blockers.append("range sem expansão")
         if not not_exhausted: blockers.append("vela esticada demais")
         if call_break and not call_close_ok: blockers.append("rompimento comprador fechou fraco")
         if put_break and not put_close_ok: blockers.append("rompimento vendedor fechou fraco")
-        reason = "Larry Breakout monitorando: " + (", ".join(blockers) if blockers else "aguardando confirmação limpa") + "."
+        ta_txt = []
+        if taurus_call: ta_txt.append("Taurus CALL pronto")
+        if taurus_put: ta_txt.append("Taurus PUT pronto")
+        if not ta_txt: ta_txt.append("Taurus aguardando região")
+        reason = "Larry Breakout + Taurus monitorando: " + (", ".join(blockers + ta_txt)) + "."
 
     return {
         "available": True,
         "direction": direction,
+        "raw_direction": larry_direction,
         "confidence": round(float(confidence), 1),
         "confirmed": direction in ("CALL", "PUT"),
-        "risk": ("LOW" if confidence >= 80 else ("MEDIUM" if direction != "NEUTRO" else "HIGH")),
+        "risk": ("LOW" if confidence >= 84 else ("MEDIUM" if direction != "NEUTRO" else "HIGH")),
         "strategy": name,
+        # Mantém IDs antigos para o botão/placar LARRY continuarem compatíveis.
         "engine": "LARRY_BREAKOUT",
         "provider": "LOCAL_LARRY_BREAKOUT",
-        "reason": reason[:360],
+        "reason": reason[:440],
         "external_ai_disabled": True,
         "gale_signal": False,
         "non_repaint": True,
+        "closed_candles_only": True,
+        "next_candle_entry": True,
         "grid": False,
         "martingale": False,
         "direct_win_only": True,
+        "taurus_confluence": True,
+        "taurus_lookback_bars": 3,
         "diagnostics": {
-            "lookback": LARRY_LOOKBACK,
-            "range_high": round(range_high, 10),
-            "range_low": round(range_low, 10),
-            "atr": round(float(a), 10),
-            "body_ratio": round(body_ratio, 4),
-            "range_expansion": round(expansion, 3),
-            "close_position": round(close_pos, 3),
-            "breakout_buffer": round(buffer, 10),
-            "short_drift_atr": round(short_drift / max(a, 1e-12), 3),
+            "larry": {
+                "direction": larry_direction,
+                "lookback": LARRY_LOOKBACK,
+                "range_high": round(range_high, 10),
+                "range_low": round(range_low, 10),
+                "atr": round(float(a), 10),
+                "body_ratio": round(body_ratio, 4),
+                "range_expansion": round(expansion, 3),
+                "close_position": round(close_pos, 3),
+                "breakout_buffer": round(buffer, 10),
+                "short_drift_atr": round(short_drift / max(a, 1e-12), 3),
+            },
+            "taurus": taurus_checks,
         },
     }
 
@@ -15030,12 +15147,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 if not iq_state:
                     out = neutral_signal(
                         symbol, interval, market,
-                        "RTM MULTI INDIVIDUAL • IQ OPTION OFFLINE",
-                        "Conecte a IQ Option para o RTM MULTI INDIVIDUAL analisar candles OTC reais.",
+                        "RTM MULTI + TAURUS • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para o RTM MULTI + TAURUS analisar candles OTC reais.",
                         source_state="WAITING",
                     )
                     out.update({
-                        "strategy":"RTM MULTI • GATILHOS INDIVIDUAIS","mode":"RTM_INTERNAL_INDEPENDENT_BLOCKS",
+                        "strategy":"RTM MULTI + TAURUS • GATILHOS INDIVIDUAIS","mode":"RTM_INTERNAL_INDEPENDENT_BLOCKS",
                         "selected_engine":engine,"feed_source":"IQ_OPTION_OTC",
                         "non_repaint_after_release":True,"next_candle_entry":True,"direct_win_only":True,"gale_signal":False,
                     })
@@ -15065,17 +15182,17 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             else:
                 raw=await candles(symbol,interval,BLACKBOOK_HISTORY_BARS,"OPEN",None,request=request)
         elif engine == "LARRY":
-            # LARRY BREAKOUT: mercado aberto via roteador multifuente; OTC via IQ Option real.
+            # LARRY BREAKOUT + TAURUS: mercado aberto via roteador multifuente; OTC via IQ Option real.
             if market == "IQ_OTC":
                 if not iq_state:
                     out = neutral_signal(
                         symbol, interval, market,
-                        "LARRY BREAKOUT • IQ OPTION OFFLINE",
-                        "Conecte a IQ Option para o Larry Breakout analisar candles OTC reais.",
+                        "LARRY BREAKOUT + TAURUS • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para o Larry Breakout + Taurus analisar candles OTC reais.",
                         source_state="WAITING",
                     )
                     out.update({
-                        "strategy": "LARRY BREAKOUT", "mode": "LARRY_BREAKOUT",
+                        "strategy": "LARRY BREAKOUT + TAURUS", "mode": "LARRY_BREAKOUT",
                         "selected_engine": engine, "feed_source": "IQ_OPTION_OTC",
                         "non_repaint": True, "direct_win_only": True,
                         "grid": False, "martingale": False, "gale_signal": False,
@@ -15420,11 +15537,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "RUBIK":
             status = "ROBÔ RUBIK • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION EM ESPERA"
         elif engine == "RTM":
-            status = "RTM MULTI INDIVIDUAL • FONTE EM ESPERA" if market == "OPEN" else "RTM MULTI INDIVIDUAL • IQ OPTION EM ESPERA"
+            status = "RTM MULTI + TAURUS • FONTE EM ESPERA" if market == "OPEN" else "RTM MULTI + TAURUS • IQ OPTION EM ESPERA"
         elif engine == "BLACKBOOK":
             status = "BLACK BOOK • FONTE EM ESPERA" if market == "OPEN" else "BLACK BOOK • IQ OPTION EM ESPERA"
         elif engine == "LARRY":
-            status = "LARRY BREAKOUT • FONTE EM ESPERA" if market == "OPEN" else "LARRY BREAKOUT • IQ OPTION EM ESPERA"
+            status = "LARRY BREAKOUT + TAURUS • FONTE EM ESPERA" if market == "OPEN" else "LARRY BREAKOUT + TAURUS • IQ OPTION EM ESPERA"
         elif engine == "RANGE":
             status = "RANGE COMPRESSION • FONTE EM ESPERA" if market == "OPEN" else "RANGE COMPRESSION • IQ OPTION EM ESPERA"
         elif engine == "VELOCITY":
@@ -15475,11 +15592,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "RUBIK":
             status = "ROBÔ RUBIK • FONTE RECONECTANDO" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION RECONECTANDO"
         elif engine == "RTM":
-            status = "RTM MULTI INDIVIDUAL • FONTE RECONECTANDO" if market == "OPEN" else "RTM MULTI INDIVIDUAL • IQ OPTION RECONECTANDO"
+            status = "RTM MULTI + TAURUS • FONTE RECONECTANDO" if market == "OPEN" else "RTM MULTI + TAURUS • IQ OPTION RECONECTANDO"
         elif engine == "BLACKBOOK":
             status = "BLACK BOOK • FONTE RECONECTANDO" if market == "OPEN" else "BLACK BOOK • IQ OPTION RECONECTANDO"
         elif engine == "LARRY":
-            status = "LARRY BREAKOUT • FONTE RECONECTANDO" if market == "OPEN" else "LARRY BREAKOUT • IQ OPTION RECONECTANDO"
+            status = "LARRY BREAKOUT + TAURUS • FONTE RECONECTANDO" if market == "OPEN" else "LARRY BREAKOUT + TAURUS • IQ OPTION RECONECTANDO"
         elif engine == "RANGE":
             status = "RANGE COMPRESSION • FONTE RECONECTANDO" if market == "OPEN" else "RANGE COMPRESSION • IQ OPTION RECONECTANDO"
         elif engine == "VELOCITY":
@@ -15570,13 +15687,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "ROBÔ RUBIK ADAPTADO"
             engine_mode = "RUBIK_ADAPTED"
         elif engine == "RTM":
-            engine_title = "RTM MULTI INDIVIDUAL"
-            engine_mode = "RTM_INTERNAL_MULTI_VOTE"
+            engine_title = "RTM MULTI + TAURUS"
+            engine_mode = "RTM_INDEPENDENT_TAURUS"
         elif engine == "BLACKBOOK":
             engine_title = "BLACK BOOK"
             engine_mode = "BLACKBOOK_PRICE_ACTION"
         elif engine == "LARRY":
-            engine_title = "LARRY BREAKOUT"
+            engine_title = "LARRY BREAKOUT + TAURUS"
             engine_mode = "LARRY_BREAKOUT"
         elif engine == "RANGE":
             engine_title = "RANGE COMPRESSION BREAKOUT"
@@ -15745,7 +15862,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     analysis["confirmed"]=False
                     analysis["direction"]="NEUTRO"
                     analysis["confidence"]=0.0
-                    analysis["reason"]=(f"RTM MULTI INDIVIDUAL monitorando • sinal oficial nos últimos {RTM_PREALERT_SECONDS}s da vela "
+                    analysis["reason"]=(f"RTM MULTI + TAURUS monitorando • sinal oficial nos últimos {RTM_PREALERT_SECONDS}s da vela "
                                         f"(agora faltam {int(rtm_seconds_to_entry)}s).")
                     analysis["early_signal_window"]=False
                     analysis["seconds_to_entry_snapshot"]=round(rtm_seconds_to_entry,1)
@@ -16030,9 +16147,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 else (analysis.get("strategy") or (
                     "EA RSI + VALUE CHART + XGBOOST" if engine == "EA"
                     else "ROBÔ RUBIK ADAPTADO" if engine == "RUBIK"
-                    else "RTM MULTI • GATILHOS INDIVIDUAIS" if engine == "RTM"
+                    else "RTM MULTI + TAURUS • GATILHOS INDIVIDUAIS" if engine == "RTM"
                     else "BLACK BOOK • PRICE ACTION" if engine == "BLACKBOOK"
-                    else "LARRY BREAKOUT" if engine == "LARRY"
+                    else "LARRY BREAKOUT + TAURUS" if engine == "LARRY"
                     else "RANGE COMPRESSION BREAKOUT" if engine == "RANGE"
                     else "VELOCITY FLOW • MR MT4" if engine == "VELOCITY"
                     else "TAURUS + SUPER SENEGAL M1" if engine == "TAURUSSENEGAL"
@@ -16480,9 +16597,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "status": (smart_status if engine == "SMART" else {
                         "EA": "SINAL TRIPLA CONFIRMAÇÃO LIBERADO",
                         "RUBIK": "SINAL ROBÔ RUBIK ADAPTADO LIBERADO",
-                        "RTM": "SINAL RTM MULTI INDIVIDUAL LIBERADO",
+                        "RTM": "SINAL RTM MULTI + TAURUS LIBERADO",
                         "BLACKBOOK": "SINAL BLACK BOOK LIBERADO",
-                        "LARRY": "SINAL LARRY BREAKOUT LIBERADO",
+                        "LARRY": "SINAL LARRY BREAKOUT + TAURUS LIBERADO",
                         "RANGE": "SINAL RANGE COMPRESSION LIBERADO",
                         "VELOCITY": "SINAL VELOCITY FLOW LIBERADO",
                         "SNIPER": "SINAL SUPER SIGNALS CHANNEL NR LIBERADO",
@@ -20280,11 +20397,11 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
             "reason": "Mais flexível em cenários mistos, desde que o preço não esteja excessivamente lateral e a IA externa esteja disponível."
         },
         {
-            "key":"LARRY","name":"LARRY BREAKOUT","score":autonomous,
+            "key":"LARRY","name":"LARRY BREAKOUT + TAURUS","score":autonomous,
             "supported":True,"operational":bool(market=="OPEN" or iq_ready),
-            "reason": ("Rompimento + força/expansão da vela em candles fechados; no mercado aberto usa o roteador multifuente."
+            "reason": ("Larry confirma o rompimento e o Taurus confirma Suporte/LTA ou Resistência/LTB; no mercado aberto usa o roteador multifuente."
                        if market=="OPEN" else
-                       "Rompimento + força/expansão da vela em candles OTC reais; no OTC exige conexão ativa com a IQ Option.")
+                       "Larry confirma o rompimento e o Taurus confirma a estrutura; no OTC usa candles reais e exige conexão ativa com a IQ Option.")
         },
         {
             "key":"SNIPER","name":"SUPER SIGNALS CHANNEL NR","score":clamp(28 + 28*f["rejection"] + 20*f["near_edge"] + 12*clean + 12*f["avg_body_ratio"],0,100),
@@ -20428,7 +20545,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = _fs
                     data["feed_label"] = _feed_source_label(_fs) if _fs != "MULTIFEED" else "Multifuente • RTM interno"
                     data["feed_fallback"] = bool(data.get("feed_fallback", False))
-                    data["feed_message"] = "RTM MULTI INDIVIDUAL analisado dentro do app por gatilhos individuais; o bridge MT4 ficou opcional."
+                    data["feed_message"] = "RTM MULTI + TAURUS analisado dentro do app por gatilhos individuais confirmados pelo Taurus; o bridge MT4 ficou opcional."
             elif engine == "EA":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -20462,12 +20579,12 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = feed_src
                     data["feed_label"] = _feed_source_label(feed_src)
                     data["feed_fallback"] = bool(feed_info.get("fallback"))
-                    data["feed_message"] = "Larry Breakout usando candles fechados do mercado aberto via roteador cTrader/multifuente."
+                    data["feed_message"] = "Larry Breakout + Taurus usando candles fechados do mercado aberto via roteador cTrader/multifuente."
                 else:
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                    data["feed_message"] = "Larry Breakout usando candles OTC reais da sessão IQ Option."
+                    data["feed_message"] = "Larry Breakout + Taurus usando candles OTC reais da sessão IQ Option."
             elif engine == "RANGE":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -21120,7 +21237,7 @@ async def pre_signals(
     if engine == "RTM":
         return {
             "ok": True,
-            "message": f"RTM MULTI INDIVIDUAL: somente BTC/USD e pares JPY; cada gatilho pode liberar CALL/PUT sozinho nos últimos {RTM_PREALERT_SECONDS}s; sem votação por blocos e sem confluência obrigatória. O MT4 é opcional.",
+            "message": f"RTM MULTI + TAURUS: somente BTC/USD e pares JPY; cada gatilho RTM continua independente, mas CALL/PUT só é liberado quando o Taurus confirma a mesma direção nos últimos 3 candles. Sem votação por blocos. O MT4 é opcional.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -21144,7 +21261,7 @@ async def pre_signals(
     if engine == "LARRY":
         return {
             "ok": True,
-            "message": "LARRY BREAKOUT usa somente candle fechado; pré-sinal na vela em formação fica desativado para não repintar.",
+            "message": "LARRY BREAKOUT + TAURUS usa somente candle fechado; pré-sinal na vela em formação fica desativado para não repintar.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -21301,7 +21418,7 @@ async def pre_signals(
             "EA": "EA Tripla",
             "RUBIK": "Robô Rubik Adaptado",
             "BLACKBOOK": "BLACK BOOK",
-            "LARRY": "Larry Breakout",
+            "LARRY": "Larry Breakout + Taurus",
             "RANGE": "Range Compression Breakout",
             "VELOCITY": "Velocity Flow",
             "SNIPER": "SUPER SIGNALS CHANNEL NR",
@@ -21865,16 +21982,16 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             try:
                 payload = await signal(sym, interval, market, iq_rtm, request=request, ai_only=True, engine="RTM", entry_mode="MIDDLE")
             except Exception as exc:
-                payload = {"direction":"NEUTRO","confidence":0.0,"status":"RTM MULTI INDIVIDUAL • AGUARDANDO FONTE","reason":str(exc)[:160]}
+                payload = {"direction":"NEUTRO","confidence":0.0,"status":"RTM MULTI + TAURUS • AGUARDANDO FONTE","reason":str(exc)[:160]}
             direction = str(payload.get("direction") or "NEUTRO").upper()
             out.append({
                 "symbol": sym, "base_symbol": sym, "direction": direction,
                 "confidence": round(float(payload.get("confidence") or 0.0), 1),
-                "status": str(payload.get("status") or "RTM MULTI INDIVIDUAL • MONITORANDO"),
+                "status": str(payload.get("status") or "RTM MULTI + TAURUS • MONITORANDO"),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": payload.get("announce_time"), "feed_source": payload.get("feed_source") or ("IQ_OPTION_OTC" if market=="IQ_OTC" else "MULTIFEED"),
                 "feed_fallback": bool(payload.get("feed_fallback",False)), "requested_market": market, "engine": "RTM",
-                "strategy": str(payload.get("strategy") or "RTM MULTI • GATILHOS INDIVIDUAIS"),
+                "strategy": str(payload.get("strategy") or "RTM MULTI + TAURUS • GATILHOS INDIVIDUAIS"),
             })
         return out
 
@@ -21956,7 +22073,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         elif engine == "LARRY":
             if market == "IQ_OTC":
                 if not iq_state:
-                    raise RuntimeError("Conecte a IQ Option para o Larry Breakout analisar OTC.")
+                    raise RuntimeError("Conecte a IQ Option para o Larry Breakout + Taurus analisar OTC.")
                 raw = await iq_ea_candles(iq_state, sym, interval, 120, regular_market=False)
             else:
                 raw = await candles(sym, interval, 120, "OPEN", None, request=request)
@@ -22121,9 +22238,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "LARRY":
                 tech = larry_breakout_strategy(closed, interval, market=market)
-                engine_label = "LARRY BREAKOUT"
+                engine_label = "LARRY BREAKOUT + TAURUS"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why = str(tech.get("reason") or "Larry Breakout monitorando").replace("\n", " ")[:88]
+                why = str(tech.get("reason") or "Larry Breakout + Taurus monitorando").replace("\n", " ")[:88]
                 status_text = (
                     f"{engine_label} • OPORTUNIDADE ENCONTRADA"
                     if direction != "NEUTRO"
@@ -22435,7 +22552,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         elif engine == "BLACKBOOK":
             source_status = "BLACK BOOK • FONTE EM ESPERA" if market == "OPEN" else "BLACK BOOK • IQ OPTION OTC EM ESPERA"
         elif engine == "LARRY":
-            source_status = "LARRY BREAKOUT • FONTE EM ESPERA" if market == "OPEN" else "LARRY BREAKOUT • IQ OPTION OTC EM ESPERA"
+            source_status = "LARRY BREAKOUT + TAURUS • FONTE EM ESPERA" if market == "OPEN" else "LARRY BREAKOUT + TAURUS • IQ OPTION OTC EM ESPERA"
         elif engine == "RANGE":
             source_status = "RANGE COMPRESSION • FONTE EM ESPERA" if market == "OPEN" else "RANGE COMPRESSION • IQ OPTION OTC EM ESPERA"
         elif engine == "VELOCITY":
@@ -22885,7 +23002,7 @@ async def result(
     - LOSS/empate no G1 => aguarda G2.
     - WIN no G2 => WIN G2; caso contrário => LOSS G2.
 
-    ``direct_only=true`` fecha somente a primeira vela. EA Tripla, EA Força, BIGRISE, LARRY BREAKOUT, VELOCITY FLOW, SUPER SIGNALS CHANNEL NR, COMBINER FLOW + RSI, ALPHAX RELAY e RSI + ADX AFIADO
+    ``direct_only=true`` fecha somente a primeira vela. EA Tripla, EA Força, BIGRISE, LARRY BREAKOUT + TAURUS, VELOCITY FLOW, SUPER SIGNALS CHANNEL NR, COMBINER FLOW + RSI, ALPHAX RELAY e RSI + ADX AFIADO
     usam esse modo; os demais motores podem acompanhar G1/G2.
     """
     if not expiry_time:
@@ -23405,7 +23522,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • BLACK BOOK • RTM MULTI INDIVIDUAL • EXTREME TMA + RSI + TREND • RSI TRIPLO 7/14/28 • ROBO FIBO + RSI + EMA • 3 LINE BREAK + RSI • RSI DIVERGENCE + BOLLINGER • TAURUS + SUPER SENEGAL • COMBINER + SUPER SIGNAL RSI • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • BLACK BOOK • RTM MULTI + TAURUS • EXTREME TMA + RSI + TREND • RSI TRIPLO 7/14/28 • ROBO FIBO + RSI + EMA • 3 LINE BREAK + RSI • RSI DIVERGENCE + BOLLINGER • TAURUS + SUPER SENEGAL • COMBINER + SUPER SIGNAL RSI • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -23474,8 +23591,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="robot-mode-card" id="rtmModeCard">
     <img src="__MEGA_IMAGE__" alt="RTM Multi EA">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">🤖 RTM MULTI INDIVIDUAL</div>
-      <div class="robot-mode-desc" id="rtmModeDesc">30 gatilhos individuais • somente BTC/USD + pares JPY • cada indicador/padrão pode liberar sozinho • sem votação por blocos • sem confluência obrigatória • pré-alerta 20s.</div>
+      <div class="robot-mode-title">🤖 RTM MULTI + TAURUS</div>
+      <div class="robot-mode-desc" id="rtmModeDesc">30 gatilhos individuais • somente BTC/USD + pares JPY • cada gatilho continua independente • Taurus confirma a mesma direção • sem votação por blocos • pré-alerta 20s.</div>
     </div>
     <button id="rtmPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -23499,9 +23616,9 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   <div class="robot-mode-card" id="larryModeCard">
-    <img src="__MEGA_IMAGE__" alt="Larry Breakout">
+    <img src="__MEGA_IMAGE__" alt="Larry Breakout + Taurus">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">⚡ LARRY BREAKOUT</div>
+      <div class="robot-mode-title">⚡ LARRY BREAKOUT + TAURUS</div>
       <div class="robot-mode-desc" id="larryModeDesc">Rompimento + força/expansão de vela • candles fechados • OPEN + OTC IQ • sem Grid, Martingale ou Gale.</div>
     </div>
     <button id="larryPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
@@ -25544,8 +25661,8 @@ function momentStudyEngineName(key){
   const names={
     GRAPH_AI:'🧠 IA GRÁFICA',
     SMART:'🧠 IA LEITURA DO GRÁFICO',
-    RTM:'🤖 RTM MULTI INDIVIDUAL',
-    LARRY:'⚡ LARRY BREAKOUT',
+    RTM:'🤖 RTM MULTI + TAURUS',
+    LARRY:'⚡ LARRY BREAKOUT + TAURUS',
     VELOCITY:'⚡ VELOCITY FLOW',
     ALPHAX:'🧬 ALPHAX RELAY',
     SNIPER:'🎯 SUPER SIGNALS CHANNEL NR',
@@ -28178,7 +28295,7 @@ function applyRobotPowerState(){
     : 'OFFLINE: Range Compression pausado.';
   if(larryModeDesc) larryModeDesc.textContent=larryEnabled
     ? 'ONLINE: rompimento + força/expansão de vela • candles fechados • OPEN/OTC • sem Grid, Martingale ou Gale.'
-    : 'OFFLINE: Larry Breakout pausado.';
+    : 'OFFLINE: Larry Breakout + Taurus pausado.';
   if(sniperModeDesc) sniperModeDesc.textContent=sniperEnabled
     ? 'ONLINE: canal causal 18 + rejeição + RSI interno • candle fechado • próxima vela • sem repaint.'
     : 'OFFLINE: Super Signals Channel NR pausado.';
@@ -28237,7 +28354,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: suporte/resistência confirmado + reação da vela + RSI 14 • próxima vela • sem repaint.'
     : 'OFFLINE: COMBINER FLOW + RSI pausado.';
 
-  if(rtmModeDesc) rtmModeDesc.textContent=rtmEnabled ? 'ONLINE: 30 gatilhos individuais • somente BTC/USD + pares JPY • qualquer gatilho válido pode liberar sozinho • sem blocos • sem confluência obrigatória • pré-alerta 20s.' : 'OFFLINE: RTM MULTI INDIVIDUAL pausado • BLACK BOOK permanece separado.';
+  if(rtmModeDesc) rtmModeDesc.textContent=rtmEnabled ? 'ONLINE: 30 gatilhos individuais • somente BTC/USD + pares JPY • cada gatilho continua independente • Taurus confirma a mesma direção • sem votação por blocos • pré-alerta 20s.' : 'OFFLINE: RTM MULTI + TAURUS pausado • BLACK BOOK permanece separado.';
   const engine=selectedRobotEngine();
   if(engine==='RTM'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RTM ONLINE • SOMENTE BTC/USD + PARES JPY • GATILHOS ANALISANDO CANDLES NO APP';
@@ -28335,9 +28452,9 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar Range Compression ativo • procurando compressão, rompimento e rejeição por pavio</div>';
     rad();
   }else if(engine==='LARRY'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='LARRY BREAKOUT ONLINE • ROMPIMENTO + FORÇA DE VELA • OPEN + OTC • SEM GALE';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Larry Breakout selecionado • somente candles fechados para não repintar.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar Larry Breakout ativo • procurando rompimentos confirmados</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='LARRY BREAKOUT + TAURUS ONLINE • ROMPIMENTO + FORÇA DE VELA • OPEN + OTC • SEM GALE';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Larry Breakout + Taurus selecionado • somente candles fechados para não repintar.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar Larry Breakout + Taurus ativo • procurando rompimentos confirmados</div>';
     rad();
   }else if(engine==='FORCE'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EA FORÇA DO MOVIMENTO ONLINE • CONFIGURAÇÃO PROTEGIDA • FOCO EM WIN DIRETO';
@@ -28366,7 +28483,7 @@ function applyRobotPowerState(){
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, IA Leitura do Gráfico, IA + Volume POC, Larry Breakout, Velocity Flow, AlphaX e Super Signals Channel NR estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, IA Leitura do Gráfico, IA + Volume POC, Larry Breakout + Taurus, Velocity Flow, AlphaX e Super Signals Channel NR estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -28578,7 +28695,7 @@ async function setLarryPower(enabled){
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled) speak(larryEnabled ? 'Larry Breakout online.' : 'Larry Breakout offline.');
+  if(voiceEnabled) speak(larryEnabled ? 'Larry Breakout + Taurus online.' : 'Larry Breakout + Taurus offline.');
 }
 
 async function setForcePower(enabled){
@@ -29750,7 +29867,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI INDIVIDUAL':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
@@ -29872,7 +29989,7 @@ async function loadPreSignals(){
     return;
   }
   if(engine==='RTM'){
-    if(preSignalStatus) preSignalStatus.textContent='RTM MULTI INDIVIDUAL • somente BTC/USD + pares JPY • pré-alerta dentro do app • sem blocos.';
+    if(preSignalStatus) preSignalStatus.textContent='RTM MULTI + TAURUS • somente BTC/USD + pares JPY • gatilho RTM independente + confirmação Taurus • pré-alerta dentro do app.';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 RTM monitorando somente BTC/USD + pares JPY • 30 gatilhos independentes • 20s antes • próxima vela.</div>';
     return;
   }
