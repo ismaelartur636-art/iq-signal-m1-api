@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.6"
+APP_VERSION = "3.96.7"
 PWA_VERSION = "v170"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -1569,11 +1569,10 @@ cache: Dict[str, Any] = {}
 # sinal na mesma direção.
 signal_release_state: Dict[str, Any] = {}
 
-# MEGA IA 3.14 — trava por ATIVO para as IAs.
+# MEGA IA 3.96.7 — trava por ATIVO para as IAs.
 # Depois que IA Gráfica ou Inteligência Artificial libera uma entrada, o mesmo
-# ativo fica bloqueado para NOVOS CALL/PUT (inclusive se o usuário trocar entre
-# as duas IAs ou mudar o timeframe) até /result fechar a sequência completa:
-# WIN direto, WIN G1, WIN G2 ou LOSS G2. Outros ativos continuam livres.
+# ativo fica bloqueado para NOVOS CALL/PUT até /result fechar a vela da entrada.
+# Todos os motores trabalham sem G1/G2; outros ativos continuam livres.
 AI_ASSET_CYCLE_ENGINES = {"GRAPH_AI", "SMART"}
 ai_asset_cycle_locks: Dict[str, Dict[str, Any]] = {}
 ai_asset_cycle_guard = threading.RLock()
@@ -15232,17 +15231,11 @@ def _ai_asset_cycle_snapshot(market: str, symbol: str):
 def _ai_asset_cycle_stage(lock: Dict[str, Any]) -> str:
     try:
         expiry_dt = parse_dt(str(lock.get("expiry_time") or ""))
-        step = timedelta(seconds=INTERVALS.get(str(lock.get("interval") or "1min"), 60))
-        current = now()
-        if current < expiry_dt:
+        if now() < expiry_dt:
             return "ENTRADA"
-        if current < expiry_dt + step:
-            return "GALE 1"
-        if current < expiry_dt + (step * 2):
-            return "GALE 2"
-        return "APURANDO RESULTADO FINAL"
+        return "APURANDO RESULTADO DIRETO"
     except Exception:
-        return "AGUARDANDO RESULTADO FINAL"
+        return "AGUARDANDO RESULTADO DIRETO"
 
 
 def _acquire_ai_asset_cycle_lock(payload: Dict[str, Any], engine: str) -> bool:
@@ -15268,7 +15261,7 @@ def _acquire_ai_asset_cycle_lock(payload: Dict[str, Any], engine: str) -> bool:
         "expiry_time": payload.get("expiry_time"),
         "strategy": payload.get("strategy"),
         "locked_at": iso(now()),
-        "waiting_until": "FINAL_RESULT_UP_TO_G2",
+        "waiting_until": "DIRECT_RESULT",
     }
     with ai_asset_cycle_guard:
         # Nunca substitui um ciclo ainda pendente por outro sinal.
@@ -15313,7 +15306,7 @@ def _ai_asset_cycle_block_signal(symbol: str, interval: str, market: str, engine
         symbol, interval, market,
         f"ATIVO BLOQUEADO • {stage}",
         (f"{symbol} já possui uma operação de IA em andamento. "
-         f"Nenhum novo CALL/PUT será liberado neste ativo até sair o resultado final da sequência até Gale 2."),
+         f"Nenhum novo CALL/PUT será liberado neste ativo até sair o resultado direto da entrada."),
         source_state="READY",
     )
     out.update({
@@ -15325,7 +15318,7 @@ def _ai_asset_cycle_block_signal(symbol: str, interval: str, market: str, engine
         "asset_cycle_direction": lock.get("direction"),
         "asset_cycle_entry_time": lock.get("entry_time"),
         "asset_cycle_expiry_time": lock.get("expiry_time"),
-        "asset_cycle_waiting_until": "FINAL_RESULT_UP_TO_G2",
+        "asset_cycle_waiting_until": "DIRECT_RESULT",
     })
     return out
 
@@ -20096,8 +20089,8 @@ async def telegram_send(body: TelegramSignalBody):
         if not bool(background_bot_state.get("telegram_enabled")):
             raise HTTPException(409, "Telegram automático está OFF no painel.")
         if result_label:
-            if result_label not in ("WIN", "LOSS", "WIN G1", "WIN G2", "LOSS G2"):
-                raise HTTPException(400, "Somente resultados finais WIN/LOSS/WIN G1/WIN G2/LOSS G2 podem ser enviados automaticamente ao Telegram.")
+            if result_label not in ("WIN", "LOSS"):
+                raise HTTPException(400, "Somente resultados finais WIN/LOSS podem ser enviados automaticamente ao Telegram.")
         elif direction not in ("CALL", "PUT"):
             raise HTTPException(400, "Somente sinais CALL ou PUT confirmados podem ser enviados.")
     return await _tg_send(body)
@@ -20107,8 +20100,8 @@ async def telegram_send(body: TelegramSignalBody):
 # MEGA IA 3.72 — execução em segundo plano no servidor; motor só muda por clique explícito
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
-    "GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY",
-    "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM",
+    # MEGA IA 3.96.7 — somente os motores que permaneceram no painel.
+    "GRAPH_AI", "SMART", "LARRY", "SNIPER", "TAURUSRSIDIV", "ALPHAX", "VOLUME_AI",
 }
 
 
@@ -20277,7 +20270,7 @@ def _background_accounting_remember(payload: Dict[str, Any], iq_state: Dict[str,
         "engine": payload.get("selected_engine") or payload.get("engine") or payload.get("mode") or "",
         "confidence": float(payload.get("confidence") or 0.0),
         "risk": str(payload.get("risk") or ""),
-        "direct_only": bool(payload.get("direct_only", False) or payload.get("direct_win_only", False) or engine_name == "RTM"),
+        "direct_only": True,  # 3.96.7: todos os motores sem Gale; LOSS encerra esta entrada.
         "trigger_indicator": payload.get("trigger_indicator") or rtm_meta.get("trigger_indicator"),
         "trigger_score": payload.get("trigger_score") if payload.get("trigger_score") is not None else rtm_meta.get("trigger_score"),
     }
@@ -20310,7 +20303,7 @@ def _background_accounting_finish(trade: Dict[str, Any], result_label: str, cand
         "engine": trade.get("engine") or "",
         "confidence": float(trade.get("confidence") or 0.0),
         "risk": str(trade.get("risk") or ""),
-        "direct_only": bool(trade.get("direct_only", False) or str(trade.get("engine") or "").upper() == "RTM"),
+        "direct_only": True,  # 3.96.7: todos os motores sem Gale.
         "trigger_indicator": trade.get("trigger_indicator"),
         "trigger_score": trade.get("trigger_score"),
     }
@@ -20572,7 +20565,7 @@ async def _background_bot_loop() -> None:
                             "confidence": float(payload.get("confidence") or 0.0),
                             "risk": str(payload.get("risk") or "--"),
                             "strategy": str(payload.get("strategy") or engine),
-                            "direct_only": bool(payload.get("direct_only", False) or payload.get("direct_win_only", False) or engine == "RTM"),
+                            "direct_only": True,  # 3.96.7: fila 24h também fecha na primeira vela.
                             "trigger_indicator": payload.get("trigger_indicator") or ((payload.get("rtm_individual") or {}).get("trigger_indicator") if isinstance(payload.get("rtm_individual"), dict) else None),
                             "trigger_score": payload.get("trigger_score") if payload.get("trigger_score") is not None else (((payload.get("rtm_individual") or {}).get("trigger_score")) if isinstance(payload.get("rtm_individual"), dict) else None),
                             "telegram_notify": True,
@@ -23333,7 +23326,7 @@ def _remember_accounting_signal(request: Request, payload: Dict[str, Any]):
         "engine": payload.get("selected_engine") or payload.get("engine") or payload.get("mode") or "",
         "confidence": float(payload.get("confidence") or 0.0),
         "risk": str(payload.get("risk") or ""),
-        "direct_only": bool(payload.get("direct_only", False) or payload.get("direct_win_only", False) or engine_name == "RTM"),
+        "direct_only": True,  # 3.96.7: todos os motores sem Gale; LOSS encerra esta entrada.
         "external_ai": bool(payload.get("external_ai", False)),
         "trigger_indicator": payload.get("trigger_indicator") or rtm_meta.get("trigger_indicator"),
         "trigger_score": payload.get("trigger_score") if payload.get("trigger_score") is not None else rtm_meta.get("trigger_score"),
@@ -23423,7 +23416,7 @@ async def performance(request: Request, interval="1min", market="OPEN"):
     else:
         direct_store = results.setdefault(market, {})
 
-    # Diagnóstico da primeira vela (LOSS DIRETO = foi para Gale).
+    # Diagnóstico da vela da entrada (LOSS direto; não existe Gale).
     for x in direct_store.values():
         entry_result = str(x.get("entry_result") or "").upper()
         if entry_result in ("WIN", "LOSS", "DRAW"):
@@ -23435,8 +23428,8 @@ async def performance(request: Request, interval="1min", market="OPEN"):
     loss_direct = sum(1 for x in merged_direct.values() if x.get("result") == "LOSS")
     draws = sum(1 for x in merged_direct.values() if x.get("result") == "DRAW")
 
-    # Resultado FINAL por operação. Resultado de Gale sempre prevalece sobre
-    # o resultado da primeira vela. LOSS da primeira vela não é LOSS final.
+    # Resultado FINAL por operação. Novas operações são sempre diretas, sem G1/G2.
+    # Entradas antigas com G1/G2 podem permanecer no histórico legado.
     final_ops = {}
     for x in done.values():
         r_done = str(x.get("result") or "").upper()
@@ -23611,17 +23604,11 @@ async def result(
     direct_only: bool = False,
     engine: str = "",
 ):
-    """Apura a entrada e, quando habilitado, acompanha G1 e G2.
+    """Apura somente a vela da entrada.
 
-    Regras:
-    - WIN na entrada => WIN direto.
-    - LOSS na entrada => aguarda G1.
-    - WIN no G1 => WIN G1.
-    - LOSS/empate no G1 => aguarda G2.
-    - WIN no G2 => WIN G2; caso contrário => LOSS G2.
-
-    ``direct_only=true`` fecha somente a primeira vela. EA Tripla, EA Força, BIGRISE, LARRY BREAKOUT + TAURUS, VELOCITY FLOW, SUPER SIGNALS CHANNEL NR, COMBINER FLOW + RSI, ALPHAX RELAY e RSI + ADX AFIADO
-    usam esse modo; os demais motores podem acompanhar G1/G2.
+    MEGA IA 3.96.7: todos os motores trabalham sem Gale. WIN/LOSS/DRAW encerra
+    a operação atual; qualquer recuperação financeira acontece somente no
+    próximo sinal confirmado, nunca em G1/G2 da mesma operação.
     """
     if not expiry_time:
         raise HTTPException(400, "expiry_time é obrigatório.")
@@ -23630,11 +23617,10 @@ async def result(
     direction = (direction or "CALL").upper()
     engine = str(engine or "").upper()
 
-    # MEGA IA 3.96.2 — regra EXCLUSIVA da RTM:
-    # nunca acompanha G1/G2. Um LOSS encerra a operação atual e a recuperação
-    # financeira, quando houver AUTO ENTRADA, fica somente para o próximo sinal RTM.
-    if engine == "RTM":
-        direct_only = True
+    # MEGA IA 3.96.7 — regra global: SEM GALE para todos os motores.
+    # Um LOSS encerra a entrada atual. A recuperação de valor, quando usada,
+    # é preparada exclusivamente para o próximo sinal confirmado.
+    direct_only = True
 
     # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
@@ -23932,44 +23918,7 @@ async def result(
     if direct_only:
         return finalize("LOSS", "ENTRADA", base, "LOSS", final_expiry_dt=expiry_dt)
 
-    # ------------------------- GALE 1 -------------------------
-    g1_entry_dt = expiry_dt
-    g1_expiry_dt = g1_entry_dt + step
-    if now() < g1_expiry_dt + timedelta(seconds=2):
-        return pending_payload("G1", g1_expiry_dt, entry_result="LOSS")
 
-    g1 = await ensure_candle(g1_entry_dt)
-    if not g1:
-        return waiting_candle("G1", entry_result="LOSS")
-
-    g1_result = candle_result(g1)
-    if g1_result == "WIN":
-        return finalize(
-            "WIN G1", "G1", g1, "LOSS",
-            g1_result="WIN", final_expiry_dt=g1_expiry_dt,
-        )
-
-    # ------------------------- GALE 2 -------------------------
-    g2_entry_dt = g1_expiry_dt
-    g2_expiry_dt = g2_entry_dt + step
-    if now() < g2_expiry_dt + timedelta(seconds=2):
-        return pending_payload("G2", g2_expiry_dt, entry_result="LOSS", g1_result=g1_result)
-
-    g2 = await ensure_candle(g2_entry_dt)
-    if not g2:
-        return waiting_candle("G2", entry_result="LOSS", g1_result=g1_result)
-
-    g2_result = candle_result(g2)
-    if g2_result == "WIN":
-        return finalize(
-            "WIN G2", "G2", g2, "LOSS",
-            g1_result=g1_result, g2_result="WIN", final_expiry_dt=g2_expiry_dt,
-        )
-
-    return finalize(
-        "LOSS G2", "G2", g2, "LOSS",
-        g1_result=g1_result, g2_result=g2_result, final_expiry_dt=g2_expiry_dt,
-    )
 
 
 HTML_PAGE = r"""
@@ -24140,7 +24089,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • BLACK BOOK • RTM MULTI + TAURUS • EXTREME TMA + RSI + TREND • RSI TRIPLO 7/14/28 • ROBO FIBO + RSI + EMA • 3 LINE BREAK + RSI • RSI DIVERGENCE + BOLLINGER • TAURUS + SUPER SENEGAL • TAURUS EA • TAURUS + RSI DIV • COMBINER + SUPER SIGNAL RSI • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • IA GRÁFICA • IA LEITURA DO GRÁFICO • IA + VOLUME POC • LARRY BREAKOUT + TAURUS • ALPHAX RELAY • SUPER SIGNALS CHANNEL NR • TAURUS + RSI DIV • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -24168,7 +24117,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <div id="btcOnlyNote" class="label" style="display:none;grid-column:1/-1">Modo BTC/USD ativo • painel, gráfico, pré-alerta e radar focados somente neste ativo.</div>
 
     <button id="adaptiveLearningBtn" type="button" style="font-weight:1000">🧠 APRENDIZADO WIN DIRETO • ON</button>
-    <div id="adaptiveLearningNote" class="label" style="grid-column:1/-1">Coletando resultados por ativo • prioridade: WIN na primeira entrada; G1/G2 têm peso reduzido.</div>
+    <div id="adaptiveLearningNote" class="label" style="grid-column:1/-1">Coletando resultados por ativo • cada entrada fecha em WIN/LOSS/DRAW • sem G1/G2.</div>
 
     <select id="interval">
       <option>1min</option>
@@ -24192,34 +24141,16 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="IA Gráfica">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧠 IA GRÁFICA</div>
-      <div class="robot-mode-desc" id="robotModeDesc">Price action • padrões de vela • regiões H1 • Dow H4 • LTA/LTB • candles fechados.</div>
+      <div class="robot-mode-desc" id="robotModeDesc">Price action • padrões de vela • regiões H1 • Dow H4 • LTA/LTB • candles fechados • sem Gale • recuperação só no próximo sinal.</div>
     </div>
     <button id="robotPowerBtn" type="button" style="font-weight:900">🟢 ONLINE</button>
-  </div>
-
-  <div class="robot-mode-card" id="blackbookModeCard">
-    <img src="__MEGA_IMAGE__" alt="Black Book">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">📕 BLACK BOOK</div>
-      <div class="robot-mode-desc" id="blackbookModeDesc">Price Action do ebook • Força • Negação/Força • Fim de Movimento • Descanso • 3x1 • Retração • Rompimento • Pullback • candle fechado • próxima vela • sem Gale.</div>
-    </div>
-    <button id="blackbookPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-  <div class="robot-mode-card" id="rtmModeCard">
-    <img src="__MEGA_IMAGE__" alt="RTM Multi EA">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🤖 RTM MULTI + TAURUS</div>
-      <div class="robot-mode-desc" id="rtmModeDesc">30 gatilhos individuais • somente BTC/USD + pares JPY • cada gatilho continua independente • Taurus confirma a mesma direção • sem votação por blocos • pré-alerta 20s.</div>
-    </div>
-    <button id="rtmPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
   <div class="robot-mode-card" id="aiModeCard">
     <img src="__MEGA_IMAGE__" alt="IA Leitura do Gráfico">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧠 IA LEITURA DO GRÁFICO</div>
-      <div class="robot-mode-desc" id="aiModeDesc">ONLINE FLEX • IA decide com 1 evidência • Trend Filter obrigatório: VERDE só CALL / VERMELHO só PUT • próxima vela.</div>
+      <div class="robot-mode-desc" id="aiModeDesc">ONLINE FLEX • IA decide com 1 evidência • Trend Filter obrigatório: VERDE só CALL / VERMELHO só PUT • próxima vela • sem Gale • recuperação só no próximo sinal.</div>
     </div>
     <button id="aiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -24228,7 +24159,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="IA + Volume POC">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧠 IA + VOLUME POC</div>
-      <div class="robot-mode-desc" id="volumePocAiModeDesc">MODO FLEX • Volume POC + IA + Trend Filter obrigatoriamente alinhados • VERDE só CALL / VERMELHO só PUT • próxima vela.</div>
+      <div class="robot-mode-desc" id="volumePocAiModeDesc">MODO FLEX • Volume POC + IA + Trend Filter obrigatoriamente alinhados • VERDE só CALL / VERMELHO só PUT • próxima vela • sem Gale • recuperação só no próximo sinal.</div>
     </div>
     <button id="volumePocAiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -24237,7 +24168,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Larry Breakout + Taurus">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">⚡ LARRY BREAKOUT + TAURUS</div>
-      <div class="robot-mode-desc" id="larryModeDesc">Rompimento + força/expansão de vela • candles fechados • OPEN + OTC IQ • sem Grid, Martingale ou Gale.</div>
+      <div class="robot-mode-desc" id="larryModeDesc">Rompimento + força/expansão de vela • candles fechados • OPEN + OTC IQ • sem Grid/Martingale/Gale • recuperação só no próximo sinal.</div>
     </div>
     <button id="larryPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -24248,7 +24179,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="AlphaX RELAY">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🧬 ALPHAX RELAY</div>
-      <div class="robot-mode-desc" id="alphaxModeDesc">AlphaX + zonas rápidas • fractal/institucional • microimpulso • LWMA/MACD • sinal ~30s antes • entrada na próxima vela.</div>
+      <div class="robot-mode-desc" id="alphaxModeDesc">AlphaX + zonas rápidas • fractal/institucional • microimpulso • LWMA/MACD • sinal ~30s antes • próxima vela • sem Gale • recuperação só no próximo sinal.</div>
     </div>
     <button id="alphaxPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -24259,39 +24190,9 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Super Signals Channel NR">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🎯 SUPER SIGNALS CHANNEL NR</div>
-      <div class="robot-mode-desc" id="sniperModeDesc">Canal causal mais solto de 18 candles • rejeição em suporte/resistência • somente candle fechado • CALL/PUT para a próxima vela • sem repaint.</div>
+      <div class="robot-mode-desc" id="sniperModeDesc">Canal causal mais solto de 18 candles • rejeição em suporte/resistência • candle fechado • próxima vela • sem repaint • sem Gale • recuperação só no próximo sinal.</div>
     </div>
     <button id="sniperPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-
-  <div class="robot-mode-card" id="bobSenegalModeCard">
-    <img src="__MEGA_IMAGE__" alt="BOB 05 + Super Senegal">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">👑🎯 BOB 05 + SUPER SENEGAL</div>
-      <div class="robot-mode-desc" id="bobSenegalModeDesc">M1 • BOB 05 original: RSI2 + TMA/StdDev 120×0,7 • Super Senegal confirma tendência + ADX/DMI • próxima vela • expiração 1 min • sem Gale.</div>
-    </div>
-    <button id="bobSenegalPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-
-  <div class="robot-mode-card" id="taurusSenegalModeCard">
-    <img src="__MEGA_IMAGE__" alt="Taurus + Super Senegal">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🐂🎯 TAURUS + SUPER SENEGAL</div>
-      <div class="robot-mode-desc" id="taurusSenegalModeDesc">M1 TESTE • Taurus S/R ou LTA/LTB + Senegal PMAX/Z + ADX/DMI + volume • 4 min entre sinais • próxima vela • expiração 1 min • sem Gale.</div>
-    </div>
-    <button id="taurusSenegalPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-
-  <div class="robot-mode-card" id="taurusEaModeCard">
-    <img src="__MEGA_IMAGE__" alt="Taurus EA">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🐂⚙️ TAURUS EA</div>
-      <div class="robot-mode-desc" id="taurusEaModeDesc">Graal EA: EMA13(CLOSE) × EMA34(OPEN) + Momentum14/0,1 • Taurus confirma S/R ou LTA/LTB • candle fechado • próxima vela • sem Gale.</div>
-    </div>
-    <button id="taurusEaPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
 
@@ -24299,75 +24200,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Taurus + RSI DIV">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🐂📉 TAURUS + RSI DIV</div>
-      <div class="robot-mode-desc" id="taurusRsiDivModeDesc">RSI 8 + T3 8 + divergências regulares/ocultas • Taurus confirma S/R ou LTA/LTB • candle fechado • próxima vela • sem Gale.</div>
+      <div class="robot-mode-desc" id="taurusRsiDivModeDesc">RSI 8 + T3 8 + divergências regulares/ocultas • Taurus confirma S/R ou LTA/LTB • candle fechado • próxima vela • sem Gale • recuperação só no próximo sinal.</div>
     </div>
     <button id="taurusRsiDivPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
-
-
-  <div class="robot-mode-card" id="rsiDivBbModeCard">
-    <img src="__MEGA_IMAGE__" alt="RSI Divergence + Bollinger">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">📉 RSI DIVERGENCE + BOLLINGER</div>
-      <div class="robot-mode-desc" id="rsiDivBbModeDesc">RSI 14 detecta divergência • Bollinger 20/2 confirma a zona • candle fechado • entrada na próxima vela • sem repaint.</div>
-    </div>
-    <button id="rsiDivBbPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-  <div class="robot-mode-card" id="tmaRsiModeCard">
-    <img src="__MEGA_IMAGE__" alt="Extreme TMA + RSI + Trend Filter">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🎯 EXTREME TMA + RSI + TREND FILTER</div>
-      <div class="robot-mode-desc" id="tmaRsiModeDesc">TMA 17 causal + ATR 100×1,7 + RSI 7 (35/65) • Trend Filter EMA 9/21 obrigatório • candle fechado • próxima vela • sem repaint.</div>
-    </div>
-    <button id="tmaRsiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-
-  <div class="robot-mode-card" id="tlbRsiModeCard">
-    <img src="__MEGA_IMAGE__" alt="3 Line Break + RSI">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🧱 3 LINE BREAK + RSI</div>
-      <div class="robot-mode-desc" id="tlbRsiModeDesc">Zonas 3 Line Break LB=3 + RSI 14 • nível causal congelado antes da confirmação • candle fechado • próxima vela • sem repaint.</div>
-    </div>
-    <button id="tlbRsiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-
-  <div class="robot-mode-card" id="tripleRsiModeCard">
-    <img src="__MEGA_IMAGE__" alt="RSI Triplo 7 14 28">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🔥 RSI TRIPLO 7/14/28</div>
-      <div class="robot-mode-desc" id="tripleRsiModeDesc">RSI 7 rápido + RSI 14 confirmação + RSI 28 direção • 3 alinhados • sinal ~10s antes • entrada na próxima vela.</div>
-    </div>
-    <button id="tripleRsiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-
-  <div class="robot-mode-card" id="roboFiboModeCard">
-    <img src="__MEGA_IMAGE__" alt="RoboFibo">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🌀 ROBO FIBO + RSI + EMA</div>
-      <div class="robot-mode-desc" id="roboFiboModeDesc">Fibonacci 23,6/76,4 de 20 candles + RSI 14 + EMA 60 • rejeição em candle fechado • entrada na próxima vela • sem repaint.</div>
-    </div>
-    <div style="display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end">
-      <button id="roboFiboPocBtn" type="button" style="font-weight:900">📊 POC OFF</button>
-      <button id="roboFiboPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-    </div>
-  </div>
-
-
-  <div class="robot-mode-card" id="combinerModeCard">
-    <img src="__MEGA_IMAGE__" alt="COMBINER FLOW + RSI">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🔀 COMBINER FLOW + RSI</div>
-      <div class="robot-mode-desc" id="combinerModeDesc">S/R confirmado + reação da vela + RSI 14 + EMA21 de contexto • candle fechado • próxima vela • sem repaint.</div>
-    </div>
-    <button id="combinerPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-
-
 
 
   <div class="tabs">
@@ -24521,28 +24357,16 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
   <div id="resultsTab" class="tab">
     <div class="card">
-      <h2 style="margin-top:0">🎯 Resultados até Gale 2</h2>
-      <div class="label">ACOMPANHAMENTO DA ENTRADA • G1 • G2</div>
+      <h2 style="margin-top:0">🎯 Resultados diretos</h2>
+      <div class="label">UMA ENTRADA • UMA VELA • SEM GALE</div>
 
       <div class="grid" style="margin-top:12px">
         <div class="card">
-          <div class="label">WIN DIRETO</div>
+          <div class="label">WIN</div>
           <div id="winDirect" class="big call">0</div>
         </div>
-
         <div class="card">
-          <div class="label">WIN G1</div>
-          <div id="winG1" class="big call">0</div>
-        </div>
-
-        <div class="card">
-          <div class="label">WIN G2</div>
-          <div id="winG2" class="big call">0</div>
-        </div>
-
-
-        <div class="card">
-          <div class="label">LOSS G2</div>
+          <div class="label">LOSS</div>
           <div id="lossG2" class="big put">0</div>
         </div>
       </div>
@@ -24558,9 +24382,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
 
       <div class="label" style="margin-top:10px;line-height:1.5">
-        WIN DIRETO mostra as operações que venceram na primeira vela.
-        No placar principal, WIN G1 e WIN G2 contam como WIN; LOSS só é contado se perder até o G2.
-        Cada operação é contabilizada uma única vez e o histórico fica salvo neste aparelho.
+        Cada sinal fecha em WIN, LOSS ou DRAW na vela da própria entrada.
+        Se houver LOSS, não abre G1/G2: a recuperação de valor fica somente para o próximo sinal confirmado.
       </div>
     </div>
   </div>
@@ -24641,7 +24464,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
       <div id="historyList" style="display:grid;gap:8px;margin-top:12px"></div>
       <div class="label" style="margin-top:12px;line-height:1.5">
-        O histórico guarda o resultado final de cada operação neste aparelho por até 15 dias: WIN, WIN G1, WIN G2 ou LOSS G2.
+        O histórico guarda o resultado de cada entrada neste aparelho por até 15 dias: WIN, LOSS ou DRAW. Não existe G1/G2.
       </div>
     </div>
   </div>
@@ -24843,22 +24666,19 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
                    style="width:100%;box-sizing:border-box;margin-top:5px">
           </div>
           <div>
-            <div class="label">NÍVEL DE GALE</div>
-            <select id="autoTradeGale" style="width:100%;margin-top:5px">
+            <div class="label">MODO DE OPERAÇÃO</div>
+            <select id="autoTradeGale" disabled style="width:100%;margin-top:5px">
               <option value="0">SEM GALE</option>
-              <option value="1">GALE 1</option>
-              <option value="2">GALE 2</option>
             </select>
           </div>
-          <div>
-            <div class="label">MULTIPLICADOR DO GALE</div>
-            <input id="autoTradeGaleMultiplier" type="number" min="1" max="5" step="0.1" value="2"
-                   style="width:100%;box-sizing:border-box;margin-top:5px">
+          <div style="display:none">
+            <div class="label">MULTIPLICADOR DESATIVADO</div>
+            <input id="autoTradeGaleMultiplier" type="number" value="2" disabled>
           </div>
           <button id="autoTradeToggle" type="button" style="width:100%;font-weight:1000">🔴 AUTO DEMO OFF</button>
         </div>
         <div id="autoTradePreview" class="label" style="margin-top:9px;line-height:1.5">
-          Entrada: 1.00 • Gale desligado
+          Entrada: 1.00 • SEM GALE • recuperação no próximo sinal
         </div>
         <div id="autoTradeStatus" style="margin-top:10px;font-size:12px;line-height:1.5">
           ⚪ Conecte a IQ Option e ative manualmente para testar.
@@ -25165,21 +24985,21 @@ try{
   else if(larryEnabled){ combinerEnabled=false; suntzuEnabled=false; rangeEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rapidEnabled=false; alphaxEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; velocityEnabled=false; rsi5Enabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
+
+// MEGA IA 3.96.7 — motores removidos do painel ficam forçados OFF, inclusive
+// quando existir estado antigo no localStorage do celular.
+blackbookEnabled=false; rtmEnabled=false; bobSenegalEnabled=false; taurusSenegalEnabled=false; taurusEaEnabled=false;
+rsiDivBbEnabled=false; tmaRsiEnabled=false; tlbRsiEnabled=false; tripleRsiEnabled=false; roboFiboEnabled=false; combinerEnabled=false;
+try{
+  ['mega_blackbook_power','mega_rtm_ea_power','mega_bob_senegal_power','mega_taurus_senegal_power','mega_taurus_ea_power',
+   'mega_rsidivbb_power','mega_tmarsi_power','mega_tlbrsi_power','mega_triprsi_power','mega_robofibo_power','mega_combiner_power']
+   .forEach(k=>localStorage.setItem(k,'OFFLINE'));
+}catch(_){}
+
 function selectedRobotEngine(){
-  if(rtmEnabled) return 'RTM';
-  if(blackbookEnabled) return 'BLACKBOOK';
-  if(tmaRsiEnabled) return 'TMARSI';
-  if(tripleRsiEnabled) return 'TRIPRSI';
-  if(roboFiboEnabled) return 'FIBORSI';
-  if(tlbRsiEnabled) return 'TLBRSI';
-  if(rsiDivBbEnabled) return 'RSIDIVBB';
-  if(combinerEnabled) return 'COMBINER';
   if(volumePocAiEnabled) return 'VOLUME_AI';
   if(presidenEnabled) return 'PRESIDEN';
-  if(taurusEaEnabled) return 'TAURUSEA';
   if(taurusRsiDivEnabled) return 'TAURUSRSIDIV';
-  if(bobSenegalEnabled) return 'BOBSENEGAL';
-  if(taurusSenegalEnabled) return 'TAURUSSENEGAL';
   if(sniperEnabled) return 'SNIPER';
   if(rangeEnabled) return 'RANGE';
   if(alphaxEnabled) return 'ALPHAX';
@@ -25204,7 +25024,8 @@ function adoptBackgroundEngineState(d){
   }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(['RAPID','SUNTZU','RANGE','PRESIDEN','RSI5','FORCE','BIGRISE'].includes(e)) return;
+  const retired=['RTM','BLACKBOOK','BOBSENEGAL','TAURUSSENEGAL','TAURUSEA','COMBINER','RSIDIVBB','TMARSI','TLBRSI','TRIPRSI','FIBORSI'];
+  if(retired.includes(e) || ['RAPID','SUNTZU','RANGE','PRESIDEN','RSI5','FORCE','BIGRISE'].includes(e)) return;
   robotEnabled=false; aiEnabled=false; blackbookEnabled=false; rtmEnabled=false; eaEnabled=false; rubikEnabled=false;
   forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false;
   rsi5Enabled=false; sniperEnabled=false; bobSenegalEnabled=false; taurusSenegalEnabled=false; taurusRsiDivEnabled=false; combinerEnabled=false; rsiDivBbEnabled=false; tmaRsiEnabled=false; tlbRsiEnabled=false; tripleRsiEnabled=false; roboFiboEnabled=false; alphaxEnabled=false; presidenEnabled=false; rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false; rangeEnabled=false;
@@ -25340,8 +25161,8 @@ const historyList=document.getElementById('historyList');
 const historySummary=document.getElementById('historySummary');
 const historyAnalysis=document.getElementById('historyAnalysis');
 const winDirect=document.getElementById('winDirect');
-const winG1=document.getElementById('winG1');
-const winG2=document.getElementById('winG2');
+const winG1=null;
+const winG2=null;
 const lossG2=document.getElementById('lossG2');
 const resetResultsBtn=document.getElementById('resetResultsBtn');
 const galeLastResult=document.getElementById('galeLastResult');
@@ -25391,17 +25212,16 @@ const autoTradeStatus=document.getElementById('autoTradeStatus');
 let autoTradeEnabled=false;
 let autoOrderBusy=false;
 const autoExecutedKeys=new Set();
-const autoGaleRuns=new Set();
-const rtmRecoveryRuns=new Set();
-const RTM_RECOVERY_KEY='mega_rtm_next_signal_recovery_v1';
-let rtmRecoveryState={baseAmount:0,nextAmount:0,lossStreak:0,lastResult:''};
+const nextSignalRecoveryRuns=new Set();
+const NEXT_SIGNAL_RECOVERY_KEY='mega_next_signal_recovery_v2';
+let nextSignalRecoveryState={baseAmount:0,nextAmount:0,lossStreak:0,lastResult:''};
 
-function loadRtmRecoveryState(){
+function loadNextSignalRecoveryState(){
   try{
-    const raw=localStorage.getItem(RTM_RECOVERY_KEY);
+    const raw=localStorage.getItem(NEXT_SIGNAL_RECOVERY_KEY);
     if(raw){
       const x=JSON.parse(raw)||{};
-      rtmRecoveryState={
+      nextSignalRecoveryState={
         baseAmount:Math.max(0,Number(x.baseAmount||0)),
         nextAmount:Math.max(0,Number(x.nextAmount||0)),
         lossStreak:Math.max(0,Number(x.lossStreak||0)),
@@ -25411,40 +25231,40 @@ function loadRtmRecoveryState(){
   }catch(_){ }
 }
 
-function saveRtmRecoveryState(){
-  try{ localStorage.setItem(RTM_RECOVERY_KEY,JSON.stringify(rtmRecoveryState)); }catch(_){ }
+function saveNextSignalRecoveryState(){
+  try{ localStorage.setItem(NEXT_SIGNAL_RECOVERY_KEY,JSON.stringify(nextSignalRecoveryState)); }catch(_){ }
 }
 
-function rtmRecoveryAmount(baseAmount){
+function nextSignalRecoveryAmount(baseAmount){
   const base=Math.max(1,Math.min(1000,Number(baseAmount||1)));
-  if(!Number.isFinite(rtmRecoveryState.baseAmount) || Math.abs(Number(rtmRecoveryState.baseAmount||0)-base)>0.0001){
-    rtmRecoveryState={baseAmount:base,nextAmount:base,lossStreak:0,lastResult:''};
-    saveRtmRecoveryState();
+  if(!Number.isFinite(nextSignalRecoveryState.baseAmount) || Math.abs(Number(nextSignalRecoveryState.baseAmount||0)-base)>0.0001){
+    nextSignalRecoveryState={baseAmount:base,nextAmount:base,lossStreak:0,lastResult:''};
+    saveNextSignalRecoveryState();
   }
-  const next=Math.max(base,Number(rtmRecoveryState.nextAmount||base));
+  const next=Math.max(base,Number(nextSignalRecoveryState.nextAmount||base));
   return Math.max(1,Math.min(1000,Number(next.toFixed(2))));
 }
 
-function finishRtmRecovery(outcome,usedAmount,baseAmount){
+function finishNextSignalRecovery(outcome,usedAmount,baseAmount){
   const r=String(outcome||'').toUpperCase();
   const base=Math.max(1,Math.min(1000,Number(baseAmount||1)));
   const used=Math.max(1,Math.min(1000,Number(usedAmount||base)));
-  rtmRecoveryState.baseAmount=base;
-  rtmRecoveryState.lastResult=r;
+  nextSignalRecoveryState.baseAmount=base;
+  nextSignalRecoveryState.lastResult=r;
   if(r==='WIN'){
-    rtmRecoveryState.lossStreak=0;
-    rtmRecoveryState.nextAmount=base;
+    nextSignalRecoveryState.lossStreak=0;
+    nextSignalRecoveryState.nextAmount=base;
   }else if(r==='LOSS'){
-    rtmRecoveryState.lossStreak=Math.max(0,Number(rtmRecoveryState.lossStreak||0))+1;
-    rtmRecoveryState.nextAmount=Math.max(1,Math.min(1000,Number((used*2).toFixed(2))));
+    nextSignalRecoveryState.lossStreak=Math.max(0,Number(nextSignalRecoveryState.lossStreak||0))+1;
+    nextSignalRecoveryState.nextAmount=Math.max(1,Math.min(1000,Number((used*2).toFixed(2))));
   }else if(r==='DRAW'){
-    // Empate não cria novo LOSS e mantém a recuperação pendente no mesmo valor.
-    rtmRecoveryState.nextAmount=used;
+    // Empate não cria novo LOSS e mantém a recuperação pendente no mesmo valor para o próximo sinal.
+    nextSignalRecoveryState.nextAmount=used;
   }
-  saveRtmRecoveryState();
+  saveNextSignalRecoveryState();
 }
 
-loadRtmRecoveryState();
+loadNextSignalRecoveryState();
 const TELEGRAM_ENABLED_KEY='mega_telegram_enabled_v1';
 const TELEGRAM_CHAT_ID_KEY='mega_telegram_chat_id_v1';
 const TELEGRAM_LAST_SIGNAL_KEY='mega_telegram_last_signal_v1';
@@ -25512,13 +25332,14 @@ try{
 
 try{
   const savedAutoAmount=Number(localStorage.getItem('mega_auto_trade_amount')||1);
-  const savedAutoGale=Number(localStorage.getItem('mega_auto_trade_gale')||0);
-  const savedAutoGaleMultiplier=Number(localStorage.getItem('mega_auto_trade_gale_multiplier')||2);
+  const savedAutoGale=0;
+  const savedAutoGaleMultiplier=2;
+  try{ localStorage.setItem('mega_auto_trade_gale','0'); }catch(_){}
   if(autoTradeAmount && Number.isFinite(savedAutoAmount)){
     autoTradeAmount.value=String(Math.max(1,Math.min(1000,savedAutoAmount)));
   }
   if(autoTradeGale){
-    autoTradeGale.value=String([0,1,2].includes(savedAutoGale)?savedAutoGale:0);
+    autoTradeGale.value='0';
   }
   if(autoTradeGaleMultiplier && Number.isFinite(savedAutoGaleMultiplier)){
     autoTradeGaleMultiplier.value=String(Math.max(1,Math.min(5,savedAutoGaleMultiplier)));
@@ -26138,21 +25959,20 @@ function registerPersistentResult(t,x){
   const entryResult=String(x.entry_result||((x.result==='WIN'||x.result==='LOSS')?x.result:'')).toUpperCase();
   const entryKey=opKey+'|ENTRY';
 
-  // LOSS da primeira vela é apenas diagnóstico: mostra quantas operações
-  // precisaram de Gale. WIN direto é contado somente no resultado FINAL.
+  // A vela da entrada é o resultado final da operação: WIN ou LOSS direto.
+  // Não existe G1/G2 nas novas operações.
   if((entryResult==='WIN' || entryResult==='LOSS') && !b.entry_keys.includes(entryKey)){
     b.entry_keys.push(entryKey);
     if(b.entry_keys.length>1500) b.entry_keys=b.entry_keys.slice(-1500);
     if(entryResult==='LOSS') b.loss_direct++;
-    // Finanças v3.58: valor inicial digitável + progressão entre SINAIS NOVOS.
-    // O resultado da primeira entrada encerra financeiramente aquela operação;
-    // G1/G2, caso existam em outros módulos, não alteram este placar.
+    // Finanças: a entrada atual encerra em WIN/LOSS. Em LOSS, a progressão
+    // fica preparada apenas para o próximo sinal confirmado.
     applyValueResult(t,entryResult,opKey+'|FIN_ENTRY');
     changed=true;
   }
 
   const r=String(x.result||'').toUpperCase();
-  const finalAllowed=['WIN','WIN G1','WIN G2','LOSS G2'].includes(r) || (t.direct_only && r==='LOSS');
+  const finalAllowed=['WIN','LOSS'].includes(r);
   if(finalAllowed){
     b.final_ops=b.final_ops||{};
     let newFinal=false;
@@ -26435,9 +26255,8 @@ function paintPersistentResults(){
   const m=activeResultMarket();
   const b=persistentResults[m]||emptyResultBucket();
   if(Object.keys(b.final_ops||{}).length) recountFinalBucket(b);
-  // Placar principal = resultado FINAL da operação.
-  // WIN direto, WIN G1 ou WIN G2 contam como WIN; LOSS só após perder até G2.
-  const totalWins=Number(b.win_direct||0)+Number(b.win_g1||0)+Number(b.win_g2||0);
+  // Placar principal = resultado direto da entrada; sem G1/G2.
+  const totalWins=Number(b.win_direct||0);
   const totalLosses=Number(b.loss_g2||0);
   const total=totalWins+totalLosses;
   const acc=total?((totalWins/total)*100):0;
@@ -26673,7 +26492,7 @@ function rememberPendingTrade(sig){
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
     // Motores de entrada direta (AlphaX/Núcleo Rápido/Samurai/Sniper/RSI+ADX/Larry/Range/EA/Força/BigRise/Velocity) são apurados na primeira vela; outros preservam G1/G2.
-    direct_only:isDirectEa,
+    direct_only:true,
     market:signalResultMarket(sig),
     requested_market:sig.requested_market || (market&&market.value) || 'OPEN',
     feed_source:sig.feed_source||'',
@@ -27074,32 +26893,17 @@ async function post(u,data={}){
 
 function autoTradeSettings(){
   let amount=Number((autoTradeAmount&&autoTradeAmount.value)||1);
-  let gale=Number((autoTradeGale&&autoTradeGale.value)||0);
-  let multiplier=Number((autoTradeGaleMultiplier&&autoTradeGaleMultiplier.value)||2);
   if(!Number.isFinite(amount)) amount=1;
-  if(!Number.isFinite(gale)) gale=0;
-  if(!Number.isFinite(multiplier)) multiplier=2;
   amount=Math.max(1,Math.min(1000,amount));
-  gale=[0,1,2].includes(gale)?gale:0;
-  multiplier=Math.max(1,Math.min(5,multiplier));
-  return {amount,gale,multiplier};
+  // MEGA IA 3.96.7: Gale bloqueado globalmente.
+  return {amount,gale:0,multiplier:2};
 }
 
 function updateAutoTradePreview(){
   if(!autoTradePreview) return;
   const cfg=autoTradeSettings();
-  const fmt=v=>Number(v).toFixed(2);
-  if(cfg.gale===0){
-    autoTradePreview.textContent='Entrada: '+fmt(cfg.amount)+' • Gale desligado';
-    return;
-  }
-  const g1=cfg.amount*cfg.multiplier;
-  if(cfg.gale===1){
-    autoTradePreview.textContent='Entrada: '+fmt(cfg.amount)+' • G1: '+fmt(g1);
-    return;
-  }
-  const g2=g1*cfg.multiplier;
-  autoTradePreview.textContent='Entrada: '+fmt(cfg.amount)+' • G1: '+fmt(g1)+' • G2: '+fmt(g2);
+  const next=nextSignalRecoveryAmount(cfg.amount);
+  autoTradePreview.textContent='Entrada atual: '+Number(next).toFixed(2)+' • SEM GALE • LOSS recupera somente no próximo sinal';
 }
 
 function renderAutoTradeState(message=''){
@@ -27130,21 +26934,14 @@ if(autoTradeAmount){
 }
 
 if(autoTradeGale){
-  autoTradeGale.onchange=()=>{
-    const cfg=autoTradeSettings();
-    autoTradeGale.value=String(cfg.gale);
-    try{ localStorage.setItem('mega_auto_trade_gale',String(cfg.gale)); }catch(_){}
-    updateAutoTradePreview();
-  };
+  autoTradeGale.value='0';
+  autoTradeGale.disabled=true;
+  try{ localStorage.setItem('mega_auto_trade_gale','0'); }catch(_){}
 }
 
 if(autoTradeGaleMultiplier){
-  autoTradeGaleMultiplier.onchange=()=>{
-    const cfg=autoTradeSettings();
-    autoTradeGaleMultiplier.value=String(cfg.multiplier);
-    try{ localStorage.setItem('mega_auto_trade_gale_multiplier',String(cfg.multiplier)); }catch(_){}
-    updateAutoTradePreview();
-  };
+  autoTradeGaleMultiplier.value='2';
+  autoTradeGaleMultiplier.disabled=true;
 }
 
 if(autoTradeToggle){
@@ -27166,7 +26963,7 @@ if(autoTradeToggle){
         }
         const cfg=autoTradeSettings();
         autoTradeEnabled=true;
-        const galeTxt=cfg.gale===0?'sem Gale':('até Gale '+cfg.gale+' • '+cfg.multiplier.toFixed(1)+'x');
+        const galeTxt='sem Gale • recuperação no próximo sinal';
         const route=(cap&&Array.isArray(cap.methods)&&cap.methods.length)?(' • '+cap.methods.join('/')):'';
         renderAutoTradeState('🟢 AUTO DEMO armada'+route+' • '+galeTxt+' • aguardando o próximo sinal confirmado.');
         if(voiceEnabled) speak('Auto entrada demo ativada.');
@@ -27228,97 +27025,20 @@ async function waitAutoOrderOutcome(orderId, sig, entryIso){
   return null;
 }
 
-async function placeAutoGaleOrder(sig, stage, entryIso, amount){
-  if(!autoTradeEnabled || !brokerConnected.IQ_OPTION) return null;
-  if(amount>1000){
-    renderAutoTradeState('🟠 '+stage+' cancelado: valor '+amount.toFixed(2)+' excede o limite DEMO de 1000.');
-    return null;
-  }
-
-  const key=[sig.market||market.value,S.value,interval.value,sig.direction,entryIso,stage,'PRACTICE'].join('|');
-  if(autoExecutedKeys.has(key)) return null;
-  autoExecutedKeys.add(key);
-
-  renderAutoTradeState('🟡 '+stage+' • enviando ordem DEMO • valor '+amount.toFixed(2)+'...');
-  try{
-    const d=await post('/iq-auto-order',{
-      symbol:sig.symbol||S.value,
-      interval:sig.interval||interval.value,
-      direction:sig.direction,
-      entry_time:entryIso,
-      market:sig.market||market.value||'OPEN',
-      amount:amount,
-      stage:stage
-    });
-    if(!d || d.ok!==true || d.status!=='PLACED') throw Error((d&&d.message)||'A IQ não confirmou a ordem.');
-    const route=d.order_type?(' • '+d.order_type):'';
-    renderAutoTradeState('✅ '+stage+' ENVIADO'+route+' • '+(d.active||sig.symbol||S.value)+' • '+sig.direction+' • valor '+amount.toFixed(2));
-    if(voiceEnabled) speak(stage+' enviado.');
-    return d;
-  }catch(e){
-    renderAutoTradeState('🔴 '+stage+': '+String((e&&e.message)||e));
-    if(voiceEnabled) speak(stage+' não foi executado.');
-    return null;
-  }
-}
-
-async function monitorAutoGale(sig, baseOrder, baseAmount, maxGale, multiplier, runKey){
-  try{
-    let stageEntryIso=sig.entry_time;
-    let order=baseOrder;
-    let amount=baseAmount;
-
-    for(let level=0;level<=maxGale;level++){
-      const outcome=await waitAutoOrderOutcome(order&&order.order_id, sig, stageEntryIso);
-      if(!autoTradeEnabled || !brokerConnected.IQ_OPTION) return;
-
-      const stageName=level===0?'ENTRADA':('G'+level);
-      if(outcome==='WIN'){
-        renderAutoTradeState('✅ '+stageName+' WIN • sequência encerrada.');
-        if(voiceEnabled) speak('Win '+(level?('Gale '+level):'direto')+'.');
-        return;
-      }
-      if(outcome==='DRAW'){
-        renderAutoTradeState('⚪ '+stageName+' EMPATE • sequência encerrada sem novo Gale.');
-        return;
-      }
-      if(outcome!=='LOSS'){
-        renderAutoTradeState('🟠 '+stageName+' sem resultado a tempo • Gale cancelado por segurança.');
-        return;
-      }
-      if(level>=maxGale){
-        renderAutoTradeState('❌ LOSS até '+(maxGale===0?'entrada':('Gale '+maxGale))+' • sequência encerrada.');
-        if(voiceEnabled) speak('Sequência encerrada em loss.');
-        return;
-      }
-
-      const stepMs=intervalSecondsValue(sig.interval||interval.value)*1000;
-      const nextEntryMs=new Date(stageEntryIso).getTime()+stepMs;
-      stageEntryIso=new Date(nextEntryMs).toISOString();
-      amount=Number((amount*multiplier).toFixed(2));
-      const nextStage='G'+(level+1);
-      order=await placeAutoGaleOrder(sig,nextStage,stageEntryIso,amount);
-      if(!order) return;
-    }
-  }finally{
-    autoGaleRuns.delete(runKey);
-  }
-}
-
-async function monitorRtmNextSignalRecovery(sig, baseOrder, usedAmount, baseAmount, runKey){
+async function monitorNextSignalRecovery(sig, baseOrder, usedAmount, baseAmount, runKey){
   try{
     const outcome=await waitAutoOrderOutcome(baseOrder&&baseOrder.order_id, sig, sig.entry_time);
     if(!outcome) return;
-    finishRtmRecovery(outcome,usedAmount,baseAmount);
+    finishNextSignalRecovery(outcome,usedAmount,baseAmount);
     if(outcome==='WIN'){
-      renderAutoTradeState('✅ RTM WIN • recuperação encerrada • próximo sinal volta para '+Number(baseAmount).toFixed(2)+'.');
+      renderAutoTradeState('✅ WIN • recuperação encerrada • próximo sinal volta para '+Number(baseAmount).toFixed(2)+'.');
     }else if(outcome==='LOSS'){
-      renderAutoTradeState('❌ RTM LOSS • sem Gale • recuperação somente no próximo sinal RTM: '+Number(rtmRecoveryState.nextAmount).toFixed(2)+'.');
+      renderAutoTradeState('❌ LOSS • sem Gale • recuperação somente no próximo sinal: '+Number(nextSignalRecoveryState.nextAmount).toFixed(2)+'.');
     }else if(outcome==='DRAW'){
-      renderAutoTradeState('⚪ RTM EMPATE • sem Gale • mantém o valor para o próximo sinal RTM.');
+      renderAutoTradeState('⚪ EMPATE • sem Gale • mantém o valor para o próximo sinal.');
     }
   }finally{
-    rtmRecoveryRuns.delete(runKey);
+    nextSignalRecoveryRuns.delete(runKey);
   }
 }
 
@@ -27341,8 +27061,7 @@ async function executeAutoTrade(sig){
   try{
     const cfg=autoTradeSettings();
     const engineKey=String(sig.selected_engine||sig.engine||sig.mode||'').toUpperCase();
-    const isRtm=(engineKey==='RTM'||engineKey.includes('RTM'));
-    const amount=isRtm ? rtmRecoveryAmount(cfg.amount) : cfg.amount;
+    const amount=nextSignalRecoveryAmount(cfg.amount);
     const d=await post('/iq-auto-order',{
       symbol:sig.symbol||S.value,
       interval:sig.interval||interval.value,
@@ -27355,20 +27074,15 @@ async function executeAutoTrade(sig){
     if(!d || d.ok!==true || d.status!=='PLACED') throw Error((d&&d.message)||'A IQ não confirmou a ordem.');
     const ativo=d.active||sig.symbol||S.value;
     const route=d.order_type?(' • '+d.order_type):'';
-    const galeTxt=isRtm ? 'RTM sem Gale • recuperação no próximo sinal' : (cfg.gale===0?'sem Gale':('até G'+cfg.gale));
+    const galeTxt='sem Gale • recuperação somente no próximo sinal';
     renderAutoTradeState('✅ ENTRADA DEMO ENVIADA'+route+' • '+ativo+' • '+sig.direction+' • valor '+amount.toFixed(2)+' • '+galeTxt);
     if(voiceEnabled) speak('Ordem demo enviada. '+(sig.direction==='CALL'?'Compra':'Venda')+'.');
 
-    if(isRtm){
-      // Exclusivo da RTM: nunca abre G1/G2 na mesma operação.
-      // O LOSS apenas prepara um valor maior para o PRÓXIMO sinal confirmado da RTM.
-      if(!rtmRecoveryRuns.has(key)){
-        rtmRecoveryRuns.add(key);
-        monitorRtmNextSignalRecovery(sig,d,amount,cfg.amount,key);
-      }
-    }else if(cfg.gale>0 && !autoGaleRuns.has(key)){
-      autoGaleRuns.add(key);
-      monitorAutoGale(sig,d,amount,cfg.gale,cfg.multiplier,key);
+    // Todos os motores: nunca abre G1/G2 na mesma operação.
+    // LOSS apenas prepara a recuperação para o PRÓXIMO sinal confirmado.
+    if(!nextSignalRecoveryRuns.has(key)){
+      nextSignalRecoveryRuns.add(key);
+      monitorNextSignalRecovery(sig,d,amount,cfg.amount,key);
     }
   }catch(e){
     renderAutoTradeState('🔴 AUTO DEMO: '+String((e&&e.message)||e));
@@ -28994,7 +28708,7 @@ function applyRobotPowerState(){
     ? 'ONLINE: compressão 50% + janela curta + buffer zero + breakout/reversão bem soltos • próxima vela.'
     : 'OFFLINE: Range Compression pausado.';
   if(larryModeDesc) larryModeDesc.textContent=larryEnabled
-    ? 'ONLINE: rompimento + força/expansão de vela • candles fechados • OPEN/OTC • sem Grid, Martingale ou Gale.'
+    ? 'ONLINE: rompimento + força/expansão de vela • candles fechados • OPEN/OTC • sem Gale • recuperação no próximo sinal.'
     : 'OFFLINE: Larry Breakout + Taurus pausado.';
   if(sniperModeDesc) sniperModeDesc.textContent=sniperEnabled
     ? 'ONLINE: canal causal 18 + rejeição + RSI interno • candle fechado • próxima vela • sem repaint.'
@@ -29003,7 +28717,7 @@ function applyRobotPowerState(){
     ? 'ONLINE M1 TESTE: Taurus S/R ou LTA/LTB + Super Senegal PMAX/Z + ADX/DMI + volume • 4 min entre sinais • próxima vela • expiração 1 min • sem Gale.'
     : 'OFFLINE: Taurus + Super Senegal pausado.';
   if(alphaxModeDesc) alphaxModeDesc.textContent=alphaxEnabled
-    ? 'ONLINE: AlphaX + zonas fractal/institucional + microimpulso/LWMA/MACD • sinal oficial ~30s antes • entrada na próxima vela • sem Gale.'
+    ? 'ONLINE: AlphaX + zonas fractal/institucional + microimpulso/LWMA/MACD • sinal ~30s antes • próxima vela • sem Gale • recuperação no próximo sinal.'
     : 'OFFLINE: AlphaX RELAY pausado.';
   if(rapidModeDesc) rapidModeDesc.textContent=rapidEnabled
     ? 'ONLINE: Núcleo Rápido com filtro reforçado • zona + impulso persistente + Scalper FX + CRIPTOBOT • SINAL FINAL INVERTIDO CALL↔PUT • independente do AlphaX • próxima vela • sem Gale.'
@@ -29056,7 +28770,7 @@ function applyRobotPowerState(){
 
   if(rtmModeDesc) rtmModeDesc.textContent=rtmEnabled ? 'ONLINE: 30 gatilhos individuais • somente BTC/USD + pares JPY • cada gatilho continua independente • Taurus confirma a mesma direção • sem votação por blocos • pré-alerta 20s.' : 'OFFLINE: RTM MULTI + TAURUS pausado • BLACK BOOK permanece separado.';
   if(taurusEaModeDesc) taurusEaModeDesc.textContent=taurusEaEnabled ? 'ONLINE: EMA13(CLOSE) × EMA34(OPEN) + Momentum14/0,1 • Taurus confirma S/R ou LTA/LTB • candle fechado • próxima vela • sem Gale.' : 'OFFLINE: TAURUS EA pausado.';
-  if(taurusRsiDivModeDesc) taurusRsiDivModeDesc.textContent=taurusRsiDivEnabled ? 'ONLINE: RSI8 + T3(8) + divergência regular/oculta • Taurus S/R ou LTA/LTB • candle fechado • próxima vela • sem Gale.' : 'OFFLINE: TAURUS + RSI DIV pausado.';
+  if(taurusRsiDivModeDesc) taurusRsiDivModeDesc.textContent=taurusRsiDivEnabled ? 'ONLINE: RSI8 + T3(8) + divergência regular/oculta • Taurus S/R ou LTA/LTB • candle fechado • próxima vela • sem Gale • recuperação no próximo sinal.' : 'OFFLINE: TAURUS + RSI DIV pausado.';
   const engine=selectedRobotEngine();
   if(engine==='RTM'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RTM ONLINE • SOMENTE BTC/USD + PARES JPY • GATILHOS ANALISANDO CANDLES NO APP';
@@ -30502,7 +30216,7 @@ async function sig(announce=false){
       const tfDir=String(tf.direction||'NEUTRO').toUpperCase();
       const tfEmoji=tfColor==='VERDE'?'🟢':(tfColor==='VERMELHO'?'🔴':'⚪');
       const permit=tfDir==='CALL'?'só CALL':(tfDir==='PUT'?'só PUT':'sem entrada');
-      aiModeDesc.textContent=`ONLINE FLEX • IA decide com 1 evidência • Trend Filter: ${tfEmoji} ${tfColor} → ${permit} • precisa estar alinhado.`;
+      aiModeDesc.textContent=`ONLINE FLEX • IA decide com 1 evidência • Trend Filter: ${tfEmoji} ${tfColor} → ${permit} • sem Gale • recuperação no próximo sinal.`;
     }
 
     if(announce){
@@ -31098,8 +30812,7 @@ async function resultCheck(){
       return;
     }
 
-    // A primeira vela é registrada separadamente para diagnóstico.
-    // O placar principal só fecha quando houver WIN direto, WIN G1, WIN G2 ou LOSS G2.
+    // A vela da entrada é o resultado final. Não existe acompanhamento G1/G2.
     const accountingChanged=registerPersistentResult(t,x);
     if(accountingChanged){
       // Atualiza WIN/LOSS na tela imediatamente.
@@ -31108,18 +30821,8 @@ async function resultCheck(){
       await perf();
     }
 
-    if(galeStageStatus){
-      const stage=x.stage||'ENTRADA';
-
-      if(!x.result){
-        if(stage==='G1'){
-          galeStageStatus.textContent='⏳ Entrada inicial não venceu • aguardando resultado do G1';
-        }else if(stage==='G2'){
-          galeStageStatus.textContent='⏳ G1 não venceu • aguardando resultado do G2';
-        }else{
-          galeStageStatus.textContent='⏳ Aguardando resultado da entrada inicial';
-        }
-      }
+    if(galeStageStatus && !x.result){
+      galeStageStatus.textContent='⏳ Aguardando resultado direto da entrada';
     }
 
     if(x.result){
@@ -31132,11 +30835,9 @@ async function resultCheck(){
 
       if(galeStageStatus){
         galeStageStatus.textContent=
-          x.result==='WIN' ? '✅ Venceu na entrada' :
-          x.result==='LOSS' ? (t.direct_only ? '❌ Loss direto • motor sem Gale' : '❌ Loss na entrada') :
-          x.result==='WIN G1' ? '✅ Venceu no Gale 1' :
-          x.result==='WIN G2' ? '✅ Venceu no Gale 2' :
-          '❌ Não venceu até o Gale 2';
+          x.result==='WIN' ? '✅ WIN direto • sem Gale' :
+          x.result==='LOSS' ? '❌ LOSS direto • recuperação somente no próximo sinal' :
+          '⚪ DRAW • sem Gale';
       }
 
       const k=t.symbol+'|'+t.direction+'|'+t.expiry_time;
@@ -31156,8 +30857,8 @@ async function resultCheck(){
         reskey=k;
       }
 
-      // Envia o resultado FINAL uma única vez ao grupo Telegram: WIN, WIN G1, WIN G2 ou LOSS G2.
-      if(['WIN','LOSS','WIN G1','WIN G2','LOSS G2'].includes(String(x.result||'').toUpperCase())){
+      // Envia o resultado FINAL uma única vez ao grupo Telegram: WIN ou LOSS.
+      if(['WIN','LOSS'].includes(String(x.result||'').toUpperCase())){
         await maybeSendTelegramResult(t,x);
       }
 
