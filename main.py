@@ -186,11 +186,12 @@ SNIPER_COOLDOWN_BARS = max(1, min(12, int(os.getenv("SNIPER_COOLDOWN_BARS", "2")
 # e o Super Senegal/SUPER Z PMAX confirma tendência + ADX/DMI + volume.
 # Somente candle fechado, entrada na próxima vela, expiração de 1 candle e sem Gale.
 TAURUS_SENEGAL_HISTORY_BARS = max(120, min(500, int(os.getenv("TAURUS_SENEGAL_HISTORY_BARS", "240"))))
-TAURUS_SENEGAL_COOLDOWN_BARS = max(4, min(20, int(os.getenv("TAURUS_SENEGAL_COOLDOWN_BARS", "4"))))
+TAURUS_SENEGAL_COOLDOWN_BARS = max(3, min(20, int(os.getenv("TAURUS_SENEGAL_COOLDOWN_BARS", "3"))))
 TAURUS_SENEGAL_PIVOT_SIDE = 2
 TAURUS_SENEGAL_SR_LOOKBACK = 50
-TAURUS_SENEGAL_TOL_ATR = max(0.10, min(0.80, float(os.getenv("TAURUS_SENEGAL_TOL_ATR", "0.22"))))
+TAURUS_SENEGAL_TOL_ATR = max(0.10, min(0.80, float(os.getenv("TAURUS_SENEGAL_TOL_ATR", "0.30"))))
 TAURUS_SENEGAL_ATR_PERIOD = 7
+TAURUS_SENEGAL_ADX_MIN = max(10.0, min(45.0, float(os.getenv("TAURUS_SENEGAL_ADX_MIN", "17"))))
 TSZ_LAMBDA_EMA = 5
 TSZ_EMA = 18
 TSZ_ATR_PERIOD = 10
@@ -10861,9 +10862,9 @@ def _taurus_region_state(rows,t,ph,pl,atr_series):
 def taurus_super_senegal_strategy(cs,timeframe='1min',market='OPEN'):
     """TAURUS + SUPER SENEGAL — confluência M1 planejada para teste no app.
 
-    CALL = Taurus em Suporte OU LTA + Super Senegal em tendência de alta + ADX>=20 + DMI comprador + volume.
-    PUT  = Taurus em Resistência OU LTB + Super Senegal em tendência de baixa + ADX>=20 + DMI vendedor + volume.
-    O volume é neutro quando a fonte não o fornece. Cooldown mínimo: 4 candles M1.
+    CALL = Taurus em Suporte OU LTA + Super Senegal em tendência de alta + ADX>=17 + DMI comprador.
+    PUT  = Taurus em Resistência OU LTB + Super Senegal em tendência de baixa + ADX>=17 + DMI vendedor.
+    Volume virou reforço de confiança, não bloqueio. Cooldown mínimo: 3 candles M1.
     """
     rows=list(cs or [])
     name='TAURUS + SUPER SENEGAL M1'
@@ -10896,9 +10897,9 @@ def taurus_super_senegal_strategy(cs,timeframe='1min',market='OPEN'):
         mdi=float(series['minus_di'][i] or 0.0) if i<len(series['minus_di']) else 0.0
         zv=float(series['z'][i] or 0.0) if i<len(series['z']) else 0.0
         vol=_tsz_volume_state(rows,i)
-        volume_ok=bool(vol['spike'] or not vol['available'])
-        call=bool(call_reg and tr>0 and av>=TSZ_ADX_MIN and pdi>=mdi and volume_ok)
-        put=bool(put_reg and tr<0 and av>=TSZ_ADX_MIN and mdi>=pdi and volume_ok)
+        # Volume é reforço, não requisito: evita travar sinal quando o restante conflui.
+        call=bool(call_reg and tr>0 and av>=TAURUS_SENEGAL_ADX_MIN and pdi>=mdi)
+        put=bool(put_reg and tr<0 and av>=TAURUS_SENEGAL_ADX_MIN and mdi>=pdi)
         if call==put: continue
         if i-last_fired < TAURUS_SENEGAL_COOLDOWN_BARS: continue
         direction='CALL' if call else 'PUT'
@@ -10910,7 +10911,7 @@ def taurus_super_senegal_strategy(cs,timeframe='1min',market='OPEN'):
         tr=int(series['trend'][i] or 0); av=float(series['adx'][i] or 0.0); pdi=float(series['plus_di'][i] or 0.0); mdi=float(series['minus_di'][i] or 0.0); vol=_tsz_volume_state(rows,i)
         flags=[k.upper() for k in ('support','resistance','lta','ltb') if reg.get(k)]
         region_txt='/'.join(flags) if flags else 'sem toque Taurus'
-        reason=f'Monitorando M1 • Taurus {region_txt} • Senegal {"ALTA" if tr>0 else "BAIXA" if tr<0 else "NEUTRO"} • ADX {av:.1f} • DMI +{pdi:.1f}/-{mdi:.1f} • cooldown 4min.'
+        reason=f'Monitorando M1 • Taurus {region_txt} • Senegal {"ALTA" if tr>0 else "BAIXA" if tr<0 else "NEUTRO"} • ADX {av:.1f} • DMI +{pdi:.1f}/-{mdi:.1f} • cooldown {TAURUS_SENEGAL_COOLDOWN_BARS}min.'
         return {'available':True,'direction':'NEUTRO','confidence':0.0,'confirmed':False,'risk':'HIGH',
                 'strategy':name,'engine':'TAURUS_SUPER_SENEGAL','provider':'LOCAL_TAURUS_SUPER_SENEGAL','reason':reason[:440],
                 'non_repaint':True,'closed_candles_only':True,'next_candle_entry':True,'direct_win_only':True,
@@ -10919,7 +10920,7 @@ def taurus_super_senegal_strategy(cs,timeframe='1min',market='OPEN'):
     reg=current['region']; flags=[k.upper() for k in ('support','resistance','lta','ltb') if reg.get(k)]
     flag_txt=' + '.join(flags) if flags else 'REGIÃO TAURUS'
     av=current['adx']; vol=current['vol']; direction=current['direction']
-    conf=72.0 + min(10.0,max(0.0,av-TSZ_ADX_MIN)*0.7) + (5.0 if len(flags)>=2 else 2.0) + (5.0 if vol['spike'] else 0.0)
+    conf=72.0 + min(10.0,max(0.0,av-TAURUS_SENEGAL_ADX_MIN)*0.7) + (5.0 if len(flags)>=2 else 2.0) + (5.0 if vol['spike'] else 0.0)
     conf=clamp(conf,72.0,94.0)
     reason=(f'{direction} TAURUS + SUPER SENEGAL confirmado • {flag_txt} • tendência PMAX/Z alinhada • '
             f'ADX {av:.1f} • DMI +{current["pdi"]:.1f}/-{current["mdi"]:.1f} • '
@@ -28304,8 +28305,8 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar COMBINER FLOW + RSI ativo • procurando reação em S/R com confirmação RSI</div>';
     rad();
   }else if(engine==='TAURUSSENEGAL'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='TAURUS + SUPER SENEGAL ONLINE • M1 • S/R OU LTA/LTB + PMAX/Z + ADX/DMI + VOLUME • 4 MIN';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🐂🎯 Taurus + Super Senegal • candle fechado • próxima vela M1 • expiração 1 min • cooldown 4 min • sem Gale.</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='TAURUS + SUPER SENEGAL ONLINE • M1 • S/R OU LTA/LTB + PMAX/Z + ADX/DMI • VOLUME REFORÇO • 3 MIN';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🐂🎯 Taurus + Super Senegal • candle fechado • próxima vela M1 • expiração 1 min • cooldown 3 min • sem Gale.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Taurus + Super Senegal ativo • procurando região Taurus com direção Senegal alinhada</div>';
     rad();
   }else if(engine==='SNIPER'){
