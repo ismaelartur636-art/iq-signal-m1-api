@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.95.5"
+APP_VERSION = "3.95.6"
 PWA_VERSION = "v168"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -2346,6 +2346,265 @@ def _rtm_ea_latest_payload(symbol: str, interval: str, market: str = "OPEN") -> 
         return _rtm_ea_wait_payload(symbol, interval, market)
     item.pop("_received_ts", None)
     return item
+
+
+
+# -----------------------------------------------------------------------------
+# RTM MULTI 3.95.6 — motor INTERNO mais frouxo + bridge MT4 opcional
+# O app agora consegue gerar o RTM sozinho pelos candles da própria fonte.
+# Se chegar um sinal fresco do EA MT4, ele continua tendo prioridade.
+# -----------------------------------------------------------------------------
+RTM_INTERNAL_HISTORY_BARS = max(210, int(os.getenv("RTM_INTERNAL_HISTORY_BARS", "220")))
+RTM_PREALERT_SECONDS = max(8, min(40, int(os.getenv("RTM_PREALERT_SECONDS", "20"))))
+RTM_EARLY_MIN_REMAINING = max(1, min(8, int(os.getenv("RTM_EARLY_MIN_REMAINING", "2"))))
+RTM_MIN_DIRECTIONAL_VOTES = max(7, min(18, int(os.getenv("RTM_MIN_DIRECTIONAL_VOTES", "10"))))
+RTM_MIN_VOTE_EDGE = max(1, min(8, int(os.getenv("RTM_MIN_VOTE_EDGE", "2"))))
+RTM_MIN_CONSENSUS = max(50.0, min(75.0, float(os.getenv("RTM_MIN_CONSENSUS", "53"))))
+RTM_MIN_ADX = max(8.0, min(30.0, float(os.getenv("RTM_MIN_ADX", "13"))))
+RTM_BREAKOUT_LOOKBACK = max(5, min(25, int(os.getenv("RTM_BREAKOUT_LOOKBACK", "8"))))
+RTM_MIN_BODY_ATR = max(0.05, min(0.50, float(os.getenv("RTM_MIN_BODY_ATR", "0.10"))))
+
+
+def _rtm_num(row, key, default=0.0):
+    try:
+        return float(row.get(key, default) or default)
+    except Exception:
+        return float(default)
+
+
+def _rtm_volume(row):
+    for key in ("volume", "tick_volume", "vol", "ticks"):
+        try:
+            v=float(row.get(key,0) or 0)
+            if v>0:
+                return v
+        except Exception:
+            pass
+    return 0.0
+
+
+def _rtm_cci(rows, period=14):
+    if len(rows) < period:
+        return None
+    tps=[(_rtm_num(c,"high")+_rtm_num(c,"low")+_rtm_num(c,"close"))/3.0 for c in rows[-period:]]
+    m=sum(tps)/period
+    dev=sum(abs(x-m) for x in tps)/period
+    if dev <= 1e-12:
+        return 0.0
+    return (tps[-1]-m)/(0.015*dev)
+
+
+def _rtm_wpr(rows, period=14):
+    if len(rows) < period:
+        return None
+    win=rows[-period:]
+    hh=max(_rtm_num(c,"high") for c in win)
+    ll=min(_rtm_num(c,"low") for c in win)
+    den=hh-ll
+    if den <= 1e-12:
+        return -50.0
+    return -100.0*(hh-_rtm_num(win[-1],"close"))/den
+
+
+def _rtm_mfi(rows, period=14):
+    if len(rows) < period+1:
+        return None
+    win=rows[-(period+1):]
+    pos=neg=0.0
+    prev_tp=None
+    has_volume=False
+    for c in win:
+        tp=(_rtm_num(c,"high")+_rtm_num(c,"low")+_rtm_num(c,"close"))/3.0
+        vol=_rtm_volume(c)
+        if vol>0:
+            has_volume=True
+        mf=tp*vol
+        if prev_tp is not None:
+            if tp>prev_tp: pos+=mf
+            elif tp<prev_tp: neg+=mf
+        prev_tp=tp
+    if not has_volume:
+        return None
+    if neg <= 1e-12:
+        return 100.0 if pos>0 else 50.0
+    ratio=pos/neg
+    return 100.0-(100.0/(1.0+ratio))
+
+
+def _rtm_demarker(rows, period=14):
+    if len(rows) < period+1:
+        return None
+    demax=[]; demin=[]
+    for i in range(len(rows)-period, len(rows)):
+        cur=rows[i]; prev=rows[i-1]
+        demax.append(max(_rtm_num(cur,"high")-_rtm_num(prev,"high"),0.0))
+        demin.append(max(_rtm_num(prev,"low")-_rtm_num(cur,"low"),0.0))
+    a=sum(demax)/period; b=sum(demin)/period
+    den=a+b
+    return 0.5 if den<=1e-12 else a/den
+
+
+def _rtm_di(rows, period=14):
+    if len(rows) < period+2:
+        return None
+    trs=[]; plus=[]; minus=[]
+    for i in range(len(rows)-period, len(rows)):
+        cur=rows[i]; prev=rows[i-1]
+        up=_rtm_num(cur,"high")-_rtm_num(prev,"high")
+        down=_rtm_num(prev,"low")-_rtm_num(cur,"low")
+        plus.append(up if up>down and up>0 else 0.0)
+        minus.append(down if down>up and down>0 else 0.0)
+        h=_rtm_num(cur,"high"); l=_rtm_num(cur,"low"); pc=_rtm_num(prev,"close")
+        trs.append(max(h-l,abs(h-pc),abs(l-pc)))
+    tr=sum(trs)
+    if tr<=1e-12:
+        return {"plus":0.0,"minus":0.0,"adx":0.0}
+    pdi=100.0*sum(plus)/tr; mdi=100.0*sum(minus)/tr
+    a=adx(rows,period) or 0.0
+    return {"plus":pdi,"minus":mdi,"adx":float(a)}
+
+
+def _rtm_rvi(rows, period=10):
+    if len(rows) < period+5:
+        return None
+    vals=[]
+    for c in rows:
+        rng=max(_rtm_num(c,"high")-_rtm_num(c,"low"),1e-12)
+        vals.append((_rtm_num(c,"close")-_rtm_num(c,"open"))/rng)
+    main=sum(vals[-period:])/period
+    signal=sum(vals[-(period+4):-4])/period if len(vals)>=period+4 else main
+    return main, signal
+
+
+def _rtm_ao(rows):
+    if len(rows) < 35:
+        return None
+    med=[(_rtm_num(c,"high")+_rtm_num(c,"low"))/2.0 for c in rows]
+    a5=sum(med[-5:])/5.0
+    a34=sum(med[-34:])/34.0
+    cur=a5-a34
+    med_prev=med[:-1]
+    prev=(sum(med_prev[-5:])/5.0)-(sum(med_prev[-34:])/34.0) if len(med_prev)>=34 else cur
+    return cur, prev
+
+
+def _rtm_vote_strategy(rows, timeframe="1min", market="OPEN", early_signal=False):
+    """RTM MULTI interno: 30 leituras, confluência frouxa e confiança por votos ATIVOS."""
+    data=list(rows or [])
+    tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30","1h":"H1","4h":"H4"}.get(timeframe,timeframe)
+    name=f"RTM MULTI • 30 VOTOS FLEX {tf_label}"
+    if len(data) < 205:
+        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
+                "risk":"HIGH","strategy":name,"engine":"RTM","provider":"LOCAL_RTM_MULTI_VOTE",
+                "reason":f"RTM coletando histórico ({len(data)}/205 candles).","votes":{},
+                "early_signal_window":bool(early_signal),"next_candle_entry":True,"gale_signal":False}
+
+    closes=[_rtm_num(c,"close") for c in data]
+    highs=[_rtm_num(c,"high") for c in data]
+    lows=[_rtm_num(c,"low") for c in data]
+    last=data[-1]; prev=data[-2]
+    c0=closes[-1]; c1=closes[-2]
+    o0=_rtm_num(last,"open"); h0=highs[-1]; l0=lows[-1]
+
+    buy=[]; sell=[]; neutral=[]
+    def vote(tag,b,s):
+        if bool(b) and not bool(s): buy.append(tag)
+        elif bool(s) and not bool(b): sell.append(tag)
+        else: neutral.append(tag)
+
+    # 1-8 Tendência
+    e5=ema(closes,5); e9=ema(closes,9); e21=ema(closes,21); e50=ema(closes,50); e200=ema(closes,200)
+    e9p=ema(closes[:-1],9); e21p=ema(closes[:-1],21)
+    s20=sma(closes,20); s50=sma(closes,50)
+    vote("EMA5x9", e5 is not None and e9 is not None and e5>e9, e5 is not None and e9 is not None and e5<e9)
+    vote("EMA9x21", e9 is not None and e21 is not None and e9>e21, e9 is not None and e21 is not None and e9<e21)
+    vote("EMA21x50", e21 is not None and e50 is not None and e21>e50, e21 is not None and e50 is not None and e21<e50)
+    vote("EMA50x200", e50 is not None and e200 is not None and e50>e200, e50 is not None and e200 is not None and e50<e200)
+    vote("SMA20", s20 is not None and c0>s20, s20 is not None and c0<s20)
+    vote("SMA20x50", s20 is not None and s50 is not None and s20>s50, s20 is not None and s50 is not None and s20<s50)
+    vote("EMA9_SLOPE", e9 is not None and e9p is not None and e9>e9p, e9 is not None and e9p is not None and e9<e9p)
+    vote("EMA21_SLOPE", e21 is not None and e21p is not None and e21>e21p, e21 is not None and e21p is not None and e21<e21p)
+
+    # 9-21 Momentum/força
+    r7=rsi(closes,7); r14=rsi(closes,14)
+    vote("RSI7", r7 is not None and r7>50.5, r7 is not None and r7<49.5)
+    vote("RSI14", r14 is not None and r14>50.5, r14 is not None and r14<49.5)
+    di=_rtm_di(data,14)
+    vote("ADX_DI", di is not None and di["adx"]>=RTM_MIN_ADX and di["plus"]>di["minus"], di is not None and di["adx"]>=RTM_MIN_ADX and di["minus"]>di["plus"])
+    mac=_macd_snapshot(closes,12,26,9)
+    vote("MACD", mac is not None and mac["macd"]>mac["signal"], mac is not None and mac["macd"]<mac["signal"])
+    st=stochastic(data,14,3,3)
+    vote("STOCH", st is not None and st["k"]>st["d"] and st["k"]<90, st is not None and st["k"]<st["d"] and st["k"]>10)
+    cci=_rtm_cci(data,14)
+    vote("CCI", cci is not None and cci>0, cci is not None and cci<0)
+    mom=(c0/closes[-15]*100.0) if len(closes)>=15 and abs(closes[-15])>1e-12 else 100.0
+    vote("MOM", mom>100.0, mom<100.0)
+    roc=(c0-closes[-6])/closes[-6] if len(closes)>=6 and abs(closes[-6])>1e-12 else 0.0
+    vote("ROC5", roc>0.0, roc<0.0)
+    rv=_rtm_rvi(data,10)
+    vote("RVI", rv is not None and rv[0]>rv[1], rv is not None and rv[0]<rv[1])
+    ao=_rtm_ao(data)
+    vote("AO", ao is not None and ao[0]>0, ao is not None and ao[0]<0)
+    vote("AC", ao is not None and ao[0]>ao[1], ao is not None and ao[0]<ao[1])
+    force=(c0-c1)*(_rtm_volume(last) or 1.0)
+    vote("FORCE", force>0, force<0)
+    e13=ema(closes,13)
+    bulls=(h0-e13) if e13 is not None else 0.0
+    bears=(l0-e13) if e13 is not None else 0.0
+    vote("BULLS_BEARS", e13 is not None and bulls>abs(bears), e13 is not None and abs(bears)>bulls)
+
+    # 22-27 Fluxo/posição/reversão
+    wpr=_rtm_wpr(data,14)
+    vote("WPR", wpr is not None and wpr>-50, wpr is not None and wpr<-50)
+    mfi=_rtm_mfi(data,14)
+    vote("MFI", mfi is not None and mfi>50, mfi is not None and mfi<50)
+    dem=_rtm_demarker(data,14)
+    vote("DEMARKER", dem is not None and dem>0.50, dem is not None and dem<0.50)
+    bb=bollinger(closes,20,2.0)
+    vote("BB_MID", bb is not None and c0>bb["middle"], bb is not None and c0<bb["middle"])
+    vol=_rtm_volume(last) or 1.0
+    obv_delta=(vol if c0>c1 else (-vol if c0<c1 else 0.0))
+    vote("OBV", obv_delta>0, obv_delta<0)
+    buy_reject=bool(bb and l0<=bb["lower"] and c0>bb["lower"] and c0>o0)
+    sell_reject=bool(bb and h0>=bb["upper"] and c0<bb["upper"] and c0<o0)
+    vote("BB_REJECT",buy_reject,sell_reject)
+
+    # 28-30 Price action/breakout
+    at=atr(data,14)
+    body=abs(c0-o0)
+    vote("BODY_ATR", at is not None and body>=at*RTM_MIN_BODY_ATR and c0>o0, at is not None and body>=at*RTM_MIN_BODY_ATR and c0<o0)
+    lb=min(RTM_BREAKOUT_LOOKBACK,len(data)-2)
+    prev_high=max(highs[-lb-1:-1]) if lb>0 else h0
+    prev_low=min(lows[-lb-1:-1]) if lb>0 else l0
+    vote("BREAKOUT", c0>prev_high, c0<prev_low)
+    vote("CLOSE_FLOW", c0>c1, c0<c1)
+
+    b=len(buy); se=len(sell); active=b+se; edge=abs(b-se)
+    if active<=0 or b==se:
+        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
+                "strategy":name,"engine":"RTM","provider":"LOCAL_RTM_MULTI_VOTE",
+                "reason":f"RTM FLEX sem maioria: BUY {b} x SELL {se}.",
+                "votes":{"buy":b,"sell":se,"active":active,"neutral":len(neutral),"total_slots":30},
+                "early_signal_window":bool(early_signal),"next_candle_entry":True,"gale_signal":False}
+
+    direction="CALL" if b>se else "PUT"
+    winner=max(b,se)
+    consensus=100.0*winner/max(active,1)
+    confirmed=bool(winner>=RTM_MIN_DIRECTIONAL_VOTES and edge>=RTM_MIN_VOTE_EDGE and consensus>=RTM_MIN_CONSENSUS)
+    reasons=(buy if direction=="CALL" else sell)
+    risk="LOW" if confirmed and consensus>=64 and edge>=5 else ("MEDIUM" if confirmed else "HIGH")
+    if confirmed:
+        reason=(f"RTM FLEX {direction}: BUY {b} x SELL {se} • consenso ativo {consensus:.1f}% • "
+                f"vantagem {edge} • confirmações: {', '.join(reasons[:8])}.")
+    else:
+        reason=(f"RTM FLEX monitorando: BUY {b} x SELL {se} • consenso {consensus:.1f}% • vantagem {edge}. "
+                f"Mínimos: {RTM_MIN_DIRECTIONAL_VOTES} votos, vantagem {RTM_MIN_VOTE_EDGE}, consenso {RTM_MIN_CONSENSUS:.0f}%.")
+    return {"available":True,"direction":direction if confirmed else "NEUTRO","raw_direction":direction,
+            "confidence":round(consensus,1) if confirmed else round(min(consensus,79.0),1),"confirmed":confirmed,
+            "risk":risk,"strategy":name,"engine":"RTM","provider":"LOCAL_RTM_MULTI_VOTE","reason":reason[:520],
+            "votes":{"buy":b,"sell":se,"active":active,"neutral":len(neutral),"total_slots":30,"edge":edge,"consensus":round(consensus,1)},
+            "buy_reasons":buy,"sell_reasons":sell,"early_signal_window":bool(early_signal),
+            "next_candle_entry":True,"direct_win_only":True,"gale_signal":False,"non_repaint_after_release":True}
 
 
 def _candle_time_candidates(value: str):
@@ -14094,12 +14353,19 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     elif engine == "BLACKBOOK":
         # BLACK BOOK usa somente candle fechado e entra na abertura imediatamente seguinte.
         entry_mode = "BIRTH"
+    elif engine == "RTM":
+        # RTM FLEX lê a vela em formação nos 20s finais e entra na próxima abertura.
+        entry_mode = "MIDDLE"
     if engine == "RSI":
         engine = "GRAPH_AI"
     if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM"):
         engine = "GRAPH_AI"
     if engine == "RTM":
-        return _rtm_ea_latest_payload(symbol, interval, market)
+        # Se o MT4 enviou um sinal fresco, ele tem prioridade. Sem bridge, o motor
+        # interno continua analisando normalmente pelos candles do próprio app.
+        _rtm_external = _rtm_ea_latest_payload(symbol, interval, market)
+        if str(_rtm_external.get("direction") or "").upper() in ("CALL", "PUT"):
+            return _rtm_external
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     fibo_poc_key = int(bool(robofibo_poc)) if engine == "FIBORSI" else 0
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}|FIBO_POC={fibo_poc_key}"
@@ -14199,6 +14465,26 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 raw = await iq_ea_candles(iq_state, symbol, interval, 120, regular_market=False)
             else:
                 raw = await candles(symbol, interval, 120, "OPEN", None, request=request)
+        elif engine == "RTM":
+            # RTM FLEX interno: OPEN via multifuente; OTC via IQ Option real.
+            if market == "IQ_OTC":
+                if not iq_state:
+                    out = neutral_signal(
+                        symbol, interval, market,
+                        "RTM MULTI FLEX • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para o RTM MULTI FLEX analisar candles OTC reais.",
+                        source_state="WAITING",
+                    )
+                    out.update({
+                        "strategy":"RTM MULTI • 30 VOTOS FLEX","mode":"RTM_INTERNAL_MULTI_VOTE",
+                        "selected_engine":engine,"feed_source":"IQ_OPTION_OTC",
+                        "non_repaint_after_release":True,"next_candle_entry":True,"direct_win_only":True,"gale_signal":False,
+                    })
+                    cache[key]=(time.time(),out)
+                    return out
+                raw=await iq_ea_candles(iq_state,symbol,interval,RTM_INTERNAL_HISTORY_BARS,regular_market=False)
+            else:
+                raw=await candles(symbol,interval,RTM_INTERNAL_HISTORY_BARS,"OPEN",None,request=request)
         elif engine == "BLACKBOOK":
             # BLACK BOOK: OPEN via roteador multifuente; OTC via candles reais da IQ Option.
             if market == "IQ_OTC":
@@ -14564,6 +14850,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "EA XGBOOST • FONTE EM ESPERA" if market == "OPEN" else "EA XGBOOST • IQ OPTION EM ESPERA"
         elif engine == "RUBIK":
             status = "ROBÔ RUBIK • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION EM ESPERA"
+        elif engine == "RTM":
+            status = "RTM MULTI FLEX • FONTE EM ESPERA" if market == "OPEN" else "RTM MULTI FLEX • IQ OPTION EM ESPERA"
         elif engine == "BLACKBOOK":
             status = "BLACK BOOK • FONTE EM ESPERA" if market == "OPEN" else "BLACK BOOK • IQ OPTION EM ESPERA"
         elif engine == "LARRY":
@@ -14615,6 +14903,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "EA XGBOOST • FONTE RECONECTANDO" if market == "OPEN" else "EA XGBOOST • IQ OPTION RECONECTANDO"
         elif engine == "RUBIK":
             status = "ROBÔ RUBIK • FONTE RECONECTANDO" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION RECONECTANDO"
+        elif engine == "RTM":
+            status = "RTM MULTI FLEX • FONTE RECONECTANDO" if market == "OPEN" else "RTM MULTI FLEX • IQ OPTION RECONECTANDO"
         elif engine == "BLACKBOOK":
             status = "BLACK BOOK • FONTE RECONECTANDO" if market == "OPEN" else "BLACK BOOK • IQ OPTION RECONECTANDO"
         elif engine == "LARRY":
@@ -14706,6 +14996,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "RUBIK":
             engine_title = "ROBÔ RUBIK ADAPTADO"
             engine_mode = "RUBIK_ADAPTED"
+        elif engine == "RTM":
+            engine_title = "RTM MULTI FLEX"
+            engine_mode = "RTM_INTERNAL_MULTI_VOTE"
         elif engine == "BLACKBOOK":
             engine_title = "BLACK BOOK"
             engine_mode = "BLACKBOOK_PRICE_ACTION"
@@ -14773,7 +15066,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK"):
+        if market != "OPEN" and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -14787,6 +15080,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                     "EA": "XGBOOST_RSI_VALUE_CHART",
                     "RUBIK": "LOCAL_RUBIK_ADAPTED",
+                    "RTM": "LOCAL_RTM_MULTI_VOTE",
                     "BLACKBOOK": "LOCAL_BLACK_BOOK",
                     "LARRY": "LOCAL_LARRY_BREAKOUT",
                     "RANGE": "LOCAL_RANGE_COMPRESSION_BREAKOUT",
@@ -14834,6 +15128,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 engine_closed = closed[-min(TRIPRSI_HISTORY_BARS, len(closed)):]
             elif engine == "TMARSI":
                 engine_closed = closed[-min(TMARSI_HISTORY_BARS, len(closed)):]
+            elif engine == "RTM":
+                engine_closed = closed[-min(RTM_INTERNAL_HISTORY_BARS, len(closed)):]
             elif engine == "BLACKBOOK":
                 engine_closed = closed[-min(BLACKBOOK_HISTORY_BARS, len(closed)):]
             elif engine in ("COMBINER", "RSIDIVBB"):
@@ -14855,6 +15151,25 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 )
             elif engine == "RUBIK":
                 analysis = rubik_adapted_strategy(engine_closed, interval, market=market)
+            elif engine == "RTM":
+                rtm_seconds_to_entry=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                rtm_early_window=(RTM_EARLY_MIN_REMAINING <= rtm_seconds_to_entry <= RTM_PREALERT_SECONDS)
+                if rtm_early_window:
+                    analysis=_rtm_vote_strategy(raw[-RTM_INTERNAL_HISTORY_BARS:],interval,market=market,early_signal=True)
+                    analysis["early_signal_window"]=True
+                    analysis["seconds_to_entry_snapshot"]=round(rtm_seconds_to_entry,1)
+                else:
+                    analysis=_rtm_vote_strategy(engine_closed,interval,market=market,early_signal=False)
+                    if analysis.get("confirmed"):
+                        analysis["preview_direction"]=analysis.get("direction")
+                        analysis["preview_confidence"]=analysis.get("confidence")
+                    analysis["confirmed"]=False
+                    analysis["direction"]="NEUTRO"
+                    analysis["confidence"]=0.0
+                    analysis["reason"]=(f"RTM MULTI FLEX monitorando • sinal oficial nos últimos {RTM_PREALERT_SECONDS}s da vela "
+                                        f"(agora faltam {int(rtm_seconds_to_entry)}s).")
+                    analysis["early_signal_window"]=False
+                    analysis["seconds_to_entry_snapshot"]=round(rtm_seconds_to_entry,1)
             elif engine == "BLACKBOOK":
                 analysis = blackbook_strategy(engine_closed, interval, market=market)
             elif engine == "LARRY":
@@ -15127,12 +15442,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "RSI5": "LOCAL_RSI_ADX_4TF",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK") else "HIGH").upper(),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM") else "HIGH").upper(),
             "strategy": (
                 "IA LEITURA DO GRÁFICO" if engine == "SMART"
                 else (analysis.get("strategy") or (
                     "EA RSI + VALUE CHART + XGBOOST" if engine == "EA"
                     else "ROBÔ RUBIK ADAPTADO" if engine == "RUBIK"
+                    else "RTM MULTI • 30 VOTOS FLEX" if engine == "RTM"
                     else "BLACK BOOK • PRICE ACTION" if engine == "BLACKBOOK"
                     else "LARRY BREAKOUT" if engine == "LARRY"
                     else "RANGE COMPRESSION BREAKOUT" if engine == "RANGE"
@@ -15197,6 +15513,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             reference_candle = engine_closed[-1].get("datetime") if engine_closed else None
             if engine == "RSI5" and analysis.get("event_key"):
                 reference_candle = analysis.get("event_key")
+            if engine == "RTM" and analysis.get("early_signal_window") and raw:
+                reference_candle = raw[-1].get("datetime")
             if engine == "ALPHAX" and analysis.get("early_signal_window") and raw:
                 reference_candle = raw[-1].get("datetime")
             if engine == "RAPID" and analysis.get("early_signal_window") and raw:
@@ -15319,6 +15637,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "SMART": "pure_ai_fingerprint",
                 "EA": "ea_fingerprint",
                 "RUBIK": "rubik_fingerprint",
+                "RTM": "rtm_fingerprint",
                 "BLACKBOOK": "blackbook_fingerprint",
                 "LARRY": "larry_fingerprint",
                 "RANGE": "range_compression_fingerprint",
@@ -15557,7 +15876,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key] = (time.time(), base)
                         return base
 
-                if engine in ("VOLUME", "VOLUME_AI", "SUNTZU"):
+                if engine == "RTM":
+                    entry = next_boundary(interval)
+                    announce = entry - timedelta(seconds=RTM_PREALERT_SECONDS)
+                    expiry = entry + timedelta(seconds=INTERVALS[interval])
+                elif engine in ("VOLUME", "VOLUME_AI", "SUNTZU"):
                     entry = next_boundary(interval)
                     _lead = SUNTZU_EARLY_SIGNAL_SECONDS if engine == "SUNTZU" else VOLUME_POC_EARLY_SIGNAL_SECONDS
                     announce = entry - timedelta(seconds=_lead)
@@ -15573,6 +15896,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "status": (smart_status if engine == "SMART" else {
                         "EA": "SINAL TRIPLA CONFIRMAÇÃO LIBERADO",
                         "RUBIK": "SINAL ROBÔ RUBIK ADAPTADO LIBERADO",
+                        "RTM": "SINAL RTM MULTI FLEX LIBERADO",
                         "BLACKBOOK": "SINAL BLACK BOOK LIBERADO",
                         "LARRY": "SINAL LARRY BREAKOUT LIBERADO",
                         "RANGE": "SINAL RANGE COMPRESSION LIBERADO",
@@ -15596,12 +15920,18 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "FORCE": "SINAL EA FORÇA DO MOVIMENTO LIBERADO",
                         "BIGRISE": "SINAL BTC FORCE MULTIATIVOS LIBERADO",
                     }.get(engine, "SINAL IA GRÁFICA LIBERADO")),
-                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK") else "MEDIUM").upper(),
+                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM") else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
                     "expiry_time": iso(expiry),
                     "reference_candle": reference_candle,
                 })
+                if engine == "RTM":
+                    base["announce_seconds_before"] = RTM_PREALERT_SECONDS
+                    base["early_signal_locked"] = True
+                    base["non_repaint_after_release"] = True
+                    base["signal_snapshot"] = "FORMING_CANDLE_AT_20S_FLEX"
+                    base["rtm_flex"] = {"slots":30,"min_votes":RTM_MIN_DIRECTIONAL_VOTES,"vote_edge":RTM_MIN_VOTE_EDGE,"min_consensus":RTM_MIN_CONSENSUS,"adx_min":RTM_MIN_ADX,"breakout_lookback":RTM_BREAKOUT_LOOKBACK,"body_atr":RTM_MIN_BODY_ATR}
                 if engine == "BLACKBOOK":
                     base["non_repaint_after_release"] = True
                     base["signal_snapshot"] = "LAST_CLOSED_CANDLE"
@@ -15670,7 +16000,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK"):
+                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -19431,7 +19761,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
     if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM"):
         raise HTTPException(400, "Motor inválido.")
 
-    state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") and engine != "RTM" else None
+    state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
     if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM"):
         fallback_twelve = False
         effective_market = requested_market
@@ -19456,10 +19786,17 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             # realmente gerou o sinal. Isto evita fechar um sinal IQ_OTC como OPEN.
             data["requested_market"] = requested_market
             if engine == "RTM":
-                data["feed_source"] = "MT4_EA"
-                data["feed_label"] = "MetaTrader 4 • RTM MULTI EA"
-                data["feed_fallback"] = False
-                data["feed_message"] = "CALL/PUT recebido diretamente do RTM MULTI EA via /rtm-ea-signal."
+                if data.get("external_ea"):
+                    data["feed_source"] = "MT4_EA"
+                    data["feed_label"] = "MetaTrader 4 • RTM MULTI EA"
+                    data["feed_fallback"] = False
+                    data["feed_message"] = "CALL/PUT recebido diretamente do RTM MULTI EA via /rtm-ea-signal."
+                else:
+                    _fs = str(data.get("feed_source") or ("IQ_OPTION_OTC" if requested_market == "IQ_OTC" else "MULTIFEED"))
+                    data["feed_source"] = _fs
+                    data["feed_label"] = _feed_source_label(_fs) if _fs != "MULTIFEED" else "Multifuente • RTM interno"
+                    data["feed_fallback"] = bool(data.get("feed_fallback", False))
+                    data["feed_message"] = "RTM MULTI FLEX analisado dentro do app; o bridge MT4 ficou opcional."
             elif engine == "EA":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -20138,7 +20475,7 @@ async def pre_signals(
     if engine == "RTM":
         return {
             "ok": True,
-            "message": "RTM MULTI EA: o pré-alerta é produzido no MetaTrader 4 e enviado ao app pelo bridge; padrão de 20s antes e entrada na próxima vela.",
+            "message": f"RTM MULTI FLEX: análise interna contínua; CALL/PUT pode ser liberado nos últimos {RTM_PREALERT_SECONDS}s para entrada na próxima vela. O MT4 é opcional.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -20860,19 +21197,23 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Motor inválido.")
 
     if engine == "RTM":
-        scan = [symbol] if symbol else list(SYMBOLS)
+        scan = [symbol] if symbol else list(SYMBOLS if market == "OPEN" else OTC_SYMBOLS)
         out = []
+        iq_rtm = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
         for sym in scan:
-            payload = _rtm_ea_latest_payload(sym, interval, market)
+            try:
+                payload = await signal(sym, interval, market, iq_rtm, request=request, ai_only=True, engine="RTM", entry_mode="MIDDLE")
+            except Exception as exc:
+                payload = {"direction":"NEUTRO","confidence":0.0,"status":"RTM MULTI FLEX • AGUARDANDO FONTE","reason":str(exc)[:160]}
             direction = str(payload.get("direction") or "NEUTRO").upper()
             out.append({
                 "symbol": sym, "base_symbol": sym, "direction": direction,
                 "confidence": round(float(payload.get("confidence") or 0.0), 1),
-                "status": str(payload.get("status") or "RTM MULTI EA • AGUARDANDO SINAL"),
+                "status": str(payload.get("status") or "RTM MULTI FLEX • MONITORANDO"),
                 "clickable": direction in ("CALL", "PUT"),
-                "updated_at": payload.get("announce_time"), "feed_source": "MT4_EA",
-                "feed_fallback": False, "requested_market": market, "engine": "RTM",
-                "strategy": "RTM MULTI EA",
+                "updated_at": payload.get("announce_time"), "feed_source": payload.get("feed_source") or ("IQ_OPTION_OTC" if market=="IQ_OTC" else "MULTIFEED"),
+                "feed_fallback": bool(payload.get("feed_fallback",False)), "requested_market": market, "engine": "RTM",
+                "strategy": str(payload.get("strategy") or "RTM MULTI • 30 VOTOS FLEX"),
             })
         return out
 
@@ -22438,7 +22779,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="robot-mode-card" id="rtmModeCard">
     <img src="__MEGA_IMAGE__" alt="RTM Multi EA">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">🤖 RTM MULTI EA</div>
+      <div class="robot-mode-title">🤖 RTM MULTI FLEX</div>
       <div class="robot-mode-desc" id="rtmModeDesc">MetaTrader 4 • mais de 20 leituras técnicas • confluência por votos • pré-alerta 20s • entrada na próxima vela • separado do BLACK BOOK.</div>
     </div>
     <button id="rtmPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
@@ -24422,7 +24763,7 @@ function momentStudyEngineName(key){
   const names={
     GRAPH_AI:'🧠 IA GRÁFICA',
     SMART:'🧠 IA LEITURA DO GRÁFICO',
-    RTM:'🤖 RTM MULTI EA',
+    RTM:'🤖 RTM MULTI FLEX',
     LARRY:'⚡ LARRY BREAKOUT',
     VELOCITY:'⚡ VELOCITY FLOW',
     ALPHAX:'🧬 ALPHAX RELAY',
@@ -27065,12 +27406,12 @@ function applyRobotPowerState(){
     ? 'ONLINE: suporte/resistência confirmado + reação da vela + RSI 14 • próxima vela • sem repaint.'
     : 'OFFLINE: COMBINER FLOW + RSI pausado.';
 
-  if(rtmModeDesc) rtmModeDesc.textContent=rtmEnabled ? 'ONLINE: MetaTrader 4 • confluência por votos de mais de 20 leituras • pré-alerta 20s • entrada na próxima vela.' : 'OFFLINE: RTM MULTI EA pausado • BLACK BOOK permanece separado.';
+  if(rtmModeDesc) rtmModeDesc.textContent=rtmEnabled ? 'ONLINE FLEX: 30 votos internos • mínimo 10 • vantagem 2 • consenso 53% • pré-alerta 20s • próxima vela • MT4 opcional.' : 'OFFLINE: RTM MULTI FLEX pausado • BLACK BOOK permanece separado.';
   const engine=selectedRobotEngine();
   if(engine==='RTM'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RTM MULTI EA ONLINE • AGUARDANDO CALL/PUT DO METATRADER 4';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 RTM MULTI EA selecionado • pré-alerta 20s • entrada na próxima vela • BLACK BOOK continua separado.</div>';
-    if(radar) radar.innerHTML='<div>📡 RTM MULTI EA ativo • aguardando sinais enviados pelo MetaTrader 4</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RTM MULTI FLEX ONLINE • ANALISANDO CANDLES NO APP';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 RTM MULTI FLEX selecionado • 30 votos internos • pré-alerta 20s • próxima vela • BLACK BOOK continua separado.</div>';
+    if(radar) radar.innerHTML='<div>📡 RTM MULTI FLEX ativo • analisando o mercado pelo próprio app</div>';
     rad();
   }else if(engine==='TMARSI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EXTREME TMA + RSI ONLINE • TMA17 + RSI7 + TREND FILTER ALINHADOS • PRÓXIMA VELA';
@@ -28658,8 +28999,8 @@ async function loadPreSignals(){
     return;
   }
   if(engine==='RTM'){
-    if(preSignalStatus) preSignalStatus.textContent='RTM MULTI EA • o pré-alerta nasce no MT4 e chega ao app via bridge.';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 Aguardando RTM MULTI EA • padrão 20s antes • entrada na próxima vela.</div>';
+    if(preSignalStatus) preSignalStatus.textContent='RTM MULTI FLEX • pré-alerta calculado dentro do app; bridge MT4 opcional.';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 RTM MULTI FLEX monitorando • 20s antes • entrada na próxima vela.</div>';
     return;
   }
 
