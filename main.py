@@ -2378,7 +2378,7 @@ def _rtm_ea_latest_payload(symbol: str, interval: str, market: str = "OPEN") -> 
 # estiver forte. Confluencias do mesmo lado aumentam a confianca; se dois blocos
 # fortes apontarem lados opostos, a entrada e cancelada por conflito.
 # -----------------------------------------------------------------------------
-RTM_INTERNAL_HISTORY_BARS = max(210, int(os.getenv("RTM_INTERNAL_HISTORY_BARS", "220")))
+RTM_INTERNAL_HISTORY_BARS = max(60, int(os.getenv("RTM_INTERNAL_HISTORY_BARS", "220")))
 RTM_PREALERT_SECONDS = max(8, min(40, int(os.getenv("RTM_PREALERT_SECONDS", "20"))))
 RTM_EARLY_MIN_REMAINING = max(1, min(8, int(os.getenv("RTM_EARLY_MIN_REMAINING", "2"))))
 RTM_MIN_ADX = max(8.0, min(30.0, float(os.getenv("RTM_MIN_ADX", "13"))))
@@ -2569,10 +2569,10 @@ def _rtm_vote_strategy(rows, timeframe="1min", market="OPEN", early_signal=False
     data=list(rows or [])
     tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30","1h":"H1","4h":"H4"}.get(timeframe,timeframe)
     name=f"RTM MULTI • GATILHOS INDIVIDUAIS {tf_label}"
-    if len(data) < 205:
+    if len(data) < 60:
         return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
                 "risk":"HIGH","strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDIVIDUAL_TRIGGERS",
-                "reason":f"RTM coletando historico ({len(data)}/205 candles).","detectors":[],
+                "reason":f"RTM coletando historico ({len(data)}/60 candles).","detectors":[],
                 "independent_indicators":True,"early_signal_window":bool(early_signal),
                 "next_candle_entry":True,"gale_signal":False}
 
@@ -2699,7 +2699,7 @@ def _rtm_vote_strategy(rows, timeframe="1min", market="OPEN", early_signal=False
         return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
                 "strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDIVIDUAL_TRIGGERS",
                 "reason":"RTM INDIVIDUAL monitorando • nenhum gatilho individual disparou agora.",
-                "detectors":[],"detectors_total":30,"independent_indicators":True,
+                "detectors":[],"detectors_total":30,"independent_indicators":True,"history_required":60,"history_available":len(data),
                 "early_signal_window":bool(early_signal),"next_candle_entry":True,"gale_signal":False,
                 "non_repaint_after_release":True}
 
@@ -2717,7 +2717,7 @@ def _rtm_vote_strategy(rows, timeframe="1min", market="OPEN", early_signal=False
             "confirmed":True,"risk":risk,"strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDIVIDUAL_TRIGGERS",
             "reason":reason[:520],"independent_indicators":True,"trigger_indicator":best["tag"],
             "trigger_score":round(confidence,1),"simultaneous_same_side":[x["tag"] for x in same_time[1:]],
-            "simultaneous_opposite":[x["tag"] for x in opposite],"detectors_total":30,
+            "simultaneous_opposite":[x["tag"] for x in opposite],"detectors_total":30,"history_required":60,"history_available":len(data),
             "detectors_triggered":candidates,"early_signal_window":bool(early_signal),
             "next_candle_entry":True,"direct_win_only":True,"gale_signal":False,
             "non_repaint_after_release":True}
