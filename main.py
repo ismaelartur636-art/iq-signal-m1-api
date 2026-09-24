@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.95.4"
-PWA_VERSION = "v167"
+APP_VERSION = "3.95.5"
+PWA_VERSION = "v168"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -2213,6 +2213,25 @@ class TelegramSignalBody(BaseModel):
     result: str | None = None
     test: bool = False
 
+class RTMEAExternalSignalBody(BaseModel):
+    engine: str = "RTM_MULTI_30"
+    source: str = "MT4_EA"
+    symbol: str = "EURUSD"
+    timeframe: str = "M1"
+    direction: str = "NEUTRO"
+    entry_mode: str = "NEXT_CANDLE"
+    entry_time: int | str | None = None
+    expiry_seconds: int = 60
+    prealert_seconds: int = 20
+    confidence: float = 0.0
+    buy_score: int = 0
+    sell_score: int = 0
+    total_votes: int = 0
+    price: float | None = None
+    reasons: str = ""
+    server_time: int | str | None = None
+
+
 class BackgroundBotStateBody(BaseModel):
     enabled: bool = False
     engine: str = "ALPHAX"
@@ -2241,6 +2260,92 @@ def parse_dt(value: str):
     d = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return (d if d.tzinfo else d.replace(tzinfo=UTC)).astimezone(BR_TZ)
 
+
+# -----------------------------------------------------------------------------
+# RTM MULTI EA BRIDGE - segundo motor, separado do BLACK BOOK
+# -----------------------------------------------------------------------------
+RTM_EA_SECRET = os.getenv("RTM_EA_SECRET", "").strip()
+RTM_EA_SIGNAL_TTL_SECONDS = max(60, int(os.getenv("RTM_EA_SIGNAL_TTL_SECONDS", "600")))
+rtm_ea_signal_guard = threading.Lock()
+rtm_ea_signals: dict[str, dict[str, Any]] = {}
+rtm_ea_last_receive_at: str | None = None
+
+
+def _rtm_ea_interval(value: str) -> str:
+    raw = str(value or "M1").strip().upper().replace(" ", "")
+    mapping = {
+        "M1": "1min", "1M": "1min", "1MIN": "1min",
+        "M5": "5min", "5M": "5min", "5MIN": "5min",
+        "M15": "15min", "15M": "15min", "15MIN": "15min",
+        "M30": "30min", "30M": "30min", "30MIN": "30min",
+        "H1": "1h", "1H": "1h",
+        "H4": "4h", "4H": "4h",
+    }
+    return mapping.get(raw, str(value or "1min"))
+
+
+def _rtm_ea_symbol(value: str) -> str:
+    raw = str(value or "").strip().upper().replace("-", "/").replace("_", "/")
+    base = raw.split(".", 1)[0]
+    if "/" not in base:
+        compact = "".join(ch for ch in base if ch.isalnum())
+        known = {
+            "BTCUSD": "BTC/USD", "ETHUSD": "ETH/USD", "LTCUSD": "LTC/USD", "XAUUSD": "XAU/USD",
+            "EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "USDJPY": "USD/JPY",
+            "USDCHF": "USD/CHF", "USDCAD": "USD/CAD", "AUDUSD": "AUD/USD",
+            "NZDUSD": "NZD/USD", "EURJPY": "EUR/JPY", "GBPJPY": "GBP/JPY",
+            "EURGBP": "EUR/GBP", "AUDJPY": "AUD/JPY", "EURAUD": "EUR/AUD",
+        }
+        if compact in known:
+            return known[compact]
+        if len(compact) == 6 and compact.isalpha():
+            return compact[:3] + "/" + compact[3:]
+        return compact or raw
+    return base
+
+
+def _rtm_ea_key(symbol: str, interval: str) -> str:
+    return f"{symbol}|{interval}"
+
+
+def _rtm_ea_wait_payload(symbol: str, interval: str, market: str = "OPEN") -> dict[str, Any]:
+    return {
+        "symbol": symbol, "interval": interval, "market": market,
+        "direction": "NEUTRO", "confidence": 0.0,
+        "entry_time": None, "announce_time": None, "expiry_time": None,
+        "strategy": "RTM MULTI EA", "mode": "RTM_EXTERNAL_MT4",
+        "selected_engine": "RTM", "engine": "RTM_MULTI_30",
+        "status": "RTM MULTI EA • AGUARDANDO SINAL DO MT4",
+        "risk": "--",
+        "reason": "Nenhum CALL/PUT fresco recebido do RTM MULTI EA para este ativo/timeframe.",
+        "source_state": "READY", "feed_source": "MT4_EA",
+        "external_ea": True, "direct_win_only": True, "gale_signal": False,
+    }
+
+
+def _rtm_ea_latest_payload(symbol: str, interval: str, market: str = "OPEN") -> dict[str, Any]:
+    market = str(market or "OPEN").upper()
+    if market != "OPEN":
+        out = _rtm_ea_wait_payload(symbol, interval, market)
+        out["status"] = "RTM MULTI EA • SOMENTE MERCADO ABERTO"
+        out["reason"] = "O bridge recebe o gráfico do MetaTrader 4; ele não usa o OTC da IQ Option."
+        return out
+    key = _rtm_ea_key(symbol, interval)
+    with rtm_ea_signal_guard:
+        item = dict(rtm_ea_signals.get(key) or {})
+    if not item:
+        return _rtm_ea_wait_payload(symbol, interval, market)
+    received_ts = float(item.get("_received_ts") or 0.0)
+    if received_ts <= 0 or (time.time() - received_ts) > RTM_EA_SIGNAL_TTL_SECONDS:
+        return _rtm_ea_wait_payload(symbol, interval, market)
+    try:
+        expiry_dt = parse_dt(str(item.get("expiry_time") or ""))
+    except Exception:
+        expiry_dt = None
+    if expiry_dt is not None and now() > (expiry_dt + timedelta(seconds=15)):
+        return _rtm_ea_wait_payload(symbol, interval, market)
+    item.pop("_received_ts", None)
+    return item
 
 
 def _candle_time_candidates(value: str):
@@ -13991,8 +14096,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         entry_mode = "BIRTH"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM"):
         engine = "GRAPH_AI"
+    if engine == "RTM":
+        return _rtm_ea_latest_payload(symbol, interval, market)
     session_part = iq_state.get("session_id", "") if (market == "IQ_OTC" and iq_state) else market
     fibo_poc_key = int(bool(robofibo_poc)) if engine == "FIBORSI" else 0
     key = f"{session_part}|{market}|{symbol}|{interval}|AI_ONLY={int(ai_only)}|ENGINE={engine}|ENTRY={entry_mode}|FIBO_POC={fibo_poc_key}"
@@ -18349,6 +18456,69 @@ async def _tg_send(body: TelegramSignalBody) -> dict:
     }
 
 
+@app.post("/rtm-ea-signal")
+async def rtm_ea_signal(request: Request, body: RTMEAExternalSignalBody):
+    """Recebe CALL/PUT do RTM MULTI EA rodando no MetaTrader 4."""
+    global rtm_ea_last_receive_at
+    if RTM_EA_SECRET:
+        supplied = str(request.headers.get("X-Mega-License") or "").strip()
+        if supplied != RTM_EA_SECRET:
+            raise HTTPException(401, "Chave do RTM EA inválida.")
+    direction = str(body.direction or "NEUTRO").upper().strip()
+    if direction not in ("CALL", "PUT"):
+        raise HTTPException(400, "direction deve ser CALL ou PUT.")
+    symbol = _rtm_ea_symbol(body.symbol)
+    interval = _rtm_ea_interval(body.timeframe)
+    if interval not in INTERVALS:
+        raise HTTPException(400, "Timeframe do RTM EA não suportado pelo app.")
+    if not _symbol_allowed(symbol, "OPEN"):
+        raise HTTPException(400, f"Ativo do RTM EA não permitido: {symbol}")
+    confidence = max(0.0, min(99.0, float(body.confidence or 0.0)))
+    expiry_seconds = max(60, min(86400, int(body.expiry_seconds or 60)))
+    prealert_seconds = max(0, min(300, int(body.prealert_seconds or 0)))
+    entry_dt = next_boundary(interval)
+    expiry_dt = entry_dt + timedelta(seconds=expiry_seconds)
+    received_at = now()
+    payload = {
+        "symbol": symbol, "interval": interval, "market": "OPEN",
+        "direction": direction, "confidence": round(confidence, 1),
+        "entry_time": iso(entry_dt), "announce_time": iso(received_at), "expiry_time": iso(expiry_dt),
+        "expiry_seconds": expiry_seconds, "prealert_seconds": prealert_seconds,
+        "strategy": "RTM MULTI EA", "mode": "RTM_EXTERNAL_MT4",
+        "selected_engine": "RTM", "engine": str(body.engine or "RTM_MULTI_30"),
+        "status": "RTM MULTI EA • SINAL RECEBIDO • ENTRADA NA PRÓXIMA VELA",
+        "risk": "MEDIUM", "reason": str(body.reasons or "Confluência multi-indicadores do EA")[:800],
+        "source_state": "READY", "feed_source": "MT4_EA", "external_ea": True,
+        "external_source": str(body.source or "MT4_EA"),
+        "buy_score": int(body.buy_score or 0), "sell_score": int(body.sell_score or 0),
+        "total_votes": int(body.total_votes or 0), "signal_price": body.price,
+        "direct_win_only": True, "gale_signal": False, "_received_ts": time.time(),
+    }
+    key = _rtm_ea_key(symbol, interval)
+    with rtm_ea_signal_guard:
+        rtm_ea_signals[key] = payload
+    rtm_ea_last_receive_at = iso(received_at)
+    public = dict(payload)
+    public.pop("_received_ts", None)
+    return {"ok": True, "stored": True, "signal": public}
+
+
+@app.get("/rtm-ea-latest")
+async def rtm_ea_latest(symbol: str = "EUR/USD", interval: str = "1min"):
+    return _rtm_ea_latest_payload(_rtm_ea_symbol(symbol), _rtm_ea_interval(interval), "OPEN")
+
+
+@app.get("/rtm-ea-status")
+async def rtm_ea_status():
+    with rtm_ea_signal_guard:
+        keys = list(rtm_ea_signals.keys())[-20:]
+    return {
+        "ok": True, "engine": "RTM MULTI EA", "receiver": "/rtm-ea-signal",
+        "last_receive_at": rtm_ea_last_receive_at, "stored_keys": keys,
+        "ttl_seconds": RTM_EA_SIGNAL_TTL_SECONDS, "secret_required": bool(RTM_EA_SECRET),
+    }
+
+
 @app.get("/telegram-status")
 async def telegram_status():
     return {
@@ -18418,7 +18588,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     "GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY",
-    "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK",
+    "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM",
 }
 
 
@@ -19258,11 +19428,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM"):
         raise HTTPException(400, "Motor inválido.")
 
-    state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK"):
+    state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") and engine != "RTM" else None
+    if engine in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -19285,7 +19455,12 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             # Sempre informa ao frontend qual mercado foi pedido e qual fonte
             # realmente gerou o sinal. Isto evita fechar um sinal IQ_OTC como OPEN.
             data["requested_market"] = requested_market
-            if engine == "EA":
+            if engine == "RTM":
+                data["feed_source"] = "MT4_EA"
+                data["feed_label"] = "MetaTrader 4 • RTM MULTI EA"
+                data["feed_fallback"] = False
+                data["feed_message"] = "CALL/PUT recebido diretamente do RTM MULTI EA via /rtm-ea-signal."
+            elif engine == "EA":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
                     feed_src = str(feed_info.get("source") or "MULTIFEED")
@@ -19949,7 +20124,7 @@ async def pre_signals(
 ):
     market = (market or "OPEN").upper()
     engine = str(engine or "GRAPH_AI").upper()
-    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM"):
         engine = "GRAPH_AI"
     limit = max(1, min(int(limit), 4))
 
@@ -19959,6 +20134,14 @@ async def pre_signals(
         symbol = str(symbol).strip().upper()
         if not _symbol_allowed(symbol, market):
             raise HTTPException(400, "Ativo inválido para pré-alerta.")
+
+    if engine == "RTM":
+        return {
+            "ok": True,
+            "message": "RTM MULTI EA: o pré-alerta é produzido no MetaTrader 4 e enviado ao app pelo bridge; padrão de 20s antes e entrada na próxima vela.",
+            "items": [],
+            "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
+        }
 
     if engine == "BIGRISE":
         return {
@@ -20673,8 +20856,25 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK"):
+    if engine not in ("GRAPH_AI", "SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM"):
         raise HTTPException(400, "Motor inválido.")
+
+    if engine == "RTM":
+        scan = [symbol] if symbol else list(SYMBOLS)
+        out = []
+        for sym in scan:
+            payload = _rtm_ea_latest_payload(sym, interval, market)
+            direction = str(payload.get("direction") or "NEUTRO").upper()
+            out.append({
+                "symbol": sym, "base_symbol": sym, "direction": direction,
+                "confidence": round(float(payload.get("confidence") or 0.0), 1),
+                "status": str(payload.get("status") or "RTM MULTI EA • AGUARDANDO SINAL"),
+                "clickable": direction in ("CALL", "PUT"),
+                "updated_at": payload.get("announce_time"), "feed_source": "MT4_EA",
+                "feed_fallback": False, "requested_market": market, "engine": "RTM",
+                "strategy": "RTM MULTI EA",
+            })
+        return out
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
@@ -22081,7 +22281,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .robot-mode-copy{min-width:150px}
 .robot-mode-title{font-weight:900;font-size:13px;letter-spacing:.4px}
 .robot-mode-desc{font-size:11px;color:#9fb2ca;margin-top:3px;max-width:245px}
-#robotPowerBtn,#aiPowerBtn,#blackbookPowerBtn,#larryPowerBtn,#rangePowerBtn,#presidenPowerBtn,#alphaxPowerBtn,#sniperPowerBtn,#rsiDivBbPowerBtn,#tlbRsiPowerBtn,#roboFiboPowerBtn,#roboFiboPocBtn,#combinerPowerBtn,#volumePocPowerBtn,#volumePocAiPowerBtn,#forcePowerBtn,#bigrisePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
+#robotPowerBtn,#aiPowerBtn,#blackbookPowerBtn,#rtmPowerBtn,#larryPowerBtn,#rangePowerBtn,#presidenPowerBtn,#alphaxPowerBtn,#sniperPowerBtn,#rsiDivBbPowerBtn,#tlbRsiPowerBtn,#roboFiboPowerBtn,#roboFiboPocBtn,#combinerPowerBtn,#volumePocPowerBtn,#volumePocAiPowerBtn,#forcePowerBtn,#bigrisePowerBtn{padding:9px 12px;border-radius:12px;min-width:105px;font-size:13px}
 
 .daily-engine-board{margin-top:14px;border-color:#1c82c9;background:linear-gradient(180deg,#0b1b2e,#071321);box-shadow:0 0 24px #00aaff22}
 .daily-engine-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
@@ -22169,7 +22369,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • BLACK BOOK • EXTREME TMA + RSI + TREND • RSI TRIPLO 7/14/28 • ROBO FIBO + RSI + EMA • 3 LINE BREAK + RSI • RSI DIVERGENCE + BOLLINGER • COMBINER + SUPER SIGNAL RSI • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • BLACK BOOK • RTM MULTI EA • EXTREME TMA + RSI + TREND • RSI TRIPLO 7/14/28 • ROBO FIBO + RSI + EMA • 3 LINE BREAK + RSI • RSI DIVERGENCE + BOLLINGER • COMBINER + SUPER SIGNAL RSI • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -22233,6 +22433,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-desc" id="blackbookModeDesc">Price Action do ebook • Força • Negação/Força • Fim de Movimento • Descanso • 3x1 • Retração • Rompimento • Pullback • candle fechado • próxima vela • sem Gale.</div>
     </div>
     <button id="blackbookPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
+  <div class="robot-mode-card" id="rtmModeCard">
+    <img src="__MEGA_IMAGE__" alt="RTM Multi EA">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">🤖 RTM MULTI EA</div>
+      <div class="robot-mode-desc" id="rtmModeDesc">MetaTrader 4 • mais de 20 leituras técnicas • confluência por votos • pré-alerta 20s • entrada na próxima vela • separado do BLACK BOOK.</div>
+    </div>
+    <button id="rtmPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
   <div class="robot-mode-card" id="aiModeCard">
@@ -22957,6 +23166,8 @@ const aiPowerBtn=document.getElementById('aiPowerBtn');
 const aiModeDesc=document.getElementById('aiModeDesc');
 const blackbookPowerBtn=document.getElementById('blackbookPowerBtn');
 const blackbookModeDesc=document.getElementById('blackbookModeDesc');
+const rtmPowerBtn=document.getElementById('rtmPowerBtn');
+const rtmModeDesc=document.getElementById('rtmModeDesc');
 const eaPowerBtn=null;
 const eaModeDesc=null;
 const rubikPowerBtn=null;
@@ -23033,6 +23244,7 @@ try{
 let robotEnabled=true;
 let aiEnabled=false;
 let blackbookEnabled=false;
+let rtmEnabled=false;
 let eaEnabled=false;
 let rubikEnabled=false;
 let forceEnabled=false;
@@ -23061,6 +23273,7 @@ try{
   robotEnabled=localStorage.getItem('mega_robot_power')!=='OFFLINE';
   aiEnabled=localStorage.getItem('mega_ai_power')==='ONLINE';
   blackbookEnabled=localStorage.getItem('mega_blackbook_power')==='ONLINE';
+  rtmEnabled=localStorage.getItem('mega_rtm_ea_power')==='ONLINE';
   const legacyEaOnline=localStorage.getItem('mega_ea_power')==='ONLINE';
   const legacyRubikOnline=localStorage.getItem('mega_rubik_power')==='ONLINE';
   eaEnabled=false;
@@ -23090,7 +23303,8 @@ try{
   localStorage.removeItem('mega_rsi_monitor_power');
   rsi5Enabled=false; localStorage.removeItem('mega_rsi_pure_power'); localStorage.removeItem('mega_rsi5_power');
   presidenEnabled=false; localStorage.removeItem('mega_presiden_power');
-  if(blackbookEnabled){ tmaRsiEnabled=false; tripleRsiEnabled=false; roboFiboEnabled=false; tlbRsiEnabled=false; rsiDivBbEnabled=false; combinerEnabled=false; volumePocAiEnabled=false; presidenEnabled=false; sniperEnabled=false; rangeEnabled=false; alphaxEnabled=false; rsi5Enabled=false; velocityEnabled=false; bigriseEnabled=false; forceEnabled=false; larryEnabled=false; aiEnabled=false; robotEnabled=false; }
+  if(rtmEnabled){ blackbookEnabled=false; tmaRsiEnabled=false; tripleRsiEnabled=false; roboFiboEnabled=false; tlbRsiEnabled=false; rsiDivBbEnabled=false; combinerEnabled=false; volumePocAiEnabled=false; presidenEnabled=false; sniperEnabled=false; rangeEnabled=false; alphaxEnabled=false; rsi5Enabled=false; velocityEnabled=false; bigriseEnabled=false; forceEnabled=false; larryEnabled=false; aiEnabled=false; robotEnabled=false; }
+  else if(blackbookEnabled){ rtmEnabled=false; tmaRsiEnabled=false; tripleRsiEnabled=false; roboFiboEnabled=false; tlbRsiEnabled=false; rsiDivBbEnabled=false; combinerEnabled=false; volumePocAiEnabled=false; presidenEnabled=false; sniperEnabled=false; rangeEnabled=false; alphaxEnabled=false; rsi5Enabled=false; velocityEnabled=false; bigriseEnabled=false; forceEnabled=false; larryEnabled=false; aiEnabled=false; robotEnabled=false; }
   else if(tmaRsiEnabled){ tripleRsiEnabled=false; roboFiboEnabled=false; tlbRsiEnabled=false; rsiDivBbEnabled=false; robotEnabled=false; aiEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; combinerEnabled=false; alphaxEnabled=false; volumePocAiEnabled=false; }
   else if(tripleRsiEnabled){ roboFiboEnabled=false; tlbRsiEnabled=false; rsiDivBbEnabled=false; robotEnabled=false; aiEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; combinerEnabled=false; alphaxEnabled=false; volumePocAiEnabled=false; }
   else if(roboFiboEnabled){ tlbRsiEnabled=false; rsiDivBbEnabled=false; robotEnabled=false; aiEnabled=false; larryEnabled=false; velocityEnabled=false; sniperEnabled=false; combinerEnabled=false; alphaxEnabled=false; volumePocAiEnabled=false; }
@@ -23121,6 +23335,7 @@ try{
   else if(robotEnabled && aiEnabled) aiEnabled=false;
 }catch(_){}
 function selectedRobotEngine(){
+  if(rtmEnabled) return 'RTM';
   if(blackbookEnabled) return 'BLACKBOOK';
   if(tmaRsiEnabled) return 'TMARSI';
   if(tripleRsiEnabled) return 'TRIPRSI';
@@ -23155,10 +23370,11 @@ function adoptBackgroundEngineState(d){
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
   if(['RAPID','SUNTZU','RANGE','PRESIDEN','RSI5','FORCE','BIGRISE'].includes(e)) return;
-  robotEnabled=false; aiEnabled=false; blackbookEnabled=false; eaEnabled=false; rubikEnabled=false;
+  robotEnabled=false; aiEnabled=false; blackbookEnabled=false; rtmEnabled=false; eaEnabled=false; rubikEnabled=false;
   forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false;
   rsi5Enabled=false; sniperEnabled=false; combinerEnabled=false; rsiDivBbEnabled=false; tmaRsiEnabled=false; tlbRsiEnabled=false; tripleRsiEnabled=false; roboFiboEnabled=false; alphaxEnabled=false; presidenEnabled=false; rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false; rangeEnabled=false;
-  if(e==='BLACKBOOK') blackbookEnabled=true;
+  if(e==='RTM') rtmEnabled=true;
+  else if(e==='BLACKBOOK') blackbookEnabled=true;
   else if(e==='VOLUME_AI') volumePocAiEnabled=true;
   else if(e==='PRESIDEN') presidenEnabled=true;
   else if(e==='SNIPER') sniperEnabled=true;
@@ -23183,6 +23399,7 @@ function adoptBackgroundEngineState(d){
     localStorage.setItem('mega_robot_power',robotEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_ai_power',aiEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_blackbook_power',blackbookEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_rtm_ea_power',rtmEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_ea_power',eaEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_rubik_power',rubikEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_force_power',forceEnabled?'ONLINE':'OFFLINE');
@@ -24190,6 +24407,7 @@ function normalizeEngineKey(value){
   if(e==='TRIPRSI' || e==='TRIPLE_RSI' || e==='RSI_TRIPLO') return 'TRIPRSI';
   if(e==='FIBORSI' || e==='ROBOFIBO' || e==='ROBO_FIBO') return 'FIBORSI';
   if(e==='ALPHAX' || e==='ALPHAX_RELAY' || e==='ALPHA_X') return 'ALPHAX';
+  if(e==='RTM' || e==='RTM_MULTI' || e==='RTM_MULTI_30') return 'RTM';
   if(e==='RSI5' || e==='RSI_PURE' || e==='RSI_PURO' || e==='RSI_PURE_4TF') return 'RSI5';
   if(e==='BIGRISE' || e==='BIGRISE_USD_BASKET' || e==='BTC_FORCE' || e==='BTC_FORCE_NEXT_CANDLE') return 'BIGRISE';
   return '';
@@ -24204,6 +24422,7 @@ function momentStudyEngineName(key){
   const names={
     GRAPH_AI:'🧠 IA GRÁFICA',
     SMART:'🧠 IA LEITURA DO GRÁFICO',
+    RTM:'🤖 RTM MULTI EA',
     LARRY:'⚡ LARRY BREAKOUT',
     VELOCITY:'⚡ VELOCITY FLOW',
     ALPHAX:'🧬 ALPHAX RELAY',
@@ -26595,7 +26814,7 @@ if(appPowerBtn){
 }
 
 function applyRobotPowerState(){
-  try{ localStorage.setItem('mega_blackbook_power',blackbookEnabled?'ONLINE':'OFFLINE'); }catch(_){}
+  try{ localStorage.setItem('mega_blackbook_power',blackbookEnabled?'ONLINE':'OFFLINE'); localStorage.setItem('mega_rtm_ea_power',rtmEnabled?'ONLINE':'OFFLINE'); }catch(_){}
   try{ localStorage.setItem('mega_presiden_power',presidenEnabled?'ONLINE':'OFFLINE'); }catch(_){}
   try{ localStorage.setItem('mega_rsidivbb_power',rsiDivBbEnabled?'ONLINE':'OFFLINE'); localStorage.setItem('mega_tmarsi_power',tmaRsiEnabled?'ONLINE':'OFFLINE'); localStorage.setItem('mega_tlbrsi_power',tlbRsiEnabled?'ONLINE':'OFFLINE'); localStorage.setItem('mega_robofibo_power',roboFiboEnabled?'ONLINE':'OFFLINE'); }catch(_){}
   try{
@@ -26613,6 +26832,12 @@ function applyRobotPowerState(){
     blackbookPowerBtn.style.background=blackbookEnabled?'#0b7a3d':'#7d1d1d';
     blackbookPowerBtn.style.color='#fff';
     blackbookPowerBtn.style.borderColor=blackbookEnabled?'#16c56b':'#ff5252';
+  }
+  if(rtmPowerBtn){
+    rtmPowerBtn.textContent=rtmEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    rtmPowerBtn.style.background=rtmEnabled?'#0b7a3d':'#7d1d1d';
+    rtmPowerBtn.style.color='#fff';
+    rtmPowerBtn.style.borderColor=rtmEnabled?'#16c56b':'#ff5252';
   }
   if(aiPowerBtn){
     aiPowerBtn.textContent=aiEnabled?'🟢 ONLINE':'🔴 OFFLINE';
@@ -26840,8 +27065,14 @@ function applyRobotPowerState(){
     ? 'ONLINE: suporte/resistência confirmado + reação da vela + RSI 14 • próxima vela • sem repaint.'
     : 'OFFLINE: COMBINER FLOW + RSI pausado.';
 
+  if(rtmModeDesc) rtmModeDesc.textContent=rtmEnabled ? 'ONLINE: MetaTrader 4 • confluência por votos de mais de 20 leituras • pré-alerta 20s • entrada na próxima vela.' : 'OFFLINE: RTM MULTI EA pausado • BLACK BOOK permanece separado.';
   const engine=selectedRobotEngine();
-  if(engine==='TMARSI'){
+  if(engine==='RTM'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RTM MULTI EA ONLINE • AGUARDANDO CALL/PUT DO METATRADER 4';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 RTM MULTI EA selecionado • pré-alerta 20s • entrada na próxima vela • BLACK BOOK continua separado.</div>';
+    if(radar) radar.innerHTML='<div>📡 RTM MULTI EA ativo • aguardando sinais enviados pelo MetaTrader 4</div>';
+    rad();
+  }else if(engine==='TMARSI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EXTREME TMA + RSI ONLINE • TMA17 + RSI7 + TREND FILTER ALINHADOS • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 Extreme TMA + RSI • banda TMA + RSI 7 precisam concordar com o Trend Filter: 🟢 CALL / 🔴 PUT.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Extreme TMA + RSI ativo • procurando TMA + RSI + Trend Filter na mesma direção</div>';
@@ -27753,9 +27984,47 @@ async function setRapidPower(enabled){
   if(voiceEnabled) speak(rapidEnabled ? 'Núcleo Rápido E As online.' : 'Núcleo Rápido E As offline.');
 }
 
+async function setRtmPower(enabled){
+  rtmEnabled=!!enabled;
+  if(rtmEnabled){
+    blackbookEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
+    forceEnabled=false; bigriseEnabled=false; larryEnabled=false; rangeEnabled=false; velocityEnabled=false;
+    rsi5Enabled=false; sniperEnabled=false; combinerEnabled=false; rsiDivBbEnabled=false; tmaRsiEnabled=false;
+    tlbRsiEnabled=false; tripleRsiEnabled=false; roboFiboEnabled=false; alphaxEnabled=false; presidenEnabled=false;
+    rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false;
+  }
+  try{
+    localStorage.setItem('mega_rtm_ea_power',rtmEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_blackbook_power',blackbookEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_rtm_ea_power',rtmEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_robot_power',robotEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_ai_power',aiEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_larry_power',larryEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_velocity_power',velocityEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_sniper_power',sniperEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_combiner_power',combinerEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_rsidivbb_power',rsiDivBbEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_tmarsi_power',tmaRsiEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_tlbrsi_power',tlbRsiEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_triprsi_power',tripleRsiEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_robofibo_power',roboFiboEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_alphax_power',alphaxEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_volume_poc_ai_power',volumePocAiEnabled?'ONLINE':'OFFLINE');
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'RTM'});
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad(), loadPreSignals()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(rtmEnabled ? 'RTM Multi EA online.' : 'RTM Multi EA offline.');
+}
+
+
 async function setBlackbookPower(enabled){
   blackbookEnabled=!!enabled;
   if(blackbookEnabled){
+    rtmEnabled=false;
     robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false;
     forceEnabled=false; bigriseEnabled=false; larryEnabled=false; rangeEnabled=false; velocityEnabled=false;
     rsi5Enabled=false; sniperEnabled=false; combinerEnabled=false; rsiDivBbEnabled=false; tmaRsiEnabled=false;
@@ -27824,9 +28093,11 @@ async function setAlphaxPower(enabled){
 document.addEventListener('click',(ev)=>{
   const b=ev.target && ev.target.closest ? ev.target.closest('button') : null;
   if(b && b.id && b.id.endsWith('PowerBtn') && b.id!=='blackbookPowerBtn' && blackbookEnabled){ blackbookEnabled=false; try{localStorage.setItem('mega_blackbook_power','OFFLINE')}catch(_){} }
+  if(b && b.id && b.id.endsWith('PowerBtn') && b.id!=='rtmPowerBtn' && rtmEnabled){ rtmEnabled=false; try{localStorage.setItem('mega_rtm_ea_power','OFFLINE')}catch(_){} }
   if(b && b.id && b.id.endsWith('PowerBtn') && b.id!=='tripleRsiPowerBtn' && tripleRsiEnabled) disableTripleRsiForOtherEngine();
   if(b && b.id && b.id.endsWith('PowerBtn') && b.id!=='tmaRsiPowerBtn' && tmaRsiEnabled) disableTmaRsiForOtherEngine();
 },true);
+if(rtmPowerBtn) rtmPowerBtn.onclick=()=>setRtmPower(!rtmEnabled);
 if(blackbookPowerBtn) blackbookPowerBtn.onclick=()=>setBlackbookPower(!blackbookEnabled);
 if(tmaRsiPowerBtn) tmaRsiPowerBtn.onclick=()=>setTmaRsiPower(!tmaRsiEnabled);
 if(tripleRsiPowerBtn) tripleRsiPowerBtn.onclick=()=>setTripleRsiPower(!tripleRsiEnabled);
@@ -28265,7 +28536,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI EA':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
@@ -28383,7 +28654,12 @@ async function loadPreSignals(){
   const engine=selectedRobotEngine();
   if(engine==='OFF'){
     if(preSignalStatus) preSignalStatus.textContent='Pré-alerta aguardando um motor ficar ONLINE.';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔕 Coloque IA Gráfica, Inteligência Artificial ou EA ONLINE para usar o pré-alerta.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔕 Coloque um motor ONLINE para usar o pré-alerta.</div>';
+    return;
+  }
+  if(engine==='RTM'){
+    if(preSignalStatus) preSignalStatus.textContent='RTM MULTI EA • o pré-alerta nasce no MT4 e chega ao app via bridge.';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 Aguardando RTM MULTI EA • padrão 20s antes • entrada na próxima vela.</div>';
     return;
   }
 
