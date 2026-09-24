@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.95.7"
+APP_VERSION = "3.95.8"
 PWA_VERSION = "v168"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -2350,7 +2350,7 @@ def _rtm_ea_latest_payload(symbol: str, interval: str, market: str = "OPEN") -> 
 
 
 # -----------------------------------------------------------------------------
-# RTM MULTI 3.95.7 — BLOCOS INDEPENDENTES + bridge MT4 opcional
+# RTM MULTI 3.95.8 — GATILHOS INDIVIDUAIS + bridge MT4 opcional
 # Cada familia tecnica pode liberar CALL/PUT sozinha quando o proprio bloco
 # estiver forte. Confluencias do mesmo lado aumentam a confianca; se dois blocos
 # fortes apontarem lados opostos, a entrada e cancelada por conflito.
@@ -2535,160 +2535,169 @@ def _rtm_block_result(key, label, bucket, min_votes, min_edge, min_consensus):
 
 
 def _rtm_vote_strategy(rows, timeframe="1min", market="OPEN", early_signal=False):
-    """RTM MULTI: quatro blocos independentes; um bloco forte ja pode liberar sinal."""
+    """RTM MULTI INDIVIDUAL: cada detector pode liberar sinal sozinho.
+
+    Sem votação global e sem dependência de blocos. Os detectores usam gatilhos
+    de evento (cruzamento, rejeição, rompimento, força etc.) para evitar que um
+    simples estado permanente gere sinal em toda vela. Se mais de um gatilho
+    aparecer no mesmo instante, o de maior prioridade/força é escolhido; não há
+    bônus por confluência.
+    """
     data=list(rows or [])
     tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30","1h":"H1","4h":"H4"}.get(timeframe,timeframe)
-    name=f"RTM MULTI • BLOCOS INDEPENDENTES {tf_label}"
+    name=f"RTM MULTI • GATILHOS INDIVIDUAIS {tf_label}"
     if len(data) < 205:
         return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
-                "risk":"HIGH","strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDEPENDENT_BLOCKS",
-                "reason":f"RTM coletando historico ({len(data)}/205 candles).","votes":{},"blocks":{},
-                "independent_blocks":True,"early_signal_window":bool(early_signal),"next_candle_entry":True,"gale_signal":False}
+                "risk":"HIGH","strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDIVIDUAL_TRIGGERS",
+                "reason":f"RTM coletando historico ({len(data)}/205 candles).","detectors":[],
+                "independent_indicators":True,"early_signal_window":bool(early_signal),
+                "next_candle_entry":True,"gale_signal":False}
 
     closes=[_rtm_num(c,"close") for c in data]
     highs=[_rtm_num(c,"high") for c in data]
     lows=[_rtm_num(c,"low") for c in data]
     last=data[-1]
-    c0=closes[-1]; c1=closes[-2]
+    c0=closes[-1]; c1=closes[-2]; c2=closes[-3]
     o0=_rtm_num(last,"open"); h0=highs[-1]; l0=lows[-1]
-
-    blocks={
-        "TREND":{"buy":[],"sell":[],"neutral":[]},
-        "MOMENTUM":{"buy":[],"sell":[],"neutral":[]},
-        "REVERSAL":{"buy":[],"sell":[],"neutral":[]},
-        "PRICE_ACTION":{"buy":[],"sell":[],"neutral":[]},
-    }
-    buy=[]; sell=[]; neutral=[]
-    def vote(block,tag,b,s):
-        target=blocks[block]
-        if bool(b) and not bool(s):
-            target["buy"].append(tag); buy.append(tag)
-        elif bool(s) and not bool(b):
-            target["sell"].append(tag); sell.append(tag)
-        else:
-            target["neutral"].append(tag); neutral.append(tag)
-
-    # BLOCO 1 — Tendencia (8 leituras)
-    e5=ema(closes,5); e9=ema(closes,9); e21=ema(closes,21); e50=ema(closes,50); e200=ema(closes,200)
-    e9p=ema(closes[:-1],9); e21p=ema(closes[:-1],21)
-    s20=sma(closes,20); s50=sma(closes,50)
-    vote("TREND","EMA5x9", e5 is not None and e9 is not None and e5>e9, e5 is not None and e9 is not None and e5<e9)
-    vote("TREND","EMA9x21", e9 is not None and e21 is not None and e9>e21, e9 is not None and e21 is not None and e9<e21)
-    vote("TREND","EMA21x50", e21 is not None and e50 is not None and e21>e50, e21 is not None and e50 is not None and e21<e50)
-    vote("TREND","EMA50x200", e50 is not None and e200 is not None and e50>e200, e50 is not None and e200 is not None and e50<e200)
-    vote("TREND","SMA20", s20 is not None and c0>s20, s20 is not None and c0<s20)
-    vote("TREND","SMA20x50", s20 is not None and s50 is not None and s20>s50, s20 is not None and s50 is not None and s20<s50)
-    vote("TREND","EMA9_SLOPE", e9 is not None and e9p is not None and e9>e9p, e9 is not None and e9p is not None and e9<e9p)
-    vote("TREND","EMA21_SLOPE", e21 is not None and e21p is not None and e21>e21p, e21 is not None and e21p is not None and e21<e21p)
-
-    # BLOCO 2 — Momentum/forca (13 leituras)
-    r7=rsi(closes,7); r14=rsi(closes,14)
-    vote("MOMENTUM","RSI7", r7 is not None and r7>50.5, r7 is not None and r7<49.5)
-    vote("MOMENTUM","RSI14", r14 is not None and r14>50.5, r14 is not None and r14<49.5)
-    di=_rtm_di(data,14)
-    vote("MOMENTUM","ADX_DI", di is not None and di["adx"]>=RTM_MIN_ADX and di["plus"]>di["minus"], di is not None and di["adx"]>=RTM_MIN_ADX and di["minus"]>di["plus"])
-    mac=_macd_snapshot(closes,12,26,9)
-    vote("MOMENTUM","MACD", mac is not None and mac["macd"]>mac["signal"], mac is not None and mac["macd"]<mac["signal"])
-    st=stochastic(data,14,3,3)
-    vote("MOMENTUM","STOCH", st is not None and st["k"]>st["d"] and st["k"]<90, st is not None and st["k"]<st["d"] and st["k"]>10)
-    cci=_rtm_cci(data,14)
-    vote("MOMENTUM","CCI", cci is not None and cci>0, cci is not None and cci<0)
-    mom=(c0/closes[-15]*100.0) if len(closes)>=15 and abs(closes[-15])>1e-12 else 100.0
-    vote("MOMENTUM","MOM", mom>100.0, mom<100.0)
-    roc=(c0-closes[-6])/closes[-6] if len(closes)>=6 and abs(closes[-6])>1e-12 else 0.0
-    vote("MOMENTUM","ROC5", roc>0.0, roc<0.0)
-    rv=_rtm_rvi(data,10)
-    vote("MOMENTUM","RVI", rv is not None and rv[0]>rv[1], rv is not None and rv[0]<rv[1])
-    ao=_rtm_ao(data)
-    vote("MOMENTUM","AO", ao is not None and ao[0]>0, ao is not None and ao[0]<0)
-    vote("MOMENTUM","AC", ao is not None and ao[0]>ao[1], ao is not None and ao[0]<ao[1])
-    force=(c0-c1)*(_rtm_volume(last) or 1.0)
-    vote("MOMENTUM","FORCE", force>0, force<0)
-    e13=ema(closes,13)
-    bulls=(h0-e13) if e13 is not None else 0.0
-    bears=(l0-e13) if e13 is not None else 0.0
-    vote("MOMENTUM","BULLS_BEARS", e13 is not None and bulls>abs(bears), e13 is not None and abs(bears)>bulls)
-
-    # BLOCO 3 — Fluxo/posicao/reversao (6 leituras)
-    wpr=_rtm_wpr(data,14)
-    vote("REVERSAL","WPR", wpr is not None and wpr>-50, wpr is not None and wpr<-50)
-    mfi=_rtm_mfi(data,14)
-    vote("REVERSAL","MFI", mfi is not None and mfi>50, mfi is not None and mfi<50)
-    dem=_rtm_demarker(data,14)
-    vote("REVERSAL","DEMARKER", dem is not None and dem>0.50, dem is not None and dem<0.50)
-    bb=bollinger(closes,20,2.0)
-    vote("REVERSAL","BB_MID", bb is not None and c0>bb["middle"], bb is not None and c0<bb["middle"])
-    vol=_rtm_volume(last) or 1.0
-    obv_delta=(vol if c0>c1 else (-vol if c0<c1 else 0.0))
-    vote("REVERSAL","OBV", obv_delta>0, obv_delta<0)
-    buy_reject=bool(bb and l0<=bb["lower"] and c0>bb["lower"] and c0>o0)
-    sell_reject=bool(bb and h0>=bb["upper"] and c0<bb["upper"] and c0<o0)
-    vote("REVERSAL","BB_REJECT",buy_reject,sell_reject)
-
-    # BLOCO 4 — Price action / breakout (3 leituras)
     at=atr(data,14)
     body=abs(c0-o0)
-    vote("PRICE_ACTION","BODY_ATR", at is not None and body>=at*RTM_MIN_BODY_ATR and c0>o0, at is not None and body>=at*RTM_MIN_BODY_ATR and c0<o0)
+
+    candidates=[]
+    def trigger(tag,buy_cond,sell_cond,score,why):
+        if bool(buy_cond) and not bool(sell_cond):
+            candidates.append({"tag":tag,"direction":"CALL","score":float(score),"reason":why})
+        elif bool(sell_cond) and not bool(buy_cond):
+            candidates.append({"tag":tag,"direction":"PUT","score":float(score),"reason":why})
+
+    # 1-8: tendencia — cada cruzamento/reversao de inclinacao e um gatilho proprio.
+    e5=ema(closes,5); e9=ema(closes,9); e21=ema(closes,21); e50=ema(closes,50); e200=ema(closes,200)
+    e5p=ema(closes[:-1],5); e9p=ema(closes[:-1],9); e21p=ema(closes[:-1],21); e50p=ema(closes[:-1],50); e200p=ema(closes[:-1],200)
+    e9pp=ema(closes[:-2],9); e21pp=ema(closes[:-2],21)
+    s20=sma(closes,20); s50=sma(closes,50); s20p=sma(closes[:-1],20); s50p=sma(closes[:-1],50)
+    trigger("EMA5x9", e5 is not None and e9 is not None and e5p is not None and e9p is not None and e5>e9 and e5p<=e9p,
+                     e5 is not None and e9 is not None and e5p is not None and e9p is not None and e5<e9 and e5p>=e9p, 74, "cruzamento EMA5/EMA9")
+    trigger("EMA9x21", e9 is not None and e21 is not None and e9p is not None and e21p is not None and e9>e21 and e9p<=e21p,
+                      e9 is not None and e21 is not None and e9p is not None and e21p is not None and e9<e21 and e9p>=e21p, 78, "cruzamento EMA9/EMA21")
+    trigger("EMA21x50", e21 is not None and e50 is not None and e21p is not None and e50p is not None and e21>e50 and e21p<=e50p,
+                       e21 is not None and e50 is not None and e21p is not None and e50p is not None and e21<e50 and e21p>=e50p, 80, "cruzamento EMA21/EMA50")
+    trigger("EMA50x200", e50 is not None and e200 is not None and e50p is not None and e200p is not None and e50>e200 and e50p<=e200p,
+                        e50 is not None and e200 is not None and e50p is not None and e200p is not None and e50<e200 and e50p>=e200p, 82, "cruzamento EMA50/EMA200")
+    trigger("PRICE_SMA20", s20 is not None and s20p is not None and c0>s20 and c1<=s20p,
+                           s20 is not None and s20p is not None and c0<s20 and c1>=s20p, 76, "preco cruzou SMA20")
+    trigger("SMA20x50", s20 is not None and s50 is not None and s20p is not None and s50p is not None and s20>s50 and s20p<=s50p,
+                       s20 is not None and s50 is not None and s20p is not None and s50p is not None and s20<s50 and s20p>=s50p, 77, "cruzamento SMA20/SMA50")
+    trigger("EMA9_SLOPE", e9 is not None and e9p is not None and e9pp is not None and e9>e9p and e9p<=e9pp,
+                         e9 is not None and e9p is not None and e9pp is not None and e9<e9p and e9p>=e9pp, 70, "virada da inclinacao EMA9")
+    trigger("EMA21_SLOPE", e21 is not None and e21p is not None and e21pp is not None and e21>e21p and e21p<=e21pp,
+                          e21 is not None and e21p is not None and e21pp is not None and e21<e21p and e21p>=e21pp, 72, "virada da inclinacao EMA21")
+
+    # 9-21: momentum/forca — todos independentes.
+    r7=rsi(closes,7); r7p=rsi(closes[:-1],7)
+    r14=rsi(closes,14); r14p=rsi(closes[:-1],14)
+    trigger("RSI7", r7 is not None and r7p is not None and r7>50 and r7p<=50,
+                    r7 is not None and r7p is not None and r7<50 and r7p>=50, 76, "RSI7 cruzou 50")
+    trigger("RSI14", r14 is not None and r14p is not None and r14>50 and r14p<=50,
+                     r14 is not None and r14p is not None and r14<50 and r14p>=50, 78, "RSI14 cruzou 50")
+    di=_rtm_di(data,14); dip=_rtm_di(data[:-1],14)
+    trigger("ADX_DI", di is not None and dip is not None and di["adx"]>=RTM_MIN_ADX and di["plus"]>di["minus"] and dip["plus"]<=dip["minus"],
+                      di is not None and dip is not None and di["adx"]>=RTM_MIN_ADX and di["minus"]>di["plus"] and dip["minus"]<=dip["plus"], 86, "cruzamento DI com ADX ativo")
+    mac=_macd_snapshot(closes,12,26,9); macp=_macd_snapshot(closes[:-1],12,26,9)
+    trigger("MACD", mac is not None and macp is not None and mac["macd"]>mac["signal"] and macp["macd"]<=macp["signal"],
+                   mac is not None and macp is not None and mac["macd"]<mac["signal"] and macp["macd"]>=macp["signal"], 84, "cruzamento MACD/sinal")
+    st=stochastic(data,14,3,3); stp=stochastic(data[:-1],14,3,3)
+    trigger("STOCH", st is not None and stp is not None and st["k"]>st["d"] and stp["k"]<=stp["d"] and st["k"]<90,
+                    st is not None and stp is not None and st["k"]<st["d"] and stp["k"]>=stp["d"] and st["k"]>10, 82, "cruzamento Estocastico")
+    cci=_rtm_cci(data,14); ccip=_rtm_cci(data[:-1],14)
+    trigger("CCI", cci is not None and ccip is not None and cci>0 and ccip<=0,
+                  cci is not None and ccip is not None and cci<0 and ccip>=0, 79, "CCI cruzou zero")
+    mom=(c0/closes[-15]*100.0) if len(closes)>=16 and abs(closes[-15])>1e-12 else None
+    momp=(c1/closes[-16]*100.0) if len(closes)>=16 and abs(closes[-16])>1e-12 else None
+    trigger("MOM", mom is not None and momp is not None and mom>100 and momp<=100,
+                  mom is not None and momp is not None and mom<100 and momp>=100, 76, "Momentum cruzou 100")
+    roc=(c0-closes[-6])/closes[-6] if len(closes)>=7 and abs(closes[-6])>1e-12 else None
+    rocp=(c1-closes[-7])/closes[-7] if len(closes)>=7 and abs(closes[-7])>1e-12 else None
+    trigger("ROC5", roc is not None and rocp is not None and roc>0 and rocp<=0,
+                   roc is not None and rocp is not None and roc<0 and rocp>=0, 75, "ROC5 virou o sinal")
+    rv=_rtm_rvi(data,10); rvp=_rtm_rvi(data[:-1],10)
+    trigger("RVI", rv is not None and rvp is not None and rv[0]>rv[1] and rvp[0]<=rvp[1],
+                  rv is not None and rvp is not None and rv[0]<rv[1] and rvp[0]>=rvp[1], 80, "cruzamento RVI")
+    ao=_rtm_ao(data); aop=_rtm_ao(data[:-1])
+    trigger("AO", ao is not None and aop is not None and ao[0]>0 and aop[0]<=0,
+                 ao is not None and aop is not None and ao[0]<0 and aop[0]>=0, 78, "Awesome Oscillator cruzou zero")
+    ac_now=(ao[0]-ao[1]) if ao is not None else None
+    ac_prev=(aop[0]-aop[1]) if aop is not None else None
+    trigger("AC", ac_now is not None and ac_prev is not None and ac_now>0 and ac_prev<=0,
+                 ac_now is not None and ac_prev is not None and ac_now<0 and ac_prev>=0, 74, "aceleracao mudou de sinal")
+    strong_body=bool(at is not None and at>0 and body>=at*max(0.12,RTM_MIN_BODY_ATR))
+    trigger("FORCE", strong_body and c0>o0, strong_body and c0<o0, 73, "candle com forca acima do ATR minimo")
+    e13=ema(closes,13); e13p=ema(closes[:-1],13)
+    bulls=(h0-e13) if e13 is not None else None; bears=(l0-e13) if e13 is not None else None
+    h1=highs[-2]; l1=lows[-2]
+    bullsp=(h1-e13p) if e13p is not None else None; bearsp=(l1-e13p) if e13p is not None else None
+    trigger("BULLS_BEARS", bulls is not None and bears is not None and bullsp is not None and bearsp is not None and bulls>abs(bears) and bullsp<=abs(bearsp),
+                            bulls is not None and bears is not None and bullsp is not None and bearsp is not None and abs(bears)>bulls and abs(bearsp)<=bullsp, 75, "virada Bulls/Bears")
+
+    # 22-27: fluxo/reversao — cada um pode liberar sozinho.
+    wpr=_rtm_wpr(data,14); wprp=_rtm_wpr(data[:-1],14)
+    trigger("WPR", wpr is not None and wprp is not None and wpr>-50 and wprp<=-50,
+                  wpr is not None and wprp is not None and wpr<-50 and wprp>=-50, 74, "Williams %R cruzou -50")
+    mfi=_rtm_mfi(data,14); mfip=_rtm_mfi(data[:-1],14)
+    trigger("MFI", mfi is not None and mfip is not None and mfi>50 and mfip<=50,
+                  mfi is not None and mfip is not None and mfi<50 and mfip>=50, 76, "MFI cruzou 50")
+    dem=_rtm_demarker(data,14); demp=_rtm_demarker(data[:-1],14)
+    trigger("DEMARKER", dem is not None and demp is not None and dem>0.50 and demp<=0.50,
+                       dem is not None and demp is not None and dem<0.50 and demp>=0.50, 74, "DeMarker cruzou 0.50")
+    bb=bollinger(closes,20,2.0); bbp=bollinger(closes[:-1],20,2.0)
+    trigger("BB_MID", bb is not None and bbp is not None and c0>bb["middle"] and c1<=bbp["middle"],
+                     bb is not None and bbp is not None and c0<bb["middle"] and c1>=bbp["middle"], 78, "preco cruzou a media das Bollinger")
+    # OBV acumulado simples usando o volume disponivel na fonte.
+    obv=[0.0]
+    for i in range(1,len(data)):
+        v=_rtm_volume(data[i]) or 1.0
+        step=v if closes[i]>closes[i-1] else (-v if closes[i]<closes[i-1] else 0.0)
+        obv.append(obv[-1]+step)
+    trigger("OBV", len(obv)>=3 and obv[-1]>obv[-2] and obv[-2]<=obv[-3],
+                  len(obv)>=3 and obv[-1]<obv[-2] and obv[-2]>=obv[-3], 75, "OBV virou a inclinacao")
+    buy_reject=bool(bb and l0<=bb["lower"] and c0>bb["lower"] and c0>o0)
+    sell_reject=bool(bb and h0>=bb["upper"] and c0<bb["upper"] and c0<o0)
+    trigger("BB_REJECT",buy_reject,sell_reject,88,"rejeicao da banda externa")
+
+    # 28-30: price action/rompimento — gatilhos independentes.
+    trigger("BODY_ATR", strong_body and c0>o0, strong_body and c0<o0, 80, "candle de expansao por ATR")
     lb=min(RTM_BREAKOUT_LOOKBACK,len(data)-2)
     prev_high=max(highs[-lb-1:-1]) if lb>0 else h0
     prev_low=min(lows[-lb-1:-1]) if lb>0 else l0
-    vote("PRICE_ACTION","BREAKOUT", c0>prev_high, c0<prev_low)
-    vote("PRICE_ACTION","CLOSE_FLOW", c0>c1, c0<c1)
+    trigger("BREAKOUT", c0>prev_high, c0<prev_low, 92, "rompimento do extremo recente")
+    flow_body=bool(at is not None and at>0 and body>=at*0.12)
+    trigger("CLOSE_FLOW", flow_body and c0>c1>c2 and c0>o0,
+                         flow_body and c0<c1<c2 and c0<o0, 72, "fluxo de 3 fechamentos na mesma direcao")
 
-    results={
-        "TREND":_rtm_block_result("TREND","TENDENCIA",blocks["TREND"],RTM_TREND_MIN_VOTES,RTM_TREND_MIN_EDGE,RTM_TREND_MIN_CONSENSUS),
-        "MOMENTUM":_rtm_block_result("MOMENTUM","MOMENTUM/FORCA",blocks["MOMENTUM"],RTM_MOMENTUM_MIN_VOTES,RTM_MOMENTUM_MIN_EDGE,RTM_MOMENTUM_MIN_CONSENSUS),
-        "REVERSAL":_rtm_block_result("REVERSAL","REVERSAO/FLUXO",blocks["REVERSAL"],RTM_REVERSAL_MIN_VOTES,RTM_REVERSAL_MIN_EDGE,RTM_REVERSAL_MIN_CONSENSUS),
-        "PRICE_ACTION":_rtm_block_result("PRICE_ACTION","PRICE ACTION/ROMPIMENTO",blocks["PRICE_ACTION"],RTM_PRICE_MIN_VOTES,RTM_PRICE_MIN_EDGE,RTM_PRICE_MIN_CONSENSUS),
-    }
-    qualified=[x for x in results.values() if x.get("qualified")]
-    b=len(buy); se=len(sell); active=b+se
-    aggregate={"buy":b,"sell":se,"active":active,"neutral":len(neutral),"total_slots":30,"edge":abs(b-se),
-               "consensus":round(100.0*max(b,se)/max(active,1),1) if active else 0.0}
-
-    if not qualified:
-        summary=" | ".join(f"{x['label']} {x['buy']}x{x['sell']}" for x in results.values())
+    if not candidates:
         return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
-                "strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDEPENDENT_BLOCKS",
-                "reason":f"RTM independente monitorando • nenhum bloco ficou forte ainda. {summary}."[:520],
-                "votes":aggregate,"blocks":results,"independent_blocks":True,
+                "strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDIVIDUAL_TRIGGERS",
+                "reason":"RTM INDIVIDUAL monitorando • nenhum gatilho individual disparou agora.",
+                "detectors":[],"detectors_total":30,"independent_indicators":True,
                 "early_signal_window":bool(early_signal),"next_candle_entry":True,"gale_signal":False,
                 "non_repaint_after_release":True}
 
-    qdirs={x["direction"] for x in qualified}
-    if len(qdirs) > 1:
-        conflicts=" x ".join(f"{x['label']}={x['direction']} {x['consensus']:.0f}%" for x in qualified)
-        return {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
-                "strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDEPENDENT_BLOCKS",
-                "reason":f"RTM bloqueou a entrada por conflito entre blocos fortes: {conflicts}."[:520],
-                "votes":aggregate,"blocks":results,"independent_blocks":True,"block_conflict":True,
-                "early_signal_window":bool(early_signal),"next_candle_entry":True,"gale_signal":False,
-                "non_repaint_after_release":True}
-
-    direction=qualified[0]["direction"]
-    supporters=[x for x in qualified if x["direction"]==direction]
-    best=max(supporters,key=lambda x:(x["consensus"],x["edge"],x["winner"]))
-    confidence=min(95.0,float(best["consensus"])+RTM_SUPPORT_BLOCK_BONUS*max(0,len(supporters)-1))
-    global_same=(direction=="CALL" and b>se) or (direction=="PUT" and se>b)
-    if global_same and active and (100.0*max(b,se)/active)>=58.0:
-        confidence=min(95.0,confidence+2.0)
-    risk="LOW" if len(supporters)>=2 and confidence>=70.0 else "MEDIUM"
-    block_names=", ".join(x["label"] for x in supporters)
-    reasons=[]
-    for x in supporters:
-        rr=x["buy_reasons"] if direction=="CALL" else x["sell_reasons"]
-        if rr:
-            reasons.append(f"{x['label']}: {', '.join(rr[:4])}")
-    why=" • ".join(reasons)
-    reason=(f"RTM INDEPENDENTE {direction}: bloco liberador {best['label']} {best['buy']}x{best['sell']} "
-            f"({best['consensus']:.1f}%). Blocos confirmando: {block_names}. {why}")
+    # Nao ha votacao nem confluencia: o gatilho individual de maior prioridade vence.
+    candidates.sort(key=lambda x:x["score"], reverse=True)
+    best=candidates[0]
+    direction=best["direction"]
+    same_time=[x for x in candidates if x["direction"]==direction]
+    opposite=[x for x in candidates if x["direction"]!=direction]
+    confidence=float(best["score"])
+    risk="LOW" if confidence>=86 else "MEDIUM"
+    reason=(f"RTM INDIVIDUAL {direction}: {best['tag']} liberou sozinho ({confidence:.0f}). "
+            f"{best['reason']}. Sem bloco e sem confluencia obrigatoria.")
     return {"available":True,"direction":direction,"raw_direction":direction,"confidence":round(confidence,1),
-            "confirmed":True,"risk":risk,"strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDEPENDENT_BLOCKS",
-            "reason":reason[:520],"votes":aggregate,"blocks":results,"independent_blocks":True,
-            "trigger_block":best["key"],"supporting_blocks":[x["key"] for x in supporters],
-            "buy_reasons":buy,"sell_reasons":sell,"early_signal_window":bool(early_signal),
-            "next_candle_entry":True,"direct_win_only":True,"gale_signal":False,"non_repaint_after_release":True}
-
+            "confirmed":True,"risk":risk,"strategy":name,"engine":"RTM","provider":"LOCAL_RTM_INDIVIDUAL_TRIGGERS",
+            "reason":reason[:520],"independent_indicators":True,"trigger_indicator":best["tag"],
+            "trigger_score":round(confidence,1),"simultaneous_same_side":[x["tag"] for x in same_time[1:]],
+            "simultaneous_opposite":[x["tag"] for x in opposite],"detectors_total":30,
+            "detectors_triggered":candidates,"early_signal_window":bool(early_signal),
+            "next_candle_entry":True,"direct_win_only":True,"gale_signal":False,
+            "non_repaint_after_release":True}
 
 def _candle_time_candidates(value: str):
     """
@@ -14554,12 +14563,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 if not iq_state:
                     out = neutral_signal(
                         symbol, interval, market,
-                        "RTM MULTI INDEPENDENTE • IQ OPTION OFFLINE",
-                        "Conecte a IQ Option para o RTM MULTI INDEPENDENTE analisar candles OTC reais.",
+                        "RTM MULTI INDIVIDUAL • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para o RTM MULTI INDIVIDUAL analisar candles OTC reais.",
                         source_state="WAITING",
                     )
                     out.update({
-                        "strategy":"RTM MULTI • BLOCOS INDEPENDENTES","mode":"RTM_INTERNAL_INDEPENDENT_BLOCKS",
+                        "strategy":"RTM MULTI • GATILHOS INDIVIDUAIS","mode":"RTM_INTERNAL_INDEPENDENT_BLOCKS",
                         "selected_engine":engine,"feed_source":"IQ_OPTION_OTC",
                         "non_repaint_after_release":True,"next_candle_entry":True,"direct_win_only":True,"gale_signal":False,
                     })
@@ -14934,7 +14943,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "RUBIK":
             status = "ROBÔ RUBIK • FONTE EM ESPERA" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION EM ESPERA"
         elif engine == "RTM":
-            status = "RTM MULTI INDEPENDENTE • FONTE EM ESPERA" if market == "OPEN" else "RTM MULTI INDEPENDENTE • IQ OPTION EM ESPERA"
+            status = "RTM MULTI INDIVIDUAL • FONTE EM ESPERA" if market == "OPEN" else "RTM MULTI INDIVIDUAL • IQ OPTION EM ESPERA"
         elif engine == "BLACKBOOK":
             status = "BLACK BOOK • FONTE EM ESPERA" if market == "OPEN" else "BLACK BOOK • IQ OPTION EM ESPERA"
         elif engine == "LARRY":
@@ -14987,7 +14996,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "RUBIK":
             status = "ROBÔ RUBIK • FONTE RECONECTANDO" if market == "OPEN" else "ROBÔ RUBIK • IQ OPTION RECONECTANDO"
         elif engine == "RTM":
-            status = "RTM MULTI INDEPENDENTE • FONTE RECONECTANDO" if market == "OPEN" else "RTM MULTI INDEPENDENTE • IQ OPTION RECONECTANDO"
+            status = "RTM MULTI INDIVIDUAL • FONTE RECONECTANDO" if market == "OPEN" else "RTM MULTI INDIVIDUAL • IQ OPTION RECONECTANDO"
         elif engine == "BLACKBOOK":
             status = "BLACK BOOK • FONTE RECONECTANDO" if market == "OPEN" else "BLACK BOOK • IQ OPTION RECONECTANDO"
         elif engine == "LARRY":
@@ -15080,7 +15089,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "ROBÔ RUBIK ADAPTADO"
             engine_mode = "RUBIK_ADAPTED"
         elif engine == "RTM":
-            engine_title = "RTM MULTI INDEPENDENTE"
+            engine_title = "RTM MULTI INDIVIDUAL"
             engine_mode = "RTM_INTERNAL_MULTI_VOTE"
         elif engine == "BLACKBOOK":
             engine_title = "BLACK BOOK"
@@ -15163,7 +15172,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                     "EA": "XGBOOST_RSI_VALUE_CHART",
                     "RUBIK": "LOCAL_RUBIK_ADAPTED",
-                    "RTM": "LOCAL_RTM_INDEPENDENT_BLOCKS",
+                    "RTM": "LOCAL_RTM_INDIVIDUAL_TRIGGERS",
                     "BLACKBOOK": "LOCAL_BLACK_BOOK",
                     "LARRY": "LOCAL_LARRY_BREAKOUT",
                     "RANGE": "LOCAL_RANGE_COMPRESSION_BREAKOUT",
@@ -15249,7 +15258,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     analysis["confirmed"]=False
                     analysis["direction"]="NEUTRO"
                     analysis["confidence"]=0.0
-                    analysis["reason"]=(f"RTM MULTI INDEPENDENTE monitorando • sinal oficial nos últimos {RTM_PREALERT_SECONDS}s da vela "
+                    analysis["reason"]=(f"RTM MULTI INDIVIDUAL monitorando • sinal oficial nos últimos {RTM_PREALERT_SECONDS}s da vela "
                                         f"(agora faltam {int(rtm_seconds_to_entry)}s).")
                     analysis["early_signal_window"]=False
                     analysis["seconds_to_entry_snapshot"]=round(rtm_seconds_to_entry,1)
@@ -15531,7 +15540,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 else (analysis.get("strategy") or (
                     "EA RSI + VALUE CHART + XGBOOST" if engine == "EA"
                     else "ROBÔ RUBIK ADAPTADO" if engine == "RUBIK"
-                    else "RTM MULTI • BLOCOS INDEPENDENTES" if engine == "RTM"
+                    else "RTM MULTI • GATILHOS INDIVIDUAIS" if engine == "RTM"
                     else "BLACK BOOK • PRICE ACTION" if engine == "BLACKBOOK"
                     else "LARRY BREAKOUT" if engine == "LARRY"
                     else "RANGE COMPRESSION BREAKOUT" if engine == "RANGE"
@@ -15979,7 +15988,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "status": (smart_status if engine == "SMART" else {
                         "EA": "SINAL TRIPLA CONFIRMAÇÃO LIBERADO",
                         "RUBIK": "SINAL ROBÔ RUBIK ADAPTADO LIBERADO",
-                        "RTM": "SINAL RTM MULTI INDEPENDENTE LIBERADO",
+                        "RTM": "SINAL RTM MULTI INDIVIDUAL LIBERADO",
                         "BLACKBOOK": "SINAL BLACK BOOK LIBERADO",
                         "LARRY": "SINAL LARRY BREAKOUT LIBERADO",
                         "RANGE": "SINAL RANGE COMPRESSION LIBERADO",
@@ -16013,8 +16022,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     base["announce_seconds_before"] = RTM_PREALERT_SECONDS
                     base["early_signal_locked"] = True
                     base["non_repaint_after_release"] = True
-                    base["signal_snapshot"] = "FORMING_CANDLE_AT_20S_INDEPENDENT"
-                    base["rtm_independent"] = {"blocks":["TREND","MOMENTUM","REVERSAL","PRICE_ACTION"],"one_strong_block_releases":True,"same_side_confluence_bonus":RTM_SUPPORT_BLOCK_BONUS,"strong_opposite_block_blocks":True,"trend":{"min_votes":RTM_TREND_MIN_VOTES,"edge":RTM_TREND_MIN_EDGE,"consensus":RTM_TREND_MIN_CONSENSUS},"momentum":{"min_votes":RTM_MOMENTUM_MIN_VOTES,"edge":RTM_MOMENTUM_MIN_EDGE,"consensus":RTM_MOMENTUM_MIN_CONSENSUS},"reversal":{"min_votes":RTM_REVERSAL_MIN_VOTES,"edge":RTM_REVERSAL_MIN_EDGE,"consensus":RTM_REVERSAL_MIN_CONSENSUS},"price_action":{"min_votes":RTM_PRICE_MIN_VOTES,"edge":RTM_PRICE_MIN_EDGE,"consensus":RTM_PRICE_MIN_CONSENSUS},"adx_min":RTM_MIN_ADX,"breakout_lookback":RTM_BREAKOUT_LOOKBACK,"body_atr":RTM_MIN_BODY_ATR}
+                    base["signal_snapshot"] = "FORMING_CANDLE_AT_20S_INDIVIDUAL"
+                    base["rtm_individual"] = {"detectors":30,"one_detector_can_release":True,"voting":False,"required_confluence":False,"trigger_indicator":analysis.get("trigger_indicator"),"trigger_score":analysis.get("trigger_score"),"adx_min":RTM_MIN_ADX,"breakout_lookback":RTM_BREAKOUT_LOOKBACK,"body_atr":RTM_MIN_BODY_ATR}
                 if engine == "BLACKBOOK":
                     base["non_repaint_after_release"] = True
                     base["signal_snapshot"] = "LAST_CLOSED_CANDLE"
@@ -18900,7 +18909,7 @@ async def rtm_ea_signal(request: Request, body: RTMEAExternalSignalBody):
         "strategy": "RTM MULTI EA", "mode": "RTM_EXTERNAL_MT4",
         "selected_engine": "RTM", "engine": str(body.engine or "RTM_MULTI_INDEPENDENT"),
         "status": "RTM MULTI EA • SINAL RECEBIDO • ENTRADA NA PRÓXIMA VELA",
-        "risk": "MEDIUM", "reason": str(body.reasons or "RTM por blocos independentes do EA")[:800],
+        "risk": "MEDIUM", "reason": str(body.reasons or "RTM por gatilho individual do EA")[:800],
         "source_state": "READY", "feed_source": "MT4_EA", "external_ea": True,
         "external_source": str(body.source or "MT4_EA"),
         "buy_score": int(body.buy_score or 0), "sell_score": int(body.sell_score or 0),
@@ -19879,7 +19888,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = _fs
                     data["feed_label"] = _feed_source_label(_fs) if _fs != "MULTIFEED" else "Multifuente • RTM interno"
                     data["feed_fallback"] = bool(data.get("feed_fallback", False))
-                    data["feed_message"] = "RTM MULTI INDEPENDENTE analisado dentro do app; o bridge MT4 ficou opcional."
+                    data["feed_message"] = "RTM MULTI INDIVIDUAL analisado dentro do app por gatilhos individuais; o bridge MT4 ficou opcional."
             elif engine == "EA":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -20558,7 +20567,7 @@ async def pre_signals(
     if engine == "RTM":
         return {
             "ok": True,
-            "message": f"RTM MULTI INDEPENDENTE: cada bloco pode liberar CALL/PUT sozinho nos últimos {RTM_PREALERT_SECONDS}s; confluência aumenta confiança e conflito forte bloqueia. O MT4 é opcional.",
+            "message": f"RTM MULTI INDIVIDUAL: cada gatilho pode liberar CALL/PUT sozinho nos últimos {RTM_PREALERT_SECONDS}s; sem votação por blocos e sem confluência obrigatória. O MT4 é opcional.",
             "items": [],
             "seconds_to_entry": int(max(0, (next_boundary(interval) - now()).total_seconds())),
         }
@@ -21287,16 +21296,16 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             try:
                 payload = await signal(sym, interval, market, iq_rtm, request=request, ai_only=True, engine="RTM", entry_mode="MIDDLE")
             except Exception as exc:
-                payload = {"direction":"NEUTRO","confidence":0.0,"status":"RTM MULTI INDEPENDENTE • AGUARDANDO FONTE","reason":str(exc)[:160]}
+                payload = {"direction":"NEUTRO","confidence":0.0,"status":"RTM MULTI INDIVIDUAL • AGUARDANDO FONTE","reason":str(exc)[:160]}
             direction = str(payload.get("direction") or "NEUTRO").upper()
             out.append({
                 "symbol": sym, "base_symbol": sym, "direction": direction,
                 "confidence": round(float(payload.get("confidence") or 0.0), 1),
-                "status": str(payload.get("status") or "RTM MULTI INDEPENDENTE • MONITORANDO"),
+                "status": str(payload.get("status") or "RTM MULTI INDIVIDUAL • MONITORANDO"),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": payload.get("announce_time"), "feed_source": payload.get("feed_source") or ("IQ_OPTION_OTC" if market=="IQ_OTC" else "MULTIFEED"),
                 "feed_fallback": bool(payload.get("feed_fallback",False)), "requested_market": market, "engine": "RTM",
-                "strategy": str(payload.get("strategy") or "RTM MULTI • BLOCOS INDEPENDENTES"),
+                "strategy": str(payload.get("strategy") or "RTM MULTI • GATILHOS INDIVIDUAIS"),
             })
         return out
 
@@ -22793,7 +22802,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • BLACK BOOK • RTM MULTI INDEPENDENTE • EXTREME TMA + RSI + TREND • RSI TRIPLO 7/14/28 • ROBO FIBO + RSI + EMA • 3 LINE BREAK + RSI • RSI DIVERGENCE + BOLLINGER • COMBINER + SUPER SIGNAL RSI • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • BLACK BOOK • RTM MULTI INDIVIDUAL • EXTREME TMA + RSI + TREND • RSI TRIPLO 7/14/28 • ROBO FIBO + RSI + EMA • 3 LINE BREAK + RSI • RSI DIVERGENCE + BOLLINGER • COMBINER + SUPER SIGNAL RSI • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -22862,8 +22871,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="robot-mode-card" id="rtmModeCard">
     <img src="__MEGA_IMAGE__" alt="RTM Multi EA">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">🤖 RTM MULTI INDEPENDENTE</div>
-      <div class="robot-mode-desc" id="rtmModeDesc">4 blocos independentes: Tendência • Momentum/Força • Reversão/Fluxo • Price Action/Rompimento • 1 bloco forte já libera • confluência aumenta confiança • conflito forte bloqueia • pré-alerta 20s.</div>
+      <div class="robot-mode-title">🤖 RTM MULTI INDIVIDUAL</div>
+      <div class="robot-mode-desc" id="rtmModeDesc">30 gatilhos individuais • cada indicador/padrão pode liberar sozinho • sem votação por blocos • sem confluência obrigatória • pré-alerta 20s.</div>
     </div>
     <button id="rtmPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -24846,7 +24855,7 @@ function momentStudyEngineName(key){
   const names={
     GRAPH_AI:'🧠 IA GRÁFICA',
     SMART:'🧠 IA LEITURA DO GRÁFICO',
-    RTM:'🤖 RTM MULTI INDEPENDENTE',
+    RTM:'🤖 RTM MULTI INDIVIDUAL',
     LARRY:'⚡ LARRY BREAKOUT',
     VELOCITY:'⚡ VELOCITY FLOW',
     ALPHAX:'🧬 ALPHAX RELAY',
@@ -27489,12 +27498,12 @@ function applyRobotPowerState(){
     ? 'ONLINE: suporte/resistência confirmado + reação da vela + RSI 14 • próxima vela • sem repaint.'
     : 'OFFLINE: COMBINER FLOW + RSI pausado.';
 
-  if(rtmModeDesc) rtmModeDesc.textContent=rtmEnabled ? 'ONLINE: blocos independentes • Tendência, Momentum, Reversão e Price Action • 1 bloco forte libera • confluência aumenta confiança • conflito forte bloqueia • pré-alerta 20s.' : 'OFFLINE: RTM MULTI INDEPENDENTE pausado • BLACK BOOK permanece separado.';
+  if(rtmModeDesc) rtmModeDesc.textContent=rtmEnabled ? 'ONLINE: 30 gatilhos individuais • qualquer gatilho válido pode liberar sozinho • sem blocos • sem confluência obrigatória • pré-alerta 20s.' : 'OFFLINE: RTM MULTI INDIVIDUAL pausado • BLACK BOOK permanece separado.';
   const engine=selectedRobotEngine();
   if(engine==='RTM'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RTM MULTI INDEPENDENTE ONLINE • BLOCOS ANALISANDO CANDLES NO APP';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 RTM MULTI INDEPENDENTE selecionado • 4 blocos autônomos • pré-alerta 20s • próxima vela • BLACK BOOK continua separado.</div>';
-    if(radar) radar.innerHTML='<div>📡 RTM MULTI INDEPENDENTE ativo • 4 blocos analisando o mercado pelo próprio app</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RTM MULTI INDIVIDUAL ONLINE • GATILHOS ANALISANDO CANDLES NO APP';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 RTM MULTI INDIVIDUAL selecionado • 30 gatilhos autônomos • cada um pode liberar sozinho • pré-alerta 20s • próxima vela.</div>';
+    if(radar) radar.innerHTML='<div>📡 RTM MULTI INDIVIDUAL ativo • 30 gatilhos individuais analisando o mercado pelo próprio app</div>';
     rad();
   }else if(engine==='TMARSI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EXTREME TMA + RSI ONLINE • TMA17 + RSI7 + TREND FILTER ALINHADOS • PRÓXIMA VELA';
@@ -28960,7 +28969,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI INDEPENDENTE':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI INDIVIDUAL':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
@@ -29082,8 +29091,8 @@ async function loadPreSignals(){
     return;
   }
   if(engine==='RTM'){
-    if(preSignalStatus) preSignalStatus.textContent='RTM MULTI INDEPENDENTE • pré-alerta calculado dentro do app; bridge MT4 opcional.';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 RTM MULTI INDEPENDENTE monitorando • 4 blocos • 20s antes • entrada na próxima vela.</div>';
+    if(preSignalStatus) preSignalStatus.textContent='RTM MULTI INDIVIDUAL • pré-alerta calculado dentro do app • sem blocos • bridge MT4 opcional.';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 RTM MULTI INDIVIDUAL monitorando • 30 gatilhos independentes • 20s antes • entrada na próxima vela.</div>';
     return;
   }
 
