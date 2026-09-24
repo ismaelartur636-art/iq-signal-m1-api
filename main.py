@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.7"
-PWA_VERSION = "v170"
+APP_VERSION = "3.96.8"
+PWA_VERSION = "v171"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -215,19 +215,20 @@ TAURUS_EA_MOM_PERIOD = max(3, min(40, int(os.getenv("TAURUS_EA_MOM_PERIOD", "14"
 TAURUS_EA_MOM_FILTER = max(0.0, min(2.0, float(os.getenv("TAURUS_EA_MOM_FILTER", "0.1"))))
 TAURUS_EA_REGION_WINDOW = max(1, min(5, int(os.getenv("TAURUS_EA_REGION_WINDOW", "3"))))
 
-# MEGA IA 3.96.5 — TAURUS + RSI DIV (00-RsiDiv_v103 adaptado).
-# RSI 8 + T3 8 fornece cruzamentos/divergencias; Taurus confirma S/R ou LTA/LTB.
+# MEGA IA 3.96.5F — TAURUS + RSI DIV FLEX (00-RsiDiv_v103 adaptado).
+# RSI 8 + T3 8 em zona 38/62 fornece cruzamentos/divergencias; Taurus confirma S/R ou LTA/LTB com tolerancia ATR propria.
 # Somente candles fechados, entrada na proxima vela e sem Gale.
 TAURUS_RSIDIV_HISTORY_BARS = max(140, min(500, int(os.getenv("TAURUS_RSIDIV_HISTORY_BARS", "240"))))
 TAURUS_RSIDIV_RSI_PERIOD = max(5, min(30, int(os.getenv("TAURUS_RSIDIV_RSI_PERIOD", "8"))))
 TAURUS_RSIDIV_T3_PERIOD = max(3, min(30, int(os.getenv("TAURUS_RSIDIV_T3_PERIOD", "8"))))
 TAURUS_RSIDIV_T3_CURVATURE = max(0.10, min(0.95, float(os.getenv("TAURUS_RSIDIV_T3_CURVATURE", "0.618"))))
-TAURUS_RSIDIV_LEVEL_LOW = max(10.0, min(45.0, float(os.getenv("TAURUS_RSIDIV_LEVEL_LOW", "30"))))
-TAURUS_RSIDIV_LEVEL_HIGH = max(55.0, min(90.0, float(os.getenv("TAURUS_RSIDIV_LEVEL_HIGH", "70"))))
+TAURUS_RSIDIV_LEVEL_LOW = max(10.0, min(45.0, float(os.getenv("TAURUS_RSIDIV_LEVEL_LOW", "38"))))
+TAURUS_RSIDIV_LEVEL_HIGH = max(55.0, min(90.0, float(os.getenv("TAURUS_RSIDIV_LEVEL_HIGH", "62"))))
 TAURUS_RSIDIV_LOOKBACK = max(24, min(160, int(os.getenv("TAURUS_RSIDIV_LOOKBACK", "120"))))
-TAURUS_RSIDIV_SIGNAL_WINDOW = max(1, min(4, int(os.getenv("TAURUS_RSIDIV_SIGNAL_WINDOW", "2"))))
-TAURUS_RSIDIV_REGION_WINDOW = max(1, min(4, int(os.getenv("TAURUS_RSIDIV_REGION_WINDOW", "2"))))
-TAURUS_RSIDIV_COOLDOWN_BARS = max(1, min(12, int(os.getenv("TAURUS_RSIDIV_COOLDOWN_BARS", "3"))))
+TAURUS_RSIDIV_SIGNAL_WINDOW = max(1, min(6, int(os.getenv("TAURUS_RSIDIV_SIGNAL_WINDOW", "4"))))
+TAURUS_RSIDIV_REGION_WINDOW = max(1, min(6, int(os.getenv("TAURUS_RSIDIV_REGION_WINDOW", "4"))))
+TAURUS_RSIDIV_COOLDOWN_BARS = max(1, min(12, int(os.getenv("TAURUS_RSIDIV_COOLDOWN_BARS", "2"))))
+TAURUS_RSIDIV_TOL_ATR = max(0.10, min(1.20, float(os.getenv("TAURUS_RSIDIV_TOL_ATR", "0.45"))))
 TAURUS_RSIDIV_USE_HIDDEN = os.getenv("TAURUS_RSIDIV_USE_HIDDEN", "1").strip().lower() in ("1","true","on","yes")
 TSZ_LAMBDA_EMA = 5
 TSZ_EMA = 18
@@ -10962,11 +10963,11 @@ def _taurus_project(i1,p1,i2,p2,t):
     return float(p1)+(float(p2)-float(p1))*(t-i1)/(i2-i1)
 
 
-def _taurus_region_state(rows,t,ph,pl,atr_series):
+def _taurus_region_state(rows,t,ph,pl,atr_series,tol_atr=None):
     if t<0 or t>=len(rows): return False,False,{}
     a=atr_series[t] if t<len(atr_series) else None
     if a is None or float(a)<=0 or float(a)!=float(a): return False,False,{}
-    tol=float(a)*TAURUS_SENEGAL_TOL_ATR
+    tol=float(a)*(TAURUS_SENEGAL_TOL_ATR if tol_atr is None else float(tol_atr))
     side=TAURUS_SENEGAL_PIVOT_SIDE
     max_idx=t-side; lo=max(0,t-TAURUS_SENEGAL_SR_LOOKBACK)
     his=[i for i in range(lo,max_idx+1) if ph[i]] if max_idx>=lo else []
@@ -11122,9 +11123,9 @@ def _taurus_rsidiv_t3_series(rsi_series, period=8, curvature=0.618):
 def taurus_rsidiv_strategy(cs,timeframe='1min',market='OPEN'):
     """TAURUS + RSI DIV — RSI8/T3 + divergencias confirmadas por estrutura Taurus.
 
-    CALL = cruzamento RSI/T3 de alta em sobrevenda OU divergencia altista regular/oculta
+    CALL = cruzamento RSI/T3 de alta na zona flexivel OU divergencia altista regular/oculta
            + Taurus em Suporte OU LTA nos candles fechados recentes.
-    PUT  = inverso em sobrecompra + Taurus em Resistencia OU LTB.
+    PUT  = inverso na zona flexivel + Taurus em Resistencia OU LTB.
     A divergencia usa pivô 2x2 confirmado; nenhum candle futuro e usado.
     """
     rows=list(cs or [])
@@ -11180,7 +11181,7 @@ def taurus_rsidiv_strategy(cs,timeframe='1min',market='OPEN'):
 
     call_regions=[]; put_regions=[]
     for i in range(max(0,last-TAURUS_RSIDIV_REGION_WINDOW+1),last+1):
-        call_reg,put_reg,reg=_taurus_region_state(rows,i,ph,pl,ta_atr)
+        call_reg,put_reg,reg=_taurus_region_state(rows,i,ph,pl,ta_atr,TAURUS_RSIDIV_TOL_ATR)
         if call_reg: call_regions.append((i,reg))
         if put_reg: put_regions.append((i,reg))
 
@@ -11223,7 +11224,7 @@ def taurus_rsidiv_strategy(cs,timeframe='1min',market='OPEN'):
     evt=str(rows[event[0]].get('datetime') or rows[event[0]].get('timestamp') or event[0])
     return {"available":True,"direction":direction,"confidence":round(conf,1),"confirmed":True,
             "risk":"LOW" if conf>=84 else "MEDIUM","strategy":name,"engine":"TAURUSRSIDIV","provider":"LOCAL_TAURUS_RSI_DIV",
-            "reason":f"{direction} TAURUS + RSI DIV confirmado • {event[1]} + {structural} • RSI8/T3(8) • entrada na proxima vela • sem Gale.",
+            "reason":f"{direction} TAURUS + RSI DIV confirmado • {event[1]} + {structural} • RSI8/T3(8) FLEX 38/62 • entrada na proxima vela • sem Gale.",
             "non_repaint":True,"non_repaint_after_release":True,"closed_candles_only":True,"next_candle_entry":True,
             "direct_win_only":True,"gale_signal":False,"martingale":False,"cooldown_bars":TAURUS_RSIDIV_COOLDOWN_BARS,
             "event_key":f"TAURUSRSIDIV:{direction}:{evt}",
@@ -28803,9 +28804,9 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar Taurus EA ativo • procurando cruzamento EMA + Momentum dentro da região Taurus</div>';
     rad();
   }else if(engine==='TAURUSRSIDIV'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='TAURUS + RSI DIV ONLINE • RSI8/T3 + DIVERGÊNCIA + S/R/LTA/LTB • CANDLE FECHADO • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🐂📉 Taurus + RSI DIV • RSI8/T3 ou divergência confirma direção e Taurus valida S/R ou LTA/LTB • sem repaint.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar Taurus + RSI DIV ativo • procurando gatilho RSI DIV dentro da região Taurus</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='TAURUS + RSI DIV FLEX ONLINE • RSI8/T3 38/62 + DIVERGÊNCIA + S/R/LTA/LTB • CANDLE FECHADO • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🐂📉 Taurus + RSI DIV FLEX • RSI8/T3 38/62 ou divergência confirma direção; Taurus valida S/R ou LTA/LTB em janela ampliada • sem repaint.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar Taurus + RSI DIV FLEX ativo • janela 4 velas • procurando RSI/T3 ou divergência dentro da região Taurus</div>';
     rad();
   }else if(engine==='RSIDIVBB'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI DIVERGENCE + BOLLINGER ONLINE • RSI14 + BB20/2 • CANDLE FECHADO • PRÓXIMA VELA';
