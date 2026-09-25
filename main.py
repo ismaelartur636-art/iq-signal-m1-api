@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.17"
+APP_VERSION = "3.96.18"
 PWA_VERSION = "v173"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -23770,6 +23770,59 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 engine_label = "TTM SCALPER SWING"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why = str(tech.get("reason") or "TTM Scalper monitorando").replace("\n", " ")[:88]
+                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
+            elif engine == "FOREXMISSION":
+                if market == "IQ_OTC":
+                    _fm_h1 = await iq_ea_candles(iq_state, sym, "1h", 90, regular_market=False)
+                else:
+                    _fm_h1 = await candles(sym, "1h", 90, "OPEN", None, request=request)
+                _fm_h1_closed = _fm_h1[:-1] if len(_fm_h1) > 1 else _fm_h1
+                tech = forex_mission_strategy(closed[-180:], _fm_h1_closed, timeframe=interval, market=market)
+                engine_label = "FOREX MISSION"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "FOREX MISSION monitorando").replace("\n", " ")[:88]
+                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
+            elif engine == "MONEYARROW":
+                tech = binary_moneyarrow_strategy(closed[-180:], symbol=sym, timeframe=interval, market=market)
+                engine_label = "BINARY MONEYARROW"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "BINARY MONEYARROW monitorando").replace("\n", " ")[:88]
+                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
+            elif engine == "LIQUIDEX":
+                tech = liquidex_strategy(closed[-180:], symbol=sym, timeframe=interval, market=market)
+                engine_label = "LIQUIDEX"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "LIQUIDEX monitorando").replace("\n", " ")[:88]
+                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
+            elif engine == "EUROFX2":
+                tech = euro_fx2_strategy(closed[-180:], symbol=sym, timeframe=interval, market=market)
+                engine_label = "EURO FX2"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "EURO FX2 monitorando").replace("\n", " ")[:88]
+                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
+            elif engine == "ATE":
+                tech = ate_ea_strategy(closed[-180:], symbol=sym, timeframe=interval, market=market)
+                engine_label = "ATE"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "ATE monitorando").replace("\n", " ")[:88]
+                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
+            elif engine == "FOREXSTAY":
+                tech = forexstay_sight_strategy(closed[-180:], symbol=sym, timeframe=interval, market=market)
+                engine_label = "FOREXSTAY SIGHT"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "FOREXSTAY SIGHT monitorando").replace("\n", " ")[:88]
+                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
+            elif engine == "FOREXSTAYPRO":
+                tech = forexstay_pro_strategy(closed[-180:], symbol=sym, timeframe=interval, market=market)
+                engine_label = "FOREXSTAY PRO"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "FOREXSTAY PRO monitorando").replace("\n", " ")[:88]
+                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
+            elif engine == "FOREXFLEX":
+                tech = forex_flex_strategy(closed[-180:], symbol=sym, timeframe=interval, market=market)
+                engine_label = "FOREX FLEX"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "FOREX FLEX monitorando").replace("\n", " ")[:88]
                 status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "SNIPER":
                 tech = super_signals_channel_nr_strategy(closed, interval, market=market)
