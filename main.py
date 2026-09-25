@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.22"
-PWA_VERSION = "v174"
+APP_VERSION = "3.96.23"
+PWA_VERSION = "v175"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -2259,6 +2259,9 @@ IQ_CANDLE_TIMEOUT = float(os.getenv("IQ_CANDLE_TIMEOUT", "15"))
 IQ_CANDLE_CACHE_TTL = float(os.getenv("IQ_CANDLE_CACHE_TTL", "3"))
 IQ_RECONNECT_BASE = float(os.getenv("IQ_RECONNECT_BASE", "4"))
 IQ_RECONNECT_MAX = float(os.getenv("IQ_RECONNECT_MAX", "45"))
+# Depois de algumas falhas consecutivas, paramos de reutilizar uma autorização
+# possivelmente inválida. Isso evita loop de WebSocket 401 e libera novo login.
+IQ_RECONNECT_MAX_FAILURES = max(1, int(os.getenv("IQ_RECONNECT_MAX_FAILURES", "3")))
 iq_sessions: Dict[str, Dict[str, Any]] = {}
 
 # BINOMO — sessão separada e somente para leitura do Crypto IDX.
@@ -7640,11 +7643,46 @@ def _iq_reason_to_message(reason: str):
         return "A IQ Option está exigindo autenticação em duas etapas (2FA)."
     if any(x in low for x in ("invalid_credentials", "wrong credentials", "invalid credentials", "incorrect credentials")):
         return "E-mail ou senha da IQ Option estão incorretos."
+    if any(x in low for x in ("401", "unauthorized", "authorization required", "not authorized", "ssid")):
+        return "A autorização da sessão da IQ Option foi recusada (401). Faça um novo login."
     if "blocked" in low or "forbidden" in low:
         return "A IQ Option recusou a sessão deste servidor."
     if reason:
         return "A IQ Option recusou a conexão: " + str(reason)[:220]
     return "A IQ Option não confirmou a conexão."
+
+
+def _iq_is_auth_failure(message: str) -> bool:
+    low = str(message or "").lower()
+    return any(key in low for key in (
+        "401",
+        "unauthorized",
+        "authorization required",
+        "not authorized",
+        "invalid_credentials",
+        "wrong credentials",
+        "invalid credentials",
+        "incorrect credentials",
+        "2fa",
+        "two-factor",
+        "duas etapas",
+        "forbidden",
+        "ssid",
+    ))
+
+
+def _iq_require_fresh_login(state: Dict[str, Any], reason: str):
+    """Invalida a autorização sem deixar o servidor insistindo no mesmo login."""
+    _iq_close_state(state)
+    state["connected"] = False
+    state["reconnecting"] = False
+    state["reauth_required"] = True
+    state["auth_invalidated_at"] = time.time()
+    state["last_error"] = str(reason or "Autorização IQ Option recusada.")[:260]
+    state["failure_count"] = 0
+    state["reconnect_after"] = 0.0
+    # Não reutiliza a senha depois que a autorização foi recusada.
+    state["password"] = ""
 
 
 def _iq_abort_client(client):
@@ -7749,6 +7787,12 @@ def _iq_reconnect_delay(failure_count: int) -> float:
 
 
 def _iq_reconnect_state(state: Dict[str, Any]):
+    if state.get("reauth_required"):
+        raise RuntimeError(
+            "A sessão da IQ Option perdeu a autorização. Faça login novamente; "
+            "a reconexão automática foi interrompida para evitar loop 401."
+        )
+
     if _iq_connected(state):
         state["connected"] = True
         state["failure_count"] = 0
@@ -7759,6 +7803,7 @@ def _iq_reconnect_state(state: Dict[str, Any]):
     email = str(state.get("email") or "").strip()
     password = str(state.get("password") or "")
     if not email or not password:
+        state["reauth_required"] = True
         raise RuntimeError("Sessão da IQ Option sem credenciais ativas. Faça login novamente.")
 
     sync_lock = state.get("sync_lock")
@@ -7767,6 +7812,9 @@ def _iq_reconnect_state(state: Dict[str, Any]):
         state["sync_lock"] = sync_lock
 
     with sync_lock:
+        if state.get("reauth_required"):
+            raise RuntimeError("A sessão da IQ Option precisa de um novo login.")
+
         if _iq_connected(state):
             state["connected"] = True
             state["failure_count"] = 0
@@ -7788,16 +7836,43 @@ def _iq_reconnect_state(state: Dict[str, Any]):
         try:
             client = _iq_connect_fresh(email, password)
         except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
             failures = int(state.get("failure_count", 0) or 0) + 1
+
+            # 401/autorização inválida não deve ficar em reconexão infinita. Mesmo
+            # quando o fork não repassa o 401 no texto, 3 falhas consecutivas encerram
+            # a autorização antiga e deixam o próximo login começar limpo.
+            auth_failure = _iq_is_auth_failure(msg)
+            too_many_failures = failures >= IQ_RECONNECT_MAX_FAILURES
+            if auth_failure or too_many_failures:
+                why = msg if auth_failure else (
+                    f"{msg}. Reconexão falhou {failures} vezes consecutivas."
+                )
+                _iq_require_fresh_login(state, why)
+                print(
+                    f"[IQ RECONNECT] sessão invalidada; novo login necessário • {why[:180]}",
+                    flush=True,
+                )
+                raise RuntimeError(
+                    "A sessão da IQ Option foi encerrada para evitar novas tentativas 401. "
+                    "Faça login novamente."
+                )
+
             delay = _iq_reconnect_delay(failures)
             state["failure_count"] = failures
             state["reconnect_after"] = time.time() + delay
             state["reconnecting"] = False
-            state["last_error"] = str(exc)[:260]
-            raise RuntimeError(f"{str(exc)[:220]} Nova tentativa automática em {int(delay)}s.")
+            state["last_error"] = msg[:260]
+            print(
+                f"[IQ RECONNECT] falha transitória {failures}/{IQ_RECONNECT_MAX_FAILURES}; "
+                f"nova tentativa em {int(delay)}s • {msg[:160]}",
+                flush=True,
+            )
+            raise RuntimeError(f"{msg[:220]} Nova tentativa automática em {int(delay)}s.")
 
         state["client"] = client
         state["connected"] = True
+        state["reauth_required"] = False
         state["last_connected"] = time.time()
         state["last_seen"] = time.time()
         state["last_error"] = ""
@@ -20035,7 +20110,7 @@ async def iq_login_ready():
 
 
 @app.post("/iq-login")
-async def iq_login(body: IQLoginBody, response: Response):
+async def iq_login(body: IQLoginBody, request: Request, response: Response):
     email = body.email.strip()
     password = body.password
     print(f"[IQ LOGIN] POST recebido dominio={email.split('@')[-1] if '@' in email else 'invalido'}", flush=True)
@@ -20051,6 +20126,23 @@ async def iq_login(body: IQLoginBody, response: Response):
             503,
             "Biblioteca iqoptionapi não carregada no servidor."
         )
+
+    # Antes de um novo login, encerra a sessão deste navegador que ainda possa
+    # estar presa/reconectando. O cookie continua sendo enviado mesmo quando o
+    # localStorage foi limpo pelo painel, então ele é a fonte mais confiável aqui.
+    old_header_token = str(request.headers.get("X-IQ-Session", "") or "").strip()
+    old_cookie_token = str(request.cookies.get(IQ_SESSION_COOKIE, "") or "").strip()
+    old_tokens = []
+    for old_token in (old_header_token, old_cookie_token):
+        if old_token and old_token not in old_tokens:
+            old_tokens.append(old_token)
+    for old_token in old_tokens:
+        old_state = iq_sessions.pop(old_token, None)
+        if old_state:
+            old_state["password"] = ""
+            old_state["candle_cache"] = {}
+            _iq_close_state(old_state)
+            print("[IQ LOGIN] sessão anterior deste navegador encerrada antes do novo login", flush=True)
 
     token = secrets.token_urlsafe(32)
 
@@ -20081,6 +20173,7 @@ async def iq_login(body: IQLoginBody, response: Response):
                 or "invalid_credentials" in low
                 or "2fa" in low
                 or "duas etapas" in low
+                or _iq_is_auth_failure(low)
             )
             if fatal or attempt >= 0:
                 break
@@ -20111,6 +20204,8 @@ async def iq_login(body: IQLoginBody, response: Response):
         "sync_lock": threading.RLock(),
         "connected": True,
         "reconnecting": False,
+        "reauth_required": False,
+        "auth_invalidated_at": 0.0,
         "failure_count": 0,
         "reconnect_after": 0.0,
         "last_attempt": time.time(),
@@ -20676,17 +20771,27 @@ async def otc_status(request: Request, broker: str = "IQ_OPTION"):
     )
     connected = _iq_connected(state)
 
+    reauth_required = bool(state and state.get("reauth_required"))
+    last_error = str(state.get("last_error") or "")[:220] if state else ""
+
     return {
         "broker": "IQ_OPTION",
         "configured": IQ_Option is not None,
         "connected": connected,
+        "reauth_required": reauth_required,
+        "reconnecting": bool(state and state.get("reconnecting")),
+        "last_error": last_error,
         "message": (
             "IQ Option conectada pelo painel."
             if connected
             else (
-                "Faça login com e-mail e senha na aba Corretora."
-                if IQ_Option is not None
-                else "Biblioteca iqoptionapi não carregada no servidor."
+                "A sessão da IQ Option perdeu a autorização. Faça login novamente."
+                if reauth_required
+                else (
+                    "Faça login com e-mail e senha na aba Corretora."
+                    if IQ_Option is not None
+                    else "Biblioteca iqoptionapi não carregada no servidor."
+                )
             )
         ),
         "pairs": len(OTC_BASE),
@@ -29848,13 +29953,25 @@ setInterval(()=>{
 
 async function refreshAccountStatus(){
   const b=(broker&&broker.value)||'IQ_OPTION';
+  let d=null;
   try{
-    const d=await get('/otc-status?broker='+encodeURIComponent(b));
+    d=await get('/otc-status?broker='+encodeURIComponent(b));
     brokerConnected[b]=!!d.connected;
+    if(d&&d.reauth_required){
+      try{localStorage.removeItem('mega_iq_session');}catch(_){}
+    }
   }catch(_){
-    brokerConnected[b]=false;
+    // Falha de rede/Render não significa logout da corretora. Mantém o estado
+    // visual anterior e deixa a próxima consulta confirmar a sessão.
+    if(iqAccountStatus && brokerConnected[b]){
+      iqAccountStatus.textContent='🟠 IQ Option • verificando conexão...';
+    }
+    return;
   }
   syncBroker(b);
+  if(d&&d.reauth_required&&iqAccountStatus){
+    iqAccountStatus.textContent='🔴 '+(d.message||'Sessão IQ Option expirada. Faça login novamente.');
+  }
   await updateMarketNote();
 }
 
@@ -30245,7 +30362,9 @@ window.megaConnectIQ=async function(event){
     try{ rad(); }catch(_){}
   }catch(e){
     brokerConnected[b]=false;
-    if(iqAccountStatus) iqAccountStatus.textContent='🔴 '+String((e&&e.message)||e);
+    try{localStorage.removeItem('mega_iq_session');}catch(_){}
+    const msg=String((e&&e.message)||e);
+    if(iqAccountStatus) iqAccountStatus.textContent='🔴 '+msg;
     if(iqConnectBtn) iqConnectBtn.style.display='block';
     if(iqLogoutBtn) iqLogoutBtn.style.display='none';
   }finally{
