@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.18"
+APP_VERSION = "3.96.19"
 PWA_VERSION = "v173"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -10506,23 +10506,26 @@ def forexstay_sight_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPE
 
 
 def forexstay_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """FOREXSTAY PRO: stricter, independent version of FOREXSTAY SIGHT.
+    """FOREXSTAY PRO: versão mais solta e independente do FOREXSTAY SIGHT.
 
-    Trigger stays identical to the original app port: a NEW ZeroLag MACD 12/26/9
-    crossover confirmed on a closed candle, entered on the next candle.  The new
-    motor only releases that crossover when all quality filters pass:
-      - price on the correct side of EMA 50;
-      - ADX 14 >= 20;
-      - RSI 14 not overextended (CALL < 70 / PUT > 30);
-      - trigger candle body >= 50% of its full range;
-      - CALL is not immediately below resistance / PUT is not immediately above support.
+    O ZeroLag MACD 12/26/9 continua sendo o gatilho principal, mas um cruzamento
+    confirmado permanece elegível por até 3 candles fechados. Isso evita perder
+    um movimento apenas porque um filtro estava desfavorável exatamente na vela
+    do cruzamento.
 
-    No Gale, grid, martingale, repeated same-side signals or automatic recovery is
-    introduced here.  A filtered crossover is discarded; the motor waits for the
-    next genuine crossover.
+    Filtros leves:
+      - EMA50 com tolerância de 0,15 ATR (não exige distância rígida);
+      - ADX14 >= 12;
+      - RSI14 apenas bloqueia extremos (CALL >= 80 / PUT <= 20);
+      - corpo do candle atual >= 20%;
+      - S/R só bloqueia quando o FECHAMENTO está realmente colado ao nível
+        (buffer de aproximadamente 0,08 ATR).
+
+    Continua: candle fechado, entrada na próxima vela, 1 sinal por cruzamento,
+    sem Gale, grid ou martingale.
     """
     rows=list(cs or [])
-    name=f"FOREXSTAY PRO • ZEROLAG 12/26/9 + EMA50 + ADX14 + RSI14 + S/R {timeframe}"
+    name=f"FOREXSTAY PRO • ZEROLAG 12/26/9 + EMA50 FLEX + ADX12 + RSI20/80 + S/R LEVE {timeframe}"
     if len(rows)<70:
         return {
             "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
@@ -10541,11 +10544,24 @@ def forexstay_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
     slow=_ate_zlema_full(closes,26)
     macd=[float(a)-float(b) for a,b in zip(fast,slow)]
     signal_line=_ate_zlema_full(macd,9)
-    gap_prev=float(macd[-2])-float(signal_line[-2])
-    gap_now=float(macd[-1])-float(signal_line[-1])
-    fresh_call=(gap_prev<=0.0 and gap_now>0.0)
-    fresh_put=(gap_prev>=0.0 and gap_now<0.0)
-    raw_direction="CALL" if fresh_call else ("PUT" if fresh_put else "NEUTRO")
+    gaps=[float(m)-float(s) for m,s in zip(macd,signal_line)]
+    gap_now=gaps[-1]
+
+    # O cruzamento continua válido por até 3 candles fechados (idade 0, 1 ou 2).
+    cross_window=3
+    raw_direction="NEUTRO"
+    cross_age=None
+    cross_idx=None
+    for age in range(cross_window):
+        idx=len(gaps)-1-age
+        if idx < 1:
+            break
+        prev_gap=gaps[idx-1]
+        this_gap=gaps[idx]
+        if prev_gap<=0.0 and this_gap>0.0 and gap_now>0.0:
+            raw_direction="CALL"; cross_age=age; cross_idx=idx; break
+        if prev_gap>=0.0 and this_gap<0.0 and gap_now<0.0:
+            raw_direction="PUT"; cross_age=age; cross_idx=idx; break
 
     last=rows[-1]
     last_close=_num(last,"close")
@@ -10562,54 +10578,64 @@ def forexstay_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
     a14=atr(rows[-40:],14) if len(rows)>=16 else None
 
     levels=_support_resistance_levels(rows[-100:], timeframe)
-    tol=float(levels.get("tolerance") or 0.0)
-    sr_buffer=max(tol, (float(a14)*0.35 if a14 else abs(last_close)*0.0004), abs(last_close)*0.00015)
+    # S/R propositalmente leve: usa o fechamento, não o pavio inteiro, e um
+    # buffer pequeno. O objetivo é bloquear somente quando estiver "colado".
+    sr_buffer=max((float(a14)*0.08 if a14 else 0.0), abs(last_close)*0.00005)
     support_prices=[float(x.get("price")) for x in (levels.get("supports") or []) if x.get("price") is not None and float(x.get("price"))<=last_close]
     resistance_prices=[float(x.get("price")) for x in (levels.get("resistances") or []) if x.get("price") is not None and float(x.get("price"))>=last_close]
     support=max(support_prices) if support_prices else None
     resistance=min(resistance_prices) if resistance_prices else None
-    near_support=bool(support is not None and (last_low <= support+sr_buffer or last_close-support <= sr_buffer))
-    near_resistance=bool(resistance is not None and (last_high >= resistance-sr_buffer or resistance-last_close <= sr_buffer))
+    near_support=bool(support is not None and 0.0 <= (last_close-support) <= sr_buffer)
+    near_resistance=bool(resistance is not None and 0.0 <= (resistance-last_close) <= sr_buffer)
 
-    trend_ok=(raw_direction=="CALL" and ema50 is not None and last_close>ema50) or (raw_direction=="PUT" and ema50 is not None and last_close<ema50)
-    adx_ok=bool(adx14 is not None and adx14>=20.0)
-    rsi_ok=bool(rsi14 is not None and ((raw_direction=="CALL" and rsi14<70.0) or (raw_direction=="PUT" and rsi14>30.0)))
-    body_ok=body_ratio>=0.50
+    # EMA50 flexível: até 0,15 ATR do lado contrário ainda é aceito.
+    ema_tolerance=max((float(a14)*0.15 if a14 else 0.0), abs(last_close)*0.00005)
+    trend_ok=(raw_direction=="CALL" and ema50 is not None and last_close>=float(ema50)-ema_tolerance) or (raw_direction=="PUT" and ema50 is not None and last_close<=float(ema50)+ema_tolerance)
+    adx_ok=bool(adx14 is not None and adx14>=12.0)
+    rsi_ok=bool(rsi14 is not None and ((raw_direction=="CALL" and rsi14<80.0) or (raw_direction=="PUT" and rsi14>20.0)))
+    body_ok=body_ratio>=0.20
     sr_ok=(raw_direction=="CALL" and not near_resistance) or (raw_direction=="PUT" and not near_support)
 
     direction="NEUTRO"
     blocked=[]
     if raw_direction in ("CALL","PUT"):
         if not trend_ok: blocked.append("EMA50")
-        if not adx_ok: blocked.append("ADX<20")
-        if not rsi_ok: blocked.append("RSI esticado")
-        if not body_ok: blocked.append("corpo<50%")
-        if not sr_ok: blocked.append("resistência próxima" if raw_direction=="CALL" else "suporte próximo")
+        if not adx_ok: blocked.append("ADX<12")
+        if not rsi_ok: blocked.append("RSI extremo")
+        if not body_ok: blocked.append("corpo<20%")
+        if not sr_ok: blocked.append("resistência colada" if raw_direction=="CALL" else "suporte colado")
         if not blocked:
             direction=raw_direction
 
     confirmed=direction in ("CALL","PUT")
-    recent=[abs(float(macd[i])-float(signal_line[i])) for i in range(max(0,len(macd)-14),len(macd))]
+    recent=[abs(gaps[i]) for i in range(max(0,len(gaps)-14),len(gaps))]
     avg_gap=(sum(recent)/len(recent)) if recent else 0.0
     cross_strength=(abs(gap_now)/avg_gap) if avg_gap>1e-12 else (1.0 if abs(gap_now)>0 else 0.0)
+    window_text=f"janela {int(cross_age)+1}/{cross_window}" if cross_age is not None else "sem cruzamento recente"
+
     if confirmed:
         trend_distance=(abs(last_close-float(ema50))/max(abs(last_close),1e-12))*10000.0 if ema50 is not None else 0.0
-        confidence=min(94.0,82.0+min(4.0,cross_strength*1.5)+min(3.0,max(0.0,float(adx14 or 20.0)-20.0)/5.0)+min(2.0,max(0.0,body_ratio-0.50)*6.0)+min(3.0,trend_distance/8.0))
-        reason=(f"{direction} FOREXSTAY PRO confirmado • novo cruzamento ZeroLag MACD 12/26/9 + EMA50 + "
+        confidence=min(93.0,78.0+min(5.0,cross_strength*1.6)+min(3.0,max(0.0,float(adx14 or 12.0)-12.0)/6.0)+min(2.0,max(0.0,body_ratio-0.20)*4.0)+min(3.0,trend_distance/10.0))
+        reason=(f"{direction} FOREXSTAY PRO liberado • ZeroLag MACD 12/26/9 ({window_text}) + EMA50 flex + "
                 f"ADX14 {float(adx14 or 0):.1f} + RSI14 {float(rsi14 or 0):.1f} + corpo {body_ratio*100:.0f}% + S/R livre • "
                 "candle fechado • entrada na próxima vela • sem Gale.")
     elif raw_direction in ("CALL","PUT"):
         confidence=0.0
-        reason=f"{raw_direction} filtrado no FOREXSTAY PRO • " + " • ".join(blocked) + ". Aguardando novo cruzamento."
+        reason=f"{raw_direction} ainda válido ({window_text}) • filtrado agora por " + " • ".join(blocked) + ". Pode liberar dentro da janela de 3 velas."
     elif gap_now>0:
         confidence=0.0
-        reason="FOREXSTAY PRO mantém MACD comprador, mas não repete CALL. Aguardando novo cruzamento."
+        reason="FOREXSTAY PRO mantém MACD comprador • último cruzamento fora da janela de 3 velas. Aguardando novo cruzamento."
     elif gap_now<0:
         confidence=0.0
-        reason="FOREXSTAY PRO mantém MACD vendedor, mas não repete PUT. Aguardando novo cruzamento."
+        reason="FOREXSTAY PRO mantém MACD vendedor • último cruzamento fora da janela de 3 velas. Aguardando novo cruzamento."
     else:
         confidence=0.0
-        reason="FOREXSTAY PRO monitorando • aguardando novo cruzamento ZeroLag MACD 12/26/9."
+        reason="FOREXSTAY PRO monitorando • aguardando cruzamento ZeroLag MACD 12/26/9."
+
+    cross_candle=None
+    if cross_idx is not None and 0 <= cross_idx < len(rows):
+        cross_row=rows[cross_idx]
+        cross_candle=cross_row.get("datetime", cross_row.get("timestamp", cross_row.get("time", cross_idx)))
 
     return {
         "available":True,"direction":direction,"confidence":round(float(confidence),1),
@@ -10618,15 +10644,16 @@ def forexstay_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
         "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
         "gale_signal":False,"grid":False,"martingale":False,"direct_win_only":True,
         "one_signal_per_cross":True,"zero_lag_macd_periods":[12,26,9],
-        "ema_period":50,"ema50":round(float(ema50),10) if ema50 is not None else None,
-        "adx_period":14,"adx_min":20.0,"adx14":round(float(adx14),2) if adx14 is not None else None,
-        "rsi_period":14,"rsi_call_max":70.0,"rsi_put_min":30.0,"rsi14":round(float(rsi14),2) if rsi14 is not None else None,
-        "min_body_ratio":0.50,"body_ratio":round(float(body_ratio),4),
-        "support":support,"resistance":resistance,"sr_buffer":sr_buffer,
+        "cross_valid_bars":cross_window,"cross_age_candles":cross_age,"cross_candle":cross_candle,
+        "ema_period":50,"ema_atr_tolerance":0.15,"ema_tolerance":ema_tolerance,"ema50":round(float(ema50),10) if ema50 is not None else None,
+        "adx_period":14,"adx_min":12.0,"adx14":round(float(adx14),2) if adx14 is not None else None,
+        "rsi_period":14,"rsi_call_max":80.0,"rsi_put_min":20.0,"rsi14":round(float(rsi14),2) if rsi14 is not None else None,
+        "min_body_ratio":0.20,"body_ratio":round(float(body_ratio),4),
+        "sr_atr_buffer":0.08,"support":support,"resistance":resistance,"sr_buffer":sr_buffer,
         "near_support":near_support,"near_resistance":near_resistance,
         "raw_cross_direction":raw_direction,"filters_passed":bool(confirmed),"blocked_filters":blocked,
         "zerolag_macd":round(float(macd[-1]),10),"zerolag_signal":round(float(signal_line[-1]),10),"zerolag_gap":round(float(gap_now),10),
-        "event_key":f"FOREXSTAYPRO:{direction}:{rows[-1].get('datetime','')}" if confirmed else None,
+        "event_key":f"FOREXSTAYPRO:{direction}:{cross_candle}" if confirmed else None,
     }
 
 
@@ -17409,7 +17436,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "EURO FX2 • MACD 14/26/9" if engine == "EUROFX2"
                     else "ATE • HARVESTER + ZEROLAG MACD 22/33/9" if engine == "ATE"
                     else "FOREXSTAY SIGHT • ZEROLAG MACD 12/26/9" if engine == "FOREXSTAY"
-                    else "FOREXSTAY PRO • ZEROLAG + EMA50 + ADX14 + RSI14 + S/R" if engine == "FOREXSTAYPRO"
+                    else "FOREXSTAY PRO • ZEROLAG 3 VELAS + EMA50 FLEX + ADX12 + RSI20/80 + S/R LEVE" if engine == "FOREXSTAYPRO"
                     else "FOREX FLEX • FRACTAL CAUSAL" if engine == "FOREXFLEX"
                     else "COMBINER FLOW + RSI" if engine == "COMBINER"
                     else "RSI DIVERGENCE + BOLLINGER 20/2" if engine == "RSIDIVBB"
@@ -21872,7 +21899,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                data["feed_message"] = {"INDICEMENT":"INDICEMENT SMA12/26 usando candles fechados.","GOLDINV":"FOREX GOLD INVESTOR usando PSAR H1 + M15 + M1.","TTMSCALPER":"TTM SCALPER usando confirmação causal de swings.","FOREXMISSION":"FOREX MISSION usando candles fechados.","MONEYARROW":"BINARY MONEYARROW usando pivôs e rejeição em candles fechados.","LIQUIDEX":"LIQUIDEX usando LWMA7 + vela de força fechada.","EUROFX2":"EURO FX2 usando a inclinação do MACD principal 14/26/9 em candles fechados.","ATE":"ATE usando Harvester adaptado + ZeroLag MACD 22/33/9 em candles fechados.","FOREXSTAY":"FOREXSTAY SIGHT usando ZeroLag MACD 12/26/9 em candles fechados.","FOREXSTAYPRO":"FOREXSTAY PRO usando ZeroLag 12/26/9 + EMA50 + ADX14 + RSI14 + filtro S/R em candles fechados.","FOREXFLEX":"FOREX FLEX usando fractal causal totalmente confirmado em candles fechados."}.get(engine, "Motor importado ativo.")
+                data["feed_message"] = {"INDICEMENT":"INDICEMENT SMA12/26 usando candles fechados.","GOLDINV":"FOREX GOLD INVESTOR usando PSAR H1 + M15 + M1.","TTMSCALPER":"TTM SCALPER usando confirmação causal de swings.","FOREXMISSION":"FOREX MISSION usando candles fechados.","MONEYARROW":"BINARY MONEYARROW usando pivôs e rejeição em candles fechados.","LIQUIDEX":"LIQUIDEX usando LWMA7 + vela de força fechada.","EUROFX2":"EURO FX2 usando a inclinação do MACD principal 14/26/9 em candles fechados.","ATE":"ATE usando Harvester adaptado + ZeroLag MACD 22/33/9 em candles fechados.","FOREXSTAY":"FOREXSTAY SIGHT usando ZeroLag MACD 12/26/9 em candles fechados.","FOREXSTAYPRO":"FOREXSTAY PRO usando ZeroLag 12/26/9 com janela de 3 velas + EMA50 flex + ADX14≥12 + RSI20/80 + corpo≥20% + S/R leve.","FOREXFLEX":"FOREX FLEX usando fractal causal totalmente confirmado em candles fechados."}.get(engine, "Motor importado ativo.")
             elif engine == "EA":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -25207,7 +25234,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
   <div class="robot-mode-card" id="forexstayProModeCard">
     <img src="__MEGA_IMAGE__" alt="Forexstay Pro">
-    <div class="robot-mode-copy"><div class="robot-mode-title">🛡️ FOREXSTAY PRO</div><div class="robot-mode-desc" id="forexstayProModeDesc">ZeroLag MACD 12/26/9 + EMA50 + ADX14 ≥ 20 + RSI14 + corpo ≥ 50% + bloqueio S/R • candle fechado • próxima vela • sem Gale.</div></div>
+    <div class="robot-mode-copy"><div class="robot-mode-title">🛡️ FOREXSTAY PRO</div><div class="robot-mode-desc" id="forexstayProModeDesc">ZeroLag 12/26/9 • janela 3 velas • EMA50 flex • ADX14 ≥ 12 • RSI 20/80 • corpo ≥ 20% • S/R leve • próxima vela • sem Gale.</div></div>
     <button id="forexstayProPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
@@ -29623,7 +29650,7 @@ function applyRobotPowerState(){
   if(euroFx2ModeDesc) euroFx2ModeDesc.textContent=euroFx2Enabled?'ONLINE: MACD 14/26/9 principal • virada para cima CALL / virada para baixo PUT • 1 sinal por virada • próxima vela • sem Gale.':'OFFLINE: EURO FX2 pausado.';
   if(ateModeDesc) ateModeDesc.textContent=ateEnabled?'ONLINE: Harvester adaptado + ZeroLag MACD 22/33/9 • nova confluência • candle fechado • próxima vela • sem Gale.':'OFFLINE: ATE pausado.';
   if(forexstayModeDesc) forexstayModeDesc.textContent=forexstayEnabled?'ONLINE: ZeroLag MACD 12/26/9 • novo cruzamento • candle fechado • próxima vela • sem Gale.':'OFFLINE: FOREXSTAY SIGHT pausado.';
-  if(forexstayProModeDesc) forexstayProModeDesc.textContent=forexstayProEnabled?'ONLINE: ZeroLag 12/26/9 + EMA50 + ADX14≥20 + RSI14 + corpo≥50% + S/R • próxima vela • sem Gale.':'OFFLINE: FOREXSTAY PRO pausado.';
+  if(forexstayProModeDesc) forexstayProModeDesc.textContent=forexstayProEnabled?'ONLINE: ZeroLag 12/26/9 • cruzamento válido 3 velas • EMA50 flex • ADX≥12 • RSI20/80 • corpo≥20% • S/R leve • próxima vela • sem Gale.':'OFFLINE: FOREXSTAY PRO pausado.';
   if(forexFlexModeDesc) forexFlexModeDesc.textContent=forexFlexEnabled?'ONLINE: fractal causal confirmado + reação original • candle fechado • próxima vela • sem Gale.':'OFFLINE: FOREX FLEX pausado.';
   if(robotPowerBtn){
     robotPowerBtn.textContent=robotEnabled?'🟢 ONLINE':'🔴 OFFLINE';
@@ -29993,7 +30020,7 @@ function applyRobotPowerState(){
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">👁️ FOREXSTAY SIGHT selecionado • somente novo cruzamento confirmado • sem repetição por vela • sem Gale.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar FOREXSTAY SIGHT ativo • aguardando cruzamento ZeroLag MACD 12/26/9</div>'; rad();
   }else if(engine==='FOREXSTAYPRO'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='FOREXSTAY PRO ONLINE • ZEROLAG + EMA50 + ADX14 + RSI14 + S/R • PRÓXIMA VELA';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='FOREXSTAY PRO ONLINE • ZEROLAG 3 VELAS + EMA50 FLEX + ADX≥12 + RSI20/80 + S/R LEVE • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🛡️ FOREXSTAY PRO selecionado • novo cruzamento + filtros de qualidade • sem repetição • sem Gale.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar FOREXSTAY PRO ativo • aguardando cruzamento com todos os filtros aprovados</div>'; rad();
   }else if(engine==='FOREXFLEX'){
