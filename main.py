@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.13"
-PWA_VERSION = "v172"
+APP_VERSION = "3.96.14"
+PWA_VERSION = "v173"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -10364,15 +10364,21 @@ def euro_fx2_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     fast=_tsz_ema_full(closes,14)
     slow=_tsz_ema_full(closes,26)
     macd=[float(a)-float(b) for a,b in zip(fast,slow)]
-    macd_now=float(macd[-1]); macd_prev=float(macd[-2])
+    macd_now=float(macd[-1]); macd_prev=float(macd[-2]); macd_prev2=float(macd[-3])
     slope=macd_now-macd_prev
+    prev_slope=macd_prev-macd_prev2
 
-    # Period 9 is the original MACD signal period. It is retained as metadata
-    # and for context, but the MQ4 entry condition compares MODE_MAIN only.
+    # O EA original só avalia a direção do MACD para a PRIMEIRA ordem quando
+    # não existe posição aberta. Em binárias não podemos repetir essa primeira
+    # entrada em toda vela. Por isso, liberamos apenas uma NOVA VIRADA da
+    # inclinação do MODE_MAIN: queda->alta = CALL; alta->queda = PUT.
+    # Isso preserva os dois lados do núcleo sem empilhar CALL/PUT a cada candle.
     signal_line=_tsz_ema_full(macd,9)
     signal_now=float(signal_line[-1]) if signal_line else 0.0
 
-    direction="CALL" if slope>0 else ("PUT" if slope<0 else "NEUTRO")
+    fresh_call=(slope>0.0 and prev_slope<=0.0)
+    fresh_put=(slope<0.0 and prev_slope>=0.0)
+    direction="CALL" if fresh_call else ("PUT" if fresh_put else "NEUTRO")
     confirmed=direction in ("CALL","PUT")
     recent_changes=[abs(macd[i]-macd[i-1]) for i in range(max(1,len(macd)-12),len(macd))]
     avg_change=(sum(recent_changes)/len(recent_changes)) if recent_changes else 0.0
@@ -10380,9 +10386,16 @@ def euro_fx2_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     confidence=(min(91.0,80.0+min(11.0,strength*4.0)) if confirmed else 0.0)
 
     if confirmed:
-        reason=(f"{direction} EURO FX2 confirmado • MACD 14/26/9 principal "
-                f"{'subiu' if direction=='CALL' else 'caiu'} de {macd_prev:.10g} para {macd_now:.10g} • "
-                "candle fechado • entrada na próxima vela • sem Grid/Martingale/Gale.")
+        turn_label="virou de queda para alta" if direction=="CALL" else "virou de alta para queda"
+        reason=(f"{direction} EURO FX2 confirmado • MACD 14/26/9 principal {turn_label} • "
+                f"inclinação {prev_slope:.10g} → {slope:.10g} • "
+                "candle fechado • entrada na próxima vela • 1 sinal por virada • sem Grid/Martingale/Gale.")
+    elif slope>0.0:
+        reason=("EURO FX2 monitorando • MACD principal continua subindo, mas não repete CALL. "
+                "Aguardando uma nova virada de direção.")
+    elif slope<0.0:
+        reason=("EURO FX2 monitorando • MACD principal continua caindo, mas não repete PUT. "
+                "Aguardando uma nova virada de direção.")
     else:
         reason="EURO FX2 monitorando • MACD principal 14/26/9 sem variação no último candle fechado."
 
@@ -10392,9 +10405,12 @@ def euro_fx2_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         "engine":"EUROFX2","provider":"LOCAL_EURO_FX2_MACD","reason":reason,
         "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
         "gale_signal":False,"grid":False,"martingale":False,"direct_win_only":True,
+        "one_signal_per_turn":True,
         "macd_fast":14,"macd_slow":26,"macd_signal":9,
         "macd_main":round(macd_now,10),"macd_main_prev":round(macd_prev,10),
+        "macd_main_prev2":round(macd_prev2,10),
         "macd_signal_line":round(signal_now,10),"macd_slope":round(slope,10),
+        "macd_prev_slope":round(prev_slope,10),
         "original_max_trades":4,"original_pips":5,"original_take_profit":40,"original_trailing_stop":20,
         "event_key":f"EUROFX2:{direction}:{rows[-1].get('datetime','')}" if confirmed else None,
     }
@@ -17591,7 +17607,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM"):
+                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "EUROFX2"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -24704,7 +24720,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
   <div class="robot-mode-card" id="euroFx2ModeCard">
     <img src="__MEGA_IMAGE__" alt="Euro FX2">
-    <div class="robot-mode-copy"><div class="robot-mode-title">💶 EURO FX2</div><div class="robot-mode-desc" id="euroFx2ModeDesc">MACD 14/26/9 principal • subindo CALL / caindo PUT • candle fechado • próxima vela • sem Grid/Martingale/Gale.</div></div>
+    <div class="robot-mode-copy"><div class="robot-mode-title">💶 EURO FX2</div><div class="robot-mode-desc" id="euroFx2ModeDesc">MACD 14/26/9 principal • CALL na virada para cima / PUT na virada para baixo • 1 sinal por virada • próxima vela • sem Grid/Martingale/Gale.</div></div>
     <button id="euroFx2PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
@@ -29075,7 +29091,7 @@ function applyRobotPowerState(){
   if(forexMissionModeDesc) forexMissionModeDesc.textContent=forexMissionEnabled?'ONLINE: Piano + Violin + Cello • consenso 2/3 • próxima vela • sem Grid/Martingale/Gale.':'OFFLINE: FOREX MISSION pausado.';
   if(moneyArrowModeDesc) moneyArrowModeDesc.textContent=moneyArrowEnabled?'ONLINE: pivôs S/R + rejeição de pavio • próxima vela • sem Gale.':'OFFLINE: BINARY MONEYARROW pausado.';
   if(liquidexModeDesc) liquidexModeDesc.textContent=liquidexEnabled?'ONLINE: LWMA7 + corpo mínimo 10 pips • candle fechado • próxima vela • sem Gale.':'OFFLINE: LIQUIDEX pausado.';
-  if(euroFx2ModeDesc) euroFx2ModeDesc.textContent=euroFx2Enabled?'ONLINE: MACD 14/26/9 principal • subindo CALL / caindo PUT • candle fechado • próxima vela • sem Gale.':'OFFLINE: EURO FX2 pausado.';
+  if(euroFx2ModeDesc) euroFx2ModeDesc.textContent=euroFx2Enabled?'ONLINE: MACD 14/26/9 principal • virada para cima CALL / virada para baixo PUT • 1 sinal por virada • próxima vela • sem Gale.':'OFFLINE: EURO FX2 pausado.';
   if(robotPowerBtn){
     robotPowerBtn.textContent=robotEnabled?'🟢 ONLINE':'🔴 OFFLINE';
     robotPowerBtn.style.background=robotEnabled?'#0b7a3d':'#7d1d1d';
@@ -29432,9 +29448,9 @@ function applyRobotPowerState(){
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">💧 LIQUIDEX selecionado • candle fechado acima/abaixo da LWMA7 com corpo mínimo de 10 pips.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar LIQUIDEX ativo • procurando vela de força alinhada à LWMA7</div>'; rad();
   }else if(engine==='EUROFX2'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EURO FX2 ONLINE • MACD 14/26/9 • SUBINDO CALL / CAINDO PUT • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">💶 EURO FX2 selecionado • direção pela inclinação do MACD principal 14/26/9 no último candle fechado • sem Grid/Martingale/Gale.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar EURO FX2 ativo • acompanhando a direção do MACD 14/26/9</div>'; rad();
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='EURO FX2 ONLINE • MACD 14/26/9 • 1 SINAL POR VIRADA • CALL↗ / PUT↘ • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">💶 EURO FX2 selecionado • CALL só na virada queda→alta e PUT só na virada alta→queda do MACD principal 14/26/9 • sem repetição em cada vela • sem Gale.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar EURO FX2 ativo • aguardando nova virada do MACD 14/26/9</div>'; rad();
   }else if(engine==='ALPHAX'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ALPHAX RELAY ONLINE • MOTOR PRINCIPAL • SINAL ~30S ANTES • PRÓXIMA VELA • SEM GALE';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧬 AlphaX selecionado • estratégia original preservada e isolada.</div>';
