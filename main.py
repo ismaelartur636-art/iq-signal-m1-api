@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.20"
+APP_VERSION = "3.96.21"
 PWA_VERSION = "v173"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -14257,28 +14257,25 @@ def _smart_trend_filter(cs):
         }
 
 
-def _smart_chart_confluence(cs, interval="1min", h1_filter=None, trend_filter=None, candle_pattern_filter=None):
-    """Leitura do gráfico equivalente à análise visual feita a partir de uma imagem.
+def _ebook_graphical_reading(cs, interval="1min", h1_filter=None, trend_filter=None):
+    """Núcleo TECHNICAL + GRAPHICAL inspirado no e-book enviado pelo usuário.
 
-    Conflui seis blocos usando somente dados disponíveis/fechados:
-      1) estrutura (HH/HL ou LH/LL),
-      2) suporte/resistência e localização do preço,
-      3) price action/padrões de vela,
-      4) força/momentum das últimas velas,
-      5) volume + POC (quando a fonte tem volume utilizável),
-      6) Trend Filter.
+    Filosofia para a IA LEITURA DO GRÁFICO:
+      * padrões/rompimentos são GATILHOS independentes;
+      * indicadores, S/R, tendência e volume são confirmações LEVES;
+      * não exige que todos os filtros concordem para liberar um candidato;
+      * usa somente candles fechados e mira a próxima vela.
 
-    Nenhum bloco isolado libera sinal. O retorno apenas cria o candidato que a IA
-    externa ainda precisa confirmar para a próxima vela. Sem confluência mínima,
-    a direção fica NEUTRO.
+    O motor não tenta reproduzir desenhos perfeitos. Ele converte as definições
+    objetivas do material (velas, MACD/RSI, Bollinger, Ichimoku, VWAP, pivôs,
+    suporte/resistência e padrões gráficos) em regras mensuráveis.
     """
     rows = list(cs or [])
-    if len(rows) < 30:
+    if len(rows) < 24:
         return {
             "ready": False, "confirmed": False, "direction": "NEUTRO",
-            "confidence": 0.0, "call_score": 0.0, "put_score": 0.0,
-            "reason": f"Leitura visual aguardando candles fechados ({len(rows)}/30).",
-            "layers": {}, "min_score": 5.0, "min_edge": 1.5,
+            "confidence": 0.0, "reason": f"EBOOK aguardando candles fechados ({len(rows)}/24).",
+            "triggers": [], "confirmations": [], "indicators": {}, "patterns": [],
         }
 
     def fv(row, key, default=0.0):
@@ -14287,186 +14284,500 @@ def _smart_chart_confluence(cs, interval="1min", h1_filter=None, trend_filter=No
         except Exception:
             return float(default)
 
-    call = 0.0
-    put = 0.0
-    call_reasons = []
-    put_reasons = []
-    layers = {}
+    def candle(row):
+        o, h, l, c = fv(row, "open"), fv(row, "high"), fv(row, "low"), fv(row, "close")
+        rng = max(h - l, 1e-12)
+        body = abs(c - o)
+        return {
+            "o": o, "h": h, "l": l, "c": c, "range": rng, "body": body,
+            "body_ratio": body / rng,
+            "upper": max(h - max(o, c), 0.0) / rng,
+            "lower": max(min(o, c) - l, 0.0) / rng,
+            "bull": c > o, "bear": c < o,
+        }
 
-    # 1) Estrutura recente: compara dois blocos iguais para detectar HH/HL ou LH/LL.
-    prev = rows[-12:-6]
-    cur = rows[-6:]
-    prev_hi = max(fv(x, "high") for x in prev)
-    prev_lo = min(fv(x, "low") for x in prev)
-    cur_hi = max(fv(x, "high") for x in cur)
-    cur_lo = min(fv(x, "low") for x in cur)
-    structure_dir = "NEUTRO"
-    if cur_hi > prev_hi and cur_lo > prev_lo:
-        structure_dir = "CALL"; call += 2.0; call_reasons.append("estrutura HH/HL")
-    elif cur_hi < prev_hi and cur_lo < prev_lo:
-        structure_dir = "PUT"; put += 2.0; put_reasons.append("estrutura LH/LL")
-    layers["structure"] = {
-        "direction": structure_dir,
-        "previous_high": prev_hi, "previous_low": prev_lo,
-        "current_high": cur_hi, "current_low": cur_lo,
-    }
+    closes = [fv(x, "close") for x in rows]
+    highs = [fv(x, "high") for x in rows]
+    lows = [fv(x, "low") for x in rows]
+    last = candle(rows[-1])
+    prev = candle(rows[-2])
+    avg_range = sum(max(fv(x, "high") - fv(x, "low"), 1e-12) for x in rows[-20:]) / min(20, len(rows))
+    recent_move = closes[-1] - closes[-6] if len(closes) >= 6 else 0.0
 
-    # 2) Suporte/resistência: H1 tem prioridade; sem toque H1, usa localização no range local.
+    triggers = []
+    confirmations = []
+    indicators = {}
+    patterns = []
+    call_trigger = 0.0
+    put_trigger = 0.0
+    call_confirm = 0.0
+    put_confirm = 0.0
+
+    def add_trigger(direction, name, weight, setup, reason):
+        nonlocal call_trigger, put_trigger
+        item = {"direction": direction, "name": name, "weight": round(float(weight), 2), "setup": setup, "reason": reason}
+        triggers.append(item)
+        patterns.append(name)
+        if direction == "CALL":
+            call_trigger += float(weight)
+        elif direction == "PUT":
+            put_trigger += float(weight)
+
+    def add_confirm(direction, name, weight, reason):
+        nonlocal call_confirm, put_confirm
+        confirmations.append({"direction": direction, "name": name, "weight": round(float(weight), 2), "reason": reason})
+        if direction == "CALL":
+            call_confirm += float(weight)
+        elif direction == "PUT":
+            put_confirm += float(weight)
+
+    # ------------------------------------------------------------------
+    # 1) PADRÕES DE VELA — gatilhos independentes
+    # ------------------------------------------------------------------
+    down_context = recent_move < -0.45 * avg_range
+    up_context = recent_move > 0.45 * avg_range
+
+    # Engolfo de alta / baixa.
+    if prev["bear"] and last["bull"] and last["o"] <= prev["c"] and last["c"] >= prev["o"] and last["body"] >= prev["body"] * 0.95:
+        add_trigger("CALL", "ENGOLFO DE ALTA", 3.2, "REVERSAL", "vela de alta engoliu o corpo da vela de baixa anterior")
+    if prev["bull"] and last["bear"] and last["o"] >= prev["c"] and last["c"] <= prev["o"] and last["body"] >= prev["body"] * 0.95:
+        add_trigger("PUT", "ENGOLFO DE BAIXA", 3.2, "REVERSAL", "vela de baixa engoliu o corpo da vela de alta anterior")
+
+    # Martelo / homem enforcado / estrela cadente.
+    small_body = last["body_ratio"] <= 0.38
+    hammer_shape = small_body and last["lower"] >= 0.52 and last["upper"] <= 0.18
+    shooting_shape = small_body and last["upper"] >= 0.52 and last["lower"] <= 0.18
+    if hammer_shape and down_context:
+        add_trigger("CALL", "MARTELO", 3.0, "REJECTION", "corpo pequeno, pavio inferior longo e contexto de queda")
+    elif hammer_shape and up_context:
+        add_trigger("PUT", "HOMEM ENFORCADO", 2.8, "REVERSAL", "formato de martelo após avanço do preço")
+    if shooting_shape and up_context:
+        add_trigger("PUT", "ESTRELA CADENTE", 3.0, "REJECTION", "corpo pequeno, pavio superior longo e contexto de alta")
+
+    # Morning Star / Evening Star.
+    if len(rows) >= 3:
+        a, b, cc = candle(rows[-3]), candle(rows[-2]), candle(rows[-1])
+        a_long = a["body_ratio"] >= 0.55
+        b_small = b["body_ratio"] <= 0.34
+        cc_long = cc["body_ratio"] >= 0.50
+        midpoint_a = (a["o"] + a["c"]) / 2.0
+        if a["bear"] and a_long and b_small and cc["bull"] and cc_long and cc["c"] > midpoint_a:
+            add_trigger("CALL", "ESTRELA DA MANHÃ", 3.4, "REVERSAL", "padrão de três velas com confirmação compradora")
+        if a["bull"] and a_long and b_small and cc["bear"] and cc_long and cc["c"] < midpoint_a:
+            add_trigger("PUT", "ESTRELA DA TARDE", 3.4, "REVERSAL", "padrão de três velas com confirmação vendedora")
+
+    # Três soldados brancos / três corvos negros.
+    if len(rows) >= 3:
+        trio = [candle(x) for x in rows[-3:]]
+        if all(x["bull"] and x["body_ratio"] >= 0.50 for x in trio) and trio[1]["c"] > trio[0]["c"] and trio[2]["c"] > trio[1]["c"]:
+            add_trigger("CALL", "TRÊS SOLDADOS BRANCOS", 3.5, "REVERSAL", "três velas compradoras longas com fechamentos progressivos")
+        if all(x["bear"] and x["body_ratio"] >= 0.50 for x in trio) and trio[1]["c"] < trio[0]["c"] and trio[2]["c"] < trio[1]["c"]:
+            add_trigger("PUT", "TRÊS CORVOS NEGROS", 3.5, "REVERSAL", "três velas vendedoras longas com fechamentos progressivos")
+
+    # Doji / Spinning Top: indecisão. Não dispara direção; reduz a qualidade quando isolado.
+    doji = last["body_ratio"] <= 0.08
+    spinning = (0.08 < last["body_ratio"] <= 0.28 and last["upper"] >= 0.22 and last["lower"] >= 0.22)
+    if doji:
+        patterns.append("DOJI / INDECISÃO")
+    elif spinning:
+        patterns.append("SPINNING TOP / INDECISÃO")
+
+    # ------------------------------------------------------------------
+    # 2) SUPORTE/RESISTÊNCIA + BREAK/BOUNCE — gatilhos independentes
+    # ------------------------------------------------------------------
+    base = rows[-26:-1] if len(rows) >= 27 else rows[:-1]
+    if len(base) >= 10:
+        local_res = max(fv(x, "high") for x in base)
+        local_sup = min(fv(x, "low") for x in base)
+        tol = max(avg_range * 0.22, abs(closes[-1]) * 0.00005)
+        # Break: fechamento atravessando a zona com corpo utilizável.
+        if last["c"] > local_res + tol * 0.10 and last["body_ratio"] >= 0.42:
+            add_trigger("CALL", "ROMPIMENTO DE RESISTÊNCIA", 3.3, "BREAKOUT", "fechamento rompeu resistência local com deslocamento")
+        if last["c"] < local_sup - tol * 0.10 and last["body_ratio"] >= 0.42:
+            add_trigger("PUT", "ROMPIMENTO DE SUPORTE", 3.3, "BREAKOUT", "fechamento rompeu suporte local com deslocamento")
+        # Bounce/rejeição: toca a área e fecha de volta para dentro.
+        if last["l"] <= local_sup + tol and last["c"] > local_sup and last["lower"] >= 0.38:
+            add_trigger("CALL", "BOUNCE NO SUPORTE", 3.0, "REJECTION", "toque/rejeição na região de suporte")
+        if last["h"] >= local_res - tol and last["c"] < local_res and last["upper"] >= 0.38:
+            add_trigger("PUT", "BOUNCE NA RESISTÊNCIA", 3.0, "REJECTION", "toque/rejeição na região de resistência")
+        indicators["local_sr"] = {"support": local_sup, "resistance": local_res, "tolerance": tol}
+
+    # H1 entra como reforço, nunca como obrigação.
     h1 = dict(h1_filter or {})
     region = str(h1.get("region") or "UNAVAILABLE").upper()
-    sr_dir = "NEUTRO"
     if region == "SUPPORT":
-        sr_dir = "CALL"; call += 2.0; call_reasons.append("suporte H1")
+        add_confirm("CALL", "SUPORTE H1", 0.9, "preço está em região de suporte H1")
     elif region == "RESISTANCE":
-        sr_dir = "PUT"; put += 2.0; put_reasons.append("resistência H1")
-    elif region == "CONFLICT":
-        call += 0.25; put += 0.25
+        add_confirm("PUT", "RESISTÊNCIA H1", 0.9, "preço está em região de resistência H1")
+    indicators["h1_region"] = region
 
-    recent20 = rows[-20:]
-    local_hi = max(fv(x, "high") for x in recent20)
-    local_lo = min(fv(x, "low") for x in recent20)
-    last = rows[-1]
-    close = fv(last, "close")
-    local_pos = (close - local_lo) / max(local_hi - local_lo, 1e-12)
-    if sr_dir == "NEUTRO":
-        if local_pos <= 0.22:
-            sr_dir = "CALL"; call += 1.0; call_reasons.append("preço em zona baixa do range")
-        elif local_pos >= 0.78:
-            sr_dir = "PUT"; put += 1.0; put_reasons.append("preço em zona alta do range")
-    layers["support_resistance"] = {
-        "direction": sr_dir, "h1_region": region,
-        "local_position": round(local_pos, 3),
-        "local_low": local_lo, "local_high": local_hi,
-        "support": h1.get("support"), "resistance": h1.get("resistance"),
-    }
+    # ------------------------------------------------------------------
+    # 3) PADRÕES GRÁFICOS — gatilhos somente quando há confirmação/rompimento
+    # ------------------------------------------------------------------
+    sample = rows[-46:]
+    if len(sample) >= 24:
+        sr = [candle(x) for x in sample]
+        # pivôs simples para Double Top/Bottom e Head & Shoulders.
+        ph = []
+        pl = []
+        for i in range(2, len(sr)-2):
+            if sr[i]["h"] >= sr[i-1]["h"] and sr[i]["h"] >= sr[i+1]["h"]:
+                ph.append((i, sr[i]["h"]))
+            if sr[i]["l"] <= sr[i-1]["l"] and sr[i]["l"] <= sr[i+1]["l"]:
+                pl.append((i, sr[i]["l"]))
+        tol_pat = max(avg_range * 0.55, abs(closes[-1]) * 0.00012)
 
-    # 3) Price action: padrão forte já calculado pelo motor + rejeição da última vela.
-    pattern = dict(candle_pattern_filter or {})
-    pa_dir = str(pattern.get("direction") or "NEUTRO").upper() if pattern.get("passed") else "NEUTRO"
-    if pa_dir == "CALL":
-        call += 2.0; call_reasons.append("price action comprador")
-    elif pa_dir == "PUT":
-        put += 2.0; put_reasons.append("price action vendedor")
+        # Double Top / Double Bottom com quebra de neckline.
+        if len(ph) >= 2:
+            p1, p2 = ph[-2], ph[-1]
+            if p2[0] - p1[0] >= 4 and abs(p2[1] - p1[1]) <= tol_pat:
+                valley = min(sr[j]["l"] for j in range(p1[0]+1, p2[0])) if p2[0] > p1[0] + 1 else None
+                if valley is not None and last["c"] < valley:
+                    add_trigger("PUT", "DOUBLE TOP", 3.5, "REVERSAL", "dois topos próximos e quebra da neckline/suporte")
+        if len(pl) >= 2:
+            p1, p2 = pl[-2], pl[-1]
+            if p2[0] - p1[0] >= 4 and abs(p2[1] - p1[1]) <= tol_pat:
+                neck = max(sr[j]["h"] for j in range(p1[0]+1, p2[0])) if p2[0] > p1[0] + 1 else None
+                if neck is not None and last["c"] > neck:
+                    add_trigger("CALL", "DOUBLE BOTTOM", 3.5, "REVERSAL", "dois fundos próximos e quebra da neckline/resistência")
 
-    o = fv(last, "open"); h = fv(last, "high"); l = fv(last, "low"); c = close
-    rng = max(h - l, 1e-12)
-    body_ratio = abs(c - o) / rng
-    lower_wick = max(min(o, c) - l, 0.0) / rng
-    upper_wick = max(h - max(o, c), 0.0) / rng
-    if lower_wick >= 0.45 and c >= o and local_pos <= 0.40:
-        call += 1.0; call_reasons.append("rejeição inferior")
-        if pa_dir == "NEUTRO": pa_dir = "CALL"
-    if upper_wick >= 0.45 and c <= o and local_pos >= 0.60:
-        put += 1.0; put_reasons.append("rejeição superior")
-        if pa_dir == "NEUTRO": pa_dir = "PUT"
-    layers["price_action"] = {
-        "direction": pa_dir, "patterns": pattern.get("patterns", []),
-        "body_ratio": round(body_ratio, 3),
-        "lower_wick_ratio": round(lower_wick, 3),
-        "upper_wick_ratio": round(upper_wick, 3),
-    }
+        # Head & Shoulders / inverso: três pivôs com cabeça central destacada + neckline rompida.
+        if len(ph) >= 3:
+            a, b, ccx = ph[-3], ph[-2], ph[-1]
+            shoulders_close = abs(a[1] - ccx[1]) <= tol_pat * 1.35
+            head_high = b[1] > max(a[1], ccx[1]) + tol_pat * 0.35
+            if shoulders_close and head_high and a[0] < b[0] < ccx[0]:
+                left_valley = min(sr[j]["l"] for j in range(a[0]+1, b[0])) if b[0] > a[0]+1 else None
+                right_valley = min(sr[j]["l"] for j in range(b[0]+1, ccx[0])) if ccx[0] > b[0]+1 else None
+                neck = max(left_valley or 0.0, right_valley or 0.0)
+                if neck > 0 and last["c"] < neck:
+                    add_trigger("PUT", "CABEÇA E OMBROS", 3.6, "REVERSAL", "três topos com cabeça central e quebra da neckline")
+        if len(pl) >= 3:
+            a, b, ccx = pl[-3], pl[-2], pl[-1]
+            shoulders_close = abs(a[1] - ccx[1]) <= tol_pat * 1.35
+            head_low = b[1] < min(a[1], ccx[1]) - tol_pat * 0.35
+            if shoulders_close and head_low and a[0] < b[0] < ccx[0]:
+                left_peak = max(sr[j]["h"] for j in range(a[0]+1, b[0])) if b[0] > a[0]+1 else None
+                right_peak = max(sr[j]["h"] for j in range(b[0]+1, ccx[0])) if ccx[0] > b[0]+1 else None
+                neck = min(left_peak or 1e99, right_peak or 1e99)
+                if neck < 1e98 and last["c"] > neck:
+                    add_trigger("CALL", "CABEÇA E OMBROS INVERSO", 3.6, "REVERSAL", "três fundos com cabeça central e quebra da neckline")
 
-    # 4) Força/momentum: deslocamento curto, predominância e corpo da última vela.
-    last14 = rows[-14:]
-    avg_range = sum(max(fv(x, "high") - fv(x, "low"), 1e-12) for x in last14) / len(last14)
-    closes = [fv(x, "close") for x in rows[-7:]]
-    opens6 = [fv(x, "open") for x in rows[-6:]]
-    closes6 = [fv(x, "close") for x in rows[-6:]]
-    move3 = (closes[-1] - closes[-4]) / max(avg_range, 1e-12)
-    bulls = sum(1 for oo, cc in zip(opens6, closes6) if cc > oo)
-    bears = sum(1 for oo, cc in zip(opens6, closes6) if cc < oo)
-    momentum_dir = "NEUTRO"
-    if move3 >= 0.55 and bulls >= 3:
-        momentum_dir = "CALL"; call += 2.0; call_reasons.append("força/momentum comprador")
-    elif move3 <= -0.55 and bears >= 3:
-        momentum_dir = "PUT"; put += 2.0; put_reasons.append("força/momentum vendedor")
-    elif body_ratio >= 0.58:
-        if c > o:
-            momentum_dir = "CALL"; call += 1.0; call_reasons.append("vela de força compradora")
-        elif c < o:
-            momentum_dir = "PUT"; put += 1.0; put_reasons.append("vela de força vendedora")
-    layers["momentum"] = {
-        "direction": momentum_dir, "move_3_ranges": round(move3, 3),
-        "bull_count_6": bulls, "bear_count_6": bears,
-        "avg_range": avg_range,
-    }
+        # Triângulos: duas metades para estimar compressão; último candle confirma ruptura.
+        pre = sr[-21:-1]
+        if len(pre) >= 16:
+            half = len(pre)//2
+            p1, p2 = pre[:half], pre[half:]
+            hi1, hi2 = max(x["h"] for x in p1), max(x["h"] for x in p2)
+            lo1, lo2 = min(x["l"] for x in p1), min(x["l"] for x in p2)
+            flat_tol = avg_range * 0.45
+            asc = abs(hi2-hi1) <= flat_tol and lo2 > lo1 + avg_range*0.25
+            desc = abs(lo2-lo1) <= flat_tol and hi2 < hi1 - avg_range*0.25
+            sym = hi2 < hi1 - avg_range*0.20 and lo2 > lo1 + avg_range*0.20
+            top_level = max(x["h"] for x in pre[-8:])
+            bot_level = min(x["l"] for x in pre[-8:])
+            if asc and last["c"] > top_level:
+                add_trigger("CALL", "TRIÂNGULO ASCENDENTE", 3.2, "BREAKOUT", "compressão com suporte ascendente e rompimento superior")
+            if desc and last["c"] < bot_level:
+                add_trigger("PUT", "TRIÂNGULO DESCENDENTE", 3.2, "BREAKOUT", "compressão com resistência descendente e rompimento inferior")
+            if sym:
+                if last["c"] > top_level:
+                    add_trigger("CALL", "TRIÂNGULO SIMÉTRICO", 3.0, "BREAKOUT", "compressão bilateral rompeu para cima")
+                elif last["c"] < bot_level:
+                    add_trigger("PUT", "TRIÂNGULO SIMÉTRICO", 3.0, "BREAKOUT", "compressão bilateral rompeu para baixo")
 
-    # 5) Volume + POC: é confirmação, não gatilho obrigatório quando a fonte não tem volume.
-    profile = _volume_poc_profile(rows[-VOLUME_POC_LOOKBACK:])
-    volume_dir = "NEUTRO"
-    volume_available = bool(profile and float(profile.get("volume_coverage") or 0.0) >= VOLUME_POC_MIN_VOLUME_COVERAGE)
-    dcur, vcur, dr = _volume_poc_bar_delta(last)
-    prev_vols = [_volume_poc_volume(x) for x in rows[-11:-1]]
-    prev_pos_vols = [x for x in prev_vols if x > 0]
-    vma = (sum(prev_pos_vols) / len(prev_pos_vols)) if prev_pos_vols else 0.0
-    vratio = (vcur / vma) if vma > 0 else 0.0
-    if volume_available:
-        poc = float(profile.get("poc") or close)
-        if close >= poc and dr >= 0.08:
-            volume_dir = "CALL"; call += 1.25; call_reasons.append("volume/POC comprador")
-        elif close <= poc and dr <= -0.08:
-            volume_dir = "PUT"; put += 1.25; put_reasons.append("volume/POC vendedor")
-        if vratio >= 1.35 and body_ratio >= 0.50:
-            if c > o:
-                call += 0.75; call_reasons.append("volume confirma vela de força")
-            elif c < o:
-                put += 0.75; put_reasons.append("volume confirma vela de força")
-    layers["volume_poc"] = {
-        "available": volume_available, "direction": volume_dir,
-        "poc": (float(profile.get("poc")) if profile else None),
-        "delta_ratio": round(float(dr), 3), "volume_ratio": round(float(vratio), 3),
-        "coverage": round(float(profile.get("volume_coverage") or 0.0), 3) if profile else 0.0,
-    }
+        # Flag simples: impulso + consolidação estreita + rompimento na direção do impulso.
+        if len(sr) >= 14:
+            impulse = sr[-14:-6]
+            cons = sr[-6:-1]
+            impulse_move = impulse[-1]["c"] - impulse[0]["o"]
+            cons_hi = max(x["h"] for x in cons); cons_lo = min(x["l"] for x in cons)
+            cons_width = cons_hi - cons_lo
+            if impulse_move >= 2.0 * avg_range and cons_width <= 1.7 * avg_range and last["c"] > cons_hi:
+                add_trigger("CALL", "BANDEIRA DE ALTA", 3.0, "BREAKOUT", "impulso comprador, consolidação e rompimento na direção inicial")
+            if impulse_move <= -2.0 * avg_range and cons_width <= 1.7 * avg_range and last["c"] < cons_lo:
+                add_trigger("PUT", "BANDEIRA DE BAIXA", 3.0, "BREAKOUT", "impulso vendedor, consolidação e rompimento na direção inicial")
 
-    # 6) Trend Filter: obrigatório para o motor SMART e vale como uma camada forte.
+    # ------------------------------------------------------------------
+    # 4) INDICADORES DO E-BOOK — confirmações leves; MACD cross pode iniciar candidato
+    # ------------------------------------------------------------------
+    macd = _macd_snapshot(closes, 12, 26, 9)
+    if macd:
+        indicators["macd"] = {k: (round(float(v), 8) if isinstance(v, (int, float)) and not isinstance(v, bool) else v) for k, v in macd.items()}
+        if macd.get("cross_up"):
+            add_trigger("CALL", "MACD CROSS UP", 2.7, "TREND", "MACD cruzou acima da linha de sinal")
+        elif macd.get("cross_down"):
+            add_trigger("PUT", "MACD CROSS DOWN", 2.7, "TREND", "MACD cruzou abaixo da linha de sinal")
+        elif float(macd.get("macd") or 0.0) > 0:
+            add_confirm("CALL", "MACD > 0", 0.65, "MACD permanece acima de zero")
+        elif float(macd.get("macd") or 0.0) < 0:
+            add_confirm("PUT", "MACD < 0", 0.65, "MACD permanece abaixo de zero")
+
+    rsi14 = rsi(closes, 14)
+    indicators["rsi14"] = round(float(rsi14), 2) if rsi14 is not None else None
+    if rsi14 is not None:
+        if rsi14 <= 30:
+            add_confirm("CALL", "RSI SOBREVENDA", 0.9, "RSI14 abaixo/igual a 30")
+        elif rsi14 >= 70:
+            add_confirm("PUT", "RSI SOBRECOMPRA", 0.9, "RSI14 acima/igual a 70")
+        elif rsi14 >= 54:
+            add_confirm("CALL", "RSI MOMENTO", 0.35, "RSI14 mantém momento comprador")
+        elif rsi14 <= 46:
+            add_confirm("PUT", "RSI MOMENTO", 0.35, "RSI14 mantém momento vendedor")
+
+    bb = bollinger(closes, 20, 2.0)
+    if bb:
+        indicators["bollinger"] = {k: round(float(v), 8) for k, v in bb.items()}
+        if last["c"] > bb["upper"] and last["body_ratio"] >= 0.42:
+            add_trigger("CALL", "BOLLINGER BREAKOUT", 2.6, "BREAKOUT", "fechamento rompeu a banda superior")
+        elif last["c"] < bb["lower"] and last["body_ratio"] >= 0.42:
+            add_trigger("PUT", "BOLLINGER BREAKOUT", 2.6, "BREAKOUT", "fechamento rompeu a banda inferior")
+        elif last["c"] >= bb["middle"]:
+            add_confirm("CALL", "BOLLINGER MEIO", 0.3, "preço acima da média central das bandas")
+        else:
+            add_confirm("PUT", "BOLLINGER MEIO", 0.3, "preço abaixo da média central das bandas")
+
+    # Ichimoku simplificado conforme períodos 9/26/52 descritos no material.
+    if len(rows) >= 52:
+        def mid_hl(period):
+            w = rows[-period:]
+            return (max(fv(x, "high") for x in w) + min(fv(x, "low") for x in w)) / 2.0
+        tenkan = mid_hl(9); kijun = mid_hl(26); span_a = (tenkan + kijun) / 2.0; span_b = mid_hl(52)
+        cloud_top, cloud_bottom = max(span_a, span_b), min(span_a, span_b)
+        ich_dir = "CALL" if last["c"] > cloud_top else ("PUT" if last["c"] < cloud_bottom else "NEUTRO")
+        indicators["ichimoku"] = {"tenkan": tenkan, "kijun": kijun, "span_a": span_a, "span_b": span_b, "direction": ich_dir}
+        if ich_dir == "CALL": add_confirm("CALL", "ICHIMOKU ACIMA DA NUVEM", 0.7, "preço acima da nuvem")
+        elif ich_dir == "PUT": add_confirm("PUT", "ICHIMOKU ABAIXO DA NUVEM", 0.7, "preço abaixo da nuvem")
+
+    # VWAP intradiário: só usa quando há volume real suficiente.
+    vrows = rows[-40:]
+    vols = [max(0.0, fv(x, "volume")) for x in vrows]
+    coverage = sum(1 for v in vols if v > 0) / max(len(vols), 1)
+    if coverage >= 0.60 and sum(vols) > 0:
+        pv = 0.0; vv = 0.0
+        for x, v in zip(vrows, vols):
+            if v <= 0: continue
+            typical = (fv(x, "high") + fv(x, "low") + fv(x, "close")) / 3.0
+            pv += typical * v; vv += v
+        vwap = pv / max(vv, 1e-12)
+        indicators["vwap"] = {"value": vwap, "coverage": round(coverage, 3)}
+        if last["c"] > vwap: add_confirm("CALL", "VWAP", 0.55, "preço fechado acima do VWAP")
+        elif last["c"] < vwap: add_confirm("PUT", "VWAP", 0.55, "preço fechado abaixo do VWAP")
+    else:
+        indicators["vwap"] = {"value": None, "coverage": round(coverage, 3)}
+
+    # Pivot Points clássicos quando o histórico contém um dia anterior completo.
+    def row_date(row):
+        raw = str(row.get("datetime") or "")
+        if not raw: return None
+        try:
+            cleaned = raw.replace("Z", "+00:00")
+            return datetime.fromisoformat(cleaned).date()
+        except Exception:
+            return raw[:10] if len(raw) >= 10 else None
+    dates = [row_date(x) for x in rows]
+    current_date = dates[-1] if dates else None
+    prior_dates = [d for d in dates if d and d != current_date]
+    if prior_dates:
+        prior_date = prior_dates[-1]
+        day_rows = [x for x, d in zip(rows, dates) if d == prior_date]
+        if day_rows:
+            dh = max(fv(x, "high") for x in day_rows); dl = min(fv(x, "low") for x in day_rows); dc = fv(day_rows[-1], "close")
+            p = (dh + dl + dc) / 3.0
+            r1 = 2*p - dl; s1 = 2*p - dh; r2 = p + (dh-dl); s2 = p - (dh-dl); r3 = dh + 2*(p-dl); s3 = dl - 2*(dh-p)
+            indicators["pivot_points"] = {"P": p, "R1": r1, "R2": r2, "R3": r3, "S1": s1, "S2": s2, "S3": s3, "source_date": str(prior_date)}
+            if last["c"] > p: add_confirm("CALL", "PIVOT P", 0.35, "preço acima do pivô central")
+            elif last["c"] < p: add_confirm("PUT", "PIVOT P", 0.35, "preço abaixo do pivô central")
+
+    # Trend Filter vira confirmação leve, não autorização obrigatória.
     tf = dict(trend_filter or {})
-    tf_ready = bool(tf.get("ready"))
     tf_dir = str(tf.get("direction") or "NEUTRO").upper()
-    if tf_ready and tf_dir == "CALL":
-        call += 2.0; call_reasons.append("Trend Filter verde")
-    elif tf_ready and tf_dir == "PUT":
-        put += 2.0; put_reasons.append("Trend Filter vermelho")
-    layers["trend_filter"] = {
-        "ready": tf_ready, "direction": tf_dir, "color": tf.get("color", "NEUTRO"),
-    }
+    if tf.get("ready") and tf_dir == "CALL":
+        add_confirm("CALL", "TREND FILTER VERDE", 0.8, "EMA9/21 e preço alinhados para alta")
+    elif tf.get("ready") and tf_dir == "PUT":
+        add_confirm("PUT", "TREND FILTER VERMELHO", 0.8, "EMA9/21 e preço alinhados para baixa")
+    indicators["trend_filter"] = {"ready": bool(tf.get("ready")), "direction": tf_dir, "color": tf.get("color", "NEUTRO")}
 
-    min_score = 5.0
-    min_edge = 1.5
-    edge = call - put
+    call_total = call_trigger + call_confirm
+    put_total = put_trigger + put_confirm
+    trigger_edge = call_trigger - put_trigger
+    total_edge = call_total - put_total
     direction = "NEUTRO"
     confirmed = False
-    # O filtro de tendência é a última autorização; sem ele não há entrada.
-    if tf_ready and tf_dir == "CALL" and call >= min_score and edge >= min_edge:
-        direction = "CALL"; confirmed = True
-    elif tf_ready and tf_dir == "PUT" and put >= min_score and edge <= -min_edge:
-        direction = "PUT"; confirmed = True
 
-    top = call if direction == "CALL" else (put if direction == "PUT" else max(call, put))
-    edge_abs = abs(edge)
+    # Um gatilho forte sozinho pode abrir candidato. As confirmações são leves:
+    # podem aumentar/reduzir a confiança, mas NÃO anulam um gatilho legítimo.
+    # Somente outro GATILHO forte no lado oposto cria conflito real.
+    min_trigger = 2.55
+    min_total_edge = 0.0
+    conflict = call_trigger >= 2.8 and put_trigger >= 2.8 and abs(trigger_edge) < 1.50
+    if not conflict:
+        if call_trigger >= min_trigger and trigger_edge >= 0.40:
+            direction, confirmed = "CALL", True
+        elif put_trigger >= min_trigger and trigger_edge <= -0.40:
+            direction, confirmed = "PUT", True
+
+    chosen_trigger = None
+    if confirmed:
+        same = [x for x in triggers if x["direction"] == direction]
+        if same: chosen_trigger = max(same, key=lambda x: float(x.get("weight", 0)))
+
+    top_trigger = call_trigger if direction == "CALL" else (put_trigger if direction == "PUT" else max(call_trigger, put_trigger))
+    top_confirm = call_confirm if direction == "CALL" else (put_confirm if direction == "PUT" else max(call_confirm, put_confirm))
     confidence = 0.0
     if confirmed:
-        confidence = clamp(54.0 + top * 4.2 + edge_abs * 2.3, 60.0, 94.0)
+        confidence = clamp(58.0 + top_trigger * 5.0 + top_confirm * 3.2 + abs(total_edge) * 1.1, 62.0, 94.0)
+        if doji or spinning:
+            confidence = max(60.0, confidence - 4.0)
 
     if confirmed:
-        reasons = call_reasons if direction == "CALL" else put_reasons
-        reason = f"{direction} por confluência visual: " + ", ".join(reasons[:6])
-    elif not tf_ready or tf_dir == "NEUTRO":
-        reason = "Sem entrada: Trend Filter ainda não autoriza uma direção."
-    elif top < min_score:
-        reason = f"Sem entrada: confluência insuficiente ({top:.1f}/{min_score:.1f})."
+        tname = chosen_trigger.get("name") if chosen_trigger else "GATILHO EBOOK"
+        reasons = [x["name"] for x in confirmations if x["direction"] == direction][:4]
+        reason = f"{direction} por {tname}"
+        if reasons: reason += " + " + " + ".join(reasons)
+        if doji or spinning: reason += " • indecisão na última vela reduziu a confiança"
+    elif conflict:
+        reason = f"Sem entrada: gatilhos fortes conflitantes (CALL {call_trigger:.1f} x PUT {put_trigger:.1f})."
+    elif max(call_trigger, put_trigger) < min_trigger:
+        reason = "Sem entrada: nenhum gatilho independente forte do e-book apareceu no candle fechado."
     else:
-        reason = f"Sem entrada: conflito entre CALL {call:.1f} e PUT {put:.1f}; vantagem mínima {min_edge:.1f}."
+        reason = f"Sem entrada: gatilho apareceu, mas o lado oposto reduziu a vantagem (CALL {call_total:.1f} x PUT {put_total:.1f})."
 
     return {
         "ready": True, "confirmed": confirmed, "direction": direction,
-        "confidence": round(float(confidence), 1),
-        "call_score": round(call, 2), "put_score": round(put, 2),
-        "edge": round(edge, 2), "min_score": min_score, "min_edge": min_edge,
-        "reason": reason[:420], "layers": layers,
-        "call_reasons": call_reasons[:8], "put_reasons": put_reasons[:8],
+        "confidence": round(float(confidence), 1), "reason": reason[:420],
+        "call_trigger_score": round(call_trigger, 2), "put_trigger_score": round(put_trigger, 2),
+        "call_confirmation_score": round(call_confirm, 2), "put_confirmation_score": round(put_confirm, 2),
+        "call_score": round(call_total, 2), "put_score": round(put_total, 2),
+        "edge": round(total_edge, 2), "trigger_edge": round(trigger_edge, 2),
+        "min_trigger": min_trigger, "min_edge": min_total_edge,
+        "primary_trigger": chosen_trigger, "triggers": triggers[:12], "confirmations": confirmations[:16],
+        "patterns": patterns[:16], "indicators": indicators,
+        "indecision": bool(doji or spinning),
+        "mode": "INDEPENDENT_TRIGGERS_SOFT_CONFIRMATION",
+        "source": "TECHNICAL_GRAPHICAL_EBOOK",
         "closed_candle_only": True, "next_candle": True,
     }
 
+
+def _smart_chart_confluence(cs, interval="1min", h1_filter=None, trend_filter=None, candle_pattern_filter=None):
+    """IA LEITURA DO GRÁFICO com gatilhos independentes e confirmações leves.
+
+    A versão anterior exigia confluência pesada e Trend Filter obrigatório. Nesta
+    versão o núcleo do e-book pode iniciar um candidato por um padrão forte
+    (vela, break/bounce, padrão gráfico, MACD/Bollinger breakout). Estrutura,
+    S/R H1, RSI, VWAP, Ichimoku, Trend Filter, volume e momentum só reforçam ou
+    reduzem a qualidade. Isso mantém a leitura técnica sem deixar o motor preso.
+    """
+    rows = list(cs or [])
+    ebook = _ebook_graphical_reading(rows, interval=interval, h1_filter=h1_filter, trend_filter=trend_filter)
+    if not ebook.get("ready"):
+        return ebook
+
+    call = float(ebook.get("call_score") or 0.0)
+    put = float(ebook.get("put_score") or 0.0)
+    call_reasons = [x.get("name") for x in ebook.get("triggers", []) if x.get("direction") == "CALL"]
+    put_reasons = [x.get("name") for x in ebook.get("triggers", []) if x.get("direction") == "PUT"]
+    layers = {"ebook": ebook}
+
+    def fv(row, key, default=0.0):
+        try: return float(row.get(key, default) or default)
+        except Exception: return float(default)
+
+    # Estrutura do preço = confirmação leve.
+    if len(rows) >= 12:
+        prev = rows[-12:-6]; cur = rows[-6:]
+        prev_hi = max(fv(x, "high") for x in prev); prev_lo = min(fv(x, "low") for x in prev)
+        cur_hi = max(fv(x, "high") for x in cur); cur_lo = min(fv(x, "low") for x in cur)
+        structure_dir = "NEUTRO"
+        if cur_hi > prev_hi and cur_lo > prev_lo:
+            structure_dir = "CALL"; call += 0.65; call_reasons.append("estrutura HH/HL")
+        elif cur_hi < prev_hi and cur_lo < prev_lo:
+            structure_dir = "PUT"; put += 0.65; put_reasons.append("estrutura LH/LL")
+        layers["structure"] = {"direction": structure_dir, "previous_high": prev_hi, "previous_low": prev_lo, "current_high": cur_hi, "current_low": cur_lo}
+
+    # Padrão forte já existente no app = gatilho alternativo real, não obrigação.
+    pattern = dict(candle_pattern_filter or {})
+    pa_dir = str(pattern.get("direction") or "NEUTRO").upper() if pattern.get("passed") else "NEUTRO"
+    app_pattern_trigger = False
+    if pa_dir == "CALL":
+        call += 2.8; call_reasons.append("price action forte do app"); app_pattern_trigger = True
+    elif pa_dir == "PUT":
+        put += 2.8; put_reasons.append("price action forte do app"); app_pattern_trigger = True
+    layers["app_candle_pattern"] = {"direction": pa_dir, "patterns": pattern.get("patterns", []), "trigger": app_pattern_trigger}
+
+    # Momentum e vela de força = confirmação leve.
+    if len(rows) >= 14:
+        last = rows[-1]
+        o, h, l, c = fv(last,"open"), fv(last,"high"), fv(last,"low"), fv(last,"close")
+        rng = max(h-l, 1e-12); body_ratio = abs(c-o)/rng
+        last14 = rows[-14:]
+        avg_range = sum(max(fv(x,"high")-fv(x,"low"),1e-12) for x in last14)/len(last14)
+        move3 = (fv(rows[-1],"close")-fv(rows[-4],"close"))/max(avg_range,1e-12)
+        if move3 >= 0.65:
+            call += 0.55; call_reasons.append("momentum comprador")
+        elif move3 <= -0.65:
+            put += 0.55; put_reasons.append("momentum vendedor")
+        if body_ratio >= 0.62:
+            if c > o: call += 0.35
+            elif c < o: put += 0.35
+        layers["momentum"] = {"move_3_ranges": round(move3,3), "body_ratio": round(body_ratio,3), "avg_range": avg_range}
+
+    # Volume/POC = confirmação opcional quando a fonte realmente possui volume.
+    try:
+        profile = _volume_poc_profile(rows[-VOLUME_POC_LOOKBACK:])
+        available = bool(profile and float(profile.get("volume_coverage") or 0.0) >= VOLUME_POC_MIN_VOLUME_COVERAGE)
+        volume_dir = "NEUTRO"
+        if available:
+            close = fv(rows[-1], "close")
+            poc = float(profile.get("poc") or close)
+            _d, _v, dr = _volume_poc_bar_delta(rows[-1])
+            if close >= poc and dr >= 0.08:
+                call += 0.45; call_reasons.append("volume/POC comprador"); volume_dir = "CALL"
+            elif close <= poc and dr <= -0.08:
+                put += 0.45; put_reasons.append("volume/POC vendedor"); volume_dir = "PUT"
+        layers["volume_poc"] = {"available": available, "direction": volume_dir, "poc": (float(profile.get("poc")) if profile else None)}
+    except Exception as exc:
+        layers["volume_poc"] = {"available": False, "direction": "NEUTRO", "error": str(exc)[:120]}
+
+    # O candidato precisa vir de ao menos um gatilho independente real.
+    ebook_has_trigger = bool(ebook.get("confirmed"))
+    app_has_trigger = bool(app_pattern_trigger)
+    has_trigger = ebook_has_trigger or app_has_trigger
+
+    direction = str(ebook.get("direction") or "NEUTRO").upper() if ebook_has_trigger else pa_dir
+    if ebook_has_trigger and app_has_trigger and pa_dir in ("CALL","PUT") and pa_dir != direction:
+        direction = "NEUTRO"; has_trigger = False
+        reason = "Sem entrada: gatilho do e-book e price action do app apontaram lados opostos."
+    else:
+        edge = call - put
+        # Confirmações não vetam o gatilho principal. Elas apenas alteram a
+        # confiança final; conflito só existe quando outro gatilho real aponta
+        # o lado oposto (tratado acima).
+        if direction in ("CALL","PUT") and has_trigger:
+            reasons = call_reasons if direction == "CALL" else put_reasons
+            reason = f"{direction} por gatilho independente + confirmações leves: " + ", ".join([x for x in reasons if x][:7])
+        else:
+            reason = str(ebook.get("reason") or "Nenhum gatilho independente liberado.")
+
+    confirmed = bool(has_trigger and direction in ("CALL","PUT"))
+    edge = call - put
+    confidence = 0.0
+    if confirmed:
+        base_conf = float(ebook.get("confidence") or 64.0) if ebook_has_trigger else 66.0
+        # confirmações alinhadas somam; contrárias tiram poucos pontos, sem bloquear
+        signed_bonus = (edge * 0.65) if direction == "CALL" else (-edge * 0.65)
+        confidence = clamp(base_conf + max(-5.0, min(6.0, signed_bonus)), 60.0, 95.0)
+
+    return {
+        "ready": True, "confirmed": confirmed, "direction": direction,
+        "confidence": round(float(confidence),1),
+        "call_score": round(call,2), "put_score": round(put,2), "edge": round(edge,2),
+        "reason": reason[:420], "layers": layers,
+        "ebook": ebook, "independent_trigger": bool(has_trigger),
+        "mode": "EBOOK_INDEPENDENT_TRIGGERS_SOFT_CONFIRMATION",
+        "closed_candle_only": True, "next_candle": True,
+    }
 
 def _pure_ai_price_context(cs):
     """Resume somente price action/OHLCV para filtrar entradas fracas da IA PURA.
@@ -15029,12 +15340,11 @@ def _pure_ai_candle_pattern_filter(cs, expected_direction="NEUTRO"):
 
 
 async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=None, state_namespace="SMART"):
-    """IA LEITURA DO GRÁFICO por confluência, para a próxima vela.
+    """IA LEITURA DO GRÁFICO para a próxima vela.
 
-    O motor replica a análise visual feita em uma foto do gráfico: estrutura,
-    suporte/resistência, price action, força/momentum, volume/POC e Trend Filter.
-    A IA externa recebe esse contexto + candles fechados e só confirma CALL/PUT
-    quando a confluência local mínima aponta o mesmo lado.
+    Usa o núcleo TECHNICAL + GRAPHICAL do e-book como gatilhos independentes.
+    Indicadores, estrutura, S/R, volume e Trend Filter entram como confirmações
+    leves. A IA externa valida o candidato usando somente candles fechados.
     """
     rows = list(cs or [])
     if not rows:
@@ -15099,9 +15409,9 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
     # Contexto de price action usado pela IA e pelo gate final.
     prefilter_ok, prefilter_score, prefilter_reason, price_ctx = _gemini_candidate_prefilter(rows, interval)
 
-    # 3.94.2 — Trend Filter OBRIGATÓRIO somente na IA LEITURA DO GRÁFICO.
-    # VERDE autoriza apenas CALL; VERMELHO autoriza apenas PUT.
-    # O IA + Volume POC continua exatamente com o FLEX anterior.
+    # 3.96.21 — na IA LEITURA DO GRÁFICO o Trend Filter virou CONFIRMAÇÃO LEVE.
+    # Ele reforça a direção, mas não bloqueia sozinho um gatilho forte do e-book.
+    # O IA + Volume POC mantém suas regras próprias abaixo.
     smart_namespace = str(state_namespace or "SMART").upper() == "SMART"
     trend_filter = _smart_trend_filter(rows) if smart_namespace else {
         "enabled": False, "ready": True, "color": "IGNORADO",
@@ -15170,8 +15480,8 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
         except Exception as exc:
             h1_filter["error"] = str(exc)[:180]
 
-    # 3.95.2 — Leitura visual por confluência. Esta camada existe somente no SMART.
-    # IA + Volume POC e os demais motores permanecem com suas próprias regras.
+    # 3.96.21 — leitura TECHNICAL + GRAPHICAL por gatilhos independentes.
+    # Esta camada existe somente no SMART; demais motores permanecem intactos.
     chart_confluence = (
         _smart_chart_confluence(
             rows, interval=interval, h1_filter=h1_filter,
@@ -15249,16 +15559,16 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
         st["last_result"] = dict(out)
         return out
 
-    # 3.95.2 — Se a própria leitura visual não atingiu confluência mínima,
-    # não força CALL/PUT e nem gasta uma chamada externa.
+    # 3.96.21 — sem gatilho técnico independente, não força CALL/PUT
+    # e também não gasta chamada externa.
     if smart_namespace and not bool(chart_confluence.get("confirmed")):
         out = {
             "available": True, "direction": "NEUTRO",
             "confidence": float(chart_confluence.get("confidence") or 0.0),
             "confirmed": False, "risk": "HIGH", "setup": "NONE",
-            "reason": str(chart_confluence.get("reason") or "Sem confluência suficiente para entrada."),
+            "reason": str(chart_confluence.get("reason") or "Sem gatilho técnico independente para entrada."),
             "smart_scan": True, "api_called": False,
-            "provider": "LOCAL_VISUAL_CONFLUENCE", "fallback": False,
+            "provider": "LOCAL_EBOOK_GRAPHICAL", "fallback": False,
             "api_available": bool(OAI_KEY or GEMINI_KEY),
             "h1_filter": h1_filter, "candle_pattern_filter": candle_pattern_filter,
             "trend_filter": trend_filter, "chart_confluence": chart_confluence,
@@ -15329,8 +15639,8 @@ async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=
     prompt = f"""Você é a IA LEITURA DO GRÁFICO da MEGA IA. Analise como faria ao receber uma FOTO de um gráfico e ter de decidir SOMENTE a direção da PRÓXIMA vela completa.
 Ativo: {symbol}. Timeframe: {interval}. Mercado: {market}.
 
-A leitura obrigatória já foi pré-calculada em seis blocos: ESTRUTURA, SUPORTE/RESISTÊNCIA + LOCALIZAÇÃO, PRICE ACTION, FORÇA/MOMENTUM, VOLUME/POC e TREND FILTER.
-Não force sinal. CALL/PUT só pode ser confirmado quando a confluência local tiver candidato e sua leitura dos candles concordar com o MESMO lado. Em conflito relevante, responda NEUTRO.
+O candidato técnico foi pré-calculado pelo núcleo TECHNICAL + GRAPHICAL do e-book. Padrões de vela, break/bounce, padrões gráficos, MACD cross e Bollinger breakout podem atuar como GATILHOS INDEPENDENTES. RSI, VWAP, Ichimoku, pivôs, estrutura, S/R H1, volume/POC e Trend Filter são CONFIRMAÇÕES LEVES.
+Não force sinal. CALL/PUT só pode ser confirmado quando existir um gatilho local real e sua leitura dos candles concordar com o MESMO lado. Em conflito relevante, responda NEUTRO.
 
 REGRAS:
 - A previsão é para UMA vela à frente, não para a tendência geral.
@@ -15339,12 +15649,13 @@ REGRAS:
 - Em suporte, procure rejeição/força compradora; em resistência, procure rejeição/força vendedora.
 - Rompimento precisa de deslocamento/força; pavio contra o rompimento reduz a qualidade.
 - Volume/POC é confirmação quando disponível; ausência de volume não deve ser tratada como volume zero confiável.
-- Trend Filter é obrigatório: VERDE só autoriza CALL; VERMELHO só autoriza PUT; NEUTRO bloqueia.
+- Trend Filter é confirmação leve: alinhado reforça; contrário reduz a qualidade, mas não veta sozinho um gatilho forte.
 - Gale, recuperação e resultados anteriores NÃO influenciam a direção.
-- Se a confluência local estiver NEUTRO, responda NEUTRO.
-- Se a confluência local apontar CALL, não responda PUT. Se apontar PUT, não responda CALL.
+- Se o núcleo local estiver NEUTRO, responda NEUTRO.
+- Se o núcleo local apontar CALL, não responda PUT. Se apontar PUT, não responda CALL.
+- Não exija todos os indicadores ao mesmo tempo: o modelo é gatilho independente + confirmações leves.
 
-CONFLUÊNCIA VISUAL OBRIGATÓRIA:
+NÚCLEO TECHNICAL + GRAPHICAL (GATILHOS + CONFIRMAÇÕES LEVES):
 {json.dumps(chart_confluence, ensure_ascii=False)}
 
 CAMADA ESTATÍSTICA XGBOOST (evidência adicional, nunca acima da confluência visual):
@@ -15469,17 +15780,11 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         if direction in ("CALL", "PUT"):
             if not confirmed:
                 blocked_reason = "IA não confirmou a própria leitura"
-            elif smart_namespace and not bool(trend_filter.get("ready")):
-                blocked_reason = "Trend Filter ainda sem dados suficientes"
-            elif smart_namespace and str(trend_filter.get("direction") or "NEUTRO").upper() != direction:
-                tf_color = str(trend_filter.get("color") or "NEUTRO").upper()
-                tf_dir = str(trend_filter.get("direction") or "NEUTRO").upper()
-                blocked_reason = f"Trend Filter {tf_color} não autoriza {direction}; direção permitida: {tf_dir}"
             elif smart_namespace and not bool(chart_confluence.get("confirmed")):
-                blocked_reason = "confluência visual local não confirmou entrada"
+                blocked_reason = "núcleo TECHNICAL + GRAPHICAL não confirmou gatilho"
             elif smart_namespace and str(chart_confluence.get("direction") or "NEUTRO").upper() != direction:
                 blocked_reason = (
-                    f"IA {direction} divergiu da confluência visual "
+                    f"IA {direction} divergiu do gatilho técnico local "
                     f"{str(chart_confluence.get('direction') or 'NEUTRO').upper()}"
                 )
             elif confidence < required_conf:
@@ -25214,7 +25519,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • IA GRÁFICA • IA LEITURA DO GRÁFICO • IA + VOLUME POC • LARRY BREAKOUT + TAURUS • ALPHAX RELAY • SUPER SIGNALS CHANNEL NR • TAURUS + RSI DIV • INDICEMENT • FOREX GOLD INVESTOR • TTM SCALPER • FOREX MISSION • BINARY MONEYARROW • LIQUIDEX • EURO FX2 • EURO FX2 + TAURUS • ATE • FOREXSTAY SIGHT • FOREXSTAY SIGHT + TAURUS • FOREXSTAY PRO • FOREX FLEX • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • IA GRÁFICA • IA LEITURA DO GRÁFICO + EBOOK TECHNICAL/GRAPHICAL • IA + VOLUME POC • LARRY BREAKOUT + TAURUS • ALPHAX RELAY • SUPER SIGNALS CHANNEL NR • TAURUS + RSI DIV • INDICEMENT • FOREX GOLD INVESTOR • TTM SCALPER • FOREX MISSION • BINARY MONEYARROW • LIQUIDEX • EURO FX2 • EURO FX2 + TAURUS • ATE • FOREXSTAY SIGHT • FOREXSTAY SIGHT + TAURUS • FOREXSTAY PRO • FOREX FLEX • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -30298,7 +30603,7 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar EA Tripla ativo • RSI + Value Chart + XGBoost • OPEN/OTC</div>';
     rad();
   }else if(engine==='SMART'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA LEITURA DO GRÁFICO ONLINE • ESTRUTURA + S/R + PRICE ACTION + FORÇA + VOLUME/POC + TREND • PRÓXIMA VELA';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA LEITURA DO GRÁFICO ONLINE • EBOOK TECHNICAL/GRAPHICAL • GATILHOS INDEPENDENTES + CONFIRMAÇÕES LEVES • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Leitura do Gráfico FLEX • Trend Filter alinhado obrigatório: 🟢 só CALL / 🔴 só PUT.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar IA Leitura ativo • aguardando IA + Trend Filter na mesma direção</div>';
     rad();
