@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.27"
-PWA_VERSION = "v177"
+APP_VERSION = "3.96.28"
+PWA_VERSION = "v178"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -1457,6 +1457,9 @@ BACKGROUND_DEFAULT_INTERVAL = os.getenv("BACKGROUND_INTERVAL", "1min").strip() o
 # quando não existe estado persistido explícito.
 BACKGROUND_DEFAULT_TELEGRAM_ENABLED = os.getenv("BACKGROUND_TELEGRAM_ENABLED", "0").strip().lower() in ("1", "true", "on", "yes")
 
+# MEGA IA 3.96.28 — HOLY GRAIL + TRENDLINES em perfil FLEX.
+# HOLY GRAIL: 2 de 3 confirmações fortes, toque com tolerância e volatilidade 0,72x.
+# TRENDLINES: M1/M5 como gatilho, M15 confirmação leve, H1 só bônus e tolerância 0,40 ATR.
 # MEGA IA 3.96.26 — TRENDLINES MTF adicionado + motores retirados continuam fora.
 # TRENDLINES: núcleo do Trendlines.mq4 convertido em gatilho causal M1 com linhas M15 e reforço H1.
 #
@@ -12145,35 +12148,37 @@ def value_chart_macd_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
 
 
 def holy_grail_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """HOLY GRAIL ORIGINAL — adaptação causal do Holy Grail.mq4 para opções binárias.
+    """HOLY GRAIL ORIGINAL — perfil FLEX 2/3 para opções binárias M1.
 
-    Núcleo preservado do EA:
-      - M1
-      - iEnvelopes período 3, MODE_LWMA, PRICE_OPEN, desvio 0.07%
-      - limite de volatilidade dinâmico (original = spread médio x 12.5)
-      - abaixo do envelope inferior arma BUY STOP; acima do superior arma SELL STOP
+    Mantém o núcleo do Holy Grail.mq4 (Envelope LWMA 3 / 0,07%), mas reduz a
+    trava do adaptador anterior. O sinal continua causal, usa somente candle
+    fechado e entra na próxima vela.
 
-    O app não executa ordens pendentes MT4. Para manter a confirmação sem repaint,
-    convertemos o BUY STOP/SELL STOP em uma rejeição já confirmada no candle fechado:
-      CALL: mínima rompe envelope inferior e fechamento retorna acima dele.
-      PUT : máxima rompe envelope superior e fechamento retorna abaixo dele.
-    A operação é sempre na próxima vela, expira em 1 candle e não usa Gale/Martingale.
+    Confirmações fortes por lado:
+      1) toque/varredura do Envelope (com pequena tolerância dinâmica);
+      2) rejeição/retorno na direção esperada;
+      3) volatilidade suficiente (limiar flexível).
+
+    O toque do Envelope é a âncora direcional e, a partir dele, 2 de 3
+    confirmações bastam. Candle que toca os dois lados só é aceito quando a
+    rejeição/corpo define claramente um lado. Sem Gale/Martingale.
     """
     rows=list(cs or [])
-    name="HOLY GRAIL ORIGINAL • M1"
+    name="HOLY GRAIL ORIGINAL • FLEX 2/3 • M1"
     base={
         "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
-        "strategy":name,"engine":"HOLYGRAIL","provider":"LOCAL_HOLY_GRAIL_ENVELOPES",
+        "strategy":name,"engine":"HOLYGRAIL","provider":"LOCAL_HOLY_GRAIL_ENVELOPES_FLEX",
         "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
         "direct_win_only":True,"gale_signal":False,"martingale":False,"grid":False,
         "expiry_candles":1,"original_timeframe":"M1","envelope_period":3,
         "envelope_method":"LWMA","envelope_price":"OPEN","envelope_deviation_pct":0.07,
         "dynamic_volatility":True,"volatility_multiplier":12.5,
+        "min_confirmations":2,"flex_profile":True,
     }
     if timeframe != "1min":
-        return {**base,"reason":"HOLY GRAIL ORIGINAL usa M1 no código original. Selecione M1 para operar este motor."}
-    if len(rows)<35:
-        return {**base,"reason":f"HOLY GRAIL coletando candles M1 fechados ({len(rows)}/35)."}
+        return {**base,"reason":"HOLY GRAIL ORIGINAL usa M1. Selecione M1 para operar este motor."}
+    if len(rows)<30:
+        return {**base,"reason":f"HOLY GRAIL coletando candles M1 fechados ({len(rows)}/30)."}
 
     rows=rows[-120:]
     def _f(row,key,default=0.0):
@@ -12195,14 +12200,13 @@ def holy_grail_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     center=_lwma_open_at(i)
     if not center or center<=0:
         return {**base,"reason":"HOLY GRAIL aguardando cálculo do Envelope LWMA 3."}
+
     dev=0.07/100.0
     upper=center*(1.0+dev)
     lower=center*(1.0-dev)
     candle_range=max(0.0,h-l)
 
-    # O MQ4 mede spread tick a tick. Quando a fonte do app trouxer bid/ask/spread,
-    # usamos esse valor; sem spread explícito, usamos um piso causal baseado no
-    # range mediano recente para não inventar um spread fixo por ativo/corretora.
+    # Spread explícito continua preferido. Sem spread, usa range mediano causal.
     explicit=[]
     for r in rows[-31:-1]:
         sp=r.get("spread")
@@ -12217,99 +12221,136 @@ def holy_grail_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
             except Exception:
                 sp=0.0
         if sp>0: explicit.append(sp)
+
     recent_ranges=[max(0.0,_f(r,"high")-_f(r,"low")) for r in rows[-31:-1]]
     median_range=_median(recent_ranges)
     if explicit:
         spread_ref=sum(explicit[-30:])/max(1,len(explicit[-30:]))
         volatility_limit=spread_ref*12.5
-        volatility_source="SPREAD_X12.5"
+        volatility_source="SPREAD_X12.5_FLEX72"
     else:
         spread_ref=0.0
-        volatility_limit=median_range*1.10
-        volatility_source="RANGE_MEDIAN_FALLBACK"
+        # Antes: 1,10 x range mediano e ainda exigia superar 100% do limite.
+        # Agora o limite-base fica no próprio range mediano e o voto é 0,72x.
+        volatility_limit=max(median_range, center*1e-8)
+        volatility_source="RANGE_MEDIAN_FLEX72"
+
     volatility_limit=max(volatility_limit, center*1e-8)
     vol_ratio=candle_range/max(volatility_limit,1e-12)
-    explosive=bool(candle_range>volatility_limit)
+    volatility_ok=bool(vol_ratio>=0.72)
 
-    call_excursion=bool(l<lower)
-    put_excursion=bool(h>upper)
-    call_return=bool(cl>lower)
-    put_return=bool(cl<upper)
-    call_ok=bool(explosive and call_excursion and call_return)
-    put_ok=bool(explosive and put_excursion and put_return)
+    # Pequena folga para não exigir que a mínima/máxima atravesse a linha por 1 tick.
+    touch_tolerance=max(median_range*0.10, abs(center)*0.000015, center*1e-8)
+    call_touch=bool(l<=lower+touch_tolerance)
+    put_touch=bool(h>=upper-touch_tolerance)
 
-    # Candle que varre os dois lados do envelope é ambíguo; preserva a disciplina
-    # do gatilho e evita escolher direção arbitrariamente.
-    if call_ok and put_ok:
-        return {**base,
-            "reason":f"HOLY GRAIL detectou explosão {vol_ratio:.2f}x, mas o candle varreu os dois lados do Envelope; aguardando direção limpa.",
-            "diagnostics":{"lwma3_open":center,"upper":upper,"lower":lower,"range":candle_range,"volatility_limit":volatility_limit,"volatility_source":volatility_source}}
+    range_safe=max(candle_range,abs(center)*1e-9,1e-12)
+    call_rej=(cl-l)/range_safe
+    put_rej=(h-cl)/range_safe
+    body_ratio=abs(cl-o)/range_safe
 
-    direction="CALL" if call_ok else ("PUT" if put_ok else "NEUTRO")
-    confirmed=direction in ("CALL","PUT")
-    if confirmed:
+    # Retorno/rejeição flex: pode fechar levemente além da linha se a rejeição/corpo
+    # já mostrar reação clara. Isso evita prender o motor por poucos pontos.
+    call_return=bool(cl>=lower-touch_tolerance*0.25)
+    put_return=bool(cl<=upper+touch_tolerance*0.25)
+    call_rejection=bool(call_return and (call_rej>=0.45 or (cl>=o and body_ratio>=0.12)))
+    put_rejection=bool(put_return and (put_rej>=0.45 or (cl<=o and body_ratio>=0.12)))
+
+    call_votes=int(call_touch)+int(call_rejection)+int(volatility_ok)
+    put_votes=int(put_touch)+int(put_rejection)+int(volatility_ok)
+    call_ok=bool(call_touch and call_votes>=2)
+    put_ok=bool(put_touch and put_votes>=2)
+
+    direction="NEUTRO"
+    if call_ok and not put_ok:
+        direction="CALL"
+    elif put_ok and not call_ok:
+        direction="PUT"
+    elif call_ok and put_ok:
+        # Envelope estreito + vela forte pode tocar os dois lados. Só escolhe um
+        # lado quando rejeição ou corpo têm vantagem suficiente.
+        edge=call_rej-put_rej
+        if edge>=0.10:
+            direction="CALL"
+        elif edge<=-0.10:
+            direction="PUT"
+        elif body_ratio>=0.20:
+            direction="CALL" if cl>o else ("PUT" if cl<o else "NEUTRO")
+
+    diag={
+        "lwma3_open":round(center,10),"upper":round(upper,10),"lower":round(lower,10),
+        "range":round(candle_range,10),"median_range":round(median_range,10),
+        "spread_ref":round(spread_ref,10),"volatility_limit":round(volatility_limit,10),
+        "volatility_ratio":round(vol_ratio,3),"volatility_ok":volatility_ok,
+        "volatility_source":volatility_source,"touch_tolerance":round(touch_tolerance,10),
+        "call_touch":call_touch,"put_touch":put_touch,
+        "call_rejection":round(call_rej,3),"put_rejection":round(put_rej,3),
+        "call_return_ok":call_rejection,"put_return_ok":put_rejection,
+        "call_votes":call_votes,"put_votes":put_votes,"min_votes":2,
+    }
+
+    if direction in ("CALL","PUT"):
+        votes=call_votes if direction=="CALL" else put_votes
+        rej=call_rej if direction=="CALL" else put_rej
         if direction=="CALL":
             excursion=max(0.0,(lower-l)/max(center,1e-12))*10000.0
-            ret=max(0.0,(cl-lower)/max(center,1e-12))*10000.0
-            side_txt="rompeu o Envelope inferior e retornou acima"
+            side_txt="toque/varredura do Envelope inferior + reação compradora"
         else:
             excursion=max(0.0,(h-upper)/max(center,1e-12))*10000.0
-            ret=max(0.0,(upper-cl)/max(center,1e-12))*10000.0
-            side_txt="rompeu o Envelope superior e retornou abaixo"
-        confidence=clamp(76.0 + min(9.0,max(0.0,vol_ratio-1.0)*7.0) + min(6.0,excursion*0.8) + min(3.0,ret*0.5),76.0,94.0)
+            side_txt="toque/varredura do Envelope superior + reação vendedora"
+        confidence=74.0 + votes*3.0
+        confidence += min(5.0,max(0.0,vol_ratio-0.72)*4.0)
+        confidence += min(4.0,max(0.0,rej-0.45)*8.0)
+        confidence += min(2.0,excursion*0.30)
+        confidence=clamp(confidence,78.0,93.0)
         stamp=str(c.get("datetime") or c.get("timestamp") or i)
-        reason=(f"{direction} HOLY GRAIL confirmado • Envelope LWMA 3 / 0,07% • {side_txt} • "
-                f"volatilidade {vol_ratio:.2f}x do limite dinâmico • próxima vela • expiração 1 candle • sem Gale.")
+        reason=(f"{direction} HOLY GRAIL FLEX confirmado • {votes}/3 confirmações • {side_txt} • "
+                f"volatilidade {vol_ratio:.2f}x • próxima vela • expiração 1 candle • sem Gale.")
         return {**base,"direction":direction,"confirmed":True,"confidence":round(float(confidence),1),
-                "risk":"MEDIUM" if confidence<86 else "LOW","reason":reason,
-                "event_key":f"HOLYGRAIL:{direction}:{stamp}",
-                "diagnostics":{"lwma3_open":round(center,10),"upper":round(upper,10),"lower":round(lower,10),
-                               "range":round(candle_range,10),"median_range":round(median_range,10),
-                               "spread_ref":round(spread_ref,10),"volatility_limit":round(volatility_limit,10),
-                               "volatility_ratio":round(vol_ratio,3),"volatility_source":volatility_source,
-                               "call_excursion":call_excursion,"put_excursion":put_excursion}}
+                "risk":"LOW" if confidence>=87 else "MEDIUM","reason":reason,
+                "event_key":f"HOLYGRAIL_FLEX:{direction}:{stamp}","diagnostics":diag}
 
     side=[]
-    if call_excursion: side.append("toque/rompimento inferior sem retorno confirmado")
-    if put_excursion: side.append("toque/rompimento superior sem retorno confirmado")
-    if not explosive: side.append(f"volatilidade {vol_ratio:.2f}x ainda abaixo do gatilho")
-    if not side: side.append("preço dentro do Envelope")
-    return {**base,"reason":"HOLY GRAIL monitorando • " + " • ".join(side) + ".",
-            "diagnostics":{"lwma3_open":round(center,10),"upper":round(upper,10),"lower":round(lower,10),
-                           "range":round(candle_range,10),"median_range":round(median_range,10),
-                           "spread_ref":round(spread_ref,10),"volatility_limit":round(volatility_limit,10),
-                           "volatility_ratio":round(vol_ratio,3),"volatility_source":volatility_source}}
+    if call_touch: side.append(f"CALL {call_votes}/3")
+    if put_touch: side.append(f"PUT {put_votes}/3")
+    if not volatility_ok: side.append(f"volatilidade {vol_ratio:.2f}x (<0,72x)")
+    if not side: side.append("preço ainda longe das bordas do Envelope")
+    return {**base,"reason":"HOLY GRAIL FLEX monitorando • " + " • ".join(side) + ".","diagnostics":diag}
 
 
 def trendlines_mtf_strategy(m1, m15, h1, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """TRENDLINES MTF — adaptação causal do Trendlines.mq4 para sinal M1.
+    """TRENDLINES MTF FLEX — gatilho M1/M5, M15 confirmação leve e H1 bônus.
 
-    O indicador original só desenha linhas; não possui CALL/PUT. Preservamos o
-    núcleo que procura HigherHigh/LowerLow e conecta dois pivôs para formar:
-      - resistência/LTB: pivô antigo mais alto -> pivô recente mais baixo;
-      - suporte/LTA: pivô antigo mais baixo -> pivô recente mais alto.
+    O Trendlines.mq4 original desenha níveis/linhas e não possui CALL/PUT. Esta
+    adaptação usa apenas candles fechados. A versão FLEX deriva M5 dos próprios
+    candles M1 (sem nova chamada de API), aumenta a tolerância de toque e permite
+    pivôs recentes como fallback quando a estrutura perfeita ainda não existe.
 
-    Para o app, M15 é a linha de disparo e H1 apenas reforça a confiança.
-    CALL = candle M1 fechado toca/varre a LTA M15 e fecha novamente acima.
-    PUT  = candle M1 fechado toca/varre a LTB M15 e fecha novamente abaixo.
+    Prioridade:
+      - M1 é o candle que confirma a rejeição;
+      - LTA/LTB M5 é o gatilho principal (derivada de M1 fechado);
+      - M15 confirma/reforça, mas não trava um gatilho M5 forte;
+      - H1 só acrescenta confiança; nunca é obrigatório.
+
     Próxima vela, expiração 1 candle, sem Gale/Martingale e sem repaint.
     """
     a=list(m1 or []); b=list(m15 or []); c=list(h1 or [])
-    name="TRENDLINES MTF • LTA/LTB M15 + H1"
+    name="TRENDLINES MTF FLEX • M1/M5 + M15 + H1"
     base={
         "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
-        "strategy":name,"engine":"TRENDLINES","provider":"LOCAL_TRENDLINES_MTF",
+        "strategy":name,"engine":"TRENDLINES","provider":"LOCAL_TRENDLINES_MTF_FLEX",
         "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
         "direct_win_only":True,"gale_signal":False,"martingale":False,"grid":False,
-        "expiry_candles":1,"trigger_timeframe":"M15","context_timeframe":"H1",
-        "source_indicator":"Trendlines.mq4 • John Hitt 2006",
+        "expiry_candles":1,"trigger_timeframe":"M1/M5","confirmation_timeframe":"M15",
+        "context_timeframe":"H1","source_indicator":"Trendlines.mq4 • John Hitt 2006",
+        "flex_profile":True,
     }
     if timeframe != "1min":
-        return {**base,"reason":"TRENDLINES MTF usa gatilho M1 no app. Selecione M1 para operar este motor."}
-    if len(a)<18 or len(b)<24:
-        return {**base,"reason":f"TRENDLINES coletando candles fechados • M1 {len(a)}/18 • M15 {len(b)}/24."}
+        return {**base,"reason":"TRENDLINES MTF FLEX usa M1 como candle de entrada. Selecione M1."}
+    if len(a)<20 or len(b)<18:
+        return {**base,"reason":f"TRENDLINES FLEX coletando candles fechados • M1 {len(a)}/20 • M15 {len(b)}/18."}
 
-    a=a[-120:]; b=b[-180:]; c=c[-180:]
+    a=a[-150:]; b=b[-180:]; c=c[-180:]
 
     def _f(row,key,default=0.0):
         try: return float(row.get(key,default) or default)
@@ -12333,6 +12374,46 @@ def trendlines_mtf_strategy(m1, m15, h1, symbol="EUR/USD", timeframe="1min", mar
         except Exception:
             return None
 
+    def _aggregate_m5(rows):
+        """Agrega somente M1 já fechado; não consulta nova fonte e não repinta."""
+        groups={}
+        ordered=[]
+        timed=True
+        for r in rows:
+            ep=_epoch(r)
+            if ep is None:
+                timed=False
+                break
+            bucket=int(ep//300)*300
+            if bucket not in groups:
+                groups[bucket]=[]; ordered.append(bucket)
+            groups[bucket].append(r)
+        out=[]
+        if timed and groups:
+            for bucket in sorted(ordered):
+                g=groups[bucket]
+                # Só fecha uma barra M5 quando existem as 5 barras M1 fechadas.
+                # Assim o M5 derivado também permanece causal e não repinta.
+                if len(g)<5: continue
+                out.append({
+                    "timestamp":bucket,
+                    "open":_f(g[0],"open"),
+                    "high":max(_f(x,"high") for x in g),
+                    "low":min(_f(x,"low") for x in g),
+                    "close":_f(g[-1],"close"),
+                })
+            return out
+        # Fallback por blocos sequenciais quando a fonte não fornece timestamp.
+        usable=(len(rows)//5)*5
+        for j in range(max(0,len(rows)-usable),len(rows),5):
+            g=rows[j:j+5]
+            if len(g)<5: continue
+            out.append({"open":_f(g[0],"open"),"high":max(_f(x,"high") for x in g),
+                        "low":min(_f(x,"low") for x in g),"close":_f(g[-1],"close")})
+        return out
+
+    m5=_aggregate_m5(a)
+
     def _line(rows, which, target_epoch=None):
         if len(rows)<5: return None
         highs=[_f(x,"high") for x in rows]; lows=[_f(x,"low") for x in rows]
@@ -12346,94 +12427,159 @@ def trendlines_mtf_strategy(m1, m15, h1, symbol="EUR/USD", timeframe="1min", mar
         if len(piv)<2: return None
         newer=piv[-1]
         older=None
+        strict=True
+        # Primeiro tenta a geometria clássica; se não houver, usa os 2 pivôs mais
+        # recentes como linha flexível. Isso evita ficar horas sem linha válida.
         for j in reversed(piv[:-1]):
             if which=="R" and highs[j]>highs[newer]: older=j; break
             if which=="S" and lows[j]<lows[newer]: older=j; break
-        if older is None: return None
+        if older is None:
+            older=piv[-2]
+            strict=False
         p_old=highs[older] if which=="R" else lows[older]
         p_new=highs[newer] if which=="R" else lows[newer]
         t_old=_epoch(rows[older]); t_new=_epoch(rows[newer])
+        # Barra em segundos depende do timeframe agregado.
+        bar_seconds=300.0 if rows is m5 else (900.0 if rows is b else 3600.0)
         if target_epoch is not None and t_old is not None and t_new is not None and t_new!=t_old:
             slope=(p_new-p_old)/(t_new-t_old)
             value=p_new+slope*(target_epoch-t_new)
-            slope_bar=slope*900.0
+            slope_bar=slope*bar_seconds
         else:
             denom=max(1,newer-older)
             slope_bar=(p_new-p_old)/denom
             value=p_new+slope_bar*((len(rows)-1)-newer)
         if value<=0: return None
-        return {"value":float(value),"old_idx":older,"new_idx":newer,"old_price":float(p_old),"new_price":float(p_new),"slope_bar":float(slope_bar)}
+        return {"value":float(value),"old_idx":older,"new_idx":newer,
+                "old_price":float(p_old),"new_price":float(p_new),
+                "slope_bar":float(slope_bar),"strict":strict}
 
     target=_epoch(a[-1])
+    m5_support=_line(m5,"S",target) if len(m5)>=8 else None
+    m5_resistance=_line(m5,"R",target) if len(m5)>=8 else None
     m15_support=_line(b,"S",target); m15_resistance=_line(b,"R",target)
-    h1_support=_line(c,"S",target) if len(c)>=24 else None
-    h1_resistance=_line(c,"R",target) if len(c)>=24 else None
-    if not m15_support and not m15_resistance:
-        return {**base,"reason":"TRENDLINES aguardando dois pivôs válidos M15 para formar LTA/LTB sem usar candle futuro."}
+    h1_support=_line(c,"S",target) if len(c)>=18 else None
+    h1_resistance=_line(c,"R",target) if len(c)>=18 else None
+
+    if not any((m5_support,m5_resistance,m15_support,m15_resistance)):
+        return {**base,"reason":"TRENDLINES FLEX aguardando pivôs M5/M15 suficientes para formar LTA/LTB causais."}
 
     last=a[-1]
     o=_f(last,"open"); hi=_f(last,"high"); lo=_f(last,"low"); cl=_f(last,"close")
-    ranges=[max(0.0,_f(x,"high")-_f(x,"low")) for x in a[-15:]]
+    ranges=[max(0.0,_f(x,"high")-_f(x,"low")) for x in a[-20:]]
     atr=sum(ranges)/max(1,len(ranges))
     candle_range=max(hi-lo, max(abs(cl)*1e-9,1e-12))
-    tolerance=max(atr*0.22, abs(cl)*0.00002)
+    # Antes 0,22 ATR. FLEX usa 0,40 ATR para aceitar aproximação/reteste realista.
+    tolerance=max(atr*0.40, abs(cl)*0.00003)
 
-    s_val=float(m15_support["value"]) if m15_support else None
-    r_val=float(m15_resistance["value"]) if m15_resistance else None
-    call_touch=bool(s_val is not None and lo<=s_val+tolerance and cl>s_val)
-    put_touch=bool(r_val is not None and hi>=r_val-tolerance and cl<r_val)
+    def _v(line):
+        return float(line["value"]) if line else None
+    m5_s=_v(m5_support); m5_r=_v(m5_resistance)
+    m15_s=_v(m15_support); m15_r=_v(m15_resistance)
+
+    def _support_touch(value):
+        return bool(value is not None and lo<=value+tolerance and cl>=value-tolerance*0.35)
+    def _resistance_touch(value):
+        return bool(value is not None and hi>=value-tolerance and cl<=value+tolerance*0.35)
+
+    call_m5=_support_touch(m5_s)
+    put_m5=_resistance_touch(m5_r)
+    call_m15=_support_touch(m15_s)
+    put_m15=_resistance_touch(m15_r)
+    call_touch=bool(call_m5 or call_m15)
+    put_touch=bool(put_m5 or put_m15)
+
     call_rej=(cl-lo)/candle_range
     put_rej=(hi-cl)/candle_range
+    body_ratio=abs(cl-o)/candle_range
+    call_body=bool(cl>=o or call_rej>=0.55)
+    put_body=bool(cl<=o or put_rej>=0.55)
+
+    # M15 é confirmação leve: proximidade OU inclinação coerente contam; não trava.
+    m15_call_confirm=bool(m15_support and (
+        (m15_support.get("slope_bar",0)>0) or abs(cl-m15_s)<=max(atr*1.8,tolerance*3.0)))
+    m15_put_confirm=bool(m15_resistance and (
+        (m15_resistance.get("slope_bar",0)<0) or abs(cl-m15_r)<=max(atr*1.8,tolerance*3.0)))
+
+    call_score=(3 if call_m5 else 0)+(2 if call_m15 else 0)+(1 if call_rej>=0.42 else 0)+(1 if call_body else 0)+(1 if m15_call_confirm else 0)
+    put_score=(3 if put_m5 else 0)+(2 if put_m15 else 0)+(1 if put_rej>=0.42 else 0)+(1 if put_body else 0)+(1 if m15_put_confirm else 0)
 
     direction="NEUTRO"
-    if call_touch and not put_touch:
+    if call_touch and not put_touch and call_score>=4:
         direction="CALL"
-    elif put_touch and not call_touch:
+    elif put_touch and not call_touch and put_score>=4:
         direction="PUT"
     elif call_touch and put_touch:
-        if call_rej-put_rej>=0.18: direction="CALL"
-        elif put_rej-call_rej>=0.18: direction="PUT"
+        if call_score>=put_score+1:
+            direction="CALL"
+        elif put_score>=call_score+1:
+            direction="PUT"
+        elif call_rej-put_rej>=0.08:
+            direction="CALL"
+        elif put_rej-call_rej>=0.08:
+            direction="PUT"
+        elif body_ratio>=0.22:
+            direction="CALL" if cl>o else ("PUT" if cl<o else "NEUTRO")
 
     diag={
-        "m15_support":round(s_val,10) if s_val is not None else None,
-        "m15_resistance":round(r_val,10) if r_val is not None else None,
+        "m5_support":round(m5_s,10) if m5_s is not None else None,
+        "m5_resistance":round(m5_r,10) if m5_r is not None else None,
+        "m15_support":round(m15_s,10) if m15_s is not None else None,
+        "m15_resistance":round(m15_r,10) if m15_r is not None else None,
         "h1_support":round(float(h1_support["value"]),10) if h1_support else None,
         "h1_resistance":round(float(h1_resistance["value"]),10) if h1_resistance else None,
         "m1_atr":round(atr,10),"touch_tolerance":round(tolerance,10),
         "call_rejection":round(call_rej,3),"put_rejection":round(put_rej,3),
-        "m15_support_slope":round(float(m15_support["slope_bar"]),10) if m15_support else None,
-        "m15_resistance_slope":round(float(m15_resistance["slope_bar"]),10) if m15_resistance else None,
+        "call_m5_touch":call_m5,"put_m5_touch":put_m5,
+        "call_m15_touch":call_m15,"put_m15_touch":put_m15,
+        "m15_call_confirm":m15_call_confirm,"m15_put_confirm":m15_put_confirm,
+        "call_score":call_score,"put_score":put_score,
+        "m5_support_strict":m5_support.get("strict") if m5_support else None,
+        "m5_resistance_strict":m5_resistance.get("strict") if m5_resistance else None,
+        "m15_support_strict":m15_support.get("strict") if m15_support else None,
+        "m15_resistance_strict":m15_resistance.get("strict") if m15_resistance else None,
     }
+
     if direction=="NEUTRO":
         near=[]
-        if s_val is not None: near.append(f"LTA M15 {s_val:.6f}")
-        if r_val is not None: near.append(f"LTB M15 {r_val:.6f}")
-        why=" • ".join(near) if near else "linhas M15 em formação"
-        return {**base,"reason":f"TRENDLINES monitorando • {why} • aguardando rejeição confirmada no candle M1 fechado.","diagnostics":diag}
+        if m5_s is not None: near.append(f"LTA M5 {m5_s:.6f}")
+        if m5_r is not None: near.append(f"LTB M5 {m5_r:.6f}")
+        if m15_s is not None: near.append(f"LTA M15 {m15_s:.6f}")
+        if m15_r is not None: near.append(f"LTB M15 {m15_r:.6f}")
+        why=" • ".join(near[:4]) if near else "linhas em formação"
+        return {**base,"reason":f"TRENDLINES FLEX monitorando • {why} • tolerância ampliada • aguardando toque/rejeição M1/M5.","diagnostics":diag}
 
-    conf=78.0
+    conf=76.0
     if direction=="CALL":
-        conf += min(7.0,max(0.0,call_rej-0.50)*14.0)
-        if m15_support and m15_support["slope_bar"]>0: conf+=3.0
+        score=call_score; rej=call_rej
+        conf += min(7.0,max(0.0,rej-0.40)*12.0)
+        if call_m5: conf+=3.0
+        if call_m15: conf+=2.0
+        if m15_call_confirm: conf+=2.0
         if h1_support:
-            if h1_support["slope_bar"]>0: conf+=2.0
-            if abs(cl-float(h1_support["value"]))<=max(atr*3.0,tolerance*4.0): conf+=3.0
-        line_txt=f"LTA M15 {s_val:.6f}"
-        rej_txt="tocou/varreu o suporte inclinado e fechou acima"
+            if h1_support.get("slope_bar",0)>0: conf+=1.5
+            if abs(cl-float(h1_support["value"]))<=max(atr*3.5,tolerance*5.0): conf+=1.5
+        trigger_txt="LTA M5" if call_m5 else "LTA M15"
+        rej_txt="toque/reteste com rejeição compradora"
     else:
-        conf += min(7.0,max(0.0,put_rej-0.50)*14.0)
-        if m15_resistance and m15_resistance["slope_bar"]<0: conf+=3.0
+        score=put_score; rej=put_rej
+        conf += min(7.0,max(0.0,rej-0.40)*12.0)
+        if put_m5: conf+=3.0
+        if put_m15: conf+=2.0
+        if m15_put_confirm: conf+=2.0
         if h1_resistance:
-            if h1_resistance["slope_bar"]<0: conf+=2.0
-            if abs(cl-float(h1_resistance["value"]))<=max(atr*3.0,tolerance*4.0): conf+=3.0
-        line_txt=f"LTB M15 {r_val:.6f}"
-        rej_txt="tocou/varreu a resistência inclinada e fechou abaixo"
+            if h1_resistance.get("slope_bar",0)<0: conf+=1.5
+            if abs(cl-float(h1_resistance["value"]))<=max(atr*3.5,tolerance*5.0): conf+=1.5
+        trigger_txt="LTB M5" if put_m5 else "LTB M15"
+        rej_txt="toque/reteste com rejeição vendedora"
+
+    conf += min(2.0,max(0,score-4)*0.7)
     conf=clamp(conf,78.0,93.0)
     stamp=str(last.get("datetime") or last.get("timestamp") or len(a)-1)
     return {**base,"direction":direction,"confirmed":True,"confidence":round(float(conf),1),
             "risk":"LOW" if conf>=87 else "MEDIUM",
-            "reason":f"{direction} TRENDLINES confirmado • {line_txt} • {rej_txt} • H1 usado só como reforço • próxima vela • expiração 1 candle • sem Gale.",
-            "event_key":f"TRENDLINES:{direction}:{stamp}","diagnostics":diag}
+            "reason":f"{direction} TRENDLINES FLEX confirmado • gatilho {trigger_txt} • {rej_txt} • M15 confirmação leve • H1 só bônus • próxima vela • expiração 1 candle • sem Gale.",
+            "event_key":f"TRENDLINES_FLEX:{direction}:{stamp}","diagnostics":diag}
 
 def taurus_ea_strategy(cs,timeframe='1min',market='OPEN'):
     """TAURUS EA — Graal-FxProg_team confirmado pela estrutura Taurus.
@@ -17909,10 +18055,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_mode = "VALUE_CHART_ZEROLAG_MACD_CONFLUENCE"
         elif engine == "HOLYGRAIL":
             engine_title = "HOLY GRAIL ORIGINAL"
-            engine_mode = "HOLY_GRAIL_ENVELOPES_M1"
+            engine_mode = "HOLY_GRAIL_ENVELOPES_M1_FLEX_2OF3"
         elif engine == "TRENDLINES":
             engine_title = "TRENDLINES MTF"
-            engine_mode = "TRENDLINES_M15_H1_REJECTION"
+            engine_mode = "TRENDLINES_M1_M5_M15_FLEX"
         elif engine == "SNIPER":
             engine_title = "SUPER SIGNALS CHANNEL NR"
             engine_mode = "SUPER_SIGNALS_CHANNEL_NR"
@@ -18007,8 +18153,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "FOREXFLEX": "LOCAL_FOREX_FLEX_FRACTAL",
                     "SENEGALPRO": "LOCAL_SUPER_SENEGAL_PRO",
                     "VALUEMACD": "LOCAL_VALUE_CHART_ZEROLAG_MACD",
-                    "HOLYGRAIL": "LOCAL_HOLY_GRAIL_ENVELOPES",
-                    "TRENDLINES": "LOCAL_TRENDLINES_MTF",
+                    "HOLYGRAIL": "LOCAL_HOLY_GRAIL_ENVELOPES_FLEX",
+                    "TRENDLINES": "LOCAL_TRENDLINES_MTF_FLEX",
                     "COMBINER": "LOCAL_COMBINER_FLOW_RSI",
                     "RSIDIVBB": "LOCAL_RSI_DIVERGENCE_BOLLINGER",
                     "TMARSI": "LOCAL_EXTREME_TMA_RSI_TREND",
@@ -18164,7 +18310,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis = holy_grail_strategy(engine_closed, symbol=symbol, timeframe=interval, market=market)
             elif engine == "TRENDLINES":
                 if interval != "1min":
-                    analysis = {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","strategy":"TRENDLINES MTF • LTA/LTB M15 + H1","engine":"TRENDLINES","provider":"LOCAL_TRENDLINES_MTF","reason":"TRENDLINES MTF usa gatilho M1 no app. Selecione M1 para operar este motor.","non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,"gale_signal":False}
+                    analysis = {"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH","strategy":"TRENDLINES MTF FLEX • M1/M5 + M15 + H1","engine":"TRENDLINES","provider":"LOCAL_TRENDLINES_MTF_FLEX","reason":"TRENDLINES MTF FLEX usa M1 como candle de entrada. Selecione M1.","non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,"gale_signal":False}
                 else:
                     if market == "IQ_OTC":
                         m15_raw = await iq_ea_candles(iq_state, symbol, "15min", 120, regular_market=False)
@@ -18450,8 +18596,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "FOREXFLEX": "LOCAL_FOREX_FLEX_FRACTAL",
                     "SENEGALPRO": "LOCAL_SUPER_SENEGAL_PRO",
                     "VALUEMACD": "LOCAL_VALUE_CHART_ZEROLAG_MACD",
-                    "HOLYGRAIL": "LOCAL_HOLY_GRAIL_ENVELOPES",
-                    "TRENDLINES": "LOCAL_TRENDLINES_MTF",
+                    "HOLYGRAIL": "LOCAL_HOLY_GRAIL_ENVELOPES_FLEX",
+                    "TRENDLINES": "LOCAL_TRENDLINES_MTF_FLEX",
                     "COMBINER": "LOCAL_COMBINER_FLOW_RSI",
                     "RSIDIVBB": "LOCAL_RSI_DIVERGENCE_BOLLINGER",
                     "TMARSI": "LOCAL_EXTREME_TMA_RSI_TREND",
@@ -18497,8 +18643,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "FOREX FLEX • FRACTAL CAUSAL" if engine == "FOREXFLEX"
                     else "SUPER SENEGAL PRO • PULLBACK + PRICE ACTION + ATR LEVE" if engine == "SENEGALPRO"
                     else "VALUE CHART + ZEROLAG MACD 12/26/9" if engine == "VALUEMACD"
-                    else "HOLY GRAIL ORIGINAL • ENVELOPES LWMA 3/0.07" if engine == "HOLYGRAIL"
-                    else "TRENDLINES MTF • LTA/LTB M15 + H1" if engine == "TRENDLINES"
+                    else "HOLY GRAIL FLEX 2/3 • ENVELOPES LWMA 3/0.07" if engine == "HOLYGRAIL"
+                    else "TRENDLINES MTF FLEX • M1/M5 + M15 + H1" if engine == "TRENDLINES"
                     else "COMBINER FLOW + RSI" if engine == "COMBINER"
                     else "RSI DIVERGENCE + BOLLINGER 20/2" if engine == "RSIDIVBB"
                     else "EXTREME TMA + RSI + TREND FILTER" if engine == "TMARSI"
@@ -19241,8 +19387,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "FOREXFLEX": "LOCAL_FOREX_FLEX_FRACTAL",
                     "SENEGALPRO": "LOCAL_SUPER_SENEGAL_PRO",
                     "VALUEMACD": "LOCAL_VALUE_CHART_ZEROLAG_MACD",
-                    "HOLYGRAIL": "LOCAL_HOLY_GRAIL_ENVELOPES",
-                    "TRENDLINES": "LOCAL_TRENDLINES_MTF",
+                    "HOLYGRAIL": "LOCAL_HOLY_GRAIL_ENVELOPES_FLEX",
+                    "TRENDLINES": "LOCAL_TRENDLINES_MTF_FLEX",
                     "COMBINER": "LOCAL_COMBINER_FLOW_RSI",
                     "RSIDIVBB": "LOCAL_RSI_DIVERGENCE_BOLLINGER",
                     "TMARSI": "LOCAL_EXTREME_TMA_RSI_TREND",
@@ -23000,7 +23146,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                data["feed_message"] = {"INDICEMENT":"INDICEMENT SMA12/26 usando candles fechados.","GOLDINV":"FOREX GOLD INVESTOR usando PSAR H1 + M15 + M1.","TTMSCALPER":"TTM SCALPER usando confirmação causal de swings.","FOREXMISSION":"FOREX MISSION usando candles fechados.","MONEYARROW":"BINARY MONEYARROW usando pivôs e rejeição em candles fechados.","LIQUIDEX":"LIQUIDEX usando LWMA7 + vela de força fechada.","EUROFX2":"EURO FX2 usando a inclinação do MACD principal 14/26/9 em candles fechados.","EUROFX2TAURUS":"EURO FX2 + Taurus: virada MACD 14/26/9 confirmada por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","ATE":"ATE usando Harvester adaptado + ZeroLag MACD 22/33/9 em candles fechados.","FOREXSTAY":"FOREXSTAY SIGHT usando ZeroLag MACD 12/26/9 em candles fechados.","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + Taurus: cruzamento ZeroLag 12/26/9 confirmado por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","FOREXSTAYPRO":"FOREXSTAY PRO usando ZeroLag 12/26/9 com janela de 3 velas + EMA50 flex + ADX14≥12 + RSI20/80 + corpo≥20% + S/R leve.","FOREXFLEX":"FOREX FLEX usando fractal causal totalmente confirmado em candles fechados.","SENEGALPRO":"SUPER SENEGAL PRO usando PMAX/Z + ADX/DMI com pullback e Price Action em candles fechados.","VALUEMACD":"VALUE CHART + MACD usando Value Chart 5/±8 + ZeroLag MACD 12/26/9 em confluência.","HOLYGRAIL":"HOLY GRAIL ORIGINAL usando Envelopes LWMA 3/0,07% + explosão de volatilidade + retorno confirmado em M1.","TRENDLINES":"TRENDLINES MTF usando LTA/LTB automáticas M15 e H1 com rejeição confirmada no M1."}.get(engine, "Motor importado ativo.")
+                data["feed_message"] = {"INDICEMENT":"INDICEMENT SMA12/26 usando candles fechados.","GOLDINV":"FOREX GOLD INVESTOR usando PSAR H1 + M15 + M1.","TTMSCALPER":"TTM SCALPER usando confirmação causal de swings.","FOREXMISSION":"FOREX MISSION usando candles fechados.","MONEYARROW":"BINARY MONEYARROW usando pivôs e rejeição em candles fechados.","LIQUIDEX":"LIQUIDEX usando LWMA7 + vela de força fechada.","EUROFX2":"EURO FX2 usando a inclinação do MACD principal 14/26/9 em candles fechados.","EUROFX2TAURUS":"EURO FX2 + Taurus: virada MACD 14/26/9 confirmada por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","ATE":"ATE usando Harvester adaptado + ZeroLag MACD 22/33/9 em candles fechados.","FOREXSTAY":"FOREXSTAY SIGHT usando ZeroLag MACD 12/26/9 em candles fechados.","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + Taurus: cruzamento ZeroLag 12/26/9 confirmado por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","FOREXSTAYPRO":"FOREXSTAY PRO usando ZeroLag 12/26/9 com janela de 3 velas + EMA50 flex + ADX14≥12 + RSI20/80 + corpo≥20% + S/R leve.","FOREXFLEX":"FOREX FLEX usando fractal causal totalmente confirmado em candles fechados.","SENEGALPRO":"SUPER SENEGAL PRO usando PMAX/Z + ADX/DMI com pullback e Price Action em candles fechados.","VALUEMACD":"VALUE CHART + MACD usando Value Chart 5/±8 + ZeroLag MACD 12/26/9 em confluência.","HOLYGRAIL":"HOLY GRAIL FLEX usando Envelopes LWMA 3/0,07% com 2 de 3 confirmações fortes em M1.","TRENDLINES":"TRENDLINES MTF FLEX usando gatilho M1/M5, M15 como confirmação leve e H1 só como bônus."}.get(engine, "Motor importado ativo.")
             elif engine == "EA":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -26312,12 +26458,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
   <div class="robot-mode-card" id="holyGrailModeCard">
     <img src="__MEGA_IMAGE__" alt="Holy Grail Original">
-    <div class="robot-mode-copy"><div class="robot-mode-title">⚡ HOLY GRAIL ORIGINAL</div><div class="robot-mode-desc" id="holyGrailModeDesc">M1 • Envelopes LWMA 3 / 0,07% • explosão de volatilidade • retorno confirmado • próxima vela • expiração 1 candle • sem Gale.</div></div>
+    <div class="robot-mode-copy"><div class="robot-mode-title">⚡ HOLY GRAIL ORIGINAL</div><div class="robot-mode-desc" id="holyGrailModeDesc">M1 • Envelopes LWMA 3 / 0,07% • FLEX 2 de 3 confirmações • toque com tolerância • próxima vela • expiração 1 candle • sem Gale.</div></div>
     <button id="holyGrailPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
   <div class="robot-mode-card" id="trendlinesModeCard">
     <img src="__MEGA_IMAGE__" alt="Trendlines MTF">
-    <div class="robot-mode-copy"><div class="robot-mode-title">📐 TRENDLINES MTF</div><div class="robot-mode-desc" id="trendlinesModeDesc">M1 • LTA/LTB automáticas do M15 • H1 reforça confiança • rejeição confirmada • próxima vela • expiração 1 candle • sem Gale.</div></div>
+    <div class="robot-mode-copy"><div class="robot-mode-title">📐 TRENDLINES MTF</div><div class="robot-mode-desc" id="trendlinesModeDesc">M1/M5 gatilho • M15 confirmação leve • H1 só bônus • tolerância ampliada • próxima vela • expiração 1 candle • sem Gale.</div></div>
     <button id="trendlinesPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 <div class="tabs">
@@ -30818,8 +30964,8 @@ function applyRobotPowerState(){
   if(forexstayProModeDesc) forexstayProModeDesc.textContent=forexstayProEnabled?'ONLINE: ZeroLag 12/26/9 • cruzamento válido 3 velas • EMA50 flex • ADX≥12 • RSI20/80 • corpo≥20% • S/R leve • próxima vela • sem Gale.':'OFFLINE: FOREXSTAY PRO pausado.';
   if(forexFlexModeDesc) forexFlexModeDesc.textContent=forexFlexEnabled?'ONLINE: fractal causal confirmado + reação original • candle fechado • próxima vela • sem Gale.':'OFFLINE: FOREX FLEX pausado.';
   if(senegalProModeDesc) senegalProModeDesc.textContent=senegalProEnabled?'ONLINE: Senegal PMAX/Z + ADX/DMI • pullback + Price Action • ATR leve • M1 • próxima vela • sem Gale.':'OFFLINE: SUPER SENEGAL PRO pausado.';
-  if(holyGrailModeDesc) holyGrailModeDesc.textContent=holyGrailEnabled?'ONLINE: M1 • Envelopes LWMA 3 / 0,07% • explosão + retorno confirmado • próxima vela • 1 candle • sem Gale.':'OFFLINE: HOLY GRAIL pausado.';
-  if(trendlinesModeDesc) trendlinesModeDesc.textContent=trendlinesEnabled?'ONLINE: M1 • LTA/LTB M15 • H1 reforço • rejeição confirmada • próxima vela • 1 candle • sem Gale.':'OFFLINE: TRENDLINES MTF pausado.';
+  if(holyGrailModeDesc) holyGrailModeDesc.textContent=holyGrailEnabled?'ONLINE: M1 • FLEX 2/3 • toque Envelope + rejeição/retorno + volatilidade • próxima vela • 1 candle • sem Gale.':'OFFLINE: HOLY GRAIL pausado.';
+  if(trendlinesModeDesc) trendlinesModeDesc.textContent=trendlinesEnabled?'ONLINE: M1/M5 gatilho • M15 confirmação leve • H1 bônus • tolerância ampliada • próxima vela • 1 candle • sem Gale.':'OFFLINE: TRENDLINES MTF pausado.';
   if(valueMacdModeDesc) valueMacdModeDesc.textContent=valueMacdEnabled?'ONLINE: Value Chart 5/±8 + ZeroLag MACD 12/26/9 • confluência obrigatória • próxima vela • sem Gale.':'OFFLINE: VALUE CHART + MACD pausado.';
   if(robotPowerBtn){
     robotPowerBtn.textContent=robotEnabled?'🟢 ONLINE':'🔴 OFFLINE';
@@ -31205,13 +31351,13 @@ function applyRobotPowerState(){
   }else if(engine==='VALUEMACD'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='VALUE CHART + MACD ONLINE • VC 5/±8 + ZEROLAG MACD 12/26/9 • CONFLUÊNCIA';
   }else if(engine==='HOLYGRAIL'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='HOLY GRAIL ORIGINAL ONLINE • M1 • ENVELOPES LWMA 3/0,07% • VOLATILIDADE + RETORNO • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ HOLY GRAIL selecionado • rompimento do Envelope + retorno confirmado no candle fechado • sem Gale.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar HOLY GRAIL ativo • procurando explosão de volatilidade e rejeição do Envelope</div>'; rad();
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='HOLY GRAIL FLEX ONLINE • M1 • ENVELOPE LWMA 3/0,07% • 2 DE 3 CONFIRMAÇÕES • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ HOLY GRAIL FLEX selecionado • 2 de 3: toque Envelope + rejeição/retorno + volatilidade • sem Gale.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar HOLY GRAIL FLEX ativo • procurando toque/rejeição do Envelope com 2 de 3 confirmações</div>'; rad();
   }else if(engine==='TRENDLINES'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='TRENDLINES MTF ONLINE • M1 • LTA/LTB M15 • H1 REFORÇO • REJEIÇÃO • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📐 TRENDLINES MTF selecionado • CALL na rejeição da LTA M15 • PUT na rejeição da LTB M15 • H1 só reforça • sem Gale.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar TRENDLINES ativo • projetando LTA/LTB M15 e contexto H1</div>'; rad();
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='TRENDLINES MTF FLEX ONLINE • M1/M5 GATILHO • M15 CONFIRMAÇÃO LEVE • H1 BÔNUS • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📐 TRENDLINES FLEX selecionado • M1/M5 gatilho • M15 confirma sem travar • H1 só reforça • sem Gale.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar TRENDLINES FLEX ativo • projetando M5/M15 com H1 apenas como bônus</div>'; rad();
   }else if(engine==='FOREXFLEX'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='FOREX FLEX ONLINE • FRACTAL CAUSAL • CONFIRMAÇÃO SEM REPAINT • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧩 FOREX FLEX selecionado • fractal de 5 candles totalmente confirmado + reação original • sem Gale.</div>';
