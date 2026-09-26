@@ -12959,6 +12959,11 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     direction=signal_dir[i] or "NEUTRO"
     bv=brooky_value(i); bp=brooky_value(i-1) if i>0 else None
     recent_k=[float(kline[j]) for j in range(max(0,i-2),i+1) if kline[j] is not None]
+    # Progresso visual simples do MEGA BOT (sem expor o nome dos filtros).
+    # 1/3 = já existe viés técnico; 2/3 = RD atingiu o mínimo 3/5;
+    # 3/3 = confluência final Brooky + RD confirmada e sinal pronto.
+    rd_abs=abs(int(rd_score[i]))
+    confluence_progress=(3 if direction in ("CALL","PUT") else (2 if rd_abs>=3 else (1 if rd_abs>=1 else 0)))
     diagnostics={
         "rd_score":int(rd_score[i]),"rd_threshold":3,
         "stoch_k":round(float(kline[i]),2) if kline[i] is not None else None,
@@ -12969,6 +12974,10 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         "recent_stoch_k":[round(x,2) for x in recent_k],
         "brooky_call":bool(brooky_bull[i]),"brooky_put":bool(brooky_bear[i]),
         "rd_call":bool(rd_score[i]>=3),"rd_put":bool(rd_score[i]<=-3),
+        "confluence_progress":int(confluence_progress),"confluence_required":3,
+        "confluence_1_ok":bool(confluence_progress>=1),
+        "confluence_2_ok":bool(confluence_progress>=2),
+        "confluence_3_ok":bool(confluence_progress>=3),
         "confluence_window":2,"cooldown_bars":3,"future_leak":False,
     }
 
@@ -28066,6 +28075,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         <div class="label">STATUS</div>
         <div id="status" class="big" style="font-size:18px">MONITORANDO</div>
         <div id="risk">Risco: --</div>
+        <div id="megaBotConfluences" style="display:none;margin-top:16px;padding-top:12px;border-top:1px solid rgba(148,163,184,.22);gap:8px">
+          <div id="megaConf1" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf1Icon">○</span><span>Confluência 1</span><span id="megaConf1State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
+          <div id="megaConf2" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf2Icon">○</span><span>Confluência 2</span><span id="megaConf2State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
+          <div id="megaConf3" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf3Icon">○</span><span>Confluência 3</span><span id="megaConf3State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
+          <div id="megaConfReady" style="margin-top:3px;font-size:13px;font-weight:900;letter-spacing:.03em;opacity:.82">Confluências: 0/3</div>
+        </div>
       </div>
     </div>
 
@@ -29294,6 +29309,38 @@ function finishNextSignalRecovery(outcome,usedAmount,baseAmount){
   saveNextSignalRecoveryState();
 }
 
+function renderMegaBotConfluences(cur, engineName){
+  if(!megaBotConfluences) return;
+  const active=String(engineName || (cur&&cur.selected_engine) || '').toUpperCase()==='MEGABOT';
+  megaBotConfluences.style.display=active?'grid':'none';
+  if(!active) return;
+
+  const technical=(cur&&cur.technical)||{};
+  const diag=technical.diagnostics || (cur&&cur.diagnostics) || {};
+  let progress=Number(diag.confluence_progress);
+  if(!Number.isFinite(progress)){
+    const score=Math.abs(Number(diag.rd_score||0));
+    progress=(cur && (cur.direction==='CALL'||cur.direction==='PUT')) ? 3 : (score>=3 ? 2 : (score>=1 ? 1 : 0));
+  }
+  progress=Math.max(0,Math.min(3,Math.floor(progress)));
+
+  megaConfRows.forEach((x,idx)=>{
+    if(!x.icon || !x.state) return;
+    const ok=progress>=idx+1;
+    x.icon.textContent=ok?'✓':'○';
+    x.icon.style.color=ok?'#22c55e':'rgba(148,163,184,.65)';
+    x.state.textContent=ok?'OK':'AGUARDANDO';
+    x.state.style.color=ok?'#22c55e':'';
+    x.state.style.opacity=ok?'1':'.72';
+    if(x.row) x.row.style.opacity=ok?'1':'.78';
+  });
+
+  if(megaConfReady){
+    megaConfReady.textContent=progress>=3?'✓ 3/3 CONFLUÊNCIAS PRONTAS':`Confluências: ${progress}/3`;
+    megaConfReady.style.color=progress>=3?'#22c55e':'';
+  }
+}
+
 loadNextSignalRecoveryState();
 const TELEGRAM_ENABLED_KEY='mega_telegram_enabled_v1';
 const TELEGRAM_CHAT_ID_KEY='mega_telegram_chat_id_v1';
@@ -29318,6 +29365,13 @@ const countdown=document.getElementById('countdown');
 const statusBox=document.getElementById('status');
 const dataFeedText=document.getElementById('dataFeedText');
 const risk=document.getElementById('risk');
+const megaBotConfluences=document.getElementById('megaBotConfluences');
+const megaConfRows=[1,2,3].map(n=>({
+  row:document.getElementById('megaConf'+n),
+  icon:document.getElementById('megaConf'+n+'Icon'),
+  state:document.getElementById('megaConf'+n+'State')
+}));
+const megaConfReady=document.getElementById('megaConfReady');
 const wins=document.getElementById('wins');
 const losses=document.getElementById('losses');
 const accuracy=document.getElementById('accuracy');
@@ -34510,6 +34564,7 @@ async function sig(announce=false){
     }else{
       risk.textContent='Risco: '+(cur.risk||'--');
     }
+    renderMegaBotConfluences(cur, engine);
     if(dataFeedText){
       const src=String(cur.feed_label||cur.feed_source||'MULTIFONTE').replaceAll('_',' ');
       const fb=cur.feed_fallback===true?' • FALLBACK ATIVO':'';
