@@ -1457,9 +1457,17 @@ BACKGROUND_DEFAULT_INTERVAL = os.getenv("BACKGROUND_INTERVAL", "1min").strip() o
 # quando não existe estado persistido explícito.
 BACKGROUND_DEFAULT_TELEGRAM_ENABLED = os.getenv("BACKGROUND_TELEGRAM_ENABLED", "0").strip().lower() in ("1", "true", "on", "yes")
 
-# MEGA IA 3.96.34 — UT BOT ALERTS adicionado como motor separado.
-# Regra fiel ao UTBotAlerts corrigido: Key 2 + ATR 1 + Heikin Ashi OFF, trailing stop causal.
-# Somente candle fechado; CALL/PUT no cruzamento; entrada na próxima vela M1; sem Gale.
+# MEGA IA 3.96.35 — UT BOT ALERTS com confluência leve 2/4.
+# Gatilho obrigatório: UT Bot Key 2 + ATR 1 + Heikin Ashi OFF, trailing stop causal.
+# Confirmações (mínimo 2/4): EMA50, ADX14 >= 18, vela de força >= 55% do range e S/R livre.
+# Somente candle fechado; entrada na próxima vela M1; sem Gale.
+UTBOT_EMA_PERIOD = max(20, min(100, int(os.getenv("UTBOT_EMA_PERIOD", "50"))))
+UTBOT_ADX_PERIOD = max(7, min(30, int(os.getenv("UTBOT_ADX_PERIOD", "14"))))
+UTBOT_ADX_MIN = max(10.0, min(40.0, float(os.getenv("UTBOT_ADX_MIN", "18"))))
+UTBOT_BODY_MIN_RATIO = max(0.30, min(0.85, float(os.getenv("UTBOT_BODY_MIN_RATIO", "0.55"))))
+UTBOT_SR_LOOKBACK = max(10, min(80, int(os.getenv("UTBOT_SR_LOOKBACK", "24"))))
+UTBOT_SR_BUFFER_ATR = max(0.05, min(0.60, float(os.getenv("UTBOT_SR_BUFFER_ATR", "0.18"))))
+UTBOT_MIN_CONFIRMATIONS = max(1, min(4, int(os.getenv("UTBOT_MIN_CONFIRMATIONS", "2"))))
 # MEGA IA 3.96.32 — BROOKY + VERTEX FLEX 30/70 adicionado como motor separado.
 # Brooky Stoch 14/5/5 + RSI14 FLEX 30/70 + nova virada Vertex causal ±6 na MESMA vela fechada.
 # Entrada: próxima vela M1; expiração 1 candle; sem Gale; Vertex sem leitura de vela futura.
@@ -12302,18 +12310,26 @@ def bb_stochrsi_x_reversal_strategy(cs, symbol="EUR/USD", timeframe="1min", mark
 
 
 def ut_bot_alerts_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", key_value=2.0, atr_period=1, use_heikin=False):
-    """UT Bot Alerts causal adaptation for the MEGA IA signal engine.
+    """UT Bot Alerts causal adaptation with a light 2/4 confirmation score.
 
-    Configuration kept from the corrected MQ4 selected for the app:
+    Core trigger stays faithful to the corrected UT Bot selected for the app:
       • Key value = 2.0;
       • ATR period = 1;
       • Heikin Ashi source = OFF;
-      • signal is confirmed only on the latest CLOSED candle;
-      • entry/expiry are handled by the app on the NEXT M1 candle;
-      • no Gale, grid or martingale.
+      • a NEW UT Bot cross on the latest CLOSED candle is mandatory.
+
+    Accuracy layer (does not replace the UT trigger):
+      • EMA50 aligned with signal direction;
+      • ADX14 >= 18;
+      • force candle body >= 55% of full candle range;
+      • no immediate opposing S/R obstacle.
+
+    At least 2 of the 4 confirmations are required. This keeps the filter light
+    enough for M1 while rejecting the weakest crosses. Entry is always next M1
+    candle, expiry 1 candle, no Gale/grid/martingale.
     """
     rows=list(cs or [])
-    name="UT BOT ALERTS • ATR 1 • KEY 2"
+    name="UT BOT ALERTS • CONFLUÊNCIA 2/4"
     base={
         "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
         "strategy":name,"engine":"UTBOT","provider":"LOCAL_UT_BOT_ATR_TRAILING",
@@ -12321,11 +12337,13 @@ def ut_bot_alerts_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
         "direct_win_only":True,"gale_signal":False,"martingale":False,"grid":False,
         "expiry_candles":1,"trigger_timeframe":"M1","utbot_key":float(key_value),
         "utbot_atr_period":int(atr_period),"utbot_heikin":bool(use_heikin),
+        "confirmation_model":"score_2_of_4","min_confirmations":int(UTBOT_MIN_CONFIRMATIONS),
     }
     if timeframe != "1min":
         return {**base,"reason":"UT BOT ALERTS foi configurado para M1. Selecione 1min."}
-    if len(rows) < max(35, int(atr_period)+25):
-        return {**base,"reason":f"UT BOT coletando candles fechados ({len(rows)}/35)."}
+    minimum_bars=max(65, int(atr_period)+25, UTBOT_EMA_PERIOD+10, UTBOT_SR_LOOKBACK+10)
+    if len(rows) < minimum_bars:
+        return {**base,"reason":f"UT BOT coletando candles fechados ({len(rows)}/{minimum_bars})."}
 
     rows=rows[-300:]
     n=len(rows)
@@ -12336,37 +12354,37 @@ def ut_bot_alerts_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
     if any(v<=0 for v in closes[-3:]):
         return {**base,"reason":"UT BOT aguardando candles válidos."}
 
-    # The corrected MQ4 uses ordinary close when h=false. Its optional HA close is OHLC/4.
+    # Corrected MQ4 uses ordinary close when HA=false. Optional HA close is OHLC/4.
     src=[((opens[i]+highs[i]+lows[i]+closes[i])/4.0 if use_heikin else closes[i]) for i in range(n)]
 
-    # True Range and Wilder ATR. ATR(1), the selected setup, equals the current True Range.
+    # True Range + Wilder ATR. With ATR(1), current ATR equals current True Range.
     tr=[0.0]*n
     tr[0]=max(0.0,highs[0]-lows[0])
     for i in range(1,n):
         tr[i]=max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1]))
     period=max(1,int(atr_period))
-    atr=[None]*n
+    atr_series=[None]*n
     if period==1:
-        atr=[float(x) for x in tr]
+        atr_series=[float(x) for x in tr]
         first=0
     else:
         if n<=period:
             return {**base,"reason":"UT BOT aguardando aquecimento do ATR."}
         first=period-1
-        atr[first]=sum(tr[:period])/period
+        atr_series[first]=sum(tr[:period])/period
         for i in range(first+1,n):
-            atr[i]=((float(atr[i-1])*(period-1))+tr[i])/period
+            atr_series[i]=((float(atr_series[i-1])*(period-1))+tr[i])/period
 
-    # Recursive xATRTrailingStop, processed oldest -> newest exactly like the fixed MQ4.
+    # Recursive xATRTrailingStop, oldest -> newest, causal and closed-candle only.
     stop=[None]*n
-    a0=float(atr[first] or 0.0)
+    a0=float(atr_series[first] or 0.0)
     if a0<=0.0:
         return {**base,"reason":"UT BOT aguardando volatilidade para formar o trailing stop."}
     stop[first]=src[first]-float(key_value)*a0
     last_cross_up=False
     last_cross_dn=False
     for i in range(first+1,n):
-        a=float(atr[i] or 0.0)
+        a=float(atr_series[i] or 0.0)
         if a<=0.0:
             stop[i]=stop[i-1]
             continue
@@ -12387,36 +12405,96 @@ def ut_bot_alerts_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
     i=n-1
     trail=float(stop[i])
     prev_trail=float(stop[i-1])
-    atr_now=max(float(atr[i] or 0.0),1e-12)
-    direction="CALL" if last_cross_up and not last_cross_dn else ("PUT" if last_cross_dn and not last_cross_up else "NEUTRO")
+    atr_now=max(float(atr_series[i] or 0.0),1e-12)
+    raw_direction="CALL" if last_cross_up and not last_cross_dn else ("PUT" if last_cross_dn and not last_cross_up else "NEUTRO")
     distance=abs(src[i]-trail)/atr_now
-    body=abs(closes[i]-opens[i])/atr_now
+    body_atr=abs(closes[i]-opens[i])/atr_now
+    candle_range=max(highs[i]-lows[i],1e-12)
+    body_ratio=abs(closes[i]-opens[i])/candle_range
+
+    # ---- Accuracy layer: 4 light confirmations, only evaluated after UT cross. ----
+    ema50=ema(closes, UTBOT_EMA_PERIOD)
+    adx14=adx(rows, UTBOT_ADX_PERIOD)
+    ema_ok=False
+    if ema50 is not None:
+        ema_ok=(raw_direction=="CALL" and closes[i]>=float(ema50)) or (raw_direction=="PUT" and closes[i]<=float(ema50))
+    adx_ok=bool(adx14 is not None and float(adx14)>=UTBOT_ADX_MIN)
+    force_ok=bool(body_ratio>=UTBOT_BODY_MIN_RATIO and (
+        (raw_direction=="CALL" and closes[i]>opens[i]) or
+        (raw_direction=="PUT" and closes[i]<opens[i])
+    ))
+
+    history_start=max(0, i-UTBOT_SR_LOOKBACK)
+    hist_highs=highs[history_start:i]
+    hist_lows=lows[history_start:i]
+    resistance=max(hist_highs) if hist_highs else highs[i]
+    support=min(hist_lows) if hist_lows else lows[i]
+    sr_buffer=max(atr_now*UTBOT_SR_BUFFER_ATR, abs(closes[i])*0.00008, 1e-12)
+    # S/R is deliberately light: reject only when the entry would run directly
+    # into the opposing level. A candle already closed beyond the level is treated
+    # as a breakout and remains eligible.
+    if raw_direction=="CALL":
+        sr_ok=not (closes[i] < resistance and (resistance-closes[i]) <= sr_buffer)
+        sr_distance=(resistance-closes[i])/atr_now
+    elif raw_direction=="PUT":
+        sr_ok=not (closes[i] > support and (closes[i]-support) <= sr_buffer)
+        sr_distance=(closes[i]-support)/atr_now
+    else:
+        sr_ok=False
+        sr_distance=0.0
+
+    checks={"ema50":bool(ema_ok),"adx18":bool(adx_ok),"force_candle":bool(force_ok),"sr_free":bool(sr_ok)}
+    score=sum(1 for ok in checks.values() if ok)
+    passed=[k for k,v in checks.items() if v]
+    failed=[k for k,v in checks.items() if not v]
     diagnostics={
         "source":round(src[i],8),"source_prev":round(src[i-1],8),
         "atr":round(atr_now,8),"trail":round(trail,8),"trail_prev":round(prev_trail,8),
         "cross_up":last_cross_up,"cross_down":last_cross_dn,
-        "distance_atr":round(distance,3),"body_atr":round(body,3),
+        "distance_atr":round(distance,3),"body_atr":round(body_atr,3),
+        "body_ratio":round(body_ratio,3),"force_body_min":round(UTBOT_BODY_MIN_RATIO,3),
+        "ema_period":UTBOT_EMA_PERIOD,"ema50":round(float(ema50),8) if ema50 is not None else None,"ema_ok":bool(ema_ok),
+        "adx_period":UTBOT_ADX_PERIOD,"adx":round(float(adx14),2) if adx14 is not None else None,"adx_min":UTBOT_ADX_MIN,"adx_ok":bool(adx_ok),
+        "support":round(float(support),8),"resistance":round(float(resistance),8),"sr_buffer":round(float(sr_buffer),8),
+        "sr_distance_atr":round(float(sr_distance),3),"sr_ok":bool(sr_ok),
+        "confirmation_score":score,"confirmation_required":UTBOT_MIN_CONFIRMATIONS,
+        "confirmations_passed":passed,"confirmations_failed":failed,
         "key":float(key_value),"atr_period":period,"heikin":bool(use_heikin),
         "future_leak":False,
     }
-    if direction=="NEUTRO":
+    if raw_direction=="NEUTRO":
         side="acima" if src[i]>trail else "abaixo"
         return {**base,
-            "confidence":round(clamp(58.0+min(14.0,distance*7.0),58.0,72.0),1),
-            "reason":f"UT BOT monitorando • preço {side} do trailing ATR • aguardando NOVO cruzamento confirmado no candle fechado • próxima vela.",
+            "confidence":round(clamp(56.0+min(12.0,distance*6.0),56.0,68.0),1),
+            "reason":f"UT BOT monitorando • preço {side} do trailing ATR • aguardando NOVO cruzamento confirmado no candle fechado • filtro 2/4 preparado.",
+            "diagnostics":diagnostics,
+        }
+
+    # New UT cross exists, but the quality score may veto it.
+    if score < UTBOT_MIN_CONFIRMATIONS:
+        labels={"ema50":"EMA50","adx18":"ADX≥18","force_candle":"vela de força","sr_free":"S/R livre"}
+        missing=", ".join(labels.get(x,x) for x in failed)
+        conf=clamp(67.0+score*4.0+min(3.0,distance*2.0),67.0,79.0)
+        return {**base,
+            "confidence":round(conf,1),
+            "reason":f"{raw_direction} UT BOT detectado, mas BLOQUEADO pela qualidade • {score}/4 confirmações (mínimo {UTBOT_MIN_CONFIRMATIONS}) • faltou: {missing}.",
+            "raw_direction":raw_direction,
             "diagnostics":diagnostics,
         }
 
     cross_strength=abs(src[i]-trail)/atr_now
-    conf=clamp(82.0+min(7.0,cross_strength*5.0)+min(5.0,body*2.5),82.0,94.0)
+    # 2/4 ~= 84+, 3/4 ~= 88+, 4/4 ~= 92+, with a small strength bonus.
+    conf=clamp(78.0+(score*3.0)+min(4.0,cross_strength*2.5)+min(2.0,max(0.0,body_ratio-UTBOT_BODY_MIN_RATIO)*5.0),82.0,95.0)
+    risk="LOW" if score>=3 and conf>=88.0 else "MEDIUM"
+    labels={"ema50":"EMA50","adx18":"ADX≥18","force_candle":"VELA FORTE","sr_free":"S/R LIVRE"}
+    confirms=" + ".join(labels.get(x,x) for x in passed)
     stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or i)
     return {**base,
-        "direction":direction,"confidence":round(conf,1),"confirmed":True,
-        "risk":"LOW" if conf>=88.0 else "MEDIUM",
-        "reason":f"{direction} UT BOT confirmado • preço cruzou o trailing ATR (Key 2 / ATR 1) no candle fechado • entrada na próxima vela • sem Gale.",
-        "event_key":f"UTBOT:{direction}:{stamp}","diagnostics":diagnostics,
+        "direction":raw_direction,"confidence":round(conf,1),"confirmed":True,
+        "risk":risk,
+        "reason":f"{raw_direction} UT BOT confirmado • cruzamento Key 2 / ATR 1 + {score}/4 confirmações ({confirms}) • candle fechado • entrada na próxima vela • sem Gale.",
+        "event_key":f"UTBOT:{raw_direction}:{stamp}","diagnostics":diagnostics,
     }
-
 
 def brooky_vertex_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     """BROOKY FLEX 30/70 + VERTEX ±6 — SECOND PROFILE.
@@ -19344,7 +19422,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "KAMIKAZE TREND SNIPER • EMA8/21 + EMA200 + ADX14 + RSI14" if engine == "KAMIKAZE"
                     else "FOREX MEGA LLC • EMA5/9 + MACD8/17/9 + RSI9 + CCI13 + STOCH5/3/3" if engine == "FOREXMEGA"
                     else "BROOKY + VERTEX FLEX 30/70 • VERTEX ±6 • RÍGIDO" if engine == "BROOKYVERTEX"
-                    else "UT BOT ALERTS • ATR 1 • KEY 2" if engine == "UTBOT"
+                    else "UT BOT ALERTS • CONFLUÊNCIA 2/4" if engine == "UTBOT"
                     else "TRENDLINES MTF FLEX • M1/M5 + M15 + H1" if engine == "TRENDLINES"
                     else "COMBINER FLOW + RSI" if engine == "COMBINER"
                     else "RSI DIVERGENCE + BOLLINGER 20/2" if engine == "RSIDIVBB"
@@ -31872,7 +31950,7 @@ function applyRobotPowerState(){
   if(kamikazeModeDesc) kamikazeModeDesc.textContent=kamikazeEnabled?'ONLINE: cruzamento REAL EMA8/21 + EMA200 + ADX14≥22 + RSI14 • candle fechado • próxima vela • sem Gale.':'OFFLINE: KAMIKAZE TREND SNIPER pausado.';
   if(forexMegaModeDesc) forexMegaModeDesc.textContent=forexMegaEnabled?'ONLINE: M1 5/5 • EMA5/9 + MACD8/17/9 + RSI9 + CCI13 + Stoch5/3/3 • M5 bônus leve • próxima vela • sem Gale.':'OFFLINE: FOREX MEGA LLC pausado.';
   if(brookyVertexModeDesc) brookyVertexModeDesc.textContent=brookyVertexEnabled?'ONLINE: Brooky Stoch14/5/5 + RSI14 FLEX 30/70 + NOVA virada Vertex causal ±6 • mesma vela fechada • próxima vela M1 • sem Gale.':'OFFLINE: BROOKY + VERTEX FLEX pausado.';
-  if(utBotModeDesc) utBotModeDesc.textContent=utBotEnabled?'ONLINE: UT Bot ATR 1 + Key 2 • Heikin Ashi OFF • cruzamento em candle fechado • próxima vela M1 • sem Gale.':'OFFLINE: UT BOT ALERTS pausado.';
+  if(utBotModeDesc) utBotModeDesc.textContent=utBotEnabled?'ONLINE: UT Bot Key 2 + ATR 1 • filtro 2/4: EMA50, ADX≥18, vela forte e S/R livre • candle fechado • próxima vela M1 • sem Gale.':'OFFLINE: UT BOT ALERTS pausado.';
   if(valueMacdModeDesc) valueMacdModeDesc.textContent=valueMacdEnabled?'ONLINE: Value Chart 5/±8 + ZeroLag MACD 12/26/9 • confluência obrigatória • próxima vela • sem Gale.':'OFFLINE: VALUE CHART + MACD pausado.';
   if(robotPowerBtn){
     robotPowerBtn.textContent=robotEnabled?'🟢 ONLINE':'🔴 OFFLINE';
@@ -32278,9 +32356,9 @@ function applyRobotPowerState(){
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧩 BROOKY + VERTEX selecionado • aguarda Brooky FLEX 30/70 e uma NOVA virada Vertex causal ±6 na mesma vela fechada • M1 • sem Gale.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar BROOKY + VERTEX ativo • procurando confluência rígida no candle fechado</div>'; rad();
   }else if(engine==='UTBOT'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='UT BOT ALERTS ONLINE • ATR 1 • KEY 2 • CANDLE FECHADO • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 UT BOT selecionado • aguarda novo cruzamento do preço com o trailing ATR no candle fechado • M1 • sem Gale.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar UT BOT ALERTS ativo • procurando novo cruzamento causal do trailing stop</div>'; rad();
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='UT BOT ONLINE • KEY 2 / ATR 1 • CONFLUÊNCIA 2/4 • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 UT BOT selecionado • cruzamento obrigatório + mínimo 2/4: EMA50, ADX≥18, vela forte e S/R livre • M1 • próxima vela • sem Gale.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar UT BOT ativo • procurando cruzamento + confluência mínima 2/4</div>'; rad();
   }else if(engine==='FOREXMEGA'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='FOREX MEGA LLC ONLINE • 5/5 M1 • EMA5/9 + MACD8/17/9 + RSI9 + CCI13 + STOCH5/3/3 • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🚀 FOREX MEGA LLC selecionado • exige 5/5 no M1 fechado; M5 apenas reforça a confiança • nova confluência somente • sem Gale.</div>';
