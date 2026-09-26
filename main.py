@@ -12795,7 +12795,7 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
       • sem Gale, martingale ou grid.
     """
     rows=list(cs or [])
-    name="MEGA BOT • BROOKY FLEX 30/70 + RD COMBO 3/5"
+    name="MEGA BOT"
     base={
         "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
         "strategy":name,"engine":"MEGABOT","provider":"LOCAL_MEGA_BOT_BROOKY_RD_3OF5",
@@ -12840,8 +12840,9 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         bv=brooky_value(i); bp=brooky_value(i-1)
         if bv is None or bp is None or dline[i] is None: continue
         recent=[kline[j] for j in range(max(0,i-2),i+1) if kline[j] is not None]
-        brooky_bull[i]=bool(recent and any(float(v)<=30.0 for v in recent) and bv>bp and float(kline[i])>=float(dline[i]))
-        brooky_bear[i]=bool(recent and any(float(v)>=70.0 for v in recent) and bv<bp and float(kline[i])<=float(dline[i]))
+        # Confluência 3 levemente mais solta: zona 32/68 em vez de 30/70.
+        brooky_bull[i]=bool(recent and any(float(v)<=32.0 for v in recent) and bv>bp and float(kline[i])>=float(dline[i]))
+        brooky_bear[i]=bool(recent and any(float(v)>=68.0 for v in recent) and bv<bp and float(kline[i])<=float(dline[i]))
 
     # ---------- RD factor 1: LWMA 5/20 ----------
     def lwma_series(values,period):
@@ -12959,9 +12960,8 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     direction=signal_dir[i] or "NEUTRO"
     bv=brooky_value(i); bp=brooky_value(i-1) if i>0 else None
     recent_k=[float(kline[j]) for j in range(max(0,i-2),i+1) if kline[j] is not None]
-    # Progresso visual simples do MEGA BOT (sem expor o nome dos filtros).
-    # 1/3 = já existe viés técnico; 2/3 = RD atingiu o mínimo 3/5;
-    # 3/3 = confluência final Brooky + RD confirmada e sinal pronto.
+    # Progresso visual do MEGA BOT.
+    # 1/3 = Direção técnica; 2/3 = Combo 3/5; 3/3 = Brooky FLEX confirmado e sinal pronto.
     rd_abs=abs(int(rd_score[i]))
     confluence_progress=(3 if direction in ("CALL","PUT") else (2 if rd_abs>=3 else (1 if rd_abs>=1 else 0)))
     diagnostics={
@@ -12985,7 +12985,7 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         side="comprador" if rd_score[i]>=3 else ("vendedor" if rd_score[i]<=-3 else "sem 3/5")
         return {**base,
             "confidence":round(clamp(56.0+abs(rd_score[i])*4.0,56.0,74.0),1),
-            "reason":f"MEGA BOT monitorando • RD {rd_score[i]:+d}/5 ({side}) • aguardando Brooky FLEX 30/70 + RD 3/5 concordarem na janela de 2 candles fechados.",
+            "reason":f"MEGA BOT monitorando • Combo {rd_score[i]:+d}/5 ({side}) • aguardando Direção Técnica + Combo 3/5 + Brooky FLEX concordarem na janela de 2 candles fechados.",
             "diagnostics":diagnostics,
         }
 
@@ -12996,7 +12996,7 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     return {**base,
         "direction":direction,"confidence":round(conf,1),"confirmed":True,
         "risk":"LOW" if conf>=89.0 else "MEDIUM",
-        "reason":f"{direction} MEGA BOT confirmado • Brooky FLEX 30/70 + RD Combo {rd_score[i]:+d}/5 (mínimo 3/5) • janela 2 • candle fechado • entrada na próxima vela • sem Gale.",
+        "reason":f"{direction} MEGA BOT confirmado • Direção Técnica + Combo {rd_score[i]:+d}/5 + Brooky FLEX • janela 2 • candle fechado • entrada na próxima vela • sem Gale.",
         "event_key":f"MEGABOT:{direction}:{stamp}","diagnostics":diagnostics,
     }
 
@@ -19963,7 +19963,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "KAMIKAZE TREND SNIPER • EMA8/21 + EMA200 + ADX14 + RSI14" if engine == "KAMIKAZE"
                     else "FOREX MEGA LLC • EMA5/9 + MACD8/17/9 + RSI9 + CCI13 + STOCH5/3/3" if engine == "FOREXMEGA"
                     else "BROOKY + VERTEX FLEX 30/70 • VERTEX ±6 • RÍGIDO" if engine == "BROOKYVERTEX"
-                    else "MEGA BOT • BROOKY FLEX 30/70 + RD COMBO 3/5" if engine == "MEGABOT"
+                    else "MEGA BOT" if engine == "MEGABOT"
                     else "UT BOT ALERTS • CONFLUÊNCIA 2/4" if engine == "UTBOT"
                     else "ONE MINUTE + RSI • PER 9 • RSI7 30/70" if engine == "ONEMINRSI"
                     else "WPR ADAPTIVE • 67/33 • RISK 3 • NEXT CANDLE" if engine == "WPRADAPT"
@@ -24493,7 +24493,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                data["feed_message"] = {"INDICEMENT":"INDICEMENT SMA12/26 usando candles fechados.","GOLDINV":"FOREX GOLD INVESTOR usando PSAR H1 + M15 + M1.","TTMSCALPER":"TTM SCALPER usando confirmação causal de swings.","FOREXMISSION":"FOREX MISSION usando candles fechados.","MONEYARROW":"BINARY MONEYARROW usando pivôs e rejeição em candles fechados.","LIQUIDEX":"LIQUIDEX usando LWMA7 + vela de força fechada.","EUROFX2":"EURO FX2 usando a inclinação do MACD principal 14/26/9 em candles fechados.","EUROFX2TAURUS":"EURO FX2 + Taurus: virada MACD 14/26/9 confirmada por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","ATE":"ATE usando Harvester adaptado + ZeroLag MACD 22/33/9 em candles fechados.","FOREXSTAY":"FOREXSTAY SIGHT usando ZeroLag MACD 12/26/9 em candles fechados.","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + Taurus: cruzamento ZeroLag 12/26/9 confirmado por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","FOREXSTAYPRO":"FOREXSTAY PRO usando ZeroLag 12/26/9 com janela de 3 velas + EMA50 flex + ADX14≥12 + RSI20/80 + corpo≥20% + S/R leve.","FOREXFLEX":"FOREX FLEX usando fractal causal totalmente confirmado em candles fechados.","SENEGALPRO":"SUPER SENEGAL PRO usando PMAX/Z + ADX/DMI com pullback e Price Action em candles fechados.","VALUEMACD":"VALUE CHART + MACD usando Value Chart 5/±8 + ZeroLag MACD 12/26/9 em confluência.","HOLYGRAIL":"HOLY GRAIL FLEX usando Envelopes LWMA 3/0,07% com 2 de 3 confirmações fortes em M1.","BBSTOCH":"BB STOCHRSI X REVERSAL usando Bollinger 20/2 + StochRSI 14/14/3/3, extremos 90/10 e retorno para dentro da banda em candle fechado.","KAMIKAZE":"KAMIKAZE TREND SNIPER usando cruzamento real EMA8/21 + filtro EMA200 + ADX14≥22 + RSI14 em candle fechado.","FOREXMEGA":"FOREX MEGA LLC usando EMA5/9 + MACD8/17/9 + RSI9 + CCI13 + Stoch5/3/3 em confluência 5/5 no M1; M5 é bônus leve.","BROOKYVERTEX":"BROOKY + VERTEX SECOND usando Brooky Stoch14/5/5 + RSI14 FLEX 30/70 e NOVA virada Vertex causal ±6 na mesma vela fechada; próxima vela, sem Gale.","MEGABOT":"MEGA BOT usando Brooky FLEX 30/70 + RD-Combo mínimo 3/5, janela de 2 candles e cooldown 3; candle fechado, próxima vela, sem Gale.","UTBOT":"UT BOT ALERTS usando trailing stop ATR 1 com Key 2, cruzamento confirmado em candle fechado e entrada na próxima vela; sem Gale.","ONEMINRSI":"ONE MINUTE + RSI usando faixa das últimas 9 velas + zona 30% + RSI Wilder 7 em 30/70; candle fechado e próxima vela; sem Gale.","WPRADAPT":"WPR ADAPTIVE usando níveis 67/33, Risk 3 e período adaptativo 9→3/4; somente candle fechado, entrada na próxima vela, sem Gale.","TRENDLINES":"TRENDLINES MTF FLEX usando gatilho M1/M5, M15 como confirmação leve e H1 só como bônus."}.get(engine, "Motor importado ativo.")
+                data["feed_message"] = {"INDICEMENT":"INDICEMENT SMA12/26 usando candles fechados.","GOLDINV":"FOREX GOLD INVESTOR usando PSAR H1 + M15 + M1.","TTMSCALPER":"TTM SCALPER usando confirmação causal de swings.","FOREXMISSION":"FOREX MISSION usando candles fechados.","MONEYARROW":"BINARY MONEYARROW usando pivôs e rejeição em candles fechados.","LIQUIDEX":"LIQUIDEX usando LWMA7 + vela de força fechada.","EUROFX2":"EURO FX2 usando a inclinação do MACD principal 14/26/9 em candles fechados.","EUROFX2TAURUS":"EURO FX2 + Taurus: virada MACD 14/26/9 confirmada por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","ATE":"ATE usando Harvester adaptado + ZeroLag MACD 22/33/9 em candles fechados.","FOREXSTAY":"FOREXSTAY SIGHT usando ZeroLag MACD 12/26/9 em candles fechados.","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + Taurus: cruzamento ZeroLag 12/26/9 confirmado por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","FOREXSTAYPRO":"FOREXSTAY PRO usando ZeroLag 12/26/9 com janela de 3 velas + EMA50 flex + ADX14≥12 + RSI20/80 + corpo≥20% + S/R leve.","FOREXFLEX":"FOREX FLEX usando fractal causal totalmente confirmado em candles fechados.","SENEGALPRO":"SUPER SENEGAL PRO usando PMAX/Z + ADX/DMI com pullback e Price Action em candles fechados.","VALUEMACD":"VALUE CHART + MACD usando Value Chart 5/±8 + ZeroLag MACD 12/26/9 em confluência.","HOLYGRAIL":"HOLY GRAIL FLEX usando Envelopes LWMA 3/0,07% com 2 de 3 confirmações fortes em M1.","BBSTOCH":"BB STOCHRSI X REVERSAL usando Bollinger 20/2 + StochRSI 14/14/3/3, extremos 90/10 e retorno para dentro da banda em candle fechado.","KAMIKAZE":"KAMIKAZE TREND SNIPER usando cruzamento real EMA8/21 + filtro EMA200 + ADX14≥22 + RSI14 em candle fechado.","FOREXMEGA":"FOREX MEGA LLC usando EMA5/9 + MACD8/17/9 + RSI9 + CCI13 + Stoch5/3/3 em confluência 5/5 no M1; M5 é bônus leve.","BROOKYVERTEX":"BROOKY + VERTEX SECOND usando Brooky Stoch14/5/5 + RSI14 FLEX 30/70 e NOVA virada Vertex causal ±6 na mesma vela fechada; próxima vela, sem Gale.","MEGABOT":"MEGA BOT usando Direção Técnica + Combo 3/5 + Brooky FLEX, janela de 2 candles e cooldown 3; candle fechado, próxima vela, sem Gale.","UTBOT":"UT BOT ALERTS usando trailing stop ATR 1 com Key 2, cruzamento confirmado em candle fechado e entrada na próxima vela; sem Gale.","ONEMINRSI":"ONE MINUTE + RSI usando faixa das últimas 9 velas + zona 30% + RSI Wilder 7 em 30/70; candle fechado e próxima vela; sem Gale.","WPRADAPT":"WPR ADAPTIVE usando níveis 67/33, Risk 3 e período adaptativo 9→3/4; somente candle fechado, entrada na próxima vela, sem Gale.","TRENDLINES":"TRENDLINES MTF FLEX usando gatilho M1/M5, M15 como confirmação leve e H1 só como bônus."}.get(engine, "Motor importado ativo.")
             elif engine == "EA":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -28008,7 +28008,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
   <div class="robot-mode-card" id="megaBotModeCard">
     <img src="__MEGA_IMAGE__" alt="Mega Bot">
-    <div class="robot-mode-copy"><div class="robot-mode-title">🤖 MEGA BOT</div><div class="robot-mode-desc" id="megaBotModeDesc">Brooky Stoch14/5/5 + RSI14 FLEX 30/70 • RD-Combo 3/5 • janela 2 velas • cooldown 3 • candle fechado • próxima vela • sem Gale.</div></div>
+    <div class="robot-mode-copy"><div class="robot-mode-title">🤖 MEGA BOT</div><div class="robot-mode-desc" id="megaBotModeDesc">Direção Técnica + Combo 3/5 + Brooky FLEX • janela 2 velas • cooldown 3 • candle fechado • próxima vela • sem Gale.</div></div>
     <button id="megaBotPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
   <div class="robot-mode-card" id="brookyVertexModeCard">
@@ -28076,9 +28076,9 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         <div id="status" class="big" style="font-size:18px">MONITORANDO</div>
         <div id="risk">Risco: --</div>
         <div id="megaBotConfluences" style="display:none;margin-top:16px;padding-top:12px;border-top:1px solid rgba(148,163,184,.22);gap:8px">
-          <div id="megaConf1" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf1Icon">○</span><span>Confluência 1</span><span id="megaConf1State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
-          <div id="megaConf2" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf2Icon">○</span><span>Confluência 2</span><span id="megaConf2State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
-          <div id="megaConf3" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf3Icon">○</span><span>Confluência 3</span><span id="megaConf3State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
+          <div id="megaConf1" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf1Icon">○</span><span>Confluência 1 • Direção Técnica</span><span id="megaConf1State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
+          <div id="megaConf2" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf2Icon">○</span><span>Confluência 2 • Combo 3/5</span><span id="megaConf2State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
+          <div id="megaConf3" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf3Icon">○</span><span>Confluência 3 • Brooky FLEX</span><span id="megaConf3State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
           <div id="megaConfReady" style="margin-top:3px;font-size:13px;font-weight:900;letter-spacing:.03em;opacity:.82">Confluências: 0/3</div>
         </div>
       </div>
@@ -32658,7 +32658,7 @@ function applyRobotPowerState(){
   if(bbStochModeDesc) bbStochModeDesc.textContent=bbStochEnabled?'ONLINE: BB20/2 + StochRSI 14/14/3/3 • extremos 90/10 • retorno confirmado • próxima vela • sem Gale.':'OFFLINE: BB STOCHRSI X REVERSAL pausado.';
   if(kamikazeModeDesc) kamikazeModeDesc.textContent=kamikazeEnabled?'ONLINE: cruzamento REAL EMA8/21 + EMA200 + ADX14≥22 + RSI14 • candle fechado • próxima vela • sem Gale.':'OFFLINE: KAMIKAZE TREND SNIPER pausado.';
   if(forexMegaModeDesc) forexMegaModeDesc.textContent=forexMegaEnabled?'ONLINE: M1 5/5 • EMA5/9 + MACD8/17/9 + RSI9 + CCI13 + Stoch5/3/3 • M5 bônus leve • próxima vela • sem Gale.':'OFFLINE: FOREX MEGA LLC pausado.';
-  if(megaBotModeDesc) megaBotModeDesc.textContent=megaBotEnabled?'ONLINE: Brooky FLEX 30/70 + RD-Combo 3/5 • janela 2 • cooldown 3 • candle fechado • próxima vela • sem Gale.':'OFFLINE: MEGA BOT pausado.';
+  if(megaBotModeDesc) megaBotModeDesc.textContent=megaBotEnabled?'ONLINE: Direção Técnica + Combo 3/5 + Brooky FLEX • janela 2 • cooldown 3 • candle fechado • próxima vela • sem Gale.':'OFFLINE: MEGA BOT pausado.';
   if(brookyVertexModeDesc) brookyVertexModeDesc.textContent=brookyVertexEnabled?'ONLINE: Brooky Stoch14/5/5 + RSI14 FLEX 30/70 + NOVA virada Vertex causal ±6 • mesma vela fechada • próxima vela M1 • sem Gale.':'OFFLINE: BROOKY + VERTEX FLEX pausado.';
   if(utBotModeDesc) utBotModeDesc.textContent=utBotEnabled?'ONLINE: UT Bot Key 2 + ATR 1 • filtro 2/4: EMA50, ADX≥18, vela forte e S/R livre • candle fechado • próxima vela M1 • sem Gale.':'OFFLINE: UT BOT ALERTS pausado.';
   if(oneMinRsiModeDesc) oneMinRsiModeDesc.textContent=oneMinRsiEnabled?'ONLINE: faixa de 9 velas + zona 30% + RSI Wilder 7 (30/70) • candle fechado • próxima vela M1 • sem Gale.':'OFFLINE: ONE MINUTE + RSI pausado.';
@@ -33064,9 +33064,9 @@ function applyRobotPowerState(){
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🥷 KAMIKAZE selecionado • aguarda novo cruzamento EMA8/21 e confirma com EMA200, ADX14 e RSI14 • candle fechado • sem Gale.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar KAMIKAZE ativo • procurando novo cruzamento EMA8/21 com tendência/força confirmadas</div>'; rad();
   }else if(engine==='MEGABOT'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MEGA BOT ONLINE • BROOKY FLEX 30/70 + RD COMBO 3/5 • JANELA 2 • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 MEGA BOT selecionado • Brooky + RD 3/5.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar MEGA BOT ativo • aguardando confluência Brooky + RD 3/5</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MEGA BOT ONLINE • 3 CONFLUÊNCIAS • JANELA 2 • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 MEGA BOT selecionado • Direção Técnica + Combo 3/5 + Brooky FLEX.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar MEGA BOT ativo • aguardando as 3 confluências</div>';
     rad();
   }else if(engine==='BROOKYVERTEX'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='BROOKY + VERTEX ONLINE • FLEX 30/70 + VERTEX ±6 • CONFLUÊNCIA RÍGIDA • PRÓXIMA VELA';
