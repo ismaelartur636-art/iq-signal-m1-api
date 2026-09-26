@@ -25792,6 +25792,50 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     if direction != "NEUTRO"
                     else f"{engine_label} • MONITORANDO"
                 )
+            elif engine == "TRENDLINES":
+                # O radar precisa usar exatamente o mesmo núcleo do TRENDLINES MTF
+                # usado no painel. Sem este bloco, o TRENDLINES caía no fallback
+                # genérico abaixo e o radar acabava executando IA GRÁFICA.
+                if interval != "1min":
+                    tech = {
+                        "available": True,
+                        "direction": "NEUTRO",
+                        "confidence": 0.0,
+                        "confirmed": False,
+                        "risk": "HIGH",
+                        "strategy": "TRENDLINES MTF FLEX • M1/M5 + M15 + H1",
+                        "engine": "TRENDLINES",
+                        "provider": "LOCAL_TRENDLINES_MTF_FLEX",
+                        "reason": "TRENDLINES MTF FLEX usa M1 como candle de entrada. Selecione M1.",
+                        "non_repaint": True,
+                        "closed_candles_only": True,
+                        "next_candle_entry": True,
+                        "gale_signal": False,
+                    }
+                else:
+                    if market == "IQ_OTC":
+                        if not iq_state:
+                            raise RuntimeError("Conecte a IQ Option para o TRENDLINES MTF analisar OTC.")
+                        m15_raw = await iq_ea_candles(iq_state, sym, "15min", 120, regular_market=False)
+                        h1_raw = await iq_ea_candles(iq_state, sym, "1h", 120, regular_market=False)
+                    else:
+                        m15_raw = await candles(sym, "15min", 120, "OPEN", None, request=request)
+                        h1_raw = await candles(sym, "1h", 120, "OPEN", None, request=request)
+                    m15_closed = m15_raw[:-1] if len(m15_raw) > 1 else m15_raw
+                    h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
+                    tech = trendlines_mtf_strategy(
+                        closed, m15_closed, h1_closed,
+                        symbol=sym, timeframe=interval, market=market,
+                    )
+
+                engine_label = "TRENDLINES MTF"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "TRENDLINES MTF monitorando").replace("\n", " ")[:88]
+                status_text = (
+                    f"{engine_label} • OPORTUNIDADE ENCONTRADA"
+                    if direction != "NEUTRO"
+                    else f"{engine_label} • MONITORANDO • {why}"
+                )
             elif market == "OPEN":
                 if engine == "SMART":
                     tech = await openai_direct_signal(sym, interval, closed, market)
