@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.38"
-PWA_VERSION = "v182"
+APP_VERSION = "3.96.39"
+PWA_VERSION = "v183"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -1487,6 +1487,8 @@ WPRADAPT_X2 = max(5.0, min(49.0, float(os.getenv("WPRADAPT_X2", "33"))))
 WPRADAPT_RISK = max(0, min(10, int(os.getenv("WPRADAPT_RISK", "3"))))
 
 # MEGA IA 3.96.38 — WPR ADAPTIVE 67/33 + Risk 3, candle fechado -> próxima vela.
+# MEGA IA 3.96.39 — MEGA BOT: Confluência 3 Brooky ajustada para 31/69 (mais seletiva que 32/68).
+# Confluências 1 e 2, janela 2 e cooldown 3 permanecem inalterados.
 # MEGA IA 3.96.37 — MEGA BOT: Brooky FLEX 30/70 + RD-Combo 3/5, janela 2, cooldown 3.
 # Candle fechado -> próxima vela; sem Gale. Motor separado no painel e no robô 24h.
 # MEGA IA 3.96.32 — BROOKY + VERTEX FLEX 30/70 adicionado como motor separado.
@@ -12783,10 +12785,10 @@ def wpr_adaptive_next_strategy(cs, symbol="EUR/USD", timeframe="1min", market="O
 
 
 def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """MEGA BOT — Brooky FLEX 30/70 + RD-Combo 3/5.
+    """MEGA BOT — Brooky FLEX 31/69 + RD-Combo 3/5.
 
     Conversão causal da confluência aprovada para o app:
-      • Brooky: Stochastic 14/5/5 + RSI Wilder 14, FLEX 30/70;
+      • Brooky: Stochastic 14/5/5 + RSI Wilder 14, FLEX 31/69;
       • RD-Combo: LWMA 5/20 + CCI 5 + Forecast/T3 + RVI 1 + ADX/DMI 14;
       • RD libera direção com score mínimo absoluto 3 de 5;
       • Brooky e RD podem confirmar dentro de uma janela de 2 candles fechados;
@@ -12802,7 +12804,7 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
         "direct_win_only":True,"gale_signal":False,"martingale":False,"grid":False,
         "expiry_candles":1,"trigger_timeframe":str(timeframe).upper(),
-        "brooky_stochastic":[14,5,5],"brooky_rsi_period":14,"brooky_flex_levels":[30.0,70.0],
+        "brooky_stochastic":[14,5,5],"brooky_rsi_period":14,"brooky_flex_levels":[31.0,69.0],
         "rd_score_threshold":3,"rd_factors":["LWMA_5_20","CCI_5","FORECAST_T3","RVI_1","ADX_DMI_14"],
         "confluence_window":2,"cooldown_bars":3,
     }
@@ -12840,9 +12842,9 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         bv=brooky_value(i); bp=brooky_value(i-1)
         if bv is None or bp is None or dline[i] is None: continue
         recent=[kline[j] for j in range(max(0,i-2),i+1) if kline[j] is not None]
-        # Confluência 3 levemente mais solta: zona 32/68 em vez de 30/70.
-        brooky_bull[i]=bool(recent and any(float(v)<=32.0 for v in recent) and bv>bp and float(kline[i])>=float(dline[i]))
-        brooky_bear[i]=bool(recent and any(float(v)>=68.0 for v in recent) and bv<bp and float(kline[i])<=float(dline[i]))
+        # Confluência 3 ajustada: 31/69, mais seletiva que 32/68 sem voltar à trava de 30/70.
+        brooky_bull[i]=bool(recent and any(float(v)<=31.0 for v in recent) and bv>bp and float(kline[i])>=float(dline[i]))
+        brooky_bear[i]=bool(recent and any(float(v)>=69.0 for v in recent) and bv<bp and float(kline[i])<=float(dline[i]))
 
     # ---------- RD factor 1: LWMA 5/20 ----------
     def lwma_series(values,period):
