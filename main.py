@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.50"
-PWA_VERSION = "v190"
+APP_VERSION = "3.96.51"
+PWA_VERSION = "v191"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -25415,13 +25415,6 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
             "supported":market=="OPEN","operational":market=="OPEN" and ai_ready,
             "reason": "Mais flexível em cenários mistos, desde que o preço não esteja excessivamente lateral e a IA externa esteja disponível."
         },
-        {
-            "key":"SNIPER","name":"SUPER SIGNALS CHANNEL NR","score":clamp(28 + 28*f["rejection"] + 20*f["near_edge"] + 12*clean + 12*f["avg_body_ratio"],0,100),
-            "supported":True,"operational":bool(market=="OPEN" or iq_ready),
-            "reason": ("Canal causal de 24 candles + rejeição confirmada em candle fechado; prepara a próxima vela sem olhar candle futuro."
-                       if market=="OPEN" else
-                       "No OTC usa os candles reais fechados da IQ Option e o mesmo canal causal sem repaint.")
-        },
     ]
     if market!="OPEN":
         for x in defs:
@@ -31508,7 +31501,6 @@ function momentStudyEngineName(key){
     LARRY:'⚡ LARRY BREAKOUT + TAURUS',
     VELOCITY:'⚡ VELOCITY FLOW',
     ALPHAX:'🧬 ALPHAX RELAY',
-    SNIPER:'🎯 SUPER SIGNALS CHANNEL NR',
     BOBSENEGAL:'👑🎯 BOB 05 + SUPER SENEGAL',
     TAURUSSENEGAL:'🐂🎯 TAURUS + SUPER SENEGAL',
     TAURUSEA:'🐂⚙️ TAURUS EA',
@@ -31576,10 +31568,22 @@ function renderMomentStudy(){
     return;
   }
 
-  if(summary) summary.textContent=d.summary||'Estudo concluído.';
+  if(summary){
+    const studySummary=String(d.summary||'Estudo concluído.');
+    summary.textContent=studySummary.toUpperCase().includes('SUPER SIGNALS CHANNEL NR')
+      ? 'Estudo atualizado com os motores atualmente disponíveis.'
+      : studySummary;
+  }
   if(regime) regime.textContent='REGIME: '+String(d.market_regime||'--');
-  const leader=String(d.recommended_engine||'').toUpperCase();
-  const engines=Array.isArray(d.engines)?d.engines:[];
+  const leaderRaw=String(d.recommended_engine||'').toUpperCase();
+  const leader=(leaderRaw==='SNIPER')?'':leaderRaw;
+  // MEGA IA 3.96.51 — proteção contra resposta/cache antigo do estudo.
+  // SUPER SIGNALS CHANNEL NR (slot SNIPER) foi retirado apenas deste quadro.
+  const engines=(Array.isArray(d.engines)?d.engines:[]).filter(e=>{
+    const k=String((e&&e.key)||'').toUpperCase();
+    const n=String((e&&e.name)||'').toUpperCase();
+    return k!=='SNIPER' && !n.includes('SUPER SIGNALS CHANNEL NR');
+  });
 
   grid.innerHTML=engines.map(e=>{
     const key=String(e.key||'').toUpperCase();
