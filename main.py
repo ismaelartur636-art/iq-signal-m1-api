@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.40"
+APP_VERSION = "3.96.41"
 PWA_VERSION = "v184"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -1487,6 +1487,10 @@ WPRADAPT_X2 = max(5.0, min(49.0, float(os.getenv("WPRADAPT_X2", "33"))))
 WPRADAPT_RISK = max(0, min(10, int(os.getenv("WPRADAPT_RISK", "3"))))
 
 # MEGA IA 3.96.38 — WPR ADAPTIVE 67/33 + Risk 3, candle fechado -> próxima vela.
+# MEGA IA 3.96.41 — MEGA BOT + WPR ADAPTIVE integrado.
+# Mantém C1 Direção Técnica, C2 RD-Combo 3/5 e C3 Brooky FLEX 31/69 sem alteração.
+# WPR 67/33 Risk 3 entra como filtro direcional: confirma/reforça quando alinha,
+# bloqueia somente quando houver sinal WPR fechado explicitamente contrário; neutro não trava.
 # MEGA IA 3.96.40 — MEGA BOT: 3 confluências realmente independentes.
 # C1 = EMA 9/21 + inclinação EMA9 + estrutura; C2 = RD-Combo 3/5; C3 = Brooky FLEX 31/69.
 # As três precisam apontar o mesmo lado na janela de 2 candles; cooldown 3.
@@ -12786,7 +12790,7 @@ def wpr_adaptive_next_strategy(cs, symbol="EUR/USD", timeframe="1min", market="O
 
 
 def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """MEGA BOT — 3 confluências independentes: Técnica + RD 3/5 + Brooky 31/69.
+    """MEGA BOT + WPR ADAPTIVE — 3 confluências-base + filtro direcional WPR.
 
     Conversão causal da confluência aprovada para o app:
       • Confluência 1 (independente): EMA 9/21 + inclinação da EMA9 + estrutura do preço;
@@ -12794,6 +12798,8 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
       • Confluência 3: Brooky Stochastic 14/5/5 + RSI Wilder 14, FLEX 31/69;
       • RD libera direção com score mínimo absoluto 3 de 5;
       • as três confirmações precisam apontar o MESMO lado dentro de 2 candles fechados;
+      • WPR Adaptive 67/33, Risk 3: se confirmar no mesmo lado, reforça a entrada;
+        se confirmar explicitamente no lado oposto, bloqueia; quando neutro, não trava o sinal;
       • cooldown histórico de 3 candles para evitar repetição;
       • sinal somente após candle fechado, entrada na próxima vela, expiração 1 candle;
       • sem Gale, martingale ou grid.
@@ -12802,7 +12808,7 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     name="MEGA BOT"
     base={
         "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
-        "strategy":name,"engine":"MEGABOT","provider":"LOCAL_MEGA_BOT_EMA_STRUCTURE_RD_BROOKY",
+        "strategy":name,"engine":"MEGABOT","provider":"LOCAL_MEGA_BOT_EMA_STRUCTURE_RD_BROOKY_WPR",
         "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
         "direct_win_only":True,"gale_signal":False,"martingale":False,"grid":False,
         "expiry_candles":1,"trigger_timeframe":str(timeframe).upper(),
@@ -12810,6 +12816,8 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         "brooky_stochastic":[14,5,5],"brooky_rsi_period":14,"brooky_flex_levels":[31.0,69.0],
         "rd_score_threshold":3,"rd_factors":["LWMA_5_20","CCI_5","FORECAST_T3","RVI_1","ADX_DMI_14"],
         "confluence_window":2,"cooldown_bars":3,
+        "wpr_adaptive_filter":True,"wpr_filter_mode":"CONFIRM_OR_VETO",
+        "wpr_x1":float(WPRADAPT_X1),"wpr_x2":float(WPRADAPT_X2),"wpr_risk":int(WPRADAPT_RISK),
     }
     if len(rows)<90:
         return {**base,"reason":f"MEGA BOT coletando candles fechados ({len(rows)}/90)."}
@@ -12822,6 +12830,15 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     closes=[float(x.get("close") or 0.0) for x in rows]
     if any(v<=0 for v in closes[-3:]):
         return {**base,"reason":"MEGA BOT aguardando candles válidos."}
+
+    # ---------- WPR Adaptive integrado: confirmação/filtro, sem travar quando neutro ----------
+    # Reaproveita exatamente a estratégia WPR causal já validada no app. O WPR só veta
+    # uma entrada quando houver um NOVO sinal fechado explicitamente no sentido contrário.
+    # Se estiver neutro, as 3 confluências originais do MEGA BOT continuam decidindo.
+    wpr_check=wpr_adaptive_next_strategy(rows, symbol=symbol, timeframe=timeframe, market=market)
+    wpr_dir=str(wpr_check.get("direction") or "NEUTRO").upper()
+    wpr_confirmed=bool(wpr_check.get("confirmed")) and wpr_dir in ("CALL","PUT")
+    wpr_diag=dict(wpr_check.get("diagnostics") or {})
 
     # ---------- Confluência 1: Direção Técnica INDEPENDENTE ----------
     # EMA 9/21 define o regime; a EMA9 precisa inclinar no mesmo sentido e a
@@ -13039,26 +13056,44 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         "confluence_2_ok":bool(c2_ok),"confluence_2_direction":c2_dir,
         "confluence_3_ok":bool(c3_ok),"confluence_3_direction":c3_dir,
         "confluences_aligned":bool(confluences_aligned),
+        "wpr_filter_confirmed":bool(wpr_confirmed),"wpr_filter_direction":wpr_dir,
+        "wpr_filter_wpr":wpr_diag.get("wpr"),"wpr_filter_dynamic_period":wpr_diag.get("dynamic_period"),
+        "wpr_filter_lower_trigger":wpr_diag.get("lower_trigger"),"wpr_filter_upper_trigger":wpr_diag.get("upper_trigger"),
+        "wpr_filter_mode":"CONFIRM_OR_VETO",
         "confluence_window":2,"cooldown_bars":3,"future_leak":False,
     }
 
     if direction=="NEUTRO":
         side="comprador" if rd_score[i]>=3 else ("vendedor" if rd_score[i]<=-3 else "sem 3/5")
         align_text=(f"C1 {c1_dir} • C2 {c2_dir} • C3 {c3_dir}")
+        wpr_text=(f"WPR {wpr_dir} OK" if wpr_confirmed else f"WPR neutro ({wpr_diag.get('wpr')})")
         return {**base,
             "confidence":round(clamp(54.0+confluence_progress*5.0+min(8.0,abs(rd_score[i])*1.5),54.0,78.0),1),
-            "reason":f"MEGA BOT monitorando • Direção Técnica EMA9/21+estrutura • Combo {rd_score[i]:+d}/5 ({side}) • Brooky 31/69 • {align_text} • aguardando 3/3 na mesma direção.",
+            "reason":f"MEGA BOT monitorando • Direção Técnica EMA9/21+estrutura • Combo {rd_score[i]:+d}/5 ({side}) • Brooky 31/69 • {align_text} • {wpr_text} • aguardando 3/3 na mesma direção.",
+            "diagnostics":diagnostics,
+        }
+
+    # WPR é um filtro final leve: só bloqueia quando acabou de confirmar o lado OPOSTO.
+    wpr_opposite=bool(wpr_confirmed and wpr_dir!=direction)
+    wpr_aligned=bool(wpr_confirmed and wpr_dir==direction)
+    diagnostics["wpr_filter_aligned"]=wpr_aligned
+    diagnostics["wpr_filter_opposite"]=wpr_opposite
+    if wpr_opposite:
+        return {**base,
+            "confidence":78.0,
+            "reason":f"MEGA BOT 3/3 {direction}, mas WPR ADAPTIVE confirmou {wpr_dir} no candle fechado • entrada bloqueada para evitar conflito de direção.",
             "diagnostics":diagnostics,
         }
 
     gap=0.0 if bv is None or bp is None else abs(float(bv)-float(bp))
     score_strength=max(0,abs(int(rd_score[i]))-3)
-    conf=clamp(84.0+score_strength*3.0+min(6.0,gap*0.35),84.0,95.0)
+    conf=clamp(84.0+score_strength*3.0+min(6.0,gap*0.35)+(3.0 if wpr_aligned else 0.0),84.0,97.0)
     stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or i)
+    wpr_status=(f"WPR ADAPTIVE {wpr_dir} confirmado" if wpr_aligned else "WPR ADAPTIVE neutro — sem bloqueio")
     return {**base,
         "direction":direction,"confidence":round(conf,1),"confirmed":True,
         "risk":"LOW" if conf>=89.0 else "MEDIUM",
-        "reason":f"{direction} MEGA BOT confirmado • EMA9/21 + Estrutura + Combo {rd_score[i]:+d}/5 + Brooky FLEX 31/69 • 3/3 alinhadas • janela 2 • candle fechado • entrada na próxima vela • sem Gale.",
+        "reason":f"{direction} MEGA BOT confirmado • EMA9/21 + Estrutura + Combo {rd_score[i]:+d}/5 + Brooky FLEX 31/69 • 3/3 alinhadas • {wpr_status} • janela 2 • candle fechado • entrada na próxima vela • sem Gale.",
         "event_key":f"MEGABOT:{direction}:{stamp}","diagnostics":diagnostics,
     }
 
@@ -19373,7 +19408,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_mode = "BROOKY_VERTEX_FLEX_30_70_VERTEX_6_RIGID_CAUSAL"
         elif engine == "MEGABOT":
             engine_title = "MEGA BOT"
-            engine_mode = "MEGA_BOT_BROOKY_RD_3OF5_WINDOW2"
+            engine_mode = "MEGA_BOT_3CONF_WPR_FILTER_WINDOW2"
         elif engine == "UTBOT":
             engine_title = "UT BOT ALERTS"
             engine_mode = "UT_BOT_ATR1_KEY2_CLOSED_NEXT_CANDLE"
@@ -19485,7 +19520,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "KAMIKAZE": "LOCAL_KAMIKAZE_TREND_SNIPER",
                     "FOREXMEGA": "LOCAL_FOREX_MEGA_LLC",
                     "BROOKYVERTEX": "LOCAL_BROOKY_VERTEX_FLEX_CAUSAL",
-                    "MEGABOT": "LOCAL_MEGA_BOT_BROOKY_RD_3OF5",
+                    "MEGABOT": "LOCAL_MEGA_BOT_3CONF_WPR_FILTER",
                     "UTBOT": "LOCAL_UT_BOT_ATR_TRAILING",
                     "ONEMINRSI": "LOCAL_ONE_MINUTE_RSI_CONFLUENCE",
                     "WPRADAPT": "LOCAL_WPR_ADAPTIVE_NEXT_CANDLE",
@@ -19970,7 +20005,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "KAMIKAZE": "LOCAL_KAMIKAZE_TREND_SNIPER",
                     "FOREXMEGA": "LOCAL_FOREX_MEGA_LLC",
                     "BROOKYVERTEX": "LOCAL_BROOKY_VERTEX_FLEX_CAUSAL",
-                    "MEGABOT": "LOCAL_MEGA_BOT_BROOKY_RD_3OF5",
+                    "MEGABOT": "LOCAL_MEGA_BOT_3CONF_WPR_FILTER",
                     "UTBOT": "LOCAL_UT_BOT_ATR_TRAILING",
                     "ONEMINRSI": "LOCAL_ONE_MINUTE_RSI_CONFLUENCE",
                     "WPRADAPT": "LOCAL_WPR_ADAPTIVE_NEXT_CANDLE",
@@ -20793,7 +20828,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "KAMIKAZE": "LOCAL_KAMIKAZE_TREND_SNIPER",
                     "FOREXMEGA": "LOCAL_FOREX_MEGA_LLC",
                     "BROOKYVERTEX": "LOCAL_BROOKY_VERTEX_FLEX_CAUSAL",
-                    "MEGABOT": "LOCAL_MEGA_BOT_BROOKY_RD_3OF5",
+                    "MEGABOT": "LOCAL_MEGA_BOT_3CONF_WPR_FILTER",
                     "UTBOT": "LOCAL_UT_BOT_ATR_TRAILING",
                     "ONEMINRSI": "LOCAL_ONE_MINUTE_RSI_CONFLUENCE",
                     "WPRADAPT": "LOCAL_WPR_ADAPTIVE_NEXT_CANDLE",
@@ -24555,7 +24590,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                data["feed_message"] = {"INDICEMENT":"INDICEMENT SMA12/26 usando candles fechados.","GOLDINV":"FOREX GOLD INVESTOR usando PSAR H1 + M15 + M1.","TTMSCALPER":"TTM SCALPER usando confirmação causal de swings.","FOREXMISSION":"FOREX MISSION usando candles fechados.","MONEYARROW":"BINARY MONEYARROW usando pivôs e rejeição em candles fechados.","LIQUIDEX":"LIQUIDEX usando LWMA7 + vela de força fechada.","EUROFX2":"EURO FX2 usando a inclinação do MACD principal 14/26/9 em candles fechados.","EUROFX2TAURUS":"EURO FX2 + Taurus: virada MACD 14/26/9 confirmada por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","ATE":"ATE usando Harvester adaptado + ZeroLag MACD 22/33/9 em candles fechados.","FOREXSTAY":"FOREXSTAY SIGHT usando ZeroLag MACD 12/26/9 em candles fechados.","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + Taurus: cruzamento ZeroLag 12/26/9 confirmado por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","FOREXSTAYPRO":"FOREXSTAY PRO usando ZeroLag 12/26/9 com janela de 3 velas + EMA50 flex + ADX14≥12 + RSI20/80 + corpo≥20% + S/R leve.","FOREXFLEX":"FOREX FLEX usando fractal causal totalmente confirmado em candles fechados.","SENEGALPRO":"SUPER SENEGAL PRO usando PMAX/Z + ADX/DMI com pullback e Price Action em candles fechados.","VALUEMACD":"VALUE CHART + MACD usando Value Chart 5/±8 + ZeroLag MACD 12/26/9 em confluência.","HOLYGRAIL":"HOLY GRAIL FLEX usando Envelopes LWMA 3/0,07% com 2 de 3 confirmações fortes em M1.","BBSTOCH":"BB STOCHRSI X REVERSAL usando Bollinger 20/2 + StochRSI 14/14/3/3, extremos 90/10 e retorno para dentro da banda em candle fechado.","KAMIKAZE":"KAMIKAZE TREND SNIPER usando cruzamento real EMA8/21 + filtro EMA200 + ADX14≥22 + RSI14 em candle fechado.","FOREXMEGA":"FOREX MEGA LLC usando EMA5/9 + MACD8/17/9 + RSI9 + CCI13 + Stoch5/3/3 em confluência 5/5 no M1; M5 é bônus leve.","BROOKYVERTEX":"BROOKY + VERTEX SECOND usando Brooky Stoch14/5/5 + RSI14 FLEX 30/70 e NOVA virada Vertex causal ±6 na mesma vela fechada; próxima vela, sem Gale.","MEGABOT":"MEGA BOT usando EMA 9/21 + estrutura + Combo 3/5 + Brooky FLEX 31/69; 3 confluências independentes na mesma direção, janela de 2 candles e cooldown 3; candle fechado, próxima vela, sem Gale.","UTBOT":"UT BOT ALERTS usando trailing stop ATR 1 com Key 2, cruzamento confirmado em candle fechado e entrada na próxima vela; sem Gale.","ONEMINRSI":"ONE MINUTE + RSI usando faixa das últimas 9 velas + zona 30% + RSI Wilder 7 em 30/70; candle fechado e próxima vela; sem Gale.","WPRADAPT":"WPR ADAPTIVE usando níveis 67/33, Risk 3 e período adaptativo 9→3/4; somente candle fechado, entrada na próxima vela, sem Gale.","TRENDLINES":"TRENDLINES MTF FLEX usando gatilho M1/M5, M15 como confirmação leve e H1 só como bônus."}.get(engine, "Motor importado ativo.")
+                data["feed_message"] = {"INDICEMENT":"INDICEMENT SMA12/26 usando candles fechados.","GOLDINV":"FOREX GOLD INVESTOR usando PSAR H1 + M15 + M1.","TTMSCALPER":"TTM SCALPER usando confirmação causal de swings.","FOREXMISSION":"FOREX MISSION usando candles fechados.","MONEYARROW":"BINARY MONEYARROW usando pivôs e rejeição em candles fechados.","LIQUIDEX":"LIQUIDEX usando LWMA7 + vela de força fechada.","EUROFX2":"EURO FX2 usando a inclinação do MACD principal 14/26/9 em candles fechados.","EUROFX2TAURUS":"EURO FX2 + Taurus: virada MACD 14/26/9 confirmada por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","ATE":"ATE usando Harvester adaptado + ZeroLag MACD 22/33/9 em candles fechados.","FOREXSTAY":"FOREXSTAY SIGHT usando ZeroLag MACD 12/26/9 em candles fechados.","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + Taurus: cruzamento ZeroLag 12/26/9 confirmado por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","FOREXSTAYPRO":"FOREXSTAY PRO usando ZeroLag 12/26/9 com janela de 3 velas + EMA50 flex + ADX14≥12 + RSI20/80 + corpo≥20% + S/R leve.","FOREXFLEX":"FOREX FLEX usando fractal causal totalmente confirmado em candles fechados.","SENEGALPRO":"SUPER SENEGAL PRO usando PMAX/Z + ADX/DMI com pullback e Price Action em candles fechados.","VALUEMACD":"VALUE CHART + MACD usando Value Chart 5/±8 + ZeroLag MACD 12/26/9 em confluência.","HOLYGRAIL":"HOLY GRAIL FLEX usando Envelopes LWMA 3/0,07% com 2 de 3 confirmações fortes em M1.","BBSTOCH":"BB STOCHRSI X REVERSAL usando Bollinger 20/2 + StochRSI 14/14/3/3, extremos 90/10 e retorno para dentro da banda em candle fechado.","KAMIKAZE":"KAMIKAZE TREND SNIPER usando cruzamento real EMA8/21 + filtro EMA200 + ADX14≥22 + RSI14 em candle fechado.","FOREXMEGA":"FOREX MEGA LLC usando EMA5/9 + MACD8/17/9 + RSI9 + CCI13 + Stoch5/3/3 em confluência 5/5 no M1; M5 é bônus leve.","BROOKYVERTEX":"BROOKY + VERTEX SECOND usando Brooky Stoch14/5/5 + RSI14 FLEX 30/70 e NOVA virada Vertex causal ±6 na mesma vela fechada; próxima vela, sem Gale.","MEGABOT":"MEGA BOT usando EMA 9/21 + estrutura + Combo 3/5 + Brooky FLEX 31/69; 3 confluências independentes na mesma direção + WPR Adaptive 67/33 Risk 3 como filtro direcional; WPR alinhado reforça e WPR contrário bloqueia; neutro não trava; candle fechado, próxima vela, sem Gale.","UTBOT":"UT BOT ALERTS usando trailing stop ATR 1 com Key 2, cruzamento confirmado em candle fechado e entrada na próxima vela; sem Gale.","ONEMINRSI":"ONE MINUTE + RSI usando faixa das últimas 9 velas + zona 30% + RSI Wilder 7 em 30/70; candle fechado e próxima vela; sem Gale.","WPRADAPT":"WPR ADAPTIVE usando níveis 67/33, Risk 3 e período adaptativo 9→3/4; somente candle fechado, entrada na próxima vela, sem Gale.","TRENDLINES":"TRENDLINES MTF FLEX usando gatilho M1/M5, M15 como confirmação leve e H1 só como bônus."}.get(engine, "Motor importado ativo.")
             elif engine == "EA":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -28070,7 +28105,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
   <div class="robot-mode-card" id="megaBotModeCard">
     <img src="__MEGA_IMAGE__" alt="Mega Bot">
-    <div class="robot-mode-copy"><div class="robot-mode-title">🤖 MEGA BOT</div><div class="robot-mode-desc" id="megaBotModeDesc">EMA 9/21 + Estrutura + Combo 3/5 + Brooky FLEX 31/69 • janela 2 velas • cooldown 3 • candle fechado • próxima vela • sem Gale.</div></div>
+    <div class="robot-mode-copy"><div class="robot-mode-title">🤖 MEGA BOT</div><div class="robot-mode-desc" id="megaBotModeDesc">EMA 9/21 + Estrutura + Combo 3/5 + Brooky FLEX 31/69 + WPR Adaptive • WPR confirma/reforça e só bloqueia se vier contrário • próxima vela • sem Gale.</div></div>
     <button id="megaBotPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
   <div class="robot-mode-card" id="brookyVertexModeCard">
@@ -33146,7 +33181,7 @@ function applyRobotPowerState(){
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🥷 KAMIKAZE selecionado • aguarda novo cruzamento EMA8/21 e confirma com EMA200, ADX14 e RSI14 • candle fechado • sem Gale.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar KAMIKAZE ativo • procurando novo cruzamento EMA8/21 com tendência/força confirmadas</div>'; rad();
   }else if(engine==='MEGABOT'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MEGA BOT ONLINE • 3 CONFLUÊNCIAS • JANELA 2 • PRÓXIMA VELA';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MEGA BOT ONLINE • 3 CONFLUÊNCIAS + WPR ADAPTIVE • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🤖 MEGA BOT selecionado • EMA 9/21 + Estrutura + Combo 3/5 + Brooky FLEX 31/69.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar MEGA BOT ativo • aguardando as 3 confluências</div>';
     rad();
