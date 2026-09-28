@@ -42,7 +42,11 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.51"
+APP_VERSION = "3.96.52"
+# MEGA IA 3.96.52 — corrige aquecimento de histórico dos motores.
+# O cache agora só satisfaz uma solicitação quando contém a quantidade pedida;
+# o roteador OPEN/cTrader/Twelve/IQ aceita até 500 candles e o radar pede
+# histórico amplo para motores que dependem de janelas longas (ex.: ELCODEX).
 PWA_VERSION = "v191"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -6766,7 +6770,7 @@ async def candles_open_twelve(symbol, interval, n=80):
         raise HTTPException(500, "TWELVE_DATA_API_KEY não configurada.")
 
     ensure_td_ws_started()
-    n = max(20, min(int(n), 150))
+    n = max(20, min(int(n), 500))
     key = f"{symbol}|{interval}"
     now_ts = time.time()
     cached = td_candle_cache.get(key)
@@ -6779,19 +6783,19 @@ async def candles_open_twelve(symbol, interval, n=80):
     if ws_rows and _td_ws_is_fresh(symbol):
         if cached:
             merged = _td_merge_rest_ws(cached[1], ws_rows, interval)
-            if len(merged) >= min(n, 20):
+            if len(merged) >= n:
                 td_candle_cache[key] = (time.time(), merged)
                 return merged[-n:]
-        elif len(ws_rows) >= min(n, 20):
+        elif len(ws_rows) >= n:
             merged = _td_merge_rest_ws([], ws_rows, interval)
             td_candle_cache[key] = (time.time(), merged)
             return merged[-n:]
 
-    if cached and now_ts - cached[0] < ttl and len(cached[1]) >= min(n, 20):
+    if cached and now_ts - cached[0] < ttl and len(cached[1]) >= n:
         return cached[1][-n:]
 
     if now_ts < td_backoff_until:
-        if cached and now_ts - cached[0] <= TD_STALE_MAX_AGE:
+        if cached and len(cached[1]) >= n and now_ts - cached[0] <= TD_STALE_MAX_AGE:
             return cached[1][-n:]
         wait = max(1, int(td_backoff_until - now_ts + 0.999))
         raise HTTPException(503, f"Twelve Data em limite temporário. Nova tentativa em {wait}s.")
@@ -6800,11 +6804,11 @@ async def candles_open_twelve(symbol, interval, n=80):
     async with lock:
         now_ts = time.time()
         cached = td_candle_cache.get(key)
-        if cached and now_ts - cached[0] < ttl and len(cached[1]) >= min(n, 20):
+        if cached and now_ts - cached[0] < ttl and len(cached[1]) >= n:
             return cached[1][-n:]
 
         if now_ts < td_backoff_until:
-            if cached and now_ts - cached[0] <= TD_STALE_MAX_AGE:
+            if cached and len(cached[1]) >= n and now_ts - cached[0] <= TD_STALE_MAX_AGE:
                 return cached[1][-n:]
             wait = max(1, int(td_backoff_until - now_ts + 0.999))
             raise HTTPException(503, f"Twelve Data em limite temporário. Nova tentativa em {wait}s.")
@@ -6823,7 +6827,7 @@ async def candles_open_twelve(symbol, interval, n=80):
                         response = await client.get(TD_URL, params=params)
                     td_last_call_at = time.time()
                 except Exception as exc:
-                    if cached and time.time() - cached[0] <= TD_STALE_MAX_AGE:
+                    if cached and len(cached[1]) >= n and time.time() - cached[0] <= TD_STALE_MAX_AGE:
                         return cached[1][-n:]
                     raise HTTPException(503, f"Twelve Data indisponível temporariamente: {str(exc)[:120]}")
 
@@ -6835,7 +6839,7 @@ async def candles_open_twelve(symbol, interval, n=80):
                 retry_after = TD_LIMIT_BACKOFF
             td_backoff_until = time.time() + retry_after
             td_backoff_reason = "HTTP 429"
-            if cached and time.time() - cached[0] <= TD_STALE_MAX_AGE:
+            if cached and len(cached[1]) >= n and time.time() - cached[0] <= TD_STALE_MAX_AGE:
                 return cached[1][-n:]
             raise HTTPException(503, f"Limite da Twelve Data atingido. Aguarde cerca de {int(retry_after // 60)} minutos.")
 
@@ -6843,7 +6847,7 @@ async def candles_open_twelve(symbol, interval, n=80):
             response.raise_for_status()
             data = response.json()
         except Exception as exc:
-            if cached and time.time() - cached[0] <= TD_STALE_MAX_AGE:
+            if cached and len(cached[1]) >= n and time.time() - cached[0] <= TD_STALE_MAX_AGE:
                 return cached[1][-n:]
             raise HTTPException(502, f"Falha ao consultar Twelve Data: {str(exc)[:140]}")
 
@@ -6853,10 +6857,10 @@ async def candles_open_twelve(symbol, interval, n=80):
             if "429" in code or "limit" in msg.lower() or "credit" in msg.lower():
                 td_backoff_until = time.time() + TD_LIMIT_BACKOFF
                 td_backoff_reason = msg[:160]
-                if cached and time.time() - cached[0] <= TD_STALE_MAX_AGE:
+                if cached and len(cached[1]) >= n and time.time() - cached[0] <= TD_STALE_MAX_AGE:
                     return cached[1][-n:]
                 raise HTTPException(503, f"Limite temporário da Twelve Data. Aguarde cerca de {int(TD_LIMIT_BACKOFF // 60)} minutos.")
-            if cached and time.time() - cached[0] <= TD_STALE_MAX_AGE:
+            if cached and len(cached[1]) >= n and time.time() - cached[0] <= TD_STALE_MAX_AGE:
                 return cached[1][-n:]
             raise HTTPException(502, msg[:220])
 
@@ -6875,7 +6879,7 @@ async def candles_open_twelve(symbol, interval, n=80):
                 pass
 
         if not out:
-            if cached and time.time() - cached[0] <= TD_STALE_MAX_AGE:
+            if cached and len(cached[1]) >= n and time.time() - cached[0] <= TD_STALE_MAX_AGE:
                 return cached[1][-n:]
             raise HTTPException(502, "Nenhum candle recebido da Twelve Data.")
 
@@ -7254,7 +7258,7 @@ async def _binance_public_candles(symbol: str, interval: str, n: int = 80):
                     })
                 except Exception:
                     continue
-            if len(out) >= min(20, int(n)):
+            if len(out) >= int(n):
                 return out[-int(n):]
             last_error = "Binance pública retornou poucos candles."
         except Exception as exc:
@@ -7271,7 +7275,8 @@ async def _yahoo_public_candles(symbol: str, interval: str, n: int = 80):
         "1h": "60m", "4h": "60m",
     }
     range_map = {
-        "1min": "1d", "5min": "5d", "15min": "5d", "30min": "5d",
+        # M1 usa 5d para conseguir buscar o histórico anterior mesmo no domingo/reabertura.
+        "1min": "5d", "5min": "5d", "15min": "5d", "30min": "5d",
         "1h": "1mo", "4h": "1mo",
     }
     q_interval = interval_map.get(interval)
@@ -7320,7 +7325,7 @@ async def _yahoo_public_candles(symbol: str, interval: str, n: int = 80):
     if interval == "4h":
         out = _aggregate_closed_candles(out, 14400)
         out = _tag_feed_rows(out, "YAHOO_PUBLIC", ysymbol)
-    if len(out) < min(20, int(n)):
+    if len(out) < int(n):
         raise RuntimeError("Yahoo público retornou poucos candles.")
     return out[-int(n):]
 
@@ -7437,7 +7442,7 @@ async def _binomo_direct_rest_candles(symbol: str, interval: str, n: int = 80):
         raise RuntimeError("Intervalo inválido para o feed Binomo.")
 
     ric_path = urllib.parse.quote(BINOMO_CRYPTO_IDX_RIC, safe="")
-    required = max(20, min(int(n), 150))
+    required = max(20, min(int(n), 500))
     # Pede uma janela maior que a necessária. Se o servidor limitar a resposta,
     # uma segunda tentativa começa mais atrás no tempo.
     window_seconds = max(seconds * (required + 30), 6 * 3600)
@@ -7489,7 +7494,7 @@ async def _binomo_bridge_candles(symbol: str, interval: str, n: int = 80):
         "interval": interval,
         "timeframe": seconds,
         "timeframe_seconds": seconds,
-        "limit": max(30, min(int(n) + 5, 200)),
+        "limit": max(30, min(int(n) + 5, 500)),
     }
     async with httpx.AsyncClient(
         timeout=BINOMO_FEED_TIMEOUT,
@@ -7505,7 +7510,7 @@ async def _binomo_bridge_candles(symbol: str, interval: str, n: int = 80):
     except Exception:
         raise RuntimeError("Bridge Binomo respondeu sem JSON válido.")
     out = _binomo_normalize_candles(payload, n=max(30, int(n)))
-    if len(out) < min(20, int(n)):
+    if len(out) < int(n):
         raise RuntimeError(f"Bridge Binomo retornou poucos candles ({len(out)}).")
     return out[-int(n):]
 
@@ -7515,10 +7520,10 @@ async def _binomo_crypto_idx_candles(symbol: str, interval: str, n: int = 80):
         raise RuntimeError("Feed Binomo reservado ao Crypto IDX.")
     errors = []
     live_rows = _binomo_quote_ws_rows(interval, n)
-    if len(live_rows) >= min(20, int(n)):
+    if len(live_rows) >= int(n):
         return _tag_feed_rows(live_rows[-int(n):], "BINOMO_CRYPTO_IDX_WS", BINOMO_CRYPTO_IDX_RIC)
     if live_rows:
-        errors.append(f"stream ao vivo aquecendo histórico ({len(live_rows)}/20 candles)")
+        errors.append(f"stream ao vivo aquecendo histórico ({len(live_rows)}/{int(n)} candles)")
     if BINOMO_DIRECT_REST_ENABLED:
         try:
             rows = await _binomo_direct_rest_candles(symbol, interval, n)
@@ -7565,7 +7570,7 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
     cTrader/ativo compatível, usa Binance/Twelve Data/Yahoo. Crypto IDX continua
     exclusivamente na Binomo.
     """
-    n = max(20, min(int(n), 150))
+    n = max(20, min(int(n), 500))
     key = _open_feed_status_key(symbol, interval)
     ctrader_session_id = None
     ctrader_item = None
@@ -7579,14 +7584,14 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
     now_ts = time.time()
     cached = public_feed_cache.get(cache_key)
     ttl = min(_public_cache_ttl(interval), CTRADER_CANDLE_CACHE_TTL) if ctrader_item and ctrader_symbol_ok else _public_cache_ttl(interval)
-    if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= min(20, n):
+    if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= n:
         return list(cached[1])[-n:]
 
     lock = public_feed_locks.setdefault(key, asyncio.Lock())
     async with lock:
         cached = public_feed_cache.get(cache_key)
         now_ts = time.time()
-        if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= min(20, n):
+        if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= n:
             return list(cached[1])[-n:]
 
         providers = []
@@ -7636,8 +7641,8 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
             try:
                 rows = await provider(symbol, interval, n)
                 rows = _tag_feed_rows(rows, source, (BINANCE_SYMBOLS.get(symbol) if source == "BINANCE_PUBLIC" else YAHOO_SYMBOLS.get(symbol) if source == "YAHOO_PUBLIC" else BINOMO_CRYPTO_IDX_RIC if source == "BINOMO_CRYPTO_IDX" else symbol))
-                if len(rows) < min(20, n):
-                    raise RuntimeError("Fonte retornou poucos candles.")
+                if len(rows) < n:
+                    raise RuntimeError(f"Fonte retornou poucos candles ({len(rows)}/{n}).")
                 # Se uma fonte respondeu apenas com cache antigo, não aceita como
                 # sucesso: tenta a próxima fonte imediatamente. Isso é essencial
                 # para escapar do backoff/limite da Twelve Data sem parar o app.
@@ -8134,7 +8139,7 @@ def _iq_get_candles_once(client, active: str, duration: int, count: int, endtime
 def iq_candles_blocking(state: Dict[str, Any], symbol: str, interval: str, n: int, regular_market: bool = False):
     client = _iq_reconnect_state(state)
     duration = iq_seconds(interval)
-    count = max(20, min(int(n), 150))
+    count = max(20, min(int(n), 500))
     errors = []
 
     candidates = iq_regular_active_candidates(symbol) if regular_market else iq_active_candidates(symbol)
@@ -8224,7 +8229,7 @@ async def iq_ea_candles(
     ttl = float(ttl_by_interval.get(interval, 30.0))
     now_ts = time.time()
 
-    if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= min(int(n), 20):
+    if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= int(n):
         return list(cached[1])[-int(n):]
 
     lock = state.get("lock")
@@ -8235,7 +8240,7 @@ async def iq_ea_candles(
     async with lock:
         cached = ea_cache.get(cache_key)
         now_ts = time.time()
-        if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= min(int(n), 20):
+        if cached and now_ts - float(cached[0]) < ttl and len(cached[1]) >= int(n):
             return list(cached[1])[-int(n):]
 
         data = await asyncio.wait_for(
@@ -8244,7 +8249,7 @@ async def iq_ea_candles(
                 state,
                 symbol,
                 interval,
-                max(80, min(int(n), 150)),
+                max(80, min(int(n), 500)),
                 bool(regular_market),
             ),
             timeout=IQ_CANDLE_TIMEOUT + 5,
@@ -8300,7 +8305,7 @@ async def candles(
         if (
             cached
             and time.time() - cached[0] < IQ_CANDLE_CACHE_TTL
-            and len(cached[1]) >= min(int(n), 20)
+            and len(cached[1]) >= int(n)
         ):
             iq_state.setdefault("otc_recent_available", {})[symbol] = time.time()
             return cached[1][-int(n):]
@@ -8317,7 +8322,7 @@ async def candles(
                 if (
                     cached
                     and time.time() - cached[0] < IQ_CANDLE_CACHE_TTL
-                    and len(cached[1]) >= min(int(n), 20)
+                    and len(cached[1]) >= int(n)
                 ):
                     return cached[1][-int(n):]
 
@@ -22332,7 +22337,7 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
     now_ts = time.time()
     with ctrader_data_guard:
         cached = (item.get("candle_cache") or {}).get(cache_key)
-        if cached and now_ts - float(cached[0]) < CTRADER_CANDLE_CACHE_TTL and len(cached[1]) >= min(20, int(n)):
+        if cached and now_ts - float(cached[0]) < CTRADER_CANDLE_CACHE_TTL and len(cached[1]) >= int(n):
             return list(cached[1])[-int(n):]
 
     account_id = int(entry["account_id"])
@@ -22341,7 +22346,7 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
     token = str(item.get("access_token") or "").strip()
     seconds = int(INTERVALS.get(interval, 60))
     to_ms = int(time.time() * 1000)
-    count = max(20, min(int(n), 150))
+    count = max(20, min(int(n), 500))
 
     # MEGA IA 3.33 — buscar a CAUDA do mercado primeiro.
     # A janela anterior era muito ampla; em alguns backends/brokers o limite de
@@ -22369,7 +22374,7 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
     # O roteador do app exige ao menos 20 candles. Não pare na primeira resposta
     # não vazia: na reabertura semanal a cTrader pode devolver só 3–8 barras M15.
     # Nesse caso ampliamos a janela para recuperar o histórico anterior.
-    minimum_history = min(20, count)
+    minimum_history = count
     attempt_debug = []
 
     def _bars_debug(rows):
@@ -24240,7 +24245,7 @@ async def candles_endpoint(
     if symbol == BINOMO_CRYPTO_IDX_SYMBOL and mirror_iq:
         raise HTTPException(400, "Crypto IDX não pode ser espelhado pela IQ Option; use o feed Binomo.")
 
-    n = max(20, min(int(n), 150))
+    n = max(20, min(int(n), 500))
 
     # Crypto IDX: o stream de cotações pode começar sem histórico. Para o gráfico
     # entregamos as primeiras velas imediatamente; o motor de sinais continua
@@ -26620,6 +26625,10 @@ async def pre_signals(
         key = f"{group_key}|{symbol}"
         try:
             pre_n = (max(170, XGB_MIN_CANDLES + 30) if engine == "EA" else (BOB_SENEGAL_HISTORY_BARS if engine == "BOBSENEGAL" else (TAURUS_SENEGAL_HISTORY_BARS if engine == "TAURUSSENEGAL" else (TAURUS_EA_HISTORY_BARS if engine == "TAURUSEA" else (TAURUS_RSIDIV_HISTORY_BARS if engine == "TAURUSRSIDIV" else (180 if engine == "SNIPER" else (120 if engine == "RUBIK" else 90)))))))
+            # 3.96.52: o pré-alerta também precisa receber histórico suficiente.
+            # Antes o fallback de 90 barras virava 89 candles fechados e motores
+            # com aquecimento maior ficavam presos para sempre em 89/X.
+            pre_n = max(int(pre_n), 320)
             if engine in ("EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
@@ -27455,6 +27464,23 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 raw = await iq_ea_candles(iq_state, sym, interval, 180, regular_market=False)
             else:
                 raw = await candles(sym, interval, 180, "OPEN", None, request=request)
+        elif engine in ("ELCODEX", "SHKHA"):
+            # Motores com aquecimento longo: ELCODEX precisa de EMA200 (~220 fechados)
+            # e SHK usa busca de divergência de até 200 candles.
+            if market == "IQ_OTC":
+                if not iq_state:
+                    raise RuntimeError(f"Conecte a IQ Option para o {engine} analisar OTC.")
+                raw = await iq_ea_candles(iq_state, sym, interval, 280, regular_market=False)
+            else:
+                raw = await candles(sym, interval, 280, "OPEN", None, request=request)
+        elif engine == "SESSIONBREAKOUT":
+            # O gatilho usa poucos candles M1, mas o range de sessão é buscado separadamente.
+            if market == "IQ_OTC":
+                if not iq_state:
+                    raise RuntimeError("Conecte a IQ Option para o SMART SESSION BREAKOUT analisar OTC.")
+                raw = await iq_ea_candles(iq_state, sym, interval, 120, regular_market=False)
+            else:
+                raw = await candles(sym, interval, 120, "OPEN", None, request=request)
         elif engine == "FORCE" and market == "IQ_OTC":
             if not iq_state:
                 raise RuntimeError("Conecte a IQ Option para usar este motor no OTC.")
@@ -27462,7 +27488,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 iq_state, sym, interval, 100, regular_market=False
             )
         else:
-            raw = await candles(sym, interval, (150 if engine == "SMART" else 90), market, iq_state, request=request)
+            raw = await candles(sym, interval, (300 if engine == "SMART" else 320), market, iq_state, request=request)
         if len(raw) >= 25:
             closed = raw[:-1] if len(raw) > 1 else raw
             if engine == "EA":
