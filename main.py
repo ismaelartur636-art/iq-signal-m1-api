@@ -42,8 +42,10 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.53"
-# MEGA IA 3.96.53 — CHATGPT ANALISTA como motor principal da antiga IA LEITURA DO GRÁFICO.
+APP_VERSION = "3.96.54"
+# MEGA IA 3.96.54 — CHATGPT ANALISTA mais seletivo para reduzir LOSS em M1.
+# A decisão continua sendo da OpenAI, mas CALL/PUT agora precisa passar por
+# validação causal de price action cru, risco aceitável e confiança mínima maior.
 # O ChatGPT/OpenAI recebe os candles fechados e o contexto técnico em cada novo candle,
 # decide CALL/PUT/NEUTRO sem depender de gatilho local prévio e entrega o sinal para
 # a próxima vela. Indicadores locais são contexto, não autorização obrigatória.
@@ -71,7 +73,11 @@ OAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "15"))
 # 3.96.53 — motor CHATGPT ANALISTA. Usa o modelo ChatGPT da API por padrão,
 # podendo ser trocado no Render por CHATGPT_MODEL sem mexer no código.
 CHATGPT_MODEL = os.getenv("CHATGPT_MODEL", "").strip() or "chat-latest"
-CHATGPT_MIN_CONFIDENCE = min(90.0, max(50.0, float(os.getenv("CHATGPT_MIN_CONFIDENCE", "62"))))
+CHATGPT_MIN_CONFIDENCE = min(94.0, max(65.0, float(os.getenv("CHATGPT_MIN_CONFIDENCE", "78"))))
+CHATGPT_STRONG_CONFIDENCE = min(96.0, max(CHATGPT_MIN_CONFIDENCE, float(os.getenv("CHATGPT_STRONG_CONFIDENCE", "86"))))
+CHATGPT_COOLDOWN_SECONDS = max(60, min(900, int(os.getenv("CHATGPT_COOLDOWN_SECONDS", "180"))))
+CHATGPT_BLOCK_HIGH_RISK = os.getenv("CHATGPT_BLOCK_HIGH_RISK", "1").strip().lower() not in ("0", "false", "off", "no")
+CHATGPT_REQUIRE_PRICE_ACTION_GATE = os.getenv("CHATGPT_REQUIRE_PRICE_ACTION_GATE", "1").strip().lower() not in ("0", "false", "off", "no")
 CHATGPT_CANDLE_LIMIT = max(40, min(160, int(os.getenv("CHATGPT_CANDLE_LIMIT", "80"))))
 CHATGPT_ERROR_RETRY_SECONDS = max(10.0, min(120.0, float(os.getenv("CHATGPT_ERROR_RETRY_SECONDS", "20"))))
 
@@ -18915,10 +18921,12 @@ REGRAS OBRIGATÓRIAS:
 - Responda CALL, PUT ou NEUTRO.
 - CALL/PUT é previsão de apenas UMA vela à frente.
 - Use somente os candles fornecidos; não invente candle futuro.
-- Se a vantagem estiver fraca, conflitante ou lateral, escolha NEUTRO.
+- SEJA SELETIVO: é melhor devolver NEUTRO do que forçar uma entrada mediana.
+- Só marque confirmed=true quando houver vantagem visual clara e coerente para a próxima vela.
+- Evite CALL/PUT em lateralização, alternância excessiva, doji/indecisão, candle já esticado ou conflito de estrutura.
+- Não tente adivinhar reversão sem rejeição/localização clara e não persiga rompimento sem fechamento forte.
 - Não use Gale, martingale, resultado anterior ou tentativa de recuperar LOSS para escolher direção.
 - Confiança representa clareza do setup, não garantia de acerto.
-- "confirmed" só deve ser true quando você realmente aceitaria emitir o sinal agora.
 - Dê preferência ao comportamento mais recente sem ignorar suporte/resistência e estrutura maior.
 - Contextos locais podem discordar entre si; você deve resolver o conflito pela leitura do gráfico, não por votação fixa.
 
@@ -18949,18 +18957,67 @@ CANDLES FECHADOS (mais recente no fim):
         model_confirmed = bool(parsed.get("confirmed", False))
         reason = str(parsed.get("reason") or "")[:420]
 
+        # 3.96.54 — modo de precisão. O ChatGPT continua sendo o DECISOR,
+        # mas um CALL/PUT só sai se a leitura também fizer sentido nos candles crus.
+        # Isso evita aceitar uma autoconfiança textual alta em price action lateral/fraco.
+        raw_direction = direction
+        gate_ok, gate_reason = (True, "price action não exigido")
+        if direction in ("CALL", "PUT") and CHATGPT_REQUIRE_PRICE_ACTION_GATE:
+            gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
+
+        blocked_reasons = []
+        required_confidence = float(CHATGPT_MIN_CONFIDENCE)
+        if bool(price_ctx.get("choppy")):
+            required_confidence = max(required_confidence, float(CHATGPT_STRONG_CONFIDENCE))
+        if setup == "NONE" and direction in ("CALL", "PUT"):
+            blocked_reasons.append("setup sem classificação clara")
+        if CHATGPT_BLOCK_HIGH_RISK and risk == "HIGH" and direction in ("CALL", "PUT"):
+            blocked_reasons.append("o próprio ChatGPT classificou o risco como HIGH")
+        if direction in ("CALL", "PUT") and not gate_ok:
+            blocked_reasons.append(str(gate_reason or "price action não confirmou"))
+        if direction in ("CALL", "PUT") and confidence < required_confidence:
+            blocked_reasons.append(
+                f"confiança {confidence:.0f}% abaixo do mínimo de precisão {required_confidence:.0f}%"
+            )
+
+        # Obstáculo estrutural H1 muito perto: não compra direto em resistência nem
+        # vende direto em suporte, salvo rompimento forte já classificado pelo ChatGPT.
+        try:
+            a14 = float(atr14 or 0.0)
+            if direction in ("CALL", "PUT") and a14 > 0 and h1_context.get("ready"):
+                if direction == "CALL" and setup != "BREAKOUT":
+                    d = h1_context.get("distance_resistance")
+                    if d is not None and float(d) <= a14 * 0.35:
+                        blocked_reasons.append("resistência H1 muito próxima da entrada")
+                elif direction == "PUT" and setup != "BREAKOUT":
+                    d = h1_context.get("distance_support")
+                    if d is not None and float(d) <= a14 * 0.35:
+                        blocked_reasons.append("suporte H1 muito próximo da entrada")
+        except Exception:
+            pass
+
+        # Evita metralhar sinais consecutivos. O ChatGPT ainda é consultado a cada
+        # candle novo, mas um novo CALL/PUT precisa respeitar um intervalo mínimo.
+        cooldown_remaining = 0
+        last_signal_ts = float(st.get("last_signal_ts") or 0.0)
+        if direction in ("CALL", "PUT") and last_signal_ts > 0:
+            cooldown_remaining = max(0, int(CHATGPT_COOLDOWN_SECONDS - (now_ts - last_signal_ts)))
+            if cooldown_remaining > 0:
+                blocked_reasons.append(f"cooldown de precisão ativo por mais {cooldown_remaining}s")
+
         confirmed = bool(
             model_confirmed
             and direction in ("CALL", "PUT")
-            and confidence >= CHATGPT_MIN_CONFIDENCE
+            and not blocked_reasons
         )
         if direction in ("CALL", "PUT") and not confirmed:
             original = direction
             direction = "NEUTRO"
-            reason = (
-                f"ChatGPT viu {original}, mas não liberou o sinal: confiança {confidence:.0f}% "
-                f"(mínimo {CHATGPT_MIN_CONFIDENCE:.0f}%) ou confirmação insuficiente. {reason}"
-            )[:420]
+            why = "; ".join(blocked_reasons[:4]) or "confirmação insuficiente"
+            reason = (f"ChatGPT viu {original}, mas o modo de precisão bloqueou a entrada: {why}. " + reason)[:520]
+        elif confirmed:
+            st["last_signal_ts"] = now_ts
+            st["last_signal_candle"] = candle_key
 
         out = {
             "available": True,
@@ -18976,6 +19033,17 @@ CANDLES FECHADOS (mais recente no fim):
             "model": CHATGPT_MODEL,
             "chatgpt_primary": True,
             "local_gate_required": False,
+            "price_action_validation": {
+                "enabled": bool(CHATGPT_REQUIRE_PRICE_ACTION_GATE),
+                "passed": bool(gate_ok),
+                "reason": str(gate_reason or ""),
+                "choppy": bool(price_ctx.get("choppy")),
+                "required_confidence": round(float(required_confidence), 1),
+                "model_direction": raw_direction,
+                "blocked_reasons": blocked_reasons[:5],
+                "cooldown_seconds": CHATGPT_COOLDOWN_SECONDS,
+                "cooldown_remaining": cooldown_remaining,
+            },
             "api_called": True,
             "api_available": True,
             "fallback": False,
@@ -21302,7 +21370,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
             "technical": (
-                {"chatgpt_primary": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "CHATGPT_PRIMARY_ANALYSIS", "local_gate_required": False, "context_layers": ["PRICE_ACTION", "STRUCTURE", "SUPPORT_RESISTANCE", "RSI", "EMA", "MACD", "BOLLINGER", "ADX", "TREND_FILTER"], "model": analysis.get("model", CHATGPT_MODEL), "setup": analysis.get("setup", "NONE"), "indicators_context": analysis.get("indicators_context", {})}
+                {"chatgpt_primary": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "CHATGPT_PRIMARY_ANALYSIS_PRECISION", "local_gate_required": False, "price_action_validation": analysis.get("price_action_validation", {}), "context_layers": ["PRICE_ACTION", "STRUCTURE", "SUPPORT_RESISTANCE", "RSI", "EMA", "MACD", "BOLLINGER", "ADX", "TREND_FILTER"], "model": analysis.get("model", CHATGPT_MODEL), "setup": analysis.get("setup", "NONE"), "indicators_context": analysis.get("indicators_context", {})}
                 if engine == "SMART"
                 else ({"config_hidden": True, "mode": "EA_FORCE_MOVEMENT", "non_repaint": True} if engine == "FORCE" else analysis)
             ),
@@ -34737,7 +34805,7 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar EA Tripla ativo • RSI + Value Chart + XGBoost • OPEN/OTC</div>';
     rad();
   }else if(engine==='SMART'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='CHATGPT ANALISTA ONLINE • DECISÃO DIRETA OPENAI • CALL / PUT / NEUTRO • PRÓXIMA VELA';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='CHATGPT ANALISTA ONLINE • MODO PRECISÃO • CALL / PUT / NEUTRO • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">💬 ChatGPT Analista selecionado • indicadores locais são contexto; a decisão oficial vem do ChatGPT.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar ChatGPT ativo • analisando candles e procurando CALL/PUT para a próxima vela</div>';
     rad();
