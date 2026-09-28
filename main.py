@@ -42,12 +42,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.52"
-# MEGA IA 3.96.52 — corrige aquecimento de histórico dos motores.
-# O cache agora só satisfaz uma solicitação quando contém a quantidade pedida;
-# o roteador OPEN/cTrader/Twelve/IQ aceita até 500 candles e o radar pede
-# histórico amplo para motores que dependem de janelas longas (ex.: ELCODEX).
-PWA_VERSION = "v191"
+APP_VERSION = "3.96.53"
+# MEGA IA 3.96.53 — CHATGPT ANALISTA como motor principal da antiga IA LEITURA DO GRÁFICO.
+# O ChatGPT/OpenAI recebe os candles fechados e o contexto técnico em cada novo candle,
+# decide CALL/PUT/NEUTRO sem depender de gatilho local prévio e entrega o sinal para
+# a próxima vela. Indicadores locais são contexto, não autorização obrigatória.
+PWA_VERSION = "v192"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -68,6 +68,12 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 GEMINI_MODEL_FALLBACKS = []
 OAI_MIN = float(os.getenv("OPENAI_MIN_CONFIDENCE", "70"))
 OAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "15"))
+# 3.96.53 — motor CHATGPT ANALISTA. Usa o modelo ChatGPT da API por padrão,
+# podendo ser trocado no Render por CHATGPT_MODEL sem mexer no código.
+CHATGPT_MODEL = os.getenv("CHATGPT_MODEL", "").strip() or "chat-latest"
+CHATGPT_MIN_CONFIDENCE = min(90.0, max(50.0, float(os.getenv("CHATGPT_MIN_CONFIDENCE", "62"))))
+CHATGPT_CANDLE_LIMIT = max(40, min(160, int(os.getenv("CHATGPT_CANDLE_LIMIT", "80"))))
+CHATGPT_ERROR_RETRY_SECONDS = max(10.0, min(120.0, float(os.getenv("CHATGPT_ERROR_RETRY_SECONDS", "20"))))
 
 # XGBoost: modelo local treinado apenas com candles fechados e validação temporal.
 # Não usa candle futuro nas features e não libera sinal sozinho.
@@ -1459,9 +1465,9 @@ BACKGROUND_STATE_PATH = os.getenv(
 BACKGROUND_SCAN_SECONDS = max(3.0, min(60.0, float(os.getenv("BACKGROUND_SCAN_SECONDS", "4"))))
 BACKGROUND_RESULT_SECONDS = max(3.0, min(30.0, float(os.getenv("BACKGROUND_RESULT_SECONDS", "5"))))
 BACKGROUND_DEFAULT_ENABLED = os.getenv("BACKGROUND_SIGNALS_ENABLED", "0").strip().lower() in ("1", "true", "on", "yes")
-BACKGROUND_DEFAULT_ENGINE = os.getenv("BACKGROUND_ENGINE", "GRAPH_AI").strip().upper() or "GRAPH_AI"
+BACKGROUND_DEFAULT_ENGINE = os.getenv("BACKGROUND_ENGINE", "SMART").strip().upper() or "SMART"
 if BACKGROUND_DEFAULT_ENGINE not in {"GRAPH_AI", "SMART", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"}:
-    BACKGROUND_DEFAULT_ENGINE = "GRAPH_AI"
+    BACKGROUND_DEFAULT_ENGINE = "SMART"
 BACKGROUND_DEFAULT_MARKET = os.getenv("BACKGROUND_MARKET", "OPEN").strip().upper() or "OPEN"
 BACKGROUND_DEFAULT_INTERVAL = os.getenv("BACKGROUND_INTERVAL", "1min").strip() or "1min"
 # Telegram do robô 24h é um estado do SERVIDOR. Por segurança começa OFF
@@ -8567,12 +8573,16 @@ def _extract_openai_output_text(payload):
     return "\n".join(pieces).strip()
 
 
-async def _openai_json(prompt):
-    """OpenAI como provedor de reserva. Retorna somente um objeto JSON parseado."""
+async def _openai_json(prompt, model_override=None):
+    """Chama a Responses API e retorna somente um objeto JSON parseado.
+
+    model_override permite ao motor CHATGPT usar chat-latest sem alterar os demais
+    fluxos que continuam respeitando OPENAI_MODEL.
+    """
     if not OAI_KEY:
         raise RuntimeError("OPENAI_API_KEY não configurada.")
 
-    model = OAI_MODEL or "gpt-5.6-terra"
+    model = str(model_override or OAI_MODEL or "gpt-5.6-terra").strip()
     headers = {
         "Authorization": f"Bearer {OAI_KEY}",
         "Content-Type": "application/json",
@@ -18224,7 +18234,7 @@ def _pure_ai_candle_pattern_filter(cs, expected_direction="NEUTRO"):
     }
 
 
-async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=None, state_namespace="SMART"):
+async def _legacy_openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=None, state_namespace="SMART"):
     """IA LEITURA DO GRÁFICO para a próxima vela.
 
     Usa o núcleo TECHNICAL + GRAPHICAL do e-book como gatilhos independentes.
@@ -18764,6 +18774,255 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
         st["last_result"] = dict(out)
         print(f"[IA FALLBACK MONITOR] {symbol} {interval} LOCAL_OHLCV | API: {str(exc)[:160]}", flush=True)
         return out
+
+
+async def chatgpt_primary_signal(symbol, interval, cs, market="OPEN", moment_hint=None):
+    """CHATGPT ANALISTA — OpenAI decide CALL/PUT/NEUTRO para a próxima vela.
+
+    Diferente do fluxo antigo, nenhum indicador local precisa liberar o ChatGPT.
+    OHLCV, estrutura e indicadores entram apenas como contexto. A decisão final vem
+    do modelo OpenAI configurado em CHATGPT_MODEL. Usa somente candles fechados para
+    manter o snapshot causal e evitar mudança do sinal depois de liberado.
+    """
+    rows = list(cs or [])
+    need = 40
+    if len(rows) < need:
+        return {
+            "available": True, "direction": "NEUTRO", "confidence": 0.0,
+            "confirmed": False, "risk": "HIGH", "setup": "NONE",
+            "strategy": "CHATGPT ANALISTA", "engine": "SMART",
+            "provider": "OPENAI_CHATGPT", "chatgpt_primary": True,
+            "reason": f"CHATGPT coletando candles fechados ({len(rows)}/{need}).",
+            "api_called": False, "next_candle_entry": True, "gale_signal": False,
+        }
+
+    live = rows[-1]
+    candle_key = str(live.get("datetime") or live.get("timestamp") or len(rows))
+    state_key = f"CHATGPT_PRIMARY_V1|{market}|{symbol}|{interval}"
+    st = ai_scan_state.setdefault(state_key, {})
+    now_ts = time.time()
+    last_call = float(st.get("last_call") or 0.0)
+    last_candle = str(st.get("candle_key") or "")
+    last_error = bool(st.get("last_error"))
+
+    should_call = (
+        last_call <= 0
+        or candle_key != last_candle
+        or (last_error and (now_ts - last_call) >= CHATGPT_ERROR_RETRY_SECONDS)
+    )
+    if not should_call and isinstance(st.get("last_result"), dict):
+        cached = dict(st["last_result"])
+        cached["api_called"] = False
+        cached["cached_analysis"] = True
+        cached["next_review"] = "NEXT_CLOSED_CANDLE"
+        return cached
+
+    st["candle_key"] = candle_key
+    st["last_call"] = now_ts
+
+    if not OAI_KEY:
+        out = {
+            "available": False, "direction": "NEUTRO", "confidence": 0.0,
+            "confirmed": False, "risk": "HIGH", "setup": "NONE",
+            "strategy": "CHATGPT ANALISTA", "engine": "SMART",
+            "provider": "OPENAI_CHATGPT", "chatgpt_primary": True,
+            "reason": "CHATGPT indisponível: configure OPENAI_API_KEY no servidor.",
+            "api_called": False, "api_available": False, "fallback": False,
+            "next_candle_entry": True, "gale_signal": False,
+        }
+        st["last_error"] = True
+        st["last_result"] = dict(out)
+        return out
+
+    closes = [float(x.get("close", 0) or 0) for x in rows]
+    def _safe(fn, default=None):
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    rsi14 = _safe(lambda: rsi(closes, 14))
+    rsi14_prev = _safe(lambda: rsi(closes[:-1], 14))
+    ema9 = _safe(lambda: ema(closes, 9))
+    ema21 = _safe(lambda: ema(closes, 21))
+    ema50 = _safe(lambda: ema(closes, 50))
+    atr14 = _safe(lambda: atr(rows, 14))
+    adx14 = _safe(lambda: adx(rows, 14))
+    bb20 = _safe(lambda: bollinger(closes, 20, 2.0))
+    macd_now = _safe(lambda: _macd_snapshot(closes, 12, 26, 9))
+    sideways, sideways_score = _safe(lambda: sideways_filter(closes), (False, 0.0))
+    trend_filter = _safe(lambda: _smart_trend_filter(rows), {}) or {}
+    candle_pattern = _safe(lambda: _pure_ai_candle_pattern_filter(rows, "NEUTRO"), {}) or {}
+    pre_ok, pre_score, pre_reason, price_ctx = _safe(
+        lambda: _gemini_candidate_prefilter(rows, interval),
+        (False, 0.0, "indisponível", {}),
+    )
+
+    h1_context = {"ready": False, "region": "UNAVAILABLE"}
+    if market == "OPEN":
+        try:
+            h1_raw = await candles(symbol, "1h", 100, "OPEN", None)
+            h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
+            levels = _support_resistance_levels(h1_closed, "1h")
+            price = float(rows[-1].get("close", 0) or 0)
+            supports = [float(x.get("price")) for x in (levels.get("supports") or []) if x.get("price") is not None]
+            resistances = [float(x.get("price")) for x in (levels.get("resistances") or []) if x.get("price") is not None]
+            ns = min(supports, key=lambda x: abs(price-x)) if supports else None
+            nr = min(resistances, key=lambda x: abs(price-x)) if resistances else None
+            h1_context = {
+                "ready": bool(supports or resistances),
+                "nearest_support": ns, "nearest_resistance": nr,
+                "distance_support": (abs(price-ns) if ns is not None else None),
+                "distance_resistance": (abs(price-nr) if nr is not None else None),
+            }
+        except Exception as exc:
+            h1_context = {"ready": False, "region": "UNAVAILABLE", "error": str(exc)[:120]}
+
+    indicators = {
+        "rsi14": rsi14, "rsi14_prev": rsi14_prev,
+        "ema9": ema9, "ema21": ema21, "ema50": ema50,
+        "atr14": atr14, "adx14": adx14,
+        "bollinger20_2": bb20, "macd": macd_now,
+        "sideways": bool(sideways), "sideways_score": sideways_score,
+        "trend_filter": trend_filter,
+        "candle_pattern": candle_pattern,
+        "price_action_context": price_ctx,
+        "legacy_prefilter_score": pre_score,
+        "legacy_prefilter_note": pre_reason,
+        "legacy_prefilter_passed": bool(pre_ok),
+        "h1_context": h1_context,
+    }
+
+    data = [
+        {
+            "time": x.get("datetime") or x.get("timestamp"),
+            "o": float(x.get("open", 0) or 0), "h": float(x.get("high", 0) or 0),
+            "l": float(x.get("low", 0) or 0), "c": float(x.get("close", 0) or 0),
+            "v": float(x.get("volume", 0) or 0),
+        }
+        for x in rows[-CHATGPT_CANDLE_LIMIT:]
+    ]
+
+    prompt = f"""Você é o CHATGPT ANALISTA dentro do app MEGA IA. Sua tarefa é analisar o gráfico representado pelos candles OHLCV fechados e decidir a direção da PRÓXIMA vela completa.
+
+Ativo: {symbol}
+Timeframe: {interval}
+Mercado: {market}
+
+Você é o DECISOR PRINCIPAL. Indicadores, padrões e filtros locais abaixo são apenas CONTEXTO; eles NÃO precisam dar gatilho e NÃO têm poder de bloquear sua análise. Não copie mecanicamente nenhum indicador. Faça uma leitura integrada de price action, estrutura, impulso, rejeição, rompimento, tendência, lateralidade e localização do preço.
+
+REGRAS OBRIGATÓRIAS:
+- Responda CALL, PUT ou NEUTRO.
+- CALL/PUT é previsão de apenas UMA vela à frente.
+- Use somente os candles fornecidos; não invente candle futuro.
+- Se a vantagem estiver fraca, conflitante ou lateral, escolha NEUTRO.
+- Não use Gale, martingale, resultado anterior ou tentativa de recuperar LOSS para escolher direção.
+- Confiança representa clareza do setup, não garantia de acerto.
+- "confirmed" só deve ser true quando você realmente aceitaria emitir o sinal agora.
+- Dê preferência ao comportamento mais recente sem ignorar suporte/resistência e estrutura maior.
+- Contextos locais podem discordar entre si; você deve resolver o conflito pela leitura do gráfico, não por votação fixa.
+
+CONTEXTO TÉCNICO AUXILIAR (não é trava):
+{json.dumps(indicators, ensure_ascii=False, default=str)}
+
+MICRO-MOMENTO AO VIVO, se disponível (apenas contexto):
+{json.dumps(dict(moment_hint or {}), ensure_ascii=False, default=str)}
+
+Retorne SOMENTE JSON válido neste formato:
+{{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"setup":"TREND|REVERSAL|BREAKOUT|REJECTION|NONE","reason":"explicação curta da leitura do gráfico","risk":"LOW|MEDIUM|HIGH"}}
+
+CANDLES FECHADOS (mais recente no fim):
+{json.dumps(data, ensure_ascii=False)}"""
+
+    try:
+        parsed = await _openai_json(prompt, model_override=CHATGPT_MODEL)
+        direction = str(parsed.get("direction") or "NEUTRO").upper()
+        if direction not in ("CALL", "PUT", "NEUTRO"):
+            direction = "NEUTRO"
+        confidence = max(0.0, min(100.0, float(parsed.get("confidence") or 0.0)))
+        setup = str(parsed.get("setup") or "NONE").upper()
+        if setup not in ("TREND", "REVERSAL", "BREAKOUT", "REJECTION", "NONE"):
+            setup = "NONE"
+        risk = str(parsed.get("risk") or "HIGH").upper()
+        if risk not in ("LOW", "MEDIUM", "HIGH"):
+            risk = "HIGH"
+        model_confirmed = bool(parsed.get("confirmed", False))
+        reason = str(parsed.get("reason") or "")[:420]
+
+        confirmed = bool(
+            model_confirmed
+            and direction in ("CALL", "PUT")
+            and confidence >= CHATGPT_MIN_CONFIDENCE
+        )
+        if direction in ("CALL", "PUT") and not confirmed:
+            original = direction
+            direction = "NEUTRO"
+            reason = (
+                f"ChatGPT viu {original}, mas não liberou o sinal: confiança {confidence:.0f}% "
+                f"(mínimo {CHATGPT_MIN_CONFIDENCE:.0f}%) ou confirmação insuficiente. {reason}"
+            )[:420]
+
+        out = {
+            "available": True,
+            "direction": direction,
+            "confidence": round(confidence, 1) if direction != "NEUTRO" else round(confidence, 1),
+            "confirmed": confirmed,
+            "risk": risk if confirmed else "HIGH",
+            "setup": setup if confirmed else (setup if direction != "NEUTRO" else "NONE"),
+            "reason": reason or "ChatGPT não encontrou vantagem clara para a próxima vela.",
+            "strategy": "CHATGPT ANALISTA",
+            "engine": "SMART",
+            "provider": "OPENAI_CHATGPT",
+            "model": CHATGPT_MODEL,
+            "chatgpt_primary": True,
+            "local_gate_required": False,
+            "api_called": True,
+            "api_available": True,
+            "fallback": False,
+            "closed_candles_only": True,
+            "next_candle_entry": True,
+            "direct_win_only": True,
+            "gale_signal": False,
+            "indicators_context": indicators,
+            "decision_candle": candle_key,
+        }
+        st["last_error"] = False
+        st["last_result"] = dict(out)
+        external_ai_runtime.update({
+            "last_provider": "OPENAI_CHATGPT",
+            "last_success_at": iso(now()),
+            "last_error": "",
+        })
+        return out
+    except Exception as exc:
+        out = {
+            "available": False, "direction": "NEUTRO", "confidence": 0.0,
+            "confirmed": False, "risk": "HIGH", "setup": "NONE",
+            "strategy": "CHATGPT ANALISTA", "engine": "SMART",
+            "provider": "OPENAI_CHATGPT", "model": CHATGPT_MODEL,
+            "chatgpt_primary": True, "local_gate_required": False,
+            "api_called": True, "api_available": True, "fallback": False,
+            "reason": f"CHATGPT não respondeu nesta leitura: {str(exc)[:220]}",
+            "closed_candles_only": True, "next_candle_entry": True, "gale_signal": False,
+            "retry_after_seconds": CHATGPT_ERROR_RETRY_SECONDS,
+        }
+        st["last_error"] = True
+        st["last_result"] = dict(out)
+        external_ai_runtime.update({
+            "last_provider": "OPENAI_CHATGPT",
+            "last_error": str(exc)[:220],
+        })
+        print(f"[CHATGPT ANALISTA] {symbol} {interval} erro: {str(exc)[:180]}", flush=True)
+        return out
+
+
+async def openai_direct_signal(symbol, interval, cs, market="OPEN", moment_hint=None, state_namespace="SMART"):
+    """Roteia SMART para o ChatGPT principal e preserva o fluxo legado nos consensos auxiliares."""
+    if str(state_namespace or "SMART").upper() == "SMART":
+        return await chatgpt_primary_signal(symbol, interval, cs, market=market, moment_hint=moment_hint)
+    return await _legacy_openai_direct_signal(
+        symbol, interval, cs, market=market, moment_hint=moment_hint, state_namespace=state_namespace
+    )
 
 
 def next_boundary(interval):
@@ -20191,14 +20450,14 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     # 33.78.0: dois motores independentes e selecionáveis no painel.
     # IA GRÁFICA substitui o antigo Robô Principal/RSI e usa somente leitura estrutural de preço.
-    # IA LEITURA DO GRÁFICO recebe candles OHLCV fechados e replica a leitura visual:
-    # estrutura + S/R + price action + força/momentum + Volume/POC + Trend Filter,
-    # com IA externa confirmando a direção para a próxima vela.
+    # CHATGPT ANALISTA recebe candles OHLCV fechados e decide a direção da próxima vela.
+    # Estrutura, S/R, price action, momentum e demais indicadores são contexto auxiliar,
+    # sem exigir gatilho local antes da chamada OpenAI.
     if ai_only and SELECTABLE_ENGINES_ENABLED:
         tf_label = {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval)
         if engine == "SMART":
-            engine_title = "IA LEITURA DO GRÁFICO"
-            engine_mode = "VISUAL_CONFLUENCE_AI"
+            engine_title = "CHATGPT ANALISTA"
+            engine_mode = "CHATGPT_PRIMARY_ANALYSIS"
         elif engine == "EA":
             engine_title = "EA RSI + VALUE CHART + XGBOOST"
             engine_mode = "EA_XGBOOST_AUTONOMOUS"
@@ -20380,7 +20639,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"):
+        if market != "OPEN" and engine not in ("SMART", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -20388,7 +20647,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 source_state="READY",
             )
             out.update({
-                "strategy": "IA LEITURA DO GRÁFICO" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
+                "strategy": "CHATGPT ANALISTA" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
                 "mode": engine_mode,
                 "selected_engine": engine,
                 "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
@@ -20901,7 +21160,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 source_state="WAITING",
             )
             out.update({
-                "strategy": "IA LEITURA DO GRÁFICO" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
+                "strategy": "CHATGPT ANALISTA" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
                 "mode": engine_mode,
                 "selected_engine": engine,
             })
@@ -20977,7 +21236,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             }.get(engine, "DISABLED")),
             "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT") else "HIGH").upper(),
             "strategy": (
-                "IA LEITURA DO GRÁFICO" if engine == "SMART"
+                "CHATGPT ANALISTA" if engine == "SMART"
                 else (analysis.get("strategy") or (
                     "EA RSI + VALUE CHART + XGBOOST" if engine == "EA"
                     else "ROBÔ RUBIK ADAPTADO" if engine == "RUBIK"
@@ -21043,7 +21302,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
             "technical": (
-                {"visual_confluence": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "VISUAL_CONFLUENCE_AI", "layers": ["STRUCTURE", "SUPPORT_RESISTANCE", "PRICE_ACTION", "MOMENTUM", "VOLUME_POC", "TREND_FILTER"], "chart_confluence": analysis.get("chart_confluence", {}), "direct_win_filter": analysis.get("direct_win_filter", {}), "setup": analysis.get("setup", "NONE")}
+                {"chatgpt_primary": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "CHATGPT_PRIMARY_ANALYSIS", "local_gate_required": False, "context_layers": ["PRICE_ACTION", "STRUCTURE", "SUPPORT_RESISTANCE", "RSI", "EMA", "MACD", "BOLLINGER", "ADX", "TREND_FILTER"], "model": analysis.get("model", CHATGPT_MODEL), "setup": analysis.get("setup", "NONE"), "indicators_context": analysis.get("indicators_context", {})}
                 if engine == "SMART"
                 else ({"config_hidden": True, "mode": "EA_FORCE_MOVEMENT", "non_repaint": True} if engine == "FORCE" else analysis)
             ),
@@ -21055,6 +21314,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "entry_mode": entry_mode,
             "training_mode": bool(engine == "SAMURAI"),
             "auto_trade_allowed": bool(engine != "SAMURAI"),
+            "chatgpt_primary": bool(engine == "SMART" and analysis.get("chatgpt_primary")),
+            "model": (analysis.get("model") if engine == "SMART" else None),
+            "local_gate_required": (analysis.get("local_gate_required") if engine == "SMART" else None),
         }
 
         if engine in ("SMART", "TMARSI"):
@@ -21068,13 +21330,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             reason = str(analysis.get("reason") or "IA temporariamente indisponível.")
             low = reason.lower()
             if "api_key" in low or "api key" in low or "não configurada" in low:
-                base["status"] = "IA PURA • CONFIGURAÇÃO DA API AUSENTE"
+                base["status"] = "CHATGPT • CONFIGURAÇÃO DA API AUSENTE"
             elif "429" in low or "quota" in low or "rate limit" in low:
-                base["status"] = "IA PURA • LIMITE DA API"
+                base["status"] = "CHATGPT • LIMITE DA API"
             elif "timeout" in low or "timed out" in low:
-                base["status"] = "IA PURA • TIMEOUT"
+                base["status"] = "CHATGPT • TIMEOUT"
             else:
-                base["status"] = "IA PURA • TEMPORARIAMENTE INDISPONÍVEL"
+                base["status"] = "CHATGPT • TEMPORARIAMENTE INDISPONÍVEL"
 
         if analysis.get("confirmed") and analysis.get("direction") in ("CALL", "PUT"):
             direction_now = analysis["direction"]
@@ -21109,19 +21371,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     )
                 except Exception:
                     moment_gate = {"available": False, "required": False, "confirmed": False}
-                base["moment_ea"] = moment_gate
+                # 3.96.53 — no CHATGPT ANALISTA, ticks/EA são somente contexto.
+                # Nem mesmo um hard_veto local pode cancelar uma decisão já confirmada
+                # pelo ChatGPT; registramos a divergência para diagnóstico.
                 if moment_gate.get("hard_veto"):
-                    base["status"] = "EA VELA ATUAL • MOMENTO CONTRÁRIO • ENTRADA BLOQUEADA"
-                    base["reason"] = (
-                        f"A IA principal apontou {direction_now}, mas os ticks finais mostraram "
-                        f"força contrária {moment_gate.get('direction')} ({float(moment_gate.get('score') or 0):.0f}%)."
-                    )
-                    base["risk"] = "HIGH"
-                    release_state["active_signal"] = None
-                    cache[key] = (time.time(), base)
-                    return base
-                # MODO FLEX 3.94: tape real fraco/neutro não trava mais a IA.
-                # Apenas hard_veto (força realmente contrária) bloqueia a entrada.
+                    moment_gate["advisory_only"] = True
+                    moment_gate["would_have_vetoed_legacy"] = True
+                    base["reason"] = (str(base.get("reason") or "") +
+                        f" • Contexto ao vivo divergiu ({moment_gate.get('direction')} {float(moment_gate.get('score') or 0):.0f}%), mas não bloqueia o ChatGPT.")[:520]
+                base["moment_ea"] = moment_gate
 
             if engine == "RAPID":
                 # Russian Bear real-time fica somente no novo motor; o AlphaX não é tocado.
@@ -21509,7 +21767,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     announce, entry, expiry = entry_window(interval, entry_mode)
                 smart_status = (
                     "FALLBACK LOCAL • BLOQUEADO PARA ENTRADA" if analysis.get("fallback")
-                    else ("SINAL IA + EA VELA CONFIRMADO" if (engine == "SMART" and moment_gate.get("confirmed")) else "SINAL IA PURA LIBERADO")
+                    else ("SINAL CHATGPT + EA VELA CONFIRMADO" if (engine == "SMART" and moment_gate.get("confirmed")) else "SINAL CHATGPT LIBERADO")
                 )
                 base.update({
                     "direction": direction_now,
@@ -22802,8 +23060,9 @@ async def health():
         "openai": {
             "configured": bool(OAI_KEY),
             "model": OAI_MODEL or "gpt-5.6-terra",
+            "chatgpt_model": CHATGPT_MODEL,
             "priority": 2,
-            "role": "CONFIRMACAO PRINCIPAL",
+            "role": "CHATGPT ANALISTA + OUTROS FLUXOS OPENAI",
             "last_provider": external_ai_runtime.get("last_provider"),
             "last_success_at": external_ai_runtime.get("last_success_at"),
             "last_error": external_ai_runtime.get("last_error"),
@@ -25408,7 +25667,7 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
         8*f["directional_consistency"] + 6*(1.0-f["flip_ratio"]), 0, 100
     )
 
-    ai_ready=bool(GEMINI_KEY or OAI_KEY)
+    ai_ready=bool(OAI_KEY)
     defs=[
         {
             "key":"GRAPH_AI","name":"IA GRÁFICA","score":graph,
@@ -25416,14 +25675,14 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
             "reason": "Boa quando a estrutura e o price action estão organizados; perde qualidade em ruído/lateralização."
         },
         {
-            "key":"SMART","name":"IA LEITURA DO GRÁFICO","score":smart,
-            "supported":market=="OPEN","operational":market=="OPEN" and ai_ready,
-            "reason": "Mais flexível em cenários mistos, desde que o preço não esteja excessivamente lateral e a IA externa esteja disponível."
+            "key":"SMART","name":"CHATGPT ANALISTA","score":smart,
+            "supported":market in VALID_MARKETS,"operational":market in VALID_MARKETS and ai_ready,
+            "reason": "ChatGPT analisa os candles diretamente e decide CALL/PUT/NEUTRO; indicadores locais entram apenas como contexto."
         },
     ]
     if market!="OPEN":
         for x in defs:
-            if x["key"] in ("GRAPH_AI","SMART"):
+            if x["key"]=="GRAPH_AI":
                 x["score"]=0.0
                 x["reason"]="Este motor está reservado ao mercado aberto no app."
     if not ai_ready:
@@ -26797,22 +27056,8 @@ async def pre_signals(
                         raw, symbol, interval, market, requested_direction,
                         seconds_to_entry, entry_dt,
                     )
-                    if (
-                        not preview
-                        and moment_ea.get("confirmed")
-                        and moment_ea.get("tick_ready")
-                        and moment_ea.get("direction") in ("CALL", "PUT")
-                    ):
-                        mscore = float(moment_ea.get("score") or 0.0)
-                        preview = {
-                            "direction": moment_ea["direction"],
-                            "confidence": round(max(74.0, min(88.0, 70.0 + max(0.0, mscore - 60.0) * 0.45)), 1),
-                            "strategy": "EA VELA ATUAL + LUNA + XGBOOST",
-                            "reason": (
-                                f"Ticks reais detectaram micro-momento {moment_ea['direction']} "
-                                f"com força {mscore:.0f}%; candidato enviado para confirmação da IA."
-                            ),
-                        }
+                    # CHATGPT ANALISTA não cria pré-sinal local. O tape é guardado
+                    # apenas como contexto para a próxima análise oficial do ChatGPT.
                 except Exception as exc:
                     moment_ea = {
                         "enabled": True, "active": seconds_to_entry <= MOMENT_EA_WINDOW_SECONDS,
@@ -28075,26 +28320,22 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     if direction != "NEUTRO"
                     else f"{engine_label} • MONITORANDO"
                 )
-            elif market == "OPEN":
-                if engine == "SMART":
-                    tech = await openai_direct_signal(sym, interval, closed, market)
-                    direction = tech.get("direction", "NEUTRO") if tech.get("available") and tech.get("confirmed") else "NEUTRO"
-                    engine_label = "IA PURA"
-                    is_fallback = bool(tech.get("fallback"))
-                    if not tech.get("available"):
-                        status_text = "IA PURA • INDISPONÍVEL"
-                    elif direction != "NEUTRO":
-                        status_text = ("FALLBACK LOCAL OHLCV • OPORTUNIDADE ENCONTRADA" if is_fallback else "IA PURA • OPORTUNIDADE ENCONTRADA")
-                    else:
-                        # Mostra no próprio radar por que a IA não liberou sinal.
-                        # Facilita distinguir falta de oportunidade de erro/API.
-                        why = str(tech.get("reason") or "sem vantagem clara").replace("\n", " ")[:78]
-                        status_text = (("FALLBACK LOCAL OHLCV • MONITORANDO • " if is_fallback else "IA PURA • MONITORANDO • ") + why)
+            elif engine == "SMART":
+                tech = await openai_direct_signal(sym, interval, closed, market)
+                direction = tech.get("direction", "NEUTRO") if tech.get("available") and tech.get("confirmed") else "NEUTRO"
+                engine_label = "CHATGPT ANALISTA"
+                if not tech.get("available"):
+                    status_text = "CHATGPT • INDISPONÍVEL"
+                elif direction != "NEUTRO":
+                    status_text = "CHATGPT • OPORTUNIDADE ENCONTRADA"
                 else:
-                    tech = await graphic_ai_strategy(sym, interval, closed, market, request=request, iq_state=iq_state, fetch_htf=False)
-                    direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
-                    engine_label = "IA GRÁFICA"
-                    status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO")
+                    why = str(tech.get("reason") or "sem vantagem clara").replace("\n", " ")[:78]
+                    status_text = "CHATGPT • MONITORANDO • " + why
+            elif market == "OPEN":
+                tech = await graphic_ai_strategy(sym, interval, closed, market, request=request, iq_state=iq_state, fetch_htf=False)
+                direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
+                engine_label = "IA GRÁFICA"
+                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO")
             else:
                 tech = {"direction": "NEUTRO", "confidence": 0, "confirmed": False}
                 direction = "NEUTRO"
@@ -29106,7 +29347,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • IA GRÁFICA • IA LEITURA DO GRÁFICO + EBOOK TECHNICAL/GRAPHICAL • WPR ADAPTIVE • TINGA TINGA • SUPER NOVA • ELCODEX SCALPER • SHK PRO HA + MACD • SMART SESSION BREAKOUT • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • IA GRÁFICA • CHATGPT ANALISTA • WPR ADAPTIVE • TINGA TINGA • SUPER NOVA • ELCODEX SCALPER • SHK PRO HA + MACD • SMART SESSION BREAKOUT • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -29164,10 +29405,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   <div class="robot-mode-card" id="aiModeCard">
-    <img src="__MEGA_IMAGE__" alt="IA Leitura do Gráfico">
+    <img src="__MEGA_IMAGE__" alt="ChatGPT Analista">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">🧠 IA LEITURA DO GRÁFICO</div>
-      <div class="robot-mode-desc" id="aiModeDesc">ONLINE FLEX • IA decide com 1 evidência • Trend Filter obrigatório: VERDE só CALL / VERMELHO só PUT • próxima vela • sem Gale • recuperação só no próximo sinal.</div>
+      <div class="robot-mode-title">💬 CHATGPT ANALISTA</div>
+      <div class="robot-mode-desc" id="aiModeDesc">ChatGPT analisa os candles do gráfico e decide CALL, PUT ou NEUTRO • indicadores são apenas contexto • próxima vela • sem Gale.</div>
     </div>
     <button id="aiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -30226,8 +30467,25 @@ try{
    'mega_utbot_power','mega_one_minute_rsi_power']
    .forEach(k=>localStorage.setItem(k,'OFFLINE'));
 }catch(_){}
-// Se um motor retirado era o único salvo como ONLINE, o app volta para IA GRÁFICA.
-if(!(robotEnabled||aiEnabled||wprAdaptiveEnabled||tingaTingaEnabled||superNovaEnabled||elcodexEnabled||shkHaEnabled||sessionBreakoutEnabled)) robotEnabled=true;
+// MEGA IA 3.96.53 — migração única: nesta atualização o CHATGPT ANALISTA
+// vira o motor ativo na primeira abertura. Depois disso, a escolha do usuário volta
+// a ser respeitada normalmente pelo localStorage.
+try{
+  const chatgptMigrationKey='mega_chatgpt_primary_v39653';
+  if(localStorage.getItem(chatgptMigrationKey)!=='1'){
+    robotEnabled=false; aiEnabled=true;
+    wprAdaptiveEnabled=false; tingaTingaEnabled=false; superNovaEnabled=false;
+    elcodexEnabled=false; shkHaEnabled=false; sessionBreakoutEnabled=false;
+    localStorage.setItem('mega_robot_power','OFFLINE');
+    localStorage.setItem('mega_ai_power','ONLINE');
+    ['mega_wpr_adaptive_power','mega_tinga_tinga_power','mega_super_nova_power','mega_elcodex_power','mega_shk_ha_power','mega_session_breakout_power']
+      .forEach(k=>localStorage.setItem(k,'OFFLINE'));
+    localStorage.setItem(chatgptMigrationKey,'1');
+  }
+}catch(_){}
+
+// Se nenhum motor válido ficou ONLINE, nesta versão o fallback é CHATGPT ANALISTA.
+if(!(robotEnabled||aiEnabled||wprAdaptiveEnabled||tingaTingaEnabled||superNovaEnabled||elcodexEnabled||shkHaEnabled||sessionBreakoutEnabled)) aiEnabled=true;
 
 function selectedRobotEngine(){
   if(indicementEnabled) return 'INDICEMENT';
@@ -31522,7 +31780,7 @@ let momentStudyUpdatedAt=0;
 function momentStudyEngineName(key){
   const names={
     GRAPH_AI:'🧠 IA GRÁFICA',
-    SMART:'🧠 IA LEITURA DO GRÁFICO',
+    SMART:'💬 CHATGPT ANALISTA',
     RTM:'🤖 RTM MULTI + TAURUS',
     LARRY:'⚡ LARRY BREAKOUT + TAURUS',
     VELOCITY:'⚡ VELOCITY FLOW',
@@ -34479,9 +34737,9 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar EA Tripla ativo • RSI + Value Chart + XGBoost • OPEN/OTC</div>';
     rad();
   }else if(engine==='SMART'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA LEITURA DO GRÁFICO ONLINE • EBOOK TECHNICAL/GRAPHICAL • GATILHOS INDEPENDENTES + CONFIRMAÇÕES LEVES • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Leitura do Gráfico FLEX • Trend Filter alinhado obrigatório: 🟢 só CALL / 🔴 só PUT.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar IA Leitura ativo • aguardando IA + Trend Filter na mesma direção</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='CHATGPT ANALISTA ONLINE • DECISÃO DIRETA OPENAI • CALL / PUT / NEUTRO • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">💬 ChatGPT Analista selecionado • indicadores locais são contexto; a decisão oficial vem do ChatGPT.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar ChatGPT ativo • analisando candles e procurando CALL/PUT para a próxima vela</div>';
     rad();
   }else if(engine==='GRAPH_AI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA GRÁFICA ONLINE • PADRÕES + H1 + DOW H4 + LTA/LTB';
@@ -34490,7 +34748,7 @@ function applyRobotPowerState(){
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, IA Leitura do Gráfico, IA + Volume POC, Larry Breakout + Taurus, AlphaX, Super Signals Channel NR, INDICEMENT, Forex Gold Investor, TTM Scalper, Forex Mission, Binary MoneyArrow, Liquidex, Euro FX2, ATE, Forexstay Sight, Forexstay Pro e Forex Flex estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ IA Gráfica, ChatGPT Analista, IA + Volume POC, Larry Breakout + Taurus, AlphaX, Super Signals Channel NR, INDICEMENT, Forex Gold Investor, TTM Scalper, Forex Mission, Binary MoneyArrow, Liquidex, Euro FX2, ATE, Forexstay Sight, Forexstay Pro e Forex Flex estão offline.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -34590,7 +34848,7 @@ async function setAiPower(enabled){
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true), perf(), rad()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled) speak(aiEnabled ? 'Inteligência artificial online.' : 'Inteligência artificial offline.');
+  if(voiceEnabled) speak(aiEnabled ? 'Chat G P T analista online.' : 'Chat G P T analista offline.');
 }
 
 async function setEaPower(enabled){
@@ -35838,12 +36096,9 @@ async function sig(announce=false){
     if(engine==='VELOCITY' && velocityTab && velocityTab.classList.contains('active')) renderVelocityTab(cur);
 
     if(engine==='SMART' && aiModeDesc){
-      const tf=(cur&&cur.trend_filter)||{};
-      const tfColor=String(tf.color||'NEUTRO').toUpperCase();
-      const tfDir=String(tf.direction||'NEUTRO').toUpperCase();
-      const tfEmoji=tfColor==='VERDE'?'🟢':(tfColor==='VERMELHO'?'🔴':'⚪');
-      const permit=tfDir==='CALL'?'só CALL':(tfDir==='PUT'?'só PUT':'sem entrada');
-      aiModeDesc.textContent=`ONLINE FLEX • IA decide com 1 evidência • Trend Filter: ${tfEmoji} ${tfColor} → ${permit} • sem Gale • recuperação no próximo sinal.`;
+      const model=String((cur&&cur.model)||'chat-latest');
+      const called=(cur&&cur.api_called)?'análise nova':'análise em cache';
+      aiModeDesc.textContent=`ONLINE • ChatGPT (${model}) é o decisor principal • ${called} • indicadores locais = contexto • próxima vela • sem Gale.`;
     }
 
     if(announce){
@@ -36048,7 +36303,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'IA LEITURA DO GRÁFICO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
