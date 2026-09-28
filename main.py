@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.57"
-# MEGA IA 3.96.57 — MENTE GPT LOCAL: motor técnico 100% local, OPEN/OTC e robô 24h.
+APP_VERSION = "3.96.58"
+# MEGA IA 3.96.58 — MENTE GPT LOCAL PRECISÃO: confluências independentes, anti-ruído e anti-esticamento.
 # Ele transforma as principais famílias de leitura usadas pelo ChatGPT em regras causais:
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
@@ -18943,12 +18943,78 @@ def local_analyst_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="O
         put=max(0.0,put-1.0); call+=0.45; exhaustion="BEAR_EXHAUSTION"
         call_reasons.append("exaustão vendedora")
 
+    # 11) Gate de PRECISÃO: evita contar o mesmo movimento várias vezes.
+    # O score bruto continua disponível para diagnóstico, mas a entrada só é
+    # liberada quando EXISTEM famílias independentes alinhadas + um gatilho real.
     edge=call-put
     top=max(call,put)
-    threshold=6.0 + (0.8 if choppy else 0.0)
-    min_edge=1.45 + (0.35 if choppy else 0.0)
-    call_ok=call>=threshold and edge>=min_edge
-    put_ok=put>=threshold and edge<=-min_edge
+    body_atr=body/max(float(a),eps)
+    dist_ema21=abs(c-float(e21))/max(float(a),eps)
+
+    trend_call_ok=bool(e9>e21 and c>e21 and e9>float(e9p))
+    trend_put_ok=bool(e9<e21 and c<e21 and e9<float(e9p))
+    momentum_call_ok=bool(r_slope>0.20 and mac.get("macd",0)>mac.get("signal",0) and mac.get("hist",0)>0)
+    momentum_put_ok=bool(r_slope<-0.20 and mac.get("macd",0)<mac.get("signal",0) and mac.get("hist",0)<0)
+    pa_call_ok=bool((c>o and body_ratio>=0.58 and close_pos>=0.72) or bull_engulf or (lower_w>=0.42 and c>=o))
+    pa_put_ok=bool((c<o and body_ratio>=0.58 and close_pos<=0.28) or bear_engulf or (upper_w>=0.42 and c<=o))
+    boll_call_ok=bool((c>upper and c>o and body_ratio>=0.52) or (l<lower and c>lower and lower_w>=0.28))
+    boll_put_ok=bool((c<lower and c<o and body_ratio>=0.52) or (h>upper and c<upper and upper_w>=0.28))
+    volume_call_ok=bool(volume_available and vcur>=vavg*1.15 and c>o)
+    volume_put_ok=bool(volume_available and vcur>=vavg*1.15 and c<o)
+
+    # Gatilho é um EVENTO de mercado, não apenas um indicador alinhado.
+    trigger_call=bool(breakout_call or reject_call or bull_engulf or (near_support and lower_w>=0.42 and c>o))
+    trigger_put=bool(breakout_put or reject_put or bear_engulf or (near_resist and upper_w>=0.42 and c<o))
+
+    call_families={
+        "trend":trend_call_ok,
+        "structure":structure=="CALL",
+        "trigger":trigger_call,
+        "price_action":pa_call_ok,
+        "momentum":momentum_call_ok,
+        "bollinger":boll_call_ok,
+        "volume":volume_call_ok,
+    }
+    put_families={
+        "trend":trend_put_ok,
+        "structure":structure=="PUT",
+        "trigger":trigger_put,
+        "price_action":pa_put_ok,
+        "momentum":momentum_put_ok,
+        "bollinger":boll_put_ok,
+        "volume":volume_put_ok,
+    }
+    call_family_count=sum(1 for v in call_families.values() if v)
+    put_family_count=sum(1 for v in put_families.values() if v)
+
+    # Regime ruim: não opera. Antes havia apenas desconto de pontos, que ainda
+    # permitia sinais em consolidação quando várias camadas correlacionadas somavam.
+    precision_choppy=bool((efficiency<0.30 and av<23) or efficiency<0.18)
+
+    # Evita comprar diretamente em resistência / vender diretamente em suporte,
+    # salvo quando a própria vela rompeu a região com fechamento convincente.
+    sr_block_call=bool(near_resist and not breakout_call and not reject_call)
+    sr_block_put=bool(near_support and not breakout_put and not reject_put)
+    structure_block_call=bool(structure=="PUT" and not breakout_call)
+    structure_block_put=bool(structure=="CALL" and not breakout_put)
+
+    # Depois de uma vela muito grande ou preço muito afastado da EMA21, a próxima
+    # vela tende a ter risco maior de pullback. O motor passa a esperar nova base.
+    overextended=bool(body_atr>1.75 or (dist_ema21>2.10 and body_atr>1.15))
+
+    threshold=7.25
+    min_edge=2.35
+    min_families=4
+    call_ok=bool(
+        call>=threshold and edge>=min_edge and call_family_count>=min_families
+        and trigger_call and not precision_choppy and not sr_block_call
+        and not structure_block_call and not overextended and r14<76
+    )
+    put_ok=bool(
+        put>=threshold and edge<=-min_edge and put_family_count>=min_families
+        and trigger_put and not precision_choppy and not sr_block_put
+        and not structure_block_put and not overextended and r14>24
+    )
     direction="CALL" if call_ok and not put_ok else ("PUT" if put_ok and not call_ok else "NEUTRO")
 
     if direction=="CALL":
@@ -18969,13 +19035,23 @@ def local_analyst_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="O
     risk="HIGH"
     if direction!="NEUTRO":
         strength=(call if direction=="CALL" else put)
-        confidence=clamp(64.0 + max(0.0,strength-threshold)*5.0 + min(10.0,abs(edge)*2.2),64.0,94.0)
-        risk="LOW" if confidence>=84 and not choppy else "MEDIUM"
-        reason=f"{direction} {setup}: " + ", ".join(chosen[:6]) + ". Próxima vela."
+        fams=(call_family_count if direction=="CALL" else put_family_count)
+        confidence=clamp(78.0 + max(0.0,strength-threshold)*2.5 + min(7.0,abs(edge)*1.35) + max(0,fams-min_families)*2.0,78.0,95.0)
+        risk="LOW" if confidence>=86 and fams>=5 else "MEDIUM"
+        reason=(f"{direction} {setup} • PRECISÃO {fams} famílias: " + ", ".join(chosen[:5]) + ". Próxima vela.")
     else:
         dominant="CALL" if call>=put else "PUT"
-        reason=(f"Mente GPT Local monitorando • {dominant} {top:.1f} pts • vantagem {abs(edge):.1f} • "
-                f"mínimo {threshold:.1f}/{min_edge:.1f} • " + ("mercado lateral." if choppy else "aguardando confluência mais limpa."))
+        fams=(call_family_count if call>=put else put_family_count)
+        blockers=[]
+        if precision_choppy: blockers.append("lateralidade")
+        if overextended: blockers.append("vela/preço esticado")
+        if (call>=put and sr_block_call) or (put>call and sr_block_put): blockers.append("S/R contrário")
+        if (call>=put and structure_block_call) or (put>call and structure_block_put): blockers.append("estrutura contrária")
+        if (call>=put and not trigger_call) or (put>call and not trigger_put): blockers.append("sem gatilho real")
+        if fams<min_families: blockers.append(f"só {fams}/{min_families} famílias")
+        why=", ".join(blockers[:4]) if blockers else "aguardando vantagem maior"
+        reason=(f"Mente GPT Local PRECISÃO monitorando • {dominant} {top:.1f} pts • vantagem {abs(edge):.1f} • "
+                f"mínimo {threshold:.2f}/{min_edge:.2f} • {why}.")
 
     return {
         **base,
@@ -18985,7 +19061,14 @@ def local_analyst_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="O
         "event_key":(f"LOCALANALYST:{direction}:{rows[-1].get('datetime') or rows[-1].get('timestamp') or len(rows)}" if direction!="NEUTRO" else None),
         "diagnostics":{
             "call_score":round(call,2),"put_score":round(put,2),"edge":round(edge,2),
-            "threshold":threshold,"min_edge":min_edge,"choppy":choppy,"efficiency":round(efficiency,3),
+            "threshold":threshold,"min_edge":min_edge,"min_families":min_families,
+            "call_family_count":call_family_count,"put_family_count":put_family_count,
+            "call_families":call_families,"put_families":put_families,
+            "trigger_call":trigger_call,"trigger_put":trigger_put,
+            "precision_choppy":precision_choppy,"choppy":choppy,"efficiency":round(efficiency,3),
+            "body_atr":round(body_atr,3),"distance_ema21_atr":round(dist_ema21,3),"overextended":overextended,
+            "sr_block_call":sr_block_call,"sr_block_put":sr_block_put,
+            "structure_block_call":structure_block_call,"structure_block_put":structure_block_put,
             "structure":structure,"ema9":round(float(e9),10),"ema21":round(float(e21),10),"ema50":round(float(e50),10),
             "rsi14":round(float(r14),2),"adx14":round(float(av),2),"atr14":round(float(a),10),
             "macd":round(float(mac.get('macd',0)),10),"macd_signal":round(float(mac.get('signal',0)),10),
