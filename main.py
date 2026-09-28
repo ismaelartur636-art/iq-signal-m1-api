@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.54"
-# MEGA IA 3.96.54 — CHATGPT ANALISTA mais seletivo para reduzir LOSS em M1.
+APP_VERSION = "3.96.55"
+# MEGA IA 3.96.55 — CHATGPT ANALISTA com decisão nativa do modelo sobre candles crus.
 # A decisão continua sendo da OpenAI, mas CALL/PUT agora precisa passar por
 # validação causal de price action cru, risco aceitável e confiança mínima maior.
 # O ChatGPT/OpenAI recebe os candles fechados e o contexto técnico em cada novo candle,
@@ -78,7 +78,7 @@ CHATGPT_STRONG_CONFIDENCE = min(96.0, max(CHATGPT_MIN_CONFIDENCE, float(os.geten
 CHATGPT_COOLDOWN_SECONDS = max(60, min(900, int(os.getenv("CHATGPT_COOLDOWN_SECONDS", "180"))))
 CHATGPT_BLOCK_HIGH_RISK = os.getenv("CHATGPT_BLOCK_HIGH_RISK", "1").strip().lower() not in ("0", "false", "off", "no")
 CHATGPT_REQUIRE_PRICE_ACTION_GATE = os.getenv("CHATGPT_REQUIRE_PRICE_ACTION_GATE", "1").strip().lower() not in ("0", "false", "off", "no")
-CHATGPT_CANDLE_LIMIT = max(40, min(160, int(os.getenv("CHATGPT_CANDLE_LIMIT", "80"))))
+CHATGPT_CANDLE_LIMIT = max(40, min(240, int(os.getenv("CHATGPT_CANDLE_LIMIT", "120"))))
 CHATGPT_ERROR_RETRY_SECONDS = max(10.0, min(120.0, float(os.getenv("CHATGPT_ERROR_RETRY_SECONDS", "20"))))
 
 # XGBoost: modelo local treinado apenas com candles fechados e validação temporal.
@@ -18783,12 +18783,12 @@ Candles: {json.dumps(data, ensure_ascii=False)}"""
 
 
 async def chatgpt_primary_signal(symbol, interval, cs, market="OPEN", moment_hint=None):
-    """CHATGPT ANALISTA — OpenAI decide CALL/PUT/NEUTRO para a próxima vela.
+    """CHATGPT ANALISTA — decisão nativa do modelo usando candles OHLCV fechados.
 
-    Diferente do fluxo antigo, nenhum indicador local precisa liberar o ChatGPT.
-    OHLCV, estrutura e indicadores entram apenas como contexto. A decisão final vem
-    do modelo OpenAI configurado em CHATGPT_MODEL. Usa somente candles fechados para
-    manter o snapshot causal e evitar mudança do sinal depois de liberado.
+    O backend não calcula direção, não vota, não exige indicador e não aplica gate
+    técnico depois da resposta. Ele apenas envia os candles crus ao modelo ChatGPT,
+    valida o formato retornado e agenda CALL/PUT para a próxima vela quando o próprio
+    modelo marcar a leitura como confirmada.
     """
     rows = list(cs or [])
     need = 40
@@ -18800,17 +18800,19 @@ async def chatgpt_primary_signal(symbol, interval, cs, market="OPEN", moment_hin
             "provider": "OPENAI_CHATGPT", "chatgpt_primary": True,
             "reason": f"CHATGPT coletando candles fechados ({len(rows)}/{need}).",
             "api_called": False, "next_candle_entry": True, "gale_signal": False,
+            "local_gate_required": False, "native_model_decision": True,
         }
 
     live = rows[-1]
     candle_key = str(live.get("datetime") or live.get("timestamp") or len(rows))
-    state_key = f"CHATGPT_PRIMARY_V1|{market}|{symbol}|{interval}"
+    state_key = f"CHATGPT_NATIVE_V2|{market}|{symbol}|{interval}"
     st = ai_scan_state.setdefault(state_key, {})
     now_ts = time.time()
     last_call = float(st.get("last_call") or 0.0)
     last_candle = str(st.get("candle_key") or "")
     last_error = bool(st.get("last_error"))
 
+    # Uma decisão por candle fechado. Em erro, permite nova tentativa após a janela.
     should_call = (
         last_call <= 0
         or candle_key != last_candle
@@ -18835,215 +18837,102 @@ async def chatgpt_primary_signal(symbol, interval, cs, market="OPEN", moment_hin
             "reason": "CHATGPT indisponível: configure OPENAI_API_KEY no servidor.",
             "api_called": False, "api_available": False, "fallback": False,
             "next_candle_entry": True, "gale_signal": False,
+            "local_gate_required": False, "native_model_decision": True,
         }
         st["last_error"] = True
         st["last_result"] = dict(out)
         return out
 
-    closes = [float(x.get("close", 0) or 0) for x in rows]
-    def _safe(fn, default=None):
-        try:
-            return fn()
-        except Exception:
-            return default
-
-    rsi14 = _safe(lambda: rsi(closes, 14))
-    rsi14_prev = _safe(lambda: rsi(closes[:-1], 14))
-    ema9 = _safe(lambda: ema(closes, 9))
-    ema21 = _safe(lambda: ema(closes, 21))
-    ema50 = _safe(lambda: ema(closes, 50))
-    atr14 = _safe(lambda: atr(rows, 14))
-    adx14 = _safe(lambda: adx(rows, 14))
-    bb20 = _safe(lambda: bollinger(closes, 20, 2.0))
-    macd_now = _safe(lambda: _macd_snapshot(closes, 12, 26, 9))
-    sideways, sideways_score = _safe(lambda: sideways_filter(closes), (False, 0.0))
-    trend_filter = _safe(lambda: _smart_trend_filter(rows), {}) or {}
-    candle_pattern = _safe(lambda: _pure_ai_candle_pattern_filter(rows, "NEUTRO"), {}) or {}
-    pre_ok, pre_score, pre_reason, price_ctx = _safe(
-        lambda: _gemini_candidate_prefilter(rows, interval),
-        (False, 0.0, "indisponível", {}),
-    )
-
-    h1_context = {"ready": False, "region": "UNAVAILABLE"}
-    if market == "OPEN":
-        try:
-            h1_raw = await candles(symbol, "1h", 100, "OPEN", None)
-            h1_closed = h1_raw[:-1] if len(h1_raw) > 1 else h1_raw
-            levels = _support_resistance_levels(h1_closed, "1h")
-            price = float(rows[-1].get("close", 0) or 0)
-            supports = [float(x.get("price")) for x in (levels.get("supports") or []) if x.get("price") is not None]
-            resistances = [float(x.get("price")) for x in (levels.get("resistances") or []) if x.get("price") is not None]
-            ns = min(supports, key=lambda x: abs(price-x)) if supports else None
-            nr = min(resistances, key=lambda x: abs(price-x)) if resistances else None
-            h1_context = {
-                "ready": bool(supports or resistances),
-                "nearest_support": ns, "nearest_resistance": nr,
-                "distance_support": (abs(price-ns) if ns is not None else None),
-                "distance_resistance": (abs(price-nr) if nr is not None else None),
-            }
-        except Exception as exc:
-            h1_context = {"ready": False, "region": "UNAVAILABLE", "error": str(exc)[:120]}
-
-    indicators = {
-        "rsi14": rsi14, "rsi14_prev": rsi14_prev,
-        "ema9": ema9, "ema21": ema21, "ema50": ema50,
-        "atr14": atr14, "adx14": adx14,
-        "bollinger20_2": bb20, "macd": macd_now,
-        "sideways": bool(sideways), "sideways_score": sideways_score,
-        "trend_filter": trend_filter,
-        "candle_pattern": candle_pattern,
-        "price_action_context": price_ctx,
-        "legacy_prefilter_score": pre_score,
-        "legacy_prefilter_note": pre_reason,
-        "legacy_prefilter_passed": bool(pre_ok),
-        "h1_context": h1_context,
-    }
-
     data = [
         {
             "time": x.get("datetime") or x.get("timestamp"),
-            "o": float(x.get("open", 0) or 0), "h": float(x.get("high", 0) or 0),
-            "l": float(x.get("low", 0) or 0), "c": float(x.get("close", 0) or 0),
-            "v": float(x.get("volume", 0) or 0),
+            "open": float(x.get("open", 0) or 0),
+            "high": float(x.get("high", 0) or 0),
+            "low": float(x.get("low", 0) or 0),
+            "close": float(x.get("close", 0) or 0),
+            "volume": float(x.get("volume", 0) or 0),
         }
         for x in rows[-CHATGPT_CANDLE_LIMIT:]
     ]
 
-    prompt = f"""Você é o CHATGPT ANALISTA dentro do app MEGA IA. Sua tarefa é analisar o gráfico representado pelos candles OHLCV fechados e decidir a direção da PRÓXIMA vela completa.
+    prompt = f"""Você é o CHATGPT ANALISTA do app MEGA IA.
+
+Analise por conta própria o gráfico representado pelos candles OHLCV abaixo e decida a direção da PRÓXIMA vela completa.
 
 Ativo: {symbol}
 Timeframe: {interval}
 Mercado: {market}
+Horizonte: somente a próxima vela
 
-Você é o DECISOR PRINCIPAL. Indicadores, padrões e filtros locais abaixo são apenas CONTEXTO; eles NÃO precisam dar gatilho e NÃO têm poder de bloquear sua análise. Não copie mecanicamente nenhum indicador. Faça uma leitura integrada de price action, estrutura, impulso, rejeição, rompimento, tendência, lateralidade e localização do preço.
+IMPORTANTE:
+- A decisão é SUA. Não existe voto, direção, score ou gatilho calculado pelo backend.
+- Use sua própria capacidade de análise sobre os candles crus.
+- Você pode inferir por conta própria price action, tendência, impulso, exaustão, rejeição, rompimento, suporte/resistência, volatilidade, lateralidade e quaisquer relações técnicas que considerar úteis.
+- Não é obrigatório usar indicador específico. Se quiser considerar conceitos equivalentes a RSI, médias, MACD, bandas, ADX ou estrutura, derive a leitura dos próprios candles fornecidos.
+- Não force entrada. Quando não houver vantagem clara para UMA vela à frente, responda NEUTRO.
+- Não use Gale, martingale, recuperação de LOSS ou resultado anterior para escolher a direção.
+- Use somente os dados fornecidos. Não invente preços, candles ou informação futura.
+- confidence mede a clareza da sua própria leitura, não é garantia de acerto.
+- confirmed=true somente quando VOCÊ realmente escolher CALL ou PUT. Para NEUTRO, confirmed=false.
+- reason deve explicar de forma curta o que você enxergou no gráfico.
 
-REGRAS OBRIGATÓRIAS:
-- Responda CALL, PUT ou NEUTRO.
-- CALL/PUT é previsão de apenas UMA vela à frente.
-- Use somente os candles fornecidos; não invente candle futuro.
-- SEJA SELETIVO: é melhor devolver NEUTRO do que forçar uma entrada mediana.
-- Só marque confirmed=true quando houver vantagem visual clara e coerente para a próxima vela.
-- Evite CALL/PUT em lateralização, alternância excessiva, doji/indecisão, candle já esticado ou conflito de estrutura.
-- Não tente adivinhar reversão sem rejeição/localização clara e não persiga rompimento sem fechamento forte.
-- Não use Gale, martingale, resultado anterior ou tentativa de recuperar LOSS para escolher direção.
-- Confiança representa clareza do setup, não garantia de acerto.
-- Dê preferência ao comportamento mais recente sem ignorar suporte/resistência e estrutura maior.
-- Contextos locais podem discordar entre si; você deve resolver o conflito pela leitura do gráfico, não por votação fixa.
+Retorne SOMENTE JSON válido, sem markdown e sem texto fora do JSON:
+{{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"setup":"TREND|REVERSAL|BREAKOUT|REJECTION|NONE","reason":"explicação curta da sua análise","risk":"LOW|MEDIUM|HIGH"}}
 
-CONTEXTO TÉCNICO AUXILIAR (não é trava):
-{json.dumps(indicators, ensure_ascii=False, default=str)}
-
-MICRO-MOMENTO AO VIVO, se disponível (apenas contexto):
-{json.dumps(dict(moment_hint or {}), ensure_ascii=False, default=str)}
-
-Retorne SOMENTE JSON válido neste formato:
-{{"direction":"CALL|PUT|NEUTRO","confidence":0,"confirmed":true,"setup":"TREND|REVERSAL|BREAKOUT|REJECTION|NONE","reason":"explicação curta da leitura do gráfico","risk":"LOW|MEDIUM|HIGH"}}
-
-CANDLES FECHADOS (mais recente no fim):
+CANDLES FECHADOS EM ORDEM CRONOLÓGICA (o último é o mais recente):
 {json.dumps(data, ensure_ascii=False)}"""
 
     try:
         parsed = await _openai_json(prompt, model_override=CHATGPT_MODEL)
+
+        # Somente saneamento de formato. Nenhuma regra técnica local altera a decisão.
         direction = str(parsed.get("direction") or "NEUTRO").upper()
         if direction not in ("CALL", "PUT", "NEUTRO"):
             direction = "NEUTRO"
-        confidence = max(0.0, min(100.0, float(parsed.get("confidence") or 0.0)))
+
+        try:
+            confidence = max(0.0, min(100.0, float(parsed.get("confidence") or 0.0)))
+        except Exception:
+            confidence = 0.0
+
         setup = str(parsed.get("setup") or "NONE").upper()
         if setup not in ("TREND", "REVERSAL", "BREAKOUT", "REJECTION", "NONE"):
             setup = "NONE"
+
         risk = str(parsed.get("risk") or "HIGH").upper()
         if risk not in ("LOW", "MEDIUM", "HIGH"):
             risk = "HIGH"
+
         model_confirmed = bool(parsed.get("confirmed", False))
-        reason = str(parsed.get("reason") or "")[:420]
+        reason = str(parsed.get("reason") or "")[:520]
 
-        # 3.96.54 — modo de precisão. O ChatGPT continua sendo o DECISOR,
-        # mas um CALL/PUT só sai se a leitura também fizer sentido nos candles crus.
-        # Isso evita aceitar uma autoconfiança textual alta em price action lateral/fraco.
-        raw_direction = direction
-        gate_ok, gate_reason = (True, "price action não exigido")
-        if direction in ("CALL", "PUT") and CHATGPT_REQUIRE_PRICE_ACTION_GATE:
-            gate_ok, gate_reason = _pure_ai_direction_gate(direction, setup, price_ctx)
-
-        blocked_reasons = []
-        required_confidence = float(CHATGPT_MIN_CONFIDENCE)
-        if bool(price_ctx.get("choppy")):
-            required_confidence = max(required_confidence, float(CHATGPT_STRONG_CONFIDENCE))
-        if setup == "NONE" and direction in ("CALL", "PUT"):
-            blocked_reasons.append("setup sem classificação clara")
-        if CHATGPT_BLOCK_HIGH_RISK and risk == "HIGH" and direction in ("CALL", "PUT"):
-            blocked_reasons.append("o próprio ChatGPT classificou o risco como HIGH")
-        if direction in ("CALL", "PUT") and not gate_ok:
-            blocked_reasons.append(str(gate_reason or "price action não confirmou"))
-        if direction in ("CALL", "PUT") and confidence < required_confidence:
-            blocked_reasons.append(
-                f"confiança {confidence:.0f}% abaixo do mínimo de precisão {required_confidence:.0f}%"
-            )
-
-        # Obstáculo estrutural H1 muito perto: não compra direto em resistência nem
-        # vende direto em suporte, salvo rompimento forte já classificado pelo ChatGPT.
-        try:
-            a14 = float(atr14 or 0.0)
-            if direction in ("CALL", "PUT") and a14 > 0 and h1_context.get("ready"):
-                if direction == "CALL" and setup != "BREAKOUT":
-                    d = h1_context.get("distance_resistance")
-                    if d is not None and float(d) <= a14 * 0.35:
-                        blocked_reasons.append("resistência H1 muito próxima da entrada")
-                elif direction == "PUT" and setup != "BREAKOUT":
-                    d = h1_context.get("distance_support")
-                    if d is not None and float(d) <= a14 * 0.35:
-                        blocked_reasons.append("suporte H1 muito próximo da entrada")
-        except Exception:
-            pass
-
-        # Evita metralhar sinais consecutivos. O ChatGPT ainda é consultado a cada
-        # candle novo, mas um novo CALL/PUT precisa respeitar um intervalo mínimo.
-        cooldown_remaining = 0
-        last_signal_ts = float(st.get("last_signal_ts") or 0.0)
-        if direction in ("CALL", "PUT") and last_signal_ts > 0:
-            cooldown_remaining = max(0, int(CHATGPT_COOLDOWN_SECONDS - (now_ts - last_signal_ts)))
-            if cooldown_remaining > 0:
-                blocked_reasons.append(f"cooldown de precisão ativo por mais {cooldown_remaining}s")
-
-        confirmed = bool(
-            model_confirmed
-            and direction in ("CALL", "PUT")
-            and not blocked_reasons
-        )
-        if direction in ("CALL", "PUT") and not confirmed:
-            original = direction
+        # A palavra final é do modelo: se ele escolheu CALL/PUT e confirmou, o backend aceita.
+        # Se o próprio modelo marcou confirmed=false, preservamos NEUTRO.
+        confirmed = bool(model_confirmed and direction in ("CALL", "PUT"))
+        if direction not in ("CALL", "PUT") or not confirmed:
             direction = "NEUTRO"
-            why = "; ".join(blocked_reasons[:4]) or "confirmação insuficiente"
-            reason = (f"ChatGPT viu {original}, mas o modo de precisão bloqueou a entrada: {why}. " + reason)[:520]
-        elif confirmed:
-            st["last_signal_ts"] = now_ts
-            st["last_signal_candle"] = candle_key
+            confirmed = False
+            if not reason:
+                reason = "ChatGPT não encontrou vantagem clara para a próxima vela."
 
         out = {
             "available": True,
             "direction": direction,
-            "confidence": round(confidence, 1) if direction != "NEUTRO" else round(confidence, 1),
+            "confidence": round(confidence, 1),
             "confirmed": confirmed,
-            "risk": risk if confirmed else "HIGH",
-            "setup": setup if confirmed else (setup if direction != "NEUTRO" else "NONE"),
+            "risk": risk,
+            "setup": setup if confirmed else "NONE",
             "reason": reason or "ChatGPT não encontrou vantagem clara para a próxima vela.",
             "strategy": "CHATGPT ANALISTA",
             "engine": "SMART",
             "provider": "OPENAI_CHATGPT",
             "model": CHATGPT_MODEL,
             "chatgpt_primary": True,
+            "native_model_decision": True,
             "local_gate_required": False,
-            "price_action_validation": {
-                "enabled": bool(CHATGPT_REQUIRE_PRICE_ACTION_GATE),
-                "passed": bool(gate_ok),
-                "reason": str(gate_reason or ""),
-                "choppy": bool(price_ctx.get("choppy")),
-                "required_confidence": round(float(required_confidence), 1),
-                "model_direction": raw_direction,
-                "blocked_reasons": blocked_reasons[:5],
-                "cooldown_seconds": CHATGPT_COOLDOWN_SECONDS,
-                "cooldown_remaining": cooldown_remaining,
-            },
+            "local_direction_override": False,
+            "local_confidence_threshold": False,
+            "local_indicator_vote": False,
             "api_called": True,
             "api_available": True,
             "fallback": False,
@@ -19051,7 +18940,8 @@ CANDLES FECHADOS (mais recente no fim):
             "next_candle_entry": True,
             "direct_win_only": True,
             "gale_signal": False,
-            "indicators_context": indicators,
+            "input_mode": "RAW_OHLCV_ONLY",
+            "candles_sent": len(data),
             "decision_candle": candle_key,
         }
         st["last_error"] = False
@@ -19068,7 +18958,8 @@ CANDLES FECHADOS (mais recente no fim):
             "confirmed": False, "risk": "HIGH", "setup": "NONE",
             "strategy": "CHATGPT ANALISTA", "engine": "SMART",
             "provider": "OPENAI_CHATGPT", "model": CHATGPT_MODEL,
-            "chatgpt_primary": True, "local_gate_required": False,
+            "chatgpt_primary": True, "native_model_decision": True,
+            "local_gate_required": False,
             "api_called": True, "api_available": True, "fallback": False,
             "reason": f"CHATGPT não respondeu nesta leitura: {str(exc)[:220]}",
             "closed_candles_only": True, "next_candle_entry": True, "gale_signal": False,
@@ -21370,7 +21261,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "reason": analysis.get("reason", "Aguardando nova confirmação de entrada."),
             "non_repaint": True,
             "technical": (
-                {"chatgpt_primary": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "CHATGPT_PRIMARY_ANALYSIS_PRECISION", "local_gate_required": False, "price_action_validation": analysis.get("price_action_validation", {}), "context_layers": ["PRICE_ACTION", "STRUCTURE", "SUPPORT_RESISTANCE", "RSI", "EMA", "MACD", "BOLLINGER", "ADX", "TREND_FILTER"], "model": analysis.get("model", CHATGPT_MODEL), "setup": analysis.get("setup", "NONE"), "indicators_context": analysis.get("indicators_context", {})}
+                {"chatgpt_primary": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "CHATGPT_NATIVE_REASONING", "local_gate_required": False, "native_model_decision": True, "input": "RAW_OHLCV_ONLY", "model": analysis.get("model", CHATGPT_MODEL), "setup": analysis.get("setup", "NONE")}
                 if engine == "SMART"
                 else ({"config_hidden": True, "mode": "EA_FORCE_MOVEMENT", "non_repaint": True} if engine == "FORCE" else analysis)
             ),
