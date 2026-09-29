@@ -42,12 +42,14 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.66"
+APP_VERSION = "3.96.67"
 # MEGA IA 3.96.66 — alinha radar e sinal oficial: oportunidade só aparece/libera com dados OPEN realmente frescos; cartão antigo expira visualmente.
 # MEGA IA 3.96.65 — corrige aquecimento do MEGA MASTER: 320 candles na coleta oficial e 260 no núcleo.
+# MEGA IA 3.96.67 — adiciona MONSTER SMC: adaptação causal do Monster Arrows v2.0 (Ultimate SMC).
+# M1 fechado -> próxima vela; Liquidity Sweep + FVG + Fibonacci 61,8% + confirmação flexível M5/M15 (1 de 2); sem Gale.
 # MEGA IA 3.96.64 — adiciona MEGA MASTER: leitura local ampliada com 15 famílias técnicas/contextuais, sem API.
 # MEGA IA 3.96.63 — placar separado por motor: CHATGPT ANALISTA, MEGA BOT e MEGA BOT FLEX.
-# Resultados antigos/sem identificação ficam fora dos quatro placares atuais para não misturar desempenho.
+# Resultados antigos/sem identificação ficam fora dos cinco placares atuais para não misturar desempenho.
 # MEGA IA 3.96.62 — adiciona MEGA BOT FLEX: mesma leitura multi-camada do MEGA BOT, com gate levemente mais solto.
 # Ele transforma as principais famílias de leitura usadas pelo ChatGPT em regras causais:
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
@@ -1476,7 +1478,7 @@ BACKGROUND_SCAN_SECONDS = max(3.0, min(60.0, float(os.getenv("BACKGROUND_SCAN_SE
 BACKGROUND_RESULT_SECONDS = max(3.0, min(30.0, float(os.getenv("BACKGROUND_RESULT_SECONDS", "5"))))
 BACKGROUND_DEFAULT_ENABLED = os.getenv("BACKGROUND_SIGNALS_ENABLED", "0").strip().lower() in ("1", "true", "on", "yes")
 BACKGROUND_DEFAULT_ENGINE = os.getenv("BACKGROUND_ENGINE", "SMART").strip().upper() or "SMART"
-if BACKGROUND_DEFAULT_ENGINE not in {"SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER"}:
+if BACKGROUND_DEFAULT_ENGINE not in {"SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "MONSTERSMC"}:
     BACKGROUND_DEFAULT_ENGINE = "SMART"
 BACKGROUND_DEFAULT_MARKET = os.getenv("BACKGROUND_MARKET", "OPEN").strip().upper() or "OPEN"
 BACKGROUND_DEFAULT_INTERVAL = os.getenv("BACKGROUND_INTERVAL", "1min").strip() or "1min"
@@ -13415,6 +13417,165 @@ def shk_ha_macd_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         "event_key":f"SHKHA:{direction}:{stamp}","diagnostics":diag}
 
 
+
+# -----------------------------------------------------------------------------
+# MONSTER SMC v2 — adaptação causal do Monster Arrows v2.0 (Ultimate SMC)
+# Original: ZigZag + HTF + Liquidity Hunt + FVG + Fibonacci 61,8%, com delay 2.
+# App: remove dependência de pivô futuro / delay fixo. Só usa candles já fechados;
+#      M1 dispara para a PRÓXIMA vela e basta 1 de 2 confirmações HTF (M5/M15).
+# -----------------------------------------------------------------------------
+MONSTER_DEPTH = max(12, int(os.getenv("MONSTER_DEPTH", "30")))
+MONSTER_FIB_LEVEL = clamp(float(os.getenv("MONSTER_FIB_LEVEL", "0.618")), 0.50, 0.786)
+MONSTER_FVG_LOOKBACK = max(6, int(os.getenv("MONSTER_FVG_LOOKBACK", "30")))
+MONSTER_HTF_MIN_CONFIRM = max(1, min(2, int(os.getenv("MONSTER_HTF_MIN_CONFIRM", "1"))))
+MONSTER_HTF_PIVOT_WING = max(1, min(4, int(os.getenv("MONSTER_HTF_PIVOT_WING", "2"))))
+MONSTER_MIN_REJECTION = clamp(float(os.getenv("MONSTER_MIN_REJECTION", "0.18")), 0.05, 0.60)
+
+
+def _monster_ohlc(rows):
+    out=[]
+    for x in rows or []:
+        try:
+            o=float(x.get("open")); h=float(x.get("high")); l=float(x.get("low")); c=float(x.get("close"))
+            if min(o,h,l,c) <= 0 or h < l:
+                continue
+            out.append((o,h,l,c,x))
+        except Exception:
+            continue
+    return out
+
+
+def _monster_last_pivot_direction(rows, wing=None, lookback=80):
+    """Último pivô já confirmado; nunca usa candle futuro ainda inexistente."""
+    vals=_monster_ohlc(rows)
+    w=int(wing or MONSTER_HTF_PIVOT_WING)
+    if len(vals) < (w*2+5):
+        return None, None
+    start=max(w, len(vals)-int(lookback))
+    # O pivô mais novo que pode ser conhecido exige w candles fechados à direita.
+    for i in range(len(vals)-w-1, start-1, -1):
+        hi=vals[i][1]; lo=vals[i][2]
+        ph=all(hi > vals[i-k][1] and hi >= vals[i+k][1] for k in range(1,w+1))
+        pl=all(lo < vals[i-k][2] and lo <= vals[i+k][2] for k in range(1,w+1))
+        if pl and not ph:
+            return "CALL", len(vals)-1-i
+        if ph and not pl:
+            return "PUT", len(vals)-1-i
+    return None, None
+
+
+def _monster_recent_fvg(rows, lookback=None):
+    """Retorna o FVG clássico mais recente (3 candles) por direção."""
+    vals=_monster_ohlc(rows)
+    lb=int(lookback or MONSTER_FVG_LOOKBACK)
+    bull_age=None; bear_age=None
+    if len(vals) < 3:
+        return bull_age,bear_age
+    start=max(2,len(vals)-lb)
+    for i in range(len(vals)-1,start-1,-1):
+        # bullish displacement gap: low atual acima da high de 2 candles atrás
+        if bull_age is None and vals[i][2] > vals[i-2][1]:
+            bull_age=len(vals)-1-i
+        # bearish displacement gap: high atual abaixo da low de 2 candles atrás
+        if bear_age is None and vals[i][1] < vals[i-2][2]:
+            bear_age=len(vals)-1-i
+        if bull_age is not None and bear_age is not None:
+            break
+    return bull_age,bear_age
+
+
+def monster_smc_strategy(cs, m5_rows=None, m15_rows=None, symbol="EUR/USD", timeframe="1min", market="OPEN"):
+    rows=list(cs or [])
+    base={
+        "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
+        "strategy":"MONSTER SMC • LIQUIDITY SWEEP + FVG + FIB 61,8% + HTF 1/2 • NEXT CANDLE",
+        "engine":"MONSTERSMC","provider":"LOCAL_MONSTER_SMC_CAUSAL_V2",
+        "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
+        "direct_win_only":True,"gale_signal":False,"martingale":False,"grid":False,
+        "expiry_candles":1,"trigger_timeframe":str(timeframe).upper(),"shift":1,
+        "original_confirmation_delay":2,"app_confirmation_delay":0,
+        "htf_rule":f"{MONSTER_HTF_MIN_CONFIRM}_OF_2","htf_timeframes":["5min","15min"],
+        "fib_level":float(MONSTER_FIB_LEVEL),"liquidity_depth":int(MONSTER_DEPTH),
+    }
+    if str(timeframe).lower() not in ("1min","m1","1m"):
+        return {**base,"reason":"MONSTER SMC foi adaptado para M1: candle fechado e entrada na próxima vela."}
+    vals=_monster_ohlc(rows)
+    need=max(70,int(MONSTER_DEPTH)+12)
+    if len(vals) < need:
+        return {**base,"reason":f"MONSTER SMC coletando candles fechados ({len(vals)}/{need})."}
+    vals=vals[-max(180,need):]
+    o,h,l,c,last=vals[-1]
+    prior=vals[-(int(MONSTER_DEPTH)+1):-1]
+    prior_h=max(v[1] for v in prior); prior_l=min(v[2] for v in prior)
+    rr=max(h-l,1e-12)
+    lower_wick=max(0.0,min(o,c)-l)/rr
+    upper_wick=max(0.0,h-max(o,c))/rr
+
+    # Stop hunt: varre a liquidez e fecha de volta para dentro do range anterior.
+    call_sweep=bool(l < prior_l and c > prior_l and lower_wick >= MONSTER_MIN_REJECTION)
+    put_sweep=bool(h > prior_h and c < prior_h and upper_wick >= MONSTER_MIN_REJECTION)
+
+    span=max(prior_h-prior_l,1e-12)
+    fib_buy=prior_h-span*float(MONSTER_FIB_LEVEL)
+    fib_sell=prior_l+span*float(MONSTER_FIB_LEVEL)
+    call_fib=bool(l <= fib_buy)
+    put_fib=bool(h >= fib_sell)
+
+    bull_fvg_age,bear_fvg_age=_monster_recent_fvg([v[4] for v in vals[:-1]], MONSTER_FVG_LOOKBACK)
+    call_fvg=bull_fvg_age is not None
+    put_fvg=bear_fvg_age is not None
+
+    m5_dir,m5_age=_monster_last_pivot_direction(m5_rows or [])
+    m15_dir,m15_age=_monster_last_pivot_direction(m15_rows or [])
+    call_htf=sum(1 for d in (m5_dir,m15_dir) if d=="CALL")
+    put_htf=sum(1 for d in (m5_dir,m15_dir) if d=="PUT")
+    call_ok=bool(call_sweep and call_fvg and call_fib and call_htf>=MONSTER_HTF_MIN_CONFIRM)
+    put_ok=bool(put_sweep and put_fvg and put_fib and put_htf>=MONSTER_HTF_MIN_CONFIRM)
+
+    call_layers=sum((call_sweep,call_fvg,call_fib,call_htf>=MONSTER_HTF_MIN_CONFIRM))
+    put_layers=sum((put_sweep,put_fvg,put_fib,put_htf>=MONSTER_HTF_MIN_CONFIRM))
+    best_dir="CALL" if call_layers>put_layers else ("PUT" if put_layers>call_layers else "NEUTRO")
+    best_layers=max(call_layers,put_layers)
+    diag={
+        "liquidity_sweep_call":call_sweep,"liquidity_sweep_put":put_sweep,
+        "lower_wick_ratio":round(lower_wick,3),"upper_wick_ratio":round(upper_wick,3),
+        "prior_high":round(prior_h,10),"prior_low":round(prior_l,10),
+        "fib_618_buy":round(fib_buy,10),"fib_618_sell":round(fib_sell,10),
+        "fib_call":call_fib,"fib_put":put_fib,
+        "bull_fvg_bars_ago":bull_fvg_age,"bear_fvg_bars_ago":bear_fvg_age,
+        "m5_direction":m5_dir,"m5_pivot_bars_ago":m5_age,
+        "m15_direction":m15_dir,"m15_pivot_bars_ago":m15_age,
+        "call_htf_confirmations":call_htf,"put_htf_confirmations":put_htf,
+        "htf_required":int(MONSTER_HTF_MIN_CONFIRM),"call_layers":call_layers,"put_layers":put_layers,
+        "candidate_direction":best_dir,"candidate_layers":best_layers,"required_layers":4,
+        "closed_candle":True,"future_leak":False,"shift":1,
+    }
+    if call_ok == put_ok:
+        conf=clamp(48.0+best_layers*7.0,48.0,76.0)
+        missing=[]
+        if best_dir in ("CALL","PUT"):
+            is_call=best_dir=="CALL"
+            if not (call_sweep if is_call else put_sweep): missing.append("Sweep")
+            if not (call_fvg if is_call else put_fvg): missing.append("FVG")
+            if not (call_fib if is_call else put_fib): missing.append("Fib 61,8%")
+            if (call_htf if is_call else put_htf) < MONSTER_HTF_MIN_CONFIRM: missing.append("M5/M15")
+        miss=(" • falta "+", ".join(missing)) if missing else ""
+        return {**base,"confidence":round(conf,1),"candidate_direction":best_dir,
+            "reason":f"MONSTER SMC monitorando • {best_layers}/4 confluências{miss} • candle M1 fechado • próxima vela.",
+            "diagnostics":diag}
+
+    direction="CALL" if call_ok else "PUT"
+    htf_n=call_htf if call_ok else put_htf
+    wick=lower_wick if call_ok else upper_wick
+    fvg_age=bull_fvg_age if call_ok else bear_fvg_age
+    rec=max(0,MONSTER_FVG_LOOKBACK-int(fvg_age or 0))/max(1,MONSTER_FVG_LOOKBACK)
+    conf=clamp(83.0 + 4.0*(htf_n-1) + min(4.0,wick*8.0) + min(3.0,rec*3.0),83.0,96.0)
+    stamp=str(last.get("datetime") or last.get("timestamp") or len(vals))
+    return {**base,"direction":direction,"confidence":round(conf,1),"confirmed":True,
+        "risk":"LOW" if conf>=91 else "MEDIUM",
+        "reason":f"{direction} MONSTER SMC • Liquidity Sweep + FVG + Fibonacci 61,8% + HTF {htf_n}/2 alinhado • candle M1 fechado • próxima vela • sem Gale.",
+        "event_key":f"MONSTERSMC:{direction}:{stamp}","diagnostics":diag}
+
 def _ssb_hhmm(value, fallback):
     try:
         hh, mm = [int(x) for x in str(value).strip().split(":", 1)]
@@ -20113,12 +20274,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     elif engine == "TAURUSRSIDIV":
         # Taurus + RSI DIV usa somente candles fechados e entra na abertura seguinte.
         entry_mode = "BIRTH"
-    elif engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"):
+    elif engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC"):
         # Motores importados: confirmação causal em candle fechado e entrada na próxima vela.
         entry_mode = "BIRTH"
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"):
+    if engine not in ("GRAPH_AI", "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "MONSTERSMC", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC"):
         engine = "GRAPH_AI"
     if engine == "RTM" and not _rtm_symbol_allowed(symbol):
         out = neutral_signal(
@@ -20660,9 +20821,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # MEGA MASTER precisa de pelo menos 210 candles FECHADOS. Como o
             # roteador devolve também a vela em formação, pedimos 320 para dar
             # folga ao aquecimento, à EMA200 e às leituras estruturais do MASTER.
-            if engine == "MEGAMASTER":
+            if engine in ("MEGAMASTER", "MONSTERSMC"):
                 request_n = 320
-            elif engine in ("KAMIKAZE", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"):
+            elif engine in ("KAMIKAZE", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC"):
                 request_n = 260
             elif engine == "SMART" and market == "OPEN":
                 request_n = 240
@@ -20745,6 +20906,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "SHK PRO HA + MACD • FONTE EM ESPERA" if market == "OPEN" else "SHK PRO HA + MACD • IQ OPTION EM ESPERA"
         elif engine == "SESSIONBREAKOUT":
             status = "SMART SESSION BREAKOUT • FONTE EM ESPERA" if market == "OPEN" else "SMART SESSION BREAKOUT • IQ OPTION EM ESPERA"
+        elif engine == "MONSTERSMC":
+            status = "MONSTER SMC • FONTE EM ESPERA" if market == "OPEN" else "MONSTER SMC • IQ OPTION EM ESPERA"
         elif engine == "ELCODEX":
             status = "ELCODEX SCALPER • FONTE EM ESPERA" if market == "OPEN" else "ELCODEX SCALPER • IQ OPTION EM ESPERA"
         elif engine == "TRENDLINES":
@@ -20838,6 +21001,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             status = "SHK PRO HA + MACD • FONTE RECONECTANDO" if market == "OPEN" else "SHK PRO HA + MACD • IQ OPTION RECONECTANDO"
         elif engine == "SESSIONBREAKOUT":
             status = "SMART SESSION BREAKOUT • FONTE RECONECTANDO" if market == "OPEN" else "SMART SESSION BREAKOUT • IQ OPTION RECONECTANDO"
+        elif engine == "MONSTERSMC":
+            status = "MONSTER SMC • FONTE RECONECTANDO" if market == "OPEN" else "MONSTER SMC • IQ OPTION RECONECTANDO"
         elif engine == "ELCODEX":
             status = "ELCODEX SCALPER • FONTE RECONECTANDO" if market == "OPEN" else "ELCODEX SCALPER • IQ OPTION RECONECTANDO"
         elif engine == "TRENDLINES":
@@ -21023,6 +21188,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "SESSIONBREAKOUT":
             engine_title = "SMART SESSION BREAKOUT"
             engine_mode = "SESSION_RANGE_0000_0800_ATR14_NEXT_CANDLE"
+        elif engine == "MONSTERSMC":
+            engine_title = "MONSTER SMC"
+            engine_mode = "MONSTER_SMC_SWEEP_FVG_FIB618_HTF_ANY_NEXT_CANDLE"
         elif engine == "ELCODEX":
             engine_title = "ELCODEX SCALPER"
             engine_mode = "ELCODEX_EMA200_RSI50_STOCH_MACD_M1_NEXT_CANDLE"
@@ -21084,7 +21252,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"):
+        if market != "OPEN" and engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -21138,6 +21306,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "ELCODEX": "LOCAL_ELCODEX_SCALPER_CLOSED_M1",
                     "SHKHA": "LOCAL_SHK_HA_MACD_V103_CLOSED_M1",
                     "SESSIONBREAKOUT": "LOCAL_SMART_SESSION_BREAKOUT_V110",
+                    "MONSTERSMC": "LOCAL_MONSTER_SMC_CAUSAL_V2",
                     "TRENDLINES": "LOCAL_TRENDLINES_MTF_FLEX",
                     "COMBINER": "LOCAL_COMBINER_FLOW_RSI",
                     "RSIDIVBB": "LOCAL_RSI_DIVERGENCE_BOLLINGER",
@@ -21160,7 +21329,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "technical": (
                     {"visual_confluence": True, "input": "OHLCV_CLOSED_CANDLES", "mode": "VISUAL_CONFLUENCE_AI", "layers": ["STRUCTURE", "SUPPORT_RESISTANCE", "PRICE_ACTION", "MOMENTUM", "VOLUME_POC", "TREND_FILTER"]}
                     if engine == "SMART"
-                    else ({"local_analyst": True, "profile": ("MASTER" if engine == "MEGAMASTER" else ("FLEX" if engine == "LOCALANALYSTFLEX" else "BALANCED")), "api_cost": 0, "inputs": (["PRICE_ACTION","TREND","STRUCTURE","MOMENTUM","EXHAUSTION","REJECTION","BREAKOUT","S_R","VOLATILITY","EMA","RSI","MACD","ADX","BOLLINGER","VOLUME","EMA_100_200","DIVERGENCE","FIBONACCI","STOCHASTIC","PULLBACK","LIQUIDITY_TRAP","PRESSURE"] if engine == "MEGAMASTER" else ["PRICE_ACTION","TREND","STRUCTURE","MOMENTUM","EXHAUSTION","REJECTION","BREAKOUT","S_R","VOLATILITY","EMA","RSI","MACD","ADX","BOLLINGER","VOLUME"])} if engine in ("LOCALANALYST","LOCALANALYSTFLEX","MEGAMASTER") else ({"triple_confirmation": True, "inputs": ["RSI_14", "VALUE_CHART", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]})))
+                    else ({"local_analyst": True, "profile": ("MASTER" if engine == "MEGAMASTER" else ("FLEX" if engine == "LOCALANALYSTFLEX" else "BALANCED")), "api_cost": 0, "inputs": (["PRICE_ACTION","TREND","STRUCTURE","MOMENTUM","EXHAUSTION","REJECTION","BREAKOUT","S_R","VOLATILITY","EMA","RSI","MACD","ADX","BOLLINGER","VOLUME","EMA_100_200","DIVERGENCE","FIBONACCI","STOCHASTIC","PULLBACK","LIQUIDITY_TRAP","PRESSURE"] if engine == "MEGAMASTER" else ["PRICE_ACTION","TREND","STRUCTURE","MOMENTUM","EXHAUSTION","REJECTION","BREAKOUT","S_R","VOLATILITY","EMA","RSI","MACD","ADX","BOLLINGER","VOLUME"])} if engine in ("LOCALANALYST","LOCALANALYSTFLEX","MEGAMASTER") else ({"monster_smc": True, "causal": True, "entry": "NEXT_CANDLE", "inputs": ["LIQUIDITY_SWEEP", "FVG", "FIBONACCI_61_8", "M5_M15_PIVOT"], "htf_min_confirm": 1, "confirmation_delay": 0, "gale": False} if engine == "MONSTERSMC" else ({"triple_confirmation": True, "inputs": ["RSI_14", "VALUE_CHART", "XGBOOST"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "EA" else ({"rubik_inspired": True, "inputs": ["HEIKIN_ASHI", "EMA_9_21", "RSI_14", "MACD_12_26_9"], "external_ai_disabled": True, "markets": ["OPEN", "IQ_OTC"]} if engine == "RUBIK" else {"graph_ai": True, "inputs": ["PRICE_ACTION", "CANDLE_PATTERNS", "H1_SR", "H4_DOW", "LTA_LTB"]}))))
                 ),
                 "legacy_ai_disabled": engine != "SMART",
                 "legacy_technical_strategies_disabled": True,
@@ -21216,6 +21385,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "SESSIONBREAKOUT":
                 # ATR14 do gatilho; a sessão completa é carregada separadamente em M15.
                 engine_closed = closed[-150:]
+            elif engine == "MONSTERSMC":
+                engine_closed = closed[-300:]
             elif engine in ("INDICEMENT", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA"):
                 engine_closed = closed[-180:]
             elif engine == "GOLDINV":
@@ -21227,7 +21398,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 engine_closed = closed[-260:]
             elif engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "EA"):
                 engine_closed = closed[-220:]
-            elif engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "RSI5", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"):
+            elif engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "RSI5", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC"):
                 engine_closed = closed[-120:]
             else:
                 engine_closed = closed[-90:] if len(closed) > 90 else closed
@@ -21358,6 +21529,18 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     session_raw = await candles(symbol, SSB_REFERENCE_INTERVAL, SSB_REFERENCE_BARS, "OPEN", None, request=request)
                 # Não remove a última vela M15: a seleção [00:00,08:00) ignora qualquer candle posterior.
                 analysis = smart_session_breakout_strategy(engine_closed, session_raw, symbol=symbol, timeframe=interval, market=market)
+            elif engine == "MONSTERSMC":
+                m5_closed=[]; m15_closed=[]
+                if interval == "1min":
+                    if market == "IQ_OTC":
+                        m5_raw = await iq_ea_candles(iq_state, symbol, "5min", 120, regular_market=False)
+                        m15_raw = await iq_ea_candles(iq_state, symbol, "15min", 120, regular_market=False)
+                    else:
+                        m5_raw = await candles(symbol, "5min", 120, "OPEN", None, request=request)
+                        m15_raw = await candles(symbol, "15min", 120, "OPEN", None, request=request)
+                    m5_closed=m5_raw[:-1] if len(m5_raw)>1 else m5_raw
+                    m15_closed=m15_raw[:-1] if len(m15_raw)>1 else m15_raw
+                analysis = monster_smc_strategy(engine_closed, m5_closed, m15_closed, symbol=symbol, timeframe=interval, market=market)
             elif engine == "ELCODEX":
                 analysis = elcodex_scalper_strategy(engine_closed, symbol=symbol, timeframe=interval, market=market)
             elif engine == "FOREXMEGA":
@@ -21632,7 +21815,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT") and analysis.get("confirmed")),
+            "ai_confirmed": bool(engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC") and analysis.get("confirmed")),
             "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                 "LOCALANALYST": "LOCAL_ANALYST_PRO",
                 "LOCALANALYSTFLEX": "LOCAL_ANALYST_FLEX",
@@ -21678,6 +21861,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "ELCODEX": "LOCAL_ELCODEX_SCALPER_CLOSED_M1",
                     "SHKHA": "LOCAL_SHK_HA_MACD_V103_CLOSED_M1",
                     "SESSIONBREAKOUT": "LOCAL_SMART_SESSION_BREAKOUT_V110",
+                    "MONSTERSMC": "LOCAL_MONSTER_SMC_CAUSAL_V2",
                     "TRENDLINES": "LOCAL_TRENDLINES_MTF_FLEX",
                     "COMBINER": "LOCAL_COMBINER_FLOW_RSI",
                     "RSIDIVBB": "LOCAL_RSI_DIVERGENCE_BOLLINGER",
@@ -21694,7 +21878,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "RSI5": "LOCAL_RSI_ADX_4TF",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT") else "HIGH").upper(),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC") else "HIGH").upper(),
             "strategy": (
                 "CHATGPT ANALISTA" if engine == "SMART"
                 else (analysis.get("strategy") or (
@@ -21738,6 +21922,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "SUPER NOVA • RSI3 + S/R + LWMA30 + CORAL/T3 • NEXT CANDLE" if engine == "SUPERNOVA"
                     else "SHK PRO HA + MACD • HA COLOR CHANGE + MACD DIVERGENCE 12/26/5 • NEXT CANDLE" if engine == "SHKHA"
                     else "SMART SESSION BREAKOUT • RANGE 00:00–08:00 + ATR14 • NEXT CANDLE" if engine == "SESSIONBREAKOUT"
+                    else "MONSTER SMC • SWEEP + FVG + FIB 61,8% + HTF 1/2 • NEXT CANDLE" if engine == "MONSTERSMC"
                     else "ELCODEX SCALPER • EMA200 + RSI14/50 + STOCH5/3/3 + MACD12/26/9 • NEXT CANDLE" if engine == "ELCODEX"
                     else "TRENDLINES MTF FLEX • M1/M5 + M15 + H1" if engine == "TRENDLINES"
                     else "COMBINER FLOW + RSI" if engine == "COMBINER"
@@ -21963,6 +22148,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "ELCODEX": "elcodex_ema200_rsi14_50_stoch533_macd12269_m1_fingerprint",
                 "SHKHA": "shk_ha_color_change_macd_divergence_12_26_5_v103_fingerprint",
                 "SESSIONBREAKOUT": "smart_session_breakout_v110_range_0000_0800_atr14_fingerprint",
+                "MONSTERSMC": "monster_smc_v2_sweep_fvg_fib618_htf_any_causal",
                 "TRENDLINES": "trendlines_fingerprint",
                 "TMARSI": "tmarsi_fingerprint",
                 "ALPHAX": "alphax_fingerprint",
@@ -22277,6 +22463,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "ELCODEX": "SINAL ELCODEX SCALPER LIBERADO",
                         "SHKHA": "SINAL SHK PRO HA + MACD LIBERADO",
                         "SESSIONBREAKOUT": "SINAL SMART SESSION BREAKOUT LIBERADO",
+                        "MONSTERSMC": "SINAL MONSTER SMC LIBERADO",
                         "TRENDLINES": "SINAL TRENDLINES MTF LIBERADO",
                         "COMBINER": "SINAL COMBINER FLOW + RSI LIBERADO",
                         "RSIDIVBB": "SINAL RSI DIVERGENCE + BOLLINGER LIBERADO",
@@ -22296,7 +22483,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "FORCE": "SINAL EA FORÇA DO MOVIMENTO LIBERADO",
                         "BIGRISE": "SINAL BTC FORCE MULTIATIVOS LIBERADO",
                     }.get(engine, "SINAL IA GRÁFICA LIBERADO")),
-                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT") else "MEDIUM").upper(),
+                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC") else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
                     "expiry_time": iso(expiry),
@@ -22389,7 +22576,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"):
+                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -22530,6 +22717,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "ELCODEX": "LOCAL_ELCODEX_SCALPER_CLOSED_M1",
                     "SHKHA": "LOCAL_SHK_HA_MACD_V103_CLOSED_M1",
                     "SESSIONBREAKOUT": "LOCAL_SMART_SESSION_BREAKOUT_V110",
+                    "MONSTERSMC": "LOCAL_MONSTER_SMC_CAUSAL_V2",
                     "TRENDLINES": "LOCAL_TRENDLINES_MTF_FLEX",
                     "COMBINER": "LOCAL_COMBINER_FLOW_RSI",
                     "RSIDIVBB": "LOCAL_RSI_DIVERGENCE_BOLLINGER",
@@ -25382,8 +25570,8 @@ async def telegram_send(body: TelegramSignalBody):
 # MEGA IA 3.72 — execução em segundo plano no servidor; motor só muda por clique explícito
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
-    # 3.96.64 — somente os quatro motores atuais podem rodar em segundo plano.
-    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER",
+    # 3.96.67 — somente os cinco motores atuais podem rodar em segundo plano.
+    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "MONSTERSMC",
 }
 
 
@@ -26252,11 +26440,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER"):
-        raise HTTPException(400, "Motor inválido. Use CHATGPT ANALISTA, MEGA BOT, MEGA BOT FLEX ou MEGA MASTER.")
+    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "MONSTERSMC"):
+        raise HTTPException(400, "Motor inválido. Use CHATGPT ANALISTA, MEGA BOT, MEGA BOT FLEX, MEGA MASTER ou MONSTER SMC.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"):
+    if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -26291,7 +26479,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_label"] = _feed_source_label(_fs) if _fs != "MULTIFEED" else "Multifuente • RTM interno"
                     data["feed_fallback"] = bool(data.get("feed_fallback", False))
                     data["feed_message"] = "RTM MULTI + TAURUS analisado dentro do app por gatilhos individuais confirmados pelo Taurus; o bridge MT4 ficou opcional."
-            elif engine in ("INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"):
+            elif engine in ("INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC"):
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
                     feed_src = str(feed_info.get("source") or "MULTIFEED")
@@ -26302,7 +26490,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                data["feed_message"] = {"INDICEMENT":"INDICEMENT SMA12/26 usando candles fechados.","GOLDINV":"FOREX GOLD INVESTOR usando PSAR H1 + M15 + M1.","TTMSCALPER":"TTM SCALPER usando confirmação causal de swings.","FOREXMISSION":"FOREX MISSION usando candles fechados.","MONEYARROW":"BINARY MONEYARROW usando pivôs e rejeição em candles fechados.","LIQUIDEX":"LIQUIDEX usando LWMA7 + vela de força fechada.","EUROFX2":"EURO FX2 usando a inclinação do MACD principal 14/26/9 em candles fechados.","EUROFX2TAURUS":"EURO FX2 + Taurus: virada MACD 14/26/9 confirmada por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","ATE":"ATE usando Harvester adaptado + ZeroLag MACD 22/33/9 em candles fechados.","FOREXSTAY":"FOREXSTAY SIGHT usando ZeroLag MACD 12/26/9 em candles fechados.","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + Taurus: cruzamento ZeroLag 12/26/9 confirmado por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","FOREXSTAYPRO":"FOREXSTAY PRO usando ZeroLag 12/26/9 com janela de 3 velas + EMA50 flex + ADX14≥12 + RSI20/80 + corpo≥20% + S/R leve.","FOREXFLEX":"FOREX FLEX usando fractal causal totalmente confirmado em candles fechados.","SENEGALPRO":"SUPER SENEGAL PRO usando PMAX/Z + ADX/DMI com pullback e Price Action em candles fechados.","VALUEMACD":"VALUE CHART + MACD usando Value Chart 5/±8 + ZeroLag MACD 12/26/9 em confluência.","HOLYGRAIL":"HOLY GRAIL FLEX usando Envelopes LWMA 3/0,07% com 2 de 3 confirmações fortes em M1.","BBSTOCH":"BB STOCHRSI X REVERSAL usando Bollinger 20/2 + StochRSI 14/14/3/3, extremos 90/10 e retorno para dentro da banda em candle fechado.","KAMIKAZE":"KAMIKAZE TREND SNIPER usando cruzamento real EMA8/21 + filtro EMA200 + ADX14≥22 + RSI14 em candle fechado.","FOREXMEGA":"FOREX MEGA LLC usando EMA5/9 + MACD8/17/9 + RSI9 + CCI13 + Stoch5/3/3 em confluência 5/5 no M1; M5 é bônus leve.","BROOKYVERTEX":"BROOKY + VERTEX SECOND usando Brooky Stoch14/5/5 + RSI14 FLEX 30/70 e NOVA virada Vertex causal ±6 na mesma vela fechada; próxima vela, sem Gale.","MEGABOT":"MEGA BOT usando EMA 9/21 + estrutura + Combo 3/5 + Brooky FLEX 31/69; 3 confluências independentes na mesma direção + WPR Adaptive 67/33 Risk 3 como filtro direcional; WPR alinhado reforça e WPR contrário bloqueia; neutro não trava; candle fechado, próxima vela, sem Gale.","BROOKYC3":"CONFLUÊNCIA 3 pura usando exatamente Brooky Stoch14/5/5 + RSI Wilder14 FLEX 31/69; sem C1, RD-Combo, Vertex ou WPR; candle fechado, próxima vela, sem Gale.","UTBOT":"UT BOT ALERTS usando trailing stop ATR 1 com Key 2, cruzamento confirmado em candle fechado e entrada na próxima vela; sem Gale.","ONEMINRSI":"ONE MINUTE + RSI usando faixa das últimas 9 velas + zona 30% + RSI Wilder 7 em 30/70; candle fechado e próxima vela; sem Gale.","WPRADAPT":"WPR ADAPTIVE usando níveis 67/33, Risk 3 e período adaptativo 9→3/4; somente candle fechado, entrada na próxima vela, sem Gale.","TINGATINGA":"TINGA TINGA usando RSI 14 Shift 1 por novo evento: cruza >59 CALL / cruza <41 PUT, com rearm em 50; não repete sinal enquanto o RSI permanecer na mesma zona; candle fechado, próxima vela, sem Gale.","SHKHA":"SHK PRO HA + MACD usando mudança de cor Heikin Ashi + divergência MACD 12/26/5 causal confirmada; pré-sinal separado; candle fechado, próxima vela, sem Gale.","SESSIONBREAKOUT":"SMART SESSION BREAKOUT usando range 00:00–08:00 Brasília + rompimento de fechamento + corpo mínimo 0,8 ATR14; próxima vela, sem Gale.","TRENDLINES":"TRENDLINES MTF FLEX usando gatilho M1/M5, M15 como confirmação leve e H1 só como bônus."}.get(engine, "Motor importado ativo.")
+                data["feed_message"] = {"INDICEMENT":"INDICEMENT SMA12/26 usando candles fechados.","GOLDINV":"FOREX GOLD INVESTOR usando PSAR H1 + M15 + M1.","TTMSCALPER":"TTM SCALPER usando confirmação causal de swings.","FOREXMISSION":"FOREX MISSION usando candles fechados.","MONEYARROW":"BINARY MONEYARROW usando pivôs e rejeição em candles fechados.","LIQUIDEX":"LIQUIDEX usando LWMA7 + vela de força fechada.","EUROFX2":"EURO FX2 usando a inclinação do MACD principal 14/26/9 em candles fechados.","EUROFX2TAURUS":"EURO FX2 + Taurus: virada MACD 14/26/9 confirmada por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","ATE":"ATE usando Harvester adaptado + ZeroLag MACD 22/33/9 em candles fechados.","FOREXSTAY":"FOREXSTAY SIGHT usando ZeroLag MACD 12/26/9 em candles fechados.","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + Taurus: cruzamento ZeroLag 12/26/9 confirmado por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","FOREXSTAYPRO":"FOREXSTAY PRO usando ZeroLag 12/26/9 com janela de 3 velas + EMA50 flex + ADX14≥12 + RSI20/80 + corpo≥20% + S/R leve.","FOREXFLEX":"FOREX FLEX usando fractal causal totalmente confirmado em candles fechados.","SENEGALPRO":"SUPER SENEGAL PRO usando PMAX/Z + ADX/DMI com pullback e Price Action em candles fechados.","VALUEMACD":"VALUE CHART + MACD usando Value Chart 5/±8 + ZeroLag MACD 12/26/9 em confluência.","HOLYGRAIL":"HOLY GRAIL FLEX usando Envelopes LWMA 3/0,07% com 2 de 3 confirmações fortes em M1.","BBSTOCH":"BB STOCHRSI X REVERSAL usando Bollinger 20/2 + StochRSI 14/14/3/3, extremos 90/10 e retorno para dentro da banda em candle fechado.","KAMIKAZE":"KAMIKAZE TREND SNIPER usando cruzamento real EMA8/21 + filtro EMA200 + ADX14≥22 + RSI14 em candle fechado.","FOREXMEGA":"FOREX MEGA LLC usando EMA5/9 + MACD8/17/9 + RSI9 + CCI13 + Stoch5/3/3 em confluência 5/5 no M1; M5 é bônus leve.","BROOKYVERTEX":"BROOKY + VERTEX SECOND usando Brooky Stoch14/5/5 + RSI14 FLEX 30/70 e NOVA virada Vertex causal ±6 na mesma vela fechada; próxima vela, sem Gale.","MEGABOT":"MEGA BOT usando EMA 9/21 + estrutura + Combo 3/5 + Brooky FLEX 31/69; 3 confluências independentes na mesma direção + WPR Adaptive 67/33 Risk 3 como filtro direcional; WPR alinhado reforça e WPR contrário bloqueia; neutro não trava; candle fechado, próxima vela, sem Gale.","BROOKYC3":"CONFLUÊNCIA 3 pura usando exatamente Brooky Stoch14/5/5 + RSI Wilder14 FLEX 31/69; sem C1, RD-Combo, Vertex ou WPR; candle fechado, próxima vela, sem Gale.","UTBOT":"UT BOT ALERTS usando trailing stop ATR 1 com Key 2, cruzamento confirmado em candle fechado e entrada na próxima vela; sem Gale.","ONEMINRSI":"ONE MINUTE + RSI usando faixa das últimas 9 velas + zona 30% + RSI Wilder 7 em 30/70; candle fechado e próxima vela; sem Gale.","WPRADAPT":"WPR ADAPTIVE usando níveis 67/33, Risk 3 e período adaptativo 9→3/4; somente candle fechado, entrada na próxima vela, sem Gale.","TINGATINGA":"TINGA TINGA usando RSI 14 Shift 1 por novo evento: cruza >59 CALL / cruza <41 PUT, com rearm em 50; não repete sinal enquanto o RSI permanecer na mesma zona; candle fechado, próxima vela, sem Gale.","SHKHA":"SHK PRO HA + MACD usando mudança de cor Heikin Ashi + divergência MACD 12/26/5 causal confirmada; pré-sinal separado; candle fechado, próxima vela, sem Gale.","SESSIONBREAKOUT":"SMART SESSION BREAKOUT usando range 00:00–08:00 Brasília + rompimento de fechamento + corpo mínimo 0,8 ATR14; próxima vela, sem Gale.","MONSTERSMC":"MONSTER SMC: Liquidity Sweep + FVG + Fibonacci 61,8% + confirmação flexível M5/M15 (1 de 2) • M1 fechado • próxima vela • sem Gale.","TRENDLINES":"TRENDLINES MTF FLEX usando gatilho M1/M5, M15 como confirmação leve e H1 só como bônus."}.get(engine, "Motor importado ativo.")
             elif engine == "EA":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -27021,7 +27209,7 @@ async def pre_signals(
     engine = str(engine or "SMART").upper()
     if engine in RETIRED_ENGINES:
         engine = "SMART"
-    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER"):
+    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "MONSTERSMC"):
         engine = "SMART"
     limit = max(1, min(int(limit), 4))
 
@@ -27080,7 +27268,7 @@ async def pre_signals(
             return {"ok":True,"engine":"SHKHA","message":f"SHK PRO HA + MACD aguardando dados: {str(exc)[:120]}","items":[],"seconds_to_entry":remain}
 
     if engine in ("INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SESSIONBREAKOUT"):
-        _nm={"INDICEMENT":"INDICEMENT SMA 12/26","GOLDINV":"FOREX GOLD INVESTOR","TTMSCALPER":"TTM SCALPER SWING","FOREXMISSION":"FOREX MISSION","MONEYARROW":"BINARY MONEYARROW","LIQUIDEX":"LIQUIDEX","EUROFX2":"EURO FX2","EUROFX2TAURUS":"EURO FX2 + TAURUS","ATE":"ATE","FOREXSTAY":"FOREXSTAY SIGHT","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + TAURUS","FOREXSTAYPRO":"FOREXSTAY PRO","FOREXFLEX":"FOREX FLEX","SENEGALPRO":"SUPER SENEGAL PRO","VALUEMACD":"VALUE CHART + MACD","HOLYGRAIL":"HOLY GRAIL ORIGINAL","TRENDLINES":"TRENDLINES MTF","BBSTOCH":"BB STOCHRSI X REVERSAL","KAMIKAZE":"KAMIKAZE TREND SNIPER","FOREXMEGA":"FOREX MEGA LLC V10.21","BROOKYVERTEX":"BROOKY + VERTEX FLEX 30/70","MEGABOT":"MEGA BOT","BROOKYC3":"CONFLUÊNCIA 3 • BROOKY FLEX","UTBOT":"UT BOT ALERTS","ONEMINRSI":"ONE MINUTE + RSI","WPRADAPT":"WPR ADAPTIVE","TINGATINGA":"TINGA TINGA RSI 14","SUPERNOVA":"SUPER NOVA","ELCODEX":"ELCODEX SCALPER","SESSIONBREAKOUT":"SMART SESSION BREAKOUT"}[engine]
+        _nm={"INDICEMENT":"INDICEMENT SMA 12/26","GOLDINV":"FOREX GOLD INVESTOR","TTMSCALPER":"TTM SCALPER SWING","FOREXMISSION":"FOREX MISSION","MONEYARROW":"BINARY MONEYARROW","LIQUIDEX":"LIQUIDEX","EUROFX2":"EURO FX2","EUROFX2TAURUS":"EURO FX2 + TAURUS","ATE":"ATE","FOREXSTAY":"FOREXSTAY SIGHT","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + TAURUS","FOREXSTAYPRO":"FOREXSTAY PRO","FOREXFLEX":"FOREX FLEX","SENEGALPRO":"SUPER SENEGAL PRO","VALUEMACD":"VALUE CHART + MACD","HOLYGRAIL":"HOLY GRAIL ORIGINAL","TRENDLINES":"TRENDLINES MTF","BBSTOCH":"BB STOCHRSI X REVERSAL","KAMIKAZE":"KAMIKAZE TREND SNIPER","FOREXMEGA":"FOREX MEGA LLC V10.21","BROOKYVERTEX":"BROOKY + VERTEX FLEX 30/70","MEGABOT":"MEGA BOT","BROOKYC3":"CONFLUÊNCIA 3 • BROOKY FLEX","UTBOT":"UT BOT ALERTS","ONEMINRSI":"ONE MINUTE + RSI","WPRADAPT":"WPR ADAPTIVE","TINGATINGA":"TINGA TINGA RSI 14","SUPERNOVA":"SUPER NOVA","ELCODEX":"ELCODEX SCALPER","SESSIONBREAKOUT":"SMART SESSION BREAKOUT","MONSTERSMC":"MONSTER SMC"}[engine]
         return {"items":[],"engine":engine,"message":f"{_nm} usa confirmação em candle fechado; o app libera somente a entrada válida para a próxima vela, sem pré-sinal repintável.","non_repaint":True,"gale_signal":False}
     if engine == "LARRY":
         return {
@@ -27250,10 +27438,10 @@ async def pre_signals(
         if requested_market == "IQ_OTC"
         else None
     )
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC")
     if fallback_twelve:
         market = "OPEN"
-    if requested_market == "IQ_OTC" and engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT") and not iq_state:
+    if requested_market == "IQ_OTC" and engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC") and not iq_state:
         wait_label = {
             "EA": "EA Tripla",
             "RUBIK": "Robô Rubik Adaptado",
@@ -27364,7 +27552,7 @@ async def pre_signals(
             # Antes o fallback de 90 barras virava 89 candles fechados e motores
             # com aquecimento maior ficavam presos para sempre em 89/X.
             pre_n = max(int(pre_n), 320)
-            if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT") and requested_market == "IQ_OTC":
+            if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC") and requested_market == "IQ_OTC":
                 raw = await iq_ea_candles(
                     iq_state, symbol, interval, pre_n, regular_market=False
                 )
@@ -27857,8 +28045,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "SMART"
-    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER"):
-        raise HTTPException(400, "Motor inválido. Use CHATGPT ANALISTA, MEGA BOT, MEGA BOT FLEX ou MEGA MASTER.")
+    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "MONSTERSMC"):
+        raise HTTPException(400, "Motor inválido. Use CHATGPT ANALISTA, MEGA BOT, MEGA BOT FLEX, MEGA MASTER ou MONSTER SMC.")
 
     if engine == "RTM":
         # Radar exclusivo: BTC/USD + pares JPY. Um símbolo manual fora da regra
@@ -27885,7 +28073,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
 
     requested_market = market
     iq_state = _iq_session_state(request, required=False) if (requested_market == "IQ_OTC" or (engine == "EA" and requested_market == "IQ_OTC")) else None
-    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT")
+    fallback_twelve = requested_market == "IQ_OTC" and not iq_state and engine not in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC")
     if fallback_twelve:
         market = "OPEN"
 
@@ -28122,6 +28310,13 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 raw = await iq_ea_candles(iq_state, sym, interval, 140, regular_market=False)
             else:
                 raw = await candles(sym, interval, 140, "OPEN", None, request=request)
+        elif engine == "MONSTERSMC":
+            if market == "IQ_OTC":
+                if not iq_state:
+                    raise RuntimeError("Conecte a IQ Option para o MONSTER SMC analisar OTC.")
+                raw = await iq_ea_candles(iq_state, sym, interval, 320, regular_market=False)
+            else:
+                raw = await candles(sym, interval, 320, "OPEN", None, request=request)
         elif engine == "KAMIKAZE":
             # EMA200 exige histórico maior; painel e radar usam o mesmo núcleo causal.
             if market == "IQ_OTC":
@@ -28587,6 +28782,22 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why = str(tech.get("reason") or "SMART SESSION BREAKOUT monitorando").replace("\n", " ")[:88]
                 status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
+            elif engine == "MONSTERSMC":
+                m5_closed=[]; m15_closed=[]
+                if interval == "1min":
+                    if market == "IQ_OTC":
+                        _m5 = await iq_ea_candles(iq_state, sym, "5min", 120, regular_market=False)
+                        _m15 = await iq_ea_candles(iq_state, sym, "15min", 120, regular_market=False)
+                    else:
+                        _m5 = await candles(sym, "5min", 120, "OPEN", None, request=request)
+                        _m15 = await candles(sym, "15min", 120, "OPEN", None, request=request)
+                    m5_closed=_m5[:-1] if len(_m5)>1 else _m5
+                    m15_closed=_m15[:-1] if len(_m15)>1 else _m15
+                tech = monster_smc_strategy(closed[-300:], m5_closed, m15_closed, symbol=sym, timeframe=interval, market=market)
+                engine_label = "MONSTER SMC"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "MONSTER SMC monitorando").replace("\n", " ")[:88]
+                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "ELCODEX":
                 tech = elcodex_scalper_strategy(closed[-260:], symbol=sym, timeframe=interval, market=market)
                 engine_label = "ELCODEX SCALPER"
@@ -28868,18 +29079,18 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "direction": direction,
                 "confidence": round(float(tech.get("confidence", 0) or 0), 1),
                 "status": (
-                    status_text if (engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT") or (engine == "FORCE" and market == "IQ_OTC"))
+                    status_text if (engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC") or (engine == "FORCE" and market == "IQ_OTC"))
                     else (((_feed_source_label(_feed_source_from_rows(raw)) + " • " + status_text) if market == "OPEN" else status_text))
                 ),
                 "clickable": direction in ("CALL", "PUT"),
                 "updated_at": iso(now()),
-                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
+                "feed_source": ((_feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else (_feed_source_from_rows(raw) if market == "OPEN" else (_feed_source_from_rows(raw) if fallback_twelve else market)))),
                 "feed_fallback": fallback_twelve,
                 "requested_market": requested_market,
                 "engine": engine,
                 "strategy": str(tech.get("strategy") or ""),
             }
-            if item.get("direction") in ("CALL", "PUT") and engine not in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"):
+            if item.get("direction") in ("CALL", "PUT") and engine not in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC"):
                 radar_probe = {
                     "symbol": sym, "market": market, "interval": interval,
                     "direction": item.get("direction"), "confidence": item.get("confidence"),
@@ -28977,6 +29188,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             source_status = "SHK PRO HA + MACD • FONTE EM ESPERA" if market == "OPEN" else "SHK PRO HA + MACD • IQ OPTION OTC EM ESPERA"
         elif engine == "SESSIONBREAKOUT":
             source_status = "SMART SESSION BREAKOUT • FONTE EM ESPERA" if market == "OPEN" else "SMART SESSION BREAKOUT • IQ OPTION OTC EM ESPERA"
+        elif engine == "MONSTERSMC":
+            source_status = "MONSTER SMC • FONTE EM ESPERA" if market == "OPEN" else "MONSTER SMC • IQ OPTION OTC EM ESPERA"
         elif engine == "ELCODEX":
             source_status = "ELCODEX SCALPER • FONTE EM ESPERA" if market == "OPEN" else "ELCODEX SCALPER • IQ OPTION OTC EM ESPERA"
         elif engine == "FORCE" and market == "IQ_OTC":
@@ -29000,7 +29213,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "status": source_status,
             "clickable": False,
             "updated_at": iso(now()),
-            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
+            "feed_source": (((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else "IQ_OPTION_OTC") if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC") else ("IQ_OPTION_OTC" if engine == "FORCE" and market == "IQ_OTC" else ((_current_open_feed_info(sym, interval).get("source") or "MULTIFEED") if market == "OPEN" else market))),
             "feed_error": detail[:180],
         }
 
@@ -29404,7 +29617,7 @@ async def result(
 
     # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
-    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT")
+    ea_iq_result = market == "IQ_OTC" and engine in ("EA", "FORCE", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT", "MONSTERSMC")
 
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido.")
@@ -29869,7 +30082,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • CHATGPT ANALISTA • MEGA BOT • MEGA BOT FLEX • MEGA MASTER • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • CHATGPT ANALISTA • MEGA BOT • MEGA BOT FLEX • MEGA MASTER • MONSTER SMC • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -29954,6 +30167,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="megaMasterPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
+  <div class="robot-mode-card" id="monsterSmcModeCard">
+    <img src="__MEGA_IMAGE__" alt="Monster SMC">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">👾 MONSTER SMC</div>
+      <div class="robot-mode-desc" id="monsterSmcModeDesc">Liquidity Sweep + FVG + Fibonacci 61,8% + confirmação flexível M5/M15 (1 de 2) • candle M1 fechado • próxima vela • sem Gale.</div>
+    </div>
+    <button id="monsterSmcPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
 <div class="tabs">
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
     <button class="tabbtn" id="tabChart">📈 Gráfico</button>
@@ -30036,7 +30258,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div style="font-weight:1000">📊 PLACAR POR MOTOR</div>
       <div class="label" style="margin-top:4px">WIN/LOSS direto separado pelo motor que realmente gerou cada entrada.</div>
       <div id="engineScoreGrid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:10px;margin-top:10px"></div>
-      <div class="label" id="engineScoreNote" style="margin-top:8px;line-height:1.4">Os quatro motores atuais são contabilizados separadamente. Operações antigas sem identificação ficam em OUTROS/ANTIGOS.</div>
+      <div class="label" id="engineScoreNote" style="margin-top:8px;line-height:1.4">Os cinco motores atuais são contabilizados separadamente. Operações antigas sem identificação ficam em OUTROS/ANTIGOS.</div>
     </div>
 
     <div class="card daily-engine-board" id="momentStudyBoard">
@@ -30562,6 +30784,8 @@ const localAnalystFlexPowerBtn=document.getElementById('localAnalystFlexPowerBtn
 const localAnalystFlexModeDesc=document.getElementById('localAnalystFlexModeDesc');
 const megaMasterPowerBtn=document.getElementById('megaMasterPowerBtn');
 const megaMasterModeDesc=document.getElementById('megaMasterModeDesc');
+const monsterSmcPowerBtn=document.getElementById('monsterSmcPowerBtn');
+const monsterSmcModeDesc=document.getElementById('monsterSmcModeDesc');
 const blackbookPowerBtn=document.getElementById('blackbookPowerBtn');
 const blackbookModeDesc=document.getElementById('blackbookModeDesc');
 const rtmPowerBtn=document.getElementById('rtmPowerBtn');
@@ -30714,6 +30938,7 @@ let aiEnabled=false;
 let localAnalystEnabled=false;
 let localAnalystFlexEnabled=false;
 let megaMasterEnabled=false;
+let monsterSmcEnabled=false;
 let blackbookEnabled=false;
 let rtmEnabled=false;
 let eaEnabled=false;
@@ -30781,7 +31006,9 @@ try{
   localAnalystEnabled=localStorage.getItem('mega_local_analyst_power')==='ONLINE';
   localAnalystFlexEnabled=localStorage.getItem('mega_local_analyst_flex_power')==='ONLINE';
   megaMasterEnabled=localStorage.getItem('mega_master_power')==='ONLINE';
-  if(megaMasterEnabled){ localAnalystFlexEnabled=false; localAnalystEnabled=false; robotEnabled=false; aiEnabled=false; }
+  monsterSmcEnabled=localStorage.getItem('mega_monster_smc_power')==='ONLINE';
+  if(monsterSmcEnabled){ megaMasterEnabled=false; localAnalystFlexEnabled=false; localAnalystEnabled=false; robotEnabled=false; aiEnabled=false; }
+  else if(megaMasterEnabled){ localAnalystFlexEnabled=false; localAnalystEnabled=false; robotEnabled=false; aiEnabled=false; }
   else if(localAnalystFlexEnabled){ localAnalystEnabled=false; robotEnabled=false; aiEnabled=false; }
   else if(localAnalystEnabled){ robotEnabled=false; aiEnabled=false; }
   blackbookEnabled=localStorage.getItem('mega_blackbook_power')==='ONLINE';
@@ -31017,7 +31244,7 @@ try{
   }
 }catch(_){}
 
-// MEGA IA 3.96.64 — modo de quatro motores. Tudo que não for CHATGPT ANALISTA,
+// MEGA IA 3.96.64 — modo de cinco motores. Tudo que não for CHATGPT ANALISTA,
 // MEGA BOT, MEGA BOT FLEX ou MEGA MASTER fica forçado OFF, inclusive estados antigos do celular.
 robotEnabled=false; wprAdaptiveEnabled=false; tingaTingaEnabled=false; superNovaEnabled=false;
 elcodexEnabled=false; shkHaEnabled=false; sessionBreakoutEnabled=false;
@@ -31064,9 +31291,10 @@ if(localAnalystEnabled){
 }
 
 // Se nenhum motor válido ficou ONLINE, nesta versão o fallback é CHATGPT ANALISTA.
-if(!(robotEnabled||aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled||wprAdaptiveEnabled||tingaTingaEnabled||superNovaEnabled||elcodexEnabled||shkHaEnabled||sessionBreakoutEnabled)) aiEnabled=true;
+if(!(robotEnabled||aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled||monsterSmcEnabled||wprAdaptiveEnabled||tingaTingaEnabled||superNovaEnabled||elcodexEnabled||shkHaEnabled||sessionBreakoutEnabled)) aiEnabled=true;
 
 function selectedRobotEngine(){
+  if(monsterSmcEnabled) return 'MONSTERSMC';
   if(megaMasterEnabled) return 'MEGAMASTER';
   if(localAnalystFlexEnabled) return 'LOCALANALYSTFLEX';
   if(localAnalystEnabled) return 'LOCALANALYST';
@@ -31083,11 +31311,12 @@ function adoptBackgroundEngineState(d){
   }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(e!=='SMART' && e!=='LOCALANALYST' && e!=='LOCALANALYSTFLEX' && e!=='MEGAMASTER') return;
+  if(e!=='SMART' && e!=='LOCALANALYST' && e!=='LOCALANALYSTFLEX' && e!=='MEGAMASTER' && e!=='MONSTERSMC') return;
   aiEnabled=(e==='SMART');
   localAnalystEnabled=(e==='LOCALANALYST');
   localAnalystFlexEnabled=(e==='LOCALANALYSTFLEX');
   megaMasterEnabled=(e==='MEGAMASTER');
+  monsterSmcEnabled=(e==='MONSTERSMC');
   robotEnabled=false; wprAdaptiveEnabled=false; tingaTingaEnabled=false; superNovaEnabled=false;
   elcodexEnabled=false; shkHaEnabled=false; sessionBreakoutEnabled=false;
   try{
@@ -31095,6 +31324,7 @@ function adoptBackgroundEngineState(d){
     localStorage.setItem('mega_local_analyst_power',localAnalystEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_local_analyst_flex_power',localAnalystFlexEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_master_power',megaMasterEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_monster_smc_power',monsterSmcEnabled?'ONLINE':'OFFLINE');
     ['mega_robot_power','mega_wpr_adaptive_power','mega_tinga_tinga_power','mega_super_nova_power','mega_elcodex_power','mega_shk_ha_power','mega_session_breakout_power']
       .forEach(k=>localStorage.setItem(k,'OFFLINE'));
   }catch(_){}
@@ -31104,7 +31334,7 @@ function adoptBackgroundEngineState(d){
 async function syncBackgroundBotState(opts={}){
   const selected=selectedRobotEngine();
   let explicitEngine=String(opts.engine||selected||'SMART').toUpperCase();
-  if(explicitEngine!=='SMART' && explicitEngine!=='LOCALANALYST' && explicitEngine!=='LOCALANALYSTFLEX' && explicitEngine!=='MEGAMASTER') explicitEngine='SMART';
+  if(explicitEngine!=='SMART' && explicitEngine!=='LOCALANALYST' && explicitEngine!=='LOCALANALYSTFLEX' && explicitEngine!=='MEGAMASTER' && explicitEngine!=='MONSTERSMC') explicitEngine='SMART';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
   const payload={
@@ -32242,6 +32472,7 @@ function normalizeEngineKey(value){
   if(e==='FOREXMEGA' || e.includes('FOREX MEGA LLC') || e.includes('FOREX_MEGA_LLC')) return 'FOREXMEGA';
   if(e==='KAMIKAZE' || e.includes('KAMIKAZE TREND SNIPER')) return 'KAMIKAZE';
   if(e==='BBSTOCH' || e.includes('BB STOCHRSI')) return 'BBSTOCH';
+  if(e==='MONSTERSMC' || e==='MONSTER_SMC' || e.includes('MONSTER SMC') || e.includes('LOCAL_MONSTER_SMC')) return 'MONSTERSMC';
   if(e==='MEGAMASTER' || e==='LOCAL_MEGA_MASTER' || e.includes('MEGA MASTER')) return 'MEGAMASTER';
   if(e==='LOCALANALYSTFLEX' || e==='LOCAL_ANALYST_FLEX' || e.includes('LOCALANALYSTFLEX')) return 'LOCALANALYSTFLEX';
   if(e==='LOCALANALYST' || e==='LOCAL_ANALYST_PRO' || e.includes('LOCALANALYST')) return 'LOCALANALYST';
@@ -32259,7 +32490,7 @@ function momentStudyEngineName(key){
     SMART:'💬 CHATGPT ANALISTA',
     LOCALANALYST:'🤖 MEGA BOT',
     LOCALANALYSTFLEX:'🤖 MEGA BOT FLEX',
-    MEGAMASTER:'🧠 MEGA MASTER',
+    MEGAMASTER:'🧠 MEGA MASTER',MONSTERSMC:'👾 MONSTER SMC',
     RTM:'🤖 RTM MULTI + TAURUS',
     LARRY:'⚡ LARRY BREAKOUT + TAURUS',
     VELOCITY:'⚡ VELOCITY FLOW',
@@ -32400,6 +32631,7 @@ function currentScoreEngineKey(item){
   const raw=String((item&&item.engine)||'').trim().toUpperCase();
   const strategy=String((item&&item.strategy)||'').trim().toUpperCase();
   const normalized=normalizeEngineKey(raw);
+  if(normalized==='MONSTERSMC' || raw==='MONSTERSMC' || strategy.includes('MONSTER SMC') || strategy.includes('MONSTER_SMC')) return 'MONSTERSMC';
   if(normalized==='MEGAMASTER' || raw==='MEGAMASTER' || strategy.includes('MEGA MASTER')) return 'MEGAMASTER';
   if(normalized==='LOCALANALYSTFLEX' || raw==='LOCALANALYSTFLEX') return 'LOCALANALYSTFLEX';
   if(normalized==='LOCALANALYST' || raw==='LOCALANALYST') return 'LOCALANALYST';
@@ -32414,6 +32646,7 @@ function engineScoreSnapshot(bucket){
     LOCALANALYST:{key:'LOCALANALYST',name:'🤖 MEGA BOT',wins:0,losses:0},
     LOCALANALYSTFLEX:{key:'LOCALANALYSTFLEX',name:'🤖 MEGA BOT FLEX',wins:0,losses:0},
     MEGAMASTER:{key:'MEGAMASTER',name:'🧠 MEGA MASTER',wins:0,losses:0},
+    MONSTERSMC:{key:'MONSTERSMC',name:'👾 MONSTER SMC',wins:0,losses:0},
     OTHER:{key:'OTHER',name:'🗂️ OUTROS / ANTIGOS',wins:0,losses:0}
   };
   const seen=new Set();
@@ -32439,7 +32672,7 @@ function engineScoreSnapshot(bucket){
 function renderEngineScoreBoard(bucket){
   if(!engineScoreGrid) return;
   const st=engineScoreSnapshot(bucket||emptyResultBucket());
-  const order=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER'];
+  const order=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','MONSTERSMC'];
   if(st.OTHER.total>0) order.push('OTHER');
   engineScoreGrid.innerHTML=order.map(k=>{
     const x=st[k];
@@ -32458,7 +32691,7 @@ function renderEngineScoreBoard(bucket){
   }).join('');
   if(engineScoreNote){
     engineScoreNote.textContent=st.OTHER.total>0
-      ? `${st.OTHER.total} operação(ões) antiga(s) ou sem identificação confiável do motor foram mantidas separadas e não entram nos quatro placares atuais.`
+      ? `${st.OTHER.total} operação(ões) antiga(s) ou sem identificação confiável do motor foram mantidas separadas e não entram nos cinco placares atuais.`
       : 'Cada resultado identificado entra somente no placar do motor que gerou a operação.';
   }
 }
@@ -34808,6 +35041,15 @@ function applyRobotPowerState(){
   if(megaMasterModeDesc) megaMasterModeDesc.textContent=megaMasterEnabled
     ? 'ONLINE: leitura ampliada com até 15 famílias/contextos • EMA 9/21/50/100/200, estrutura, price action, S/R, breakout/trap, pullback, RSI/MACD, divergência, Fibonacci, Stochastic, ATR, Bollinger, volume e pressão • próxima vela • sem Gale.'
     : 'OFFLINE: Mega Master pausado.';
+  if(monsterSmcPowerBtn){
+    monsterSmcPowerBtn.textContent=monsterSmcEnabled?'🟢 ONLINE':'🔴 OFFLINE';
+    monsterSmcPowerBtn.style.background=monsterSmcEnabled?'#0b7a3d':'#7d1d1d';
+    monsterSmcPowerBtn.style.color='#fff';
+    monsterSmcPowerBtn.style.borderColor=monsterSmcEnabled?'#16c56b':'#ff5252';
+  }
+  if(monsterSmcModeDesc) monsterSmcModeDesc.textContent=monsterSmcEnabled
+    ? 'ONLINE: Liquidity Sweep + FVG + Fibonacci 61,8% + M5/M15 flexível 1 de 2 • candle M1 fechado • próxima vela • sem Gale.'
+    : 'OFFLINE: Monster SMC pausado.';
   if(eaPowerBtn){
     eaPowerBtn.textContent=eaEnabled?'🟢 ONLINE':'🔴 OFFLINE';
     eaPowerBtn.style.background=eaEnabled?'#0b7a3d':'#7d1d1d';
@@ -35415,7 +35657,7 @@ async function setRobotPower(enabled){
 async function setLocalAnalystPower(enabled){
   localAnalystEnabled=!!enabled;
   if(localAnalystEnabled){
-    localAnalystFlexEnabled=false; megaMasterEnabled=false;
+    localAnalystFlexEnabled=false; megaMasterEnabled=false; monsterSmcEnabled=false;
     robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false;
     larryEnabled=false; rangeEnabled=false; velocityEnabled=false; rsi5Enabled=false; sniperEnabled=false; alphaxEnabled=false;
     combinerEnabled=false; suntzuEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; samuraiEnabled=false;
@@ -35425,6 +35667,7 @@ async function setLocalAnalystPower(enabled){
     localStorage.setItem('mega_local_analyst_power',localAnalystEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_local_analyst_flex_power',localAnalystFlexEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_master_power',megaMasterEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_monster_smc_power',monsterSmcEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_robot_power',robotEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_ai_power',aiEnabled?'ONLINE':'OFFLINE');
   }catch(_){}
@@ -35440,7 +35683,7 @@ async function setLocalAnalystPower(enabled){
 async function setLocalAnalystFlexPower(enabled){
   localAnalystFlexEnabled=!!enabled;
   if(localAnalystFlexEnabled){
-    localAnalystEnabled=false; megaMasterEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false;
+    localAnalystEnabled=false; megaMasterEnabled=false; monsterSmcEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false;
     larryEnabled=false; rangeEnabled=false; velocityEnabled=false; rsi5Enabled=false; sniperEnabled=false; alphaxEnabled=false;
     combinerEnabled=false; suntzuEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; samuraiEnabled=false;
     disableImportedEnginesForOtherEngine();
@@ -35449,6 +35692,7 @@ async function setLocalAnalystFlexPower(enabled){
     localStorage.setItem('mega_local_analyst_flex_power',localAnalystFlexEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_local_analyst_power',localAnalystEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_master_power',megaMasterEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_monster_smc_power',monsterSmcEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_robot_power',robotEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_ai_power',aiEnabled?'ONLINE':'OFFLINE');
   }catch(_){}
@@ -35464,13 +35708,14 @@ async function setLocalAnalystFlexPower(enabled){
 async function setMegaMasterPower(enabled){
   megaMasterEnabled=!!enabled;
   if(megaMasterEnabled){
-    localAnalystEnabled=false; localAnalystFlexEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false;
+    localAnalystEnabled=false; localAnalystFlexEnabled=false; monsterSmcEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false;
     larryEnabled=false; rangeEnabled=false; velocityEnabled=false; rsi5Enabled=false; sniperEnabled=false; alphaxEnabled=false;
     combinerEnabled=false; suntzuEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; samuraiEnabled=false;
     disableImportedEnginesForOtherEngine();
   }
   try{
     localStorage.setItem('mega_master_power',megaMasterEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_monster_smc_power',monsterSmcEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_local_analyst_power',localAnalystEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_local_analyst_flex_power',localAnalystFlexEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_robot_power',robotEnabled?'ONLINE':'OFFLINE');
@@ -35485,15 +35730,42 @@ async function setMegaMasterPower(enabled){
   if(voiceEnabled) speak(megaMasterEnabled?'Mega Master online.':'Mega Master offline.');
 }
 
+async function setMonsterSmcPower(enabled){
+  monsterSmcEnabled=!!enabled;
+  if(monsterSmcEnabled){
+    localAnalystEnabled=false; localAnalystFlexEnabled=false; megaMasterEnabled=false; aiEnabled=false; robotEnabled=false;
+    eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; rangeEnabled=false;
+    velocityEnabled=false; rsi5Enabled=false; sniperEnabled=false; alphaxEnabled=false; combinerEnabled=false; suntzuEnabled=false;
+    rsiMonEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; samuraiEnabled=false;
+    disableImportedEnginesForOtherEngine();
+  }
+  try{
+    localStorage.setItem('mega_monster_smc_power',monsterSmcEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_master_power',megaMasterEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_local_analyst_power',localAnalystEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_local_analyst_flex_power',localAnalystFlexEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_ai_power',aiEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_robot_power',robotEnabled?'ONLINE':'OFFLINE');
+  }catch(_){}
+  resetEngineVisualState();
+  applyRobotPowerState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'MONSTERSMC'});
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]);
+  else await Promise.allSettled([perf()]);
+  if(chartTab.classList.contains('active')) loadChart();
+  if(voiceEnabled) speak(monsterSmcEnabled?'Monster S M C online.':'Monster S M C offline.');
+}
+
 async function setAiPower(enabled){
   aiEnabled=!!enabled;
   if(aiEnabled) rapidEnabled=false;
-  if(aiEnabled){ localAnalystEnabled=false; localAnalystFlexEnabled=false; megaMasterEnabled=false; combinerEnabled=false; suntzuEnabled=false; rangeEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; rsi5Enabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
+  if(aiEnabled){ localAnalystEnabled=false; localAnalystFlexEnabled=false; megaMasterEnabled=false; monsterSmcEnabled=false; combinerEnabled=false; suntzuEnabled=false; rangeEnabled=false; rsiMonEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; robotEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false; larryEnabled=false; velocityEnabled=false; rsi5Enabled=false; sniperEnabled=false; alphaxEnabled=false; samuraiEnabled=false; }
   try{
     localStorage.setItem('mega_ai_power', aiEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_local_analyst_power', localAnalystEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_local_analyst_flex_power', localAnalystFlexEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_master_power', megaMasterEnabled ? 'ONLINE' : 'OFFLINE');
+    localStorage.setItem('mega_monster_smc_power', monsterSmcEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_robot_power', 'OFFLINE');
     localStorage.setItem('mega_ea_power', eaEnabled ? 'ONLINE' : 'OFFLINE');
     localStorage.setItem('mega_rubik_power', rubikEnabled ? 'ONLINE' : 'OFFLINE');
@@ -36539,6 +36811,7 @@ if(robotPowerBtn) robotPowerBtn.onclick=()=>{ disableImportedEnginesForOtherEngi
 if(localAnalystPowerBtn) localAnalystPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); disablePresidenForOtherEngine(); setLocalAnalystPower(!localAnalystEnabled); };
 if(localAnalystFlexPowerBtn) localAnalystFlexPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); disablePresidenForOtherEngine(); setLocalAnalystFlexPower(!localAnalystFlexEnabled); };
 if(megaMasterPowerBtn) megaMasterPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); disablePresidenForOtherEngine(); setMegaMasterPower(!megaMasterEnabled); };
+if(monsterSmcPowerBtn) monsterSmcPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); disablePresidenForOtherEngine(); setMonsterSmcPower(!monsterSmcEnabled); };
 if(aiPowerBtn) aiPowerBtn.onclick=()=>{ disableImportedEnginesForOtherEngine(); disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); disablePresidenForOtherEngine(); setAiPower(!aiEnabled); };
 if(eaPowerBtn) eaPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); setEaPower(!eaEnabled); };
 if(rubikPowerBtn) rubikPowerBtn.onclick=()=>{ disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); setRubikPower(!rubikEnabled); };
@@ -36984,7 +37257,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
