@@ -42,11 +42,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.70"
+APP_VERSION = "3.96.71"
 # MEGA IA 3.96.66 — alinha radar e sinal oficial: oportunidade só aparece/libera com dados OPEN realmente frescos; cartão antigo expira visualmente.
 # MEGA IA 3.96.65 — corrige aquecimento do MEGA MASTER: 320 candles na coleta oficial e 260 no núcleo.
 # MEGA IA 3.96.67 — adiciona MONSTER SMC: adaptação causal do Monster Arrows v2.0 (Ultimate SMC).
 # MEGA IA 3.96.70 — mantém MEGA ULTRA privado e restaura MOMENTUM 14 puro no app.
+# MEGA IA 3.96.71 — corrige MOMENTUM 14: radar usa o motor real e descarta cruzamento tardio após 10s da abertura.
 # MEGA IA 3.96.69 — renomeia o motor privado para MEGA ULTRA e oculta sua composição técnica no painel/API.
 # MEGA IA 3.96.69 — adiciona MOMENTUM 14 puro: fórmula original MT4 Close[i]*100/Close[i+14], cruzamento causal do nível 100, candle fechado -> próxima vela.
 # M1 fechado -> próxima vela; Liquidity Sweep + FVG + Fibonacci 61,8% + confirmação flexível M5/M15 (1 de 2); sem Gale.
@@ -22388,6 +22389,24 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key] = (time.time(), base)
                         return base
 
+                if engine == "MOMENTUM":
+                    # Momentum é NEXT CANDLE: o cruzamento pertence ao último candle fechado.
+                    # Depois de 10s da abertura, entrar seria uma vela atrasado e pioraria a leitura.
+                    momentum_age = max(0.0, (now() - current_boundary(interval)).total_seconds())
+                    if momentum_age > 10.0:
+                        base["status"] = "ONLINE • MOMENTUM 14 • AGUARDANDO PRÓXIMO FECHAMENTO"
+                        base["reason"] = (
+                            "Cruzamento Momentum 14 confirmado, mas a abertura imediatamente seguinte já passou. "
+                            "A entrada tardia foi descartada; o motor recalcula no próximo candle fechado."
+                        )
+                        base["direction"] = "NEUTRO"
+                        base["entry_time"] = None
+                        base["expiry_time"] = None
+                        base["risk"] = "HIGH"
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
+
                 if engine == "SNIPER":
                     # Sniper permanece no modelo de candle fechado / nascimento.
                     sniper_age = max(0.0, (now() - current_boundary(interval)).total_seconds())
@@ -28980,6 +28999,22 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     if direction != "NEUTRO"
                     else f"{engine_label} • MONITORANDO • {why}"
                 )
+            elif engine == "MOMENTUM":
+                # Radar e sinal oficial usam exatamente o mesmo Momentum 14 puro.
+                tech = momentum14_strategy(closed[-120:], symbol=sym, timeframe=interval, market=market)
+                engine_label = "MOMENTUM 14"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "MOMENTUM 14 monitorando").replace("\n", " ")[:88]
+                momentum_age = max(0.0, (now() - current_boundary(interval)).total_seconds())
+                if direction != "NEUTRO" and momentum_age > 10.0:
+                    direction = "NEUTRO"
+                    status_text = f"{engine_label} • OPORTUNIDADE PASSOU • aguardando próximo fechamento"
+                else:
+                    status_text = (
+                        f"{engine_label} • OPORTUNIDADE ENCONTRADA"
+                        if direction != "NEUTRO"
+                        else f"{engine_label} • MONITORANDO • {why}"
+                    )
             elif engine == "SESSIONBREAKOUT":
                 if market == "IQ_OTC":
                     _ssb_ref = await iq_ea_candles(iq_state, sym, SSB_REFERENCE_INTERVAL, SSB_REFERENCE_BARS, regular_market=False)
@@ -29394,6 +29429,10 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             source_status = "SUPER NOVA • FONTE EM ESPERA" if market == "OPEN" else "SUPER NOVA • IQ OPTION OTC EM ESPERA"
         elif engine == "SHKHA":
             source_status = "SHK PRO HA + MACD • FONTE EM ESPERA" if market == "OPEN" else "SHK PRO HA + MACD • IQ OPTION OTC EM ESPERA"
+        elif engine == "TSI":
+            source_status = "MEGA ULTRA • FONTE EM ESPERA" if market == "OPEN" else "MEGA ULTRA • IQ OPTION OTC EM ESPERA"
+        elif engine == "MOMENTUM":
+            source_status = "MOMENTUM 14 • FONTE EM ESPERA" if market == "OPEN" else "MOMENTUM 14 • IQ OPTION OTC EM ESPERA"
         elif engine == "SESSIONBREAKOUT":
             source_status = "SMART SESSION BREAKOUT • FONTE EM ESPERA" if market == "OPEN" else "SMART SESSION BREAKOUT • IQ OPTION OTC EM ESPERA"
         elif engine == "MONSTERSMC":
