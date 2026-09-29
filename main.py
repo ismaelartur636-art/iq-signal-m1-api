@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.65"
+APP_VERSION = "3.96.66"
+# MEGA IA 3.96.66 — alinha radar e sinal oficial: oportunidade só aparece/libera com dados OPEN realmente frescos; cartão antigo expira visualmente.
 # MEGA IA 3.96.65 — corrige aquecimento do MEGA MASTER: 320 candles na coleta oficial e 260 no núcleo.
 # MEGA IA 3.96.64 — adiciona MEGA MASTER: leitura local ampliada com 15 famílias técnicas/contextuais, sem API.
 # MEGA IA 3.96.63 — placar separado por motor: CHATGPT ANALISTA, MEGA BOT e MEGA BOT FLEX.
@@ -28209,7 +28210,35 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             )
         else:
             raw = await candles(sym, interval, (300 if engine == "SMART" else 320), market, iq_state, request=request)
-        if len(raw) >= 25:
+        # 3.96.66 — o radar usa a MESMA trava de frescor do sinal oficial.
+        # Antes ele podia exibir CALL/PUT calculado sobre candles antigos enquanto
+        # /signal-ai recusava a entrada com "AGUARDANDO DADOS ATUALIZADOS".
+        if market == "OPEN":
+            radar_source = _feed_source_from_rows(raw)
+            radar_age = _open_rows_age_seconds(raw)
+            radar_safe_age = max(105.0, INTERVALS[interval] * 1.8)
+        else:
+            radar_source = "IQ_OPTION_OTC"
+            radar_age = 0.0
+            radar_safe_age = 0.0
+
+        if market == "OPEN" and radar_age > radar_safe_age:
+            item = {
+                "symbol": sym + suffix,
+                "base_symbol": sym,
+                "direction": "NEUTRO",
+                "confidence": 0,
+                "status": f"{_feed_source_label(radar_source)} • AGUARDANDO DADOS ATUALIZADOS",
+                "clickable": False,
+                "updated_at": iso(now()),
+                "feed_source": radar_source,
+                "feed_age_seconds": round(float(radar_age), 1),
+                "feed_fallback": fallback_twelve,
+                "requested_market": requested_market,
+                "engine": engine,
+                "strategy": "",
+            }
+        elif len(raw) >= 25:
             closed = raw[:-1] if len(raw) > 1 else raw
             if engine == "EA":
                 tech = await ea_xgboost_strategy(closed, sym, interval, market=market)
@@ -36879,10 +36908,19 @@ function radarBaseSymbol(item){
 }
 
 function radarCard(item){
-  const dir=String(item.direction||'NEUTRO').toUpperCase();
+  let dir=String(item.direction||'NEUTRO').toUpperCase();
   const sym=radarBaseSymbol(item);
   const conf=Math.round(Number(item.confidence||0));
-  const status=String(item.status||'MONITORANDO');
+  let status=String(item.status||'MONITORANDO');
+
+  // 3.96.66 — um CALL/PUT antigo não pode continuar verde/vermelho no radar.
+  // O backend já valida o frescor da fonte; esta proteção visual também expira
+  // cartões que ainda estavam no snapshot enquanto a fila gira os demais ativos.
+  if((dir==='CALL'||dir==='PUT') && !radarOpportunityIsFresh(item)){
+    dir='NEUTRO';
+    status='OPORTUNIDADE EXPIRADA • aguardando nova leitura';
+  }
+
   const opportunity=(dir==='CALL'||dir==='PUT');
   const cls=opportunity ? ('radar-opportunity '+(dir==='CALL'?'radar-call':'radar-put')) : '';
   const icon=dir==='CALL'?'🟢':dir==='PUT'?'🔴':'⚪';
