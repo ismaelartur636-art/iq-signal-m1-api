@@ -42,11 +42,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.74"
+APP_VERSION = "3.96.75"
 # MEGA IA 3.96.66 — alinha radar e sinal oficial: oportunidade só aparece/libera com dados OPEN realmente frescos; cartão antigo expira visualmente.
 # MEGA IA 3.96.65 — corrige aquecimento do MEGA MASTER: 320 candles na coleta oficial e 260 no núcleo.
 # MEGA IA 3.96.67 — adiciona MONSTER SMC: adaptação causal do Monster Arrows v2.0 (Ultimate SMC).
 # MEGA IA 3.96.70 — mantém MEGA ULTRA privado e restaura MOMENTUM 14 puro no app.
+# MEGA IA 3.96.75 — adiciona VASILY PIP SNIPER ZL e PLATINUM ao placar por motor com WIN/LOSS/assertividade separados.
 # MEGA IA 3.96.74 — integra PLATINUM original em vela atual (WPR adaptativo Risk=3, 30/70) junto de FIGURES CANDLE e VASILY PIP SNIPER ZL.
 # MEGA IA 3.96.73 — integra VASILY PIP SNIPER ZL: Zero-Lag EMA 1/6, candle fechado, novo cruzamento -> próxima vela, sem MTF no gatilho.
 # MEGA IA 3.96.72 — corrige e integra FIGURES CANDLE: EMA5 causal corrigida, alerta lógico corrigido, candle fechado -> próxima vela.
@@ -30949,7 +30950,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div style="font-weight:1000">📊 PLACAR POR MOTOR</div>
       <div class="label" style="margin-top:4px">WIN/LOSS direto separado pelo motor que realmente gerou cada entrada.</div>
       <div id="engineScoreGrid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:10px;margin-top:10px"></div>
-      <div class="label" id="engineScoreNote" style="margin-top:8px;line-height:1.4">Os cinco motores atuais são contabilizados separadamente. Operações antigas sem identificação ficam em OUTROS/ANTIGOS.</div>
+      <div class="label" id="engineScoreNote" style="margin-top:8px;line-height:1.4">Cada motor atual é contabilizado separadamente. Operações antigas sem identificação ficam em OUTROS/ANTIGOS.</div>
     </div>
 
     <div class="card daily-engine-board" id="momentStudyBoard">
@@ -31955,7 +31956,7 @@ try{
   }
 }catch(_){}
 
-// MEGA IA 3.96.74 — modo de dez motores. Tudo que não for CHATGPT ANALISTA,
+// MEGA IA 3.96.75 — modo de dez motores. Tudo que não for CHATGPT ANALISTA,
 // MEGA BOT, MEGA BOT FLEX, MEGA MASTER, MONSTER SMC, MEGA ULTRA, MOMENTUM 14, FIGURES CANDLE, VASILY PIP SNIPER ZL ou PLATINUM fica forçado OFF, inclusive estados antigos do celular.
 robotEnabled=false; wprAdaptiveEnabled=false; tingaTingaEnabled=false; superNovaEnabled=false;
 elcodexEnabled=false; shkHaEnabled=false; sessionBreakoutEnabled=false;
@@ -33468,7 +33469,7 @@ function engineScoreSnapshot(bucket){
 function renderEngineScoreBoard(bucket){
   if(!engineScoreGrid) return;
   const st=engineScoreSnapshot(bucket||emptyResultBucket());
-  const order=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','MONSTERSMC','TSI','MOMENTUM','FIGURES'];
+  const order=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','MONSTERSMC','TSI','MOMENTUM','FIGURES','VASILY','PLATINUM'];
   if(st.OTHER.total>0) order.push('OTHER');
   engineScoreGrid.innerHTML=order.map(k=>{
     const x=st[k];
@@ -33487,7 +33488,7 @@ function renderEngineScoreBoard(bucket){
   }).join('');
   if(engineScoreNote){
     engineScoreNote.textContent=st.OTHER.total>0
-      ? `${st.OTHER.total} operação(ões) antiga(s) ou sem identificação confiável do motor foram mantidas separadas e não entram nos seis placares atuais.`
+      ? `${st.OTHER.total} operação(ões) antiga(s) ou sem identificação confiável do motor foram mantidas separadas e não entram nos placares atuais.`
       : 'Cada resultado identificado entra somente no placar do motor que gerou a operação.';
   }
 }
