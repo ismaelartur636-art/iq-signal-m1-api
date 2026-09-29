@@ -42,7 +42,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.62"
+APP_VERSION = "3.96.63"
+# MEGA IA 3.96.63 — placar separado por motor: CHATGPT ANALISTA, MEGA BOT e MEGA BOT FLEX.
+# Resultados antigos/sem identificação ficam fora dos três placares atuais para não misturar desempenho.
 # MEGA IA 3.96.62 — adiciona MEGA BOT FLEX: mesma leitura multi-camada do MEGA BOT, com gate levemente mais solto.
 # Ele transforma as principais famílias de leitura usadas pelo ChatGPT em regras causais:
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
@@ -29796,6 +29798,13 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
     </div>
 
+    <div class="card" id="engineScoreBoard" style="margin-top:10px">
+      <div style="font-weight:1000">📊 PLACAR POR MOTOR</div>
+      <div class="label" style="margin-top:4px">WIN/LOSS direto separado pelo motor que realmente gerou cada entrada.</div>
+      <div id="engineScoreGrid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:10px;margin-top:10px"></div>
+      <div class="label" id="engineScoreNote" style="margin-top:8px;line-height:1.4">Os três motores atuais são contabilizados separadamente. Operações antigas sem identificação ficam em OUTROS/ANTIGOS.</div>
+    </div>
+
     <div class="card daily-engine-board" id="momentStudyBoard">
       <div class="daily-engine-head">
         <div>
@@ -31098,6 +31107,8 @@ const wins=document.getElementById('wins');
 const losses=document.getElementById('losses');
 const accuracy=document.getElementById('accuracy');
 const result=document.getElementById('result');
+const engineScoreGrid=document.getElementById('engineScoreGrid');
+const engineScoreNote=document.getElementById('engineScoreNote');
 const radar=document.getElementById('radar');
 const radarOtc=document.getElementById('radarOtc');
 const radarOtcStatus=document.getElementById('radarOtcStatus');
@@ -31734,12 +31745,16 @@ function renderHistory(){
     const trigger=String(h.trigger_indicator||'').trim();
     const triggerScore=Number(h.trigger_score||0);
     const triggerLine=trigger ? `<div class="label" style="margin-top:6px">🤖 RTM • Gatilho: <b>${trigger}</b>${triggerScore?` • ${Math.round(triggerScore)}%`:''}</div>` : '';
+    const ek=currentScoreEngineKey(h);
+    const engineLabel=ek==='SMART'?'💬 CHATGPT ANALISTA':(ek==='LOCALANALYST'?'🤖 MEGA BOT':(ek==='LOCALANALYSTFLEX'?'🤖 MEGA BOT FLEX':'🗂️ OUTRO/ANTIGO'));
+    const engineLine=`<div class="label" style="margin-top:6px">Motor: <b>${engineLabel}</b></div>`;
     return `<div class="card" style="padding:12px">
       <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap">
         <div><b>${date}</b><div class="label">${time} • Brasília</div></div>
         <div style="text-align:right"><b>${h.symbol||'--'} • ${h.interval||'--'}</b><div class="label">${dirIcon} ${dir||'--'}</div></div>
       </div>
       <div style="margin-top:8px;font-size:20px;font-weight:1000;${resultStyle}">${isWin?'✅':'❌'} ${r}</div>
+      ${engineLine}
       ${triggerLine}
     </div>`;
   }).join('');
@@ -31972,6 +31987,8 @@ function normalizeEngineKey(value){
   if(e==='FOREXMEGA' || e.includes('FOREX MEGA LLC') || e.includes('FOREX_MEGA_LLC')) return 'FOREXMEGA';
   if(e==='KAMIKAZE' || e.includes('KAMIKAZE TREND SNIPER')) return 'KAMIKAZE';
   if(e==='BBSTOCH' || e.includes('BB STOCHRSI')) return 'BBSTOCH';
+  if(e==='LOCALANALYSTFLEX' || e==='LOCAL_ANALYST_FLEX' || e.includes('LOCALANALYSTFLEX')) return 'LOCALANALYSTFLEX';
+  if(e==='LOCALANALYST' || e==='LOCAL_ANALYST_PRO' || e.includes('LOCALANALYST')) return 'LOCALANALYST';
   return '';
 }
 
@@ -32122,6 +32139,71 @@ async function loadMomentStudy(force=false){
   }
 }
 
+function currentScoreEngineKey(item){
+  const raw=String((item&&item.engine)||'').trim().toUpperCase();
+  const strategy=String((item&&item.strategy)||'').trim().toUpperCase();
+  const normalized=normalizeEngineKey(raw);
+  if(normalized==='LOCALANALYSTFLEX' || raw==='LOCALANALYSTFLEX') return 'LOCALANALYSTFLEX';
+  if(normalized==='LOCALANALYST' || raw==='LOCALANALYST') return 'LOCALANALYST';
+  if(normalized==='SMART' || raw==='SMART' || strategy.includes('CHATGPT ANALISTA')) return 'SMART';
+  // Não transforma o MEGABOT legado no MEGA BOT atual: são motores diferentes.
+  return 'OTHER';
+}
+
+function engineScoreSnapshot(bucket){
+  const stats={
+    SMART:{key:'SMART',name:'💬 CHATGPT ANALISTA',wins:0,losses:0},
+    LOCALANALYST:{key:'LOCALANALYST',name:'🤖 MEGA BOT',wins:0,losses:0},
+    LOCALANALYSTFLEX:{key:'LOCALANALYSTFLEX',name:'🤖 MEGA BOT FLEX',wins:0,losses:0},
+    OTHER:{key:'OTHER',name:'🗂️ OUTROS / ANTIGOS',wins:0,losses:0}
+  };
+  const seen=new Set();
+  const rows=Array.isArray(bucket&&bucket.history)?bucket.history:[];
+  rows.forEach(h=>{
+    if(!h) return;
+    const r=String(h.result||'').toUpperCase();
+    if(r!=='WIN' && r!=='LOSS') return;
+    const op=String(h.op_key||h.key||'');
+    if(op && seen.has(op)) return;
+    if(op) seen.add(op);
+    const k=currentScoreEngineKey(h);
+    const dst=stats[k]||stats.OTHER;
+    if(r==='WIN') dst.wins++; else dst.losses++;
+  });
+  Object.values(stats).forEach(x=>{
+    x.total=x.wins+x.losses;
+    x.accuracy=x.total?(100*x.wins/x.total):0;
+  });
+  return stats;
+}
+
+function renderEngineScoreBoard(bucket){
+  if(!engineScoreGrid) return;
+  const st=engineScoreSnapshot(bucket||emptyResultBucket());
+  const order=['SMART','LOCALANALYST','LOCALANALYSTFLEX'];
+  if(st.OTHER.total>0) order.push('OTHER');
+  engineScoreGrid.innerHTML=order.map(k=>{
+    const x=st[k];
+    const empty=x.total===0;
+    const acc=empty?'--':x.accuracy.toFixed(2)+'%';
+    return `<div class="card" style="padding:11px;border-color:${k==='SMART'?'#d6bd45':k==='LOCALANALYSTFLEX'?'#8b67d8':k==='LOCALANALYST'?'#4f8ed7':'rgba(160,180,210,.35)'}">
+      <div style="font-weight:1000;font-size:12px">${x.name}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px">
+        <div><div class="label">WIN</div><b class="call" style="font-size:20px">${x.wins}</b></div>
+        <div><div class="label">LOSS</div><b class="put" style="font-size:20px">${x.losses}</b></div>
+      </div>
+      <div class="label" style="margin-top:7px">ASSERTIVIDADE</div>
+      <div style="font-weight:1000;font-size:18px">${acc}</div>
+      <div class="label" style="margin-top:3px">${x.total} operação${x.total===1?'':'ões'} identificada${x.total===1?'':'s'}</div>
+    </div>`;
+  }).join('');
+  if(engineScoreNote){
+    engineScoreNote.textContent=st.OTHER.total>0
+      ? `${st.OTHER.total} operação(ões) antiga(s) ou sem identificação confiável do motor foram mantidas separadas e não entram nos três placares atuais.`
+      : 'Cada resultado identificado entra somente no placar do motor que gerou a operação.';
+  }
+}
+
 function paintPersistentResults(){
   const m=activeResultMarket();
   const b=persistentResults[m]||emptyResultBucket();
@@ -32139,6 +32221,7 @@ function paintPersistentResults(){
   if(winG1) winG1.textContent=String(b.win_g1);
   if(winG2) winG2.textContent=String(b.win_g2);
   if(lossG2) lossG2.textContent=String(b.loss_g2);
+  renderEngineScoreBoard(b);
   renderMomentStudy();
   if(historyTab && historyTab.classList.contains('active')) renderHistory();
 }
