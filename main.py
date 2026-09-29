@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.64"
+APP_VERSION = "3.96.65"
+# MEGA IA 3.96.65 — corrige aquecimento do MEGA MASTER: 320 candles na coleta oficial e 260 no núcleo.
 # MEGA IA 3.96.64 — adiciona MEGA MASTER: leitura local ampliada com 15 famílias técnicas/contextuais, sem API.
 # MEGA IA 3.96.63 — placar separado por motor: CHATGPT ANALISTA, MEGA BOT e MEGA BOT FLEX.
 # Resultados antigos/sem identificação ficam fora dos quatro placares atuais para não misturar desempenho.
@@ -20655,7 +20656,17 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         else:
             # SMART pede histórico maior para treinar/validar o XGBoost.
             # Os demais motores mantêm a janela anterior para reduzir carga.
-            request_n = 260 if engine in ("KAMIKAZE", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT") else (240 if (engine == "SMART" and market == "OPEN") else 150)
+            # MEGA MASTER precisa de pelo menos 210 candles FECHADOS. Como o
+            # roteador devolve também a vela em formação, pedimos 320 para dar
+            # folga ao aquecimento, à EMA200 e às leituras estruturais do MASTER.
+            if engine == "MEGAMASTER":
+                request_n = 320
+            elif engine in ("KAMIKAZE", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"):
+                request_n = 260
+            elif engine == "SMART" and market == "OPEN":
+                request_n = 240
+            else:
+                request_n = 150
             raw = await candles(symbol, interval, request_n, market, iq_state, request=request)
     except HTTPException as exc:
         if engine == "EA":
@@ -21210,7 +21221,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 engine_closed = closed[-120:]
             elif engine in ("COMBINER", "RSIDIVBB"):
                 engine_closed = closed[-180:]
-            elif engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA"):
+            elif engine == "MEGAMASTER":
+                # O MASTER usa EMA100/200 e até 260 candles de contexto.
+                engine_closed = closed[-260:]
+            elif engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "EA"):
                 engine_closed = closed[-220:]
             elif engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "RSI5", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "SESSIONBREAKOUT"):
                 engine_closed = closed[-120:]
