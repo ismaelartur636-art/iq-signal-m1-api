@@ -43,6 +43,7 @@ from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
 APP_VERSION = "3.96.90"
+# MEGA IA 3.96.91 — corrige o PLACAR POR MOTOR: 1 MINUTE SCALPER volta a aparecer com WIN/LOSS/assertividade separados.
 # MEGA IA 3.96.90 — destrava sinais: cTrader cai automaticamente para a multifuente quando falha/atrasa; RSI CHANNELS ganha reentrada FLEX nos 20s finais e pré-alerta coerente com o sinal oficial.
 # MEGA IA 3.96.89 — corrige o radar do 1 MINUTE SCALPER: usa o próprio motor e elimina o fallback legado da IA GRÁFICA.
 # MEGA IA 3.96.88 — restaura 1 MINUTE SCALPER e preserva RSI CHANNELS com pré-sinal oficial nos 20s finais para a próxima vela.
@@ -34532,7 +34533,7 @@ function engineScoreSnapshot(bucket){
 function renderEngineScoreBoard(bucket){
   if(!engineScoreGrid) return;
   const st=engineScoreSnapshot(bucket||emptyResultBucket());
-  const order=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','STREAKREV','ISMAELTRADER','RSICHANNEL'];
+  const order=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','STREAKREV','ISMAELTRADER','RSICHANNEL','MINSCALPER'];
   if(st.OTHER.total>0) order.push('OTHER');
   engineScoreGrid.innerHTML=order.map(k=>{
     const x=st[k];
