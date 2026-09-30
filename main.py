@@ -42,7 +42,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.77"
+APP_VERSION = "3.96.79"
+# MEGA IA 3.96.79 — retira PLATINUM e RSI CROSS 6/14 do painel, placar, compatibilidade, seleção e robô 24h; estados antigos ficam forçados OFF.
+# MEGA IA 3.96.78 — remove também do PLACAR POR MOTOR os cartões de MONSTER SMC, MEGA ULTRA, MOMENTUM 14, FIGURES CANDLE e VASILY PIP SNIPER ZL; históricos desses motores passam para OUTROS/ANTIGOS.
 # MEGA IA 3.96.77 — retira MONSTER SMC, MEGA ULTRA, MOMENTUM 14, FIGURES CANDLE e VASILY PIP SNIPER ZL do painel e bloqueia reativação/backend/robô 24h.
 # MEGA IA 3.96.66 — alinha radar e sinal oficial: oportunidade só aparece/libera com dados OPEN realmente frescos; cartão antigo expira visualmente.
 # MEGA IA 3.96.65 — corrige aquecimento do MEGA MASTER: 320 candles na coleta oficial e 260 no núcleo.
@@ -65,7 +67,7 @@ APP_VERSION = "3.96.77"
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # CHATGPT ANALISTA permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v196"
+PWA_VERSION = "v198"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -1488,7 +1490,7 @@ BACKGROUND_SCAN_SECONDS = max(3.0, min(60.0, float(os.getenv("BACKGROUND_SCAN_SE
 BACKGROUND_RESULT_SECONDS = max(3.0, min(30.0, float(os.getenv("BACKGROUND_RESULT_SECONDS", "5"))))
 BACKGROUND_DEFAULT_ENABLED = os.getenv("BACKGROUND_SIGNALS_ENABLED", "0").strip().lower() in ("1", "true", "on", "yes")
 BACKGROUND_DEFAULT_ENGINE = os.getenv("BACKGROUND_ENGINE", "SMART").strip().upper() or "SMART"
-if BACKGROUND_DEFAULT_ENGINE not in {"SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "PLATINUM", "RSICROSS"}:
+if BACKGROUND_DEFAULT_ENGINE not in {"SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER"}:
     BACKGROUND_DEFAULT_ENGINE = "SMART"
 BACKGROUND_DEFAULT_MARKET = os.getenv("BACKGROUND_MARKET", "OPEN").strip().upper() or "OPEN"
 BACKGROUND_DEFAULT_INTERVAL = os.getenv("BACKGROUND_INTERVAL", "1min").strip() or "1min"
@@ -1655,8 +1657,8 @@ RETIRED_ENGINES = {
     "LARRY", "ALPHAX", "TAURUSRSIDIV", "INDICEMENT", "GOLDINV", "TTMSCALPER",
     "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE",
     "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX",
-    # 3.96.77 — retirados do painel e bloqueados no backend/robô 24h.
-    "MONSTERSMC", "TSI", "MOMENTUM", "FIGURES", "VASILY",
+    # 3.96.79 — retirados do painel e bloqueados no backend/robô 24h.
+    "MONSTERSMC", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "RSICROSS",
 }
 
 background_bot_task = None
@@ -26252,8 +26254,8 @@ async def telegram_send(body: TelegramSignalBody):
 # MEGA IA 3.72 — execução em segundo plano no servidor; motor só muda por clique explícito
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
-    # 3.96.77 — somente motores atuais/visíveis podem rodar em segundo plano.
-    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "PLATINUM", "RSICROSS",
+    # 3.96.79 — somente os quatro motores atuais/visíveis podem rodar em segundo plano.
+    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER",
 }
 
 
@@ -27123,8 +27125,10 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
     if engine == "RSI":
         engine = "GRAPH_AI"
-    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "PLATINUM", "RSICROSS"):
-        raise HTTPException(400, "Motor inválido. Use CHATGPT ANALISTA, MEGA BOT, MEGA BOT FLEX, MEGA MASTER, PLATINUM ou RSI CROSS 6/14.")
+    if engine in RETIRED_ENGINES:
+        engine = "SMART"
+    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER"):
+        raise HTTPException(400, "Motor inválido. Use CHATGPT ANALISTA, MEGA BOT, MEGA BOT FLEX ou MEGA MASTER.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
     if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC"):
@@ -27892,7 +27896,7 @@ async def pre_signals(
     engine = str(engine or "SMART").upper()
     if engine in RETIRED_ENGINES:
         engine = "SMART"
-    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "MONSTERSMC", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "RSICROSS"):
+    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER"):
         engine = "SMART"
     limit = max(1, min(int(limit), 4))
 
@@ -28734,8 +28738,10 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Ativo do radar inválido.")
     if engine == "RSI":
         engine = "SMART"
-    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "MONSTERSMC", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "RSICROSS"):
-        raise HTTPException(400, "Motor inválido. Use CHATGPT ANALISTA, MEGA BOT, MEGA BOT FLEX, MEGA MASTER, MONSTER SMC, MEGA ULTRA, MOMENTUM 14, FIGURES CANDLE, VASILY PIP SNIPER ZL, PLATINUM ou RSI CROSS 6/14.")
+    if engine in RETIRED_ENGINES:
+        engine = "SMART"
+    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER"):
+        raise HTTPException(400, "Motor inválido. Use CHATGPT ANALISTA, MEGA BOT, MEGA BOT FLEX ou MEGA MASTER.")
 
     if engine == "RTM":
         # Radar exclusivo: BTC/USD + pares JPY. Um símbolo manual fora da regra
@@ -30838,7 +30844,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • CHATGPT ANALISTA • MEGA BOT • MEGA BOT FLEX • MEGA MASTER • PLATINUM • RSI CROSS 6/14 • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • CHATGPT ANALISTA • MEGA BOT • MEGA BOT FLEX • MEGA MASTER • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -30928,23 +30934,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
 
 
-  <div class="robot-mode-card" id="platinumModeCard">
-    <img src="__MEGA_IMAGE__" alt="Platinum">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">💎 PLATINUM</div>
-      <div class="robot-mode-desc" id="platinumModeDesc">Lógica original • Risk 3 • WPR adaptativo 30/70 • shift 0 • sinal para a mesma vela • pode variar enquanto a vela estiver aberta • sem Gale.</div>
-    </div>
-    <button id="platinumPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-  <div class="robot-mode-card" id="rsiCrossModeCard">
-    <img src="__MEGA_IMAGE__" alt="RSI Cross 6/14">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🔀 RSI CROSS 6/14</div>
-      <div class="robot-mode-desc" id="rsiCrossModeDesc">RSI rápido 6 x RSI lento 14 • CALL no cruzamento para cima • PUT no cruzamento para baixo • candle fechado • próxima vela • sem Gale.</div>
-    </div>
-    <button id="rsiCrossPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
 
 <div class="tabs">
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
@@ -31487,8 +31476,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 (function(){
   try{
     const u=new URL(window.location.href);
-    if(u.searchParams.get('pwa')!=='v125'){
-      u.searchParams.set('pwa','v125');
+    if(u.searchParams.get('pwa')!=='v126'){
+      u.searchParams.set('pwa','v126');
       window.history.replaceState({},'',u.pathname+u.search+u.hash);
     }
   }catch(_){}
@@ -32008,10 +31997,10 @@ try{
    'mega_forexstay_pro_power','mega_forexflex_power']
    .forEach(k=>localStorage.setItem(k,'OFFLINE'));
 }catch(_){}
-// MEGA IA 3.96.77 — motores retirados: nunca podem ser restaurados por localStorage antigo.
-monsterSmcEnabled=false; tsiEnabled=false; momentumEnabled=false; figuresEnabled=false; vasilyEnabled=false;
+// MEGA IA 3.96.79 — motores retirados: nunca podem ser restaurados por localStorage antigo.
+monsterSmcEnabled=false; tsiEnabled=false; momentumEnabled=false; figuresEnabled=false; vasilyEnabled=false; platinumEnabled=false; rsiCrossEnabled=false;
 try{
-  ['mega_monster_smc_power','mega_tsi_power','mega_momentum_power','mega_figures_power','mega_vasily_power']
+  ['mega_monster_smc_power','mega_tsi_power','mega_momentum_power','mega_figures_power','mega_vasily_power','mega_platinum_power','mega_rsi_cross_power']
     .forEach(k=>localStorage.setItem(k,'OFFLINE'));
 }catch(_){}
 
@@ -32045,8 +32034,8 @@ try{
   }
 }catch(_){}
 
-// MEGA IA 3.96.76 — modo de onze motores. Tudo que não for CHATGPT ANALISTA,
-// MEGA BOT, MEGA BOT FLEX, MEGA MASTER, MONSTER SMC, MEGA ULTRA, MOMENTUM 14, FIGURES CANDLE, VASILY PIP SNIPER ZL, PLATINUM ou RSI CROSS 6/14 fica forçado OFF, inclusive estados antigos do celular.
+// MEGA IA 3.96.79 — modo de quatro motores: CHATGPT ANALISTA, MEGA BOT,
+// MEGA BOT FLEX e MEGA MASTER. Indicadores retirados ficam forçados OFF, inclusive estados antigos do celular.
 robotEnabled=false; wprAdaptiveEnabled=false; tingaTingaEnabled=false; superNovaEnabled=false;
 elcodexEnabled=false; shkHaEnabled=false; sessionBreakoutEnabled=false;
 try{
@@ -32157,12 +32146,10 @@ if(localAnalystEnabled){
 }
 
 // Se nenhum motor válido ficou ONLINE, nesta versão o fallback é CHATGPT ANALISTA.
-monsterSmcEnabled=false; tsiEnabled=false; momentumEnabled=false; figuresEnabled=false; vasilyEnabled=false;
-if(!(robotEnabled||aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled||platinumEnabled||rsiCrossEnabled||wprAdaptiveEnabled||tingaTingaEnabled||superNovaEnabled||elcodexEnabled||shkHaEnabled||sessionBreakoutEnabled)) aiEnabled=true;
+monsterSmcEnabled=false; tsiEnabled=false; momentumEnabled=false; figuresEnabled=false; vasilyEnabled=false; platinumEnabled=false; rsiCrossEnabled=false;
+if(!(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled)) aiEnabled=true;
 
 function selectedRobotEngine(){
-  if(rsiCrossEnabled) return 'RSICROSS';
-  if(platinumEnabled) return 'PLATINUM';
   if(megaMasterEnabled) return 'MEGAMASTER';
   if(localAnalystFlexEnabled) return 'LOCALANALYSTFLEX';
   if(localAnalystEnabled) return 'LOCALANALYST';
@@ -33517,13 +33504,6 @@ function currentScoreEngineKey(item){
   const raw=String((item&&item.engine)||'').trim().toUpperCase();
   const strategy=String((item&&item.strategy)||'').trim().toUpperCase();
   const normalized=normalizeEngineKey(raw);
-  if(normalized==='MOMENTUM' || raw==='MOMENTUM' || strategy.includes('MOMENTUM 14') || strategy.includes('LOCAL_MOMENTUM14')) return 'MOMENTUM';
-  if(normalized==='FIGURES' || raw==='FIGURES' || strategy.includes('FIGURES CANDLE') || strategy.includes('LOCAL_FIGURES_CANDLE')) return 'FIGURES';
-  if(normalized==='VASILY' || raw==='VASILY' || strategy.includes('VASILY PIP SNIPER') || strategy.includes('LOCAL_VASILY')) return 'VASILY';
-  if(normalized==='PLATINUM' || raw==='PLATINUM' || strategy.includes('PLATINUM') || strategy.includes('LOCAL_PLATINUM')) return 'PLATINUM';
-  if(normalized==='RSICROSS' || raw==='RSICROSS' || strategy.includes('RSI CROSS 6/14') || strategy.includes('LOCAL_RSI_CROSS')) return 'RSICROSS';
-  if(normalized==='TSI' || raw==='TSI' || raw==='MEGAULTRA' || strategy.includes('MEGA ULTRA') || strategy.includes('MEGA_ULTRA_PRIVATE')) return 'TSI';
-  if(normalized==='MONSTERSMC' || raw==='MONSTERSMC' || strategy.includes('MONSTER SMC') || strategy.includes('MONSTER_SMC')) return 'MONSTERSMC';
   if(normalized==='MEGAMASTER' || raw==='MEGAMASTER' || strategy.includes('MEGA MASTER')) return 'MEGAMASTER';
   if(normalized==='LOCALANALYSTFLEX' || raw==='LOCALANALYSTFLEX') return 'LOCALANALYSTFLEX';
   if(normalized==='LOCALANALYST' || raw==='LOCALANALYST') return 'LOCALANALYST';
@@ -33538,13 +33518,6 @@ function engineScoreSnapshot(bucket){
     LOCALANALYST:{key:'LOCALANALYST',name:'🤖 MEGA BOT',wins:0,losses:0},
     LOCALANALYSTFLEX:{key:'LOCALANALYSTFLEX',name:'🤖 MEGA BOT FLEX',wins:0,losses:0},
     MEGAMASTER:{key:'MEGAMASTER',name:'🧠 MEGA MASTER',wins:0,losses:0},
-    MONSTERSMC:{key:'MONSTERSMC',name:'👾 MONSTER SMC',wins:0,losses:0},
-    TSI:{key:'TSI',name:'⚡ MEGA ULTRA',wins:0,losses:0},
-    MOMENTUM:{key:'MOMENTUM',name:'⚡ MOMENTUM 14',wins:0,losses:0},
-    FIGURES:{key:'FIGURES',name:'🕯️ FIGURES CANDLE',wins:0,losses:0},
-    VASILY:{key:'VASILY',name:'🎯 VASILY PIP SNIPER ZL',wins:0,losses:0},
-    PLATINUM:{key:'PLATINUM',name:'💎 PLATINUM',wins:0,losses:0},
-    RSICROSS:{key:'RSICROSS',name:'🔀 RSI CROSS 6/14',wins:0,losses:0},
     OTHER:{key:'OTHER',name:'🗂️ OUTROS / ANTIGOS',wins:0,losses:0}
   };
   const seen=new Set();
@@ -33570,7 +33543,7 @@ function engineScoreSnapshot(bucket){
 function renderEngineScoreBoard(bucket){
   if(!engineScoreGrid) return;
   const st=engineScoreSnapshot(bucket||emptyResultBucket());
-  const order=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','MONSTERSMC','TSI','MOMENTUM','FIGURES','VASILY','PLATINUM','RSICROSS'];
+  const order=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER'];
   if(st.OTHER.total>0) order.push('OTHER');
   engineScoreGrid.innerHTML=order.map(k=>{
     const x=st[k];
