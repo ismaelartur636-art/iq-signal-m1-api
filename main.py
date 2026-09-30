@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.83"
+APP_VERSION = "3.96.84"
+# MEGA IA 3.96.84 — radar STREAKREV usa exclusivamente a própria estratégia fechada; pré-alerta sem KeyError.
 # MEGA IA 3.96.83 — RSI XOVER retirado do painel, placar e bot 24h; seleção antiga forçada OFF.
 # MEGA IA 3.96.82 — Streak Reversal
 # MEGA IA 3.96.81 — corrige temporalidade, fonte de apuração e confluências dos cinco motores atuais.
@@ -71,7 +72,7 @@ APP_VERSION = "3.96.83"
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # CHATGPT ANALISTA permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v201"
+PWA_VERSION = "v202"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -28223,7 +28224,7 @@ async def pre_signals(
             return {"ok":True,"engine":"SHKHA","message":f"SHK PRO HA + MACD aguardando dados: {str(exc)[:120]}","items":[],"seconds_to_entry":remain}
 
     if engine in ("INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "RSICROSS", "SESSIONBREAKOUT"):
-        _nm={"INDICEMENT":"INDICEMENT SMA 12/26","GOLDINV":"FOREX GOLD INVESTOR","TTMSCALPER":"TTM SCALPER SWING","FOREXMISSION":"FOREX MISSION","MONEYARROW":"BINARY MONEYARROW","LIQUIDEX":"LIQUIDEX","EUROFX2":"EURO FX2","EUROFX2TAURUS":"EURO FX2 + TAURUS","ATE":"ATE","FOREXSTAY":"FOREXSTAY SIGHT","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + TAURUS","FOREXSTAYPRO":"FOREXSTAY PRO","FOREXFLEX":"FOREX FLEX","SENEGALPRO":"SUPER SENEGAL PRO","VALUEMACD":"VALUE CHART + MACD","HOLYGRAIL":"HOLY GRAIL ORIGINAL","TRENDLINES":"TRENDLINES MTF","BBSTOCH":"BB STOCHRSI X REVERSAL","KAMIKAZE":"KAMIKAZE TREND SNIPER","FOREXMEGA":"FOREX MEGA LLC V10.21","BROOKYVERTEX":"BROOKY + VERTEX FLEX 30/70","MEGABOT":"MEGA BOT","BROOKYC3":"CONFLUÊNCIA 3 • BROOKY FLEX","UTBOT":"UT BOT ALERTS","ONEMINRSI":"ONE MINUTE + RSI","WPRADAPT":"WPR ADAPTIVE","TINGATINGA":"TINGA TINGA RSI 14","SUPERNOVA":"SUPER NOVA","ELCODEX":"ELCODEX SCALPER","TSI":"MEGA ULTRA","MOMENTUM":"MOMENTUM 14","FIGURES":"FIGURES CANDLE","VASILY":"VASILY PIP SNIPER ZL","PLATINUM":"PLATINUM","RSIXOVER":"RSI XOVER","RSICROSS":"RSI CROSS 6/14","SESSIONBREAKOUT":"SMART SESSION BREAKOUT","MONSTERSMC":"MONSTER SMC"}[engine]
+        _nm={"INDICEMENT":"INDICEMENT SMA 12/26","GOLDINV":"FOREX GOLD INVESTOR","TTMSCALPER":"TTM SCALPER SWING","FOREXMISSION":"FOREX MISSION","MONEYARROW":"BINARY MONEYARROW","LIQUIDEX":"LIQUIDEX","EUROFX2":"EURO FX2","EUROFX2TAURUS":"EURO FX2 + TAURUS","ATE":"ATE","FOREXSTAY":"FOREXSTAY SIGHT","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + TAURUS","FOREXSTAYPRO":"FOREXSTAY PRO","FOREXFLEX":"FOREX FLEX","SENEGALPRO":"SUPER SENEGAL PRO","VALUEMACD":"VALUE CHART + MACD","HOLYGRAIL":"HOLY GRAIL ORIGINAL","TRENDLINES":"TRENDLINES MTF","BBSTOCH":"BB STOCHRSI X REVERSAL","KAMIKAZE":"KAMIKAZE TREND SNIPER","FOREXMEGA":"FOREX MEGA LLC V10.21","BROOKYVERTEX":"BROOKY + VERTEX FLEX 30/70","MEGABOT":"MEGA BOT","BROOKYC3":"CONFLUÊNCIA 3 • BROOKY FLEX","UTBOT":"UT BOT ALERTS","ONEMINRSI":"ONE MINUTE + RSI","WPRADAPT":"WPR ADAPTIVE","TINGATINGA":"TINGA TINGA RSI 14","SUPERNOVA":"SUPER NOVA","ELCODEX":"ELCODEX SCALPER","TSI":"MEGA ULTRA","MOMENTUM":"MOMENTUM 14","FIGURES":"FIGURES CANDLE","VASILY":"VASILY PIP SNIPER ZL","PLATINUM":"PLATINUM","STREAKREV":"STREAK REVERSAL","RSIXOVER":"RSI XOVER","RSICROSS":"RSI CROSS 6/14","SESSIONBREAKOUT":"SMART SESSION BREAKOUT","MONSTERSMC":"MONSTER SMC"}[engine]
         return {"items":[],"engine":engine,"message":f"{_nm} usa confirmação em candle fechado; o app libera somente a entrada válida para a próxima vela, sem pré-sinal repintável.","non_repaint":True,"gale_signal":False}
     if engine == "LARRY":
         return {
@@ -29407,7 +29408,10 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "strategy": "",
             }
         elif len(raw) >= 25:
-            closed = raw[:-1] if len(raw) > 1 else raw
+            # Os sinais STREAKREV trabalham com timestamps verificáveis para
+            # usar a mesma última vela FECHADA do motor oficial /signal-ai.
+            closed = (_verified_closed_candles(raw, interval) if engine == "STREAKREV"
+                      else (raw[:-1] if len(raw) > 1 else raw))
             if engine == "EA":
                 tech = await ea_xgboost_strategy(closed, sym, interval, market=market)
                 engine_label = "EA RSI + VALUE CHART + XGBOOST"
@@ -30091,6 +30095,24 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 engine_label = "MEGA MASTER"
                 why = str(tech.get("reason") or "aguardando contexto completo").replace("\n", " ")[:78]
                 status_text = ("MEGA MASTER • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else "MEGA MASTER • MONITORANDO • " + why)
+            elif engine == "STREAKREV":
+                # 3.96.84 — o radar precisa usar a MESMA estratégia do sinal oficial,
+                # nunca cair no fallback legado GRAPH_AI quando STREAKREV é selecionado.
+                # closed vem de _verified_closed_candles: ignora a vela intrabar.
+                tech = streak_reversal_strategy(closed[-320:], symbol=sym, timeframe=interval, market=market)
+                engine_label = "STREAK REVERSAL"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "aguardando sequência 2+2").replace("\n", " ")[:94]
+                if direction in ("CALL", "PUT") and (
+                    not _last_closed_matches_current_open(closed, interval)
+                    or max(0.0, (now() - current_boundary(interval)).total_seconds()) > 10.0
+                ):
+                    # Não apresenta o sinal anterior como oportunidade de entrada tardia.
+                    direction = "NEUTRO"
+                    status_text = "STREAK REVERSAL • OPORTUNIDADE PASSOU • aguardando próximo fechamento"
+                else:
+                    status_text = ("STREAK REVERSAL • OPORTUNIDADE ENCONTRADA"
+                                   if direction in ("CALL", "PUT") else "STREAK REVERSAL • MONITORANDO • " + why)
             elif market == "OPEN":
                 tech = await graphic_ai_strategy(sym, interval, closed, market, request=request, iq_state=iq_state, fetch_htf=False)
                 direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
@@ -31155,7 +31177,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • CHATGPT ANALISTA • MEGA BOT • MEGA BOT FLEX • MEGA MASTER • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • CHATGPT ANALISTA • MEGA BOT • MEGA BOT FLEX • MEGA MASTER • STREAK REVERSAL • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -31766,7 +31788,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </div>
 
 <div style="margin-top:12px;border-top:1px solid #173c5e;padding-top:12px">
-      <div class="label">🌐 RADAR MERCADO ABERTO</div>
+      <div class="label">🌐 RADAR MERCADO ABERTO • MOTOR SELECIONADO</div>
       <small style="opacity:.72">Oportunidades do mercado aberto • continua usando o motor selecionado</small>
       <div id="radar" class="radar" style="margin-top:8px"></div>
     </div>
@@ -38854,6 +38876,8 @@ async function rad(){
     if(engine==='OFF'){ radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>'; return; }
     const onlySymbol=(engine==='RTM')?'':(btcOnlyEnabled?'&symbol='+encodeURIComponent('BTC/USD'):'');
     const items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}${onlySymbol}`);
+    // Uma resposta antiga do motor anterior não pode reaparecer após trocar ONLINE/OFFLINE.
+    if(engine!==selectedRobotEngine()) return;
     const list=Array.isArray(items)?items:[];
     if(!list.length){
       radar.innerHTML='<div>📡 Radar ativo • aguardando leitura</div>';
