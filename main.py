@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.89"
+APP_VERSION = "3.96.90"
+# MEGA IA 3.96.90 — destrava sinais: cTrader cai automaticamente para a multifuente quando falha/atrasa; RSI CHANNELS ganha reentrada FLEX nos 20s finais e pré-alerta coerente com o sinal oficial.
 # MEGA IA 3.96.89 — corrige o radar do 1 MINUTE SCALPER: usa o próprio motor e elimina o fallback legado da IA GRÁFICA.
 # MEGA IA 3.96.88 — restaura 1 MINUTE SCALPER e preserva RSI CHANNELS com pré-sinal oficial nos 20s finais para a próxima vela.
 # MEGA IA 3.96.87 — 1 MINUTE SCALPER integrado: 13 LWMAs no PRICE_TYPICAL, alinhamento fechado, próxima vela, rearm obrigatório e placar independente.
@@ -78,7 +79,7 @@ APP_VERSION = "3.96.89"
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # CHATGPT ANALISTA permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v202"
+PWA_VERSION = "v203"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -7790,12 +7791,14 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
                 if (
                     source == "CTRADER_OPEN"
                     and MULTIFEED_ENABLED
-                    and CTRADER_STRICT_PRIMARY
-                    and CTRADER_FALLBACK_ON_SHORT_HISTORY
                     and public_fallbacks
-                    and ("poucos candles" in err_text.lower() or "zero candles" in err_text.lower())
                     and not any(src != "CTRADER_OPEN" for src, _ in providers)
                 ):
+                    # 3.96.90 — cTrader continua sendo tentada PRIMEIRO, mas uma
+                    # falha real desta leitura (timeout, candle antigo, histórico curto,
+                    # sessão oscilando etc.) não pode deixar o robô preso em
+                    # "AGUARDANDO DADOS ATUALIZADOS". A multifuente assume só nesta
+                    # requisição; na próxima leitura a cTrader volta a ser a primeira.
                     providers.extend(public_fallbacks)
             except Exception as exc:
                 err_text = str(exc)[:150]
@@ -7803,12 +7806,14 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
                 if (
                     source == "CTRADER_OPEN"
                     and MULTIFEED_ENABLED
-                    and CTRADER_STRICT_PRIMARY
-                    and CTRADER_FALLBACK_ON_SHORT_HISTORY
                     and public_fallbacks
-                    and ("poucos candles" in err_text.lower() or "zero candles" in err_text.lower())
                     and not any(src != "CTRADER_OPEN" for src, _ in providers)
                 ):
+                    # 3.96.90 — cTrader continua sendo tentada PRIMEIRO, mas uma
+                    # falha real desta leitura (timeout, candle antigo, histórico curto,
+                    # sessão oscilando etc.) não pode deixar o robô preso em
+                    # "AGUARDANDO DADOS ATUALIZADOS". A multifuente assume só nesta
+                    # requisição; na próxima leitura a cTrader volta a ser a primeira.
                     providers.extend(public_fallbacks)
 
         # Cache curto evita tela vazia durante uma queda momentânea. A função de
@@ -14497,27 +14502,74 @@ def rsi_channels_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN",
             return {**base,"reason":"RSI CHANNELS: aquecendo RSI4 e canais dinâmicos."}
     except (KeyError,TypeError,ValueError,OverflowError,ZeroDivisionError):
         return {**base,"reason":"RSI CHANNELS: aguardando candles válidos."}
-    direction='CALL' if calls[i] and not puts[i] else ('PUT' if puts[i] and not calls[i] else 'NEUTRO')
+    exact_direction='CALL' if calls[i] and not puts[i] else ('PUT' if puts[i] and not calls[i] else 'NEUTRO')
+    direction=exact_direction
+
+    # 3.96.90 — FLEX de reentrada, SOMENTE no snapshot dos 20s finais.
+    # Não muda RSI4, smoothing 5, 30/70 ou 45/55. O que muda é apenas o gatilho:
+    # se o RSI já visitou a região extrema nos últimos candles e está voltando com
+    # inclinação clara, aceitamos a reentrada mesmo quando o cruzamento matemático
+    # exato aconteceu alguns segundos antes do polling. Isso evita perder o sinal por
+    # diferença de 5–10s entre as consultas do celular/Render.
+    flex_reentry=False
+    flex_reason=''
+    rsi_delta=0.0
+    if direction=='NEUTRO' and live_snapshot and i >= 3:
+        recent=[x for x in raw[max(0,i-3):i] if x is not None]
+        prev_rsi=raw[i-1]
+        if recent and prev_rsi is not None:
+            rsi_delta=float(raw[i])-float(prev_rsi)
+            recent_low=min(float(x) for x in recent)
+            recent_high=max(float(x) for x in recent)
+            call_flex=bool(
+                recent_low <= 35.0
+                and float(raw[i]) >= 37.0
+                and rsi_delta >= 1.5
+                and float(centered[i]) >= float(bdnu[i]) - 3.0
+            )
+            put_flex=bool(
+                recent_high >= 65.0
+                and float(raw[i]) <= 63.0
+                and rsi_delta <= -1.5
+                and float(centered[i]) <= float(bupu[i]) + 3.0
+            )
+            if call_flex and not put_flex:
+                direction='CALL'
+                flex_reentry=True
+                flex_reason=f'RSI4 retomando após região de sobrevenda (mín. recente {recent_low:.1f}, agora {float(raw[i]):.1f})'
+            elif put_flex and not call_flex:
+                direction='PUT'
+                flex_reentry=True
+                flex_reason=f'RSI4 recuando após região de sobrecompra (máx. recente {recent_high:.1f}, agora {float(raw[i]):.1f})'
+
     diag={
         "rsi4":round(raw[i],2),"rsi_centered":round(centered[i],2),
         "dynamic_overbought":round(bupu[i],2),"dynamic_upper_neutral":round(bupd[i],2),
         "dynamic_oversold":round(bdnu[i],2),"dynamic_lower_neutral":round(bdnd[i],2),
-        "call_cross":bool(calls[i]),"put_cross":bool(puts[i]),"smoothing":5,
+        "call_cross":bool(calls[i]),"put_cross":bool(puts[i]),"exact_cross":exact_direction in ('CALL','PUT'),
+        "flex_reentry":bool(flex_reentry),"rsi_delta":round(rsi_delta,2),"smoothing":5,
         "rsi_period":4,"overbought":70.0,"oversold":30.0,"upper_neutral":55.0,"lower_neutral":45.0,
         "closed_candle":not live_snapshot,"shift":0 if live_snapshot else 1,"future_leak":False,
         "snapshot":"FORMING_CANDLE_20S" if live_snapshot else "LAST_CLOSED_CANDLE"
     }
     if direction=='NEUTRO':
         if live_snapshot:
-            reason="RSI CHANNELS 20S monitorando • aguardando reentrada do RSI4 pelos canais dinâmicos antes da próxima abertura."
+            reason="RSI CHANNELS 20S monitorando • aguardando cruzamento ou reentrada FLEX do RSI4 antes da próxima abertura."
         else:
             reason="RSI CHANNELS monitorando • aguardando reentrada do RSI4 pelos canais dinâmicos 30/70."
         return {**base,"reason":reason,"diagnostics":diag}
-    # Score técnico: intensidade do cruzamento; não representa probabilidade de WIN.
-    edge=abs(centered[i]-(bdnu[i] if direction=='CALL' else bupu[i]))
-    score=round(min(90.0,78.0+edge*1.8),1)
+    # Score técnico: não representa probabilidade de WIN. O gatilho FLEX fica
+    # deliberadamente um pouco abaixo do cruzamento exato.
+    if flex_reentry:
+        score=round(min(87.0,74.0+min(8.0,abs(rsi_delta)*1.6)),1)
+    else:
+        edge=abs(centered[i]-(bdnu[i] if direction=='CALL' else bupu[i]))
+        score=round(min(90.0,78.0+edge*1.8),1)
     stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or '')
-    if live_snapshot:
+    if live_snapshot and flex_reentry:
+        reason=(f"{direction} RSI CHANNELS FLEX • {flex_reason}; snapshot nos 20s finais; "
+                "sinal travado para entrada na próxima vela; sem Gale.")
+    elif live_snapshot:
         reason=(f"{direction} RSI CHANNELS • cruzamento RSI4/canal dinâmico detectado no snapshot dos 20s finais; "
                 "sinal travado para entrada na próxima vela; sem Gale.")
     else:
@@ -28633,6 +28685,40 @@ async def pre_signals(
         except Exception as exc:
             return {"ok":True,"engine":"SHKHA","message":f"SHK PRO HA + MACD aguardando dados: {str(exc)[:120]}","items":[],"seconds_to_entry":remain}
 
+    if engine == "RSICHANNEL":
+        entry_dt=next_boundary(interval)
+        remain=int(max(0,(entry_dt-now()).total_seconds()))
+        if not (RSICHANNEL_EARLY_MIN_REMAINING <= remain <= RSICHANNEL_EARLY_WINDOW_BEFORE):
+            return {
+                "ok":True,"engine":"RSICHANNEL","items":[],"seconds_to_entry":remain,
+                "message":f"RSI CHANNELS monitorando • pré-alerta oficial abre nos 20s finais • faltam {remain}s para a próxima vela.",
+                "non_repaint_after_release":True,"gale_signal":False,
+            }
+        target=symbol or "EUR/USD"
+        state=_iq_session_state(request, required=False) if market == "IQ_OTC" else None
+        if market == "IQ_OTC" and not state:
+            return {"ok":True,"engine":"RSICHANNEL","items":[],"seconds_to_entry":remain,"message":"RSI CHANNELS OTC aguardando conexão com a IQ Option."}
+        try:
+            raw=(await iq_ea_candles(state,target,interval,180,regular_market=False)) if market == "IQ_OTC" else (await candles(target,interval,180,"OPEN",None,request=request))
+            tech=rsi_channels_strategy(raw[-180:],symbol=target,timeframe=interval,market=market,current_candle_closed=False,allow_prealert=True)
+            items=[]
+            if tech.get("confirmed") and str(tech.get("direction") or "").upper() in ("CALL","PUT"):
+                items=[{
+                    "symbol":target,"direction":str(tech.get("direction")).upper(),
+                    "confidence":float(tech.get("confidence") or 0.0),
+                    "strategy":"RSI CHANNELS 20S FLEX",
+                    "reason":str(tech.get("reason") or "RSI Channels confirmou reentrada."),
+                    "entry_time":iso(entry_dt),"seconds_to_entry":remain,"prealert_only":False,
+                    "early_signal_locked":True,
+                }]
+            return {
+                "ok":True,"engine":"RSICHANNEL","items":items,"seconds_to_entry":remain,
+                "message":str(tech.get("reason") or "RSI CHANNELS monitorando a janela de 20s."),
+                "non_repaint_after_release":True,"gale_signal":False,
+            }
+        except Exception as exc:
+            return {"ok":True,"engine":"RSICHANNEL","items":[],"seconds_to_entry":remain,"message":f"RSI CHANNELS aguardando dados: {str(exc)[:120]}"}
+
     if engine in ("INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT"):
         _nm={"INDICEMENT":"INDICEMENT SMA 12/26","GOLDINV":"FOREX GOLD INVESTOR","TTMSCALPER":"TTM SCALPER SWING","FOREXMISSION":"FOREX MISSION","MONEYARROW":"BINARY MONEYARROW","LIQUIDEX":"LIQUIDEX","EUROFX2":"EURO FX2","EUROFX2TAURUS":"EURO FX2 + TAURUS","ATE":"ATE","FOREXSTAY":"FOREXSTAY SIGHT","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + TAURUS","FOREXSTAYPRO":"FOREXSTAY PRO","FOREXFLEX":"FOREX FLEX","SENEGALPRO":"SUPER SENEGAL PRO","VALUEMACD":"VALUE CHART + MACD","HOLYGRAIL":"HOLY GRAIL ORIGINAL","TRENDLINES":"TRENDLINES MTF","BBSTOCH":"BB STOCHRSI X REVERSAL","KAMIKAZE":"KAMIKAZE TREND SNIPER","FOREXMEGA":"FOREX MEGA LLC V10.21","BROOKYVERTEX":"BROOKY + VERTEX FLEX 30/70","MEGABOT":"MEGA BOT","BROOKYC3":"CONFLUÊNCIA 3 • BROOKY FLEX","UTBOT":"UT BOT ALERTS","ONEMINRSI":"ONE MINUTE + RSI","WPRADAPT":"WPR ADAPTIVE","TINGATINGA":"TINGA TINGA RSI 14","SUPERNOVA":"SUPER NOVA","ELCODEX":"ELCODEX SCALPER","TSI":"MEGA ULTRA","MOMENTUM":"MOMENTUM 14","FIGURES":"FIGURES CANDLE","VASILY":"VASILY PIP SNIPER ZL","PLATINUM":"PLATINUM","STREAKREV":"STREAK REVERSAL","ISMAELTRADER":"ISMAEL TRADER","RSICHANNEL":"RSI CHANNELS","RSIXOVER":"RSI XOVER","RSICROSS":"RSI CROSS 6/14","SESSIONBREAKOUT":"SMART SESSION BREAKOUT","MONSTERSMC":"MONSTER SMC"}[engine]
         return {"items":[],"engine":engine,"message":f"{_nm} usa confirmação em candle fechado; o app libera somente a entrada válida para a próxima vela, sem pré-sinal repintável.","non_repaint":True,"gale_signal":False}
@@ -37433,7 +37519,11 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar 1 Minute Scalper • procurando novo alinhamento completo no M1</div>';
     rad();
   }else if(engine==='RSICHANNEL'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI CHANNELS ONLINE • RSI4 + CANAIS DINÂMICOS • PRÓXIMA VELA';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI CHANNELS ONLINE • 20S FLEX • RSI4 + CANAIS DINÂMICOS • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📡 RSI Channels • monitora RSI4 + canais dinâmicos e libera cruzamento/reentrada FLEX nos 20s finais para a próxima vela.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar RSI Channels ativo • procurando reentrada nos canais e preparando a janela de 20s</div>';
+    rad();
+    loadPreSignals();
   }else if(engine==='ISMAELTRADER'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ISMAEL TRADER ONLINE • EMA3/7 RSI9 ADX21 • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 Ismael Trader selecionado • candle fechado, evento único, sem Gale.</div>';
@@ -40128,8 +40218,13 @@ setInterval(()=>{
 // Pré-alerta geral permanece leve. No RSI + ADX usamos um relógio mais curto
 // para capturar a janela de 25 s com precisão sem aumentar a carga dos outros motores.
 setInterval(()=>{
-  if(megaCanPoll() && selectedRobotEngine()!=='OFF' && !['RSI5','SNIPER','TAURUSSENEGAL','BOBSENEGAL','TAURUSEA','TAURUSRSIDIV','COMBINER','RSIDIVBB','TMARSI','TLBRSI','FIBORSI','TRIPRSI'].includes(selectedRobotEngine())) loadPreSignals();
+  if(megaCanPoll() && selectedRobotEngine()!=='OFF' && !['RSICHANNEL','RSI5','SNIPER','TAURUSSENEGAL','BOBSENEGAL','TAURUSEA','TAURUSRSIDIV','COMBINER','RSIDIVBB','TMARSI','TLBRSI','FIBORSI','TRIPRSI'].includes(selectedRobotEngine())) loadPreSignals();
 },10000);
+// RSI CHANNELS tem janela oficial de 20s. Consulta a cada 5s para não perder
+// o cruzamento/reentrada por causa do polling do celular/Render.
+setInterval(()=>{
+  if(megaCanPoll() && selectedRobotEngine()==='RSICHANNEL') loadPreSignals();
+},5000);
 setInterval(()=>{
   if(megaCanPoll() && ['RSI5','SNIPER','TAURUSSENEGAL','BOBSENEGAL','TAURUSEA','TAURUSRSIDIV','COMBINER','RSIDIVBB','TMARSI','TLBRSI','FIBORSI','TRIPRSI'].includes(selectedRobotEngine())) loadPreSignals();
 },2000);
