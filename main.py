@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.88"
+APP_VERSION = "3.96.89"
+# MEGA IA 3.96.89 — corrige o radar do 1 MINUTE SCALPER: usa o próprio motor e elimina o fallback legado da IA GRÁFICA.
 # MEGA IA 3.96.88 — restaura 1 MINUTE SCALPER e preserva RSI CHANNELS com pré-sinal oficial nos 20s finais para a próxima vela.
 # MEGA IA 3.96.87 — 1 MINUTE SCALPER integrado: 13 LWMAs no PRICE_TYPICAL, alinhamento fechado, próxima vela, rearm obrigatório e placar independente.
 # MEGA IA 3.96.87 — RSI CHANNELS: pré-sinal oficial nos 20s finais da vela atual, travado para entrada na próxima abertura; parâmetros originais preservados.
@@ -30533,6 +30534,23 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 why = str(tech.get("reason") or "aguardando janela de 20s").replace("\n", " ")[:94]
                 status_text = ("RSI CHANNELS • OPORTUNIDADE 20S ENCONTRADA"
                                if direction in ("CALL", "PUT") else f"RSI CHANNELS • MONITORANDO • faltam {int(_rc_remaining)}s • " + why)
+            elif engine == "MINSCALPER":
+                # 3.96.89 — o radar usa o próprio 1 MINUTE SCALPER.
+                # Antes MINSCALPER não tinha ramo aqui e caía no fallback legado GRAPH_AI,
+                # por isso o painel mostrava "IA GRÁFICA" mesmo após esse motor ter sido retirado.
+                tech = one_minute_scalper_strategy(closed[-320:], symbol=sym, timeframe=interval, market=market)
+                engine_label = "1 MINUTE SCALPER"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "aguardando novo alinhamento das 13 LWMAs").replace("\n", " ")[:94]
+                if direction in ("CALL", "PUT") and (
+                    not _last_closed_matches_current_open(closed, interval)
+                    or max(0.0, (now() - current_boundary(interval)).total_seconds()) > 10.0
+                ):
+                    direction = "NEUTRO"
+                    status_text = "1 MINUTE SCALPER • OPORTUNIDADE PASSOU • aguardando novo fechamento"
+                else:
+                    status_text = ("1 MINUTE SCALPER • OPORTUNIDADE ENCONTRADA"
+                                   if direction in ("CALL", "PUT") else "1 MINUTE SCALPER • MONITORANDO • " + why)
             elif engine == "STREAKREV":
                 # 3.96.84 — o radar precisa usar a MESMA estratégia do sinal oficial,
                 # nunca cair no fallback legado GRAPH_AI quando STREAKREV é selecionado.
@@ -30551,15 +30569,29 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 else:
                     status_text = ("STREAK REVERSAL • OPORTUNIDADE ENCONTRADA"
                                    if direction in ("CALL", "PUT") else "STREAK REVERSAL • MONITORANDO • " + why)
-            elif market == "OPEN":
-                tech = await graphic_ai_strategy(sym, interval, closed, market, request=request, iq_state=iq_state, fetch_htf=False)
-                direction = tech["direction"] if tech.get("confirmed") else "NEUTRO"
-                engine_label = "IA GRÁFICA"
-                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO")
             else:
-                tech = {"direction": "NEUTRO", "confidence": 0, "confirmed": False}
+                # 3.96.89 — sem fallback para IA GRÁFICA.
+                # Se algum motor válido não tiver ramo específico no radar, ele fica neutro
+                # com o próprio nome em vez de executar um motor antigo por engano.
+                _radar_names = {
+                    "SMART": "CHATGPT ANALISTA",
+                    "LOCALANALYST": "MEGA BOT",
+                    "LOCALANALYSTFLEX": "MEGA BOT FLEX",
+                    "MEGAMASTER": "MEGA MASTER",
+                    "STREAKREV": "STREAK REVERSAL",
+                    "ISMAELTRADER": "ISMAEL TRADER",
+                    "RSICHANNEL": "RSI CHANNELS",
+                    "MINSCALPER": "1 MINUTE SCALPER",
+                }
+                engine_label = _radar_names.get(engine, str(engine or "MOTOR"))
+                tech = {
+                    "direction": "NEUTRO", "confidence": 0, "confirmed": False,
+                    "strategy": engine_label,
+                    "reason": f"{engine_label}: radar específico indisponível nesta leitura.",
+                    "engine": engine,
+                }
                 direction = "NEUTRO"
-                status_text = "AGUARDANDO MÓDULO OTC"
+                status_text = f"{engine_label} • MONITORANDO • RADAR ESPECÍFICO INDISPONÍVEL"
             item = {
                 "symbol": sym + suffix,
                 "base_symbol": sym,
