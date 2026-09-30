@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.80"
+APP_VERSION = "3.96.81"
+# MEGA IA 3.96.81 — corrige temporalidade, fonte de apuração e confluências dos cinco motores atuais.
 # MEGA IA 3.96.80 — adiciona RSI XOVER 7/4 (2RSIXover): PRICE_WEIGHTED, direção original, sem atraso extra, candle fechado -> próxima vela, placar próprio.
 # MEGA IA 3.96.79 — retira PLATINUM e RSI CROSS 6/14 do painel, placar, compatibilidade, seleção e robô 24h; estados antigos ficam forçados OFF.
 # MEGA IA 3.96.78 — remove também do PLACAR POR MOTOR os cartões de MONSTER SMC, MEGA ULTRA, MOMENTUM 14, FIGURES CANDLE e VASILY PIP SNIPER ZL; históricos desses motores passam para OUTROS/ANTIGOS.
@@ -68,7 +69,7 @@ APP_VERSION = "3.96.80"
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # CHATGPT ANALISTA permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v199"
+PWA_VERSION = "v200"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -3293,7 +3294,7 @@ def _nearest_candle_for_time(candles_list, target_dt, interval_seconds):
                 best_dt = cdt
 
     # Um candle do timeframe deve ficar muito próximo do horário esperado.
-    tolerance = max(45.0, float(interval_seconds) * 0.80)
+    tolerance = min(12.0, max(3.0, float(interval_seconds) * 0.10))
     if target is None or best_delta is None or best_delta > tolerance:
         return None, best_delta, best_dt
 
@@ -7022,6 +7023,68 @@ def _open_rows_age_seconds(rows) -> float:
         return max(0.0, (datetime.now(UTC) - dt).total_seconds())
     except Exception:
         return 10**9
+
+
+# 3.96.81 — leitura temporal única para os cinco motores visíveis do painel.
+# Todos os provedores do roteador devem fornecer o início da barra; datetime sem
+# timezone vem em UTC (Twelve Data é solicitada explicitamente em UTC).
+CLOSED_PANEL_ENGINES = frozenset({
+    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "RSIXOVER"
+})
+
+
+def _verified_closed_candles(rows, interval: str, observed_at=None):
+    """Exclui apenas candles ainda em formação; não descarta uma barra já fechada.
+
+    Se não existir timestamp verificável, falha fechado: não usa suposição de [-1].
+    A entrada destes motores é sempre na abertura após o candle de referência.
+    """
+    step = int(INTERVALS[interval])
+    cutoff = (observed_at or now()).astimezone(UTC).timestamp()
+    out = []
+    previous = None
+    for row in list(rows or []):
+        if not isinstance(row, dict):
+            continue
+        try:
+            dt = parse_dt(str(row.get("datetime") or "")).astimezone(UTC)
+            start_ts = dt.timestamp()
+            # Não admite séries fora de ordem, timestamps futuros ou duplicados.
+            if previous is not None and start_ts <= previous:
+                return []
+            previous = start_ts
+            if start_ts + step <= cutoff:
+                out.append(row)
+        except (TypeError, ValueError, OverflowError):
+            return []
+    return out
+
+
+def _last_closed_matches_current_open(rows, interval: str, observed_at=None) -> bool:
+    """Nunca reaproveita o gatilho de uma vela antiga em uma abertura futura."""
+    if not rows:
+        return False
+    ref = observed_at or now()
+    step = int(INTERVALS[interval])
+    try:
+        last_start = parse_dt(str(rows[-1].get("datetime") or "")).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return False
+    # timestamps UTC/BR são normalizados por parse_dt.
+    opening = int(ref.timestamp() // step) * step
+    return abs((last_start + step) - opening) < 1.0
+
+
+def _invalidate_preexpiry_open_result_cache(symbol: str, interval: str, expiry_dt):
+    """Um snapshot capturado DURANTE a operação não pode apurá-la."""
+    prefix = f"{symbol}|{interval}"
+    required_at = expiry_dt.timestamp() + 2.0
+    for key, value in list(public_feed_cache.items()):
+        if (key == prefix or key.startswith(prefix + "|CTRADER:")) and float(value[0]) < required_at:
+            public_feed_cache.pop(key, None)
+    item = td_candle_cache.get(prefix)
+    if item and float(item[0]) < required_at:
+        td_candle_cache.pop(prefix, None)
 
 
 def _open_feed_status_key(symbol: str, interval: str) -> str:
@@ -13500,10 +13563,12 @@ def rsi_xover_7_4_weighted_strategy(cs, symbol="EUR/USD", timeframe="1min", mark
     direction="CALL" if call_cross else "PUT"
     separation=abs(spread)
     acceleration=abs(spread-prev_spread)
-    conf=clamp(80.0+min(14.0,separation*1.30+acceleration*0.80),80.0,94.0)
+    # Força do cruzamento, NÃO probabilidade calibrada de WIN.
+    conf=clamp(60.0+min(22.0,separation*1.30+acceleration*0.80),60.0,82.0)
     risk="LOW" if separation>=4.0 else ("MEDIUM" if separation>=1.5 else "HIGH")
     stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or (len(rows)-1))
     return {**base,"direction":direction,"confidence":round(conf,1),"confirmed":True,"risk":risk,
+            "confidence_kind":"TECHNICAL_STRENGTH_UNCALIBRATED", "calibrated_win_probability":False,
             "reason":f"{direction} RSI XOVER • RSI7 cruzou RSI4 em PRICE_WEIGHTED no candle fechado • entrada na próxima vela • sem Gale.",
             "event_key":f"RSIXOVER:{direction}:{stamp}","diagnostics":diag}
 
@@ -19878,8 +19943,31 @@ def local_analyst_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="O
         "liquidity":bool(master_profile and master_liquidity_put),
         "volatility":bool(master_profile and master_atr_expand and breakout_put),
     }
-    call_family_count=sum(1 for v in call_families.values() if v)
-    put_family_count=sum(1 for v in put_families.values() if v)
+    def independent_families(flags):
+        # EMA9/21 e EMA100/200 medem tendência; engolfo/rejeição/rompimento,
+        # PA, liquidez, pullback e ATR do rompimento compartilham evento de preço.
+        # Momentum RSI/MACD e Stochastic ficam em um grupo oscilador.
+        groups = {
+            "trend": ("trend", "macro_trend"),
+            "structure": ("structure",),
+            "candle_event": ("trigger", "price_action", "liquidity", "pullback", "volatility"),
+            "momentum": ("momentum", "oscillator"),
+            "bollinger": ("bollinger",),
+            "participation": ("volume", "pressure"),
+            "divergence": ("divergence",),
+            "fibonacci": ("fibonacci",),
+        }
+        return {name: any(flags.get(item, False) for item in family) for name, family in groups.items()}
+
+    call_independent = independent_families(call_families)
+    put_independent = independent_families(put_families)
+    call_family_count = sum(bool(v) for v in call_independent.values())
+    put_family_count = sum(bool(v) for v in put_independent.values())
+    # Desconta parte do score bruto do mesmo movimento avaliado como gatilho + PA.
+    if trigger_call and pa_call_ok: call = max(0.0, call - 0.75)
+    if trigger_put and pa_put_ok: put = max(0.0, put - 0.75)
+    edge = call - put
+    top = max(call, put)
 
     # Regime ruim: não opera. Antes havia apenas desconto de pontos, que ainda
     # permitia sinais em consolidação quando várias camadas correlacionadas somavam.
@@ -19951,8 +20039,9 @@ def local_analyst_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="O
     if direction!="NEUTRO":
         strength=(call if direction=="CALL" else put)
         fams=(call_family_count if direction=="CALL" else put_family_count)
-        confidence=clamp(78.0 + max(0.0,strength-threshold)*2.5 + min(7.0,abs(edge)*1.35) + max(0,fams-min_families)*2.0,78.0,95.0)
-        risk="LOW" if confidence>=86 and fams>=5 else "MEDIUM"
+        # Força heurística, não é taxa de acerto nem probabilidade calibrada.
+        confidence=clamp(60.0 + max(0.0,strength-threshold)*2.1 + min(9.0,abs(edge)*1.15) + max(0,fams-min_families)*2.0,60.0,88.0)
+        risk="LOW" if confidence>=82 and fams>=5 else "MEDIUM"
         mode_label="MASTER" if master_profile else ("FLEX" if flex_profile else "PRECISÃO")
         reason=(f"{direction} {setup} • {mode_label} {fams} famílias: " + ", ".join(chosen[:5]) + ". Próxima vela.")
     else:
@@ -19973,6 +20062,7 @@ def local_analyst_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="O
     return {
         **base,
         "direction":direction,"confidence":round(float(confidence),1),
+        "confidence_kind":"TECHNICAL_STRENGTH_UNCALIBRATED", "calibrated_win_probability":False,
         "confirmed":direction in ("CALL","PUT"),"risk":risk,"setup":setup,
         "reason":reason[:520],
         "event_key":(f"{engine_key}:{direction}:{rows[-1].get('datetime') or rows[-1].get('timestamp') or len(rows)}" if direction!="NEUTRO" else None),
@@ -19980,6 +20070,7 @@ def local_analyst_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="O
             "call_score":round(call,2),"put_score":round(put,2),"edge":round(edge,2),
             "threshold":threshold,"min_edge":min_edge,"min_families":min_families,"profile":("MASTER" if master_profile else ("FLEX" if flex_profile else "BALANCED")),
             "call_family_count":call_family_count,"put_family_count":put_family_count,
+            "call_independent":call_independent,"put_independent":put_independent,
             "call_families":call_families,"put_families":put_families,
             "trigger_call":trigger_call,"trigger_put":trigger_put,
             "precision_choppy":precision_choppy,"choppy":choppy,"efficiency":round(efficiency,3),
@@ -20821,6 +20912,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     if engine in RETIRED_ENGINES:
         engine = "GRAPH_AI"
     entry_mode = normalize_entry_mode(entry_mode)
+    if engine in CLOSED_PANEL_ENGINES:
+        # MEIO/CLOSE com candle fechado reutilizavam análise antiga na outra vela.
+        # Os cinco motores visíveis operam na abertura imediatamente seguinte.
+        entry_mode = "BIRTH"
     if engine == "RSI5":
         # RSI + ADX AFIADO usa somente candles fechados e entra na abertura seguinte.
         entry_mode = "BIRTH"
@@ -20934,6 +21029,21 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     if key in cache and time.time() - cache[key][0] < 1:
         return cache[key][1]
+
+    # Nenhum custo de IA nem análise de barra antiga fora da janela de nascimento.
+    # A janela é conferida novamente depois da chamada ao modelo, antes de liberar.
+    if ai_only and engine in CLOSED_PANEL_ENGINES:
+        elapsed = max(0.0, (now() - current_boundary(interval)).total_seconds())
+        if elapsed > 10.0:
+            out = neutral_signal(
+                symbol, interval, market,
+                "AGUARDANDO PRÓXIMO FECHAMENTO",
+                "Estes cinco motores trabalham com a última vela fechada. Fora dos primeiros 10s não reutilizam o gatilho para outra vela.",
+                source_state="WAITING",
+            )
+            out.update({"selected_engine": engine, "entry_mode": "BIRTH"})
+            cache[key] = (time.time(), out)
+            return out
 
     bigrise_pack = None
     try:
@@ -21678,7 +21788,21 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             cache[key] = (time.time(), out)
             return out
 
-    closed = raw[:-1] if len(raw) > 1 else raw
+    if ai_only and engine in CLOSED_PANEL_ENGINES:
+        closed = _verified_closed_candles(raw, interval)
+        if not closed or not _last_closed_matches_current_open(closed, interval):
+            out = neutral_signal(
+                symbol, interval, market,
+                "AGUARDANDO ÚLTIMO CANDLE FECHADO",
+                "O fechamento imediatamente anterior à abertura atual ainda não foi confirmado pela fonte. Não será usado candle antigo nem candle em formação.",
+                source_state="WAITING",
+            )
+            out.update({"selected_engine": engine, "entry_mode": entry_mode,
+                        "feed_source": _feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC"})
+            cache[key] = (time.time(), out)
+            return out
+    else:
+        closed = raw[:-1] if len(raw) > 1 else raw
 
     # 33.78.0: dois motores independentes e selecionáveis no painel.
     # IA GRÁFICA substitui o antigo Robô Principal/RSI e usa somente leitura estrutural de preço.
@@ -22649,6 +22773,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "legacy_ai_disabled": engine != "SMART",
             "legacy_technical_strategies_disabled": True,
             "entry_mode": entry_mode,
+            "feed_source": _feed_source_from_rows(raw) if market == "OPEN" else "IQ_OPTION_OTC",
+            "source_symbol": (raw[-1].get("source_symbol") if raw else None),
             "training_mode": bool(engine == "SAMURAI"),
             "auto_trade_allowed": bool(engine != "SAMURAI"),
             "chatgpt_primary": bool(engine == "SMART" and analysis.get("chatgpt_primary")),
@@ -23184,6 +23310,20 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     announce = entry - timedelta(seconds=_lead)
                     expiry = entry + timedelta(seconds=INTERVALS[interval])
                 else:
+                    # CLOSED_PANEL_ENGINES jamais carregam sinal de uma barra antiga
+                    # para a vela subsequente após a janela de nascimento.
+                    if ai_only and engine in CLOSED_PANEL_ENGINES:
+                        elapsed = max(0.0, (now() - current_boundary(interval)).total_seconds())
+                        if elapsed > 10.0 or not _last_closed_matches_current_open(engine_closed, interval):
+                            base.update({
+                                "direction": "NEUTRO", "confidence": 0.0,
+                                "status": "AGUARDANDO PRÓXIMO FECHAMENTO",
+                                "reason": "A análise chegou fora dos primeiros 10 segundos da abertura ou a vela de referência envelheceu. O sinal foi descartado, sem reagendar a entrada antiga.",
+                                "entry_time": None, "announce_time": None, "expiry_time": None,
+                                "risk": "HIGH", "source_state": "WAITING",
+                            })
+                            cache[key] = (time.time(), base)
+                            return base
                     announce, entry, expiry = entry_window(interval, entry_mode)
                 smart_status = (
                     "FALLBACK LOCAL • BLOQUEADO PARA ENTRADA" if analysis.get("fallback")
@@ -30192,6 +30332,8 @@ def _remember_accounting_signal(request: Request, payload: Dict[str, Any]):
         "risk": str(payload.get("risk") or ""),
         "direct_only": True,  # 3.96.7: todos os motores sem Gale; LOSS encerra esta entrada.
         "external_ai": bool(payload.get("external_ai", False)),
+        "feed_source": str(payload.get("feed_source") or ""),
+        "source_symbol": str(payload.get("source_symbol") or ""),
         "trigger_indicator": payload.get("trigger_indicator") or rtm_meta.get("trigger_indicator"),
         "trigger_score": payload.get("trigger_score") if payload.get("trigger_score") is not None else rtm_meta.get("trigger_score"),
     }
@@ -30218,13 +30360,20 @@ async def _settle_accounting_pending(request: Request, market: str):
             interval = t["interval"]
             direction = str(t["direction"]).upper()
             entry_dt = parse_dt(t["entry_time"])
+            if market == "OPEN":
+                _invalidate_preexpiry_open_result_cache(symbol, interval, expiry_dt)
             cs = await candles(symbol, interval, 50, market, iq_state, request=request)
+            expected_feed = str(t.get("feed_source") or "").upper()
+            # Não inventa WIN/LOSS com outra corretora ou cotação pública.
+            if market == "OPEN" and expected_feed and expected_feed != "UNKNOWN":
+                if not _result_feed_compatible(expected_feed, _feed_source_from_rows(cs)):
+                    continue
 
             target, best_delta, matched_dt = _nearest_candle_for_time(
                 cs, entry_dt, INTERVALS[interval]
             )
 
-            if not target:
+            if not target or not _verified_closed_candles([target], interval):
                 continue
 
             op = float(target["open"])
@@ -30372,14 +30521,37 @@ async def reset_performance(request: Request, market="OPEN"):
 
 
 
-def _cached_open_candles_for_result(symbol: str, interval: str, n: int = 100):
-    """Usa primeiro o cache multifuente OPEN sem gastar uma nova chamada."""
+def _result_feed_compatible(expected: str, observed: str) -> bool:
+    expected = str(expected or "").upper()
+    observed = str(observed or "").upper()
+    if not expected or expected == "UNKNOWN":
+        return True
+    if expected.startswith("TWELVE_DATA") and observed.startswith("TWELVE_DATA"):
+        return True  # WS e REST do mesmo provedor/preço.
+    return expected == observed
+
+
+def _cached_open_candles_for_result(symbol: str, interval: str, n: int = 100, *, request=None, completed_after=None):
+    """Não mistura cTrader com TD e não apura usando snapshot anterior à expiração."""
     key = f"{symbol}|{interval}"
-    item = public_feed_cache.get(key) or td_candle_cache.get(key)
+    sess_id, sess = (None, None)
+    if request is not None:
+        try:
+            sess_id, sess = _ctrader_session_from_request(request)
+        except Exception:
+            pass
+    use_ctrader = bool(sess and _ctrader_symbol_supported(sess, symbol))
+    scoped_key = f"{key}|CTRADER:{sess_id}" if use_ctrader else key
+    # Não cair no cache genérico da TD se este usuário está lendo cTrader.
+    item = public_feed_cache.get(scoped_key) if use_ctrader else (public_feed_cache.get(key) or td_candle_cache.get(key))
     if not item:
         return []
     try:
-        values = item[1] or []
+        if completed_after is not None and float(item[0]) < completed_after.timestamp() + 2.0:
+            return []
+        values = list(item[1] or [])
+        if use_ctrader and _feed_source_from_rows(values) != "CTRADER_OPEN":
+            return []
         return values[-max(20, min(int(n), 150)):]
     except Exception:
         return []
@@ -30467,6 +30639,7 @@ async def result(
     market="OPEN",
     direct_only: bool = False,
     engine: str = "",
+    feed_source: str = "",
 ):
     """Apura somente a vela da entrada.
 
@@ -30480,6 +30653,7 @@ async def result(
     market = (market or "OPEN").upper()
     direction = (direction or "CALL").upper()
     engine = str(engine or "").upper()
+    expected_result_feed = str(feed_source or "").upper()
 
     # MEGA IA 3.96.7 — regra global: SEM GALE para todos os motores.
     # Um LOSS encerra a entrada atual. A recuperação de valor, quando usada,
@@ -30529,10 +30703,12 @@ async def result(
     cs = (
         []
         if ea_iq_result
-        else (_cached_open_candles_for_result(symbol, interval, 140) if market == "OPEN" else [])
+        else (_cached_open_candles_for_result(symbol, interval, 140, request=request, completed_after=expiry_dt) if market == "OPEN" else [])
     )
     if not cs:
         try:
+            if market == "OPEN":
+                _invalidate_preexpiry_open_result_cache(symbol, interval, expiry_dt)
             if ea_iq_result:
                 cs = await iq_ea_candles(
                     state, symbol, interval, 120,
@@ -30560,8 +30736,11 @@ async def result(
             }
 
     def candle_near(target_dt):
+        if market == "OPEN" and expected_result_feed and not _result_feed_compatible(expected_result_feed, _feed_source_from_rows(cs)):
+            return None
         target, _, _ = _nearest_candle_for_time(cs, target_dt, INTERVALS[interval])
-        return target
+        # Não finalizar com uma barra ainda em formação, mesmo quando o horário bate.
+        return target if target and _verified_closed_candles([target], interval) else None
 
     def candle_result(candle):
         if candle is None:
@@ -30609,6 +30788,7 @@ async def result(
 
         elif market == "OPEN":
             cache_key = f"{symbol}|{interval}"
+            _invalidate_preexpiry_open_result_cache(symbol, interval, expiry_dt)
             old_public_cache = public_feed_cache.pop(cache_key, None)
             old_td_cache = td_candle_cache.pop(cache_key, None)
             fresh_ok = False
@@ -30634,7 +30814,7 @@ async def result(
                 exact = await _fetch_open_result_window(symbol, interval, target_dt)
             except Exception:
                 exact = []
-            if exact:
+            if exact and (not expected_result_feed or _result_feed_compatible(expected_result_feed, "TWELVE_DATA")):
                 cs = exact
                 found = candle_near(target_dt)
                 if found:
@@ -33838,6 +34018,13 @@ try{
 
 function paintEntryModeNote(){
   if(!entryMode || !entryModeNote) return;
+  const fixed=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','RSIXOVER'].includes(selectedRobotEngine());
+  if(fixed){
+    entryMode.value='BIRTH';
+    if(entryScheduleLabel) entryScheduleLabel.textContent='⏱ CRONOGRAMA • NASCIMENTO / CANDLE FECHADO';
+    entryModeNote.textContent='🟢 Este motor usa a última vela fechada e só libera entrada nos primeiros 10 s da vela seguinte. MEIO é incompatível com confirmação por candle fechado.';
+    return;
+  }
   const mode=entryMode.value||'BIRTH';
   if(entryScheduleLabel) entryScheduleLabel.textContent='⏱ CRONOGRAMA • '+(mode==='BIRTH'?'NASCIMENTO':(mode==='MIDDLE'?'MEIO → PRÓXIMA VELA':'FECHAMENTO'));
   if(mode==='BIRTH'){
@@ -34430,7 +34617,8 @@ async function autoDirectCandleOutcome(sig, entryIso){
     '&direction='+encodeURIComponent(sig.direction)+
     '&expiry_time='+encodeURIComponent(expiryIso)+
     '&market='+encodeURIComponent(sig.market||market.value||'OPEN')+
-    '&direct_only=true';
+    '&direct_only=true'+
+    '&feed_source='+encodeURIComponent(sig.feed_source||'');
   try{
     const d=await get(url);
     if(d && d.status==='FINALIZADA' && ['WIN','LOSS','DRAW'].includes(d.result)) return d.result;
@@ -38310,6 +38498,7 @@ function renderVelocityPreviewOnMain(data){
 }
 
 async function sig(announce=false){
+  if(typeof paintEntryModeNote==='function') paintEntryModeNote();
   if(!appEnabled) return;
   if(sigBusy) return;
 
@@ -38338,7 +38527,7 @@ async function sig(announce=false){
       return;
     }
     cur=await get(
-      `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent((entryMode&&entryMode.value)||'BIRTH')}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`
+      `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent(['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','RSIXOVER'].includes(engine)?'BIRTH':((entryMode&&entryMode.value)||'BIRTH'))}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`
     );
 
     // 3.64: quando o pré-alerta completo do Velocity já foi promovido a ALERTA,
@@ -38951,7 +39140,7 @@ async function resultCheck(){
     pendingTrade=t;
 
     const x=await get(
-      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=${t.direct_only?'true':'false'}&engine=${encodeURIComponent(t.engine||'')}`
+      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=${t.direct_only?'true':'false'}&engine=${encodeURIComponent(t.engine||'')}&feed_source=${encodeURIComponent(t.feed_source||'')}`
     );
 
     if(x && !x.result && (x.status==='AGUARDANDO_FONTE' || String(x.status||'').startsWith('AGUARDANDO'))){
