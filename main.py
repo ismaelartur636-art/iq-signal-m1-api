@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.95"
+APP_VERSION = "3.96.96"
+# MEGA IA 3.96.96 — BACKTEST 48H automático por motor ativo + STREAK REVERSAL retirado do painel/seleção/robô 24h.
 # MEGA IA 3.96.95 — ISMAEL TRADER: perfil FLEX controlado (RSI9 35/65, memória 4 candles, ADX21>=18), análise 24h no servidor mesmo com tela apagada e ativo selecionado priorizado no bot de fundo.
 # MEGA IA 3.96.94 — ISMAEL TRADER: mantém EMA3/7 + RSI9 30/70 + ADX21, mas aceita extremo RSI visto nos 2 candles recentes; pré-alerta/polling 20s alinhados e timing sem conflito BIRTH/MIDDLE.
 # MEGA IA 3.96.93 — 1 MINUTE SCALPER: janela oficial de 20s + memória de alinhamento de até 2 candles; remove trava de 10s.
@@ -1507,7 +1508,7 @@ BACKGROUND_SCAN_SECONDS = max(3.0, min(60.0, float(os.getenv("BACKGROUND_SCAN_SE
 BACKGROUND_RESULT_SECONDS = max(3.0, min(30.0, float(os.getenv("BACKGROUND_RESULT_SECONDS", "5"))))
 BACKGROUND_DEFAULT_ENABLED = os.getenv("BACKGROUND_SIGNALS_ENABLED", "0").strip().lower() in ("1", "true", "on", "yes")
 BACKGROUND_DEFAULT_ENGINE = os.getenv("BACKGROUND_ENGINE", "SMART").strip().upper() or "SMART"
-if BACKGROUND_DEFAULT_ENGINE not in {"SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER"}:
+if BACKGROUND_DEFAULT_ENGINE not in {"SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER"}:
     BACKGROUND_DEFAULT_ENGINE = "SMART"
 BACKGROUND_DEFAULT_MARKET = os.getenv("BACKGROUND_MARKET", "OPEN").strip().upper() or "OPEN"
 BACKGROUND_DEFAULT_INTERVAL = os.getenv("BACKGROUND_INTERVAL", "1min").strip() or "1min"
@@ -1675,7 +1676,7 @@ RETIRED_ENGINES = {
     "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE",
     "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX",
     # 3.96.79 — retirados do painel e bloqueados no backend/robô 24h.
-    "MONSTERSMC", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "RSICROSS", "RSIXOVER",
+    "MONSTERSMC", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "RSICROSS", "RSIXOVER", "STREAKREV",
 }
 
 background_bot_task = None
@@ -7044,7 +7045,7 @@ def _open_rows_age_seconds(rows) -> float:
 # Todos os provedores do roteador devem fornecer o início da barra; datetime sem
 # timezone vem em UTC (Twelve Data é solicitada explicitamente em UTC).
 CLOSED_PANEL_ENGINES = frozenset({
-    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER"
+    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER"
 })
 
 
@@ -21473,7 +21474,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         engine = "GRAPH_AI"
     if engine in RETIRED_ENGINES:
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "MONSTERSMC", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC"):
+    if engine not in ("GRAPH_AI", "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "MONSTERSMC", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC"):
         engine = "GRAPH_AI"
     if engine == "RTM" and not _rtm_symbol_allowed(symbol):
         out = neutral_signal(
@@ -22531,7 +22532,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "IA GRÁFICA"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC"):
+        if market != "OPEN" and engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -23162,7 +23163,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
-            "ai_confirmed": bool(engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC") and analysis.get("confirmed")),
+            "ai_confirmed": bool(engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC") and analysis.get("confirmed")),
             "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                 "LOCALANALYST": "LOCAL_ANALYST_PRO",
                 "LOCALANALYSTFLEX": "LOCAL_ANALYST_FLEX",
@@ -23234,7 +23235,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 "RSI5": "LOCAL_RSI_ADX_4TF",
                 "BIGRISE": "LOCAL_BTC_FORCE_STRUCTURE",
             }.get(engine, "DISABLED")),
-            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC") else "HIGH").upper(),
+            "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC") else "HIGH").upper(),
             "strategy": (
                 "CHATGPT ANALISTA" if engine == "SMART"
                 else (analysis.get("strategy") or (
@@ -24001,7 +24002,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "FORCE": "SINAL EA FORÇA DO MOVIMENTO LIBERADO",
                         "BIGRISE": "SINAL BTC FORCE MULTIATIVOS LIBERADO",
                     }.get(engine, "SINAL IA GRÁFICA LIBERADO")),
-                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC") else "MEDIUM").upper(),
+                    "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC") else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
                     "expiry_time": iso(expiry),
@@ -27130,7 +27131,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     # 3.96.79 — somente os quatro motores atuais/visíveis podem rodar em segundo plano.
-    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER",
+    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER",
 }
 
 
@@ -27992,6 +27993,303 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
 
 # Scanner dedicado removido; os sinais continuam pelos motores selecionáveis.
 
+
+# -----------------------------------------------------------------------------
+# MEGA IA 3.96.96 — BACKTEST 48H causal do motor ativo
+# -----------------------------------------------------------------------------
+_BACKTEST48_SUPPORTED = {
+    "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER",
+    "ISMAELTRADER", "RSICHANNEL", "MINSCALPER",
+}
+_BACKTEST48_NAMES = {
+    "SMART": "CHATGPT ANALISTA",
+    "LOCALANALYST": "MEGA BOT",
+    "LOCALANALYSTFLEX": "MEGA BOT FLEX",
+    "MEGAMASTER": "MEGA MASTER",
+    "ISMAELTRADER": "ISMAEL TRADER",
+    "RSICHANNEL": "RSI CHANNELS",
+    "MINSCALPER": "1 MINUTE SCALPER",
+}
+_backtest48_history_cache: Dict[str, Any] = {}
+_backtest48_result_cache: Dict[str, Any] = {}
+_BACKTEST48_CACHE_TTL = 120.0
+
+
+def _backtest48_count(interval: str) -> int:
+    step = int(INTERVALS.get(interval, 60))
+    return max(12, int((48 * 3600 + step - 1) // step))
+
+
+async def _backtest48_binance_history(symbol: str, interval: str, required: int) -> list:
+    pair = BINANCE_SYMBOLS.get(symbol)
+    imap = {"1min":"1m","5min":"5m","15min":"15m","30min":"30m","1h":"1h","4h":"4h"}
+    bint = imap.get(interval)
+    if not pair or not bint:
+        raise RuntimeError("Binance sem histórico compatível para este ativo/timeframe.")
+    rows_by_ts = {}
+    end_ms = None
+    pages = max(1, min(12, (int(required) + 999) // 1000 + 1))
+    for _ in range(pages):
+        need = max(1, int(required) - len(rows_by_ts))
+        limit = min(1000, max(100, need + 5))
+        data = None
+        last_error = ""
+        for url in BINANCE_KLINES_URLS:
+            try:
+                params = {"symbol": pair, "interval": bint, "limit": limit}
+                if end_ms is not None:
+                    params["endTime"] = int(end_ms)
+                async with httpx.AsyncClient(timeout=PUBLIC_FEED_TIMEOUT, follow_redirects=True) as client:
+                    r = await client.get(url, params=params)
+                r.raise_for_status()
+                candidate = r.json()
+                if isinstance(candidate, list) and candidate:
+                    data = candidate
+                    break
+            except Exception as exc:
+                last_error = str(exc)[:180]
+        if not data:
+            if rows_by_ts:
+                break
+            raise RuntimeError(last_error or "Binance não retornou histórico.")
+        earliest = None
+        for x in data:
+            try:
+                ms = int(x[0])
+                earliest = ms if earliest is None else min(earliest, ms)
+                rows_by_ts[ms] = {
+                    "datetime": datetime.fromtimestamp(ms / 1000.0, tz=UTC).isoformat(),
+                    "open": float(x[1]), "high": float(x[2]), "low": float(x[3]), "close": float(x[4]),
+                    "volume": float(x[5] or 0), "feed_source": "BINANCE_PUBLIC", "source_symbol": pair,
+                }
+            except Exception:
+                continue
+        if len(rows_by_ts) >= int(required) or earliest is None:
+            break
+        end_ms = int(earliest) - 1
+    rows = [rows_by_ts[k] for k in sorted(rows_by_ts)]
+    if len(rows) < min(int(required), 40):
+        raise RuntimeError(f"Histórico Binance insuficiente ({len(rows)}/{required}).")
+    return rows[-int(required):]
+
+
+def _backtest48_iq_history_blocking(state: Dict[str, Any], symbol: str, interval: str, required: int) -> list:
+    client = _iq_reconnect_state(state)
+    duration = iq_seconds(interval)
+    errors = []
+    for active in iq_active_candidates(symbol):
+        rows_by_ts = {}
+        endtime = time.time()
+        try:
+            for _ in range(max(1, min(12, (int(required) + 499) // 500 + 1))):
+                count = min(500, max(80, int(required) - len(rows_by_ts) + 5))
+                raw = _iq_get_candles_once(client, active, duration, count, endtime)
+                page = []
+                for item in raw or []:
+                    c = _normalize_iq_candle(item)
+                    if c:
+                        c["source"] = active
+                        page.append(c)
+                if not page:
+                    break
+                page.sort(key=lambda r: r.get("datetime", ""))
+                earliest_dt = None
+                for c in page:
+                    try:
+                        dt = parse_dt(str(c.get("datetime") or "")).astimezone(UTC)
+                        key = int(dt.timestamp())
+                        rows_by_ts[key] = c
+                        earliest_dt = dt if earliest_dt is None or dt < earliest_dt else earliest_dt
+                    except Exception:
+                        continue
+                if len(rows_by_ts) >= int(required) or earliest_dt is None:
+                    break
+                endtime = earliest_dt.timestamp() - 1.0
+            rows = [rows_by_ts[k] for k in sorted(rows_by_ts)]
+            if len(rows) >= min(int(required), 40):
+                return rows[-int(required):]
+            errors.append(f"{active}: {len(rows)}/{required} candles")
+        except Exception as exc:
+            errors.append(f"{active}: {str(exc)[:160]}")
+    raise RuntimeError("IQ Option sem histórico suficiente para backtest. " + " | ".join(errors[-3:]))
+
+
+async def _backtest48_history(request: Request, symbol: str, interval: str, market: str, required: int, refresh: bool=False):
+    cache_key = f"{market}|{symbol}|{interval}|{required}"
+    cached = _backtest48_history_cache.get(cache_key)
+    if not refresh and cached and time.time() - float(cached[0]) < _BACKTEST48_CACHE_TTL:
+        return list(cached[1]), str(cached[2])
+    if market == "OPEN":
+        if symbol in BINANCE_SYMBOLS:
+            rows = await _backtest48_binance_history(symbol, interval, required)
+            source = "BINANCE_PUBLIC"
+        else:
+            try:
+                rows = await _yahoo_public_candles(symbol, interval, required)
+                source = "YAHOO_PUBLIC"
+            except Exception as exc:
+                # Fallback do roteador normal é limitado a 500 barras; ainda é útil
+                # para timeframes maiores, mas M1/M5 exigem a fonte histórica longa.
+                if required <= 500:
+                    rows = await candles(symbol, interval, required, "OPEN", None, request=request)
+                    source = _feed_source_from_rows(rows)
+                else:
+                    raise RuntimeError(f"Histórico 48H indisponível para {symbol}: {str(exc)[:180]}")
+    elif market == "IQ_OTC":
+        iq_state = _iq_session_state(request, required=False)
+        if not iq_state or not _iq_connected(iq_state):
+            raise RuntimeError("Conecte a IQ Option para executar o Backtest 48H no OTC.")
+        lock = iq_state.get("lock") or asyncio.Lock()
+        iq_state["lock"] = lock
+        async with lock:
+            rows = await asyncio.wait_for(
+                asyncio.to_thread(_backtest48_iq_history_blocking, iq_state, symbol, interval, required),
+                timeout=max(45.0, IQ_CANDLE_TIMEOUT * 8),
+            )
+        source = "IQ_OPTION_OTC"
+    else:
+        raise RuntimeError("Mercado inválido para backtest.")
+    rows = sorted([dict(r) for r in rows if isinstance(r, dict)], key=lambda r: str(r.get("datetime") or ""))
+    # Backtest nunca usa a vela ainda em formação nem como referência nem como expiração.
+    verified = _verified_closed_candles(rows, interval, observed_at=now())
+    if verified:
+        rows = verified
+    _backtest48_history_cache[cache_key] = (time.time(), list(rows), source)
+    return rows, source
+
+
+def _backtest48_eval(engine: str, hist: list, symbol: str, interval: str, market: str) -> Dict[str, Any]:
+    if engine == "LOCALANALYST":
+        return local_analyst_pro_strategy(hist[-220:], symbol=symbol, timeframe=interval, market=market, profile="BALANCED")
+    if engine == "LOCALANALYSTFLEX":
+        return local_analyst_pro_strategy(hist[-220:], symbol=symbol, timeframe=interval, market=market, profile="FLEX")
+    if engine == "MEGAMASTER":
+        return local_analyst_pro_strategy(hist[-260:], symbol=symbol, timeframe=interval, market=market, profile="MASTER")
+    if engine == "ISMAELTRADER":
+        return ismael_trader_strategy(hist[-320:], symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
+    if engine == "RSICHANNEL":
+        return rsi_channels_strategy(hist[-180:], symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
+    if engine == "MINSCALPER":
+        return one_minute_scalper_strategy(hist[-320:], symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
+    return {"confirmed": False, "direction": "NEUTRO", "confidence": 0.0}
+
+
+@app.get("/backtest48h")
+async def backtest48h_endpoint(
+    request: Request,
+    symbol: str = "EUR/USD",
+    interval: str = "1min",
+    market: str = "OPEN",
+    engine: str = "LOCALANALYST",
+    refresh: bool = False,
+):
+    market = str(market or "OPEN").upper()
+    engine = str(engine or "").upper()
+    if not _symbol_allowed(symbol, market) or interval not in INTERVALS or market not in VALID_MARKETS:
+        raise HTTPException(400, "Ativo, intervalo ou mercado inválido para o Backtest 48H.")
+    if engine == "STREAKREV" or engine in RETIRED_ENGINES:
+        raise HTTPException(400, "Este motor foi removido do app.")
+    name = _BACKTEST48_NAMES.get(engine, engine or "SEM MOTOR")
+    if engine == "SMART":
+        return {
+            "ok": True, "supported": False, "engine": engine, "engine_name": name,
+            "symbol": symbol, "interval": interval, "market": market,
+            "message": "CHATGPT ANALISTA usa decisão externa dinâmica. Para não inventar um resultado histórico nem fazer milhares de chamadas de IA, o Backtest 48H clássico fica disponível somente para os motores locais.",
+        }
+    if engine not in _BACKTEST48_SUPPORTED:
+        return {
+            "ok": True, "supported": False, "engine": engine, "engine_name": name,
+            "symbol": symbol, "interval": interval, "market": market,
+            "message": "Este motor ainda não possui adaptador causal no Backtest 48H.",
+        }
+
+    result_key = f"{market}|{symbol}|{interval}|{engine}"
+    cached = _backtest48_result_cache.get(result_key)
+    if not refresh and cached and time.time() - float(cached[0]) < _BACKTEST48_CACHE_TTL:
+        return dict(cached[1])
+
+    window_bars = _backtest48_count(interval)
+    warmup = 340
+    required = window_bars + warmup + 8
+    try:
+        rows, source = await _backtest48_history(request, symbol, interval, market, required, refresh=bool(refresh))
+    except Exception as exc:
+        return {
+            "ok": False, "supported": True, "engine": engine, "engine_name": name,
+            "symbol": symbol, "interval": interval, "market": market,
+            "message": str(exc)[:320], "wins": 0, "losses": 0, "draws": 0, "signals": 0,
+            "accuracy": None, "operations": [],
+        }
+
+    cutoff = datetime.now(UTC) - timedelta(hours=48)
+    wins = losses = draws = 0
+    operations = []
+    seen_events = set()
+    first_i = min(warmup, max(0, len(rows) - 2))
+    for i in range(first_i, len(rows) - 1):
+        ref = rows[i]
+        nxt = rows[i + 1]
+        try:
+            ref_dt = parse_dt(str(ref.get("datetime") or "")).astimezone(UTC)
+            entry_dt = parse_dt(str(nxt.get("datetime") or "")).astimezone(UTC)
+        except Exception:
+            continue
+        if entry_dt < cutoff:
+            continue
+        hist = rows[: i + 1]
+        try:
+            analysis = _backtest48_eval(engine, hist, symbol, interval, market) or {}
+        except Exception:
+            continue
+        direction = str(analysis.get("direction") or "NEUTRO").upper()
+        if not bool(analysis.get("confirmed")) or direction not in ("CALL", "PUT"):
+            continue
+        event_key = str(analysis.get("event_key") or "").strip()
+        if event_key:
+            if event_key in seen_events:
+                continue
+            seen_events.add(event_key)
+        try:
+            entry_open = float(nxt.get("open"))
+            expiry_close = float(nxt.get("close"))
+        except Exception:
+            continue
+        if expiry_close == entry_open:
+            label = "DRAW"; draws += 1
+        elif (direction == "CALL" and expiry_close > entry_open) or (direction == "PUT" and expiry_close < entry_open):
+            label = "WIN"; wins += 1
+        else:
+            label = "LOSS"; losses += 1
+        operations.append({
+            "signal_time": ref_dt.isoformat(), "entry_time": entry_dt.isoformat(),
+            "direction": direction, "result": label,
+            "entry": entry_open, "close": expiry_close,
+            "confidence": round(float(analysis.get("confidence") or 0.0), 1),
+            "reason": str(analysis.get("reason") or "")[:180],
+        })
+
+    decided = wins + losses
+    accuracy = round((wins / decided) * 100.0, 1) if decided else None
+    approximation = engine in {"ISMAELTRADER", "RSICHANNEL", "MINSCALPER"}
+    out = {
+        "ok": True, "supported": True, "engine": engine, "engine_name": name,
+        "symbol": symbol, "interval": interval, "market": market,
+        "hours": 48, "signals": len(operations), "wins": wins, "losses": losses, "draws": draws,
+        "accuracy": accuracy, "source": source, "history_bars": len(rows),
+        "generated_at": iso(now()),
+        "causal": True, "lookahead": False, "expiration_candles": 1, "gale": False,
+        "timing_approximation": approximation,
+        "timing_note": (
+            "Este motor usa pré-alerta nos 20s finais no ao vivo. O histórico OHLC não guarda o estado exato de 20s antes; o backtest usa a decisão causal do candle fechado como aproximação."
+            if approximation else
+            "Replay candle a candle, sem usar candles futuros; entrada na abertura seguinte e expiração de 1 candle."
+        ),
+        "operations": operations[-80:],
+    }
+    _backtest48_result_cache[result_key] = (time.time(), dict(out))
+    return out
+
+
 @app.get("/signal-ai")
 async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "SMART", entry_mode: str = "BIRTH", robofibo_poc: bool = False):
     requested_market = (market or "OPEN").upper()
@@ -28004,9 +28302,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
         engine = "GRAPH_AI"
     if engine == "RSIXOVER":
         raise HTTPException(410, "RSI XOVER foi retirado do MEGA IA. Atualize o painel para escolher outro motor.")
+    if engine == "STREAKREV":
+        raise HTTPException(410, "STREAK REVERSAL foi retirado do MEGA IA. Atualize o painel para escolher outro motor.")
     if engine in RETIRED_ENGINES:
         engine = "SMART"
-    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER"):
+    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER"):
         raise HTTPException(400, "Motor inválido. Escolha um dos sete motores disponíveis no painel.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
@@ -31948,7 +32248,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • CHATGPT ANALISTA • MEGA BOT • MEGA BOT FLEX • MEGA MASTER • STREAK REVERSAL • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • CHATGPT ANALISTA • MEGA BOT • MEGA BOT FLEX • MEGA MASTER • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -32033,15 +32333,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="megaMasterPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
-  <div class="robot-mode-card" id="streakRevModeCard">
-    <img src="__MEGA_IMAGE__" alt="Streak Reversal">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🔁 STREAK REVERSAL</div>
-      <div class="robot-mode-desc" id="streakRevModeDesc">Sequência 2+ candles + 2 candles contrários, ATR100 e EMA100 • CALL/PUT somente após confirmação do fechamento • entrada na próxima vela • sem Gale.</div>
-    </div>
-    <button id="streakRevPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
   <div class="robot-mode-card" id="ismaelTraderModeCard">
     <img src="__MEGA_IMAGE__" alt="Ismael Trader">
     <div class="robot-mode-copy">
@@ -32067,6 +32358,27 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-desc" id="minScalperModeDesc">13 LWMAs no preço típico • novo alinhamento completo em M1 fechado • entrada na próxima vela • rearm obrigatório • sem Gale.</div>
     </div>
     <button id="minScalperPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
+  <div class="card" id="backtest48Card" style="margin-top:14px;border-color:#2f86ff">
+    <div style="display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap">
+      <div>
+        <div class="label">📊 BACKTEST AUTOMÁTICO • ÚLTIMAS 48 HORAS</div>
+        <div id="backtest48Engine" style="font-size:20px;font-weight:1000;margin-top:4px">Aguardando motor ativo...</div>
+      </div>
+      <button id="backtest48RefreshBtn" type="button" style="font-weight:900">🔄 ATUALIZAR</button>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:12px" id="backtest48Stats">
+      <div><div class="label">SINAIS</div><div id="backtest48Signals" class="big" style="font-size:28px">--</div></div>
+      <div><div class="label">WIN</div><div id="backtest48Wins" class="big" style="font-size:28px;color:#38d67a">--</div></div>
+      <div><div class="label">LOSS</div><div id="backtest48Losses" class="big" style="font-size:28px;color:#ff667a">--</div></div>
+      <div><div class="label">ASSERTIVIDADE</div><div id="backtest48Accuracy" class="big" style="font-size:28px">--</div></div>
+    </div>
+    <div id="backtest48Note" class="label" style="margin-top:10px;line-height:1.45">Ative um motor para calcular.</div>
+    <details id="backtest48Details" style="margin-top:10px">
+      <summary style="cursor:pointer;font-weight:900">Ver últimas operações do backtest</summary>
+      <div id="backtest48Ops" style="margin-top:8px;max-height:300px;overflow:auto;font-size:13px"></div>
+    </details>
   </div>
 
 <div class="tabs">
@@ -33042,6 +33354,7 @@ try{
   shkHaEnabled=localStorage.getItem('mega_shk_ha_power')==='ONLINE';
   sessionBreakoutEnabled=localStorage.getItem('mega_session_breakout_power')==='ONLINE';
   streakRevEnabled=localStorage.getItem('mega_streak_rev_power')==='ONLINE';
+  streakRevEnabled=false; localStorage.setItem('mega_streak_rev_power','OFFLINE');
   ismaelTraderEnabled=localStorage.getItem('mega_ismael_trader_power')==='ONLINE';
   rsiChannelsEnabled=localStorage.getItem('mega_rsi_channels_power')==='ONLINE';
   if(shkHaEnabled){
@@ -33318,15 +33631,15 @@ if(localAnalystEnabled){
 
 // Se nenhum motor válido ficou ONLINE, nesta versão o fallback é CHATGPT ANALISTA.
 monsterSmcEnabled=false; tsiEnabled=false; momentumEnabled=false; figuresEnabled=false; vasilyEnabled=false; platinumEnabled=false;
-if(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled) {streakRevEnabled=false;ismaelTraderEnabled=false;rsiChannelsEnabled=false;minScalperEnabled=false;}
-if(minScalperEnabled){aiEnabled=false;localAnalystEnabled=false;localAnalystFlexEnabled=false;megaMasterEnabled=false;streakRevEnabled=false;ismaelTraderEnabled=false;rsiChannelsEnabled=false;}
-if(!(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled||streakRevEnabled||ismaelTraderEnabled||rsiChannelsEnabled||minScalperEnabled)) aiEnabled=true;
+streakRevEnabled=false; try{localStorage.setItem('mega_streak_rev_power','OFFLINE')}catch(_){}
+if(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled) {ismaelTraderEnabled=false;rsiChannelsEnabled=false;minScalperEnabled=false;}
+if(minScalperEnabled){aiEnabled=false;localAnalystEnabled=false;localAnalystFlexEnabled=false;megaMasterEnabled=false;ismaelTraderEnabled=false;rsiChannelsEnabled=false;}
+if(!(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled||ismaelTraderEnabled||rsiChannelsEnabled||minScalperEnabled)) aiEnabled=true;
 
 function selectedRobotEngine(){
   if(minScalperEnabled) return 'MINSCALPER';
   if(rsiChannelsEnabled) return 'RSICHANNEL';
   if(ismaelTraderEnabled) return 'ISMAELTRADER';
-  if(streakRevEnabled) return 'STREAKREV';
   if(megaMasterEnabled) return 'MEGAMASTER';
   if(localAnalystFlexEnabled) return 'LOCALANALYSTFLEX';
   if(localAnalystEnabled) return 'LOCALANALYST';
@@ -33343,7 +33656,7 @@ function adoptBackgroundEngineState(d){
   }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(e!=='SMART' && e!=='LOCALANALYST' && e!=='LOCALANALYSTFLEX' && e!=='MEGAMASTER' && e!=='STREAKREV' && e!=='ISMAELTRADER' && e!=='RSICHANNEL' && e!=='MINSCALPER') return;
+  if(e!=='SMART' && e!=='LOCALANALYST' && e!=='LOCALANALYSTFLEX' && e!=='MEGAMASTER' && e!=='ISMAELTRADER' && e!=='RSICHANNEL' && e!=='MINSCALPER') return;
   aiEnabled=(e==='SMART');
   localAnalystEnabled=(e==='LOCALANALYST');
   localAnalystFlexEnabled=(e==='LOCALANALYSTFLEX');
@@ -33355,7 +33668,7 @@ function adoptBackgroundEngineState(d){
   vasilyEnabled=(e==='VASILY');
   platinumEnabled=(e==='PLATINUM');
   rsiCrossEnabled=false;
-  streakRevEnabled=(e==='STREAKREV');
+  streakRevEnabled=false;
   ismaelTraderEnabled=(e==='ISMAELTRADER');
   rsiChannelsEnabled=(e==='RSICHANNEL');
   minScalperEnabled=(e==='MINSCALPER');
@@ -33381,12 +33694,86 @@ function adoptBackgroundEngineState(d){
       .forEach(k=>localStorage.setItem(k,'OFFLINE'));
   }catch(_){}
   if(typeof applyRobotPowerState==='function') applyRobotPowerState();
+  if(typeof scheduleBacktest48==='function') scheduleBacktest48(false,250);
+}
+
+function backtest48Name(e){
+  return ({SMART:'CHATGPT ANALISTA',LOCALANALYST:'MEGA BOT',LOCALANALYSTFLEX:'MEGA BOT FLEX',MEGAMASTER:'MEGA MASTER',ISMAELTRADER:'ISMAEL TRADER',RSICHANNEL:'RSI CHANNELS',MINSCALPER:'1 MINUTE SCALPER'})[e]||e||'SEM MOTOR';
+}
+function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
+function scheduleBacktest48(force=false,delay=260){
+  if(backtest48Timer) clearTimeout(backtest48Timer);
+  backtest48Timer=setTimeout(()=>loadBacktest48(force),delay);
+}
+async function loadBacktest48(force=false){
+  if(backtest48Busy){ scheduleBacktest48(force,700); return; }
+  const engine=selectedRobotEngine();
+  const requestKey=`${engine}|${market.value}|${S.value}|${interval.value}`;
+  if(!backtest48Engine) return;
+  if(engine==='OFF'){
+    backtest48Engine.textContent='Nenhum motor ativo';
+    if(backtest48Signals) backtest48Signals.textContent='--';
+    if(backtest48Wins) backtest48Wins.textContent='--';
+    if(backtest48Losses) backtest48Losses.textContent='--';
+    if(backtest48Accuracy) backtest48Accuracy.textContent='--';
+    if(backtest48Note) backtest48Note.textContent='Ative um motor para calcular as últimas 48 horas.';
+    if(backtest48Ops) backtest48Ops.innerHTML='';
+    return;
+  }
+  backtest48Busy=true;
+  backtest48Engine.textContent=`${backtest48Name(engine)} • ${S.value} • ${interval.value}`;
+  if(backtest48Note) backtest48Note.textContent='Calculando replay candle a candle...';
+  if(backtest48RefreshBtn){backtest48RefreshBtn.disabled=true;backtest48RefreshBtn.textContent='⏳ CALCULANDO';}
+  try{
+    const d=await get(`/backtest48h?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&refresh=${force?'true':'false'}`);
+    if(!d || d.supported===false){
+      if(backtest48Signals) backtest48Signals.textContent='N/D';
+      if(backtest48Wins) backtest48Wins.textContent='--';
+      if(backtest48Losses) backtest48Losses.textContent='--';
+      if(backtest48Accuracy) backtest48Accuracy.textContent='--';
+      if(backtest48Note) backtest48Note.textContent=(d&&d.message)||'Backtest indisponível para este motor.';
+      if(backtest48Ops) backtest48Ops.innerHTML='';
+      return;
+    }
+    if(!d.ok){
+      if(backtest48Signals) backtest48Signals.textContent='--';
+      if(backtest48Wins) backtest48Wins.textContent='--';
+      if(backtest48Losses) backtest48Losses.textContent='--';
+      if(backtest48Accuracy) backtest48Accuracy.textContent='--';
+      if(backtest48Note) backtest48Note.textContent=d.message||'Não foi possível calcular o backtest.';
+      return;
+    }
+    backtest48Engine.textContent=`${d.engine_name||backtest48Name(engine)} • ${d.symbol} • ${d.interval}`;
+    if(backtest48Signals) backtest48Signals.textContent=String(d.signals??0);
+    if(backtest48Wins) backtest48Wins.textContent=String(d.wins??0);
+    if(backtest48Losses) backtest48Losses.textContent=String(d.losses??0);
+    if(backtest48Accuracy) backtest48Accuracy.textContent=(d.accuracy==null?'--':`${Number(d.accuracy).toFixed(1)}%`);
+    if(backtest48Note){
+      const drawTxt=(d.draws?` • DRAW ${d.draws}`:'');
+      backtest48Note.textContent=`Fonte: ${d.source||'--'} • 48H • 1 candle de expiração • sem Gale${drawTxt}. ${d.timing_note||''}`;
+    }
+    if(backtest48Ops){
+      const ops=Array.isArray(d.operations)?d.operations.slice().reverse():[];
+      backtest48Ops.innerHTML=ops.length?ops.map(o=>{
+        let tm='--'; try{tm=new Date(o.entry_time).toLocaleString('pt-BR',{timeZone:'America/Fortaleza',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});}catch(_){}
+        const icon=o.result==='WIN'?'🟢':(o.result==='LOSS'?'🔴':'⚪');
+        return `<div style="padding:7px 4px;border-bottom:1px solid #ffffff18">${icon} <b>${backtest48Escape(o.result)}</b> • ${backtest48Escape(o.direction)} • ${backtest48Escape(tm)} • conf. ${Number(o.confidence||0).toFixed(0)}%</div>`;
+      }).join(''):'<div style="opacity:.7;padding:8px 0">Nenhum sinal encontrado nas últimas 48 horas.</div>';
+    }
+  }catch(err){
+    if(backtest48Note) backtest48Note.textContent='Backtest 48H indisponível agora: '+String(err&&err.message||err||'erro');
+  }finally{
+    backtest48Busy=false;
+    if(backtest48RefreshBtn){backtest48RefreshBtn.disabled=false;backtest48RefreshBtn.textContent='🔄 ATUALIZAR';}
+    const currentKey=`${selectedRobotEngine()}|${market.value}|${S.value}|${interval.value}`;
+    if(currentKey!==requestKey) scheduleBacktest48(false,120);
+  }
 }
 
 async function syncBackgroundBotState(opts={}){
   const selected=selectedRobotEngine();
   let explicitEngine=String(opts.engine||selected||'SMART').toUpperCase();
-  if(explicitEngine!=='SMART' && explicitEngine!=='LOCALANALYST' && explicitEngine!=='LOCALANALYSTFLEX' && explicitEngine!=='MEGAMASTER' && explicitEngine!=='STREAKREV' && explicitEngine!=='ISMAELTRADER' && explicitEngine!=='RSICHANNEL' && explicitEngine!=='MINSCALPER') explicitEngine='SMART';
+  if(explicitEngine!=='SMART' && explicitEngine!=='LOCALANALYST' && explicitEngine!=='LOCALANALYSTFLEX' && explicitEngine!=='MEGAMASTER' && explicitEngine!=='ISMAELTRADER' && explicitEngine!=='RSICHANNEL' && explicitEngine!=='MINSCALPER') explicitEngine='SMART';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
   const payload={
@@ -33438,6 +33825,16 @@ const tabResults=document.getElementById('tabResults');
 const tabValues=document.getElementById('tabValues');
 const tabHistory=document.getElementById('tabHistory');
 const tabCompatibility=document.getElementById('tabCompatibility');
+const backtest48Engine=document.getElementById('backtest48Engine');
+const backtest48RefreshBtn=document.getElementById('backtest48RefreshBtn');
+const backtest48Signals=document.getElementById('backtest48Signals');
+const backtest48Wins=document.getElementById('backtest48Wins');
+const backtest48Losses=document.getElementById('backtest48Losses');
+const backtest48Accuracy=document.getElementById('backtest48Accuracy');
+const backtest48Note=document.getElementById('backtest48Note');
+const backtest48Ops=document.getElementById('backtest48Ops');
+let backtest48Busy=false;
+let backtest48Timer=null;
 const tabTelegram=document.getElementById('tabTelegram');
 const telegramChatId=document.getElementById('telegramChatId');
 const telegramChatSelect=document.getElementById('telegramChatSelect');
@@ -34748,7 +35145,7 @@ function engineScoreSnapshot(bucket){
 function renderEngineScoreBoard(bucket){
   if(!engineScoreGrid) return;
   const st=engineScoreSnapshot(bucket||emptyResultBucket());
-  const order=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','STREAKREV','ISMAELTRADER','RSICHANNEL','MINSCALPER'];
+  const order=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER'];
   if(st.OTHER.total>0) order.push('OTHER');
   engineScoreGrid.innerHTML=order.map(k=>{
     const x=st[k];
@@ -34921,7 +35318,7 @@ try{
 
 function paintEntryModeNote(){
   if(!entryMode || !entryModeNote) return;
-  const fixed=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','STREAKREV','ISMAELTRADER','RSICHANNEL'].includes(selectedRobotEngine());
+  const fixed=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL'].includes(selectedRobotEngine());
   if(fixed){
     entryMode.value='BIRTH';
     if(entryScheduleLabel) entryScheduleLabel.textContent='⏱ CRONOGRAMA • NASCIMENTO / CANDLE FECHADO';
@@ -37022,6 +37419,14 @@ async function setAppPower(enabled){
 if(appPowerBtn){
   appPowerBtn.onclick=()=>{ setAppPower(!appEnabled); };
 }
+
+if(backtest48RefreshBtn) backtest48RefreshBtn.onclick=()=>loadBacktest48(true);
+[aiPowerBtn,localAnalystPowerBtn,localAnalystFlexPowerBtn,megaMasterPowerBtn,ismaelTraderPowerBtn,rsiChannelsPowerBtn,minScalperPowerBtn]
+  .filter(Boolean).forEach(b=>b.addEventListener('click',()=>scheduleBacktest48(false,450)));
+if(S) S.addEventListener('change',()=>scheduleBacktest48(false,300));
+if(interval) interval.addEventListener('change',()=>scheduleBacktest48(false,300));
+if(marketMode) marketMode.addEventListener('change',()=>scheduleBacktest48(false,450));
+setTimeout(()=>scheduleBacktest48(false,50),1200);
 
 function disableVasilyPlatinumForOtherEngine(){
   vasilyEnabled=false;
@@ -39314,7 +39719,6 @@ if(shkHaPowerBtn) shkHaPowerBtn.onclick=()=>setImportedEnginePower('SHKHA',!shkH
 if(minScalperPowerBtn) minScalperPowerBtn.onclick=()=>setMinScalperPower(!minScalperEnabled);
 if(rsiChannelsPowerBtn) rsiChannelsPowerBtn.onclick=()=>setRsiChannelsPower(!rsiChannelsEnabled);
 if(ismaelTraderPowerBtn) ismaelTraderPowerBtn.onclick=()=>setIsmaelTraderPower(!ismaelTraderEnabled);
-if(streakRevPowerBtn) streakRevPowerBtn.onclick=()=>setStreakRevPower(!streakRevEnabled);
 if(sessionBreakoutPowerBtn) sessionBreakoutPowerBtn.onclick=()=>setImportedEnginePower('SESSIONBREAKOUT',!sessionBreakoutEnabled);
 if(robotPowerBtn) robotPowerBtn.onclick=()=>{ disableImportedEnginesForOtherEngine(); disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); disablePresidenForOtherEngine(); setRobotPower(!robotEnabled); };
 if(localAnalystPowerBtn) localAnalystPowerBtn.onclick=()=>{ disableVasilyPlatinumForOtherEngine(); disableRoboFiboForOtherEngine(); disableRsiDivBbForOtherEngine(); disableTlbRsiForOtherEngine(); disablePresidenForOtherEngine(); setLocalAnalystPower(!localAnalystEnabled); };
@@ -39535,7 +39939,7 @@ async function sig(announce=false){
       return;
     }
     cur=await get(
-      `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent(['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER','STREAKREV'].includes(engine)?'BIRTH':((entryMode&&entryMode.value)||'BIRTH'))}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`
+      `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent(['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER'].includes(engine)?'BIRTH':((entryMode&&entryMode.value)||'BIRTH'))}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`
     );
 
     // 3.64: quando o pré-alerta completo do Velocity já foi promovido a ALERTA,
