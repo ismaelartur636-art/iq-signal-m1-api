@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.00"
+APP_VERSION = "3.97.03"
+# MEGA IA 3.97.03 — corrige sincronização do Backtest 48H com o motor realmente ativo (inclui MOMENTUM CHART).
 # MEGA IA 3.96.99 — ISMAEL TRADER: controle de quantidade 1–10 (padrão 5) no painel; 1 MINUTE SCALPER removido do painel e bloqueado no motor.
 # MEGA IA 3.96.98 — deixa explícito que o Backtest 48H é SIMULAÇÃO histórica e não log de sinais enviados ao app.
 # MEGA IA 3.96.97 — Backtest 48H com recuperação nos 2 sinais seguintes + nome correto do motor no histórico.
@@ -33937,6 +33938,14 @@ async function loadBacktest48(force=false){
       if(backtest48Note) backtest48Note.textContent=d.message||'Não foi possível calcular o backtest.';
       return;
     }
+    // 3.97.03: se o usuário trocou de motor enquanto o cálculo estava em andamento,
+    // descarta esta resposta antiga para não exibir WIN/LOSS de outro indicador.
+    const liveEngine=selectedRobotEngine();
+    const liveKey=`${liveEngine}|${market.value}|${S.value}|${interval.value}`;
+    if(liveKey!==requestKey){
+      scheduleBacktest48(false,120);
+      return;
+    }
     backtest48Engine.textContent=`${d.engine_name||backtest48Name(engine)} • ${d.symbol} • ${d.interval}`;
     if(backtest48Signals) backtest48Signals.textContent=String(d.signals??0);
     if(backtest48Wins) backtest48Wins.textContent=String(d.wins??0);
@@ -33972,7 +33981,7 @@ async function loadBacktest48(force=false){
 async function syncBackgroundBotState(opts={}){
   const selected=selectedRobotEngine();
   let explicitEngine=String(opts.engine||selected||'SMART').toUpperCase();
-  if(explicitEngine!=='SMART' && explicitEngine!=='LOCALANALYST' && explicitEngine!=='LOCALANALYSTFLEX' && explicitEngine!=='MEGAMASTER' && explicitEngine!=='ISMAELTRADER' && explicitEngine!=='RSICHANNEL' && explicitEngine!=='MINSCALPER') explicitEngine='SMART';
+  if(explicitEngine!=='SMART' && explicitEngine!=='LOCALANALYST' && explicitEngine!=='LOCALANALYSTFLEX' && explicitEngine!=='MEGAMASTER' && explicitEngine!=='ISMAELTRADER' && explicitEngine!=='RSICHANNEL' && explicitEngine!=='MINSCALPER' && explicitEngine!=='MOMENTUM') explicitEngine='SMART';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
   const payload={
