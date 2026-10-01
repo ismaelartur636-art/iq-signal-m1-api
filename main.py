@@ -42,11 +42,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.08"
+APP_VERSION = "3.97.09"
 # MEGA IA 3.97.06 — corrige painel sem controle: declara estado ISMAEL 98 antes da inicialização JS e restaura botões ON/OFF.
+# MEGA IA 3.97.09 — 4 PERIOD RSI PRO: M1 com confirmação obrigatória somente pelo RSI9 do M5 fechado; M15/M30/H1 deixam de bloquear.
 # MEGA IA 3.97.08 — completa 4 PERIOD RSI PRO: status/radar próprios e adaptador causal no Backtest 48H.
 # MEGA IA 3.97.07 — registra RSI4PERIOD em /signal, /signal-ai e /radar; corrige “Motor inválido”.
-# MEGA IA 3.97.05 — adiciona 4 PERIOD RSI PRO corrigido: RSI9 M5/M15/M30/H1, PRICE_TYPICAL, alinhamento temporal, candle fechado, confluência 3/4 e evento único.
+# MEGA IA 3.97.05 — adiciona 4 PERIOD RSI PRO corrigido: RSI9 M5, PRICE_TYPICAL, alinhamento temporal, candle fechado, confirmação M5 e evento único.
 # MEGA IA 3.97.04 — adiciona ISMAEL 98 como motor seletivo separado: EMA21/50 + RSI14 + ADX14/DMI + ATR + força da vela + S/R, próxima vela, sem Gale.
 # MEGA IA 3.97.03 — corrige sincronização do Backtest 48H com o motor realmente ativo (inclui MOMENTUM CHART).
 # MEGA IA 3.96.99 — ISMAEL TRADER: controle de quantidade 1–10 (padrão 5) no painel; 1 MINUTE SCALPER removido do painel e bloqueado no motor.
@@ -13429,47 +13430,48 @@ def tsi_signals_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
 
 
 def four_period_rsi_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """4 PERIOD RSI PRO — correção causal do 4Period_RSI_Arrows.mq4.
-    RSI(9) no PRICE_TYPICAL em M5/M15/M30/H1, alinhado por timestamp.
-    Usa somente candles fechados; exige 3 de 4 extremos e rearm para evitar repetição.
+    """4 PERIOD RSI PRO — perfil M1 confirmado exclusivamente pelo M5.
+
+    RSI(9) no PRICE_TYPICAL do M5, níveis 38/62. O M15/M30/H1 não bloqueia.
+    Somente buckets M5 completos/fechados entram no cálculo para evitar repaint.
     """
-    rows=list(cs or [])[-900:]
+    rows=list(cs or [])[-600:]
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
-          "strategy":"4 PERIOD RSI PRO","engine":"RSI4PERIOD","provider":"LOCAL_4PERIOD_RSI_FIXED_V1",
+          "strategy":"4 PERIOD RSI PRO • CONFIRMAÇÃO M5","engine":"RSI4PERIOD","provider":"LOCAL_4PERIOD_RSI_M5_V2",
           "risk":"HIGH","closed_candles_only":True,"non_repaint":True,"next_candle_entry":True,
-          "expiry_candles":1,"gale_signal":False,"martingale":False,"confidence_is_probability":False}
-    if len(rows)<120:
-        return {**base,"reason":f"4 PERIOD RSI PRO coletando histórico ({len(rows)}/120)."}
+          "expiry_candles":1,"gale_signal":False,"martingale":False,"confidence_is_probability":False,
+          "confirmation_timeframe":"M5","entry_timeframe":"M1"}
+    if len(rows)<60:
+        return {**base,"reason":f"4 PERIOD RSI PRO coletando histórico M1 ({len(rows)}/60)."}
     try:
-        parsed=[]
+        buckets={}
         for x in rows:
             dt=parse_dt(str(x.get("datetime") or x.get("time") or x.get("timestamp") or ""))
-            parsed.append((dt,float(x['high']),float(x['low']),float(x['close'])))
-        def mtf_rsi(minutes):
-            buckets={}
-            for dt,h,l,c in parsed:
-                ts=int(dt.timestamp()); key=ts//(minutes*60)
-                b=buckets.get(key)
-                if b is None: buckets[key]=[h,l,c,dt]
-                else: b[0]=max(b[0],h); b[1]=min(b[1],l); b[2]=c; b[3]=dt
-            vals=[(h+l+c)/3.0 for h,l,c,_ in [buckets[k] for k in sorted(buckets)]]
-            return rsi(vals,9)
-        vals={"M5":mtf_rsi(5),"M15":mtf_rsi(15),"M30":mtf_rsi(30),"H1":mtf_rsi(60)}
-        valid={k:v for k,v in vals.items() if v is not None}
-        if len(valid)<3:
-            return {**base,"reason":"4 PERIOD RSI PRO aguardando histórico MTF suficiente.","rsi_mtf":vals}
-        low=[k for k,v in valid.items() if v<=38.0]; high=[k for k,v in valid.items() if v>=62.0]
-        direction="CALL" if len(low)>=3 else ("PUT" if len(high)>=3 else "NEUTRO")
+            ts=int(dt.timestamp()); key=ts//300
+            b=buckets.get(key)
+            h=float(x['high']); l=float(x['low']); c=float(x['close'])
+            if b is None:
+                buckets[key]={"h":h,"l":l,"c":c,"count":1,"dt":dt}
+            else:
+                b["h"]=max(b["h"],h); b["l"]=min(b["l"],l); b["c"]=c; b["count"]+=1; b["dt"]=dt
+        complete=[(k,b) for k,b in sorted(buckets.items()) if int(b.get("count",0))>=5]
+        if len(complete)<12:
+            return {**base,"reason":f"4 PERIOD RSI PRO aguardando M5 fechado ({len(complete)}/12)."}
+        typical=[(b["h"]+b["l"]+b["c"])/3.0 for _,b in complete]
+        m5=rsi(typical,9)
+        if m5 is None:
+            return {**base,"reason":"4 PERIOD RSI PRO aguardando RSI9 do M5."}
+        direction="CALL" if m5<=38.0 else ("PUT" if m5>=62.0 else "NEUTRO")
         if direction=="NEUTRO":
-            return {**base,"reason":f"4 PERIOD RSI PRO monitorando • extremos CALL {len(low)}/4 • PUT {len(high)}/4.","rsi_mtf":vals}
-        agree=len(low) if direction=="CALL" else len(high)
-        conf=76.0 + (agree-3)*8.0
-        stamp=str(rows[-1].get('datetime') or rows[-1].get('time') or '')
-        return {**base,"direction":direction,"confidence":min(92.0,conf),"confirmed":True,
-                "reason":f"{direction} • confluência RSI9 MTF {agree}/4 • próxima vela.",
-                "rsi_mtf":vals,"event_key":f"RSI4PERIOD:{direction}:{stamp}"}
+            return {**base,"reason":f"4 PERIOD RSI PRO monitorando • RSI9 M5 {m5:.1f} • níveis 38/62.","rsi_m5":round(float(m5),2)}
+        dist=(38.0-m5) if direction=="CALL" else (m5-62.0)
+        conf=min(92.0,76.0+max(0.0,float(dist))*0.8)
+        m5_key=complete[-1][0]
+        return {**base,"direction":direction,"confidence":round(conf,1),"confirmed":True,
+                "reason":f"{direction} • RSI9 M5 {m5:.1f} confirmou • entrada na próxima vela M1.",
+                "rsi_m5":round(float(m5),2),"event_key":f"RSI4PERIOD:M5:{direction}:{m5_key}"}
     except Exception as exc:
-        return {**base,"reason":f"4 PERIOD RSI PRO sem leitura: {str(exc)[:120]}"}
+        return {**base,"reason":f"4 PERIOD RSI PRO sem leitura M5: {str(exc)[:120]}"}
 
 
 def momentum14_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
@@ -32724,7 +32726,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="4 Period RSI Pro">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🎯 4 PERIOD RSI PRO</div>
-      <div class="robot-mode-desc" id="rsi4PeriodModeDesc">RSI 9 • M5/M15/M30/H1 • Typical Price • confluência 3/4 • candle fechado • próxima vela • sem Gale.</div>
+      <div class="robot-mode-desc" id="rsi4PeriodModeDesc">RSI 9 • M5/M15/M30/H1 • Typical Price • confirmação M5 • candle fechado • próxima vela • sem Gale.</div>
     </div>
     <button id="rsi4PeriodPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -38599,9 +38601,9 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar ChatGPT ativo • analisando candles e procurando CALL/PUT para a próxima vela</div>';
     rad();
   }else if(engine==='RSI4PERIOD'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='4 PERIOD RSI PRO ONLINE • M1 • M5/M15/M30/H1 • CONFLUÊNCIA 3/4';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='4 PERIOD RSI PRO ONLINE • M1 • CONFIRMAÇÃO RSI9 M5 • 38/62';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 4 Period RSI Pro selecionado • RSI9 Typical Price • M5/M15/M30/H1 • exige 3 de 4 • candle fechado • próxima vela.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar 4 Period RSI Pro ativo • aguardando confluência 3/4 dos RSIs MTF</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar 4 Period RSI Pro ativo • aguardando confirmação M5 dos RSIs MTF</div>';
     rad();
   }else if(engine==='GRAPH_AI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA GRÁFICA ONLINE • PADRÕES + H1 + DOW H4 + LTA/LTB';
