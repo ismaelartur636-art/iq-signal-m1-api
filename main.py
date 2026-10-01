@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.92"
+APP_VERSION = "3.96.93"
+# MEGA IA 3.96.93 — 1 MINUTE SCALPER: janela oficial de 20s + memória de alinhamento de até 2 candles; remove trava de 10s.
 # MEGA IA 3.96.92 — ISMAEL TRADER: sinal antecipado nos 20s finais para a próxima vela; remove descarte de 10s pós-abertura; radar e pré-sinais alinhados.
 # MEGA IA 3.96.91 — corrige o PLACAR POR MOTOR: 1 MINUTE SCALPER volta a aparecer com WIN/LOSS/assertividade separados.
 # MEGA IA 3.96.90 — destrava sinais: cTrader cai automaticamente para a multifuente quando falha/atrasa; RSI CHANNELS ganha reentrada FLEX nos 20s finais e pré-alerta coerente com o sinal oficial.
@@ -14334,12 +14335,17 @@ def smart_session_breakout_strategy(cs, session_reference, symbol="EUR/USD", tim
 
 
 
-# MEGA IA 3.96.87 — 1 MINUTE SCALPER (EA MQL4 adaptado para sinal binário M1).
+# MEGA IA 3.96.87/3.96.93 — 1 MINUTE SCALPER (EA MQL4 adaptado para sinal binário M1).
 # Original: MODE_LWMA no PRICE_TYPICAL, períodos 3/5/8/10/12/15/30/35/40/45/50/55/200.
-# A versão do app remove ordens, lote, SL/TP, trailing e break-even. Só usa candle fechado.
-# Para não repetir CALL/PUT em toda vela da mesma tendência, libera apenas no NOVO alinhamento completo.
+# A versão do app remove ordens, lote, SL/TP, trailing e break-even.
+# 3.96.93: snapshot oficial nos 20s finais + memória curta de até 2 candles para não perder
+# um alinhamento que acabou de nascer. Mantém as 13 LWMAs e o filtro de esticamento 2,20 ATR.
 MINSCALPER_PERIODS = (3,5,8,10,12,15,30,35,40,45,50,55,200)
 MINSCALPER_MAX_STRETCH_ATR = max(1.0, min(4.0, float(os.getenv("MINSCALPER_MAX_STRETCH_ATR", "2.20"))))
+MINSCALPER_EARLY_SIGNAL_SECONDS = max(5, min(30, int(os.getenv("MINSCALPER_EARLY_SIGNAL_SECONDS", "20"))))
+MINSCALPER_EARLY_WINDOW_BEFORE = MINSCALPER_EARLY_SIGNAL_SECONDS
+MINSCALPER_EARLY_MIN_REMAINING = 1
+MINSCALPER_RECENT_ALIGNMENT_BARS = max(1, min(3, int(os.getenv("MINSCALPER_RECENT_ALIGNMENT_BARS", "2"))))
 
 def _lwma_endpoint(values, period, end_index=None):
     if end_index is None:
@@ -14351,28 +14357,59 @@ def _lwma_endpoint(values, period, end_index=None):
     den=period*(period+1)/2.0
     return sum(float(values[start+j])*(j+1) for j in range(period))/den
 
-def one_minute_scalper_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
+def one_minute_scalper_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
     rows=list(cs or [])[-320:]
+    live_snapshot=bool(allow_prealert and not current_candle_closed)
     base={
         "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
-        "strategy":"1 MINUTE SCALPER • 13 LWMA PRICE_TYPICAL • NEXT CANDLE",
-        "engine":"MINSCALPER","provider":"LOCAL_1_MINUTE_SCALPER_LWMA_CLOSED",
-        "closed_candles_only":True,"non_repaint":True,"next_candle_entry":True,
-        "expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,
-        "confidence_is_probability":False,"shift":1,
+        "strategy":"1 MINUTE SCALPER • 13 LWMA PRICE_TYPICAL • EARLY20 NEXT CANDLE",
+        "engine":"MINSCALPER","provider":("LOCAL_1_MINUTE_SCALPER_LWMA_EARLY20" if live_snapshot else "LOCAL_1_MINUTE_SCALPER_LWMA_CLOSED"),
+        "closed_candles_only":not live_snapshot,"non_repaint":not live_snapshot,"non_repaint_after_release":True,
+        "early_signal_window":live_snapshot,"prealert_seconds":MINSCALPER_EARLY_SIGNAL_SECONDS,
+        "next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,
+        "confidence_is_probability":False,"shift":0 if live_snapshot else 1,
     }
     if str(timeframe).lower() != "1min":
         return {**base,"reason":"1 MINUTE SCALPER opera somente no M1. Selecione 1min."}
     need=max(MINSCALPER_PERIODS)+3
     if len(rows)<need:
-        return {**base,"reason":f"1 MINUTE SCALPER coletando candles fechados ({len(rows)}/{need})."}
+        return {**base,"reason":f"1 MINUTE SCALPER coletando candles ({len(rows)}/{need}) para aquecer a LWMA200."}
     try:
         typical=[(float(x["high"])+float(x["low"])+float(x["close"]))/3.0 for x in rows]
         closes=[float(x["close"]) for x in rows]
-        cur={p:_lwma_endpoint(typical,p,len(typical)-1) for p in MINSCALPER_PERIODS}
-        prev={p:_lwma_endpoint(typical,p,len(typical)-2) for p in MINSCALPER_PERIODS}
+        pairs=list(zip(MINSCALPER_PERIODS[:-1],MINSCALPER_PERIODS[1:]))
+
+        def _stack(end_idx):
+            vals={p:_lwma_endpoint(typical,p,end_idx) for p in MINSCALPER_PERIODS}
+            if any(v is None for v in vals.values()):
+                return False,False,vals
+            call=all(vals[a] > vals[b] for a,b in pairs)
+            put=all(vals[a] < vals[b] for a,b in pairs)
+            return bool(call),bool(put),vals
+
+        call_now,put_now,cur=_stack(len(typical)-1)
+        call_prev,put_prev,prev=_stack(len(typical)-2)
         if any(v is None for v in list(cur.values())+list(prev.values())):
             return {**base,"reason":"1 MINUTE SCALPER aquecendo as LWMAs até 200."}
+
+        direction=None
+        alignment_age=None
+        origin_idx=None
+        if call_now and not put_now:
+            for age in range(MINSCALPER_RECENT_ALIGNMENT_BARS+1):
+                idx=len(typical)-1-age
+                c_now,p_now,_=_stack(idx)
+                c_before,_,_=_stack(idx-1)
+                if c_now and not p_now and not c_before:
+                    direction="CALL"; alignment_age=age; origin_idx=idx; break
+        elif put_now and not call_now:
+            for age in range(MINSCALPER_RECENT_ALIGNMENT_BARS+1):
+                idx=len(typical)-1-age
+                c_now,p_now,_=_stack(idx)
+                _,p_before,_=_stack(idx-1)
+                if p_now and not c_now and not p_before:
+                    direction="PUT"; alignment_age=age; origin_idx=idx; break
+
         trs=[]
         for i in range(max(1,len(rows)-14),len(rows)):
             h=float(rows[i]["high"]); l=float(rows[i]["low"]); pc=closes[i-1]
@@ -14381,47 +14418,51 @@ def one_minute_scalper_strategy(cs, symbol="EUR/USD", timeframe="1min", market="
     except (KeyError,TypeError,ValueError,OverflowError,ZeroDivisionError):
         return {**base,"reason":"1 MINUTE SCALPER aguardando candles OHLC válidos."}
 
-    pairs=list(zip(MINSCALPER_PERIODS[:-1],MINSCALPER_PERIODS[1:]))
-    call_now=all(cur[a] > cur[b] for a,b in pairs)
-    put_now=all(cur[a] < cur[b] for a,b in pairs)
-    call_prev=all(prev[a] > prev[b] for a,b in pairs)
-    put_prev=all(prev[a] < prev[b] for a,b in pairs)
-    new_call=bool(call_now and not call_prev)
-    new_put=bool(put_now and not put_prev)
     stretch=(abs(closes[-1]-cur[55])/atr14) if atr14>1e-15 else 0.0
     stretch_ok=bool(atr14<=1e-15 or stretch<=MINSCALPER_MAX_STRETCH_ATR)
     stack_span=(abs(cur[3]-cur[55])/atr14) if atr14>1e-15 else 0.0
+    recent_alignment=direction in ("CALL","PUT") and alignment_age is not None
     diag={
         "periods":list(MINSCALPER_PERIODS),"ma_method":"LWMA","applied_price":"PRICE_TYPICAL",
         "call_stack":call_now,"put_stack":put_now,"previous_call_stack":call_prev,"previous_put_stack":put_prev,
-        "new_call_alignment":new_call,"new_put_alignment":new_put,"atr14":round(float(atr14),10),
-        "stretch_from_lwma55_atr":round(float(stretch),3),"max_stretch_atr":MINSCALPER_MAX_STRETCH_ATR,
-        "stack_span_atr":round(float(stack_span),3),"closed_candle":True,"future_leak":False,"shift":1,
+        "recent_alignment":recent_alignment,"alignment_age_bars":alignment_age,
+        "recent_alignment_bars":MINSCALPER_RECENT_ALIGNMENT_BARS,
+        "atr14":round(float(atr14),10),"stretch_from_lwma55_atr":round(float(stretch),3),
+        "max_stretch_atr":MINSCALPER_MAX_STRETCH_ATR,"stack_span_atr":round(float(stack_span),3),
+        "closed_candle":bool(current_candle_closed),"live_snapshot":live_snapshot,"future_leak":False,
         "lwma":{str(p):round(float(cur[p]),10) for p in MINSCALPER_PERIODS},
     }
-    if (new_call or new_put) and not stretch_ok:
-        side="CALL" if new_call else "PUT"
-        return {**base,"confidence":68.0,"pre_signal":side,
-                "reason":f"1 MINUTE SCALPER detectou novo alinhamento {side}, mas o preço está esticado {stretch:.2f}×ATR da LWMA55; entrada bloqueada.",
+
+    if recent_alignment and not stretch_ok:
+        return {**base,"confidence":68.0,"pre_signal":direction,
+                "reason":f"1 MINUTE SCALPER detectou alinhamento recente {direction}, mas o preço está esticado {stretch:.2f}×ATR da LWMA55; entrada bloqueada.",
                 "diagnostics":diag}
-    if not (new_call or new_put):
+
+    if not recent_alignment:
         if call_now or put_now:
             side="CALL" if call_now else "PUT"
-            why=f"alinhamento {side} continua ativo; aguardando rearm para não repetir sinal em toda vela"
+            why=f"alinhamento {side} já está antigo; aguardando rearm (memória máxima {MINSCALPER_RECENT_ALIGNMENT_BARS} candles)"
             score=min(79.0,70.0+min(9.0,stack_span*5.0))
         else:
             why="aguardando alinhamento completo das 13 LWMAs"
             score=52.0
         return {**base,"confidence":round(score,1),
-                "reason":f"1 MINUTE SCALPER monitorando • {why} • candle fechado • próxima vela.",
+                "reason":f"1 MINUTE SCALPER monitorando • {why} • próxima vela.","diagnostics":diag}
+
+    age_txt="agora" if alignment_age==0 else ("há 1 candle" if alignment_age==1 else f"há {alignment_age} candles")
+    if not live_snapshot:
+        score=min(82.0,72.0+min(8.0,stack_span*4.0))
+        return {**base,"confidence":round(score,1),"pre_signal":direction,
+                "reason":f"1 MINUTE SCALPER encontrou alinhamento {direction} {age_txt}; aguardando a janela oficial dos {MINSCALPER_EARLY_SIGNAL_SECONDS}s finais para liberar a próxima vela.",
                 "diagnostics":diag}
-    direction="CALL" if new_call else "PUT"
-    score=min(94.0,82.0+min(8.0,stack_span*5.0)+min(4.0,max(0.0,MINSCALPER_MAX_STRETCH_ATR-stretch)*1.5))
-    stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "closed")
+
+    score=min(94.0,82.0+min(8.0,stack_span*5.0)+min(4.0,max(0.0,MINSCALPER_MAX_STRETCH_ATR-stretch)*1.5)-min(3.0,float(alignment_age or 0)*1.5))
+    stamp=str(rows[origin_idx].get("datetime") or rows[origin_idx].get("timestamp") or origin_idx)
     return {**base,"direction":direction,"confidence":round(score,1),"confirmed":True,
             "risk":"MEDIUM" if score<91 else "LOW",
-            "reason":f"{direction} 1 MINUTE SCALPER • novo alinhamento completo das 13 LWMAs no PRICE_TYPICAL • candle M1 fechado • entrada na próxima vela • sem Gale.",
-            "event_key":f"MINSCALPER:{direction}:{stamp}","diagnostics":diag}
+            "reason":f"{direction} 1 MINUTE SCALPER • 13 LWMAs alinhadas ({age_txt}) • snapshot nos {MINSCALPER_EARLY_SIGNAL_SECONDS}s finais • entrada na próxima vela • sem Gale.",
+            "event_key":f"MINSCALPER:{direction}:{stamp}","diagnostics":diag,
+            "early_signal_locked":True,"signal_snapshot":"FORMING_CANDLE_AT_20S"}
 
 
 # MEGA IA 3.96.87 — RSI WITH CHANNELS (MQ4 corrigido, versão 1.10).
@@ -21343,7 +21384,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     if engine in RETIRED_ENGINES:
         engine = "GRAPH_AI"
     entry_mode = normalize_entry_mode(entry_mode)
-    if engine in CLOSED_PANEL_ENGINES and engine != "ISMAELTRADER":
+    if engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER"):
         # Motores estritamente fechados operam na abertura imediatamente seguinte.
         # ISMAEL TRADER usa snapshot oficial nos 20s finais para a próxima abertura.
         entry_mode = "BIRTH"
@@ -21465,7 +21506,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     # Nenhum custo de IA nem análise de barra antiga fora da janela de nascimento.
     # A janela é conferida novamente depois da chamada ao modelo, antes de liberar.
-    if ai_only and engine in CLOSED_PANEL_ENGINES and engine != "ISMAELTRADER":
+    if ai_only and engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER"):
         elapsed = max(0.0, (now() - current_boundary(interval)).total_seconds())
         if elapsed > 10.0:
             out = neutral_signal(
@@ -22795,7 +22836,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                                     "early_signal_window":False}
                 analysis["seconds_to_entry_snapshot"]=round(_rc_remaining,1)
             elif engine == "MINSCALPER":
-                analysis = one_minute_scalper_strategy(engine_closed, symbol=symbol, timeframe=interval, market=market)
+                _min_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                _min_early=MINSCALPER_EARLY_MIN_REMAINING <= _min_remaining <= MINSCALPER_EARLY_WINDOW_BEFORE
+                if _min_early:
+                    analysis = one_minute_scalper_strategy(raw[-320:], symbol=symbol, timeframe=interval, market=market, current_candle_closed=False, allow_prealert=True)
+                else:
+                    analysis = one_minute_scalper_strategy(engine_closed, symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
+                analysis["seconds_to_entry_snapshot"]=round(_min_remaining,1)
             elif engine == "STREAKREV":
                 analysis = streak_reversal_strategy(engine_closed, symbol=symbol, timeframe=interval, market=market)
             elif engine == "RSICROSS":
@@ -23780,6 +23827,19 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key] = (time.time(), base)
                         return base
 
+                if engine == "MINSCALPER":
+                    _min_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                    if not (MINSCALPER_EARLY_MIN_REMAINING <= _min_remaining <= MINSCALPER_EARLY_WINDOW_BEFORE):
+                        base["status"] = "ONLINE • 1 MINUTE SCALPER • AGUARDANDO JANELA DE 20S"
+                        base["reason"] = f"1 MINUTE SCALPER aguardando a janela antecipada; faltam {int(_min_remaining)}s para a próxima vela."
+                        base["direction"] = "NEUTRO"
+                        base["entry_time"] = None
+                        base["expiry_time"] = None
+                        base["risk"] = "HIGH"
+                        release_state["active_signal"] = None
+                        cache[key] = (time.time(), base)
+                        return base
+
                 if engine == "RSICHANNEL":
                     _rc_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
                     if not (RSICHANNEL_EARLY_MIN_REMAINING <= _rc_remaining <= RSICHANNEL_EARLY_WINDOW_BEFORE):
@@ -23812,6 +23872,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     if announce <= now():
                         announce = now()
                     expiry = entry + timedelta(seconds=INTERVALS[interval])
+                elif engine == "MINSCALPER":
+                    entry = next_boundary(interval)
+                    announce = entry - timedelta(seconds=MINSCALPER_EARLY_SIGNAL_SECONDS)
+                    if announce <= now():
+                        announce = now()
+                    expiry = entry + timedelta(seconds=INTERVALS[interval])
                 elif engine == "RSICHANNEL":
                     entry = next_boundary(interval)
                     announce = entry - timedelta(seconds=RSICHANNEL_EARLY_SIGNAL_SECONDS)
@@ -23821,7 +23887,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 else:
                     # CLOSED_PANEL_ENGINES jamais carregam sinal de uma barra antiga
                     # para a vela subsequente após a janela de nascimento.
-                    if ai_only and engine in CLOSED_PANEL_ENGINES and engine != "ISMAELTRADER":
+                    if ai_only and engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER"):
                         elapsed = max(0.0, (now() - current_boundary(interval)).total_seconds())
                         if elapsed > 10.0 or not _last_closed_matches_current_open(engine_closed, interval):
                             base.update({
@@ -24006,6 +24072,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     base["closed_candles_only"] = False
                     base["signal_snapshot"] = "FORMING_CANDLE_AT_20S"
                     base["ismael_trader"] = {"ema_fast":3,"ema_slow":7,"rsi_period":9,"rsi_call_max":30.0,"rsi_put_min":70.0,"adx_period":21,"adx_min":20.0,"timing_seconds_before":20}
+                if engine == "MINSCALPER":
+                    base["announce_seconds_before"] = MINSCALPER_EARLY_SIGNAL_SECONDS
+                    base["early_signal_locked"] = True
+                    base["non_repaint_after_release"] = True
+                    base["closed_candles_only"] = False
+                    base["signal_snapshot"] = "FORMING_CANDLE_AT_20S"
+                    base["min_scalper"] = {"periods":list(MINSCALPER_PERIODS),"recent_alignment_bars":MINSCALPER_RECENT_ALIGNMENT_BARS,"max_stretch_atr":MINSCALPER_MAX_STRETCH_ATR,"timing_seconds_before":MINSCALPER_EARLY_SIGNAL_SECONDS}
                 if engine == "RSICHANNEL":
                     base["announce_seconds_before"] = RSICHANNEL_EARLY_SIGNAL_SECONDS
                     base["early_signal_locked"] = True
@@ -28772,6 +28845,40 @@ async def pre_signals(
         except Exception as exc:
             return {"ok":True,"engine":"ISMAELTRADER","items":[],"seconds_to_entry":remain,"message":f"ISMAEL TRADER aguardando dados: {str(exc)[:120]}"}
 
+    if engine == "MINSCALPER":
+        entry_dt=next_boundary(interval)
+        remain=int(max(0,(entry_dt-now()).total_seconds()))
+        if not (MINSCALPER_EARLY_MIN_REMAINING <= remain <= MINSCALPER_EARLY_WINDOW_BEFORE):
+            return {
+                "ok":True,"engine":"MINSCALPER","items":[],"seconds_to_entry":remain,
+                "message":f"1 MINUTE SCALPER monitorando • janela oficial abre nos {MINSCALPER_EARLY_SIGNAL_SECONDS}s finais • faltam {remain}s para a próxima vela.",
+                "non_repaint_after_release":True,"gale_signal":False,
+            }
+        target=symbol or "EUR/USD"
+        state=_iq_session_state(request, required=False) if market == "IQ_OTC" else None
+        if market == "IQ_OTC" and not state:
+            return {"ok":True,"engine":"MINSCALPER","items":[],"seconds_to_entry":remain,"message":"1 MINUTE SCALPER OTC aguardando conexão com a IQ Option."}
+        try:
+            raw=(await iq_ea_candles(state,target,interval,320,regular_market=False)) if market == "IQ_OTC" else (await candles(target,interval,320,"OPEN",None,request=request))
+            tech=one_minute_scalper_strategy(raw[-320:],symbol=target,timeframe=interval,market=market,current_candle_closed=False,allow_prealert=True)
+            items=[]
+            if tech.get("confirmed") and str(tech.get("direction") or "").upper() in ("CALL","PUT"):
+                items=[{
+                    "symbol":target,"direction":str(tech.get("direction")).upper(),
+                    "confidence":float(tech.get("confidence") or 0.0),
+                    "strategy":"1 MINUTE SCALPER 20S",
+                    "reason":str(tech.get("reason") or "1 Minute Scalper confirmou o alinhamento recente."),
+                    "entry_time":iso(entry_dt),"seconds_to_entry":remain,"prealert_only":False,
+                    "early_signal_locked":True,
+                }]
+            return {
+                "ok":True,"engine":"MINSCALPER","items":items,"seconds_to_entry":remain,
+                "message":str(tech.get("reason") or "1 MINUTE SCALPER monitorando a janela de 20s."),
+                "non_repaint_after_release":True,"gale_signal":False,
+            }
+        except Exception as exc:
+            return {"ok":True,"engine":"MINSCALPER","items":[],"seconds_to_entry":remain,"message":f"1 MINUTE SCALPER aguardando dados: {str(exc)[:120]}"}
+
     if engine == "RSICHANNEL":
         entry_dt=next_boundary(interval)
         remain=int(max(0,(entry_dt-now()).total_seconds()))
@@ -30706,22 +30813,19 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 status_text = ("RSI CHANNELS • OPORTUNIDADE 20S ENCONTRADA"
                                if direction in ("CALL", "PUT") else f"RSI CHANNELS • MONITORANDO • faltam {int(_rc_remaining)}s • " + why)
             elif engine == "MINSCALPER":
-                # 3.96.89 — o radar usa o próprio 1 MINUTE SCALPER.
-                # Antes MINSCALPER não tinha ramo aqui e caía no fallback legado GRAPH_AI,
-                # por isso o painel mostrava "IA GRÁFICA" mesmo após esse motor ter sido retirado.
-                tech = one_minute_scalper_strategy(closed[-320:], symbol=sym, timeframe=interval, market=market)
-                engine_label = "1 MINUTE SCALPER"
-                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why = str(tech.get("reason") or "aguardando novo alinhamento das 13 LWMAs").replace("\n", " ")[:94]
-                if direction in ("CALL", "PUT") and (
-                    not _last_closed_matches_current_open(closed, interval)
-                    or max(0.0, (now() - current_boundary(interval)).total_seconds()) > 10.0
-                ):
-                    direction = "NEUTRO"
-                    status_text = "1 MINUTE SCALPER • OPORTUNIDADE PASSOU • aguardando novo fechamento"
+                # 3.96.93 — radar usa o mesmo snapshot de 20s do sinal oficial e aceita
+                # alinhamento das 13 LWMAs que tenha nascido nos últimos 0..2 candles.
+                _min_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                _min_early=MINSCALPER_EARLY_MIN_REMAINING <= _min_remaining <= MINSCALPER_EARLY_WINDOW_BEFORE
+                if _min_early:
+                    tech = one_minute_scalper_strategy(raw[-320:], symbol=sym, timeframe=interval, market=market, current_candle_closed=False, allow_prealert=True)
                 else:
-                    status_text = ("1 MINUTE SCALPER • OPORTUNIDADE ENCONTRADA"
-                                   if direction in ("CALL", "PUT") else "1 MINUTE SCALPER • MONITORANDO • " + why)
+                    tech = one_minute_scalper_strategy(closed[-320:], symbol=sym, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
+                engine_label = "1 MINUTE SCALPER"
+                direction = tech.get("direction", "NEUTRO") if (_min_early and tech.get("confirmed")) else "NEUTRO"
+                why = str(tech.get("reason") or "aguardando alinhamento recente das 13 LWMAs").replace("\n", " ")[:94]
+                status_text = ("1 MINUTE SCALPER • OPORTUNIDADE 20S ENCONTRADA"
+                               if direction in ("CALL", "PUT") else f"1 MINUTE SCALPER • MONITORANDO • faltam {int(_min_remaining)}s • " + why)
             elif engine == "STREAKREV":
                 # 3.96.84 — o radar precisa usar a MESMA estratégia do sinal oficial,
                 # nunca cair no fallback legado GRAPH_AI quando STREAKREV é selecionado.
@@ -36960,7 +37064,7 @@ function applyRobotPowerState(){
   if(rsiChannelsPowerBtn){ rsiChannelsPowerBtn.textContent=rsiChannelsEnabled?'🟢 ONLINE':'🔴 OFFLINE'; rsiChannelsPowerBtn.style.background=rsiChannelsEnabled?'#0b7a3d':'#7d1d1d'; rsiChannelsPowerBtn.style.color='#fff'; rsiChannelsPowerBtn.style.borderColor=rsiChannelsEnabled?'#16c56b':'#ff5252'; }
   if(rsiChannelsModeDesc) rsiChannelsModeDesc.textContent=rsiChannelsEnabled?'ONLINE: RSI4 + canais dinâmicos EMA5 • reentrada 30/70 • vela fechada, próxima vela • sem Gale.':'OFFLINE: RSI Channels pausado.';
   if(minScalperPowerBtn){ minScalperPowerBtn.textContent=minScalperEnabled?'🟢 ONLINE':'🔴 OFFLINE'; minScalperPowerBtn.style.background=minScalperEnabled?'#0b7a3d':'#7d1d1d'; minScalperPowerBtn.style.color='#fff'; minScalperPowerBtn.style.borderColor=minScalperEnabled?'#16c56b':'#ff5252'; }
-  if(minScalperModeDesc) minScalperModeDesc.textContent=minScalperEnabled?'ONLINE: 13 LWMAs PRICE_TYPICAL • novo alinhamento em M1 fechado • próxima vela • rearm obrigatório • sem Gale.':'OFFLINE: 1 Minute Scalper pausado.';
+  if(minScalperModeDesc) minScalperModeDesc.textContent=minScalperEnabled?'ONLINE: 13 LWMAs PRICE_TYPICAL • alinhamento recente até 2 candles • janela 20s • próxima vela • sem Gale.':'OFFLINE: 1 Minute Scalper pausado.';
   if(streakRevPowerBtn){ streakRevPowerBtn.textContent=streakRevEnabled?'🟢 ONLINE':'🔴 OFFLINE'; streakRevPowerBtn.style.background=streakRevEnabled?'#0b7a3d':'#7d1d1d'; streakRevPowerBtn.style.color='#fff'; streakRevPowerBtn.style.borderColor=streakRevEnabled?'#16c56b':'#ff5252'; }
   if(streakRevModeDesc) streakRevModeDesc.textContent=streakRevEnabled?'ONLINE: sequência 2+2 • ATR100 1,5 • pavio até 40% • EMA100 • candle fechado • próxima vela • sem Gale.':'OFFLINE: Streak Reversal pausado.';
   if(sessionBreakoutModeDesc) sessionBreakoutModeDesc.textContent=sessionBreakoutEnabled?'ONLINE: range 00:00–08:00 Brasília • rompimento confirmado + corpo ≥ 0,8 ATR14 • próxima vela • sem Gale.':'OFFLINE: SMART SESSION BREAKOUT pausado.';
@@ -37599,10 +37703,11 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar Platinum ativo • procurando seta original na vela atual</div>';
     rad();
   }else if(engine==='MINSCALPER'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='1 MINUTE SCALPER ONLINE • 13 LWMA • M1 FECHADO • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ 1 Minute Scalper selecionado • aguarda NOVO alinhamento completo das 13 LWMAs • evita sinal repetido em toda vela.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar 1 Minute Scalper • procurando novo alinhamento completo no M1</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='1 MINUTE SCALPER ONLINE • 13 LWMA • JANELA 20S • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ 1 Minute Scalper • 13 LWMAs • aceita alinhamento recém-formado em até 2 candles • libera nos 20s finais para a próxima vela.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar 1 Minute Scalper • procurando alinhamento recente e preparando a janela de 20s</div>';
     rad();
+    loadPreSignals();
   }else if(engine==='RSICHANNEL'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI CHANNELS ONLINE • 20S FLEX • RSI4 + CANAIS DINÂMICOS • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📡 RSI Channels • monitora RSI4 + canais dinâmicos e libera cruzamento/reentrada FLEX nos 20s finais para a próxima vela.</div>';
