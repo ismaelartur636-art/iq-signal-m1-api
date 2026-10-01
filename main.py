@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.94"
+APP_VERSION = "3.96.95"
+# MEGA IA 3.96.95 — ISMAEL TRADER: perfil FLEX controlado (RSI9 35/65, memória 4 candles, ADX21>=18), análise 24h no servidor mesmo com tela apagada e ativo selecionado priorizado no bot de fundo.
 # MEGA IA 3.96.94 — ISMAEL TRADER: mantém EMA3/7 + RSI9 30/70 + ADX21, mas aceita extremo RSI visto nos 2 candles recentes; pré-alerta/polling 20s alinhados e timing sem conflito BIRTH/MIDDLE.
 # MEGA IA 3.96.93 — 1 MINUTE SCALPER: janela oficial de 20s + memória de alinhamento de até 2 candles; remove trava de 10s.
 # MEGA IA 3.96.92 — ISMAEL TRADER: sinal antecipado nos 20s finais para a próxima vela; remove descarte de 10s pós-abertura; radar e pré-sinais alinhados.
@@ -14632,6 +14633,12 @@ ISMAEL_COOLDOWN_BARS = 2
 ISMAEL_EARLY_SIGNAL_SECONDS = 20
 ISMAEL_EARLY_WINDOW_BEFORE = 20
 ISMAEL_EARLY_MIN_REMAINING = 1
+# 3.96.95 — FLEX controlado: o 30/70 + ADX 20 ficou raro demais no M1.
+# Continua exigindo EMA3/7 e força ADX/DMI, mas aceita pullback menos extremo.
+ISMAEL_RSI_LOW = 35.0
+ISMAEL_RSI_HIGH = 65.0
+ISMAEL_RSI_MEMORY_BARS = 4
+ISMAEL_ADX_MIN = 18.0
 
 
 def _ismael_trader_indicator_series(rows, fast=3, slow=7, rsi_period=9, adx_period=21):
@@ -14733,17 +14740,17 @@ def ismael_trader_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
         cross_sell=ef[i]<es[i] and ef[i-1]>=es[i-1]
         trend_buy=ef[i]>es[i] and pdi[i]>mdi[i]
         trend_sell=ef[i]<es[i] and mdi[i]>pdi[i]
-        # 3.96.94: o código anterior exigia RSI extremo exatamente no mesmo candle
-        # em que EMA/DMI já estavam alinhados. No M1 isso quase nunca coincide.
-        # Mantemos os mesmos níveis 30/70 e ADX>=20, mas guardamos o extremo
-        # ocorrido no candle atual ou nos 2 anteriores para permitir a confirmação
-        # logo após a saída da zona extrema, sem inventar outro indicador.
-        j0=max(0,i-2)
+        # 3.96.95: FLEX controlado para M1. O perfil anterior (30/70, 2 candles,
+        # ADX>=20) podia passar horas sem coincidir com EMA/DMI. Mantemos a mesma
+        # estrutura do ISMAEL TRADER, mas aceitamos RSI 35/65 visto nos últimos
+        # 4 candles e ADX>=18. Cruzamento EMA pode disparar com a direção da EMA;
+        # em tendência contínua, DMI ainda precisa concordar para filtrar ruído.
+        j0=max(0,i-(ISMAEL_RSI_MEMORY_BARS-1))
         rsi_recent=rs[j0:i+1]
-        recent_oversold=any((v is not None and v<=30.0) for v in rsi_recent)
-        recent_overbought=any((v is not None and v>=70.0) for v in rsi_recent)
-        buy=(cross_buy or trend_buy) and recent_oversold and adxs[i]>=20.0
-        sell=(cross_sell or trend_sell) and recent_overbought and adxs[i]>=20.0
+        recent_oversold=any((v is not None and v<=ISMAEL_RSI_LOW) for v in rsi_recent)
+        recent_overbought=any((v is not None and v>=ISMAEL_RSI_HIGH) for v in rsi_recent)
+        buy=(cross_buy or trend_buy) and recent_oversold and adxs[i]>=ISMAEL_ADX_MIN
+        sell=(cross_sell or trend_sell) and recent_overbought and adxs[i]>=ISMAEL_ADX_MIN
         triggered=(buy and not previous_buy and not sell) or (sell and not previous_sell and not buy)
         fired=None
         if triggered and (i-last_event)>ISMAEL_COOLDOWN_BARS:
@@ -14755,19 +14762,21 @@ def ismael_trader_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
                          "rsi9":round(rs[i],2),"adx21":round(adxs[i],2),
                          "plus_di":round(pdi[i],2),"minus_di":round(mdi[i],2),
                          "cross_buy":cross_buy,"cross_sell":cross_sell,
-                         "recent_oversold_2bars":bool(recent_oversold),
-                         "recent_overbought_2bars":bool(recent_overbought),
+                         "recent_oversold_4bars":bool(recent_oversold),
+                         "recent_overbought_4bars":bool(recent_overbought),
+                         "rsi_low":ISMAEL_RSI_LOW,"rsi_high":ISMAEL_RSI_HIGH,
+                         "adx_min":ISMAEL_ADX_MIN,
                          "raw_buy":bool(buy),"raw_sell":bool(sell),
                          "cooldown_bars":ISMAEL_COOLDOWN_BARS}
     if not fired:
         phase=("janela 20s" if live_snapshot else "candle fechado")
-        return {**base,"confidence":0.0,"reason":f"ISMAEL TRADER monitorando ({phase}) • aguardando EMA3/7 + extremo RSI9 30/70 visto nos últimos 2 candles + ADX21>=20; sem sinais repetidos.","diagnostics":latest_diag}
-    val=latest_diag.get('adx21',20.0)
-    score=round(min(91.0,80.0+max(0.0,val-20.0)*0.6),1)
+        return {**base,"confidence":0.0,"reason":f"ISMAEL TRADER monitorando ({phase}) • aguardando EMA3/7 + RSI9 35/65 visto nos últimos 4 candles + ADX21>=18; sem sinais repetidos.","diagnostics":latest_diag}
+    val=latest_diag.get('adx21',ISMAEL_ADX_MIN)
+    score=round(min(91.0,78.0+max(0.0,val-ISMAEL_ADX_MIN)*0.65),1)
     stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or '')
     timing=(f"snapshot oficial nos {ISMAEL_EARLY_SIGNAL_SECONDS}s finais" if live_snapshot else "vela fechada")
     return {**base,"direction":fired,"confidence":score,"confirmed":True,
-            "risk":"MEDIUM","reason":f"{fired} ISMAEL TRADER • EMA3/7 + RSI9 30/70 recente + ADX21 validado no {timing}; entrada na próxima vela; sem Gale.",
+            "risk":"MEDIUM","reason":f"{fired} ISMAEL TRADER • EMA3/7 + RSI9 35/65 recente + ADX21>=18 validado no {timing}; entrada na próxima vela; sem Gale.",
             "event_key":f"ISMAELTRADER:{fired}:{stamp}","diagnostics":latest_diag,
             "early_signal_locked":live_snapshot,"signal_snapshot":("FORMING_CANDLE_AT_20S" if live_snapshot else "LAST_CLOSED_CANDLE")}
 
@@ -27510,13 +27519,12 @@ async def _background_bot_loop() -> None:
                 await asyncio.sleep(max(5.0, BACKGROUND_SCAN_SECONDS))
                 continue
 
-            # Motor pode continuar selecionado/ONLINE, mas Telegram OFF bloqueia
-            # a criação de novos sinais em segundo plano e qualquer mensagem.
+            # 3.96.95 — a análise 24h não depende mais da tela nem do Telegram.
+            # Com Telegram OFF o servidor continua analisando/contabilizando; apenas
+            # o envio das mensagens fica bloqueado em _background_send_signal/result.
             if not bool(background_bot_state.get("telegram_enabled")):
                 current_engine = str(background_bot_state.get("engine") or "SMART").upper()
-                background_bot_state["status"] = f"ONLINE • {current_engine} • TELEGRAM OFF"
-                await asyncio.sleep(max(5.0, BACKGROUND_SCAN_SECONDS))
-                continue
+                background_bot_state["status"] = f"ONLINE • {current_engine} • SERVIDOR 24H • TELEGRAM OFF"
 
             engine = str(background_bot_state.get("engine") or "SMART").upper()
             market = str(background_bot_state.get("market") or "OPEN").upper()
@@ -27525,14 +27533,17 @@ async def _background_bot_loop() -> None:
                 background_bot_state["status"] = "CONFIGURAÇÃO INVÁLIDA"
                 await asyncio.sleep(10)
                 continue
-            if not TELEGRAM_BOT_TOKEN:
-                background_bot_state["status"] = "AGUARDANDO TELEGRAM_BOT_TOKEN"
-                await asyncio.sleep(15)
-                continue
-            if not (str(background_bot_state.get("chat_id") or "").strip() or TELEGRAM_CHAT_ID):
-                background_bot_state["status"] = "AGUARDANDO CHAT ID DO TELEGRAM"
-                await asyncio.sleep(15)
-                continue
+            # Telegram só é pré-requisito quando o envio de mensagens estiver ON.
+            # A análise/contabilização 24h continua funcionando com Telegram OFF.
+            if bool(background_bot_state.get("telegram_enabled")):
+                if not TELEGRAM_BOT_TOKEN:
+                    background_bot_state["status"] = "AGUARDANDO TELEGRAM_BOT_TOKEN"
+                    await asyncio.sleep(15)
+                    continue
+                if not (str(background_bot_state.get("chat_id") or "").strip() or TELEGRAM_CHAT_ID):
+                    background_bot_state["status"] = "AGUARDANDO CHAT ID DO TELEGRAM"
+                    await asyncio.sleep(15)
+                    continue
 
             iq_state = None
             if market == "IQ_OTC":
@@ -33383,7 +33394,10 @@ async function syncBackgroundBotState(opts={}){
     engine:(explicitEngine==='OFF'?'SMART':explicitEngine),
     market:String((market && market.value)||'OPEN'),
     interval:String((interval && interval.value)||'1min'),
-    symbols:(explicitEngine==='RTM' ? [] : (btcOnlyEnabled ? ['BTC/USD'] : [])),
+    // 3.96.95: ISMAEL TRADER precisa ser consultado várias vezes dentro da janela
+    // de 20s. No bot 24h ele fixa o ativo que estava selecionado ao ligar o motor,
+    // evitando dividir a janela entre todos os pares e perder o gatilho.
+    symbols:(explicitEngine==='RTM' ? [] : (explicitEngine==='ISMAELTRADER' ? [String((S&&S.value)||'EUR/USD')] : (btcOnlyEnabled ? ['BTC/USD'] : []))),
     chat_id:chat||null,
     action:action,
     telegram_enabled:(action==='TELEGRAM_TOGGLE' ? !!telegramEnabled : null),
@@ -37728,7 +37742,7 @@ function applyRobotPowerState(){
     rad();
     loadPreSignals();
   }else if(engine==='ISMAELTRADER'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ISMAEL TRADER ONLINE • 20S • EMA3/7 RSI9 ADX21 • PRÓXIMA VELA';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ISMAEL TRADER ONLINE • FLEX 20S • EMA3/7 RSI9 35/65 ADX21≥18 • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 Ismael Trader • extremo RSI 30/70 pode ter ocorrido nos 2 candles recentes • valida EMA3/7 + ADX21 • libera nos 20s finais para a próxima vela.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Ismael Trader • procurando EMA3/7 + RSI9 recente + ADX21 e preparando janela de 20s</div>';
     rad();
