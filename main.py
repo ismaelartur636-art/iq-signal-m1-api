@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.05"
+APP_VERSION = "3.97.06"
+# MEGA IA 3.97.06 — corrige painel sem controle: declara estado ISMAEL 98 antes da inicialização JS e restaura botões ON/OFF.
 # MEGA IA 3.97.05 — adiciona 4 PERIOD RSI PRO corrigido: RSI9 M5/M15/M30/H1, PRICE_TYPICAL, alinhamento temporal, candle fechado, confluência 3/4 e evento único.
 # MEGA IA 3.97.04 — adiciona ISMAEL 98 como motor seletivo separado: EMA21/50 + RSI14 + ADX14/DMI + ATR + força da vela + S/R, próxima vela, sem Gale.
 # MEGA IA 3.97.03 — corrige sincronização do Backtest 48H com o motor realmente ativo (inclui MOMENTUM CHART).
@@ -33550,6 +33551,7 @@ let localAnalystFlexEnabled=false;
 let megaMasterEnabled=false;
 let monsterSmcEnabled=false;
 let tsiEnabled=false;
+let ismael98Enabled=false;
 let rsi4PeriodEnabled=false;
 let momentumEnabled=false;
 let figuresEnabled=false;
@@ -39039,7 +39041,7 @@ async function setRsiChannelsPower(enabled){
   if(voiceEnabled) speak(rsiChannelsEnabled?'RSI Channels online.':'RSI Channels offline.');
 }
 
-async async function setIsmael98Power(enabled){
+async function setIsmael98Power(enabled){
   ismael98Enabled=!!enabled;
   if(ismael98Enabled){
     ismaelTraderEnabled=false;rsiChannelsEnabled=false;minScalperEnabled=false;momentumEnabled=false;
@@ -39064,7 +39066,7 @@ async async function setIsmael98Power(enabled){
   if(voiceEnabled) speak(ismael98Enabled?'Ismael noventa e oito online.':'Ismael noventa e oito offline.');
 }
 
-function setIsmaelTraderPower(enabled){
+async function setIsmaelTraderPower(enabled){
   if(enabled){rsiChannelsEnabled=false;try{localStorage.setItem('mega_rsi_channels_power','OFFLINE')}catch(_){}}
   ismaelTraderEnabled=!!enabled;
   if(ismaelTraderEnabled){
