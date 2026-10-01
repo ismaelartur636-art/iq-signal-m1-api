@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.17"
-# MEGA IA 3.97.17 — substitui o segundo RSI (RSICHANNEL2) por SUPPLY DEMAND [ORT] v3: zonas confirmadas, CALL em demanda, PUT em oferta, expiração M1.
+APP_VERSION = "3.97.19"
+# MEGA IA 3.97.19 — corrige seleção/backtest do SUPPLY DEMAND; substitui o segundo RSI (RSICHANNEL2) por SUPPLY DEMAND [ORT] v3: zonas confirmadas, CALL em demanda, PUT em oferta, expiração M1.
 # MEGA IA 3.97.16 — dois motores RSI independentes: MEGA FÚRIA (M5 → próxima M1) e MEGA BOT (M5 → +2min → expira M1).
 # MEGA IA 3.97.15 — RSI CHANNELS: leitura M5; pré-alerta na janela oficial de 20s; entrada exatamente 2 minutos após o pré-alerta; expiração M1 (60s).
 # MEGA IA 3.97.14 — painel limpo: oculta PLACAR POR MOTOR e ESTUDO ANTES DE OPERAR; mantém somente RSI CHANNELS visível.
@@ -169,7 +169,7 @@ def ismael98_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", cur
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # CHATGPT ANALISTA permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v206"
+PWA_VERSION = "v208"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -28608,8 +28608,12 @@ def _backtest48_eval(engine: str, hist: list, symbol: str, interval: str, market
         return ismael_trader_strategy(hist[-320:], symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
     if engine == "ISMAEL98":
         return ismael98_strategy(hist[-320:], symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
-    if engine in ("RSICHANNEL", "RSICHANNEL2"):
+    if engine == "RSICHANNEL":
         out=rsi_channels_strategy(hist[-180:], symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
+        out["engine"]=engine
+        return out
+    if engine == "RSICHANNEL2":
+        out=supply_demand_ort_strategy(hist[-220:], symbol=symbol, timeframe=interval, market=market)
         out["engine"]=engine
         return out
     if engine == "MINSCALPER":
@@ -34198,15 +34202,22 @@ monsterSmcEnabled=false; tsiEnabled=false; figuresEnabled=false; vasilyEnabled=f
 streakRevEnabled=false; try{localStorage.setItem('mega_streak_rev_power','OFFLINE')}catch(_){}
 if(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled) {ismaelTraderEnabled=false;rsiChannelsEnabled=false;minScalperEnabled=false;}
 if(minScalperEnabled){aiEnabled=false;localAnalystEnabled=false;localAnalystFlexEnabled=false;megaMasterEnabled=false;ismaelTraderEnabled=false;rsiChannelsEnabled=false;}
-if(!(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled||ismaelTraderEnabled||rsiChannelsEnabled||minScalperEnabled||momentumEnabled)) aiEnabled=true;
+if(!(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled||ismaelTraderEnabled||rsiChannelsEnabled||rsiChannels2Enabled||minScalperEnabled||momentumEnabled)) aiEnabled=true;
 
 
 // 3.97.11 — modo exclusivo RSI CHANNELS. Outros motores ficam desligados e não podem assumir fallback.
 try{
-  rsiChannelsEnabled=true;
+  // 3.97.18 — preserva o motor realmente escolhido pelo usuário.
+  // SUPPLY DEMAND (RSICHANNEL2) não pode cair no fallback CHATGPT/SMART ao recarregar.
+  const savedSupply=(localStorage.getItem('mega_rsi_channels2_power')==='ONLINE');
+  const savedFuria=(localStorage.getItem('mega_rsi_channels_power')==='ONLINE');
+  rsiChannels2Enabled=!!savedSupply;
+  rsiChannelsEnabled=!savedSupply && !!savedFuria;
+  if(!rsiChannels2Enabled && !rsiChannelsEnabled) rsiChannelsEnabled=true;
   aiEnabled=false; localAnalystEnabled=false; localAnalystFlexEnabled=false; megaMasterEnabled=false;
   ismaelTraderEnabled=false; ismael98Enabled=false; minScalperEnabled=false; momentumEnabled=false; rsi4PeriodEnabled=false;
-  localStorage.setItem('mega_rsi_channels_power','ONLINE');
+  localStorage.setItem('mega_rsi_channels_power',rsiChannelsEnabled?'ONLINE':'OFFLINE');
+  localStorage.setItem('mega_rsi_channels2_power',rsiChannels2Enabled?'ONLINE':'OFFLINE');
   ['mega_ai_power','mega_local_analyst_power','mega_local_analyst_flex_power','mega_master_power','mega_ismael_trader_power','mega_ismael98_power','mega_min_scalper_power','mega_momentum_power','mega_rsi4period_power'].forEach(k=>localStorage.setItem(k,'OFFLINE'));
 }catch(_){}
 
@@ -34234,7 +34245,7 @@ function adoptBackgroundEngineState(d){
   }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(e!=='SMART' && e!=='LOCALANALYST' && e!=='LOCALANALYSTFLEX' && e!=='MEGAMASTER' && e!=='ISMAELTRADER' && e!=='ISMAEL98' && e!=='RSICHANNEL' && e!=='MINSCALPER' && e!=='MOMENTUM') return;
+  if(e!=='SMART' && e!=='LOCALANALYST' && e!=='LOCALANALYSTFLEX' && e!=='MEGAMASTER' && e!=='ISMAELTRADER' && e!=='ISMAEL98' && e!=='RSICHANNEL' && e!=='RSICHANNEL2' && e!=='MINSCALPER' && e!=='MOMENTUM') return;
   aiEnabled=(e==='SMART');
   localAnalystEnabled=(e==='LOCALANALYST');
   localAnalystFlexEnabled=(e==='LOCALANALYSTFLEX');
@@ -34279,7 +34290,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({SMART:'CHATGPT ANALISTA',LOCALANALYST:'MEGA BOT',LOCALANALYSTFLEX:'MEGA BOT FLEX',MEGAMASTER:'MEGA MASTER',ISMAELTRADER:'ISMAEL TRADER',ISMAEL98:'ISMAEL 98',RSICHANNEL:'RSI CHANNELS',MINSCALPER:'1 MINUTE SCALPER',MOMENTUM:'MOMENTUM CHART',RSI4PERIOD:'4 PERIOD RSI PRO'})[e]||e||'SEM MOTOR';
+  return ({SMART:'CHATGPT ANALISTA',LOCALANALYST:'MEGA BOT',LOCALANALYSTFLEX:'MEGA BOT FLEX',MEGAMASTER:'MEGA MASTER',ISMAELTRADER:'ISMAEL TRADER',ISMAEL98:'ISMAEL 98',RSICHANNEL:'MEGA FÚRIA',RSICHANNEL2:'SUPPLY DEMAND',MINSCALPER:'1 MINUTE SCALPER',MOMENTUM:'MOMENTUM CHART',RSI4PERIOD:'4 PERIOD RSI PRO'})[e]||e||'SEM MOTOR';
 }
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
 function scheduleBacktest48(force=false,delay=260){
@@ -34367,7 +34378,7 @@ async function loadBacktest48(force=false){
 async function syncBackgroundBotState(opts={}){
   const selected=selectedRobotEngine();
   let explicitEngine=String(opts.engine||selected||'SMART').toUpperCase();
-  if(explicitEngine!=='SMART' && explicitEngine!=='LOCALANALYST' && explicitEngine!=='LOCALANALYSTFLEX' && explicitEngine!=='MEGAMASTER' && explicitEngine!=='ISMAELTRADER' && explicitEngine!=='ISMAEL98' && explicitEngine!=='RSICHANNEL' && explicitEngine!=='MINSCALPER' && explicitEngine!=='MOMENTUM') explicitEngine='SMART';
+  if(explicitEngine!=='SMART' && explicitEngine!=='LOCALANALYST' && explicitEngine!=='LOCALANALYSTFLEX' && explicitEngine!=='MEGAMASTER' && explicitEngine!=='ISMAELTRADER' && explicitEngine!=='ISMAEL98' && explicitEngine!=='RSICHANNEL' && explicitEngine!=='RSICHANNEL2' && explicitEngine!=='MINSCALPER' && explicitEngine!=='MOMENTUM') explicitEngine='SMART';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
   const payload={
