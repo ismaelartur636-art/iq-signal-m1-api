@@ -42,7 +42,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.13"
+APP_VERSION = "3.97.15"
+# MEGA IA 3.97.15 — RSI CHANNELS: leitura M5; pré-alerta na janela oficial de 20s; entrada exatamente 2 minutos após o pré-alerta; expiração M1 (60s).
+# MEGA IA 3.97.14 — painel limpo: oculta PLACAR POR MOTOR e ESTUDO ANTES DE OPERAR; mantém somente RSI CHANNELS visível.
 # MEGA IA 3.97.13 — RSI CHANNELS: leitura M5 fechada, entrada na próxima vela M1 e expiração fixa de 1 minuto.
 # MEGA IA 3.97.12 — RSI CHANNELS: leitura M5 fechada, entrada M1 e expiração fixa de 1 minuto.
 # MEGA IA 3.97.11 — RSI CHANNELS exclusivo: leitura técnica M5 fechada, disparo/entrada M1 e demais cards de motores removidos do painel.
@@ -14630,6 +14632,8 @@ RSICHANNEL_EARLY_WINDOW_BEFORE = 20
 RSICHANNEL_EARLY_MIN_REMAINING = 1
 RSICHANNEL_ANALYSIS_INTERVAL = "5min"
 RSICHANNEL_ENTRY_SECONDS = 60
+RSICHANNEL_ENTRY_DELAY_AFTER_PREALERT_SECONDS = 120
+RSICHANNEL_EXPIRY_SECONDS = 60
 
 def rsi_channels_next_m1_boundary(dt=None):
     dt = (dt or now()).astimezone(BR_TZ)
@@ -14690,7 +14694,7 @@ def rsi_channels_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN",
     rows=list(cs or [])[-180:]
     live_snapshot=bool(allow_prealert and not current_candle_closed)
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
-          "strategy":"RSI CHANNELS • LEITURA M5 • ENTRADA M1",
+          "strategy":"RSI CHANNELS • LEITURA M5 • ENTRADA +2MIN DO PRÉ-ALERTA • EXPIRA M1",
           "engine":"RSICHANNEL","provider":"LOCAL_RSI_CHANNELS_EARLY20_V111",
           "risk":"HIGH","closed_candles_only":not live_snapshot,"non_repaint":not live_snapshot,
           "non_repaint_after_release":True,"next_candle_entry":True,"expiry_seconds":60,"expiry_candles":1,"direct_win_only":True,
@@ -23050,10 +23054,14 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                                     "early_signal_window":False}
                 analysis["seconds_to_entry_snapshot"]=round(_ismael_remaining,1)
             elif engine == "RSICHANNEL":
-                # 3.97.11 — RSI CHANNELS lê SOMENTE M5 fechado e agenda a entrada na próxima abertura M1.
-                _rc_entry=rsi_channels_next_m1_boundary()
+                # 3.97.15 — lê SOMENTE M5 fechado. O pré-alerta nasce na janela de 20s
+                # e a entrada fica agendada para 2 minutos após esse pré-alerta; expiração = 60s.
+                _rc_boundary=rsi_channels_next_m1_boundary()
+                _rc_announce=_rc_boundary-timedelta(seconds=RSICHANNEL_EARLY_SIGNAL_SECONDS)
+                _rc_entry=_rc_announce+timedelta(seconds=RSICHANNEL_ENTRY_DELAY_AFTER_PREALERT_SECONDS)
+                _rc_pre_remaining=max(0.0,(_rc_boundary-now()).total_seconds())
                 _rc_remaining=max(0.0,(_rc_entry-now()).total_seconds())
-                _rc_early=RSICHANNEL_EARLY_MIN_REMAINING <= _rc_remaining <= RSICHANNEL_EARLY_WINDOW_BEFORE
+                _rc_early=RSICHANNEL_EARLY_MIN_REMAINING <= _rc_pre_remaining <= RSICHANNEL_EARLY_WINDOW_BEFORE
                 try:
                     if market == "IQ_OTC":
                         _rc_state=_iq_session_state(request, required=False)
@@ -23065,10 +23073,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 except Exception as _rc_exc:
                     analysis={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"engine":"RSICHANNEL","reason":f"RSI CHANNELS M5 aguardando dados: {str(_rc_exc)[:100]}"}
                 if not _rc_early and analysis.get("confirmed"):
-                    analysis={**analysis,"direction":"NEUTRO","confirmed":False,"confidence":0.0,"reason":f"RSI CHANNELS M5 confirmado; aguardando janela de 20s da entrada M1 • faltam {int(_rc_remaining)}s.","early_signal_window":False}
+                    analysis={**analysis,"direction":"NEUTRO","confirmed":False,"confidence":0.0,"reason":f"RSI CHANNELS M5 confirmado; aguardando pré-alerta de 20s • faltam {int(_rc_pre_remaining)}s para a janela.","early_signal_window":False}
                 analysis["analysis_timeframe"]="5min"
-                analysis["entry_timeframe"]="1min"
-                analysis["expiry_seconds"]=60
+                analysis["entry_delay_after_prealert_seconds"]=RSICHANNEL_ENTRY_DELAY_AFTER_PREALERT_SECONDS
+                analysis["expiry_timeframe"]="1min"
+                analysis["expiry_seconds"]=RSICHANNEL_EXPIRY_SECONDS
                 analysis["seconds_to_entry_snapshot"]=round(_rc_remaining,1)
             elif engine == "MINSCALPER":
                 _min_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
@@ -23497,7 +23506,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "PLATINUM • WPR ADAPTATIVO • MESMA VELA" if engine == "PLATINUM"
                     else "RSI CROSS 6/14 • CANDLE FECHADO • NEXT CANDLE" if engine == "RSICROSS"
                     else "ISMAEL TRADER • EMA3/7 + RSI9 + ADX21 • NEXT CANDLE" if engine == "ISMAELTRADER"
-                    else "RSI CHANNELS • LEITURA M5 • ENTRADA M1 • 20S" if engine == "RSICHANNEL"
+                    else "RSI CHANNELS • LEITURA M5 • PRÉ-ALERTA 20S • ENTRADA +2MIN • EXPIRA M1" if engine == "RSICHANNEL"
                     else "1 MINUTE SCALPER • 13 LWMA PRICE_TYPICAL • NEXT CANDLE" if engine == "MINSCALPER"
                     else "STREAK REVERSAL • SEQUÊNCIA 2+2 • EMA100 + ATR100 • NEXT CANDLE" if engine == "STREAKREV"
                     else "SMART SESSION BREAKOUT • RANGE 00:00–08:00 + ATR14 • NEXT CANDLE" if engine == "SESSIONBREAKOUT"
@@ -24127,11 +24136,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         announce = now()
                     expiry = entry + timedelta(seconds=INTERVALS[interval])
                 elif engine == "RSICHANNEL":
-                    entry = next_boundary(interval)
-                    announce = entry - timedelta(seconds=RSICHANNEL_EARLY_SIGNAL_SECONDS)
-                    if announce <= now():
-                        announce = now()
-                    expiry = entry + timedelta(seconds=INTERVALS[interval])
+                    # Pré-alerta 20s antes da próxima referência M1; entrada 120s depois do pré-alerta.
+                    boundary = next_boundary(interval)
+                    announce = boundary - timedelta(seconds=RSICHANNEL_EARLY_SIGNAL_SECONDS)
+                    entry = announce + timedelta(seconds=RSICHANNEL_ENTRY_DELAY_AFTER_PREALERT_SECONDS)
+                    expiry = entry + timedelta(seconds=RSICHANNEL_EXPIRY_SECONDS)
                 else:
                     # CLOSED_PANEL_ENGINES jamais carregam sinal de uma barra antiga
                     # para a vela subsequente após a janela de nascimento.
@@ -29585,12 +29594,15 @@ async def pre_signals(
             return {"ok":True,"engine":"MINSCALPER","items":[],"seconds_to_entry":remain,"message":f"1 MINUTE SCALPER aguardando dados: {str(exc)[:120]}"}
 
     if engine == "RSICHANNEL":
-        entry_dt=rsi_channels_next_m1_boundary()
+        boundary_dt=rsi_channels_next_m1_boundary()
+        announce_dt=boundary_dt-timedelta(seconds=RSICHANNEL_EARLY_SIGNAL_SECONDS)
+        entry_dt=announce_dt+timedelta(seconds=RSICHANNEL_ENTRY_DELAY_AFTER_PREALERT_SECONDS)
+        pre_remain=int(max(0,(boundary_dt-now()).total_seconds()))
         remain=int(max(0,(entry_dt-now()).total_seconds()))
-        if not (RSICHANNEL_EARLY_MIN_REMAINING <= remain <= RSICHANNEL_EARLY_WINDOW_BEFORE):
+        if not (RSICHANNEL_EARLY_MIN_REMAINING <= pre_remain <= RSICHANNEL_EARLY_WINDOW_BEFORE):
             return {
                 "ok":True,"engine":"RSICHANNEL","items":[],"seconds_to_entry":remain,
-                "message":f"RSI CHANNELS monitorando • pré-alerta oficial abre nos 20s finais • faltam {remain}s para a próxima vela.",
+                "message":f"RSI CHANNELS monitorando • pré-alerta oficial abre nos 20s finais • faltam {pre_remain}s para a janela; entrada será 2min após o pré-alerta.",
                 "non_repaint_after_release":True,"gale_signal":False,
             }
         target=symbol or "EUR/USD"
@@ -29606,7 +29618,7 @@ async def pre_signals(
                 items=[{
                     "symbol":target,"direction":str(tech.get("direction")).upper(),
                     "confidence":float(tech.get("confidence") or 0.0),
-                    "strategy":"RSI CHANNELS M5 → M1",
+                    "strategy":"RSI CHANNELS • M5 • ENTRADA +2MIN • EXPIRA M1",
                     "reason":str(tech.get("reason") or "RSI Channels confirmou reentrada."),
                     "entry_time":iso(entry_dt),"seconds_to_entry":remain,"prealert_only":False,
                     "early_signal_locked":True,
@@ -32875,14 +32887,14 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
     </div>
 
-    <div class="card" id="engineScoreBoard" style="margin-top:10px">
+    <div class="card" id="engineScoreBoard" style="display:none !important;margin-top:10px">
       <div style="font-weight:1000">📊 PLACAR POR MOTOR</div>
       <div class="label" style="margin-top:4px">WIN/LOSS direto separado pelo motor que realmente gerou cada entrada.</div>
       <div id="engineScoreGrid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:10px;margin-top:10px"></div>
       <div class="label" id="engineScoreNote" style="margin-top:8px;line-height:1.4">Cada motor atual é contabilizado separadamente. Operações antigas sem identificação ficam em OUTROS/ANTIGOS.</div>
     </div>
 
-    <div class="card daily-engine-board" id="momentStudyBoard">
+    <div class="card daily-engine-board" id="momentStudyBoard" style="display:none !important">
       <div class="daily-engine-head">
         <div>
           <h3>🔎 Estudo antes de operar</h3>
@@ -38601,7 +38613,7 @@ function applyRobotPowerState(){
     rad();
     loadPreSignals();
   }else if(engine==='RSICHANNEL'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI CHANNELS ONLINE • LEITURA M5 • ENTRADA M1 • RSI4 + CANAIS DINÂMICOS';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI CHANNELS ONLINE • LEITURA M5 • ENTRADA 2MIN APÓS PRÉ-ALERTA • EXPIRA M1 • RSI4 + CANAIS DINÂMICOS';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📡 RSI Channels • monitora RSI4 + canais dinâmicos e libera cruzamento/reentrada FLEX nos 20s finais para a próxima vela.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar RSI Channels ativo • procurando reentrada nos canais e preparando a janela de 20s</div>';
     rad();
