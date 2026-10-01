@@ -64,7 +64,7 @@ APP_VERSION = "3.97.00"
 # MEGA IA 3.96.81 — corrige temporalidade, fonte de apuração e confluências dos cinco motores atuais.
 # MEGA IA 3.96.80 — adiciona RSI XOVER 7/4 (2RSIXover): PRICE_WEIGHTED, direção original, sem atraso extra, candle fechado -> próxima vela, placar próprio.
 # MEGA IA 3.96.79 — retira PLATINUM e RSI CROSS 6/14 do painel, placar, compatibilidade, seleção e robô 24h; estados antigos ficam forçados OFF.
-# MEGA IA 3.97.01 — restaura card visível/ON-OFF do MOMENTUM CHART e remove bloqueio legado 3.96.79.
+# MEGA IA 3.97.02 — restaura card visível/ON-OFF do MOMENTUM CHART e remove bloqueio legado 3.96.79.
 # MEGA IA 3.97.00 — integra MOMENTUM CHART corrigido: Momentum7 + ATR12 + CCI6 + RSI7 + ADX7, controle RSI12/ADX12, DMI corrigido, candle fechado -> próxima vela.
 # MEGA IA 3.96.78 — remove também do PLACAR POR MOTOR os cartões de MONSTER SMC, MEGA ULTRA, MOMENTUM CHART, FIGURES CANDLE e VASILY PIP SNIPER ZL; históricos desses motores passam para OUTROS/ANTIGOS.
 # MEGA IA 3.96.77 — retira MONSTER SMC, MEGA ULTRA, MOMENTUM CHART, FIGURES CANDLE e VASILY PIP SNIPER ZL do painel e bloqueia reativação/backend/robô 24h.
@@ -27182,7 +27182,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     # 3.96.79 — somente os quatro motores atuais/visíveis podem rodar em segundo plano.
-    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER",
+    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "MOMENTUM",
 }
 
 
@@ -28050,7 +28050,7 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
 # -----------------------------------------------------------------------------
 _BACKTEST48_SUPPORTED = {
     "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER",
-    "ISMAELTRADER", "RSICHANNEL", "MINSCALPER",
+    "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "MOMENTUM",
 }
 _BACKTEST48_NAMES = {
     "SMART": "CHATGPT ANALISTA",
@@ -28060,6 +28060,7 @@ _BACKTEST48_NAMES = {
     "ISMAELTRADER": "ISMAEL TRADER",
     "RSICHANNEL": "RSI CHANNELS",
     "MINSCALPER": "1 MINUTE SCALPER",
+    "MOMENTUM": "MOMENTUM CHART",
 }
 _backtest48_history_cache: Dict[str, Any] = {}
 _backtest48_result_cache: Dict[str, Any] = {}
@@ -28340,6 +28341,8 @@ def _backtest48_eval(engine: str, hist: list, symbol: str, interval: str, market
         return rsi_channels_strategy(hist[-180:], symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
     if engine == "MINSCALPER":
         return one_minute_scalper_strategy(hist[-320:], symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
+    if engine == "MOMENTUM":
+        return momentum14_strategy(hist[-320:], symbol=symbol, timeframe=interval, market=market)
     return {"confirmed": False, "direction": "NEUTRO", "confidence": 0.0}
 
 
@@ -33648,7 +33651,7 @@ try{
    'mega_forexstay_pro_power','mega_forexflex_power']
    .forEach(k=>localStorage.setItem(k,'OFFLINE'));
 }catch(_){}
-// MEGA IA 3.97.01 — mantém removidos os motores antigos de 3.96.79, mas MOMENTUM CHART voltou como motor novo corrigido.
+// MEGA IA 3.97.02 — mantém removidos os motores antigos de 3.96.79, mas MOMENTUM CHART voltou como motor novo corrigido.
 monsterSmcEnabled=false; tsiEnabled=false; figuresEnabled=false; vasilyEnabled=false; platinumEnabled=false;
 try{
   ['mega_monster_smc_power','mega_tsi_power','mega_figures_power','mega_vasily_power','mega_platinum_power','mega_rsi_cross_power']
@@ -33828,6 +33831,7 @@ if(!(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled|
 
 function selectedRobotEngine(){
   if(minScalperEnabled) return 'MINSCALPER';
+  if(momentumEnabled) return 'MOMENTUM';
   if(rsiChannelsEnabled) return 'RSICHANNEL';
   if(ismaelTraderEnabled) return 'ISMAELTRADER';
   if(megaMasterEnabled) return 'MEGAMASTER';
@@ -33846,7 +33850,7 @@ function adoptBackgroundEngineState(d){
   }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(e!=='SMART' && e!=='LOCALANALYST' && e!=='LOCALANALYSTFLEX' && e!=='MEGAMASTER' && e!=='ISMAELTRADER' && e!=='RSICHANNEL' && e!=='MINSCALPER') return;
+  if(e!=='SMART' && e!=='LOCALANALYST' && e!=='LOCALANALYSTFLEX' && e!=='MEGAMASTER' && e!=='ISMAELTRADER' && e!=='RSICHANNEL' && e!=='MINSCALPER' && e!=='MOMENTUM') return;
   aiEnabled=(e==='SMART');
   localAnalystEnabled=(e==='LOCALANALYST');
   localAnalystFlexEnabled=(e==='LOCALANALYSTFLEX');
@@ -33888,7 +33892,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({SMART:'CHATGPT ANALISTA',LOCALANALYST:'MEGA BOT',LOCALANALYSTFLEX:'MEGA BOT FLEX',MEGAMASTER:'MEGA MASTER',ISMAELTRADER:'ISMAEL TRADER',RSICHANNEL:'RSI CHANNELS',MINSCALPER:'1 MINUTE SCALPER'})[e]||e||'SEM MOTOR';
+  return ({SMART:'CHATGPT ANALISTA',LOCALANALYST:'MEGA BOT',LOCALANALYSTFLEX:'MEGA BOT FLEX',MEGAMASTER:'MEGA MASTER',ISMAELTRADER:'ISMAEL TRADER',RSICHANNEL:'RSI CHANNELS',MINSCALPER:'1 MINUTE SCALPER',MOMENTUM:'MOMENTUM CHART'})[e]||e||'SEM MOTOR';
 }
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
 function scheduleBacktest48(force=false,delay=260){
