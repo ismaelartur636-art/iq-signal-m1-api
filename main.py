@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.96"
-# MEGA IA 3.96.96 — BACKTEST 48H automático por motor ativo + STREAK REVERSAL retirado do painel/seleção/robô 24h.
+APP_VERSION = "3.96.97"
+# MEGA IA 3.96.97 — Backtest 48H com recuperação nos 2 sinais seguintes + nome correto do motor no histórico.
 # MEGA IA 3.96.95 — ISMAEL TRADER: perfil FLEX controlado (RSI9 35/65, memória 4 candles, ADX21>=18), análise 24h no servidor mesmo com tela apagada e ativo selecionado priorizado no bot de fundo.
 # MEGA IA 3.96.94 — ISMAEL TRADER: mantém EMA3/7 + RSI9 30/70 + ADX21, mas aceita extremo RSI visto nos 2 candles recentes; pré-alerta/polling 20s alinhados e timing sem conflito BIRTH/MIDDLE.
 # MEGA IA 3.96.93 — 1 MINUTE SCALPER: janela oficial de 20s + memória de alinhamento de até 2 candles; remove trava de 10s.
@@ -27995,7 +27995,7 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
 
 
 # -----------------------------------------------------------------------------
-# MEGA IA 3.96.96 — BACKTEST 48H causal do motor ativo
+# MEGA IA 3.96.97 — BACKTEST 48H causal do motor ativo + recuperação por próximos sinais
 # -----------------------------------------------------------------------------
 _BACKTEST48_SUPPORTED = {
     "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER",
@@ -28158,6 +28158,124 @@ async def _backtest48_history(request: Request, symbol: str, interval: str, mark
     return rows, source
 
 
+def _backtest48_apply_next_signal_recovery(raw_operations: list) -> Dict[str, Any]:
+    """Agrupa o backtest em ciclos de resultado.
+
+    Regra de gestão: não existe Gale dentro da mesma entrada. Depois de um LOSS,
+    a recuperação é tentada somente nos próximos sinais confirmados do indicador,
+    no máximo em 2 sinais seguintes. DRAW não consome uma tentativa. Um ciclo só
+    vira LOSS FINAL quando a entrada inicial e as duas recuperações dão LOSS.
+    """
+    raw = [dict(x) for x in (raw_operations or []) if isinstance(x, dict)]
+    cycles = []
+    direct_wins = recovered_1 = recovered_2 = final_losses = pending = 0
+    standalone_draws = 0
+    i = 0
+
+    while i < len(raw):
+        first = raw[i]
+        first_result = str(first.get("result") or "").upper()
+
+        if first_result == "DRAW":
+            item = dict(first)
+            item.update({
+                "result": "DRAW", "cycle_result": "DRAW", "recovery_level": 0,
+                "attempts": 1, "chain": [dict(first)],
+            })
+            cycles.append(item)
+            standalone_draws += 1
+            i += 1
+            continue
+
+        if first_result == "WIN":
+            item = dict(first)
+            item.update({
+                "result": "WIN", "cycle_result": "WIN DIRETO", "recovery_level": 0,
+                "attempts": 1, "chain": [dict(first)],
+            })
+            cycles.append(item)
+            direct_wins += 1
+            i += 1
+            continue
+
+        if first_result != "LOSS":
+            i += 1
+            continue
+
+        chain = [dict(first)]
+        recovery_attempts = 0
+        j = i + 1
+        recovered_level = 0
+
+        while j < len(raw) and recovery_attempts < 2:
+            candidate = raw[j]
+            candidate_result = str(candidate.get("result") or "").upper()
+            chain.append(dict(candidate))
+            if candidate_result == "DRAW":
+                # Empate/refund não gasta uma das duas oportunidades de recuperação.
+                j += 1
+                continue
+            if candidate_result not in ("WIN", "LOSS"):
+                j += 1
+                continue
+            recovery_attempts += 1
+            if candidate_result == "WIN":
+                recovered_level = recovery_attempts
+                break
+            j += 1
+
+        item = dict(first)
+        item["chain"] = chain
+        item["attempts"] = 1 + recovery_attempts
+        item["last_entry_time"] = chain[-1].get("entry_time") if chain else first.get("entry_time")
+
+        if recovered_level:
+            item["result"] = f"RECUPERADO {recovered_level}"
+            item["cycle_result"] = f"RECUPERADO NO {recovered_level}º SINAL SEGUINTE"
+            item["recovery_level"] = recovered_level
+            if recovered_level == 1:
+                recovered_1 += 1
+            else:
+                recovered_2 += 1
+            cycles.append(item)
+            i = j + 1
+            continue
+
+        if recovery_attempts >= 2:
+            item["result"] = "LOSS FINAL"
+            item["cycle_result"] = "LOSS FINAL APÓS 2 RECUPERAÇÕES"
+            item["recovery_level"] = 2
+            final_losses += 1
+            cycles.append(item)
+            i = j
+            continue
+
+        # A janela terminou antes de existirem 2 sinais seguintes. Não transforma
+        # uma sequência ainda aberta em LOSS final.
+        item["result"] = "PENDENTE"
+        item["cycle_result"] = "RECUPERAÇÃO PENDENTE"
+        item["recovery_level"] = recovery_attempts
+        pending += 1
+        cycles.append(item)
+        i = len(raw)
+
+    wins = direct_wins + recovered_1 + recovered_2
+    decided = wins + final_losses
+    accuracy = round((wins / decided) * 100.0, 1) if decided else None
+    return {
+        "cycles": cycles,
+        "wins": wins,
+        "losses": final_losses,
+        "direct_wins": direct_wins,
+        "recovered_1": recovered_1,
+        "recovered_2": recovered_2,
+        "pending": pending,
+        "draws": standalone_draws,
+        "decided_cycles": decided,
+        "accuracy": accuracy,
+    }
+
+
 def _backtest48_eval(engine: str, hist: list, symbol: str, interval: str, market: str) -> Dict[str, Any]:
     if engine == "LOCALANALYST":
         return local_analyst_pro_strategy(hist[-220:], symbol=symbol, timeframe=interval, market=market, profile="BALANCED")
@@ -28268,23 +28386,35 @@ async def backtest48h_endpoint(
             "reason": str(analysis.get("reason") or "")[:180],
         })
 
-    decided = wins + losses
-    accuracy = round((wins / decided) * 100.0, 1) if decided else None
+    raw_wins, raw_losses, raw_draws = wins, losses, draws
+    recovery = _backtest48_apply_next_signal_recovery(operations)
     approximation = engine in {"ISMAELTRADER", "RSICHANNEL", "MINSCALPER"}
     out = {
         "ok": True, "supported": True, "engine": engine, "engine_name": name,
         "symbol": symbol, "interval": interval, "market": market,
-        "hours": 48, "signals": len(operations), "wins": wins, "losses": losses, "draws": draws,
-        "accuracy": accuracy, "source": source, "history_bars": len(rows),
+        # signals continua sendo a quantidade real de sinais disparados pelo motor.
+        # WIN/LOSS/accuracy abaixo são RESULTADOS DE CICLO com recuperação nos
+        # próximos 2 sinais, conforme a gestão configurada pelo usuário.
+        "hours": 48, "signals": len(operations), "raw_signals": len(operations),
+        "wins": int(recovery["wins"]), "losses": int(recovery["losses"]),
+        "draws": int(recovery["draws"]), "accuracy": recovery["accuracy"],
+        "direct_wins": int(recovery["direct_wins"]),
+        "recovered_1": int(recovery["recovered_1"]),
+        "recovered_2": int(recovery["recovered_2"]),
+        "pending": int(recovery["pending"]),
+        "decided_cycles": int(recovery["decided_cycles"]),
+        "raw_wins": raw_wins, "raw_losses": raw_losses, "raw_draws": raw_draws,
+        "recovery_mode": "NEXT_2_SIGNALS", "recovery_max_signals": 2,
+        "source": source, "history_bars": len(rows),
         "generated_at": iso(now()),
         "causal": True, "lookahead": False, "expiration_candles": 1, "gale": False,
         "timing_approximation": approximation,
         "timing_note": (
-            "Este motor usa pré-alerta nos 20s finais no ao vivo. O histórico OHLC não guarda o estado exato de 20s antes; o backtest usa a decisão causal do candle fechado como aproximação."
+            "Este motor usa pré-alerta nos 20s finais no ao vivo. O histórico OHLC não guarda o estado exato de 20s antes; o backtest usa a decisão causal do candle fechado como aproximação. Resultado agrupado com recuperação nos próximos 2 sinais confirmados."
             if approximation else
-            "Replay candle a candle, sem usar candles futuros; entrada na abertura seguinte e expiração de 1 candle."
+            "Replay candle a candle, sem usar candles futuros; entrada na abertura seguinte e expiração de 1 candle. Resultado agrupado com recuperação nos próximos 2 sinais confirmados."
         ),
-        "operations": operations[-80:],
+        "operations": recovery["cycles"][-80:],
     }
     _backtest48_result_cache[result_key] = (time.time(), dict(out))
     return out
@@ -32370,9 +32500,9 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </div>
     <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:12px" id="backtest48Stats">
       <div><div class="label">SINAIS</div><div id="backtest48Signals" class="big" style="font-size:28px">--</div></div>
-      <div><div class="label">WIN</div><div id="backtest48Wins" class="big" style="font-size:28px;color:#38d67a">--</div></div>
-      <div><div class="label">LOSS</div><div id="backtest48Losses" class="big" style="font-size:28px;color:#ff667a">--</div></div>
-      <div><div class="label">ASSERTIVIDADE</div><div id="backtest48Accuracy" class="big" style="font-size:28px">--</div></div>
+      <div><div class="label">WIN / RECUP.</div><div id="backtest48Wins" class="big" style="font-size:28px;color:#38d67a">--</div></div>
+      <div><div class="label">LOSS FINAL</div><div id="backtest48Losses" class="big" style="font-size:28px;color:#ff667a">--</div></div>
+      <div><div class="label">ACERTO C/ RECUP.</div><div id="backtest48Accuracy" class="big" style="font-size:28px">--</div></div>
     </div>
     <div id="backtest48Note" class="label" style="margin-top:10px;line-height:1.45">Ative um motor para calcular.</div>
     <details id="backtest48Details" style="margin-top:10px">
@@ -33750,14 +33880,19 @@ async function loadBacktest48(force=false){
     if(backtest48Accuracy) backtest48Accuracy.textContent=(d.accuracy==null?'--':`${Number(d.accuracy).toFixed(1)}%`);
     if(backtest48Note){
       const drawTxt=(d.draws?` • DRAW ${d.draws}`:'');
-      backtest48Note.textContent=`Fonte: ${d.source||'--'} • 48H • 1 candle de expiração • sem Gale${drawTxt}. ${d.timing_note||''}`;
+      const pendingTxt=(d.pending?` • PENDENTE ${d.pending}`:'');
+      const recTxt=`WIN direto ${Number(d.direct_wins||0)} • Rec.1 ${Number(d.recovered_1||0)} • Rec.2 ${Number(d.recovered_2||0)} • LOSS final ${Number(d.losses||0)}`;
+      backtest48Note.textContent=`${recTxt}${drawTxt}${pendingTxt} • ${Number(d.raw_signals??d.signals??0)} sinais brutos em 48H • sem Gale. ${d.timing_note||''}`;
     }
     if(backtest48Ops){
       const ops=Array.isArray(d.operations)?d.operations.slice().reverse():[];
       backtest48Ops.innerHTML=ops.length?ops.map(o=>{
         let tm='--'; try{tm=new Date(o.entry_time).toLocaleString('pt-BR',{timeZone:'America/Fortaleza',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});}catch(_){}
-        const icon=o.result==='WIN'?'🟢':(o.result==='LOSS'?'🔴':'⚪');
-        return `<div style="padding:7px 4px;border-bottom:1px solid #ffffff18">${icon} <b>${backtest48Escape(o.result)}</b> • ${backtest48Escape(o.direction)} • ${backtest48Escape(tm)} • conf. ${Number(o.confidence||0).toFixed(0)}%</div>`;
+        const rr=String(o.result||'').toUpperCase();
+        const icon=(rr==='WIN'||rr.startsWith('RECUPERADO'))?'🟢':(rr.startsWith('LOSS')?'🔴':(rr==='PENDENTE'?'🟡':'⚪'));
+        const attempts=Number(o.attempts||1);
+        const attemptTxt=attempts>1?` • ${attempts} sinais no ciclo`:'';
+        return `<div style="padding:7px 4px;border-bottom:1px solid #ffffff18">${icon} <b>${backtest48Escape(o.cycle_result||o.result)}</b> • ${backtest48Escape(o.direction)} • ${backtest48Escape(tm)}${attemptTxt} • conf. ${Number(o.confidence||0).toFixed(0)}%</div>`;
       }).join(''):'<div style="opacity:.7;padding:8px 0">Nenhum sinal encontrado nas últimas 48 horas.</div>';
     }
   }catch(err){
@@ -34683,7 +34818,11 @@ function renderHistory(){
     const triggerScore=Number(h.trigger_score||0);
     const triggerLine=trigger ? `<div class="label" style="margin-top:6px">🤖 RTM • Gatilho: <b>${trigger}</b>${triggerScore?` • ${Math.round(triggerScore)}%`:''}</div>` : '';
     const ek=currentScoreEngineKey(h);
-    const engineLabel=ek==='SMART'?'💬 CHATGPT ANALISTA':(ek==='LOCALANALYST'?'🤖 MEGA BOT':(ek==='LOCALANALYSTFLEX'?'🤖 MEGA BOT FLEX':(ek==='MEGAMASTER'?'🧠 MEGA MASTER':'🗂️ OUTRO/ANTIGO')));
+    const engineLabels={
+      SMART:'💬 CHATGPT ANALISTA',LOCALANALYST:'🤖 MEGA BOT',LOCALANALYSTFLEX:'🤖 MEGA BOT FLEX',MEGAMASTER:'🧠 MEGA MASTER',
+      ISMAELTRADER:'🎯 ISMAEL TRADER',RSICHANNEL:'📈 RSI CHANNELS',MINSCALPER:'⚡ 1 MINUTE SCALPER'
+    };
+    const engineLabel=engineLabels[ek]||'🗂️ OUTRO/ANTIGO';
     const engineLine=`<div class="label" style="margin-top:6px">Motor: <b>${engineLabel}</b></div>`;
     return `<div class="card" style="padding:12px">
       <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap">
