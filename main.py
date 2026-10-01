@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.93"
+APP_VERSION = "3.96.94"
+# MEGA IA 3.96.94 — ISMAEL TRADER: mantém EMA3/7 + RSI9 30/70 + ADX21, mas aceita extremo RSI visto nos 2 candles recentes; pré-alerta/polling 20s alinhados e timing sem conflito BIRTH/MIDDLE.
 # MEGA IA 3.96.93 — 1 MINUTE SCALPER: janela oficial de 20s + memória de alinhamento de até 2 candles; remove trava de 10s.
 # MEGA IA 3.96.92 — ISMAEL TRADER: sinal antecipado nos 20s finais para a próxima vela; remove descarte de 10s pós-abertura; radar e pré-sinais alinhados.
 # MEGA IA 3.96.91 — corrige o PLACAR POR MOTOR: 1 MINUTE SCALPER volta a aparecer com WIN/LOSS/assertividade separados.
@@ -14732,8 +14733,17 @@ def ismael_trader_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
         cross_sell=ef[i]<es[i] and ef[i-1]>=es[i-1]
         trend_buy=ef[i]>es[i] and pdi[i]>mdi[i]
         trend_sell=ef[i]<es[i] and mdi[i]>pdi[i]
-        buy=(cross_buy or trend_buy) and rs[i]<=30.0 and adxs[i]>=20.0
-        sell=(cross_sell or trend_sell) and rs[i]>=70.0 and adxs[i]>=20.0
+        # 3.96.94: o código anterior exigia RSI extremo exatamente no mesmo candle
+        # em que EMA/DMI já estavam alinhados. No M1 isso quase nunca coincide.
+        # Mantemos os mesmos níveis 30/70 e ADX>=20, mas guardamos o extremo
+        # ocorrido no candle atual ou nos 2 anteriores para permitir a confirmação
+        # logo após a saída da zona extrema, sem inventar outro indicador.
+        j0=max(0,i-2)
+        rsi_recent=rs[j0:i+1]
+        recent_oversold=any((v is not None and v<=30.0) for v in rsi_recent)
+        recent_overbought=any((v is not None and v>=70.0) for v in rsi_recent)
+        buy=(cross_buy or trend_buy) and recent_oversold and adxs[i]>=20.0
+        sell=(cross_sell or trend_sell) and recent_overbought and adxs[i]>=20.0
         triggered=(buy and not previous_buy and not sell) or (sell and not previous_sell and not buy)
         fired=None
         if triggered and (i-last_event)>ISMAEL_COOLDOWN_BARS:
@@ -14745,17 +14755,19 @@ def ismael_trader_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
                          "rsi9":round(rs[i],2),"adx21":round(adxs[i],2),
                          "plus_di":round(pdi[i],2),"minus_di":round(mdi[i],2),
                          "cross_buy":cross_buy,"cross_sell":cross_sell,
+                         "recent_oversold_2bars":bool(recent_oversold),
+                         "recent_overbought_2bars":bool(recent_overbought),
                          "raw_buy":bool(buy),"raw_sell":bool(sell),
                          "cooldown_bars":ISMAEL_COOLDOWN_BARS}
     if not fired:
         phase=("janela 20s" if live_snapshot else "candle fechado")
-        return {**base,"confidence":0.0,"reason":f"ISMAEL TRADER monitorando ({phase}) • aguardando NOVO evento EMA3/7 + RSI9 30/70 + ADX21>=20; sem sinais repetidos.","diagnostics":latest_diag}
+        return {**base,"confidence":0.0,"reason":f"ISMAEL TRADER monitorando ({phase}) • aguardando EMA3/7 + extremo RSI9 30/70 visto nos últimos 2 candles + ADX21>=20; sem sinais repetidos.","diagnostics":latest_diag}
     val=latest_diag.get('adx21',20.0)
     score=round(min(91.0,80.0+max(0.0,val-20.0)*0.6),1)
     stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or '')
     timing=(f"snapshot oficial nos {ISMAEL_EARLY_SIGNAL_SECONDS}s finais" if live_snapshot else "vela fechada")
     return {**base,"direction":fired,"confidence":score,"confirmed":True,
-            "risk":"MEDIUM","reason":f"{fired} ISMAEL TRADER • EMA3/7 + RSI9 extremo + ADX21 validado no {timing}; entrada na próxima vela; sem Gale.",
+            "risk":"MEDIUM","reason":f"{fired} ISMAEL TRADER • EMA3/7 + RSI9 30/70 recente + ADX21 validado no {timing}; entrada na próxima vela; sem Gale.",
             "event_key":f"ISMAELTRADER:{fired}:{stamp}","diagnostics":latest_diag,
             "early_signal_locked":live_snapshot,"signal_snapshot":("FORMING_CANDLE_AT_20S" if live_snapshot else "LAST_CLOSED_CANDLE")}
 
@@ -21442,11 +21454,12 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     elif engine == "TAURUSRSIDIV":
         # Taurus + RSI DIV usa somente candles fechados e entra na abertura seguinte.
         entry_mode = "BIRTH"
-    elif engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC"):
+    elif engine == "ISMAELTRADER":
+        # ISMAEL TRADER faz snapshot nos 20s finais e entra somente na próxima abertura.
+        entry_mode = "MIDDLE"
+    elif engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC"):
         # Motores importados: confirmação causal em candle fechado e entrada na próxima vela.
         entry_mode = "BIRTH"
-    if engine == "ISMAELTRADER":
-        entry_mode = "MIDDLE"
     if engine == "RSI":
         engine = "GRAPH_AI"
     if engine in RETIRED_ENGINES:
@@ -37715,10 +37728,11 @@ function applyRobotPowerState(){
     rad();
     loadPreSignals();
   }else if(engine==='ISMAELTRADER'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ISMAEL TRADER ONLINE • EMA3/7 RSI9 ADX21 • PRÓXIMA VELA';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 Ismael Trader selecionado • candle fechado, evento único, sem Gale.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar Ismael Trader • aguardando EMA3/7 + RSI9 + ADX21</div>';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='ISMAEL TRADER ONLINE • 20S • EMA3/7 RSI9 ADX21 • PRÓXIMA VELA';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 Ismael Trader • extremo RSI 30/70 pode ter ocorrido nos 2 candles recentes • valida EMA3/7 + ADX21 • libera nos 20s finais para a próxima vela.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar Ismael Trader • procurando EMA3/7 + RSI9 recente + ADX21 e preparando janela de 20s</div>';
     rad();
+    loadPreSignals();
   }else if(engine==='STREAKREV'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='STREAK REVERSAL ONLINE • SEQUÊNCIA 2+2 • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🔁 Streak Reversal selecionado • somente candle fechado • sem Gale.</div>';
@@ -40408,8 +40422,13 @@ setInterval(()=>{
 // Pré-alerta geral permanece leve. No RSI + ADX usamos um relógio mais curto
 // para capturar a janela de 25 s com precisão sem aumentar a carga dos outros motores.
 setInterval(()=>{
-  if(megaCanPoll() && selectedRobotEngine()!=='OFF' && !['RSICHANNEL','RSI5','SNIPER','TAURUSSENEGAL','BOBSENEGAL','TAURUSEA','TAURUSRSIDIV','COMBINER','RSIDIVBB','TMARSI','TLBRSI','FIBORSI','TRIPRSI'].includes(selectedRobotEngine())) loadPreSignals();
+  if(megaCanPoll() && selectedRobotEngine()!=='OFF' && !['ISMAELTRADER','RSICHANNEL','RSI5','SNIPER','TAURUSSENEGAL','BOBSENEGAL','TAURUSEA','TAURUSRSIDIV','COMBINER','RSIDIVBB','TMARSI','TLBRSI','FIBORSI','TRIPRSI'].includes(selectedRobotEngine())) loadPreSignals();
 },10000);
+// ISMAEL TRADER e RSI CHANNELS têm janela oficial de 20s. Consulta a cada 5s
+// para não perder o snapshot por causa do polling do celular/Render.
+setInterval(()=>{
+  if(megaCanPoll() && selectedRobotEngine()==='ISMAELTRADER') loadPreSignals();
+},5000);
 // RSI CHANNELS tem janela oficial de 20s. Consulta a cada 5s para não perder
 // o cruzamento/reentrada por causa do polling do celular/Render.
 setInterval(()=>{
