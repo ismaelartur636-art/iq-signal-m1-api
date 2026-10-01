@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.97"
+APP_VERSION = "3.96.98"
+# MEGA IA 3.96.98 — deixa explícito que o Backtest 48H é SIMULAÇÃO histórica e não log de sinais enviados ao app.
 # MEGA IA 3.96.97 — Backtest 48H com recuperação nos 2 sinais seguintes + nome correto do motor no histórico.
 # MEGA IA 3.96.95 — ISMAEL TRADER: perfil FLEX controlado (RSI9 35/65, memória 4 candles, ADX21>=18), análise 24h no servidor mesmo com tela apagada e ativo selecionado priorizado no bot de fundo.
 # MEGA IA 3.96.94 — ISMAEL TRADER: mantém EMA3/7 + RSI9 30/70 + ADX21, mas aceita extremo RSI visto nos 2 candles recentes; pré-alerta/polling 20s alinhados e timing sem conflito BIRTH/MIDDLE.
@@ -28407,6 +28408,7 @@ async def backtest48h_endpoint(
         "recovery_mode": "NEXT_2_SIGNALS", "recovery_max_signals": 2,
         "source": source, "history_bars": len(rows),
         "generated_at": iso(now()),
+        "simulation": True, "live_dispatch_log": False,
         "causal": True, "lookahead": False, "expiration_candles": 1, "gale": False,
         "timing_approximation": approximation,
         "timing_note": (
@@ -32493,7 +32495,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="card" id="backtest48Card" style="margin-top:14px;border-color:#2f86ff">
     <div style="display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap">
       <div>
-        <div class="label">📊 BACKTEST AUTOMÁTICO • ÚLTIMAS 48 HORAS</div>
+        <div class="label">🧪 BACKTEST 48H • SIMULAÇÃO HISTÓRICA • NÃO É SINAL ENVIADO</div>
         <div id="backtest48Engine" style="font-size:20px;font-weight:1000;margin-top:4px">Aguardando motor ativo...</div>
       </div>
       <button id="backtest48RefreshBtn" type="button" style="font-weight:900">🔄 ATUALIZAR</button>
@@ -32506,7 +32508,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </div>
     <div id="backtest48Note" class="label" style="margin-top:10px;line-height:1.45">Ative um motor para calcular.</div>
     <details id="backtest48Details" style="margin-top:10px">
-      <summary style="cursor:pointer;font-weight:900">Ver últimas operações do backtest</summary>
+      <summary style="cursor:pointer;font-weight:900">Ver operações SIMULADAS do backtest</summary>
       <div id="backtest48Ops" style="margin-top:8px;max-height:300px;overflow:auto;font-size:13px"></div>
     </details>
   </div>
@@ -33852,7 +33854,7 @@ async function loadBacktest48(force=false){
   }
   backtest48Busy=true;
   backtest48Engine.textContent=`${backtest48Name(engine)} • ${S.value} • ${interval.value}`;
-  if(backtest48Note) backtest48Note.textContent='Calculando replay candle a candle...';
+  if(backtest48Note) backtest48Note.textContent='🧪 SIMULAÇÃO HISTÓRICA: calculando replay candle a candle. Estes registros NÃO significam sinais enviados ao app.';
   if(backtest48RefreshBtn){backtest48RefreshBtn.disabled=true;backtest48RefreshBtn.textContent='⏳ CALCULANDO';}
   try{
     const d=await get(`/backtest48h?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&refresh=${force?'true':'false'}`);
@@ -33882,7 +33884,7 @@ async function loadBacktest48(force=false){
       const drawTxt=(d.draws?` • DRAW ${d.draws}`:'');
       const pendingTxt=(d.pending?` • PENDENTE ${d.pending}`:'');
       const recTxt=`WIN direto ${Number(d.direct_wins||0)} • Rec.1 ${Number(d.recovered_1||0)} • Rec.2 ${Number(d.recovered_2||0)} • LOSS final ${Number(d.losses||0)}`;
-      backtest48Note.textContent=`${recTxt}${drawTxt}${pendingTxt} • ${Number(d.raw_signals??d.signals??0)} sinais brutos em 48H • sem Gale. ${d.timing_note||''}`;
+      backtest48Note.textContent=`🧪 SIMULAÇÃO / BACKTEST — NÃO É HISTÓRICO DE ALERTAS ENVIADOS • ${recTxt}${drawTxt}${pendingTxt} • ${Number(d.raw_signals??d.signals??0)} sinais brutos em 48H • sem Gale. ${d.timing_note||''}`;
     }
     if(backtest48Ops){
       const ops=Array.isArray(d.operations)?d.operations.slice().reverse():[];
@@ -33892,7 +33894,7 @@ async function loadBacktest48(force=false){
         const icon=(rr==='WIN'||rr.startsWith('RECUPERADO'))?'🟢':(rr.startsWith('LOSS')?'🔴':(rr==='PENDENTE'?'🟡':'⚪'));
         const attempts=Number(o.attempts||1);
         const attemptTxt=attempts>1?` • ${attempts} sinais no ciclo`:'';
-        return `<div style="padding:7px 4px;border-bottom:1px solid #ffffff18">${icon} <b>${backtest48Escape(o.cycle_result||o.result)}</b> • ${backtest48Escape(o.direction)} • ${backtest48Escape(tm)}${attemptTxt} • conf. ${Number(o.confidence||0).toFixed(0)}%</div>`;
+        return `<div style="padding:7px 4px;border-bottom:1px solid #ffffff18"><span style="font-weight:1000">🧪 SIMULADO</span> • ${icon} <b>${backtest48Escape(o.cycle_result||o.result)}</b> • ${backtest48Escape(o.direction)} • ${backtest48Escape(tm)}${attemptTxt} • conf. ${Number(o.confidence||0).toFixed(0)}%</div>`;
       }).join(''):'<div style="opacity:.7;padding:8px 0">Nenhum sinal encontrado nas últimas 48 horas.</div>';
     }
   }catch(err){
