@@ -64,6 +64,7 @@ APP_VERSION = "3.97.00"
 # MEGA IA 3.96.81 — corrige temporalidade, fonte de apuração e confluências dos cinco motores atuais.
 # MEGA IA 3.96.80 — adiciona RSI XOVER 7/4 (2RSIXover): PRICE_WEIGHTED, direção original, sem atraso extra, candle fechado -> próxima vela, placar próprio.
 # MEGA IA 3.96.79 — retira PLATINUM e RSI CROSS 6/14 do painel, placar, compatibilidade, seleção e robô 24h; estados antigos ficam forçados OFF.
+# MEGA IA 3.97.01 — restaura card visível/ON-OFF do MOMENTUM CHART e remove bloqueio legado 3.96.79.
 # MEGA IA 3.97.00 — integra MOMENTUM CHART corrigido: Momentum7 + ATR12 + CCI6 + RSI7 + ADX7, controle RSI12/ADX12, DMI corrigido, candle fechado -> próxima vela.
 # MEGA IA 3.96.78 — remove também do PLACAR POR MOTOR os cartões de MONSTER SMC, MEGA ULTRA, MOMENTUM CHART, FIGURES CANDLE e VASILY PIP SNIPER ZL; históricos desses motores passam para OUTROS/ANTIGOS.
 # MEGA IA 3.96.77 — retira MONSTER SMC, MEGA ULTRA, MOMENTUM CHART, FIGURES CANDLE e VASILY PIP SNIPER ZL do painel e bloqueia reativação/backend/robô 24h.
@@ -32531,6 +32532,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </div>
   </div>
 
+  <div class="robot-mode-card" id="momentumModeCard">
+    <img src="__MEGA_IMAGE__" alt="Momentum Chart">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">⚡ MOMENTUM CHART</div>
+      <div class="robot-mode-desc" id="momentumModeDesc">Momentum 7 + ATR 12 + CCI 6 + RSI 7 + ADX 7 • controle RSI 12 / ADX 12 • DMI corrigido • candle fechado • entrada na próxima vela • sem Gale.</div>
+    </div>
+    <button id="momentumPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
   <div class="robot-mode-card" id="rsiChannelsModeCard">
     <img src="__MEGA_IMAGE__" alt="RSI Channels">
     <div class="robot-mode-copy">
@@ -33638,10 +33648,10 @@ try{
    'mega_forexstay_pro_power','mega_forexflex_power']
    .forEach(k=>localStorage.setItem(k,'OFFLINE'));
 }catch(_){}
-// MEGA IA 3.96.79 — motores retirados: nunca podem ser restaurados por localStorage antigo.
-monsterSmcEnabled=false; tsiEnabled=false; momentumEnabled=false; figuresEnabled=false; vasilyEnabled=false; platinumEnabled=false;
+// MEGA IA 3.97.01 — mantém removidos os motores antigos de 3.96.79, mas MOMENTUM CHART voltou como motor novo corrigido.
+monsterSmcEnabled=false; tsiEnabled=false; figuresEnabled=false; vasilyEnabled=false; platinumEnabled=false;
 try{
-  ['mega_monster_smc_power','mega_tsi_power','mega_momentum_power','mega_figures_power','mega_vasily_power','mega_platinum_power','mega_rsi_cross_power']
+  ['mega_monster_smc_power','mega_tsi_power','mega_figures_power','mega_vasily_power','mega_platinum_power','mega_rsi_cross_power']
     .forEach(k=>localStorage.setItem(k,'OFFLINE'));
 }catch(_){}
 
@@ -33810,11 +33820,11 @@ if(localAnalystEnabled){
 }
 
 // Se nenhum motor válido ficou ONLINE, nesta versão o fallback é CHATGPT ANALISTA.
-monsterSmcEnabled=false; tsiEnabled=false; momentumEnabled=false; figuresEnabled=false; vasilyEnabled=false; platinumEnabled=false;
+monsterSmcEnabled=false; tsiEnabled=false; figuresEnabled=false; vasilyEnabled=false; platinumEnabled=false;
 streakRevEnabled=false; try{localStorage.setItem('mega_streak_rev_power','OFFLINE')}catch(_){}
 if(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled) {ismaelTraderEnabled=false;rsiChannelsEnabled=false;minScalperEnabled=false;}
 if(minScalperEnabled){aiEnabled=false;localAnalystEnabled=false;localAnalystFlexEnabled=false;megaMasterEnabled=false;ismaelTraderEnabled=false;rsiChannelsEnabled=false;}
-if(!(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled||ismaelTraderEnabled||rsiChannelsEnabled||minScalperEnabled)) aiEnabled=true;
+if(!(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled||ismaelTraderEnabled||rsiChannelsEnabled||minScalperEnabled||momentumEnabled)) aiEnabled=true;
 
 function selectedRobotEngine(){
   if(minScalperEnabled) return 'MINSCALPER';
@@ -38639,7 +38649,7 @@ async function setMomentumPower(enabled){
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled) speak(momentumEnabled?'Momentum quatorze online.':'Momentum quatorze offline.');
+  if(voiceEnabled) speak(momentumEnabled?'Momentum Chart online.':'Momentum Chart offline.');
 }
 
 async function setFiguresPower(enabled){
