@@ -42,7 +42,11 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.09"
+APP_VERSION = "3.97.13"
+# MEGA IA 3.97.13 — RSI CHANNELS: leitura M5 fechada, entrada na próxima vela M1 e expiração fixa de 1 minuto.
+# MEGA IA 3.97.12 — RSI CHANNELS: leitura M5 fechada, entrada M1 e expiração fixa de 1 minuto.
+# MEGA IA 3.97.11 — RSI CHANNELS exclusivo: leitura técnica M5 fechada, disparo/entrada M1 e demais cards de motores removidos do painel.
+# MEGA IA 3.97.10 — corrige status do 4 PERIOD RSI PRO: remove fallback visual/backend “IA GRÁFICA” quando RSI4PERIOD está ativo.
 # MEGA IA 3.97.06 — corrige painel sem controle: declara estado ISMAEL 98 antes da inicialização JS e restaura botões ON/OFF.
 # MEGA IA 3.97.09 — 4 PERIOD RSI PRO: M1 com confirmação obrigatória somente pelo RSI9 do M5 fechado; M15/M30/H1 deixam de bloquear.
 # MEGA IA 3.97.08 — completa 4 PERIOD RSI PRO: status/radar próprios e adaptador causal no Backtest 48H.
@@ -161,7 +165,7 @@ def ismael98_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", cur
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # CHATGPT ANALISTA permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v204"
+PWA_VERSION = "v205"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -14517,7 +14521,7 @@ def one_minute_scalper_strategy(cs, symbol="EUR/USD", timeframe="1min", market="
         "engine":"MINSCALPER","provider":("LOCAL_1_MINUTE_SCALPER_LWMA_EARLY20" if live_snapshot else "LOCAL_1_MINUTE_SCALPER_LWMA_CLOSED"),
         "closed_candles_only":not live_snapshot,"non_repaint":not live_snapshot,"non_repaint_after_release":True,
         "early_signal_window":live_snapshot,"prealert_seconds":MINSCALPER_EARLY_SIGNAL_SECONDS,
-        "next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,
+        "next_candle_entry":True,"entry_timeframe":"1min","analysis_timeframe":"5min","expiry_seconds":120,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,
         "confidence_is_probability":False,"shift":0 if live_snapshot else 1,
     }
     if str(timeframe).lower() != "1min":
@@ -14624,6 +14628,14 @@ def one_minute_scalper_strategy(cs, symbol="EUR/USD", timeframe="1min", market="
 RSICHANNEL_EARLY_SIGNAL_SECONDS = 20
 RSICHANNEL_EARLY_WINDOW_BEFORE = 20
 RSICHANNEL_EARLY_MIN_REMAINING = 1
+RSICHANNEL_ANALYSIS_INTERVAL = "5min"
+RSICHANNEL_ENTRY_SECONDS = 60
+
+def rsi_channels_next_m1_boundary(dt=None):
+    dt = (dt or now()).astimezone(BR_TZ)
+    ts = int(dt.timestamp())
+    nxt = ((ts // RSICHANNEL_ENTRY_SECONDS) + 1) * RSICHANNEL_ENTRY_SECONDS
+    return datetime.fromtimestamp(nxt, tz=BR_TZ)
 
 def _rsi_channels_indicator_series(rows, rsi_period=4, smoothing=5, overbought=70.0, oversold=30.0, upper_neutral=55.0, lower_neutral=45.0):
     n=len(rows)
@@ -14678,10 +14690,10 @@ def rsi_channels_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN",
     rows=list(cs or [])[-180:]
     live_snapshot=bool(allow_prealert and not current_candle_closed)
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
-          "strategy":"RSI CHANNELS • RSI4 + CANAIS DINÂMICOS 5",
+          "strategy":"RSI CHANNELS • LEITURA M5 • ENTRADA M1",
           "engine":"RSICHANNEL","provider":"LOCAL_RSI_CHANNELS_EARLY20_V111",
           "risk":"HIGH","closed_candles_only":not live_snapshot,"non_repaint":not live_snapshot,
-          "non_repaint_after_release":True,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,
+          "non_repaint_after_release":True,"next_candle_entry":True,"expiry_seconds":60,"expiry_candles":1,"direct_win_only":True,
           "gale_signal":False,"martingale":False,"confidence_is_probability":False,
           "prealert_seconds":int(RSICHANNEL_EARLY_SIGNAL_SECONDS),"early_signal_window":live_snapshot}
     need=35
@@ -23038,18 +23050,25 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                                     "early_signal_window":False}
                 analysis["seconds_to_entry_snapshot"]=round(_ismael_remaining,1)
             elif engine == "RSICHANNEL":
-                _rc_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                # 3.97.11 — RSI CHANNELS lê SOMENTE M5 fechado e agenda a entrada na próxima abertura M1.
+                _rc_entry=rsi_channels_next_m1_boundary()
+                _rc_remaining=max(0.0,(_rc_entry-now()).total_seconds())
                 _rc_early=RSICHANNEL_EARLY_MIN_REMAINING <= _rc_remaining <= RSICHANNEL_EARLY_WINDOW_BEFORE
-                if _rc_early:
-                    analysis = rsi_channels_strategy(raw[-180:], symbol=symbol, timeframe=interval, market=market, current_candle_closed=False, allow_prealert=True)
-                else:
-                    analysis = rsi_channels_strategy(engine_closed[-180:], symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
-                    # Fora da janela antecipada, o RSI CHANNELS apenas monitora. O CALL/PUT
-                    # oficial nasce nos 20s finais para entrar na próxima abertura.
-                    if analysis.get("confirmed"):
-                        analysis = {**analysis, "direction":"NEUTRO", "confirmed":False, "confidence":0.0,
-                                    "reason":f"RSI CHANNELS aguardando janela de 20s; faltam {int(_rc_remaining)}s para a próxima vela.",
-                                    "early_signal_window":False}
+                try:
+                    if market == "IQ_OTC":
+                        _rc_state=_iq_session_state(request, required=False)
+                        _rc_raw=(await iq_ea_candles(_rc_state,symbol,RSICHANNEL_ANALYSIS_INTERVAL,180,regular_market=False)) if _rc_state else []
+                    else:
+                        _rc_raw=await candles(symbol,RSICHANNEL_ANALYSIS_INTERVAL,180,"OPEN",None,request=request)
+                    _rc_closed=_verified_closed_candles(_rc_raw,RSICHANNEL_ANALYSIS_INTERVAL)
+                    analysis=rsi_channels_strategy(_rc_closed[-180:],symbol=symbol,timeframe=RSICHANNEL_ANALYSIS_INTERVAL,market=market,current_candle_closed=True,allow_prealert=False)
+                except Exception as _rc_exc:
+                    analysis={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"engine":"RSICHANNEL","reason":f"RSI CHANNELS M5 aguardando dados: {str(_rc_exc)[:100]}"}
+                if not _rc_early and analysis.get("confirmed"):
+                    analysis={**analysis,"direction":"NEUTRO","confirmed":False,"confidence":0.0,"reason":f"RSI CHANNELS M5 confirmado; aguardando janela de 20s da entrada M1 • faltam {int(_rc_remaining)}s.","early_signal_window":False}
+                analysis["analysis_timeframe"]="5min"
+                analysis["entry_timeframe"]="1min"
+                analysis["expiry_seconds"]=60
                 analysis["seconds_to_entry_snapshot"]=round(_rc_remaining,1)
             elif engine == "MINSCALPER":
                 _min_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
@@ -23478,7 +23497,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "PLATINUM • WPR ADAPTATIVO • MESMA VELA" if engine == "PLATINUM"
                     else "RSI CROSS 6/14 • CANDLE FECHADO • NEXT CANDLE" if engine == "RSICROSS"
                     else "ISMAEL TRADER • EMA3/7 + RSI9 + ADX21 • NEXT CANDLE" if engine == "ISMAELTRADER"
-                    else "RSI CHANNELS • RSI4 + CANAIS DINÂMICOS 5 • 20S • NEXT CANDLE" if engine == "RSICHANNEL"
+                    else "RSI CHANNELS • LEITURA M5 • ENTRADA M1 • 20S" if engine == "RSICHANNEL"
                     else "1 MINUTE SCALPER • 13 LWMA PRICE_TYPICAL • NEXT CANDLE" if engine == "MINSCALPER"
                     else "STREAK REVERSAL • SEQUÊNCIA 2+2 • EMA100 + ATR100 • NEXT CANDLE" if engine == "STREAKREV"
                     else "SMART SESSION BREAKOUT • RANGE 00:00–08:00 + ATR14 • NEXT CANDLE" if engine == "SESSIONBREAKOUT"
@@ -24205,6 +24224,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "SUNTZU": "SINAL SUNTZU FLEX 2/3 LIBERADO",
                         "RSIMON": "SINAL RSI MONITOR 20S LIBERADO",
                         "RSI5": "SINAL RSI + ADX AFIADO LIBERADO",
+                        "RSI4PERIOD": "SINAL 4 PERIOD RSI PRO LIBERADO",
                         "FORCE": "SINAL EA FORÇA DO MOVIMENTO LIBERADO",
                         "BIGRISE": "SINAL BTC FORCE MULTIATIVOS LIBERADO",
                     }.get(engine, "SINAL IA GRÁFICA LIBERADO")),
@@ -29565,7 +29585,7 @@ async def pre_signals(
             return {"ok":True,"engine":"MINSCALPER","items":[],"seconds_to_entry":remain,"message":f"1 MINUTE SCALPER aguardando dados: {str(exc)[:120]}"}
 
     if engine == "RSICHANNEL":
-        entry_dt=next_boundary(interval)
+        entry_dt=rsi_channels_next_m1_boundary()
         remain=int(max(0,(entry_dt-now()).total_seconds()))
         if not (RSICHANNEL_EARLY_MIN_REMAINING <= remain <= RSICHANNEL_EARLY_WINDOW_BEFORE):
             return {
@@ -29578,14 +29598,15 @@ async def pre_signals(
         if market == "IQ_OTC" and not state:
             return {"ok":True,"engine":"RSICHANNEL","items":[],"seconds_to_entry":remain,"message":"RSI CHANNELS OTC aguardando conexão com a IQ Option."}
         try:
-            raw=(await iq_ea_candles(state,target,interval,180,regular_market=False)) if market == "IQ_OTC" else (await candles(target,interval,180,"OPEN",None,request=request))
-            tech=rsi_channels_strategy(raw[-180:],symbol=target,timeframe=interval,market=market,current_candle_closed=False,allow_prealert=True)
+            raw=(await iq_ea_candles(state,target,RSICHANNEL_ANALYSIS_INTERVAL,180,regular_market=False)) if market == "IQ_OTC" else (await candles(target,RSICHANNEL_ANALYSIS_INTERVAL,180,"OPEN",None,request=request))
+            closed5=_verified_closed_candles(raw,RSICHANNEL_ANALYSIS_INTERVAL)
+            tech=rsi_channels_strategy(closed5[-180:],symbol=target,timeframe=RSICHANNEL_ANALYSIS_INTERVAL,market=market,current_candle_closed=True,allow_prealert=False)
             items=[]
             if tech.get("confirmed") and str(tech.get("direction") or "").upper() in ("CALL","PUT"):
                 items=[{
                     "symbol":target,"direction":str(tech.get("direction")).upper(),
                     "confidence":float(tech.get("confidence") or 0.0),
-                    "strategy":"RSI CHANNELS 20S FLEX",
+                    "strategy":"RSI CHANNELS M5 → M1",
                     "reason":str(tech.get("reason") or "RSI Channels confirmou reentrada."),
                     "entry_time":iso(entry_dt),"seconds_to_entry":remain,"prealert_only":False,
                     "early_signal_locked":True,
@@ -32740,11 +32761,17 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="momentumPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
+  <style>
+    /* 3.97.11 — painel de motores enxuto: somente RSI CHANNELS visível */
+    .robot-mode-card{display:none !important}
+    #rsiChannelsModeCard{display:flex !important}
+  </style>
+
   <div class="robot-mode-card" id="rsiChannelsModeCard">
     <img src="__MEGA_IMAGE__" alt="RSI Channels">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">📈 RSI CHANNELS</div>
-      <div class="robot-mode-desc" id="rsiChannelsModeDesc">RSI 4 + canais dinâmicos suavizados 5 • reentrada 30/70 em candle fechado • entrada na próxima vela • sem Gale.</div>
+      <div class="robot-mode-desc" id="rsiChannelsModeDesc">RSI 4 + canais dinâmicos suavizados 5 • leitura em M5 fechado • sinal nos 20s finais para entrada M1 • expiração 1 minuto • sem Gale.</div>
     </div>
     <button id="rsiChannelsPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -34031,6 +34058,16 @@ streakRevEnabled=false; try{localStorage.setItem('mega_streak_rev_power','OFFLIN
 if(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled) {ismaelTraderEnabled=false;rsiChannelsEnabled=false;minScalperEnabled=false;}
 if(minScalperEnabled){aiEnabled=false;localAnalystEnabled=false;localAnalystFlexEnabled=false;megaMasterEnabled=false;ismaelTraderEnabled=false;rsiChannelsEnabled=false;}
 if(!(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled||ismaelTraderEnabled||rsiChannelsEnabled||minScalperEnabled||momentumEnabled)) aiEnabled=true;
+
+
+// 3.97.11 — modo exclusivo RSI CHANNELS. Outros motores ficam desligados e não podem assumir fallback.
+try{
+  rsiChannelsEnabled=true;
+  aiEnabled=false; localAnalystEnabled=false; localAnalystFlexEnabled=false; megaMasterEnabled=false;
+  ismaelTraderEnabled=false; ismael98Enabled=false; minScalperEnabled=false; momentumEnabled=false; rsi4PeriodEnabled=false;
+  localStorage.setItem('mega_rsi_channels_power','ONLINE');
+  ['mega_ai_power','mega_local_analyst_power','mega_local_analyst_flex_power','mega_master_power','mega_ismael_trader_power','mega_ismael98_power','mega_min_scalper_power','mega_momentum_power','mega_rsi4period_power'].forEach(k=>localStorage.setItem(k,'OFFLINE'));
+}catch(_){}
 
 function selectedRobotEngine(){
   if(rsi4PeriodEnabled) return 'RSI4PERIOD';
@@ -38564,7 +38601,7 @@ function applyRobotPowerState(){
     rad();
     loadPreSignals();
   }else if(engine==='RSICHANNEL'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI CHANNELS ONLINE • 20S FLEX • RSI4 + CANAIS DINÂMICOS • PRÓXIMA VELA';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='RSI CHANNELS ONLINE • LEITURA M5 • ENTRADA M1 • RSI4 + CANAIS DINÂMICOS';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📡 RSI Channels • monitora RSI4 + canais dinâmicos e libera cruzamento/reentrada FLEX nos 20s finais para a próxima vela.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar RSI Channels ativo • procurando reentrada nos canais e preparando a janela de 20s</div>';
     rad();
@@ -38602,7 +38639,7 @@ function applyRobotPowerState(){
     rad();
   }else if(engine==='RSI4PERIOD'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='4 PERIOD RSI PRO ONLINE • M1 • CONFIRMAÇÃO RSI9 M5 • 38/62';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 4 Period RSI Pro selecionado • RSI9 Typical Price • M5/M15/M30/H1 • exige 3 de 4 • candle fechado • próxima vela.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 4 Period RSI Pro selecionado • M1 com RSI9 Typical Price • confirmação obrigatória somente pelo RSI9 do M5 fechado • próxima vela.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar 4 Period RSI Pro ativo • aguardando confirmação M5 dos RSIs MTF</div>';
     rad();
   }else if(engine==='GRAPH_AI'){
