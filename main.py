@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.99"
+APP_VERSION = "3.97.00"
 # MEGA IA 3.96.99 — ISMAEL TRADER: controle de quantidade 1–10 (padrão 5) no painel; 1 MINUTE SCALPER removido do painel e bloqueado no motor.
 # MEGA IA 3.96.98 — deixa explícito que o Backtest 48H é SIMULAÇÃO histórica e não log de sinais enviados ao app.
 # MEGA IA 3.96.97 — Backtest 48H com recuperação nos 2 sinais seguintes + nome correto do motor no histórico.
@@ -64,20 +64,21 @@ APP_VERSION = "3.96.99"
 # MEGA IA 3.96.81 — corrige temporalidade, fonte de apuração e confluências dos cinco motores atuais.
 # MEGA IA 3.96.80 — adiciona RSI XOVER 7/4 (2RSIXover): PRICE_WEIGHTED, direção original, sem atraso extra, candle fechado -> próxima vela, placar próprio.
 # MEGA IA 3.96.79 — retira PLATINUM e RSI CROSS 6/14 do painel, placar, compatibilidade, seleção e robô 24h; estados antigos ficam forçados OFF.
-# MEGA IA 3.96.78 — remove também do PLACAR POR MOTOR os cartões de MONSTER SMC, MEGA ULTRA, MOMENTUM 14, FIGURES CANDLE e VASILY PIP SNIPER ZL; históricos desses motores passam para OUTROS/ANTIGOS.
-# MEGA IA 3.96.77 — retira MONSTER SMC, MEGA ULTRA, MOMENTUM 14, FIGURES CANDLE e VASILY PIP SNIPER ZL do painel e bloqueia reativação/backend/robô 24h.
+# MEGA IA 3.97.00 — integra MOMENTUM CHART corrigido: Momentum7 + ATR12 + CCI6 + RSI7 + ADX7, controle RSI12/ADX12, DMI corrigido, candle fechado -> próxima vela.
+# MEGA IA 3.96.78 — remove também do PLACAR POR MOTOR os cartões de MONSTER SMC, MEGA ULTRA, MOMENTUM CHART, FIGURES CANDLE e VASILY PIP SNIPER ZL; históricos desses motores passam para OUTROS/ANTIGOS.
+# MEGA IA 3.96.77 — retira MONSTER SMC, MEGA ULTRA, MOMENTUM CHART, FIGURES CANDLE e VASILY PIP SNIPER ZL do painel e bloqueia reativação/backend/robô 24h.
 # MEGA IA 3.96.66 — alinha radar e sinal oficial: oportunidade só aparece/libera com dados OPEN realmente frescos; cartão antigo expira visualmente.
 # MEGA IA 3.96.65 — corrige aquecimento do MEGA MASTER: 320 candles na coleta oficial e 260 no núcleo.
 # MEGA IA 3.96.67 — adiciona MONSTER SMC: adaptação causal do Monster Arrows v2.0 (Ultimate SMC).
-# MEGA IA 3.96.70 — mantém MEGA ULTRA privado e restaura MOMENTUM 14 puro no app.
+# MEGA IA 3.96.70 — mantém MEGA ULTRA privado e restaura MOMENTUM CHART puro no app.
 # MEGA IA 3.96.76 — integra RSI CROSS 6/14: RSI rápido 6 x RSI lento 14 em candle fechado -> próxima vela, sem Gale, com placar próprio.
 # MEGA IA 3.96.75 — adiciona VASILY PIP SNIPER ZL e PLATINUM ao placar por motor com WIN/LOSS/assertividade separados.
 # MEGA IA 3.96.74 — integra PLATINUM original em vela atual (WPR adaptativo Risk=3, 30/70) junto de FIGURES CANDLE e VASILY PIP SNIPER ZL.
 # MEGA IA 3.96.73 — integra VASILY PIP SNIPER ZL: Zero-Lag EMA 1/6, candle fechado, novo cruzamento -> próxima vela, sem MTF no gatilho.
 # MEGA IA 3.96.72 — corrige e integra FIGURES CANDLE: EMA5 causal corrigida, alerta lógico corrigido, candle fechado -> próxima vela.
-# MEGA IA 3.96.71 — corrige MOMENTUM 14: radar usa o motor real e descarta cruzamento tardio após 10s da abertura.
+# MEGA IA 3.96.71 — corrige MOMENTUM CHART: radar usa o motor real e descarta cruzamento tardio após 10s da abertura.
 # MEGA IA 3.96.69 — renomeia o motor privado para MEGA ULTRA e oculta sua composição técnica no painel/API.
-# MEGA IA 3.96.69 — adiciona MOMENTUM 14 puro: fórmula original MT4 Close[i]*100/Close[i+14], cruzamento causal do nível 100, candle fechado -> próxima vela.
+# MEGA IA 3.96.69 — adiciona MOMENTUM CHART puro: fórmula original MT4 Close[i]*100/Close[i+14], cruzamento causal do nível 100, candle fechado -> próxima vela.
 # M1 fechado -> próxima vela; Liquidity Sweep + FVG + Fibonacci 61,8% + confirmação flexível M5/M15 (1 de 2); sem Gale.
 # MEGA IA 3.96.64 — adiciona MEGA MASTER: leitura local ampliada com 15 famílias técnicas/contextuais, sem API.
 # MEGA IA 3.96.63 — placar separado por motor: CHATGPT ANALISTA, MEGA BOT e MEGA BOT FLEX.
@@ -87,7 +88,7 @@ APP_VERSION = "3.96.99"
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # CHATGPT ANALISTA permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v203"
+PWA_VERSION = "v204"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -1565,7 +1566,7 @@ TSI_FIRST_R = max(1, min(100, int(os.getenv("TSI_FIRST_R", "8"))))
 TSI_SECOND_S = max(1, min(100, int(os.getenv("TSI_SECOND_S", "5"))))
 TSI_SIGNAL_PERIOD = max(1, min(100, int(os.getenv("TSI_SIGNAL_PERIOD", "5"))))
 
-# MEGA IA 3.96.69 — MOMENTUM 14 puro, convertido do Momentum.mq4 da MetaQuotes.
+# MEGA IA 3.96.69 — MOMENTUM CHART puro, convertido do Momentum.mq4 da MetaQuotes.
 # Fórmula original: Close[i] * 100 / Close[i + MomPeriod].
 # O app confirma apenas o cruzamento do nível 100 no último candle FECHADO;
 # isso evita repetir CALL/PUT em toda vela enquanto o Momentum permanece do mesmo lado.
@@ -1678,7 +1679,7 @@ RETIRED_ENGINES = {
     "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE",
     "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX",
     # 3.96.79 — retirados do painel e bloqueados no backend/robô 24h.
-    "MONSTERSMC", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "RSICROSS", "RSIXOVER", "STREAKREV",
+    "MONSTERSMC", "TSI", "FIGURES", "VASILY", "PLATINUM", "RSICROSS", "RSIXOVER", "STREAKREV",
 }
 
 background_bot_task = None
@@ -13356,69 +13357,93 @@ def tsi_signals_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
 
 
 def momentum14_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """Momentum clássico do MT4 (MomPeriod=14), sem filtros escondidos.
+    """MOMENTUM CHART: adaptação causal do #Momentum onChartSignals v1.0 corrigido.
 
-    Fórmula fiel ao MQ4: Momentum[i] = Close[i] * 100 / Close[i+14].
-    No app, somente candles fechados entram no cálculo. O evento oficial nasce apenas
-    quando o último candle fechado cruza o nível 100:
-      • CALL: Momentum anterior <= 100 e Momentum atual > 100;
-      • PUT:  Momentum anterior >= 100 e Momentum atual < 100.
-    A entrada é na próxima vela, expiração de 1 candle e sem Gale.
+    Defaults preservados do MQ4: CCI6, ATR12, Momentum7, RSI7, ADX7; controles
+    RSI12/ADX12, gatilhos RSI50 e ADX20. A direção DMI foi corrigida:
+    CALL exige +DI > -DI; PUT exige -DI > +DI. Usa somente candle fechado.
     """
-    rows=list(cs or [])
+    rows=list(cs or [])[-320:]
     base={
         "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
-        "strategy":"MOMENTUM 14 • NÍVEL 100 • NEXT CANDLE",
-        "engine":"MOMENTUM","provider":"LOCAL_MOMENTUM14_LEVEL100_CLOSED",
+        "strategy":"MOMENTUM CHART • MOM7 + ATR12 + CCI6 + RSI7 + ADX7",
+        "engine":"MOMENTUM","provider":"LOCAL_MOMENTUM_CHART_FIXED_CLOSED",
         "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
         "direct_win_only":True,"gale_signal":False,"martingale":False,"grid":False,
-        "expiry_candles":1,"trigger_timeframe":str(timeframe).upper(),
-        "momentum_period":int(MOMENTUM_PERIOD),"momentum_level":float(MOMENTUM_LEVEL),"shift":1,
+        "expiry_candles":1,"trigger_timeframe":str(timeframe).upper(),"shift":1,
     }
-    need=max(20,int(MOMENTUM_PERIOD)+3)
-    if len(rows)<need:
-        return {**base,"reason":f"MOMENTUM 14 coletando candles fechados ({len(rows)}/{need})."}
-    rows=rows[-220:]
-    closes=[]
-    for x in rows:
-        try: closes.append(float(x.get("close") or 0.0))
-        except Exception: closes.append(0.0)
-    p=int(MOMENTUM_PERIOD)
-    if len(closes)<p+2 or any(v<=0 for v in closes[-(p+2):]):
-        return {**base,"reason":"MOMENTUM 14 aguardando candles válidos."}
-
-    values=[None]*len(closes)
-    for i in range(p,len(closes)):
-        den=float(closes[i-p])
-        values[i]=None if abs(den)<=1e-15 else (float(closes[i])*100.0/den)
-    cur=values[-1]; prev=values[-2]
-    if cur is None or prev is None:
-        return {**base,"reason":"MOMENTUM 14 aquecendo período 14."}
-    cur=float(cur); prev=float(prev); level=float(MOMENTUM_LEVEL)
-    call_cross=(prev<=level and cur>level)
-    put_cross=(prev>=level and cur<level)
-    delta=cur-prev
-    distance=abs(cur-level)
-    diag={
-        "momentum":round(cur,6),"momentum_prev":round(prev,6),"level":level,
-        "delta":round(delta,6),"distance_from_100":round(distance,6),
-        "call_cross":call_cross,"put_cross":put_cross,"period":p,
-        "shift":1,"closed_candle":True,"future_leak":False,
-    }
-    if call_cross == put_cross:
-        side="ACIMA" if cur>level else ("ABAIXO" if cur<level else "NO NÍVEL")
-        return {**base,"reason":f"MOMENTUM 14 monitorando • {cur:.3f} {side} de 100 • aguardando novo cruzamento confirmado.","diagnostics":diag}
-
-    direction="CALL" if call_cross else "PUT"
-    # Confiança informativa, sem filtro extra: o cruzamento por si só libera o evento.
-    impulse=abs(delta)
-    conf=clamp(80.0+min(14.0,distance*7.0+impulse*5.0),80.0,94.0)
-    risk="LOW" if distance>=0.80 and impulse>=0.45 else ("MEDIUM" if distance>=0.30 else "HIGH")
-    stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or (len(rows)-1))
-    return {**base,"direction":direction,"confidence":round(conf,1),"confirmed":True,"risk":risk,
-        "reason":f"{direction} MOMENTUM 14 • cruzamento confirmado {prev:.3f}→{cur:.3f} no nível 100 • candle fechado • próxima vela • sem Gale.",
-        "event_key":f"MOMENTUM:{direction}:{stamp}","diagnostics":diag}
-
+    if len(rows)<40:
+        return {**base,"reason":f"MOMENTUM CHART coletando candles fechados ({len(rows)}/40)."}
+    try:
+        O=[float(x["open"]) for x in rows]; H=[float(x["high"]) for x in rows]
+        L=[float(x["low"]) for x in rows]; C=[float(x["close"]) for x in rows]
+        T=[(H[i]+L[i]+C[i])/3.0 for i in range(len(rows))]
+        n=len(rows)
+        def rsi_series(vals,p):
+            out=[None]*n
+            gains=[max(0.0,vals[i]-vals[i-1]) for i in range(1,n)]
+            losses=[max(0.0,vals[i-1]-vals[i]) for i in range(1,n)]
+            if n<=p:return out
+            g=sum(gains[:p])/p; l=sum(losses[:p])/p
+            out[p]=100.0 if l<=1e-15 and g>1e-15 else (50.0 if l<=1e-15 else 100.0-100.0/(1.0+g/l))
+            for i in range(p+1,n):
+                g=(g*(p-1)+gains[i-1])/p; l=(l*(p-1)+losses[i-1])/p
+                out[i]=100.0 if l<=1e-15 and g>1e-15 else (50.0 if l<=1e-15 else 100.0-100.0/(1.0+g/l))
+            return out
+        def atr_series(p):
+            tr=[0.0]*n; out=[None]*n
+            for i in range(1,n): tr[i]=max(H[i]-L[i],abs(H[i]-C[i-1]),abs(L[i]-C[i-1]))
+            if n<=p:return out
+            v=sum(tr[1:p+1])/p; out[p]=v
+            for i in range(p+1,n): v=(v*(p-1)+tr[i])/p; out[i]=v
+            return out
+        def cci_series(p):
+            out=[None]*n
+            for i in range(p-1,n):
+                w=T[i-p+1:i+1]; ma=sum(w)/p; md=sum(abs(x-ma) for x in w)/p
+                out[i]=0.0 if md<=1e-15 else (T[i]-ma)/(0.015*md)
+            return out
+        def adx_series(p):
+            plus=[None]*n; minus=[None]*n; adx=[None]*n
+            tr=[0.0]*n; pdm=[0.0]*n; mdm=[0.0]*n
+            for i in range(1,n):
+                up=H[i]-H[i-1]; dn=L[i-1]-L[i]
+                pdm[i]=up if up>dn and up>0 else 0.0; mdm[i]=dn if dn>up and dn>0 else 0.0
+                tr[i]=max(H[i]-L[i],abs(H[i]-C[i-1]),abs(L[i]-C[i-1]))
+            if n<=p:return adx,plus,minus
+            st=sum(tr[1:p+1]); sp=sum(pdm[1:p+1]); sm=sum(mdm[1:p+1]); dx=[]; av=None
+            for i in range(p,n):
+                if i>p:
+                    st=st-st/p+tr[i]; sp=sp-sp/p+pdm[i]; sm=sm-sm/p+mdm[i]
+                pi=100.0*sp/st if st>1e-15 else 0.0; mi=100.0*sm/st if st>1e-15 else 0.0
+                plus[i]=pi; minus[i]=mi; d=100.0*abs(pi-mi)/(pi+mi) if pi+mi>1e-15 else 0.0; dx.append(d)
+                if len(dx)==p: av=sum(dx)/p
+                elif len(dx)>p: av=(av*(p-1)+d)/p
+                adx[i]=av
+            return adx,plus,minus
+        mom=[None]*n
+        for i in range(7,n): mom[i]=100.0*T[i]/T[i-7] if abs(T[i-7])>1e-15 else None
+        atr=atr_series(12); cci=cci_series(6); rsi=rsi_series(T,7); adx,_,_=adx_series(7)
+        rsi_ctl=rsi_series(C,12); adx_ctl,plus_ctl,minus_ctl=adx_series(12)
+        i=n-1
+        vals=(mom[i],atr[i],cci[i],rsi[i],adx[i],rsi_ctl[i],adx_ctl[i],plus_ctl[i],minus_ctl[i])
+        if any(v is None for v in vals) or float(adx[i])<=1e-15:
+            return {**base,"reason":"MOMENTUM CHART aquecendo indicadores."}
+        signal_val=(mom[i]/(atr[i]+adx[i]))+2.0 if abs(atr[i]+adx[i])>1e-15 else 0.0
+        indi_val=((atr[i]+cci[i]+rsi[i])/adx[i])+1.0
+        call=bool(signal_val>indi_val and plus_ctl[i]>minus_ctl[i] and rsi_ctl[i]<50.0 and adx_ctl[i]>20.0)
+        put=bool(signal_val<indi_val and minus_ctl[i]>plus_ctl[i] and rsi_ctl[i]>50.0 and adx_ctl[i]>20.0)
+    except (KeyError,TypeError,ValueError,OverflowError,ZeroDivisionError):
+        return {**base,"reason":"MOMENTUM CHART aguardando OHLC válido."}
+    diag={"momentum7":round(mom[i],4),"atr12":round(atr[i],6),"cci6":round(cci[i],2),"rsi7":round(rsi[i],2),"adx7":round(adx[i],2),"signal_val":round(signal_val,4),"indi_val":round(indi_val,4),"rsi12":round(rsi_ctl[i],2),"adx12":round(adx_ctl[i],2),"plus_di12":round(plus_ctl[i],2),"minus_di12":round(minus_ctl[i],2),"dmi_corrected":True,"closed_candle":True,"future_leak":False,"shift":1}
+    if call==put:
+        return {**base,"reason":f"MOMENTUM CHART monitorando • RSI12 {rsi_ctl[i]:.1f} • ADX12 {adx_ctl[i]:.1f} • aguardando confluência.","diagnostics":diag}
+    direction="CALL" if call else "PUT"
+    dmi_gap=abs(plus_ctl[i]-minus_ctl[i]); conf=clamp(78.0+min(8.0,max(0.0,adx_ctl[i]-20.0)*0.5)+min(6.0,dmi_gap*0.25),78.0,92.0)
+    stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or i)
+    return {**base,"direction":direction,"confidence":round(conf,1),"confirmed":True,"risk":"LOW" if conf>=88 else "MEDIUM",
+        "reason":f"{direction} MOMENTUM CHART • confluência Momentum/ATR/CCI/RSI/ADX confirmada • DMI corrigido • candle fechado • próxima vela • sem Gale.",
+        "event_key":f"MOMENTUMCHART:{direction}:{stamp}","diagnostics":diag}
 
 def _rsicross_wilder_series(values, period):
     """RSI Wilder causal, compatível com a lógica do iRSI do MT4."""
@@ -22144,7 +22169,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "TSI":
             status = "MEGA ULTRA • ANALISANDO" if market == "OPEN" else "MEGA ULTRA • ANALISANDO"
         elif engine == "MOMENTUM":
-            status = "MOMENTUM 14 • FONTE EM ESPERA" if market == "OPEN" else "MOMENTUM 14 • IQ OPTION EM ESPERA"
+            status = "MOMENTUM CHART • FONTE EM ESPERA" if market == "OPEN" else "MOMENTUM CHART • IQ OPTION EM ESPERA"
         elif engine == "FIGURES":
             status = "FIGURES CANDLE • FONTE EM ESPERA" if market == "OPEN" else "FIGURES CANDLE • IQ OPTION EM ESPERA"
         elif engine == "VASILY":
@@ -22251,7 +22276,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "TSI":
             status = "MEGA ULTRA • ANALISANDO" if market == "OPEN" else "MEGA ULTRA • ANALISANDO"
         elif engine == "MOMENTUM":
-            status = "MOMENTUM 14 • FONTE RECONECTANDO" if market == "OPEN" else "MOMENTUM 14 • IQ OPTION RECONECTANDO"
+            status = "MOMENTUM CHART • FONTE RECONECTANDO" if market == "OPEN" else "MOMENTUM CHART • IQ OPTION RECONECTANDO"
         elif engine == "FIGURES":
             status = "FIGURES CANDLE • FONTE RECONECTANDO" if market == "OPEN" else "FIGURES CANDLE • IQ OPTION RECONECTANDO"
         elif engine == "VASILY":
@@ -22464,8 +22489,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "MEGA ULTRA"
             engine_mode = "MEGA_ULTRA_PRIVATE"
         elif engine == "MOMENTUM":
-            engine_title = "MOMENTUM 14"
-            engine_mode = "MOMENTUM14_LEVEL100_CLOSED_NEXT_CANDLE"
+            engine_title = "MOMENTUM CHART"
+            engine_mode = "MOMENTUM_CHART_FIXED_CLOSED_NEXT_CANDLE"
         elif engine == "FIGURES":
             engine_title = "FIGURES CANDLE"
             engine_mode = "FIGURES_CANDLE_EMA5_FIXED_CLOSED_NEXT_CANDLE"
@@ -22611,7 +22636,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "ELCODEX": "LOCAL_ELCODEX_SCALPER_CLOSED_M1",
                     "SHKHA": "LOCAL_SHK_HA_MACD_V103_CLOSED_M1",
                     "TSI": "MEGA_ULTRA_PRIVATE",
-                    "MOMENTUM": "LOCAL_MOMENTUM14_LEVEL100_CLOSED",
+                    "MOMENTUM": "LOCAL_MOMENTUM_CHART_FIXED_CLOSED",
                     "FIGURES": "LOCAL_FIGURES_CANDLE_EMA5_FIXED_CLOSED",
                     "VASILY": "LOCAL_VASILY_PIP_SNIPER_ZL_CLOSED",
                     "PLATINUM": "LOCAL_PLATINUM_WPR_CURRENT_CANDLE",
@@ -23234,7 +23259,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "ELCODEX": "LOCAL_ELCODEX_SCALPER_CLOSED_M1",
                     "SHKHA": "LOCAL_SHK_HA_MACD_V103_CLOSED_M1",
                     "TSI": "MEGA_ULTRA_PRIVATE",
-                    "MOMENTUM": "LOCAL_MOMENTUM14_LEVEL100_CLOSED",
+                    "MOMENTUM": "LOCAL_MOMENTUM_CHART_FIXED_CLOSED",
                     "FIGURES": "LOCAL_FIGURES_CANDLE_EMA5_FIXED_CLOSED",
                     "VASILY": "LOCAL_VASILY_PIP_SNIPER_ZL_CLOSED",
                     "PLATINUM": "LOCAL_PLATINUM_WPR_CURRENT_CANDLE",
@@ -23304,7 +23329,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "SUPER NOVA • RSI3 + S/R + LWMA30 + CORAL/T3 • NEXT CANDLE" if engine == "SUPERNOVA"
                     else "SHK PRO HA + MACD • HA COLOR CHANGE + MACD DIVERGENCE 12/26/5 • NEXT CANDLE" if engine == "SHKHA"
                     else "MEGA ULTRA" if engine == "TSI"
-                    else "MOMENTUM 14 • NÍVEL 100 • NEXT CANDLE" if engine == "MOMENTUM"
+                    else "MOMENTUM CHART • NÍVEL 100 • NEXT CANDLE" if engine == "MOMENTUM"
                     else "FIGURES CANDLE • PADRÕES + EMA5 CORRIGIDA • NEXT CANDLE" if engine == "FIGURES"
                     else "VASILY PIP SNIPER ZL • ZERO-LAG EMA 1/6 • NEXT CANDLE" if engine == "VASILY"
                     else "PLATINUM • WPR ADAPTATIVO • MESMA VELA" if engine == "PLATINUM"
@@ -23617,7 +23642,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     # Depois de 10s da abertura, entrar seria uma vela atrasado e pioraria a leitura.
                     momentum_age = max(0.0, (now() - current_boundary(interval)).total_seconds())
                     if momentum_age > 10.0:
-                        base["status"] = "ONLINE • MOMENTUM 14 • AGUARDANDO PRÓXIMO FECHAMENTO"
+                        base["status"] = "ONLINE • MOMENTUM CHART • AGUARDANDO PRÓXIMO FECHAMENTO"
                         base["reason"] = (
                             "Cruzamento Momentum 14 confirmado, mas a abertura imediatamente seguinte já passou. "
                             "A entrada tardia foi descartada; o motor recalcula no próximo candle fechado."
@@ -23997,7 +24022,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "ELCODEX": "SINAL ELCODEX SCALPER LIBERADO",
                         "SHKHA": "SINAL SHK PRO HA + MACD LIBERADO",
                         "TSI": "SINAL MEGA ULTRA LIBERADO",
-                        "MOMENTUM": "SINAL MOMENTUM 14 LIBERADO",
+                        "MOMENTUM": "SINAL MOMENTUM CHART LIBERADO",
                         "FIGURES": "SINAL FIGURES CANDLE LIBERADO",
                         "VASILY": "SINAL VASILY PIP SNIPER ZL LIBERADO",
                         "PLATINUM": "SINAL PLATINUM • MESMA VELA LIBERADO",
@@ -24293,7 +24318,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "ELCODEX": "LOCAL_ELCODEX_SCALPER_CLOSED_M1",
                     "SHKHA": "LOCAL_SHK_HA_MACD_V103_CLOSED_M1",
                     "TSI": "MEGA_ULTRA_PRIVATE",
-                    "MOMENTUM": "LOCAL_MOMENTUM14_LEVEL100_CLOSED",
+                    "MOMENTUM": "LOCAL_MOMENTUM_CHART_FIXED_CLOSED",
                     "FIGURES": "LOCAL_FIGURES_CANDLE_EMA5_FIXED_CLOSED",
                     "VASILY": "LOCAL_VASILY_PIP_SNIPER_ZL_CLOSED",
                     "PLATINUM": "LOCAL_PLATINUM_WPR_CURRENT_CANDLE",
@@ -28512,7 +28537,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = "IQ_OPTION_OTC"
                     data["feed_label"] = _feed_source_label(data["feed_source"])
                     data["feed_fallback"] = False
-                data["feed_message"] = {"INDICEMENT":"INDICEMENT SMA12/26 usando candles fechados.","GOLDINV":"FOREX GOLD INVESTOR usando PSAR H1 + M15 + M1.","TTMSCALPER":"TTM SCALPER usando confirmação causal de swings.","FOREXMISSION":"FOREX MISSION usando candles fechados.","MONEYARROW":"BINARY MONEYARROW usando pivôs e rejeição em candles fechados.","LIQUIDEX":"LIQUIDEX usando LWMA7 + vela de força fechada.","EUROFX2":"EURO FX2 usando a inclinação do MACD principal 14/26/9 em candles fechados.","EUROFX2TAURUS":"EURO FX2 + Taurus: virada MACD 14/26/9 confirmada por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","ATE":"ATE usando Harvester adaptado + ZeroLag MACD 22/33/9 em candles fechados.","FOREXSTAY":"FOREXSTAY SIGHT usando ZeroLag MACD 12/26/9 em candles fechados.","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + Taurus: cruzamento ZeroLag 12/26/9 confirmado por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","FOREXSTAYPRO":"FOREXSTAY PRO usando ZeroLag 12/26/9 com janela de 3 velas + EMA50 flex + ADX14≥12 + RSI20/80 + corpo≥20% + S/R leve.","FOREXFLEX":"FOREX FLEX usando fractal causal totalmente confirmado em candles fechados.","SENEGALPRO":"SUPER SENEGAL PRO usando PMAX/Z + ADX/DMI com pullback e Price Action em candles fechados.","VALUEMACD":"VALUE CHART + MACD usando Value Chart 5/±8 + ZeroLag MACD 12/26/9 em confluência.","HOLYGRAIL":"HOLY GRAIL FLEX usando Envelopes LWMA 3/0,07% com 2 de 3 confirmações fortes em M1.","BBSTOCH":"BB STOCHRSI X REVERSAL usando Bollinger 20/2 + StochRSI 14/14/3/3, extremos 90/10 e retorno para dentro da banda em candle fechado.","KAMIKAZE":"KAMIKAZE TREND SNIPER usando cruzamento real EMA8/21 + filtro EMA200 + ADX14≥22 + RSI14 em candle fechado.","FOREXMEGA":"FOREX MEGA LLC usando EMA5/9 + MACD8/17/9 + RSI9 + CCI13 + Stoch5/3/3 em confluência 5/5 no M1; M5 é bônus leve.","BROOKYVERTEX":"BROOKY + VERTEX SECOND usando Brooky Stoch14/5/5 + RSI14 FLEX 30/70 e NOVA virada Vertex causal ±6 na mesma vela fechada; próxima vela, sem Gale.","MEGABOT":"MEGA BOT usando EMA 9/21 + estrutura + Combo 3/5 + Brooky FLEX 31/69; 3 confluências independentes na mesma direção + WPR Adaptive 67/33 Risk 3 como filtro direcional; WPR alinhado reforça e WPR contrário bloqueia; neutro não trava; candle fechado, próxima vela, sem Gale.","BROOKYC3":"CONFLUÊNCIA 3 pura usando exatamente Brooky Stoch14/5/5 + RSI Wilder14 FLEX 31/69; sem C1, RD-Combo, Vertex ou WPR; candle fechado, próxima vela, sem Gale.","UTBOT":"UT BOT ALERTS usando trailing stop ATR 1 com Key 2, cruzamento confirmado em candle fechado e entrada na próxima vela; sem Gale.","ONEMINRSI":"ONE MINUTE + RSI usando faixa das últimas 9 velas + zona 30% + RSI Wilder 7 em 30/70; candle fechado e próxima vela; sem Gale.","WPRADAPT":"WPR ADAPTIVE usando níveis 67/33, Risk 3 e período adaptativo 9→3/4; somente candle fechado, entrada na próxima vela, sem Gale.","TINGATINGA":"TINGA TINGA usando RSI 14 Shift 1 por novo evento: cruza >59 CALL / cruza <41 PUT, com rearm em 50; não repete sinal enquanto o RSI permanecer na mesma zona; candle fechado, próxima vela, sem Gale.","SHKHA":"SHK PRO HA + MACD usando mudança de cor Heikin Ashi + divergência MACD 12/26/5 causal confirmada; pré-sinal separado; candle fechado, próxima vela, sem Gale.","TSI":"MEGA ULTRA analisando o mercado com configuração interna protegida.","MOMENTUM":"MOMENTUM 14 usando a fórmula original Close×100/Close[14]; libera somente no cruzamento confirmado do nível 100 em candle fechado, com entrada na próxima vela e sem Gale.","RSIXOVER":"RSI XOVER usando RSI7 x RSI4 no PRICE_WEIGHTED; direção original do 2RSIXover, sem atraso extra, candle fechado e próxima vela, sem Gale.","RSICROSS":"RSI CROSS 6/14 usando RSI Wilder rápido 6 x lento 14; libera somente novo cruzamento confirmado em candle fechado, com entrada na próxima vela e sem Gale.","SESSIONBREAKOUT":"SMART SESSION BREAKOUT usando range 00:00–08:00 Brasília + rompimento de fechamento + corpo mínimo 0,8 ATR14; próxima vela, sem Gale.","STREAKREV":"STREAK REVERSAL: sequência >=2 + 2 opostos fechados, movimento >=1,5 ATR100, rompimento de corpo, filtro de pavio <=40% e EMA100 para classificar. Próxima vela, sem Gale.","ISMAELTRADER":"ISMAEL TRADER: EMA3/7, RSI9 30/70 e ADX21>=20 em vela fechada. Um evento por ativação, cooldown de 2 velas, próxima vela e sem Gale.","RSICHANNEL":"RSI CHANNELS: RSI4 + canais dinâmicos EMA5; saída confirmada das zonas 30/70 em candle fechado, entrada na próxima vela e sem Gale.","MONSTERSMC":"MONSTER SMC: Liquidity Sweep + FVG + Fibonacci 61,8% + confirmação flexível M5/M15 (1 de 2) • M1 fechado • próxima vela • sem Gale.","TRENDLINES":"TRENDLINES MTF FLEX usando gatilho M1/M5, M15 como confirmação leve e H1 só como bônus."}.get(engine, "Motor importado ativo.")
+                data["feed_message"] = {"INDICEMENT":"INDICEMENT SMA12/26 usando candles fechados.","GOLDINV":"FOREX GOLD INVESTOR usando PSAR H1 + M15 + M1.","TTMSCALPER":"TTM SCALPER usando confirmação causal de swings.","FOREXMISSION":"FOREX MISSION usando candles fechados.","MONEYARROW":"BINARY MONEYARROW usando pivôs e rejeição em candles fechados.","LIQUIDEX":"LIQUIDEX usando LWMA7 + vela de força fechada.","EUROFX2":"EURO FX2 usando a inclinação do MACD principal 14/26/9 em candles fechados.","EUROFX2TAURUS":"EURO FX2 + Taurus: virada MACD 14/26/9 confirmada por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","ATE":"ATE usando Harvester adaptado + ZeroLag MACD 22/33/9 em candles fechados.","FOREXSTAY":"FOREXSTAY SIGHT usando ZeroLag MACD 12/26/9 em candles fechados.","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + Taurus: cruzamento ZeroLag 12/26/9 confirmado por Suporte/LTA ou Resistência/LTB em janela de 3 velas.","FOREXSTAYPRO":"FOREXSTAY PRO usando ZeroLag 12/26/9 com janela de 3 velas + EMA50 flex + ADX14≥12 + RSI20/80 + corpo≥20% + S/R leve.","FOREXFLEX":"FOREX FLEX usando fractal causal totalmente confirmado em candles fechados.","SENEGALPRO":"SUPER SENEGAL PRO usando PMAX/Z + ADX/DMI com pullback e Price Action em candles fechados.","VALUEMACD":"VALUE CHART + MACD usando Value Chart 5/±8 + ZeroLag MACD 12/26/9 em confluência.","HOLYGRAIL":"HOLY GRAIL FLEX usando Envelopes LWMA 3/0,07% com 2 de 3 confirmações fortes em M1.","BBSTOCH":"BB STOCHRSI X REVERSAL usando Bollinger 20/2 + StochRSI 14/14/3/3, extremos 90/10 e retorno para dentro da banda em candle fechado.","KAMIKAZE":"KAMIKAZE TREND SNIPER usando cruzamento real EMA8/21 + filtro EMA200 + ADX14≥22 + RSI14 em candle fechado.","FOREXMEGA":"FOREX MEGA LLC usando EMA5/9 + MACD8/17/9 + RSI9 + CCI13 + Stoch5/3/3 em confluência 5/5 no M1; M5 é bônus leve.","BROOKYVERTEX":"BROOKY + VERTEX SECOND usando Brooky Stoch14/5/5 + RSI14 FLEX 30/70 e NOVA virada Vertex causal ±6 na mesma vela fechada; próxima vela, sem Gale.","MEGABOT":"MEGA BOT usando EMA 9/21 + estrutura + Combo 3/5 + Brooky FLEX 31/69; 3 confluências independentes na mesma direção + WPR Adaptive 67/33 Risk 3 como filtro direcional; WPR alinhado reforça e WPR contrário bloqueia; neutro não trava; candle fechado, próxima vela, sem Gale.","BROOKYC3":"CONFLUÊNCIA 3 pura usando exatamente Brooky Stoch14/5/5 + RSI Wilder14 FLEX 31/69; sem C1, RD-Combo, Vertex ou WPR; candle fechado, próxima vela, sem Gale.","UTBOT":"UT BOT ALERTS usando trailing stop ATR 1 com Key 2, cruzamento confirmado em candle fechado e entrada na próxima vela; sem Gale.","ONEMINRSI":"ONE MINUTE + RSI usando faixa das últimas 9 velas + zona 30% + RSI Wilder 7 em 30/70; candle fechado e próxima vela; sem Gale.","WPRADAPT":"WPR ADAPTIVE usando níveis 67/33, Risk 3 e período adaptativo 9→3/4; somente candle fechado, entrada na próxima vela, sem Gale.","TINGATINGA":"TINGA TINGA usando RSI 14 Shift 1 por novo evento: cruza >59 CALL / cruza <41 PUT, com rearm em 50; não repete sinal enquanto o RSI permanecer na mesma zona; candle fechado, próxima vela, sem Gale.","SHKHA":"SHK PRO HA + MACD usando mudança de cor Heikin Ashi + divergência MACD 12/26/5 causal confirmada; pré-sinal separado; candle fechado, próxima vela, sem Gale.","TSI":"MEGA ULTRA analisando o mercado com configuração interna protegida.","MOMENTUM":"MOMENTUM CHART usando a fórmula original Momentum7 + ATR12 + CCI6 + RSI7 + ADX7, controle RSI12/ADX12 e DMI corrigido; candle fechado, próxima vela e sem Gale.","RSIXOVER":"RSI XOVER usando RSI7 x RSI4 no PRICE_WEIGHTED; direção original do 2RSIXover, sem atraso extra, candle fechado e próxima vela, sem Gale.","RSICROSS":"RSI CROSS 6/14 usando RSI Wilder rápido 6 x lento 14; libera somente novo cruzamento confirmado em candle fechado, com entrada na próxima vela e sem Gale.","SESSIONBREAKOUT":"SMART SESSION BREAKOUT usando range 00:00–08:00 Brasília + rompimento de fechamento + corpo mínimo 0,8 ATR14; próxima vela, sem Gale.","STREAKREV":"STREAK REVERSAL: sequência >=2 + 2 opostos fechados, movimento >=1,5 ATR100, rompimento de corpo, filtro de pavio <=40% e EMA100 para classificar. Próxima vela, sem Gale.","ISMAELTRADER":"ISMAEL TRADER: EMA3/7, RSI9 30/70 e ADX21>=20 em vela fechada. Um evento por ativação, cooldown de 2 velas, próxima vela e sem Gale.","RSICHANNEL":"RSI CHANNELS: RSI4 + canais dinâmicos EMA5; saída confirmada das zonas 30/70 em candle fechado, entrada na próxima vela e sem Gale.","MONSTERSMC":"MONSTER SMC: Liquidity Sweep + FVG + Fibonacci 61,8% + confirmação flexível M5/M15 (1 de 2) • M1 fechado • próxima vela • sem Gale.","TRENDLINES":"TRENDLINES MTF FLEX usando gatilho M1/M5, M15 como confirmação leve e H1 só como bônus."}.get(engine, "Motor importado ativo.")
             elif engine == "EA":
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
@@ -29394,7 +29419,7 @@ async def pre_signals(
             return {"ok":True,"engine":"RSICHANNEL","items":[],"seconds_to_entry":remain,"message":f"RSI CHANNELS aguardando dados: {str(exc)[:120]}"}
 
     if engine in ("INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "RSICHANNEL", "MINSCALPER", "RSICROSS", "SESSIONBREAKOUT"):
-        _nm={"INDICEMENT":"INDICEMENT SMA 12/26","GOLDINV":"FOREX GOLD INVESTOR","TTMSCALPER":"TTM SCALPER SWING","FOREXMISSION":"FOREX MISSION","MONEYARROW":"BINARY MONEYARROW","LIQUIDEX":"LIQUIDEX","EUROFX2":"EURO FX2","EUROFX2TAURUS":"EURO FX2 + TAURUS","ATE":"ATE","FOREXSTAY":"FOREXSTAY SIGHT","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + TAURUS","FOREXSTAYPRO":"FOREXSTAY PRO","FOREXFLEX":"FOREX FLEX","SENEGALPRO":"SUPER SENEGAL PRO","VALUEMACD":"VALUE CHART + MACD","HOLYGRAIL":"HOLY GRAIL ORIGINAL","TRENDLINES":"TRENDLINES MTF","BBSTOCH":"BB STOCHRSI X REVERSAL","KAMIKAZE":"KAMIKAZE TREND SNIPER","FOREXMEGA":"FOREX MEGA LLC V10.21","BROOKYVERTEX":"BROOKY + VERTEX FLEX 30/70","MEGABOT":"MEGA BOT","BROOKYC3":"CONFLUÊNCIA 3 • BROOKY FLEX","UTBOT":"UT BOT ALERTS","ONEMINRSI":"ONE MINUTE + RSI","WPRADAPT":"WPR ADAPTIVE","TINGATINGA":"TINGA TINGA RSI 14","SUPERNOVA":"SUPER NOVA","ELCODEX":"ELCODEX SCALPER","TSI":"MEGA ULTRA","MOMENTUM":"MOMENTUM 14","FIGURES":"FIGURES CANDLE","VASILY":"VASILY PIP SNIPER ZL","PLATINUM":"PLATINUM","STREAKREV":"STREAK REVERSAL","ISMAELTRADER":"ISMAEL TRADER","RSICHANNEL":"RSI CHANNELS","RSIXOVER":"RSI XOVER","RSICROSS":"RSI CROSS 6/14","SESSIONBREAKOUT":"SMART SESSION BREAKOUT","MONSTERSMC":"MONSTER SMC"}[engine]
+        _nm={"INDICEMENT":"INDICEMENT SMA 12/26","GOLDINV":"FOREX GOLD INVESTOR","TTMSCALPER":"TTM SCALPER SWING","FOREXMISSION":"FOREX MISSION","MONEYARROW":"BINARY MONEYARROW","LIQUIDEX":"LIQUIDEX","EUROFX2":"EURO FX2","EUROFX2TAURUS":"EURO FX2 + TAURUS","ATE":"ATE","FOREXSTAY":"FOREXSTAY SIGHT","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + TAURUS","FOREXSTAYPRO":"FOREXSTAY PRO","FOREXFLEX":"FOREX FLEX","SENEGALPRO":"SUPER SENEGAL PRO","VALUEMACD":"VALUE CHART + MACD","HOLYGRAIL":"HOLY GRAIL ORIGINAL","TRENDLINES":"TRENDLINES MTF","BBSTOCH":"BB STOCHRSI X REVERSAL","KAMIKAZE":"KAMIKAZE TREND SNIPER","FOREXMEGA":"FOREX MEGA LLC V10.21","BROOKYVERTEX":"BROOKY + VERTEX FLEX 30/70","MEGABOT":"MEGA BOT","BROOKYC3":"CONFLUÊNCIA 3 • BROOKY FLEX","UTBOT":"UT BOT ALERTS","ONEMINRSI":"ONE MINUTE + RSI","WPRADAPT":"WPR ADAPTIVE","TINGATINGA":"TINGA TINGA RSI 14","SUPERNOVA":"SUPER NOVA","ELCODEX":"ELCODEX SCALPER","TSI":"MEGA ULTRA","MOMENTUM":"MOMENTUM CHART","FIGURES":"FIGURES CANDLE","VASILY":"VASILY PIP SNIPER ZL","PLATINUM":"PLATINUM","STREAKREV":"STREAK REVERSAL","ISMAELTRADER":"ISMAEL TRADER","RSICHANNEL":"RSI CHANNELS","RSIXOVER":"RSI XOVER","RSICROSS":"RSI CROSS 6/14","SESSIONBREAKOUT":"SMART SESSION BREAKOUT","MONSTERSMC":"MONSTER SMC"}[engine]
         return {"items":[],"engine":engine,"message":f"{_nm} usa confirmação em candle fechado; o app libera somente a entrada válida para a próxima vela, sem pré-sinal repintável.","non_repaint":True,"gale_signal":False}
     if engine == "LARRY":
         return {
@@ -29610,7 +29635,7 @@ async def pre_signals(
             "ELCODEX": "ELCODEX SCALPER",
             "SHKHA": "SHK PRO HA + MACD",
             "TSI": "MEGA ULTRA",
-            "MOMENTUM": "MOMENTUM 14",
+            "MOMENTUM": "MOMENTUM CHART",
             "FIGURES": "FIGURES CANDLE",
             "VASILY": "VASILY PIP SNIPER ZL",
             "PLATINUM": "PLATINUM",
@@ -30934,9 +30959,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             elif engine == "MOMENTUM":
                 # Radar e sinal oficial usam exatamente o mesmo Momentum 14 puro.
                 tech = momentum14_strategy(closed[-120:], symbol=sym, timeframe=interval, market=market)
-                engine_label = "MOMENTUM 14"
+                engine_label = "MOMENTUM CHART"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why = str(tech.get("reason") or "MOMENTUM 14 monitorando").replace("\n", " ")[:88]
+                why = str(tech.get("reason") or "MOMENTUM CHART monitorando").replace("\n", " ")[:88]
                 momentum_age = max(0.0, (now() - current_boundary(interval)).total_seconds())
                 if direction != "NEUTRO" and momentum_age > 10.0:
                     direction = "NEUTRO"
@@ -31463,7 +31488,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         elif engine == "TSI":
             source_status = "MEGA ULTRA • FONTE EM ESPERA" if market == "OPEN" else "MEGA ULTRA • IQ OPTION OTC EM ESPERA"
         elif engine == "MOMENTUM":
-            source_status = "MOMENTUM 14 • FONTE EM ESPERA" if market == "OPEN" else "MOMENTUM 14 • IQ OPTION OTC EM ESPERA"
+            source_status = "MOMENTUM CHART • FONTE EM ESPERA" if market == "OPEN" else "MOMENTUM CHART • IQ OPTION OTC EM ESPERA"
         elif engine == "FIGURES":
             source_status = "FIGURES CANDLE • FONTE EM ESPERA" if market == "OPEN" else "FIGURES CANDLE • IQ OPTION OTC EM ESPERA"
         elif engine == "RSICHANNEL":
@@ -33723,7 +33748,7 @@ if(figuresEnabled){
   }catch(_){}
 }
 
-// MOMENTUM 14 é exclusivo quando salvo ONLINE.
+// MOMENTUM CHART é exclusivo quando salvo ONLINE.
 if(momentumEnabled){
   rsiCrossEnabled=false; vasilyEnabled=false; platinumEnabled=false; figuresEnabled=false;
   aiEnabled=false; localAnalystEnabled=false; localAnalystFlexEnabled=false; megaMasterEnabled=false; monsterSmcEnabled=false; tsiEnabled=false; robotEnabled=false;
@@ -35083,7 +35108,7 @@ function normalizeEngineKey(value){
   if(e==='TINGATINGA' || e.includes('TINGA TINGA') || e.includes('TINGA_TINGA')) return 'TINGATINGA';
   if(e==='SUPERNOVA' || e.includes('SUPER NOVA') || e.includes('SUPER_NOVA')) return 'SUPERNOVA';
   if(e==='SHKHA' || e.includes('SHK PRO HA') || e.includes('SHK_HA')) return 'SHKHA';
-  if(e==='MOMENTUM' || e.includes('MOMENTUM 14') || e.includes('LOCAL_MOMENTUM14')) return 'MOMENTUM';
+  if(e==='MOMENTUM' || e.includes('MOMENTUM CHART') || e.includes('LOCAL_MOMENTUM14')) return 'MOMENTUM';
   if(e==='FIGURES' || e.includes('FIGURES CANDLE') || e.includes('LOCAL_FIGURES_CANDLE')) return 'FIGURES';
   if(e==='VASILY' || e.includes('VASILY PIP SNIPER') || e.includes('LOCAL_VASILY')) return 'VASILY';
   if(e==='PLATINUM' || e.includes('PLATINUM_WPR') || e.includes('LOCAL_PLATINUM')) return 'PLATINUM';
@@ -35117,7 +35142,7 @@ function momentStudyEngineName(key){
     SMART:'💬 CHATGPT ANALISTA',
     LOCALANALYST:'🤖 MEGA BOT',
     LOCALANALYSTFLEX:'🤖 MEGA BOT FLEX',
-    MEGAMASTER:'🧠 MEGA MASTER',MONSTERSMC:'👾 MONSTER SMC',TSI:'⚡ MEGA ULTRA',MOMENTUM:'⚡ MOMENTUM 14',FIGURES:'🕯️ FIGURES CANDLE',VASILY:'🎯 VASILY PIP SNIPER ZL',PLATINUM:'💎 PLATINUM',RSICROSS:'🔀 RSI CROSS 6/14',
+    MEGAMASTER:'🧠 MEGA MASTER',MONSTERSMC:'👾 MONSTER SMC',TSI:'⚡ MEGA ULTRA',MOMENTUM:'⚡ MOMENTUM CHART',FIGURES:'🕯️ FIGURES CANDLE',VASILY:'🎯 VASILY PIP SNIPER ZL',PLATINUM:'💎 PLATINUM',RSICROSS:'🔀 RSI CROSS 6/14',
     RTM:'🤖 RTM MULTI + TAURUS',
     LARRY:'⚡ LARRY BREAKOUT + TAURUS',
     VELOCITY:'⚡ VELOCITY FLOW',
@@ -38279,7 +38304,7 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Mega Ultra analisando o mercado...</div>';
     rad();
   }else if(engine==='MOMENTUM'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOMENTUM 14 ONLINE • NÍVEL 100 • CANDLE FECHADO • PRÓXIMA VELA • SEM GALE';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOMENTUM CHART ONLINE • MOM7 + ATR12 + CCI6 + RSI7 + ADX7 • CANDLE FECHADO • PRÓXIMA VELA • SEM GALE';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Momentum 14 selecionado • CALL somente ao cruzar 100 para cima • PUT somente ao cruzar 100 para baixo • sem pré-sinal repintável.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar Momentum 14 ativo • procurando novo cruzamento confirmado do nível 100</div>';
     rad();
@@ -40340,7 +40365,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='MINSCALPER'?'1 MINUTE SCALPER':ek==='RSICHANNEL'?'RSI CHANNELS':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI CROSS 6/14':ek==='MOMENTUM'?'MOMENTUM 14':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='MINSCALPER'?'1 MINUTE SCALPER':ek==='RSICHANNEL'?'RSI CHANNELS':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI CROSS 6/14':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
