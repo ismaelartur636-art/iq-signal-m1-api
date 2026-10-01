@@ -42,8 +42,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.07"
+APP_VERSION = "3.97.08"
 # MEGA IA 3.97.06 — corrige painel sem controle: declara estado ISMAEL 98 antes da inicialização JS e restaura botões ON/OFF.
+# MEGA IA 3.97.08 — completa 4 PERIOD RSI PRO: status/radar próprios e adaptador causal no Backtest 48H.
 # MEGA IA 3.97.07 — registra RSI4PERIOD em /signal, /signal-ai e /radar; corrige “Motor inválido”.
 # MEGA IA 3.97.05 — adiciona 4 PERIOD RSI PRO corrigido: RSI9 M5/M15/M30/H1, PRICE_TYPICAL, alinhamento temporal, candle fechado, confluência 3/4 e evento único.
 # MEGA IA 3.97.04 — adiciona ISMAEL 98 como motor seletivo separado: EMA21/50 + RSI14 + ADX14/DMI + ATR + força da vela + S/R, próxima vela, sem Gale.
@@ -28202,7 +28203,7 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
 # -----------------------------------------------------------------------------
 _BACKTEST48_SUPPORTED = {
     "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER",
-    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "MINSCALPER", "MOMENTUM",
+    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "MINSCALPER", "MOMENTUM", "RSI4PERIOD",
 }
 _BACKTEST48_NAMES = {
     "SMART": "CHATGPT ANALISTA",
@@ -38597,6 +38598,11 @@ function applyRobotPowerState(){
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">💬 ChatGPT Analista selecionado • indicadores locais são contexto; a decisão oficial vem do ChatGPT.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar ChatGPT ativo • analisando candles e procurando CALL/PUT para a próxima vela</div>';
     rad();
+  }else if(engine==='RSI4PERIOD'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='4 PERIOD RSI PRO ONLINE • M1 • M5/M15/M30/H1 • CONFLUÊNCIA 3/4';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🎯 4 Period RSI Pro selecionado • RSI9 Typical Price • M5/M15/M30/H1 • exige 3 de 4 • candle fechado • próxima vela.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar 4 Period RSI Pro ativo • aguardando confluência 3/4 dos RSIs MTF</div>';
+    rad();
   }else if(engine==='GRAPH_AI'){
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA GRÁFICA ONLINE • PADRÕES + H1 + DOW H4 + LTA/LTB';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Gráfica selecionada.</div>';
@@ -40641,7 +40647,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='MINSCALPER'?'1 MINUTE SCALPER':ek==='RSICHANNEL'?'RSI CHANNELS':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI CROSS 6/14':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='MINSCALPER'?'1 MINUTE SCALPER':ek==='RSICHANNEL'?'RSI CHANNELS':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI CROSS 6/14':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
