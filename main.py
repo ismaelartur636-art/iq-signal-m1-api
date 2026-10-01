@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.96.98"
+APP_VERSION = "3.96.99"
+# MEGA IA 3.96.99 — ISMAEL TRADER: controle de quantidade 1–10 (padrão 5) no painel; 1 MINUTE SCALPER removido do painel e bloqueado no motor.
 # MEGA IA 3.96.98 — deixa explícito que o Backtest 48H é SIMULAÇÃO histórica e não log de sinais enviados ao app.
 # MEGA IA 3.96.97 — Backtest 48H com recuperação nos 2 sinais seguintes + nome correto do motor no histórico.
 # MEGA IA 3.96.95 — ISMAEL TRADER: perfil FLEX controlado (RSI9 35/65, memória 4 candles, ADX21>=18), análise 24h no servidor mesmo com tela apagada e ativo selecionado priorizado no bot de fundo.
@@ -14362,6 +14363,9 @@ def _lwma_endpoint(values, period, end_index=None):
     return sum(float(values[start+j])*(j+1) for j in range(period))/den
 
 def one_minute_scalper_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
+    # 3.96.99: indicador removido; mantém compatibilidade sem executar análise/sinal.
+    return {"available":False,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"engine":"MINSCALPER","provider":"REMOVED_3_96_99","reason":"1 MINUTE SCALPER removido do app."}
+    
     rows=list(cs or [])[-320:]
     live_snapshot=bool(allow_prealert and not current_candle_closed)
     base={
@@ -14641,6 +14645,24 @@ ISMAEL_RSI_LOW = 35.0
 ISMAEL_RSI_HIGH = 65.0
 ISMAEL_RSI_MEMORY_BARS = 4
 ISMAEL_ADX_MIN = 18.0
+# 3.96.99 — nível 1..10 controla frequência do ISMAEL TRADER; 5 preserva o perfil 3.96.95.
+ISMAEL_SIGNAL_LEVEL = 5
+def _ismael_level_profile():
+    level=max(1,min(10,int(ISMAEL_SIGNAL_LEVEL)))
+    # Interpolação controlada: níveis baixos = mais seletivo; altos = mais sinais.
+    rsi_low=30.0 + (level-1)*(12.0/9.0)
+    rsi_high=70.0 - (level-1)*(12.0/9.0)
+    memory=max(2,min(7,round(2+(level-1)*(5.0/9.0))))
+    adx_min=22.0 - (level-1)*(8.0/9.0)
+    if level==5: return {"level":5,"rsi_low":35.0,"rsi_high":65.0,"memory":4,"adx_min":18.0}
+    return {"level":level,"rsi_low":round(rsi_low,1),"rsi_high":round(rsi_high,1),"memory":memory,"adx_min":round(adx_min,1)}
+
+@app.get("/ismael-signal-level")
+async def ismael_signal_level(level: int | None = None):
+    global ISMAEL_SIGNAL_LEVEL
+    if level is not None:
+        ISMAEL_SIGNAL_LEVEL=max(1,min(10,int(level)))
+    return {"ok":True,**_ismael_level_profile()}
 
 
 def _ismael_trader_indicator_series(rows, fast=3, slow=7, rsi_period=9, adx_period=21):
@@ -14716,6 +14738,8 @@ def _ismael_trader_indicator_series(rows, fast=3, slow=7, rsi_period=9, adx_peri
 def ismael_trader_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
     rows=list(cs or [])[-320:]
     live_snapshot=bool(allow_prealert and not current_candle_closed)
+    _profile=_ismael_level_profile()
+    _rsi_low=float(_profile["rsi_low"]); _rsi_high=float(_profile["rsi_high"]); _memory=int(_profile["memory"]); _adx_min=float(_profile["adx_min"])
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
           "strategy":"ISMAEL TRADER • EMA3/7 + RSI9 + ADX21",
           "engine":"ISMAELTRADER","provider":("LOCAL_ISMAEL_EMA_RSI_ADX_EARLY20" if live_snapshot else "LOCAL_ISMAEL_EMA_RSI_ADX_CLOSED"),
@@ -14747,12 +14771,12 @@ def ismael_trader_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
         # estrutura do ISMAEL TRADER, mas aceitamos RSI 35/65 visto nos últimos
         # 4 candles e ADX>=18. Cruzamento EMA pode disparar com a direção da EMA;
         # em tendência contínua, DMI ainda precisa concordar para filtrar ruído.
-        j0=max(0,i-(ISMAEL_RSI_MEMORY_BARS-1))
+        j0=max(0,i-(_memory-1))
         rsi_recent=rs[j0:i+1]
-        recent_oversold=any((v is not None and v<=ISMAEL_RSI_LOW) for v in rsi_recent)
-        recent_overbought=any((v is not None and v>=ISMAEL_RSI_HIGH) for v in rsi_recent)
-        buy=(cross_buy or trend_buy) and recent_oversold and adxs[i]>=ISMAEL_ADX_MIN
-        sell=(cross_sell or trend_sell) and recent_overbought and adxs[i]>=ISMAEL_ADX_MIN
+        recent_oversold=any((v is not None and v<=_rsi_low) for v in rsi_recent)
+        recent_overbought=any((v is not None and v>=_rsi_high) for v in rsi_recent)
+        buy=(cross_buy or trend_buy) and recent_oversold and adxs[i]>=_adx_min
+        sell=(cross_sell or trend_sell) and recent_overbought and adxs[i]>=_adx_min
         triggered=(buy and not previous_buy and not sell) or (sell and not previous_sell and not buy)
         fired=None
         if triggered and (i-last_event)>ISMAEL_COOLDOWN_BARS:
@@ -14764,21 +14788,21 @@ def ismael_trader_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
                          "rsi9":round(rs[i],2),"adx21":round(adxs[i],2),
                          "plus_di":round(pdi[i],2),"minus_di":round(mdi[i],2),
                          "cross_buy":cross_buy,"cross_sell":cross_sell,
-                         "recent_oversold_4bars":bool(recent_oversold),
-                         "recent_overbought_4bars":bool(recent_overbought),
-                         "rsi_low":ISMAEL_RSI_LOW,"rsi_high":ISMAEL_RSI_HIGH,
-                         "adx_min":ISMAEL_ADX_MIN,
+                         "recent_oversold":bool(recent_oversold),
+                         "recent_overbought":bool(recent_overbought),
+                         "rsi_low":_rsi_low,"rsi_high":_rsi_high,
+                         "adx_min":_adx_min,
                          "raw_buy":bool(buy),"raw_sell":bool(sell),
-                         "cooldown_bars":ISMAEL_COOLDOWN_BARS}
+                         "cooldown_bars":ISMAEL_COOLDOWN_BARS,"signal_level":_profile["level"],"memory_bars":_memory}
     if not fired:
         phase=("janela 20s" if live_snapshot else "candle fechado")
-        return {**base,"confidence":0.0,"reason":f"ISMAEL TRADER monitorando ({phase}) • aguardando EMA3/7 + RSI9 35/65 visto nos últimos 4 candles + ADX21>=18; sem sinais repetidos.","diagnostics":latest_diag}
-    val=latest_diag.get('adx21',ISMAEL_ADX_MIN)
-    score=round(min(91.0,78.0+max(0.0,val-ISMAEL_ADX_MIN)*0.65),1)
+        return {**base,"confidence":0.0,"reason":f"ISMAEL TRADER monitorando ({phase}) • aguardando EMA3/7 + RSI9 ajustável + ADX21 (nível {_profile["level"]}); sem sinais repetidos.","diagnostics":latest_diag}
+    val=latest_diag.get('adx21',_adx_min)
+    score=round(min(91.0,78.0+max(0.0,val-_adx_min)*0.65),1)
     stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or '')
     timing=(f"snapshot oficial nos {ISMAEL_EARLY_SIGNAL_SECONDS}s finais" if live_snapshot else "vela fechada")
     return {**base,"direction":fired,"confidence":score,"confirmed":True,
-            "risk":"MEDIUM","reason":f"{fired} ISMAEL TRADER • EMA3/7 + RSI9 35/65 recente + ADX21>=18 validado no {timing}; entrada na próxima vela; sem Gale.",
+            "risk":"MEDIUM","reason":f"{fired} ISMAEL TRADER • EMA3/7 + RSI9/ADX ajustáveis (nível {_profile["level"]}) validado no {timing}; entrada na próxima vela; sem Gale.",
             "event_key":f"ISMAELTRADER:{fired}:{stamp}","diagnostics":latest_diag,
             "early_signal_locked":live_snapshot,"signal_snapshot":("FORMING_CANDLE_AT_20S" if live_snapshot else "LAST_CLOSED_CANDLE")}
 
@@ -32471,7 +32495,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-title">🎯 ISMAEL TRADER</div>
       <div class="robot-mode-desc" id="ismaelTraderModeDesc">EMA 3/7 + RSI 9 (30/70) + ADX 21 mínimo 20 • novo evento após vela fechada • entrada na próxima vela • sem Gale.</div>
     </div>
-    <button id="ismaelTraderPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+    <div style="display:flex;flex-direction:column;gap:7px;align-items:center">
+      <button id="ismaelTraderPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+      <div style="display:flex;align-items:center;gap:8px" title="1 = menos sinais / 10 = mais sinais">
+        <button id="ismaelLevelMinus" type="button" style="font-weight:1000;min-width:42px">➖</button>
+        <span id="ismaelLevelValue" style="font-size:22px;font-weight:1000;min-width:28px;text-align:center">5</span>
+        <button id="ismaelLevelPlus" type="button" style="font-weight:1000;min-width:42px">➕</button>
+      </div>
+      <div style="font-size:11px;opacity:.75">1 MENOS • 5 PADRÃO • 10 MAIS</div>
+    </div>
   </div>
 
   <div class="robot-mode-card" id="rsiChannelsModeCard">
@@ -32481,15 +32513,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-desc" id="rsiChannelsModeDesc">RSI 4 + canais dinâmicos suavizados 5 • reentrada 30/70 em candle fechado • entrada na próxima vela • sem Gale.</div>
     </div>
     <button id="rsiChannelsPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-  <div class="robot-mode-card" id="minScalperModeCard">
-    <img src="__MEGA_IMAGE__" alt="1 Minute Scalper">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">⚡ 1 MINUTE SCALPER</div>
-      <div class="robot-mode-desc" id="minScalperModeDesc">13 LWMAs no preço típico • novo alinhamento completo em M1 fechado • entrada na próxima vela • rearm obrigatório • sem Gale.</div>
-    </div>
-    <button id="minScalperPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
   <div class="card" id="backtest48Card" style="margin-top:14px;border-color:#2f86ff">
@@ -40899,7 +40922,25 @@ try{
   fillSymbols();
 }
 
+
+let ismaelSignalLevel=5;
+async function setIsmaelSignalLevel(v){
+  ismaelSignalLevel=Math.max(1,Math.min(10,Number(v)||5));
+  const el=document.getElementById('ismaelLevelValue'); if(el) el.textContent=String(ismaelSignalLevel);
+  try{ localStorage.setItem('mega_ismael_signal_level',String(ismaelSignalLevel)); }catch(_){}
+  try{ const r=await fetch('/ismael-signal-level?level='+ismaelSignalLevel,{cache:'no-store'}); const d=await r.json(); if(d&&d.level){ismaelSignalLevel=d.level;if(el)el.textContent=String(d.level);} }catch(_){}
+}
+try{ismaelSignalLevel=Math.max(1,Math.min(10,Number(localStorage.getItem('mega_ismael_signal_level')||5)));}catch(_){}
+setTimeout(()=>{
+ const v=document.getElementById('ismaelLevelValue'); if(v)v.textContent=String(ismaelSignalLevel);
+ const mn=document.getElementById('ismaelLevelMinus'); const pl=document.getElementById('ismaelLevelPlus');
+ if(mn)mn.onclick=()=>setIsmaelSignalLevel(ismaelSignalLevel-1);
+ if(pl)pl.onclick=()=>setIsmaelSignalLevel(ismaelSignalLevel+1);
+ setIsmaelSignalLevel(ismaelSignalLevel);
+},0);
+
 async function bootApp(){
+  minScalperEnabled=false; try{localStorage.setItem('mega_min_scalper_power','OFFLINE');}catch(_){}
   syncMarketFromBroker();
   applyAppPowerState();
   applyRobotPowerState();
