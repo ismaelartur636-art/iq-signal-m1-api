@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.20"
+APP_VERSION = "3.97.21"
+# MEGA IA 3.97.21 — MEMORY FUSION: Espelho 24H + sequência 3 velas + similaridade OHLC + EMA9/21 + RSI14 + S/R + ATR; substitui SUPPLY DEMAND no segundo card; candle fechado, próxima M1, sem Gale.
 # MEGA IA 3.97.19 — corrige seleção/backtest do SUPPLY DEMAND; substitui o segundo RSI (RSICHANNEL2) por SUPPLY DEMAND [ORT] v3: zonas confirmadas, CALL em demanda, PUT em oferta, expiração M1.
 # MEGA IA 3.97.16 — dois motores RSI independentes: MEGA FÚRIA (M5 → próxima M1) e MEGA BOT (M5 → +2min → expira M1).
 # MEGA IA 3.97.15 — RSI CHANNELS: leitura M5; pré-alerta na janela oficial de 20s; entrada exatamente 2 minutos após o pré-alerta; expiração M1 (60s).
@@ -14629,67 +14630,170 @@ def one_minute_scalper_strategy(cs, symbol="EUR/USD", timeframe="1min", market="
 # ignora os 5 candles mais recentes para formar zonas e dispara quando o fechamento
 # entra numa zona válida. Somente candles fechados => sem look-ahead no sinal ao vivo.
 def supply_demand_ort_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    rows=list(cs or [])[-320:]
+    """MEMORY FUSION — motor causal de memória de mercado.
+
+    Mantém o identificador RSICHANNEL2 para preservar toda a infraestrutura da v3.97.20,
+    mas substitui a lógica antiga Supply/Demand. Usa somente candles já fechados.
+    """
+    rows=list(cs or [])
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
-          "strategy":"SUPPLY DEMAND • [ORT] v3 • ZONAS CONFIRMADAS • EXPIRA M1",
-          "engine":"RSICHANNEL2","provider":"LOCAL_ORT_SUPPLY_DEMAND_V3",
+          "strategy":"MEMORY FUSION • ESPELHO 24H + SEQUÊNCIA + CONFLUÊNCIAS • EXPIRA M1",
+          "engine":"RSICHANNEL2","provider":"LOCAL_MEMORY_FUSION_V1",
           "risk":"HIGH","closed_candles_only":True,"non_repaint":True,
           "next_candle_entry":True,"expiry_seconds":60,"expiry_candles":1,
           "direct_win_only":True,"gale_signal":False,"martingale":False,
           "confidence_is_probability":False}
-    if len(rows)<35:
-        return {**base,"reason":f"SUPPLY DEMAND: coletando candles ({len(rows)}/35)."}
+    if len(rows) < 40:
+        return {**base,"reason":f"MEMORY FUSION: coletando candles ({len(rows)}/40)."}
+
+    def _dt(x):
+        v=x.get("datetime") or x.get("timestamp")
+        if isinstance(v, datetime):
+            return v.astimezone(BR_TZ) if v.tzinfo else v.replace(tzinfo=BR_TZ)
+        if isinstance(v,(int,float)):
+            return datetime.fromtimestamp(float(v),tz=BR_TZ)
+        z=str(v or "").replace("Z","+00:00")
+        try:
+            d=datetime.fromisoformat(z)
+            return d.astimezone(BR_TZ) if d.tzinfo else d.replace(tzinfo=BR_TZ)
+        except Exception:
+            return None
+
     try:
-        H=[float(x['high']) for x in rows]; L=[float(x['low']) for x in rows]
-        C=[float(x['close']) for x in rows]
-        n=len(rows)
-        tr=[]
-        for i in range(n):
-            pc=C[i-1] if i else C[i]
-            tr.append(max(H[i]-L[i],abs(H[i]-pc),abs(L[i]-pc)))
-        def atr7(i):
-            a=max(0,i-6); v=tr[a:i+1]
-            return sum(v)/max(1,len(v))
-        # Fractal rápido confirmado: 3 candles de cada lado. O MQ4 usa fator 3.
-        up=[False]*n; dn=[False]*n
-        for i in range(3,n-3):
-            up[i]=H[i]>=max(H[i-3:i]+H[i+1:i+4])
-            dn[i]=L[i]<=min(L[i-3:i]+L[i+1:i+4])
-        zones=[]
-        # Igual ao original: zonas candidatas ignoram os 5 candles mais recentes.
-        for i in range(7,n-5):
-            atr=atr7(i); fu=(atr/2.0)*0.5
-            if fu<=0: continue
-            if up[i]:
-                hi=H[i]+fu
-                lo=max(min(C[i],H[i]-fu),H[i]-2.0*fu)
-                # invalida se houve dois rompimentos posteriores acima da zona
-                bust=sum(1 for j in range(i+1,n) if H[j]>hi)
-                if bust<2: zones.append((lo,hi,'PUT',i))
-            if dn[i]:
-                lo=L[i]-fu
-                hi=min(max(C[i],L[i]+fu),L[i]+2.0*fu)
-                bust=sum(1 for j in range(i+1,n) if L[j]<lo)
-                if bust<2: zones.append((lo,hi,'CALL',i))
-        px=C[-1]
-        touched=[z for z in zones if z[0] <= px < z[1]]
-        if not touched:
-            return {**base,"reason":"SUPPLY DEMAND monitorando • preço fora das zonas confirmadas de oferta/demanda.",
-                    "diagnostics":{"zones":len(zones),"price":px,"atr7":round(atr7(n-1),8)}}
-        # Prefere a zona mais recente quando houver sobreposição.
-        lo,hi,direction,origin=max(touched,key=lambda z:z[3])
-        width=max(hi-lo,1e-12); center=(lo+hi)/2.0
-        edge=min(1.0,abs(px-center)/(width/2.0))
-        score=round(min(90.0,78.0+(1.0-edge)*10.0),1)
-        kind='DEMANDA/SUPORTE' if direction=='CALL' else 'OFERTA/RESISTÊNCIA'
-        stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or '')
+        clean=[]
+        for x in rows:
+            d=_dt(x)
+            if d is None: continue
+            y=dict(x); y["_dt"]=d
+            for k in ("open","high","low","close"):
+                y[k]=float(y[k])
+            clean.append(y)
+        clean.sort(key=lambda x:x["_dt"])
+        if len(clean)<40:
+            return {**base,"reason":"MEMORY FUSION: aguardando histórico válido."}
+
+        cur=clean[-1]
+        target_dt=cur["_dt"] + timedelta(minutes=1)  # próxima M1 que receberá a entrada
+
+        # Referências do MESMO minuto em dias anteriores. Se o feed carregado tiver
+        # 3/5/7 dias, todos entram no score; se não tiver, o motor informa a cobertura.
+        refs=[]
+        by_min={(x["_dt"].date(),x["_dt"].hour,x["_dt"].minute):i for i,x in enumerate(clean)}
+        for days in range(1,8):
+            td=target_dt-timedelta(days=days)
+            idx=by_min.get((td.date(),td.hour,td.minute))
+            if idx is not None:
+                x=clean[idx]
+                if x["close"]!=x["open"]:
+                    refs.append((days,idx,"CALL" if x["close"]>x["open"] else "PUT"))
+
+        if not refs:
+            return {**base,"reason":"MEMORY FUSION: aguardando a vela do mesmo minuto de ontem/histórico.",
+                    "diagnostics":{"target":target_dt.strftime("%d/%m %H:%M"),"history_days_loaded":0}}
+
+        # Ontem recebe maior peso; depois 2..7 dias recebem peso decrescente.
+        weights={1:4.0,2:2.0,3:1.8,4:1.5,5:1.3,6:1.1,7:1.0}
+        hist_call=sum(weights[d] for d,_,side in refs if side=="CALL")
+        hist_put=sum(weights[d] for d,_,side in refs if side=="PUT")
+        hist_dir="CALL" if hist_call>hist_put else ("PUT" if hist_put>hist_call else "NEUTRO")
+        hist_total=max(1e-9,hist_call+hist_put)
+        hist_strength=abs(hist_call-hist_put)/hist_total
+
+        # Similaridade das 3 velas imediatamente anteriores de hoje com as 3 anteriores
+        # ao minuto espelhado de ontem. Cor, corpo, pavios e range são comparados.
+        sim_score=0.0; sim_parts=0
+        yesterday=next((r for r in refs if r[0]==1),None)
+        if yesterday and yesterday[1]>=3 and len(clean)>=4:
+            yi=yesterday[1]
+            now3=clean[-3:]
+            old3=clean[yi-3:yi]
+            for a,b in zip(now3,old3):
+                ar=max(a["high"]-a["low"],1e-12); br=max(b["high"]-b["low"],1e-12)
+                acol=1 if a["close"]>a["open"] else (-1 if a["close"]<a["open"] else 0)
+                bcol=1 if b["close"]>b["open"] else (-1 if b["close"]<b["open"] else 0)
+                body_a=abs(a["close"]-a["open"])/ar; body_b=abs(b["close"]-b["open"])/br
+                up_a=(a["high"]-max(a["open"],a["close"]))/ar
+                up_b=(b["high"]-max(b["open"],b["close"]))/br
+                lo_a=(min(a["open"],a["close"])-a["low"])/ar
+                lo_b=(min(b["open"],b["close"])-b["low"])/br
+                one=(0.45 if acol==bcol else 0.0)
+                one+=0.25*max(0.0,1.0-abs(body_a-body_b))
+                one+=0.15*max(0.0,1.0-abs(up_a-up_b))
+                one+=0.15*max(0.0,1.0-abs(lo_a-lo_b))
+                sim_score+=one; sim_parts+=1
+        similarity=(sim_score/max(1,sim_parts))
+
+        closes=[x["close"] for x in clean]
+        def ema(vals,p):
+            k=2.0/(p+1.0); e=vals[0]
+            for v in vals[1:]: e=v*k+e*(1-k)
+            return e
+        ema9=ema(closes[-80:],9); ema21=ema(closes[-100:],21)
+        trend="CALL" if ema9>ema21 else ("PUT" if ema9<ema21 else "NEUTRO")
+
+        # RSI14 de Wilder
+        dif=[closes[i]-closes[i-1] for i in range(max(1,len(closes)-40),len(closes))]
+        gains=[max(0.0,d) for d in dif]; losses=[max(0.0,-d) for d in dif]
+        ag=sum(gains[-14:])/max(1,len(gains[-14:])); al=sum(losses[-14:])/max(1,len(losses[-14:]))
+        rsi=100.0 if al<=1e-12 else 100.0-(100.0/(1.0+ag/al))
+
+        recent=clean[-25:]
+        support=min(x["low"] for x in recent[:-1]); resistance=max(x["high"] for x in recent[:-1])
+        ranges=[max(x["high"]-x["low"],1e-12) for x in recent]
+        atr=sum(ranges[-14:])/max(1,len(ranges[-14:]))
+        px=cur["close"]
+        near_support=(px-support)<=0.35*atr
+        near_resistance=(resistance-px)<=0.35*atr
+
+        call=0.0; put=0.0
+        # Memória histórica é o núcleo.
+        call += 46.0*(hist_call/hist_total); put += 46.0*(hist_put/hist_total)
+        # Similaridade só reforça a direção histórica; nunca cria direção sozinha.
+        if hist_dir=="CALL": call += 18.0*similarity
+        elif hist_dir=="PUT": put += 18.0*similarity
+        # Tendência atual.
+        if trend=="CALL": call+=12.0
+        elif trend=="PUT": put+=12.0
+        # RSI: confirmação moderada e trava de extremo.
+        if 50<=rsi<=72: call+=8.0
+        if 28<=rsi<50: put+=8.0
+        if rsi>=78: call-=10.0
+        if rsi<=22: put-=10.0
+        # S/R recente.
+        if near_support: call+=8.0; put-=4.0
+        if near_resistance: put+=8.0; call-=4.0
+        # Força da última vela fechada.
+        lr=max(cur["high"]-cur["low"],1e-12)
+        body=abs(cur["close"]-cur["open"])/lr
+        last_dir="CALL" if cur["close"]>cur["open"] else ("PUT" if cur["close"]<cur["open"] else "NEUTRO")
+        if body>=0.55:
+            if last_dir=="CALL": call+=8.0
+            elif last_dir=="PUT": put+=8.0
+
+        direction="CALL" if call>put else ("PUT" if put>call else "NEUTRO")
+        edge=abs(call-put)
+        score=round(min(95.0,50.0+edge*0.65),1)
+        confirmed=direction in ("CALL","PUT") and hist_dir==direction and edge>=12.0 and hist_strength>=0.18
+
+        diag={"target":target_dt.strftime("%d/%m %H:%M"),
+              "history_days_loaded":len(refs),
+              "history_votes":[{"days_ago":d,"direction":side} for d,_,side in refs],
+              "history_direction":hist_dir,"history_strength":round(hist_strength,3),
+              "sequence_similarity":round(similarity,3),"ema9":round(ema9,8),"ema21":round(ema21,8),
+              "trend":trend,"rsi14":round(rsi,2),"atr14":round(atr,8),
+              "near_support":near_support,"near_resistance":near_resistance,
+              "last_body_ratio":round(body,3),"call_score":round(call,2),"put_score":round(put,2),
+              "future_leak":False}
+        if not confirmed:
+            return {**base,"reason":f"MEMORY FUSION monitorando • histórico {hist_dir} • score CALL {call:.1f} x PUT {put:.1f} • aguardando confluência.",
+                    "diagnostics":diag}
+        stamp=cur["_dt"].isoformat()
         return {**base,"direction":direction,"confidence":score,"confirmed":True,"risk":"MEDIUM",
-                "reason":f"SUPPLY DEMAND: preço entrou em zona confirmada de {kind} • {direction} • expiração M1.",
-                "event_key":f"SUPPLYDEMAND:{direction}:{origin}:{stamp}",
-                "diagnostics":{"zone_low":round(lo,8),"zone_high":round(hi,8),"zone_origin":origin,
-                               "zones":len(zones),"price":px,"atr7":round(atr7(n-1),8),"fuzzfactor":0.5}}
+                "reason":f"MEMORY FUSION: Espelho/Histórico + sequência + mercado atual confirmam {direction} para {target_dt.strftime('%H:%M')} • expiração M1.",
+                "event_key":f"MEMORYFUSION:{symbol}:{direction}:{target_dt.strftime('%Y%m%d%H%M')}:{stamp}",
+                "diagnostics":diag}
     except (KeyError,TypeError,ValueError,OverflowError,ZeroDivisionError):
-        return {**base,"reason":"SUPPLY DEMAND: aguardando candles válidos."}
+        return {**base,"reason":"MEMORY FUSION: aguardando candles válidos."}
 
 # MEGA IA 3.96.87 — RSI WITH CHANNELS (MQ4 corrigido, versão 1.10).
 # Parâmetros originais PRESERVADOS: RSI4, smoothing EMA 5, 70/30 e neutros 55/45.
@@ -22288,7 +22392,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             # MEGA MASTER precisa de pelo menos 210 candles FECHADOS. Como o
             # roteador devolve também a vela em formação, pedimos 320 para dar
             # folga ao aquecimento, à EMA200 e às leituras estruturais do MASTER.
-            if engine in ("MEGAMASTER", "MONSTERSMC", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER"):
+            if engine == "RSICHANNEL2":
+                request_n = 1600
+            elif engine in ("MEGAMASTER", "MONSTERSMC", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "MINSCALPER"):
                 request_n = 320
             elif engine in ("KAMIKAZE", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "SESSIONBREAKOUT", "MONSTERSMC"):
                 request_n = 260
@@ -22714,7 +22820,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "ISMAEL 98"
             engine_mode = "ISMAEL98_SELECTIVE_CONFLUENCE_NEXT_CANDLE"
         elif engine in ("RSICHANNEL", "RSICHANNEL2"):
-            engine_title = "MEGA FÚRIA" if engine == "RSICHANNEL" else "SUPPLY DEMAND"
+            engine_title = "MEGA FÚRIA" if engine == "RSICHANNEL" else "MEMORY FUSION"
             engine_mode = "RSI4_M5_NEXT_M1" if engine == "RSICHANNEL" else "ORT_SUPPLY_DEMAND_V3_M1"
         elif engine == "MINSCALPER":
             engine_title = "1 MINUTE SCALPER"
@@ -22926,7 +23032,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "BROOKYC3":
                 # C3 pura mantém a mesma folga histórica do MegaBot para comparação.
                 engine_closed = closed[-300:]
-            elif engine in ("STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER"):
+            elif engine == "RSICHANNEL2":
+                engine_closed = closed[-1600:]
+            elif engine in ("STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "MINSCALPER"):
                 # EMA100/ATR100 ou ADX21; historico amplo e causal; necessidade de aquecimento.
                 engine_closed = closed[-320:]
             elif engine == "ELCODEX":
@@ -23125,7 +23233,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                                     "early_signal_window":False}
                 analysis["seconds_to_entry_snapshot"]=round(_ismael_remaining,1)
             elif engine == "RSICHANNEL2":
-                analysis = supply_demand_ort_strategy(engine_closed[-320:], symbol=symbol, timeframe="1min", market=market)
+                analysis = supply_demand_ort_strategy(engine_closed, symbol=symbol, timeframe="1min", market=market)
             elif engine == "RSICHANNEL":
                 # 3.97.15 — lê SOMENTE M5 fechado. O pré-alerta nasce na janela de 20s
                 # e a entrada fica agendada para 2 minutos após esse pré-alerta; expiração = 60s.
@@ -23583,7 +23691,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "RSI CROSS 6/14 • CANDLE FECHADO • NEXT CANDLE" if engine == "RSICROSS"
                     else "ISMAEL TRADER • EMA3/7 + RSI9 + ADX21 • NEXT CANDLE" if engine == "ISMAELTRADER"
                     else "MEGA FÚRIA • LEITURA M5 • PRÓXIMA M1 • EXPIRA M1" if engine == "RSICHANNEL"
-                    else "SUPPLY DEMAND • [ORT] v3 • ZONAS CONFIRMADAS • EXPIRA M1" if engine == "RSICHANNEL2"
+                    else "MEMORY FUSION • ESPELHO 24H + SEQUÊNCIA + CONFLUÊNCIAS • EXPIRA M1" if engine == "RSICHANNEL2"
                     else "1 MINUTE SCALPER • 13 LWMA PRICE_TYPICAL • NEXT CANDLE" if engine == "MINSCALPER"
                     else "STREAK REVERSAL • SEQUÊNCIA 2+2 • EMA100 + ATR100 • NEXT CANDLE" if engine == "STREAKREV"
                     else "SMART SESSION BREAKOUT • RANGE 00:00–08:00 + ATR14 • NEXT CANDLE" if engine == "SESSIONBREAKOUT"
@@ -28326,7 +28434,7 @@ _BACKTEST48_NAMES = {
     "MEGAMASTER": "MEGA MASTER",
     "ISMAELTRADER": "ISMAEL TRADER",
     "RSICHANNEL": "MEGA FÚRIA",
-    "RSICHANNEL2": "SUPPLY DEMAND",
+    "RSICHANNEL2": "MEMORY FUSION",
     "MINSCALPER": "1 MINUTE SCALPER",
     "MOMENTUM": "MOMENTUM CHART",
     "RSI4PERIOD": "4 PERIOD RSI PRO",
@@ -28613,7 +28721,7 @@ def _backtest48_eval(engine: str, hist: list, symbol: str, interval: str, market
         out["engine"]=engine
         return out
     if engine == "RSICHANNEL2":
-        out=supply_demand_ort_strategy(hist[-220:], symbol=symbol, timeframe=interval, market=market)
+        out=supply_demand_ort_strategy(hist[-1600:], symbol=symbol, timeframe=interval, market=market)
         out["engine"]=engine
         return out
     if engine == "MINSCALPER":
@@ -29693,7 +29801,7 @@ async def pre_signals(
         try:
             raw=(await iq_ea_candles(state,target,"1min",320,regular_market=False)) if market == "IQ_OTC" else (await candles(target,"1min",320,"OPEN",None,request=request))
             closed=_verified_closed_candles(raw,"1min")
-            tech=supply_demand_ort_strategy(closed[-320:],symbol=target,timeframe="1min",market=market)
+            tech=supply_demand_ort_strategy(closed[-1600:],symbol=target,timeframe="1min",market=market)
             items=[]
             if tech.get("confirmed") and str(tech.get("direction") or "").upper() in ("CALL","PUT"):
                 items=[{"symbol":target,"direction":str(tech.get("direction")).upper(),"confidence":float(tech.get("confidence") or 0.0),
@@ -29713,13 +29821,13 @@ async def pre_signals(
         if not (RSICHANNEL_EARLY_MIN_REMAINING <= pre_remain <= RSICHANNEL_EARLY_WINDOW_BEFORE):
             return {
                 "ok":True,"engine":engine,"items":[],"seconds_to_entry":remain,
-                "message":f"{('MEGA FÚRIA' if engine=='RSICHANNEL' else 'SUPPLY DEMAND')} monitorando • pré-alerta abre nos 20s finais • faltam {pre_remain}s para a janela.",
+                "message":f"{('MEGA FÚRIA' if engine=='RSICHANNEL' else 'MEMORY FUSION')} monitorando • pré-alerta abre nos 20s finais • faltam {pre_remain}s para a janela.",
                 "non_repaint_after_release":True,"gale_signal":False,
             }
         target=symbol or "EUR/USD"
         state=_iq_session_state(request, required=False) if market == "IQ_OTC" else None
         if market == "IQ_OTC" and not state:
-            return {"ok":True,"engine":engine,"items":[],"seconds_to_entry":remain,"message":f"{('MEGA FÚRIA' if engine=='RSICHANNEL' else 'SUPPLY DEMAND')} OTC aguardando conexão com a IQ Option."}
+            return {"ok":True,"engine":engine,"items":[],"seconds_to_entry":remain,"message":f"{('MEGA FÚRIA' if engine=='RSICHANNEL' else 'MEMORY FUSION')} OTC aguardando conexão com a IQ Option."}
         try:
             raw=(await iq_ea_candles(state,target,RSICHANNEL_ANALYSIS_INTERVAL,180,regular_market=False)) if market == "IQ_OTC" else (await candles(target,RSICHANNEL_ANALYSIS_INTERVAL,180,"OPEN",None,request=request))
             closed5=_verified_closed_candles(raw,RSICHANNEL_ANALYSIS_INTERVAL)
@@ -29740,10 +29848,10 @@ async def pre_signals(
                 "non_repaint_after_release":True,"gale_signal":False,
             }
         except Exception as exc:
-            return {"ok":True,"engine":engine,"items":[],"seconds_to_entry":remain,"message":f"{('MEGA FÚRIA' if engine=='RSICHANNEL' else 'SUPPLY DEMAND')} aguardando dados: {str(exc)[:120]}"}
+            return {"ok":True,"engine":engine,"items":[],"seconds_to_entry":remain,"message":f"{('MEGA FÚRIA' if engine=='RSICHANNEL' else 'MEMORY FUSION')} aguardando dados: {str(exc)[:120]}"}
 
     if engine in ("INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "SESSIONBREAKOUT"):
-        _nm={"INDICEMENT":"INDICEMENT SMA 12/26","GOLDINV":"FOREX GOLD INVESTOR","TTMSCALPER":"TTM SCALPER SWING","FOREXMISSION":"FOREX MISSION","MONEYARROW":"BINARY MONEYARROW","LIQUIDEX":"LIQUIDEX","EUROFX2":"EURO FX2","EUROFX2TAURUS":"EURO FX2 + TAURUS","ATE":"ATE","FOREXSTAY":"FOREXSTAY SIGHT","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + TAURUS","FOREXSTAYPRO":"FOREXSTAY PRO","FOREXFLEX":"FOREX FLEX","SENEGALPRO":"SUPER SENEGAL PRO","VALUEMACD":"VALUE CHART + MACD","HOLYGRAIL":"HOLY GRAIL ORIGINAL","TRENDLINES":"TRENDLINES MTF","BBSTOCH":"BB STOCHRSI X REVERSAL","KAMIKAZE":"KAMIKAZE TREND SNIPER","FOREXMEGA":"FOREX MEGA LLC V10.21","BROOKYVERTEX":"BROOKY + VERTEX FLEX 30/70","MEGABOT":"MEGA BOT","BROOKYC3":"CONFLUÊNCIA 3 • BROOKY FLEX","UTBOT":"UT BOT ALERTS","ONEMINRSI":"ONE MINUTE + RSI","WPRADAPT":"WPR ADAPTIVE","TINGATINGA":"TINGA TINGA RSI 14","SUPERNOVA":"SUPER NOVA","ELCODEX":"ELCODEX SCALPER","TSI":"MEGA ULTRA","MOMENTUM":"MOMENTUM CHART","FIGURES":"FIGURES CANDLE","VASILY":"VASILY PIP SNIPER ZL","PLATINUM":"PLATINUM","STREAKREV":"STREAK REVERSAL","ISMAELTRADER":"ISMAEL TRADER","RSICHANNEL":"MEGA FÚRIA","RSICHANNEL2":"SUPPLY DEMAND","RSIXOVER":"RSI XOVER","RSICROSS":"RSI CROSS 6/14","SESSIONBREAKOUT":"SMART SESSION BREAKOUT","MONSTERSMC":"MONSTER SMC"}[engine]
+        _nm={"INDICEMENT":"INDICEMENT SMA 12/26","GOLDINV":"FOREX GOLD INVESTOR","TTMSCALPER":"TTM SCALPER SWING","FOREXMISSION":"FOREX MISSION","MONEYARROW":"BINARY MONEYARROW","LIQUIDEX":"LIQUIDEX","EUROFX2":"EURO FX2","EUROFX2TAURUS":"EURO FX2 + TAURUS","ATE":"ATE","FOREXSTAY":"FOREXSTAY SIGHT","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + TAURUS","FOREXSTAYPRO":"FOREXSTAY PRO","FOREXFLEX":"FOREX FLEX","SENEGALPRO":"SUPER SENEGAL PRO","VALUEMACD":"VALUE CHART + MACD","HOLYGRAIL":"HOLY GRAIL ORIGINAL","TRENDLINES":"TRENDLINES MTF","BBSTOCH":"BB STOCHRSI X REVERSAL","KAMIKAZE":"KAMIKAZE TREND SNIPER","FOREXMEGA":"FOREX MEGA LLC V10.21","BROOKYVERTEX":"BROOKY + VERTEX FLEX 30/70","MEGABOT":"MEGA BOT","BROOKYC3":"CONFLUÊNCIA 3 • BROOKY FLEX","UTBOT":"UT BOT ALERTS","ONEMINRSI":"ONE MINUTE + RSI","WPRADAPT":"WPR ADAPTIVE","TINGATINGA":"TINGA TINGA RSI 14","SUPERNOVA":"SUPER NOVA","ELCODEX":"ELCODEX SCALPER","TSI":"MEGA ULTRA","MOMENTUM":"MOMENTUM CHART","FIGURES":"FIGURES CANDLE","VASILY":"VASILY PIP SNIPER ZL","PLATINUM":"PLATINUM","STREAKREV":"STREAK REVERSAL","ISMAELTRADER":"ISMAEL TRADER","RSICHANNEL":"MEGA FÚRIA","RSICHANNEL2":"MEMORY FUSION","RSIXOVER":"RSI XOVER","RSICROSS":"RSI CROSS 6/14","SESSIONBREAKOUT":"SMART SESSION BREAKOUT","MONSTERSMC":"MONSTER SMC"}[engine]
         return {"items":[],"engine":engine,"message":f"{_nm} usa confirmação em candle fechado; o app libera somente a entrada válida para a próxima vela, sem pré-sinal repintável.","non_repaint":True,"gale_signal":False}
     if engine == "LARRY":
         return {
@@ -29966,7 +30074,7 @@ async def pre_signals(
             "STREAKREV": "STREAK REVERSAL",
             "ISMAELTRADER": "ISMAEL TRADER",
             "RSICHANNEL": "MEGA FÚRIA",
-    "RSICHANNEL2": "SUPPLY DEMAND",
+    "RSICHANNEL2": "MEMORY FUSION",
             "RSICROSS": "RSI CROSS 6/14",
             "SESSIONBREAKOUT": "SMART SESSION BREAKOUT",
         }.get(engine, engine)
@@ -31630,8 +31738,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 status_text = ("ISMAEL TRADER • OPORTUNIDADE 20S ENCONTRADA"
                                if direction in ("CALL", "PUT") else f"ISMAEL TRADER • MONITORANDO • faltam {int(_ismael_remaining)}s • " + why)
             elif engine == "RSICHANNEL2":
-                tech = supply_demand_ort_strategy(closed[-320:], symbol=sym, timeframe="1min", market=market)
-                engine_label = "SUPPLY DEMAND"
+                tech = supply_demand_ort_strategy(closed[-1600:], symbol=sym, timeframe="1min", market=market)
+                engine_label = "MEMORY FUSION"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why = str(tech.get("reason") or "monitorando zonas").replace("\n", " ")[:94]
                 status_text = ("SUPPLY DEMAND • OPORTUNIDADE ENCONTRADA" if direction in ("CALL","PUT") else "SUPPLY DEMAND • MONITORANDO • " + why)
@@ -31693,7 +31801,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     "ISMAELTRADER": "ISMAEL TRADER",
                     "ISMAEL98": "ISMAEL 98",
                     "RSICHANNEL": "MEGA FÚRIA",
-    "RSICHANNEL2": "SUPPLY DEMAND",
+    "RSICHANNEL2": "MEMORY FUSION",
                     "MINSCALPER": "1 MINUTE SCALPER",
                 }
                 engine_label = _radar_names.get(engine, str(engine or "MOTOR"))
@@ -32893,7 +33001,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   <style>
-    /* 3.97.11 — painel de motores enxuto: somente RSI CHANNELS visível */
+    /* 3.97.11 — painel de motores enxuto: MEGA FÚRIA + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
     #rsiChannelsModeCard,#rsiChannels2ModeCard{display:flex !important}
   </style>
@@ -32908,10 +33016,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   <div class="robot-mode-card" id="rsiChannels2ModeCard">
-    <img src="__MEGA_IMAGE__" alt="Supply Demand">
+    <img src="__MEGA_IMAGE__" alt="Memory Fusion">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">📦 SUPPLY DEMAND</div>
-      <div class="robot-mode-desc" id="rsiChannels2ModeDesc">[ORT] Supply/Demand v3 • zonas confirmadas • CALL em demanda • PUT em oferta • expiração M1 • sem Gale.</div>
+      <div class="robot-mode-title">🧠 MEMORY FUSION</div>
+      <div class="robot-mode-desc" id="rsiChannels2ModeDesc">Espelho 24H • sequência das 3 velas • memória 3/5/7 dias quando disponível • EMA9/21 • RSI14 • S/R • ATR • próxima M1 • sem Gale.</div>
     </div>
     <button id="rsiChannels2PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -34290,7 +34398,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({SMART:'CHATGPT ANALISTA',LOCALANALYST:'MEGA BOT',LOCALANALYSTFLEX:'MEGA BOT FLEX',MEGAMASTER:'MEGA MASTER',ISMAELTRADER:'ISMAEL TRADER',ISMAEL98:'ISMAEL 98',RSICHANNEL:'MEGA FÚRIA',RSICHANNEL2:'SUPPLY DEMAND',MINSCALPER:'1 MINUTE SCALPER',MOMENTUM:'MOMENTUM CHART',RSI4PERIOD:'4 PERIOD RSI PRO'})[e]||e||'SEM MOTOR';
+  return ({SMART:'CHATGPT ANALISTA',LOCALANALYST:'MEGA BOT',LOCALANALYSTFLEX:'MEGA BOT FLEX',MEGAMASTER:'MEGA MASTER',ISMAELTRADER:'ISMAEL TRADER',ISMAEL98:'ISMAEL 98',RSICHANNEL:'MEGA FÚRIA',RSICHANNEL2:'MEMORY FUSION',MINSCALPER:'1 MINUTE SCALPER',MOMENTUM:'MOMENTUM CHART',RSI4PERIOD:'4 PERIOD RSI PRO'})[e]||e||'SEM MOTOR';
 }
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
 function scheduleBacktest48(force=false,delay=260){
@@ -39262,7 +39370,7 @@ async function setRsiChannels2Power(enabled){
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]); else await Promise.allSettled([perf()]);
   scheduleBacktest48(true,80);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled) speak(rsiChannels2Enabled?'Supply Demand online.':'Supply Demand offline.');
+  if(voiceEnabled) speak(rsiChannels2Enabled?'Memory Fusion online.':'Memory Fusion offline.');
 }
 
 async function setIsmael98Power(enabled){
@@ -40865,7 +40973,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='MINSCALPER'?'1 MINUTE SCALPER':ek==='RSICHANNEL2'?'SUPPLY DEMAND':ek==='RSICHANNEL'?'MEGA FÚRIA':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI CROSS 6/14':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='MINSCALPER'?'1 MINUTE SCALPER':ek==='RSICHANNEL2'?'MEMORY FUSION':ek==='RSICHANNEL'?'MEGA FÚRIA':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI CROSS 6/14':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
