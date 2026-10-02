@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.27"
+APP_VERSION = "3.97.28"
+# MEGA IA 3.97.28 — SCALPING ASIA TEST: adaptador causal SMA15 + Envelopes 0,07%, reentrada na banda, Backtest 48H, próxima M1, sem grade/Gale.
 # MEGA IA 3.97.26 — integra M-SNIPER EA no slot legado MINSCALPER: vela forte M1 normalizada por range/ATR, pré-alerta 20s, próxima M1, expiração M1, sem grade/Gale.
 # MEGA IA 3.97.25 — NINJA HFT: MA3 High/Low + microimpulso/range, motor M1 separado, próxima vela, expiração M1, sem Gale.
 # MEGA IA 3.97.24 — RSI EA MTF: EMA13/30 M15 + RSI13 M5 + MACD M30, candle fechado, próxima M1, expiração M1, sem Gale.
@@ -27618,7 +27619,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     # 3.96.79 — somente os quatro motores atuais/visíveis podem rodar em segundo plano.
-    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD",
+    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA",
 }
 
 
@@ -28481,6 +28482,47 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
 # Scanner dedicado removido; os sinais continuam pelos motores selecionáveis.
 
 
+# MEGA IA 3.97.28 — SCALPING ASIA TEST (EA Scalping Asia adaptado sem ordens/grade/martingale)
+SCALPING_ASIA_PERIOD = 15
+SCALPING_ASIA_DEVIATION_PCT = 0.07
+
+def scalping_asia_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
+    """Reentrada no Envelopes SMA15 ±0,07%. Candle fechado -> próxima vela."""
+    rows = list(cs or [])
+    base = {
+        "available": True, "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
+        "risk": "MEDIUM", "strategy": "SCALPING ASIA TEST", "engine": "SCALPINGASIA",
+        "provider": "LOCAL_SCALPING_ASIA", "closed_candles_only": True,
+        "next_candle_entry": True, "expiry_candles": 1, "gale_signal": False,
+        "martingale": False, "non_repaint": True, "non_repaint_after_release": True,
+    }
+    if len(rows) < SCALPING_ASIA_PERIOD + 2:
+        return {**base, "reason": f"SCALPING ASIA coletando candles ({len(rows)}/{SCALPING_ASIA_PERIOD + 2})."}
+    try:
+        closes = [float(x.get("close", 0) or 0) for x in rows]
+        o = float(rows[-1].get("open", 0) or 0)
+        c = float(rows[-1].get("close", 0) or 0)
+        sma15 = sum(closes[-SCALPING_ASIA_PERIOD:]) / SCALPING_ASIA_PERIOD
+        dev = SCALPING_ASIA_DEVIATION_PCT / 100.0
+        upper = sma15 * (1.0 + dev)
+        lower = sma15 * (1.0 - dev)
+        # Núcleo do EA: preço começa fora do envelope e retorna para dentro.
+        call = o < lower and c >= lower
+        put = o > upper and c <= upper
+        direction = "CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
+        stamp = str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
+        if direction == "NEUTRO":
+            return {**base, "reason": "SCALPING ASIA aguardando reentrada no Envelopes SMA15.",
+                    "diagnostics": {"sma15": sma15, "upper": upper, "lower": lower}}
+        confidence = 76.0
+        return {**base, "direction": direction, "confidence": confidence, "confirmed": True, "risk": "MEDIUM",
+                "reason": f"{direction} SCALPING ASIA • reentrada no Envelopes SMA15 0,07%; próxima vela; sem Gale.",
+                "event_key": f"SCALPINGASIA:{direction}:{stamp}",
+                "diagnostics": {"sma15": sma15, "upper": upper, "lower": lower}}
+    except Exception as exc:
+        return {**base, "reason": f"SCALPING ASIA aguardando leitura válida: {str(exc)[:100]}"}
+
+
 # -----------------------------------------------------------------------------
 # MEGA IA 3.96.97 — BACKTEST 48H causal do motor ativo + recuperação por próximos sinais
 # -----------------------------------------------------------------------------
@@ -28499,6 +28541,7 @@ _BACKTEST48_NAMES = {
     "MINSCALPER": "1 MINUTE SCALPER",
     "MOMENTUM": "MOMENTUM CHART",
     "RSI4PERIOD": "4 PERIOD RSI PRO",
+    "SCALPINGASIA": "SCALPING ASIA TEST",
 }
 _backtest48_history_cache: Dict[str, Any] = {}
 _backtest48_result_cache: Dict[str, Any] = {}
@@ -28791,6 +28834,8 @@ def _backtest48_eval(engine: str, hist: list, symbol: str, interval: str, market
         return four_period_rsi_strategy(hist[-900:], symbol=symbol, timeframe=interval, market=market)
     if engine == "MOMENTUM":
         return momentum14_strategy(hist[-320:], symbol=symbol, timeframe=interval, market=market)
+    if engine == "SCALPINGASIA":
+        return scalping_asia_strategy(hist[-120:], symbol=symbol, timeframe=interval, market=market)
     return {"confirmed": False, "direction": "NEUTRO", "confidence": 0.0}
 
 
