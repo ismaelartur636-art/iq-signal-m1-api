@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.25"
+APP_VERSION = "3.97.26"
+# MEGA IA 3.97.26 — integra M-SNIPER EA no slot legado MINSCALPER: vela forte M1 normalizada por range/ATR, pré-alerta 20s, próxima M1, expiração M1, sem grade/Gale.
 # MEGA IA 3.97.25 — NINJA HFT: MA3 High/Low + microimpulso/range, motor M1 separado, próxima vela, expiração M1, sem Gale.
 # MEGA IA 3.97.24 — RSI EA MTF: EMA13/30 M15 + RSI13 M5 + MACD M30, candle fechado, próxima M1, expiração M1, sem Gale.
 # MEGA IA 3.97.22 — cTrader mobile: botão Conectar usa navegação robusta com link real + fallback JS e feedback visível quando o OAuth não abre.
@@ -14519,8 +14520,58 @@ def _lwma_endpoint(values, period, end_index=None):
     return sum(float(values[start+j])*(j+1) for j in range(period))/den
 
 def one_minute_scalper_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
-    # 3.96.99: indicador removido; mantém compatibilidade sem executar análise/sinal.
-    return {"available":False,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"engine":"MINSCALPER","provider":"REMOVED_3_96_99","reason":"1 MINUTE SCALPER removido do app."}
+    # 3.97.26 — slot MINSCALPER reaproveitado para M-SNIPER EA.
+    # Mantém a essência do MQ4: direção pela vela forte anterior, mas remove grade/lote/ordens
+    # e corrige PipsStep=30 com normalização causal por range anterior + ATR14.
+    rows=list(cs or [])[-120:]
+    live_snapshot=bool(allow_prealert and not current_candle_closed)
+    base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"HIGH",
+          "strategy":"M-SNIPER • STRONG CANDLE • EARLY20 • NEXT M1",
+          "engine":"MINSCALPER","provider":"LOCAL_M_SNIPER_EA_V1",
+          "closed_candles_only":True,"non_repaint":True,"non_repaint_after_release":True,
+          "early_signal_window":live_snapshot,"prealert_seconds":MINSCALPER_EARLY_SIGNAL_SECONDS,
+          "next_candle_entry":True,"entry_timeframe":"1min","analysis_timeframe":"1min",
+          "expiry_seconds":60,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,
+          "confidence_is_probability":False}
+    if str(timeframe).lower()!='1min':
+        return {**base,"reason":"M-SNIPER opera em M1; selecione 1min."}
+    if len(rows)<18:
+        return {**base,"reason":f"M-SNIPER aquecendo candles ({len(rows)}/18)."}
+    try:
+        # Se recebemos snapshot em formação, -2 é a última vela fechada; no histórico fechado, -1.
+        i=-2 if live_snapshot else -1
+        c=rows[i]; p=rows[i-1]
+        o=float(c['open']); cl=float(c['close']); h=float(c['high']); l=float(c['low'])
+        ph=float(p['high']); pl=float(p['low'])
+        body=abs(cl-o); candle_range=max(h-l,1e-15); prev_range=max(ph-pl,1e-15)
+        trs=[]
+        start=max(1,len(rows)+i-14)
+        end=(len(rows)+i+1) if i<0 else i+1
+        for j in range(start,end):
+            r=rows[j]; pc=float(rows[j-1]['close']); rh=float(r['high']); rl=float(r['low'])
+            trs.append(max(rh-rl,abs(rh-pc),abs(rl-pc)))
+        atr14=sum(trs)/len(trs) if trs else candle_range
+        body_ratio=body/candle_range
+        vs_prev=body/prev_range
+        vs_atr=body/max(atr14,1e-15)
+        strong=body_ratio>=0.62 and vs_prev>=0.72 and vs_atr>=0.58
+        direction='CALL' if cl>o else ('PUT' if cl<o else 'NEUTRO')
+        diag={"body_ratio":round(body_ratio,3),"body_vs_prev_range":round(vs_prev,3),
+              "body_vs_atr14":round(vs_atr,3),"original_pips_step":30,"grid_removed":True,"future_leak":False}
+        if direction=='NEUTRO' or not strong:
+            conf=min(79.0,52.0+body_ratio*18.0+min(vs_atr,1.2)*7.0)
+            return {**base,"confidence":round(conf,1),"reason":f"M-SNIPER monitorando • corpo {body_ratio:.0%} da vela • {vs_atr:.2f}×ATR • aguardando vela forte.","diagnostics":diag}
+        conf=min(94.0,78.0+min(8.0,(body_ratio-.62)*24.0)+min(5.0,(vs_prev-.72)*10.0)+min(3.0,(vs_atr-.58)*6.0))
+        if not live_snapshot:
+            return {**base,"confidence":round(conf,1),"pre_signal":direction,
+                    "reason":f"M-SNIPER detectou vela forte {direction}; aguardando janela dos {MINSCALPER_EARLY_SIGNAL_SECONDS}s para a próxima M1.","diagnostics":diag}
+        stamp=str(c.get('datetime') or c.get('timestamp') or len(rows)+i)
+        return {**base,"direction":direction,"confidence":round(conf,1),"confirmed":True,
+                "risk":"LOW" if conf>=90 else "MEDIUM",
+                "reason":f"{direction} M-SNIPER • vela forte confirmada • corpo {body_ratio:.0%} • {vs_atr:.2f}×ATR • próxima M1 • expira M1 • sem Gale.",
+                "event_key":f"MSNIPER:{direction}:{stamp}","diagnostics":diag,"early_signal_locked":True}
+    except (KeyError,TypeError,ValueError,OverflowError,ZeroDivisionError) as exc:
+        return {**base,"reason":f"M-SNIPER aguardando OHLC válido: {str(exc)[:70]}"}
     
     rows=list(cs or [])[-320:]
     live_snapshot=bool(allow_prealert and not current_candle_closed)
@@ -22827,7 +22878,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "MEGA FÚRIA" if engine == "RSICHANNEL" else "MEMORY FUSION"
             engine_mode = "RSI4_M5_NEXT_M1" if engine == "RSICHANNEL" else "ORT_SUPPLY_DEMAND_V3_M1"
         elif engine == "MINSCALPER":
-            engine_title = "1 MINUTE SCALPER"
+            engine_title = "M-SNIPER"
             engine_mode = "LWMA_3_5_8_10_12_15_30_35_40_45_50_55_200_TYPICAL_NEXT_CANDLE"
         elif engine == "STREAKREV":
             engine_title = "STREAK REVERSAL"
@@ -22968,7 +23019,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "ISMAELTRADER": "LOCAL_ISMAEL_EMA_RSI_ADX_EARLY20",
                     "RSICHANNEL": "LOCAL_MEGA_FURIA_RSI_M5_V116",
                     "RSICHANNEL2": "LOCAL_ORT_SUPPLY_DEMAND_V3",
-                    "MINSCALPER": "LOCAL_1_MINUTE_SCALPER_LWMA_CLOSED",
+                    "MINSCALPER": "LOCAL_M_SNIPER_EA_V1",
                     "MONSTERSMC": "LOCAL_MONSTER_SMC_CAUSAL_V2",
                     "TRENDLINES": "LOCAL_TRENDLINES_MTF_FLEX",
                     "COMBINER": "LOCAL_COMBINER_FLOW_RSI",
@@ -23631,7 +23682,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "ISMAELTRADER": "LOCAL_ISMAEL_EMA_RSI_ADX_CLOSED",
                     "RSICHANNEL": "LOCAL_MEGA_FURIA_RSI_M5_V116",
                     "RSICHANNEL2": "LOCAL_ORT_SUPPLY_DEMAND_V3",
-                    "MINSCALPER": "LOCAL_1_MINUTE_SCALPER_LWMA_CLOSED",
+                    "MINSCALPER": "LOCAL_M_SNIPER_EA_V1",
                     "MONSTERSMC": "LOCAL_MONSTER_SMC_CAUSAL_V2",
                     "TRENDLINES": "LOCAL_TRENDLINES_MTF_FLEX",
                     "COMBINER": "LOCAL_COMBINER_FLOW_RSI",
@@ -23702,7 +23753,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "ISMAEL TRADER • EMA3/7 + RSI9 + ADX21 • NEXT CANDLE" if engine == "ISMAELTRADER"
                     else "MEGA FÚRIA • LEITURA M5 • PRÓXIMA M1 • EXPIRA M1" if engine == "RSICHANNEL"
                     else "MEMORY FUSION • ESPELHO 24H + SEQUÊNCIA + CONFLUÊNCIAS • EXPIRA M1" if engine == "RSICHANNEL2"
-                    else "1 MINUTE SCALPER • 13 LWMA PRICE_TYPICAL • NEXT CANDLE" if engine == "MINSCALPER"
+                    else "M-SNIPER • VELA FORTE M1 • EARLY20 • NEXT M1" if engine == "MINSCALPER"
                     else "STREAK REVERSAL • SEQUÊNCIA 2+2 • EMA100 + ATR100 • NEXT CANDLE" if engine == "STREAKREV"
                     else "SMART SESSION BREAKOUT • RANGE 00:00–08:00 + ATR14 • NEXT CANDLE" if engine == "SESSIONBREAKOUT"
                     else "MONSTER SMC • SWEEP + FVG + FIB 61,8% + HTF 1/2 • NEXT CANDLE" if engine == "MONSTERSMC"
@@ -24712,7 +24763,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     "ISMAELTRADER": "LOCAL_ISMAEL_EMA_RSI_ADX_CLOSED",
                     "RSICHANNEL": "LOCAL_MEGA_FURIA_RSI_M5_V116",
                     "RSICHANNEL2": "LOCAL_ORT_SUPPLY_DEMAND_V3",
-                    "MINSCALPER": "LOCAL_1_MINUTE_SCALPER_LWMA_CLOSED",
+                    "MINSCALPER": "LOCAL_M_SNIPER_EA_V1",
                     "MONSTERSMC": "LOCAL_MONSTER_SMC_CAUSAL_V2",
                     "TRENDLINES": "LOCAL_TRENDLINES_MTF_FLEX",
                     "COMBINER": "LOCAL_COMBINER_FLOW_RSI",
@@ -33051,6 +33102,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="rsiChannels2PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
+  <div class="robot-mode-card" id="minScalperModeCard">
+    <img src="__MEGA_IMAGE__" alt="M-Sniper">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">🎯 M-SNIPER</div>
+      <div class="robot-mode-desc" id="minScalperModeDesc">Vela forte M1 • pré-alerta 20s • entrada na próxima M1 • expiração M1 • sem Gale • sem grade.</div>
+    </div>
+    <button id="minScalperPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+
   <div class="card" id="backtest48Card" style="margin-top:14px;border-color:#2f86ff">
     <div style="display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap">
       <div>
@@ -38258,7 +38318,7 @@ function applyRobotPowerState(){
   if(rsiChannels2PowerBtn){ rsiChannels2PowerBtn.textContent=rsiChannels2Enabled?'🟢 ONLINE':'🔴 OFFLINE'; rsiChannels2PowerBtn.style.background=rsiChannels2Enabled?'#0b7a3d':'#7d1d1d'; rsiChannels2PowerBtn.style.color='#fff'; rsiChannels2PowerBtn.style.borderColor=rsiChannels2Enabled?'#16c56b':'#ff5252'; }
   if(rsiChannels2ModeDesc) rsiChannels2ModeDesc.textContent=rsiChannels2Enabled?'ONLINE: SUPPLY DEMAND • [ORT] v3 • zonas confirmadas • CALL demanda / PUT oferta • expira M1 • sem Gale.':'OFFLINE: Supply Demand pausado.';
   if(minScalperPowerBtn){ minScalperPowerBtn.textContent=minScalperEnabled?'🟢 ONLINE':'🔴 OFFLINE'; minScalperPowerBtn.style.background=minScalperEnabled?'#0b7a3d':'#7d1d1d'; minScalperPowerBtn.style.color='#fff'; minScalperPowerBtn.style.borderColor=minScalperEnabled?'#16c56b':'#ff5252'; }
-  if(minScalperModeDesc) minScalperModeDesc.textContent=minScalperEnabled?'ONLINE: 13 LWMAs PRICE_TYPICAL • alinhamento recente até 2 candles • janela 20s • próxima vela • sem Gale.':'OFFLINE: 1 Minute Scalper pausado.';
+  if(minScalperModeDesc) minScalperModeDesc.textContent=minScalperEnabled?'ONLINE: vela forte M1 • janela 20s • próxima M1 • expira M1 • sem Gale • sem grade.':'OFFLINE: M-Sniper pausado.';
   if(streakRevPowerBtn){ streakRevPowerBtn.textContent=streakRevEnabled?'🟢 ONLINE':'🔴 OFFLINE'; streakRevPowerBtn.style.background=streakRevEnabled?'#0b7a3d':'#7d1d1d'; streakRevPowerBtn.style.color='#fff'; streakRevPowerBtn.style.borderColor=streakRevEnabled?'#16c56b':'#ff5252'; }
   if(streakRevModeDesc) streakRevModeDesc.textContent=streakRevEnabled?'ONLINE: sequência 2+2 • ATR100 1,5 • pavio até 40% • EMA100 • candle fechado • próxima vela • sem Gale.':'OFFLINE: Streak Reversal pausado.';
   if(sessionBreakoutModeDesc) sessionBreakoutModeDesc.textContent=sessionBreakoutEnabled?'ONLINE: range 00:00–08:00 Brasília • rompimento confirmado + corpo ≥ 0,8 ATR14 • próxima vela • sem Gale.':'OFFLINE: SMART SESSION BREAKOUT pausado.';
@@ -39360,7 +39420,7 @@ async function setMinScalperPower(enabled){
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]);
   else await Promise.allSettled([perf()]);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled) speak(minScalperEnabled?'1 Minute Scalper online.':'1 Minute Scalper offline.');
+  if(voiceEnabled) speak(minScalperEnabled?'M-Sniper online.':'M-Sniper offline.');
 }
 
 async function setRsiEaPower(enabled){
@@ -41029,7 +41089,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='MINSCALPER'?'1 MINUTE SCALPER':ek==='RSICHANNEL2'?'MEMORY FUSION':ek==='RSICHANNEL'?'MEGA FÚRIA':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI EA MTF':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='MINSCALPER'?'M-SNIPER':ek==='RSICHANNEL2'?'MEMORY FUSION':ek==='RSICHANNEL'?'MEGA FÚRIA':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI EA MTF':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
