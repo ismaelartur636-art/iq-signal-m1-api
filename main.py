@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.31"
+APP_VERSION = "3.97.32"
+# MEGA IA 3.97.32 — 🌏 SCALPER FLEX: Iron Scalper, pré-alerta 10s, próxima M1, expiração M1, sem Gale.
 # MEGA IA 3.97.31 — corrige SCALPINGASIA no sinal/radar e sincronização do motor ativo (remove “Motor inválido”).
 # MEGA IA 3.97.30 — corrige registro do SCALPINGASIA no Backtest 48H (motor reconhecido).
 # MEGA IA 3.97.29 — SCALPING ASIA visível no painel + botão ON/OFF + radar/backtest.
@@ -22456,7 +22457,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine in ("MEGAMASTER", "MONSTERSMC", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "MINSCALPER"):
                 request_n = 320
             elif engine in ("KAMIKAZE", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SESSIONBREAKOUT", "MONSTERSMC"):
-                request_n = 1300 if engine == "RSICROSS" else 260
+                request_n = 1300 if engine in ("RSICROSS", "SCALPINGASIA") else 260
             elif engine == "SMART" and market == "OPEN":
                 request_n = 240
             else:
@@ -22893,6 +22894,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "RSICROSS":
             engine_title = "RSI EA MTF"
             engine_mode = "RSI_EA_MTF_M5_M15_M30_NEXT_M1"
+        elif engine == "SCALPINGASIA":
+            engine_title = "🌏 SCALPER FLEX"
+            engine_mode = "IRON_SCALPER_BODY_4X_AVG_RANGE_EARLY10_NEXT_M1"
         elif engine == "SESSIONBREAKOUT":
             engine_title = "SMART SESSION BREAKOUT"
             engine_mode = "SESSION_RANGE_0000_0800_ATR14_NEXT_CANDLE"
@@ -23332,6 +23336,16 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 else:
                     analysis = one_minute_scalper_strategy(engine_closed, symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
                 analysis["seconds_to_entry_snapshot"]=round(_min_remaining,1)
+            elif engine == "SCALPINGASIA":
+                _sf_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                _sf_early=SCALPER_FLEX_EARLY_MIN_REMAINING <= _sf_remaining <= SCALPER_FLEX_EARLY_WINDOW_BEFORE
+                if _sf_early:
+                    analysis=scalping_asia_strategy(raw[-1001:],symbol=symbol,timeframe=interval,market=market,current_candle_closed=False,allow_prealert=True)
+                else:
+                    analysis=scalping_asia_strategy(engine_closed[-1001:],symbol=symbol,timeframe=interval,market=market,current_candle_closed=True,allow_prealert=False)
+                    if analysis.get("confirmed"):
+                        analysis={**analysis,"direction":"NEUTRO","confirmed":False,"confidence":0.0,"reason":f"SCALPER FLEX confirmado; aguardando pré-alerta de 10s • faltam {int(_sf_remaining)}s.","early_signal_window":False}
+                analysis["seconds_to_entry_snapshot"]=round(_sf_remaining,1)
             elif engine == "STREAKREV":
                 analysis = streak_reversal_strategy(engine_closed, symbol=symbol, timeframe=interval, market=market)
             elif engine == "NINJAHFT":
@@ -28485,45 +28499,43 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
 # Scanner dedicado removido; os sinais continuam pelos motores selecionáveis.
 
 
-# MEGA IA 3.97.28 — SCALPING ASIA TEST (EA Scalping Asia adaptado sem ordens/grade/martingale)
-SCALPING_ASIA_PERIOD = 15
-SCALPING_ASIA_DEVIATION_PCT = 0.07
+# MEGA IA 3.97.32 — 🌏 SCALPER FLEX (Iron Scalper EA adaptado)
+SCALPER_FLEX_AVG_BARS=1000
+SCALPER_FLEX_MIN_HISTORY=80
+SCALPER_FLEX_PIPS_STEP=4.0
+SCALPER_FLEX_EARLY_SIGNAL_SECONDS=10
+SCALPER_FLEX_EARLY_WINDOW_BEFORE=12
+SCALPER_FLEX_EARLY_MIN_REMAINING=3
 
-def scalping_asia_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """Reentrada no Envelopes SMA15 ±0,07%. Candle fechado -> próxima vela."""
-    rows = list(cs or [])
-    base = {
-        "available": True, "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
-        "risk": "MEDIUM", "strategy": "SCALPING ASIA TEST", "engine": "SCALPINGASIA",
-        "provider": "LOCAL_SCALPING_ASIA", "closed_candles_only": True,
-        "next_candle_entry": True, "expiry_candles": 1, "gale_signal": False,
-        "martingale": False, "non_repaint": True, "non_repaint_after_release": True,
-    }
-    if len(rows) < SCALPING_ASIA_PERIOD + 2:
-        return {**base, "reason": f"SCALPING ASIA coletando candles ({len(rows)}/{SCALPING_ASIA_PERIOD + 2})."}
+def scalping_asia_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
+    rows=list(cs or [])
+    live_snapshot=bool(allow_prealert and not current_candle_closed)
+    base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
+          "strategy":"🌏 SCALPER FLEX","engine":"SCALPINGASIA","provider":"LOCAL_IRON_SCALPER_FLEX",
+          "closed_candles_only":not live_snapshot,"forming_candle_snapshot":live_snapshot,"early_signal_window":live_snapshot,
+          "prealert_seconds":10,"next_candle_entry":True,"expiry_candles":1,"gale_signal":False,"martingale":False,
+          "non_repaint":True,"non_repaint_after_release":True}
+    if len(rows)<SCALPER_FLEX_MIN_HISTORY+1:
+        return {**base,"reason":f"SCALPER FLEX coletando candles ({len(rows)}/{SCALPER_FLEX_MIN_HISTORY+1})."}
     try:
-        closes = [float(x.get("close", 0) or 0) for x in rows]
-        o = float(rows[-1].get("open", 0) or 0)
-        c = float(rows[-1].get("close", 0) or 0)
-        sma15 = sum(closes[-SCALPING_ASIA_PERIOD:]) / SCALPING_ASIA_PERIOD
-        dev = SCALPING_ASIA_DEVIATION_PCT / 100.0
-        upper = sma15 * (1.0 + dev)
-        lower = sma15 * (1.0 - dev)
-        # Núcleo do EA: preço começa fora do envelope e retorna para dentro.
-        call = o < lower and c >= lower
-        put = o > upper and c <= upper
-        direction = "CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
-        stamp = str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
-        if direction == "NEUTRO":
-            return {**base, "reason": "SCALPING ASIA aguardando reentrada no Envelopes SMA15.",
-                    "diagnostics": {"sma15": sma15, "upper": upper, "lower": lower}}
-        confidence = 76.0
-        return {**base, "direction": direction, "confidence": confidence, "confirmed": True, "risk": "MEDIUM",
-                "reason": f"{direction} SCALPING ASIA • reentrada no Envelopes SMA15 0,07%; próxima vela; sem Gale.",
-                "event_key": f"SCALPINGASIA:{direction}:{stamp}",
-                "diagnostics": {"sma15": sma15, "upper": upper, "lower": lower}}
+        bar=rows[-1]; hist=rows[:-1][-SCALPER_FLEX_AVG_BARS:]
+        ranges=[float(x.get("high",0) or 0)-float(x.get("low",0) or 0) for x in hist]
+        ranges=[r for r in ranges if r>0]
+        if len(ranges)<SCALPER_FLEX_MIN_HISTORY:
+            return {**base,"reason":f"SCALPER FLEX aguardando histórico válido ({len(ranges)}/{SCALPER_FLEX_MIN_HISTORY})."}
+        avg=sum(ranges)/len(ranges); o=float(bar.get("open",0) or 0); c=float(bar.get("close",0) or 0)
+        body=abs(c-o); ratio=body/max(avg,1e-12)
+        call=c>o and body>avg*SCALPER_FLEX_PIPS_STEP; put=c<o and body>avg*SCALPER_FLEX_PIPS_STEP
+        direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
+        diag={"body":round(body,10),"avg_range":round(avg,10),"body_vs_avg":round(ratio,2),"pips_step":4.0,"history_bars":len(ranges),"live_10s":live_snapshot}
+        if direction=="NEUTRO":
+            return {**base,"reason":f"SCALPER FLEX monitorando vela de força • corpo {ratio:.2f}x média • gatilho >4.0x.","diagnostics":diag}
+        conf=round(min(94.0,78.0+max(0.0,ratio-4.0)*4.0),1); stamp=str(bar.get("datetime") or bar.get("timestamp") or "")
+        return {**base,"direction":direction,"confidence":conf,"confirmed":True,
+                "reason":f"{direction} SCALPER FLEX • vela de força {ratio:.2f}x a média; pré-alerta 10s; próxima M1; sem Gale.",
+                "event_key":f"SCALPINGASIA:{direction}:{stamp}","early_signal_locked":live_snapshot,"diagnostics":diag}
     except Exception as exc:
-        return {**base, "reason": f"SCALPING ASIA aguardando leitura válida: {str(exc)[:100]}"}
+        return {**base,"reason":f"SCALPER FLEX aguardando leitura válida: {str(exc)[:100]}"}
 
 
 # -----------------------------------------------------------------------------
@@ -28544,7 +28556,7 @@ _BACKTEST48_NAMES = {
     "MINSCALPER": "1 MINUTE SCALPER",
     "MOMENTUM": "MOMENTUM CHART",
     "RSI4PERIOD": "4 PERIOD RSI PRO",
-    "SCALPINGASIA": "SCALPING ASIA TEST",
+    "SCALPINGASIA": "🌏 SCALPER FLEX",
 }
 _backtest48_history_cache: Dict[str, Any] = {}
 _backtest48_result_cache: Dict[str, Any] = {}
@@ -28838,7 +28850,7 @@ def _backtest48_eval(engine: str, hist: list, symbol: str, interval: str, market
     if engine == "MOMENTUM":
         return momentum14_strategy(hist[-320:], symbol=symbol, timeframe=interval, market=market)
     if engine == "SCALPINGASIA":
-        return scalping_asia_strategy(hist[-120:], symbol=symbol, timeframe=interval, market=market)
+        return scalping_asia_strategy(hist[-1001:], symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
     return {"confirmed": False, "direction": "NEUTRO", "confidence": 0.0}
 
 
@@ -33160,10 +33172,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   <div class="robot-mode-card" id="scalpingAsiaModeCard">
-    <img src="__MEGA_IMAGE__" alt="Scalping Asia">
+    <img src="__MEGA_IMAGE__" alt="Scalper Flex">
     <div class="robot-mode-copy">
-      <div class="robot-mode-title">🌏 SCALPING ASIA</div>
-      <div class="robot-mode-desc" id="scalpingAsiaModeDesc">SMA 15 + Envelopes 0,07% • reentrada na banda • M1 • próxima vela • expiração M1 • sem Gale/grade.</div>
+      <div class="robot-mode-title">🌏 SCALPER FLEX</div>
+      <div class="robot-mode-desc" id="scalpingAsiaModeDesc">Iron Scalper • vela de força >4× média histórica • pré-alerta 10s • próxima M1 • expiração M1 • sem Gale.</div>
     </div>
     <button id="scalpingAsiaPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -34555,7 +34567,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({SMART:'CHATGPT ANALISTA',LOCALANALYST:'MEGA BOT',LOCALANALYSTFLEX:'MEGA BOT FLEX',MEGAMASTER:'MEGA MASTER',ISMAELTRADER:'ISMAEL TRADER',ISMAEL98:'ISMAEL 98',RSICHANNEL:'MEGA FÚRIA',RSICHANNEL2:'MEMORY FUSION',MINSCALPER:'1 MINUTE SCALPER',MOMENTUM:'MOMENTUM CHART',RSI4PERIOD:'4 PERIOD RSI PRO',SCALPINGASIA:'SCALPING ASIA'})[e]||e||'SEM MOTOR';
+  return ({SMART:'CHATGPT ANALISTA',LOCALANALYST:'MEGA BOT',LOCALANALYSTFLEX:'MEGA BOT FLEX',MEGAMASTER:'MEGA MASTER',ISMAELTRADER:'ISMAEL TRADER',ISMAEL98:'ISMAEL 98',RSICHANNEL:'MEGA FÚRIA',RSICHANNEL2:'MEMORY FUSION',MINSCALPER:'1 MINUTE SCALPER',MOMENTUM:'MOMENTUM CHART',RSI4PERIOD:'4 PERIOD RSI PRO',SCALPINGASIA:'🌏 SCALPER FLEX'})[e]||e||'SEM MOTOR';
 }
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
 function scheduleBacktest48(force=false,delay=260){
@@ -41168,7 +41180,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SCALPINGASIA'?'SCALPING ASIA':ek==='MINSCALPER'?'M-SNIPER':ek==='RSICHANNEL2'?'MEMORY FUSION':ek==='RSICHANNEL'?'MEGA FÚRIA':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI EA MTF':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SCALPINGASIA'?'🌏 SCALPER FLEX':ek==='MINSCALPER'?'M-SNIPER':ek==='RSICHANNEL2'?'MEMORY FUSION':ek==='RSICHANNEL'?'MEGA FÚRIA':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI EA MTF':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
