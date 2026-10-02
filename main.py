@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.26"
+APP_VERSION = "3.97.27"
 # MEGA IA 3.97.26 — integra M-SNIPER EA no slot legado MINSCALPER: vela forte M1 normalizada por range/ATR, pré-alerta 20s, próxima M1, expiração M1, sem grade/Gale.
 # MEGA IA 3.97.25 — NINJA HFT: MA3 High/Low + microimpulso/range, motor M1 separado, próxima vela, expiração M1, sem Gale.
 # MEGA IA 3.97.24 — RSI EA MTF: EMA13/30 M15 + RSI13 M5 + MACD M30, candle fechado, próxima M1, expiração M1, sem Gale.
@@ -33064,7 +33064,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <style>
     /* 3.97.11 — painel de motores enxuto: MEGA FÚRIA + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
-    #rsiChannelsModeCard,#rsiChannels2ModeCard,#rsiEaModeCard,#ninjaHftModeCard{display:flex !important}
+    #rsiChannelsModeCard,#rsiChannels2ModeCard,#rsiEaModeCard,#ninjaHftModeCard,#minScalperModeCard{display:flex !important}
   </style>
 
   <div class="robot-mode-card" id="rsiEaModeCard">
