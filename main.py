@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.34"
+APP_VERSION = "3.97.35"
+# MEGA IA 3.97.35 — corrige visibilidade do card SCALPER PRO no painel; mantém SCALPER FLEX separado.
 # MEGA IA 3.97.33 — SCALPER PRO restaurado como motor separado (SMA15 + Envelopes 0,07%), mantendo 🌏 SCALPER FLEX.
 # MEGA IA 3.97.32 — 🌏 SCALPER FLEX: Iron Scalper, pré-alerta 10s, próxima M1, expiração M1, sem Gale.
 # MEGA IA 3.97.31 — corrige SCALPINGASIA no sinal/radar e sincronização do motor ativo (remove “Motor inválido”).
@@ -33161,7 +33162,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <style>
     /* 3.97.11 — painel de motores enxuto: MEGA FÚRIA + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
-    #rsiChannelsModeCard,#rsiChannels2ModeCard,#rsiEaModeCard,#ninjaHftModeCard,#minScalperModeCard,#scalpingAsiaModeCard{display:flex !important}
+    #rsiChannelsModeCard,#rsiChannels2ModeCard,#rsiEaModeCard,#ninjaHftModeCard,#minScalperModeCard,#scalperProModeCard,#scalpingAsiaModeCard{display:flex !important}
   </style>
 
   <div class="robot-mode-card" id="rsiEaModeCard">
