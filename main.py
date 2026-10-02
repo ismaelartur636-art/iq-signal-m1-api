@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.33"
+APP_VERSION = "3.97.34"
 # MEGA IA 3.97.33 — SCALPER PRO restaurado como motor separado (SMA15 + Envelopes 0,07%), mantendo 🌏 SCALPER FLEX.
 # MEGA IA 3.97.32 — 🌏 SCALPER FLEX: Iron Scalper, pré-alerta 10s, próxima M1, expiração M1, sem Gale.
 # MEGA IA 3.97.31 — corrige SCALPINGASIA no sinal/radar e sincronização do motor ativo (remove “Motor inválido”).
@@ -180,7 +180,7 @@ def ismael98_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", cur
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # CHATGPT ANALISTA permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v209"
+PWA_VERSION = "v210"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -7140,7 +7140,7 @@ def _open_rows_age_seconds(rows) -> float:
 # Todos os provedores do roteador devem fornecer o início da barra; datetime sem
 # timezone vem em UTC (Twelve Data é solicitada explicitamente em UTC).
 CLOSED_PANEL_ENGINES = frozenset({
-    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "SCALPINGASIA"
+    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "SCALPINGASIA", "SCALPERPRO"
 })
 
 
@@ -34705,7 +34705,7 @@ async function loadBacktest48(force=false){
 async function syncBackgroundBotState(opts={}){
   const selected=selectedRobotEngine();
   let explicitEngine=String(opts.engine||selected||'SMART').toUpperCase();
-  if(explicitEngine!=='SMART' && explicitEngine!=='LOCALANALYST' && explicitEngine!=='LOCALANALYSTFLEX' && explicitEngine!=='MEGAMASTER' && explicitEngine!=='ISMAELTRADER' && explicitEngine!=='ISMAEL98' && explicitEngine!=='RSICHANNEL' && explicitEngine!=='RSICHANNEL2' && explicitEngine!=='MINSCALPER' && explicitEngine!=='MOMENTUM' && explicitEngine!=='NINJAHFT' && explicitEngine!=='SCALPINGASIA') explicitEngine='SMART';
+  if(explicitEngine!=='SMART' && explicitEngine!=='LOCALANALYST' && explicitEngine!=='LOCALANALYSTFLEX' && explicitEngine!=='MEGAMASTER' && explicitEngine!=='ISMAELTRADER' && explicitEngine!=='ISMAEL98' && explicitEngine!=='RSICHANNEL' && explicitEngine!=='RSICHANNEL2' && explicitEngine!=='MINSCALPER' && explicitEngine!=='MOMENTUM' && explicitEngine!=='NINJAHFT' && explicitEngine!=='SCALPINGASIA' && explicitEngine!=='SCALPERPRO') explicitEngine='SMART';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
   const payload={
