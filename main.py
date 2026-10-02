@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.19"
+APP_VERSION = "3.97.20"
 # MEGA IA 3.97.19 — corrige seleção/backtest do SUPPLY DEMAND; substitui o segundo RSI (RSICHANNEL2) por SUPPLY DEMAND [ORT] v3: zonas confirmadas, CALL em demanda, PUT em oferta, expiração M1.
 # MEGA IA 3.97.16 — dois motores RSI independentes: MEGA FÚRIA (M5 → próxima M1) e MEGA BOT (M5 → +2min → expira M1).
 # MEGA IA 3.97.15 — RSI CHANNELS: leitura M5; pré-alerta na janela oficial de 20s; entrada exatamente 2 minutos após o pré-alerta; expiração M1 (60s).
@@ -169,7 +169,7 @@ def ismael98_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", cur
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # CHATGPT ANALISTA permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v208"
+PWA_VERSION = "v209"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -38033,7 +38033,7 @@ if(appPowerBtn){
 }
 
 if(backtest48RefreshBtn) backtest48RefreshBtn.onclick=()=>loadBacktest48(true);
-[aiPowerBtn,localAnalystPowerBtn,localAnalystFlexPowerBtn,megaMasterPowerBtn,ismael98PowerBtn,ismaelTraderPowerBtn,rsiChannelsPowerBtn,minScalperPowerBtn]
+[aiPowerBtn,localAnalystPowerBtn,localAnalystFlexPowerBtn,megaMasterPowerBtn,ismael98PowerBtn,ismaelTraderPowerBtn,rsiChannelsPowerBtn,rsiChannels2PowerBtn,minScalperPowerBtn]
   .filter(Boolean).forEach(b=>b.addEventListener('click',()=>scheduleBacktest48(false,450)));
 if(S) S.addEventListener('change',()=>scheduleBacktest48(false,300));
 if(interval) interval.addEventListener('change',()=>scheduleBacktest48(false,300));
@@ -39254,10 +39254,15 @@ async function setRsiChannels2Power(enabled){
   }
   try{localStorage.setItem('mega_rsi_channels2_power',rsiChannels2Enabled?'ONLINE':'OFFLINE');}catch(_){}
   resetEngineVisualState(); applyRobotPowerState();
+  // 3.97.20 — atualiza o Backtest 48H imediatamente ao ligar/desligar SUPPLY DEMAND.
+  // Antes, o card podia continuar exibindo o resultado N/D do CHATGPT ANALISTA
+  // carregado antes da troca do motor, apesar de RSICHANNEL2 já estar ONLINE.
+  scheduleBacktest48(true,80);
   await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'RSICHANNEL2'});
   if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]); else await Promise.allSettled([perf()]);
+  scheduleBacktest48(true,80);
   if(chartTab.classList.contains('active')) loadChart();
-  if(voiceEnabled) speak(rsiChannels2Enabled?'Mega Bot online.':'Mega Bot offline.');
+  if(voiceEnabled) speak(rsiChannels2Enabled?'Supply Demand online.':'Supply Demand offline.');
 }
 
 async function setIsmael98Power(enabled){
