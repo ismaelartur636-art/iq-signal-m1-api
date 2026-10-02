@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.28"
+APP_VERSION = "3.97.30"
+# MEGA IA 3.97.30 — corrige registro do SCALPINGASIA no Backtest 48H (motor reconhecido).
 # MEGA IA 3.97.29 — SCALPING ASIA visível no painel + botão ON/OFF + radar/backtest.
 # MEGA IA 3.97.28 — SCALPING ASIA TEST: adaptador causal SMA15 + Envelopes 0,07%, reentrada na banda, Backtest 48H, próxima M1, sem grade/Gale.
 # MEGA IA 3.97.26 — integra M-SNIPER EA no slot legado MINSCALPER: vela forte M1 normalizada por range/ATR, pré-alerta 20s, próxima M1, expiração M1, sem grade/Gale.
@@ -28529,7 +28530,7 @@ def scalping_asia_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
 # -----------------------------------------------------------------------------
 _BACKTEST48_SUPPORTED = {
     "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER",
-    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD",
+    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA",
 }
 _BACKTEST48_NAMES = {
     "SMART": "CHATGPT ANALISTA",
