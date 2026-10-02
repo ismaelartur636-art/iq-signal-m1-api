@@ -22901,7 +22901,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "🌏 SCALPER FLEX"
         elif engine == "SCALPERPRO":
             engine_title = "SCALPER PRO"
-            engine_mode = "IRON_SCALPER_BODY_4X_AVG_RANGE_EARLY10_NEXT_M1"
+            engine_mode = "ENVELOPES_SMA15_007_REENTRY_EARLY10_NEXT_M1"
         elif engine == "SESSIONBREAKOUT":
             engine_title = "SMART SESSION BREAKOUT"
             engine_mode = "SESSION_RANGE_0000_0800_ATR14_NEXT_CANDLE"
@@ -23078,6 +23078,47 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 engine_closed = closed[-min(TAURUS_EA_HISTORY_BARS, len(closed)):]
             elif engine == "TAURUSRSIDIV":
                 engine_closed = closed[-min(TAURUS_RSIDIV_HISTORY_BARS, len(closed)):]
+            elif engine == "SCALPERPRO":
+                # 3.97.37 — radar/pré-alerta usa EXATAMENTE o mesmo motor do sinal oficial.
+                # Antes caía no preview genérico, por isso o painel podia mostrar
+                # "radar específico indisponível" mesmo com SCALPER PRO online.
+                _sp_remain = int(max(0, (entry_dt - now()).total_seconds()))
+                if SCALPER_PRO_EARLY_MIN_REMAINING <= _sp_remain <= SCALPER_PRO_EARLY_WINDOW_BEFORE:
+                    sp_preview = scalper_pro_strategy(
+                        raw[-260:], symbol=symbol, timeframe=interval, market=requested_market,
+                        current_candle_closed=False, allow_prealert=True
+                    )
+                    preview = (
+                        {
+                            "direction": sp_preview.get("direction"),
+                            "confidence": sp_preview.get("confidence", 0),
+                            "strategy": "SCALPER PRO • PRÉ-ALERTA 10S",
+                            "reason": sp_preview.get("reason", "SCALPER PRO monitorando reentrada no Envelopes SMA15 0,07%."),
+                        }
+                        if sp_preview.get("confirmed") and sp_preview.get("direction") in ("CALL", "PUT")
+                        else None
+                    )
+                else:
+                    preview = None
+            elif engine == "SCALPINGASIA":
+                _sf_remain = int(max(0, (entry_dt - now()).total_seconds()))
+                if SCALPER_FLEX_EARLY_MIN_REMAINING <= _sf_remain <= SCALPER_FLEX_EARLY_WINDOW_BEFORE:
+                    sf_preview = scalping_asia_strategy(
+                        raw[-1001:], symbol=symbol, timeframe=interval, market=requested_market,
+                        current_candle_closed=False, allow_prealert=True
+                    )
+                    preview = (
+                        {
+                            "direction": sf_preview.get("direction"),
+                            "confidence": sf_preview.get("confidence", 0),
+                            "strategy": "🌏 SCALPER FLEX • PRÉ-ALERTA 10S",
+                            "reason": sf_preview.get("reason", "SCALPER FLEX monitorando."),
+                        }
+                        if sf_preview.get("confirmed") and sf_preview.get("direction") in ("CALL", "PUT")
+                        else None
+                    )
+                else:
+                    preview = None
             elif engine == "SNIPER":
                 engine_closed = closed[-min(SSC_HISTORY_BARS, len(closed)):]
             elif engine == "TLBRSI":
@@ -24371,6 +24412,13 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         cache[key] = (time.time(), base)
                         return base
 
+                if engine == "SCALPERPRO":
+                    base["announce_seconds_before"] = SCALPER_PRO_EARLY_SIGNAL_SECONDS
+                    base["early_signal_locked"] = True
+                    base["non_repaint_after_release"] = True
+                    base["closed_candles_only"] = False
+                    base["signal_snapshot"] = "FORMING_CANDLE_AT_10S"
+                    base["scalper_pro"] = {"sma_period": SCALPER_PRO_PERIOD, "envelope_pct": SCALPER_PRO_DEVIATION_PCT, "timing_seconds_before": SCALPER_PRO_EARLY_SIGNAL_SECONDS}
                 if engine == "RSICHANNEL":
                     _rc_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
                     if not (RSICHANNEL_EARLY_MIN_REMAINING <= _rc_remaining <= RSICHANNEL_EARLY_WINDOW_BEFORE):
@@ -28516,13 +28564,13 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
 
 # MEGA IA 3.97.33 — SCALPER PRO (antigo SCALPING ASIA)
 SCALPER_PRO_PERIOD = 15
-SCALPER_PRO_DEVIATION_PCT = 0.05
+SCALPER_PRO_DEVIATION_PCT = 0.07
 SCALPER_PRO_EARLY_SIGNAL_SECONDS = 10
 SCALPER_PRO_EARLY_WINDOW_BEFORE = 12
 SCALPER_PRO_EARLY_MIN_REMAINING = 3
 
 def scalper_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
-    """SCALPER PRO — reentrada no Envelopes SMA15 ±0,05%. Candle fechado -> próxima M1."""
+    """SCALPER PRO — reentrada no Envelopes SMA15 ±0,07%. Candle fechado -> próxima M1."""
     rows=list(cs or [])
     live_snapshot=bool(allow_prealert and not current_candle_closed)
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
@@ -28542,7 +28590,7 @@ def scalper_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", 
         if direction=="NEUTRO": return {**base,"reason":"SCALPER PRO aguardando reentrada no Envelopes SMA15.","diagnostics":diag}
         stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
         return {**base,"direction":direction,"confidence":76.0,"confirmed":True,
-                "reason":f"{direction} SCALPER PRO • reentrada no Envelopes SMA15 0,05%; pré-alerta 10s; próxima M1; sem Gale.",
+                "reason":f"{direction} SCALPER PRO • reentrada no Envelopes SMA15 0,07%; pré-alerta 10s; próxima M1; sem Gale.",
                 "event_key":f"SCALPERPRO:{direction}:{stamp}","diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"SCALPER PRO aguardando leitura válida: {str(exc)[:100]}"}
