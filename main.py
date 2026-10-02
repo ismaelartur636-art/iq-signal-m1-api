@@ -28516,13 +28516,13 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
 
 # MEGA IA 3.97.33 — SCALPER PRO (antigo SCALPING ASIA)
 SCALPER_PRO_PERIOD = 15
-SCALPER_PRO_DEVIATION_PCT = 0.07
+SCALPER_PRO_DEVIATION_PCT = 0.05
 SCALPER_PRO_EARLY_SIGNAL_SECONDS = 10
 SCALPER_PRO_EARLY_WINDOW_BEFORE = 12
 SCALPER_PRO_EARLY_MIN_REMAINING = 3
 
 def scalper_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
-    """SCALPER PRO — reentrada no Envelopes SMA15 ±0,07%. Candle fechado -> próxima M1."""
+    """SCALPER PRO — reentrada no Envelopes SMA15 ±0,05%. Candle fechado -> próxima M1."""
     rows=list(cs or [])
     live_snapshot=bool(allow_prealert and not current_candle_closed)
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
@@ -28542,7 +28542,7 @@ def scalper_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", 
         if direction=="NEUTRO": return {**base,"reason":"SCALPER PRO aguardando reentrada no Envelopes SMA15.","diagnostics":diag}
         stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
         return {**base,"direction":direction,"confidence":76.0,"confirmed":True,
-                "reason":f"{direction} SCALPER PRO • reentrada no Envelopes SMA15 0,07%; pré-alerta 10s; próxima M1; sem Gale.",
+                "reason":f"{direction} SCALPER PRO • reentrada no Envelopes SMA15 0,05%; pré-alerta 10s; próxima M1; sem Gale.",
                 "event_key":f"SCALPERPRO:{direction}:{stamp}","diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"SCALPER PRO aguardando leitura válida: {str(exc)[:100]}"}
