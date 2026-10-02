@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.35"
+APP_VERSION = "3.97.36"
+# MEGA IA 3.97.36 — SCALPER PRO pré-alerta 10s + SCALPER FLEX mais solto (2,5x) + scanner rápido para não perder janela.
 # MEGA IA 3.97.35 — corrige visibilidade do card SCALPER PRO no painel; mantém SCALPER FLEX separado.
 # MEGA IA 3.97.33 — SCALPER PRO restaurado como motor separado (SMA15 + Envelopes 0,07%), mantendo 🌏 SCALPER FLEX.
 # MEGA IA 3.97.32 — 🌏 SCALPER FLEX: Iron Scalper, pré-alerta 10s, próxima M1, expiração M1, sem Gale.
@@ -1600,7 +1601,7 @@ BACKGROUND_STATE_PATH = os.getenv(
     "BACKGROUND_STATE_PATH",
     os.path.join(BASE_DIR, ".mega_background_state.json"),
 ).strip()
-BACKGROUND_SCAN_SECONDS = max(3.0, min(60.0, float(os.getenv("BACKGROUND_SCAN_SECONDS", "4"))))
+BACKGROUND_SCAN_SECONDS = max(1.0, min(60.0, float(os.getenv("BACKGROUND_SCAN_SECONDS", "1"))))
 BACKGROUND_RESULT_SECONDS = max(3.0, min(30.0, float(os.getenv("BACKGROUND_RESULT_SECONDS", "5"))))
 BACKGROUND_DEFAULT_ENABLED = os.getenv("BACKGROUND_SIGNALS_ENABLED", "0").strip().lower() in ("1", "true", "on", "yes")
 BACKGROUND_DEFAULT_ENGINE = os.getenv("BACKGROUND_ENGINE", "SMART").strip().upper() or "SMART"
@@ -23341,7 +23342,15 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     analysis = one_minute_scalper_strategy(engine_closed, symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
                 analysis["seconds_to_entry_snapshot"]=round(_min_remaining,1)
             elif engine == "SCALPERPRO":
-                analysis=scalper_pro_strategy(engine_closed[-260:],symbol=symbol,timeframe=interval,market=market)
+                _sp_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                _sp_early=SCALPER_PRO_EARLY_MIN_REMAINING <= _sp_remaining <= SCALPER_PRO_EARLY_WINDOW_BEFORE
+                if _sp_early:
+                    analysis=scalper_pro_strategy(raw[-260:],symbol=symbol,timeframe=interval,market=market,current_candle_closed=False,allow_prealert=True)
+                else:
+                    analysis=scalper_pro_strategy(engine_closed[-260:],symbol=symbol,timeframe=interval,market=market,current_candle_closed=True,allow_prealert=False)
+                    if analysis.get("confirmed"):
+                        analysis={**analysis,"direction":"NEUTRO","confirmed":False,"confidence":0.0,"reason":f"SCALPER PRO confirmado; aguardando pré-alerta de 10s • faltam {int(_sp_remaining)}s.","early_signal_window":False}
+                analysis["seconds_to_entry_snapshot"]=round(_sp_remaining,1)
             elif engine == "SCALPINGASIA":
                 _sf_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
                 _sf_early=SCALPER_FLEX_EARLY_MIN_REMAINING <= _sf_remaining <= SCALPER_FLEX_EARLY_WINDOW_BEFORE
@@ -28508,13 +28517,17 @@ async def engine_study(request: Request, symbol: str="EUR/USD", interval: str="1
 # MEGA IA 3.97.33 — SCALPER PRO (antigo SCALPING ASIA)
 SCALPER_PRO_PERIOD = 15
 SCALPER_PRO_DEVIATION_PCT = 0.07
+SCALPER_PRO_EARLY_SIGNAL_SECONDS = 10
+SCALPER_PRO_EARLY_WINDOW_BEFORE = 12
+SCALPER_PRO_EARLY_MIN_REMAINING = 3
 
-def scalper_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
+def scalper_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
     """SCALPER PRO — reentrada no Envelopes SMA15 ±0,07%. Candle fechado -> próxima M1."""
     rows=list(cs or [])
+    live_snapshot=bool(allow_prealert and not current_candle_closed)
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
           "strategy":"SCALPER PRO","engine":"SCALPERPRO","provider":"LOCAL_SCALPER_PRO",
-          "closed_candles_only":True,"next_candle_entry":True,"expiry_candles":1,"gale_signal":False,
+          "closed_candles_only":not live_snapshot,"forming_candle_snapshot":live_snapshot,"early_signal_window":live_snapshot,"prealert_seconds":10,"next_candle_entry":True,"expiry_candles":1,"gale_signal":False,
           "martingale":False,"non_repaint":True,"non_repaint_after_release":True}
     if len(rows)<SCALPER_PRO_PERIOD+2:
         return {**base,"reason":f"SCALPER PRO coletando candles ({len(rows)}/{SCALPER_PRO_PERIOD+2})."}
@@ -28529,7 +28542,7 @@ def scalper_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         if direction=="NEUTRO": return {**base,"reason":"SCALPER PRO aguardando reentrada no Envelopes SMA15.","diagnostics":diag}
         stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
         return {**base,"direction":direction,"confidence":76.0,"confirmed":True,
-                "reason":f"{direction} SCALPER PRO • reentrada no Envelopes SMA15 0,07%; próxima M1; sem Gale.",
+                "reason":f"{direction} SCALPER PRO • reentrada no Envelopes SMA15 0,07%; pré-alerta 10s; próxima M1; sem Gale.",
                 "event_key":f"SCALPERPRO:{direction}:{stamp}","diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"SCALPER PRO aguardando leitura válida: {str(exc)[:100]}"}
@@ -28537,7 +28550,7 @@ def scalper_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
 # MEGA IA 3.97.32 — 🌏 SCALPER FLEX (Iron Scalper EA adaptado)
 SCALPER_FLEX_AVG_BARS=1000
 SCALPER_FLEX_MIN_HISTORY=80
-SCALPER_FLEX_PIPS_STEP=4.0
+SCALPER_FLEX_PIPS_STEP=2.5
 SCALPER_FLEX_EARLY_SIGNAL_SECONDS=10
 SCALPER_FLEX_EARLY_WINDOW_BEFORE=12
 SCALPER_FLEX_EARLY_MIN_REMAINING=3
@@ -28562,10 +28575,10 @@ def scalping_asia_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
         body=abs(c-o); ratio=body/max(avg,1e-12)
         call=c>o and body>avg*SCALPER_FLEX_PIPS_STEP; put=c<o and body>avg*SCALPER_FLEX_PIPS_STEP
         direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
-        diag={"body":round(body,10),"avg_range":round(avg,10),"body_vs_avg":round(ratio,2),"pips_step":4.0,"history_bars":len(ranges),"live_10s":live_snapshot}
+        diag={"body":round(body,10),"avg_range":round(avg,10),"body_vs_avg":round(ratio,2),"pips_step":SCALPER_FLEX_PIPS_STEP,"history_bars":len(ranges),"live_10s":live_snapshot}
         if direction=="NEUTRO":
-            return {**base,"reason":f"SCALPER FLEX monitorando vela de força • corpo {ratio:.2f}x média • gatilho >4.0x.","diagnostics":diag}
-        conf=round(min(94.0,78.0+max(0.0,ratio-4.0)*4.0),1); stamp=str(bar.get("datetime") or bar.get("timestamp") or "")
+            return {**base,"reason":f"SCALPER FLEX monitorando vela de força • corpo {ratio:.2f}x média • gatilho >{SCALPER_FLEX_PIPS_STEP:.1f}x.","diagnostics":diag}
+        conf=round(min(94.0,78.0+max(0.0,ratio-SCALPER_FLEX_PIPS_STEP)*4.0),1); stamp=str(bar.get("datetime") or bar.get("timestamp") or "")
         return {**base,"direction":direction,"confidence":conf,"confirmed":True,
                 "reason":f"{direction} SCALPER FLEX • vela de força {ratio:.2f}x a média; pré-alerta 10s; próxima M1; sem Gale.",
                 "event_key":f"SCALPINGASIA:{direction}:{stamp}","early_signal_locked":live_snapshot,"diagnostics":diag}
@@ -33213,7 +33226,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Scalper Pro">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">SCALPER PRO</div>
-      <div class="robot-mode-desc" id="scalperProModeDesc">SMA15 + Envelopes 0,07% • reentrada na banda • próxima M1 • expiração M1 • sem Gale.</div>
+      <div class="robot-mode-desc" id="scalperProModeDesc">SMA15 + Envelopes 0,07% • reentrada na banda • pré-alerta 10s • próxima M1 • expiração M1 • sem Gale.</div>
     </div>
     <button id="scalperProPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -33222,7 +33235,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Scalper Flex">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🌏 SCALPER FLEX</div>
-      <div class="robot-mode-desc" id="scalpingAsiaModeDesc">Iron Scalper • vela de força >4× média histórica • pré-alerta 10s • próxima M1 • expiração M1 • sem Gale.</div>
+      <div class="robot-mode-desc" id="scalpingAsiaModeDesc">Iron Scalper • vela de força >2,5× média histórica • pré-alerta 10s • próxima M1 • expiração M1 • sem Gale.</div>
     </div>
     <button id="scalpingAsiaPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
