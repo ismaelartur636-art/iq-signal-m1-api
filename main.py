@@ -29977,6 +29977,31 @@ async def pre_signals(
         except Exception as exc:
             return {"ok":True,"engine":"ISMAELTRADER","items":[],"seconds_to_entry":remain,"message":f"ISMAEL TRADER aguardando dados: {str(exc)[:120]}"}
 
+    if engine == "SCALPERPRO":
+        entry_dt=next_boundary(interval)
+        remain=int(max(0,(entry_dt-now()).total_seconds()))
+        target=symbol or "EUR/USD"
+        if not (SCALPER_PRO_EARLY_MIN_REMAINING <= remain <= SCALPER_PRO_EARLY_WINDOW_BEFORE):
+            return {"ok":True,"engine":"SCALPERPRO","items":[],"seconds_to_entry":remain,
+                    "message":f"SCALPER PRO monitorando • pré-alerta abre nos {SCALPER_PRO_EARLY_SIGNAL_SECONDS}s finais • faltam {remain}s para a próxima vela.",
+                    "non_repaint_after_release":True,"gale_signal":False}
+        state=_iq_session_state(request, required=False) if market == "IQ_OTC" else None
+        if market == "IQ_OTC" and not state:
+            return {"ok":True,"engine":"SCALPERPRO","items":[],"seconds_to_entry":remain,"message":"SCALPER PRO OTC aguardando conexão com a IQ Option."}
+        try:
+            raw=(await iq_ea_candles(state,target,interval,260,regular_market=False)) if market == "IQ_OTC" else (await candles(target,interval,260,"OPEN",None,request=request))
+            tech=scalper_pro_strategy(raw[-260:],symbol=target,timeframe=interval,market=market,current_candle_closed=False,allow_prealert=True)
+            items=[]
+            if tech.get("confirmed") and str(tech.get("direction") or "").upper() in ("CALL","PUT"):
+                items=[{"symbol":target,"direction":str(tech.get("direction")).upper(),"confidence":float(tech.get("confidence") or 0.0),
+                        "strategy":"SCALPER PRO • PRÉ-ALERTA 10S","reason":str(tech.get("reason") or "SCALPER PRO confirmou reentrada no Envelopes SMA15 0,07%."),
+                        "entry_time":iso(entry_dt),"seconds_to_entry":remain,"prealert_only":False,"early_signal_locked":True}]
+            return {"ok":True,"engine":"SCALPERPRO","items":items,"seconds_to_entry":remain,
+                    "message":str(tech.get("reason") or "SCALPER PRO monitorando reentrada no Envelopes SMA15 0,07%."),
+                    "non_repaint_after_release":True,"gale_signal":False}
+        except Exception as exc:
+            return {"ok":True,"engine":"SCALPERPRO","items":[],"seconds_to_entry":remain,"message":f"SCALPER PRO aguardando dados: {str(exc)[:120]}"}
+
     if engine == "MINSCALPER":
         entry_dt=next_boundary(interval)
         remain=int(max(0,(entry_dt-now()).total_seconds()))
@@ -31260,7 +31285,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         elif len(raw) >= 25:
             # Os sinais STREAKREV trabalham com timestamps verificáveis para
             # usar a mesma última vela FECHADA do motor oficial /signal-ai.
-            closed = (_verified_closed_candles(raw, interval) if engine in ("STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER")
+            closed = (_verified_closed_candles(raw, interval) if engine in ("STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "SCALPINGASIA", "SCALPERPRO")
                       else (raw[:-1] if len(raw) > 1 else raw))
             if engine == "EA":
                 tech = await ea_xgboost_strategy(closed, sym, interval, market=market)
@@ -31609,6 +31634,19 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     if direction != "NEUTRO"
                     else f"{engine_label} • MONITORANDO • {why}"
                 )
+            elif engine == "SCALPERPRO":
+                # Radar dedicado: mesma regra do sinal oficial, sem fallback genérico.
+                tech = scalper_pro_strategy(closed[-260:], symbol=sym, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
+                engine_label = "SCALPER PRO"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "SCALPER PRO monitorando reentrada no Envelopes SMA15 0,07%.").replace("\n", " ")[:120]
+                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
+            elif engine == "SCALPINGASIA":
+                tech = scalping_asia_strategy(closed[-1001:], symbol=sym, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
+                engine_label = "SCALPER FLEX"
+                direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why = str(tech.get("reason") or "SCALPER FLEX monitorando.").replace("\n", " ")[:120]
+                status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "MOMENTUM":
                 # Radar e sinal oficial usam exatamente o mesmo Momentum 14 puro.
                 tech = momentum14_strategy(closed[-120:], symbol=sym, timeframe=interval, market=market)
