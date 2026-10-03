@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.52"
+APP_VERSION = "3.97.53"
+# MEGA IA 3.97.53 — SCALPER PRO restaurado ao gatilho original do EA Scalping Asia: Open fora do Envelope e preço atual reentra; mantém pré-alerta 10s, próxima M1, sem Gale.
 # MEGA IA 3.97.51 — SCALPER PRO alinhado em 10s: motor, pré-alerta, radar, painel e texto do backtest.
 # MEGA IA 3.97.50 — deixa somente SCALPER PRO e converte seleções antigas automaticamente para SCALPERPRO.
 # MEGA IA 3.97.52 — SCALPER PRO: status neutro passa a mostrar MONITORANDO MERCADO/AGUARDANDO OPORTUNIDADE; AGUARDANDO DADOS fica reservado a falha real de fonte/análise.
@@ -28659,36 +28660,43 @@ async def _scalper_pro_candles(symbol: str, interval: str, n: int, market: str =
 
 
 def scalper_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
-    """SCALPER PRO — SMA15 + Envelopes ±0,07%. Saída por máxima/mínima e reentrada por fechamento."""
+    """SCALPER PRO — gatilho original do EA Scalping Asia.
+
+    EA original:
+      BUY  quando Envelope inferior > Open[0] e Envelope inferior < preço atual.
+      SELL quando Envelope superior < Open[0] e Envelope superior > preço atual.
+    No app, o último preço disponível do snapshot representa Bid/preço atual.
+    """
     rows=list(cs or [])
     live_snapshot=bool(allow_prealert and not current_candle_closed)
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
-          "strategy":"SCALPER PRO","engine":"SCALPERPRO","provider":"LOCAL_SCALPER_PRO",
+          "strategy":"SCALPER PRO","engine":"SCALPERPRO","provider":"EA_SCALPING_ASIA_ORIGINAL_TRIGGER",
           "closed_candles_only":not live_snapshot,"forming_candle_snapshot":live_snapshot,
           "early_signal_window":live_snapshot,"prealert_seconds":10,"next_candle_entry":True,
           "expiry_candles":1,"gale_signal":False,"martingale":False,
-          "non_repaint":True,"non_repaint_after_release":True}
-    if len(rows)<SCALPER_PRO_PERIOD+2:
-        return {**base,"reason":f"SCALPER PRO coletando candles ({len(rows)}/{SCALPER_PRO_PERIOD+2})."}
+          "non_repaint_after_release":True}
+    if len(rows)<SCALPER_PRO_PERIOD+1:
+        return {**base,"reason":f"SCALPER PRO coletando candles ({len(rows)}/{SCALPER_PRO_PERIOD+1})."}
     try:
-        prev_closes=[float(x.get("close",0) or 0) for x in rows[:-1]]
-        sma15=sum(prev_closes[-SCALPER_PRO_PERIOD:])/SCALPER_PRO_PERIOD
+        # iEnvelopes shift 0 usa a vela atual; reproduzimos a SMA15 incluindo o close
+        # atual do snapshot. Durante o pré-alerta, esse close é o preço corrente.
+        closes=[float(x.get("close",0) or 0) for x in rows]
+        sma15=sum(closes[-SCALPER_PRO_PERIOD:])/SCALPER_PRO_PERIOD
         dev=SCALPER_PRO_DEVIATION_PCT/100.0
         upper=sma15*(1+dev); lower=sma15*(1-dev)
         bar=rows[-1]
-        h=float(bar.get("high",0) or 0); l=float(bar.get("low",0) or 0); c=float(bar.get("close",0) or 0)
-        call=(l < lower and c >= lower)
-        put=(h > upper and c <= upper)
+        o=float(bar.get("open",0) or 0); price=float(bar.get("close",0) or 0)
+        call=(lower > o and lower < price)
+        put=(upper < o and upper > price)
         if call and put: call=put=False
         direction="CALL" if call else ("PUT" if put else "NEUTRO")
         diag={"sma15":round(sma15,10),"upper":round(upper,10),"lower":round(lower,10),
-              "high":round(h,10),"low":round(l,10),"close":round(c,10),
-              "touched_lower":l<lower,"touched_upper":h>upper}
+              "open":round(o,10),"price":round(price,10),"original_ea_trigger":True}
         if direction=="NEUTRO":
-            return {**base,"reason":"SCALPER PRO monitorando • aguardando toque/saída do Envelope e fechamento de volta para dentro.","diagnostics":diag}
+            return {**base,"reason":"SCALPER PRO monitorando • aguardando abertura fora do Envelope e reentrada do preço na banda.","diagnostics":diag}
         stamp=str(bar.get("datetime") or bar.get("timestamp") or "")
         return {**base,"direction":direction,"confidence":76.0,"confirmed":True,
-                "reason":f"{direction} SCALPER PRO • tocou/rompeu Envelope SMA15 0,07% e fechou de volta dentro; pré-alerta 10s; próxima M1; sem Gale.",
+                "reason":f"{direction} SCALPER PRO • gatilho original Scalping Asia: abertura fora do Envelope SMA15 0,07% e preço reentrou; pré-alerta 10s; próxima M1; sem Gale.",
                 "event_key":f"SCALPERPRO:{direction}:{stamp}","early_signal_locked":live_snapshot,"diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"SCALPER PRO aguardando leitura válida: {str(exc)[:100]}"}
@@ -33360,7 +33368,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Scalper Pro">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">SCALPER PRO</div>
-      <div class="robot-mode-desc" id="scalperProModeDesc">SMA15 + Envelopes 0,07% • reentrada na banda • pré-alerta 10s • próxima M1 • expiração M1 • sem Gale.</div>
+      <div class="robot-mode-desc" id="scalperProModeDesc">SMA15 + Envelopes 0,07% • gatilho original Scalping Asia • pré-alerta 10s • próxima M1 • expiração M1 • sem Gale.</div>
     </div>
     <button id="scalperProPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
