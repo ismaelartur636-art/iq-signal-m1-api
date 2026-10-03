@@ -42,8 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.45"
-# MEGA IA 3.97.45 — corrige SCALPER PRO: reentrada usa banda SMA15 anterior + fechamento anterior fora + preço atual retornando para dentro; mesma regra no ao vivo e backtest.
+APP_VERSION = "3.97.46"
 # MEGA IA 3.97.44 — teste isolado: SCALPER FLEX removido do painel/seleção/background; somente SCALPER PRO permanece ativo.
 # MEGA IA 3.97.43 — limpeza final: somente SCALPER PRO/FLEX podem ser selecionados; remove fallbacks visuais/operacionais de ChatGPT, IA Gráfica e motores antigos.
 # MEGA IA 3.97.42 — limpa fila 24h: somente SCALPER PRO/FLEX; BTC ONLY também no servidor; descarta pendências antigas ao trocar motor.
@@ -28596,43 +28595,37 @@ SCALPER_PRO_EARLY_WINDOW_BEFORE = 12
 SCALPER_PRO_EARLY_MIN_REMAINING = 3
 
 def scalper_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
-    """SCALPER PRO — reentrada no Envelopes SMA15 ±0,07%. Candle fechado -> próxima M1."""
+    """SCALPER PRO — SMA15 + Envelopes ±0,07%. Saída por máxima/mínima e reentrada por fechamento."""
     rows=list(cs or [])
     live_snapshot=bool(allow_prealert and not current_candle_closed)
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
           "strategy":"SCALPER PRO","engine":"SCALPERPRO","provider":"LOCAL_SCALPER_PRO",
-          "closed_candles_only":not live_snapshot,"forming_candle_snapshot":live_snapshot,"early_signal_window":live_snapshot,"prealert_seconds":10,"next_candle_entry":True,"expiry_candles":1,"gale_signal":False,
-          "martingale":False,"non_repaint":True,"non_repaint_after_release":True}
+          "closed_candles_only":not live_snapshot,"forming_candle_snapshot":live_snapshot,
+          "early_signal_window":live_snapshot,"prealert_seconds":10,"next_candle_entry":True,
+          "expiry_candles":1,"gale_signal":False,"martingale":False,
+          "non_repaint":True,"non_repaint_after_release":True}
     if len(rows)<SCALPER_PRO_PERIOD+2:
         return {**base,"reason":f"SCALPER PRO coletando candles ({len(rows)}/{SCALPER_PRO_PERIOD+2})."}
     try:
-        closes=[float(x.get("close",0) or 0) for x in rows]
-        # 3.97.45 — reentrada causal e idêntica no ao vivo/backtest.
-        # A banda é congelada com os 15 fechamentos ANTERIORES ao candle avaliado.
-        # O candle anterior precisa estar fora do envelope e o candle/preço atual
-        # precisa retornar para dentro. Isso evita a trava causada por exigir que
-        # a abertura do próprio candle atual estivesse fora de uma banda que
-        # mudava com o fechamento desse mesmo candle.
-        prev_c=float(rows[-2].get("close",0) or 0)
-        c=float(rows[-1].get("close",0) or 0)
-        basis=closes[-(SCALPER_PRO_PERIOD+1):-1]
-        sma15=sum(basis)/SCALPER_PRO_PERIOD
+        prev_closes=[float(x.get("close",0) or 0) for x in rows[:-1]]
+        sma15=sum(prev_closes[-SCALPER_PRO_PERIOD:])/SCALPER_PRO_PERIOD
         dev=SCALPER_PRO_DEVIATION_PCT/100.0
         upper=sma15*(1+dev); lower=sma15*(1-dev)
-        call=prev_c<lower and c>=lower
-        put=prev_c>upper and c<=upper
-        direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
-        diag={"sma15":sma15,"upper":upper,"lower":lower,"prev_close":prev_c,"current_close":c,
-              "prev_below":prev_c<lower,"prev_above":prev_c>upper,"live_snapshot":live_snapshot}
+        bar=rows[-1]
+        h=float(bar.get("high",0) or 0); l=float(bar.get("low",0) or 0); c=float(bar.get("close",0) or 0)
+        call=(l < lower and c >= lower)
+        put=(h > upper and c <= upper)
+        if call and put: call=put=False
+        direction="CALL" if call else ("PUT" if put else "NEUTRO")
+        diag={"sma15":round(sma15,10),"upper":round(upper,10),"lower":round(lower,10),
+              "high":round(h,10),"low":round(l,10),"close":round(c,10),
+              "touched_lower":l<lower,"touched_upper":h>upper}
         if direction=="NEUTRO":
-            state=("preço anterior abaixo da banda; aguardando retorno" if prev_c<lower else
-                   ("preço anterior acima da banda; aguardando retorno" if prev_c>upper else
-                    "aguardando preço sair do envelope antes da reentrada"))
-            return {**base,"reason":f"SCALPER PRO • {state}.","diagnostics":diag}
-        stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
+            return {**base,"reason":"SCALPER PRO monitorando • aguardando toque/saída do Envelope e fechamento de volta para dentro.","diagnostics":diag}
+        stamp=str(bar.get("datetime") or bar.get("timestamp") or "")
         return {**base,"direction":direction,"confidence":76.0,"confirmed":True,
-                "reason":f"{direction} SCALPER PRO • reentrada no Envelopes SMA15 0,07%; pré-alerta 10s; próxima M1; sem Gale.",
-                "event_key":f"SCALPERPRO:{direction}:{stamp}","diagnostics":diag}
+                "reason":f"{direction} SCALPER PRO • tocou/rompeu Envelope SMA15 0,07% e fechou de volta dentro; pré-alerta 10s; próxima M1; sem Gale.",
+                "event_key":f"SCALPERPRO:{direction}:{stamp}","early_signal_locked":live_snapshot,"diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"SCALPER PRO aguardando leitura válida: {str(exc)[:100]}"}
 
