@@ -42,8 +42,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.81"
+APP_VERSION = "3.97.82"
 # MEGA IA 3.97.81 — IQ Option: fechamento completo do socket antigo + validação de estabilidade do WebSocket antes de aceitar login/reconexão; reduz loops NoneType/sock e reconexões fantasma.
+# MEGA IA 3.97.82 — painel: impede repetição acumulativa de “MANTIDO ATÉ A EXPIRAÇÃO” a cada polling; sinal continua preservado uma única vez até expirar.
 # MEGA IA 3.97.80 — IQ Option: reconexão persistente; falhas transitórias não invalidam login e /otc-status tenta recuperar o WebSocket automaticamente.
 # MEGA IA 3.97.79 — painel: preserva CALL/PUT já promovido pelo radar até expiry_time; polling NEUTRO não apaga o sinal no mesmo segundo.
 # MEGA IA 3.97.78 — corrige PREDATOR PIPS no fluxo direto do painel e destrava PYRAMID 7 PRO: Bollinger 20/2 volta a ser o gatilho nativo; ATR/EMA ficam diagnósticos.
@@ -33818,6 +33819,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     /* 3.97.11 — painel de motores enxuto: MOTOR REMOVIDO + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
     #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#masyukModeCard,#pyramid7ModeCard,#predatorPipsModeCard{display:flex !important}
+    #scalperProModeCard .robot-mode-desc,#dragonFireModeCard .robot-mode-desc,#dragonFireProModeCard .robot-mode-desc,#roboFiboModeCard .robot-mode-desc,#masyukModeCard .robot-mode-desc,#pyramid7ModeCard .robot-mode-desc,#predatorPipsModeCard .robot-mode-desc{display:none !important}
     #scalpingAsiaModeCard{display:none !important}
   </style>
 
@@ -41873,7 +41875,10 @@ async function sig(announce=false){
     const previousEngine=String((previousPanelSignal&&(previousPanelSignal.selected_engine||previousPanelSignal.engine))||'').toUpperCase();
     const previousSameEngine=!previousEngine||previousEngine===String(engine||'').toUpperCase();
     if(serverDirection==='NEUTRO' && (previousDirection==='CALL'||previousDirection==='PUT') && previousStillAlive && previousSameSymbol && previousSameInterval && previousSameEngine){
-      cur={...previousPanelSignal,signal_held_until_expiry:true,status:String(previousPanelSignal.status||'SINAL CONFIRMADO')+' • MANTIDO ATÉ A EXPIRAÇÃO'};
+      const heldBaseStatus=String(previousPanelSignal.status||'SINAL CONFIRMADO')
+        .replace(/(?:\s*•\s*MANTIDO ATÉ A EXPIRAÇÃO)+/gi,'')
+        .trim();
+      cur={...previousPanelSignal,signal_held_until_expiry:true,status:heldBaseStatus+' • MANTIDO ATÉ A EXPIRAÇÃO'};
     }
 
     // 3.64: quando o pré-alerta completo do Velocity já foi promovido a ALERTA,
@@ -41924,9 +41929,18 @@ async function sig(announce=false){
       ? 'Sem entrada confirmada'
       : (cur.same_candle_entry===true ? 'ENTRADA IMEDIATA • MESMA VELA' : 'Preparando entrada');
 
+    const cleanPanelStatus=(value)=>{
+      let txt=String(value||'MONITORANDO').replace(/\s+/g,' ').trim();
+      const hold='MANTIDO ATÉ A EXPIRAÇÃO';
+      if(txt.toUpperCase().includes(hold)){
+        txt=txt.replace(/(?:\s*•?\s*MANTIDO ATÉ A EXPIRAÇÃO)+/gi,'').replace(/\s*•\s*$/,'').trim();
+        txt=(txt?txt+' • ':'')+hold;
+      }
+      return txt;
+    };
     statusBox.textContent=(engine==='SCALPERPRO' && String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO')
       ? 'ONLINE • SCALPER PRO • MONITORANDO MERCADO'
-      : (cur.status||'MONITORANDO');
+      : cleanPanelStatus(cur.status);
     const learn=cur&&cur.adaptive_learning;
     if(learn && learn.enabled){
       const learnTxt=learn.active
