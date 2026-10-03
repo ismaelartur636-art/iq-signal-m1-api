@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.78"
+APP_VERSION = "3.97.79"
+# MEGA IA 3.97.79 — painel: preserva CALL/PUT já promovido pelo radar até expiry_time; polling NEUTRO não apaga o sinal no mesmo segundo.
 # MEGA IA 3.97.78 — corrige PREDATOR PIPS no fluxo direto do painel e destrava PYRAMID 7 PRO: Bollinger 20/2 volta a ser o gatilho nativo; ATR/EMA ficam diagnósticos.
 # MEGA IA 3.97.76 — sincroniza motor visível/backend: exclusividade central dos 7 motores + resposta do servidor autoritativa no clique.
 # MEGA IA 3.97.77 — radar→painel: oportunidade fresca do mesmo motor não é perdida ao trocar o ativo; se /signal-ai voltar NEUTRO no polling seguinte, promove o snapshot causal do radar para a próxima M1.
@@ -41806,9 +41807,26 @@ async function sig(announce=false){
       if(dataFeedText) dataFeedText.textContent='MOTORES OFFLINE • nenhuma análise solicitada';
       return;
     }
-    cur=await get(
+    // 3.97.79 — guarda o sinal que já está visível ANTES do novo polling.
+    // O radar pode promover um CALL/PUT localmente e, alguns ms depois, /signal-ai
+    // ainda responder NEUTRO. Sem esta retenção, o painel piscava e apagava o sinal.
+    const previousPanelSignal=(cur&&typeof cur==='object')?{...cur}:null;
+    const serverSignal=await get(
       `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent(['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER'].includes(engine)?'BIRTH':((entryMode&&entryMode.value)||'BIRTH'))}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`
     );
+    cur=serverSignal;
+
+    const serverDirection=String((serverSignal&&serverSignal.direction)||'NEUTRO').toUpperCase();
+    const previousDirection=String((previousPanelSignal&&previousPanelSignal.direction)||'NEUTRO').toUpperCase();
+    const previousExpiryMs=Date.parse(String((previousPanelSignal&&previousPanelSignal.expiry_time)||''));
+    const previousStillAlive=Number.isFinite(previousExpiryMs)&&previousExpiryMs>Date.now();
+    const previousSameSymbol=String((previousPanelSignal&&previousPanelSignal.symbol)||'')===String((S&&S.value)||'');
+    const previousSameInterval=String((previousPanelSignal&&previousPanelSignal.interval)||'')===String((interval&&interval.value)||'');
+    const previousEngine=String((previousPanelSignal&&(previousPanelSignal.selected_engine||previousPanelSignal.engine))||'').toUpperCase();
+    const previousSameEngine=!previousEngine||previousEngine===String(engine||'').toUpperCase();
+    if(serverDirection==='NEUTRO' && (previousDirection==='CALL'||previousDirection==='PUT') && previousStillAlive && previousSameSymbol && previousSameInterval && previousSameEngine){
+      cur={...previousPanelSignal,signal_held_until_expiry:true,status:String(previousPanelSignal.status||'SINAL CONFIRMADO')+' • MANTIDO ATÉ A EXPIRAÇÃO'};
+    }
 
     // 3.64: quando o pré-alerta completo do Velocity já foi promovido a ALERTA,
     // o polling do sinal fechado não pode apagar esse alerta antes da entrada.
