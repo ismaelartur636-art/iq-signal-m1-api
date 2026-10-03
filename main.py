@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.41"
+APP_VERSION = "3.97.42"
+# MEGA IA 3.97.42 — limpa fila 24h: somente SCALPER PRO/FLEX; BTC ONLY também no servidor; descarta pendências antigas ao trocar motor.
 # MEGA IA 3.97.36 — SCALPER PRO pré-alerta 10s + SCALPER FLEX mais solto (2,5x) + scanner rápido para não perder janela.
 # MEGA IA 3.97.35 — corrige visibilidade do card SCALPER PRO no painel; mantém SCALPER FLEX separado.
 # MEGA IA 3.97.33 — SCALPER PRO restaurado como motor separado (SMA15 + Envelopes 0,07%), mantendo 🌏 SCALPER FLEX.
@@ -27712,8 +27713,8 @@ async def telegram_send(body: TelegramSignalBody):
 # MEGA IA 3.72 — execução em segundo plano no servidor; motor só muda por clique explícito
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
-    # 3.96.79 — somente os quatro motores atuais/visíveis podem rodar em segundo plano.
-    "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO",
+    # 3.97.42 — servidor 24h isolado: somente os dois motores visíveis.
+    "SCALPINGASIA", "SCALPERPRO",
 }
 
 
@@ -27785,7 +27786,7 @@ def _background_load_state() -> None:
         interval = str(data.get("interval") or BACKGROUND_DEFAULT_INTERVAL)
         invalid_saved_engine = engine not in _BACKGROUND_ENGINES
         if invalid_saved_engine:
-            engine = "SMART"
+            engine = "SCALPERPRO"
         if market not in VALID_MARKETS:
             market = "OPEN"
         if interval not in INTERVALS:
@@ -27838,19 +27839,17 @@ def _background_active_iq_state() -> Dict[str, Any] | None:
 
 def _background_symbols_for_state() -> list[str]:
     market = str(background_bot_state.get("market") or "OPEN").upper()
-    engine = str(background_bot_state.get("engine") or "SMART").upper()
+    engine = str(background_bot_state.get("engine") or "SCALPERPRO").upper()
     configured = [str(x).upper() for x in (background_bot_state.get("symbols") or [])]
-    if engine == "RTM":
-        # RTM nunca sai de BTC/USD + universo JPY, inclusive no robô 24h.
-        return _rtm_scan_symbols(market, configured if configured else None)
-    base = list(SYMBOLS if market == "OPEN" else OTC_SYMBOLS)
+    allowed = SYMBOLS if market == "OPEN" else OTC_SYMBOLS
+    configured = [x for x in configured if x in allowed and _symbol_allowed(x, market)]
     if configured:
-        base = [x for x in base if x in configured]
-    # Crypto IDX só entra quando explicitamente selecionado; evita deixar a fila
-    # inteira esperando uma fonte específica que pode não estar conectada.
-    if not configured:
-        base = [x for x in base if x != BINOMO_CRYPTO_IDX_SYMBOL]
-    return [x for x in base if _symbol_allowed(x, market)]
+        return configured
+    # 3.97.42: com apenas Scalper Pro/Flex no app, não varrer pares antigos
+    # silenciosamente. Mercado aberto fica em BTC/USD até o painel enviar outro ativo.
+    if market == "OPEN" and engine in ("SCALPERPRO", "SCALPINGASIA"):
+        return ["BTC/USD"] if "BTC/USD" in allowed else []
+    return []
 
 
 def _background_signal_key(payload: Dict[str, Any]) -> str:
@@ -28257,6 +28256,16 @@ async def background_bot_set_state(body: BackgroundBotStateBody):
 
         if action == "ACTIVATE_ENGINE":
             tg_on = bool(background_bot_state.get("telegram_enabled"))
+            old_engine = str(background_bot_state.get("engine") or "").upper()
+            old_market = str(background_bot_state.get("market") or "").upper()
+            old_symbols = [str(x).upper() for x in (background_bot_state.get("symbols") or [])]
+            scope_changed = (old_engine != requested_engine or old_market != market or old_symbols != symbols)
+            if scope_changed:
+                # Não carregar operações/sinais de motores ou pares antigos para o novo motor.
+                background_bot_state["pending_trades"] = []
+                background_bot_state["sent_signal_keys"] = []
+                background_bot_state["last_signal"] = None
+                background_bot_state["last_result"] = None
             background_bot_state.update({
                 "enabled": True,
                 "engine": requested_engine,
@@ -28294,7 +28303,7 @@ async def background_bot_set_state(body: BackgroundBotStateBody):
             background_bot_state["telegram_enabled"] = tg_on
             current_engine = str(background_bot_state.get("engine") or BACKGROUND_DEFAULT_ENGINE).upper()
             if current_engine not in _BACKGROUND_ENGINES:
-                current_engine = "SMART"
+                current_engine = "SCALPERPRO"
                 background_bot_state["engine"] = current_engine
 
             if not tg_on:
@@ -34774,7 +34783,7 @@ async function loadBacktest48(force=false){
 async function syncBackgroundBotState(opts={}){
   const selected=selectedRobotEngine();
   let explicitEngine=String(opts.engine||selected||'SMART').toUpperCase();
-  if(explicitEngine!=='LOCALANALYST' && explicitEngine!=='LOCALANALYSTFLEX' && explicitEngine!=='MEGAMASTER' && explicitEngine!=='ISMAELTRADER' && explicitEngine!=='ISMAEL98' && explicitEngine!=='RSICHANNEL' && explicitEngine!=='RSICHANNEL2' && explicitEngine!=='MINSCALPER' && explicitEngine!=='MOMENTUM' && explicitEngine!=='NINJAHFT' && explicitEngine!=='SCALPINGASIA' && explicitEngine!=='SCALPERPRO') explicitEngine='SCALPERPRO';
+  if(explicitEngine!=='SCALPINGASIA' && explicitEngine!=='SCALPERPRO') explicitEngine='SCALPERPRO';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
   const payload={
@@ -34785,7 +34794,7 @@ async function syncBackgroundBotState(opts={}){
     // 3.96.95: ISMAEL TRADER precisa ser consultado várias vezes dentro da janela
     // de 20s. No bot 24h ele fixa o ativo que estava selecionado ao ligar o motor,
     // evitando dividir a janela entre todos os pares e perder o gatilho.
-    symbols:(explicitEngine==='RTM' ? [] : ((explicitEngine==='ISMAELTRADER' || explicitEngine==='ISMAEL98') ? [String((S&&S.value)||'EUR/USD')] : (btcOnlyEnabled ? ['BTC/USD'] : []))),
+    symbols:((explicitEngine==='SCALPERPRO' || explicitEngine==='SCALPINGASIA') ? [String((S&&S.value)||'BTC/USD')] : []),
     chat_id:chat||null,
     action:action,
     telegram_enabled:(action==='TELEGRAM_TOGGLE' ? !!telegramEnabled : null),
