@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.64"
+APP_VERSION = "3.97.65"
+# MEGA IA 3.97.65 — cTrader: reconhece BTCUSD com sufixo da corretora (ex.: BTCUSD.c/BTCUSDm) e mantém cTrader como fonte principal antes do fallback.
 # MEGA IA 3.97.64 — corrige persistência do motor: refresh não converte PYRAMID/PREDATOR/MASYUK/FIBO para SCALPER PRO.\n# MEGA IA 3.97.63 — PYRAMID 7 PRO: corrige placar direto, migração de LOSS e identificação do motor; 1 operação = 1 resultado.\n# MEGA IA 3.97.60 — corrige visibilidade do card PYRAMID 7 PRO no painel (CSS allowlist).\n# MEGA IA 3.97.59 — PYRAMID 7 PRO: Bollinger 20/2 breakout + ATR14 + EMA62/200, candle fechado, próxima M1, sem Grid/Pyramid/Average/Martingale/Gale.
 # MEGA IA 3.97.58 — MASYUK V3 integrado como motor separado: PSAR 0.02/0.2 + LWMA7, CALL/PUT, próxima M1, sem Grid/Martingale/Gale.
 # MEGA IA 3.97.57 — SCALPER PRO: remove trava genérica pós-abertura que trocava ONLINE por AGUARDANDO PRÓXIMO FECHAMENTO; mantém monitoramento contínuo e pré-alerta próprio de 10s.
@@ -7801,7 +7802,16 @@ def _ctrader_symbol_supported(item: Dict[str, Any] | None, symbol: str) -> bool:
         raw = str(row.get("raw_symbol") or "").strip().upper()
         if target in (display, raw):
             return True
-        if compact and compact in (re.sub(r"[^A-Z0-9]", "", display), re.sub(r"[^A-Z0-9]", "", raw)):
+        display_compact = re.sub(r"[^A-Z0-9]", "", display)
+        raw_compact = re.sub(r"[^A-Z0-9]", "", raw)
+        # Brokers cTrader frequentemente adicionam sufixos ao ativo, por exemplo
+        # BTCUSD.c, BTCUSDm ou BTCUSDx. Aceita essas variantes como BTC/USD.
+        if compact and (
+            compact == display_compact
+            or compact == raw_compact
+            or display_compact.startswith(compact)
+            or raw_compact.startswith(compact)
+        ):
             return True
     return False
 
