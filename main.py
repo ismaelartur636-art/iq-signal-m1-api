@@ -42,9 +42,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.86"
-# MEGA IA 3.97.86 — IQ Option: valida o socket WebSocket real, aumenta estabilidade inicial e bloqueia reconexão automática após 401/autorização recusada.
+APP_VERSION = "3.97.85"
 # MEGA IA 3.97.85 — adiciona BTC Binance e Bitcoin IQ Option como fontes separadas no seletor cripto; IQ usa candles regulares autenticados.
+# MEGA IA 3.97.85 — BTC/USD com trava manual: ao selecionar BTC/USD, radar/robô não trocam o ativo automaticamente; a trava só sai quando o usuário escolhe outro ativo.
 # MEGA IA 3.97.84 — seletor rápido de criptos exibe somente o nome da moeda (Bitcoin, Ethereum etc.); internamente mantém pares /USD para obter cotação e candles.
 # MEGA IA 3.97.83 — adiciona BTC como opção separada no painel; usa o mesmo mercado BTC/USD internamente sem remover nenhum ativo.
 # MEGA IA 3.97.81 — IQ Option: fechamento completo do socket antigo + validação de estabilidade do WebSocket antes de aceitar login/reconexão; reduz loops NoneType/sock e reconexões fantasma.
@@ -3480,18 +3480,7 @@ def _iq_connected(state: Dict[str, Any] | None) -> bool:
     if client is None:
         return False
     try:
-        if not bool(client.check_connect()):
-            return False
-        # check_connect() de alguns forks pode continuar True por alguns segundos
-        # depois de um handshake 401. Confirma também o socket real quando exposto.
-        api = getattr(client, "api", None)
-        ws = getattr(api, "websocket", None) if api is not None else None
-        if ws is None:
-            return False
-        sock = getattr(ws, "sock", None)
-        if sock is not None and hasattr(sock, "connected") and not bool(sock.connected):
-            return False
-        return True
+        return bool(client.check_connect())
     except Exception:
         return False
 
@@ -8276,27 +8265,27 @@ def _iq_connect_fresh(email: str, password: str):
     # estabilizado. Nao basta ver check_connect=True uma unica vez: no problema
     # observado ele conecta, recebe 401/fecha logo depois e o app aceita uma
     # sessao fantasma. Exigimos uma pequena janela continua de estabilidade.
-    deadline = time.monotonic() + 12.0
+    deadline = time.monotonic() + 8.0
     stable_since = None
     connected = False
     while time.monotonic() < deadline:
         try:
-            connected = _iq_connected({"client": client})
+            connected = bool(client.check_connect())
         except Exception:
             connected = False
         if connected:
             if stable_since is None:
                 stable_since = time.monotonic()
-            if time.monotonic() - stable_since >= 4.0:
+            if time.monotonic() - stable_since >= 2.0:
                 break
         else:
             stable_since = None
         time.sleep(0.20)
 
-    stable = bool(connected and stable_since is not None and time.monotonic() - stable_since >= 4.0)
+    stable = bool(connected and stable_since is not None and time.monotonic() - stable_since >= 2.0)
     if not stable:
         _iq_abort_client(client)
-        raise RuntimeError("401 Authorization Required: a IQ Option não manteve o WebSocket autenticado. Faça um novo login; a reconexão automática foi bloqueada para evitar loop 401.")
+        raise RuntimeError("A IQ Option abriu o WebSocket, mas ele caiu antes de estabilizar. Reconexao descartada para evitar loop de socket/401.")
 
     print("[IQ CONNECTOR] IQ Option conectada; sessão interna ativa", flush=True)
     return client
@@ -35790,12 +35779,7 @@ if(cryptoQuickSelect){
   cryptoQuickSelect.addEventListener('change',async()=>{
     const chosen=String(cryptoQuickSelect.value||'').trim();
     if(!chosen || !S) return;
-    // O seletor rápido apenas escolhe o ativo; não liga o antigo modo BTC-only.
-    if(btcOnlyEnabled){
-      btcOnlyEnabled=false;
-      try{localStorage.setItem('mega_btc_only_mode','OFF');}catch(_){}
-      fillSymbols();
-    }
+    // 3.97.85: BTC/USD ativa a trava; outra escolha a remove pelo onchange do seletor principal.
     if([...S.options].some(o=>o.value===chosen)) S.value=chosen;
     try{localStorage.setItem('mega_symbol',chosen);}catch(_){}
     S.dispatchEvent(new Event('change'));
@@ -37219,8 +37203,9 @@ function renderBtcOnlyState(){
   }
   if(S){
     const rtmActive=(typeof selectedRobotEngine==='function' && selectedRobotEngine()==='RTM');
-    S.disabled=!!(btcOnlyEnabled && !rtmActive);
-    S.title=rtmActive?'RTM: somente BTC/USD e pares JPY':(btcOnlyEnabled?'Modo BTC/USD exclusivo ativo':'Selecione o ativo');
+    // 3.97.85: a trava é contra troca AUTOMÁTICA; o usuário continua livre para escolher outro ativo.
+    S.disabled=false;
+    S.title=rtmActive?'RTM: somente BTC/USD e pares JPY':(btcOnlyEnabled?'BTC/USD travado contra troca automática • escolha outro ativo para destravar':'Selecione o ativo');
   }
 }
 
@@ -37237,7 +37222,8 @@ function fillSymbols(){
     .sort((a,b)=>String(a).localeCompare(String(b)));
   const openSymbols=[...syms.filter(x=>x!=='CRYPTO IDX'),...ctraderExtra,'CRYPTO IDX'];
   const engineNow=(typeof selectedRobotEngine==='function'?selectedRobotEngine():'');
-  let visibleSymbols=btcOnlyEnabled ? ['BTC/USD'] : (isOtc ? syms : openSymbols);
+  // 3.97.85: mantém todos os ativos visíveis; btcOnlyEnabled bloqueia apenas a troca automática.
+  let visibleSymbols=(isOtc ? syms : openSymbols);
   if(engineNow==='RTM'){
     const source=isOtc ? syms : [...rtmSeedSyms,...ctraderExtra];
     visibleSymbols=[...new Set(source)].filter(x=>{
@@ -42182,6 +42168,8 @@ function robotHasActiveSignal(){
 
 async function sendRadarOpportunityToRobot(items){
   if(radarAutoBusy || !appEnabled || selectedRobotEngine()==='OFF' || !S) return;
+  // 3.97.85: BTC/USD escolhido pelo usuário fica fixo; radar não pode trocar o ativo.
+  if(btcOnlyEnabled && S.value==='BTC/USD') return;
   // O radar OPEN é separado do OTC. Não troca o mercado do usuário automaticamente.
   if(market.value!=='OPEN') return;
   const list=(Array.isArray(items)?items:[])
@@ -42790,7 +42778,14 @@ marketMode.onchange=async()=>{
 
 
 S.onchange=async()=>{
-  try{localStorage.setItem('mega_symbol',S.value)}catch(_){}
+  // 3.97.85: selecionar BTC/USD manualmente ativa a trava automática.
+  // Escolher qualquer outro ativo manualmente desativa a trava.
+  btcOnlyEnabled=(S.value==='BTC/USD');
+  try{
+    localStorage.setItem('mega_btc_only_mode',btcOnlyEnabled?'ON':'OFF');
+    localStorage.setItem('mega_symbol',S.value);
+  }catch(_){}
+  renderBtcOnlyState();
   renderAdaptiveLearningState();
 
   lastSignalVoice='';
