@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.71"
+APP_VERSION = "3.97.72"
 # MEGA IA 3.97.68 — cTrader Trendbars: remove campo count incompatível do ProtoOAGetTrendbarsReq; usa fromTimestamp/toTimestamp + period + symbolId e recorta localmente. Corrige cTrader conectado com candles indisponíveis e queda indevida para Binance.
 # MEGA IA 3.97.69 — radar: fila avança sem congelar 10s e prioriza cripto 24/7 no fim de semana.
 # MEGA IA 3.97.71 — sincroniza frescor entre roteador, /signal-ai e radar: evita STATUS preso em “AGUARDANDO DADOS ATUALIZADOS” quando o mesmo candle cTrader já foi aceito pelo radar.
@@ -28754,14 +28754,12 @@ SCALPER_FLEX_EARLY_WINDOW_BEFORE=12
 SCALPER_FLEX_EARLY_MIN_REMAINING=3
 
 def predator_pips_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """PREDATOR PIPS — adaptação binária causal do EA Predator Pips.
-    Preserva o núcleo observável do EA: MA100 +/- 60 points + confirmação direcional.
-    O uni_cross externo do MT4 não veio embutido no EA; no app a confirmação é reproduzida
-    de forma causal por rejeição/cruzamento de volta da zona da MA, sem candle futuro.
+    """PREDATOR PIPS — MA100 +/-60 points, corrigido para não exigir um evento impossível no mesmo candle.
+    Aceita cruzamento real da borda OU rejeição da zona; candle fechado, próxima M1, sem Gale.
     """
     rows=list(cs or [])
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
-          "strategy":"🐆 PREDATOR PIPS","engine":"PREDATORPIPS","provider":"EA_PREDATOR_PIPS_MA100_ZONE_CROSS",
+          "strategy":"🐆 PREDATOR PIPS","engine":"PREDATORPIPS","provider":"EA_PREDATOR_PIPS_MA100_ZONE_CROSS_V2",
           "next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,
           "grid":False,"martingale":False,"closed_candles_only":True,"non_repaint_after_release":True}
     if len(rows)<110:
@@ -28772,26 +28770,34 @@ def predator_pips_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
         highs=[float(x.get("high",0) or 0) for x in rows]
         lows=[float(x.get("low",0) or 0) for x in rows]
         ma100=sum(closes[-101:-1])/100.0
-        # 60 MT4 points: infer point size from price convention (5/3 digit FX => pip/10).
+        sym=str(symbol or "").upper().replace("/","").replace("-","")
         price=max(abs(closes[-1]),1e-12)
-        point=0.001 if price>=20 else 0.00001
+        if "JPY" in sym:
+            point=0.001
+        elif any(k in sym for k in ("BTC","ETH","LTC","CRYPTO")):
+            point=0.01
+        else:
+            point=0.00001
         zone=60.0*point
         lower=ma100-zone; upper=ma100+zone
-        c=closes[-1]; o=opens[-1]; h=highs[-1]; l=lows[-1]
-        pc=closes[-2]
+        c=closes[-1]; o=opens[-1]; h=highs[-1]; l=lows[-1]; pc=closes[-2]
         rng=max(1e-12,h-l); body=abs(c-o)/rng
-        # CALL: preço esteve/fechou abaixo da zona e rejeitou para cima.
-        # PUT: espelho acima da zona. Isso substitui somente a confirmação uni_cross ausente.
-        call=(l<=lower and c>o and c>pc and c>=lower and body>=0.25)
-        put=(h>=upper and c<o and c<pc and c<=upper and body>=0.25)
+        # Cruzamento da borda entre dois fechamentos OU rejeição intrabar da própria zona.
+        cross_call=(pc < lower and c >= lower and c > o)
+        cross_put=(pc > upper and c <= upper and c < o)
+        reject_call=(l <= lower and c >= lower and c > o and body >= 0.18)
+        reject_put=(h >= upper and c <= upper and c < o and body >= 0.18)
+        call=(cross_call or reject_call) and c>pc
+        put=(cross_put or reject_put) and c<pc
         direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
-        diag={"ma100":round(ma100,10),"zone_points":60,"point":point,"lower":round(lower,10),"upper":round(upper,10),"body_ratio":round(body,3)}
+        diag={"ma100":round(ma100,10),"zone_points":60,"point":point,"lower":round(lower,10),"upper":round(upper,10),
+              "body_ratio":round(body,3),"cross_call":cross_call,"cross_put":cross_put,"reject_call":reject_call,"reject_put":reject_put}
         if direction=="NEUTRO":
-            return {**base,"reason":"PREDATOR PIPS monitorando • aguardando afastamento MA100 ±60 pontos + confirmação de rejeição/cruzamento.","diagnostics":diag}
-        confidence=round(min(90.0,74.0+min(10.0,max(0.0,body-0.25)*20.0)),1)
+            return {**base,"reason":"PREDATOR PIPS monitorando • aguardando cruzamento ou rejeição da zona MA100 ±60 pontos.","diagnostics":diag}
+        confidence=round(min(90.0,76.0+min(10.0,max(0.0,body-0.18)*18.0)),1)
         stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
         return {**base,"direction":direction,"confidence":confidence,"confirmed":True,"risk":"LOW" if confidence>=84 else "MEDIUM",
-                "reason":f"{direction} PREDATOR PIPS • MA100 ±60 pontos + confirmação causal • próxima M1 • sem Martingale/Gale.",
+                "reason":f"{direction} PREDATOR PIPS • cruzamento/rejeição MA100 ±60 pontos confirmado • próxima M1 • sem Gale.",
                 "event_key":f"PREDATORPIPS:{direction}:{stamp}","diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"PREDATOR PIPS aguardando leitura válida: {str(exc)[:100]}"}
