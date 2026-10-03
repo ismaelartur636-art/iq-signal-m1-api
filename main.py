@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.63"
-# MEGA IA 3.97.63 — PYRAMID 7 PRO: corrige placar direto, migração de LOSS e identificação do motor; 1 operação = 1 resultado.\n# MEGA IA 3.97.60 — corrige visibilidade do card PYRAMID 7 PRO no painel (CSS allowlist).\n# MEGA IA 3.97.59 — PYRAMID 7 PRO: Bollinger 20/2 breakout + ATR14 + EMA62/200, candle fechado, próxima M1, sem Grid/Pyramid/Average/Martingale/Gale.
+APP_VERSION = "3.97.64"
+# MEGA IA 3.97.64 — corrige persistência do motor: refresh não converte PYRAMID/PREDATOR/MASYUK/FIBO para SCALPER PRO.\n# MEGA IA 3.97.63 — PYRAMID 7 PRO: corrige placar direto, migração de LOSS e identificação do motor; 1 operação = 1 resultado.\n# MEGA IA 3.97.60 — corrige visibilidade do card PYRAMID 7 PRO no painel (CSS allowlist).\n# MEGA IA 3.97.59 — PYRAMID 7 PRO: Bollinger 20/2 breakout + ATR14 + EMA62/200, candle fechado, próxima M1, sem Grid/Pyramid/Average/Martingale/Gale.
 # MEGA IA 3.97.58 — MASYUK V3 integrado como motor separado: PSAR 0.02/0.2 + LWMA7, CALL/PUT, próxima M1, sem Grid/Martingale/Gale.
 # MEGA IA 3.97.57 — SCALPER PRO: remove trava genérica pós-abertura que trocava ONLINE por AGUARDANDO PRÓXIMO FECHAMENTO; mantém monitoramento contínuo e pré-alerta próprio de 10s.
 # MEGA IA 3.97.56 — ROBO FIBO reativado como motor separado no painel/background; Fibonacci + RSI14 + EMA60, sem grid/martingale.
@@ -35229,8 +35229,12 @@ async function loadBacktest48(force=false){
 
 async function syncBackgroundBotState(opts={}){
   const selected=selectedRobotEngine();
-  let explicitEngine=String(opts.engine||selected||'SMART').toUpperCase();
-  if(explicitEngine!=='SCALPERPRO' && explicitEngine!=='DRAGONFIRE' && explicitEngine!=='DRAGONFIREPRO') explicitEngine='SCALPERPRO';
+  let explicitEngine=String(opts.engine||selected||'SCALPERPRO').toUpperCase();
+  // 3.97.64 — preserva o motor realmente escolhido ao sincronizar/recarregar.
+  // Antes, PYRAMID7/PREDATORPIPS/MASYUK/FIBORSI eram convertidos para SCALPERPRO
+  // no servidor; no refresh o estado do servidor voltava e trocava o motor na tela.
+  const backgroundEngines=new Set(['SCALPERPRO','DRAGONFIRE','DRAGONFIREPRO','FIBORSI','MASYUK','PYRAMID7','PREDATORPIPS']);
+  if(!backgroundEngines.has(explicitEngine)) explicitEngine='SCALPERPRO';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
   const payload={
