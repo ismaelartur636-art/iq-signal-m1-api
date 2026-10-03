@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.46"
+APP_VERSION = "3.97.47"
 # MEGA IA 3.97.44 — teste isolado: SCALPER FLEX removido do painel/seleção/background; somente SCALPER PRO permanece ativo.
 # MEGA IA 3.97.43 — limpeza final: somente SCALPER PRO/FLEX podem ser selecionados; remove fallbacks visuais/operacionais de ChatGPT, IA Gráfica e motores antigos.
 # MEGA IA 3.97.42 — limpa fila 24h: somente SCALPER PRO/FLEX; BTC ONLY também no servidor; descarta pendências antigas ao trocar motor.
@@ -22470,7 +22470,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 request_n = 240
             else:
                 request_n = 150
-            raw = await candles(symbol, interval, request_n, market, iq_state, request=request)
+            if engine == "SCALPERPRO":
+                raw = await _scalper_pro_candles(symbol, interval, request_n, market, iq_state, request=request)
+            else:
+                raw = await candles(symbol, interval, request_n, market, iq_state, request=request)
     except HTTPException as exc:
         if engine == "EA":
             status = "EA XGBOOST • FONTE EM ESPERA" if market == "OPEN" else "EA XGBOOST • IQ OPTION EM ESPERA"
@@ -28594,6 +28597,31 @@ SCALPER_PRO_EARLY_SIGNAL_SECONDS = 10
 SCALPER_PRO_EARLY_WINDOW_BEFORE = 12
 SCALPER_PRO_EARLY_MIN_REMAINING = 3
 
+async def _scalper_pro_candles(symbol: str, interval: str, n: int, market: str = "OPEN", iq_state=None, request: Request | None = None):
+    """Feed isolado do SCALPER PRO.
+
+    BTC/ETH/LTC no mercado aberto usam Binance diretamente, evitando que uma
+    sessão cTrader/Twelve Data travada deixe o motor sem candles. Forex continua
+    no roteador normal. OTC continua usando a IQ Option.
+    """
+    market = str(market or "OPEN").upper()
+    n = max(20, min(int(n), 500))
+    if market == "OPEN" and symbol in BINANCE_SYMBOLS:
+        rows = await _binance_public_candles(symbol, interval, n)
+        rows = _tag_feed_rows(rows, "BINANCE_PUBLIC", BINANCE_SYMBOLS.get(symbol))
+        if len(rows) < n:
+            raise HTTPException(503, f"SCALPER PRO: Binance retornou poucos candles ({len(rows)}/{n}).")
+        age = _open_rows_age_seconds(rows)
+        fresh_limit = max(150.0, float(INTERVALS.get(interval, 60)) * 2.5)
+        if age > fresh_limit:
+            raise HTTPException(503, f"SCALPER PRO: Binance com candles antigos ({int(age)}s).")
+        key = _open_feed_status_key(symbol, interval)
+        public_feed_cache[key] = (time.time(), list(rows), "BINANCE_PUBLIC")
+        _record_open_feed_status(symbol, interval, "BINANCE_PUBLIC", source_symbol=BINANCE_SYMBOLS.get(symbol), rows=rows, fallback=False)
+        return rows[-n:]
+    return await candles(symbol, interval, n, market, iq_state, request=request)
+
+
 def scalper_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
     """SCALPER PRO — SMA15 + Envelopes ±0,07%. Saída por máxima/mínima e reentrada por fechamento."""
     rows=list(cs or [])
@@ -31273,7 +31301,11 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 iq_state, sym, interval, 100, regular_market=False
             )
         else:
-            raw = await candles(sym, interval, (300 if engine == "SMART" else 320), market, iq_state, request=request)
+            if engine == "SCALPERPRO":
+                raw = await _scalper_pro_candles(sym, interval, 260, market, iq_state, request=request)
+            else:
+                raw = await candles(sym, interval, (300 if engine == "SMART" else 320), market, iq_state, request=request)
+        # 3.97.47 — SCALPER PRO usa feed isolado; BTC/USD vai direto à Binance.
         # 3.96.66 — o radar usa a MESMA trava de frescor do sinal oficial.
         # Antes ele podia exibir CALL/PUT calculado sobre candles antigos enquanto
         # /signal-ai recusava a entrada com "AGUARDANDO DADOS ATUALIZADOS".
