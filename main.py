@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.85"
+APP_VERSION = "3.97.86"
+# MEGA IA 3.97.86 — corrige BTC/USD travado: radar pode enviar CALL/PUT do próprio BTC ao painel sem permitir troca automática de ativo.
 # MEGA IA 3.97.85 — adiciona BTC Binance e Bitcoin IQ Option como fontes separadas no seletor cripto; IQ usa candles regulares autenticados.
 # MEGA IA 3.97.85 — BTC/USD com trava manual: ao selecionar BTC/USD, radar/robô não trocam o ativo automaticamente; a trava só sai quando o usuário escolhe outro ativo.
 # MEGA IA 3.97.84 — seletor rápido de criptos exibe somente o nome da moeda (Bitcoin, Ethereum etc.); internamente mantém pares /USD para obter cotação e candles.
@@ -42168,8 +42169,9 @@ function robotHasActiveSignal(){
 
 async function sendRadarOpportunityToRobot(items){
   if(radarAutoBusy || !appEnabled || selectedRobotEngine()==='OFF' || !S) return;
-  // 3.97.85: BTC/USD escolhido pelo usuário fica fixo; radar não pode trocar o ativo.
-  if(btcOnlyEnabled && S.value==='BTC/USD') return;
+  // 3.97.86: BTC/USD manual continua travado contra TROCA automática de ativo,
+  // mas o próprio BTC/USD pode ser promovido normalmente do radar para o painel.
+  // A validação do símbolo é feita depois de escolher a melhor oportunidade fresca.
   // O radar OPEN é separado do OTC. Não troca o mercado do usuário automaticamente.
   if(market.value!=='OPEN') return;
   const list=(Array.isArray(items)?items:[])
@@ -42184,6 +42186,10 @@ async function sendRadarOpportunityToRobot(items){
   const sym=radarBaseSymbol(best);
   const dir=String(best.direction||'').toUpperCase();
   if(!sym) return;
+
+  // BTC/USD travado manualmente: aceita sinal do próprio BTC/USD, mas nunca muda
+  // automaticamente para outro ativo encontrado pelo radar.
+  if(btcOnlyEnabled && S.value==='BTC/USD' && sym!=='BTC/USD') return;
 
   // Não abandona uma operação que já foi liberada e ainda não expirou.
   if(robotHasActiveSignal() && cur && cur.symbol!==sym) return;
