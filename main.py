@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.56"
+APP_VERSION = "3.97.57"
+# MEGA IA 3.97.57 — SCALPER PRO: remove trava genérica pós-abertura que trocava ONLINE por AGUARDANDO PRÓXIMO FECHAMENTO; mantém monitoramento contínuo e pré-alerta próprio de 10s.
 # MEGA IA 3.97.56 — ROBO FIBO reativado como motor separado no painel/background; Fibonacci + RSI14 + EMA60, sem grid/martingale.
 # MEGA IA 3.97.54 — DRAGON FIRE integrado como segundo motor: 4 fechamentos consecutivos, próxima M1, sem Grid/Martingale/Gale.
 # MEGA IA 3.97.53 — SCALPER PRO restaurado ao gatilho original do EA Scalping Asia: Open fora do Envelope e preço atual reentra; mantém pré-alerta 10s, próxima M1, sem Gale.
@@ -21870,7 +21871,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     }
             else:
                 scalper_pro_prealert_latch.pop(_sp_key, None)
-    if engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER"):
+    if engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER", "SCALPERPRO"):
         # Motores estritamente fechados operam na abertura imediatamente seguinte.
         # ISMAEL TRADER usa snapshot oficial nos 20s finais para a próxima abertura.
         entry_mode = "BIRTH"
@@ -21996,7 +21997,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
     # Nenhum custo de IA nem análise de barra antiga fora da janela de nascimento.
     # A janela é conferida novamente depois da chamada ao modelo, antes de liberar.
-    if ai_only and engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER"):
+    if ai_only and engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER", "SCALPERPRO"):
         elapsed = max(0.0, (now() - current_boundary(interval)).total_seconds())
         if elapsed > 10.0:
             out = neutral_signal(
@@ -41395,7 +41396,9 @@ async function sig(announce=false){
       ? 'Sem entrada confirmada'
       : (cur.same_candle_entry===true ? 'ENTRADA IMEDIATA • MESMA VELA' : 'Preparando entrada');
 
-    statusBox.textContent=cur.status||'MONITORANDO';
+    statusBox.textContent=(engine==='SCALPERPRO' && String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO')
+      ? 'ONLINE • SCALPER PRO • MONITORANDO MERCADO'
+      : (cur.status||'MONITORANDO');
     const learn=cur&&cur.adaptive_learning;
     if(learn && learn.enabled){
       const learnTxt=learn.active
