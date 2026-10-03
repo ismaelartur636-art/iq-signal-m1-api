@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.85"
+APP_VERSION = "3.97.86"
+# MEGA IA 3.97.86 — IQ Option: valida o socket WebSocket real, aumenta estabilidade inicial e bloqueia reconexão automática após 401/autorização recusada.
 # MEGA IA 3.97.85 — adiciona BTC Binance e Bitcoin IQ Option como fontes separadas no seletor cripto; IQ usa candles regulares autenticados.
 # MEGA IA 3.97.84 — seletor rápido de criptos exibe somente o nome da moeda (Bitcoin, Ethereum etc.); internamente mantém pares /USD para obter cotação e candles.
 # MEGA IA 3.97.83 — adiciona BTC como opção separada no painel; usa o mesmo mercado BTC/USD internamente sem remover nenhum ativo.
@@ -3479,7 +3480,18 @@ def _iq_connected(state: Dict[str, Any] | None) -> bool:
     if client is None:
         return False
     try:
-        return bool(client.check_connect())
+        if not bool(client.check_connect()):
+            return False
+        # check_connect() de alguns forks pode continuar True por alguns segundos
+        # depois de um handshake 401. Confirma também o socket real quando exposto.
+        api = getattr(client, "api", None)
+        ws = getattr(api, "websocket", None) if api is not None else None
+        if ws is None:
+            return False
+        sock = getattr(ws, "sock", None)
+        if sock is not None and hasattr(sock, "connected") and not bool(sock.connected):
+            return False
+        return True
     except Exception:
         return False
 
@@ -8264,27 +8276,27 @@ def _iq_connect_fresh(email: str, password: str):
     # estabilizado. Nao basta ver check_connect=True uma unica vez: no problema
     # observado ele conecta, recebe 401/fecha logo depois e o app aceita uma
     # sessao fantasma. Exigimos uma pequena janela continua de estabilidade.
-    deadline = time.monotonic() + 8.0
+    deadline = time.monotonic() + 12.0
     stable_since = None
     connected = False
     while time.monotonic() < deadline:
         try:
-            connected = bool(client.check_connect())
+            connected = _iq_connected({"client": client})
         except Exception:
             connected = False
         if connected:
             if stable_since is None:
                 stable_since = time.monotonic()
-            if time.monotonic() - stable_since >= 2.0:
+            if time.monotonic() - stable_since >= 4.0:
                 break
         else:
             stable_since = None
         time.sleep(0.20)
 
-    stable = bool(connected and stable_since is not None and time.monotonic() - stable_since >= 2.0)
+    stable = bool(connected and stable_since is not None and time.monotonic() - stable_since >= 4.0)
     if not stable:
         _iq_abort_client(client)
-        raise RuntimeError("A IQ Option abriu o WebSocket, mas ele caiu antes de estabilizar. Reconexao descartada para evitar loop de socket/401.")
+        raise RuntimeError("401 Authorization Required: a IQ Option não manteve o WebSocket autenticado. Faça um novo login; a reconexão automática foi bloqueada para evitar loop 401.")
 
     print("[IQ CONNECTOR] IQ Option conectada; sessão interna ativa", flush=True)
     return client
