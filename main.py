@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.36"
+APP_VERSION = "3.97.40"
 # MEGA IA 3.97.36 — SCALPER PRO pré-alerta 10s + SCALPER FLEX mais solto (2,5x) + scanner rápido para não perder janela.
 # MEGA IA 3.97.35 — corrige visibilidade do card SCALPER PRO no painel; mantém SCALPER FLEX separado.
 # MEGA IA 3.97.33 — SCALPER PRO restaurado como motor separado (SMA15 + Envelopes 0,07%), mantendo 🌏 SCALPER FLEX.
@@ -23086,6 +23086,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "TAURUSRSIDIV":
                 engine_closed = closed[-min(TAURUS_RSIDIV_HISTORY_BARS, len(closed)):]
             elif engine == "SCALPERPRO":
+                # 3.97.40 — mantém engine_closed inicializado também fora da janela de pré-alerta.
+                # Sem isso, o fluxo oficial podia cair em UnboundLocalError e ficar em AGUARDANDO DADOS.
+                engine_closed = closed[-260:]
                 # 3.97.37 — radar/pré-alerta usa EXATAMENTE o mesmo motor do sinal oficial.
                 # Antes caía no preview genérico, por isso o painel podia mostrar
                 # "radar específico indisponível" mesmo com SCALPER PRO online.
@@ -23108,6 +23111,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 else:
                     preview = None
             elif engine == "SCALPINGASIA":
+                # 3.97.40 — SCALPER FLEX usa histórico próprio e não compartilha estado com o PRO.
+                engine_closed = closed[-1001:]
                 _sf_remain = int(max(0, (entry_dt - now()).total_seconds()))
                 if SCALPER_FLEX_EARLY_MIN_REMAINING <= _sf_remain <= SCALPER_FLEX_EARLY_WINDOW_BEFORE:
                     sf_preview = scalping_asia_strategy(
