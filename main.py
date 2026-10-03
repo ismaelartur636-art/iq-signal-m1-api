@@ -42,9 +42,10 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.69"
+APP_VERSION = "3.97.70"
 # MEGA IA 3.97.68 — cTrader Trendbars: remove campo count incompatível do ProtoOAGetTrendbarsReq; usa fromTimestamp/toTimestamp + period + symbolId e recorta localmente. Corrige cTrader conectado com candles indisponíveis e queda indevida para Binance.
 # MEGA IA 3.97.69 — radar: fila avança sem congelar 10s e prioriza cripto 24/7 no fim de semana.
+# MEGA IA 3.97.70 — sincroniza frescor entre roteador, /signal-ai e radar: evita STATUS preso em “AGUARDANDO DADOS ATUALIZADOS” quando o mesmo candle cTrader já foi aceito pelo radar.
 # MEGA IA 3.97.67 — cTrader Trendbars: envia count explicitamente em todas as requisições históricas, conforme ProtoOAGetTrendbarsReq.
 # MEGA IA 3.97.66 — cTrader candles: prioriza conta LIVE no catálogo (antes DEMO podia capturar o mesmo símbolo e devolver zero trendbars); mantém M1/cripto na Open API antes do fallback.
 # MEGA IA 3.97.65 — cTrader: reconhece BTCUSD com sufixo da corretora (ex.: BTCUSD.c/BTCUSDm) e mantém cTrader como fonte principal antes do fallback.
@@ -22767,7 +22768,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         # valida o horário real do último candle recebido.
         source_now = _feed_source_from_rows(raw)
         age = _open_rows_age_seconds(raw)
-        safe_age = max(105.0, INTERVALS[interval] * 1.8)
+        safe_age = max(150.0, INTERVALS[interval] * 2.5)
         if age > safe_age:
             out = neutral_signal(
                 symbol, interval, market,
@@ -31701,7 +31702,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         if market == "OPEN":
             radar_source = _feed_source_from_rows(raw)
             radar_age = _open_rows_age_seconds(raw)
-            radar_safe_age = max(105.0, INTERVALS[interval] * 1.8)
+            radar_safe_age = max(150.0, INTERVALS[interval] * 2.5)
         else:
             radar_source = "IQ_OPTION_OTC"
             radar_age = 0.0
