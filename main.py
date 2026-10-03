@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.43"
+APP_VERSION = "3.97.44"
+# MEGA IA 3.97.44 — teste isolado: SCALPER FLEX removido do painel/seleção/background; somente SCALPER PRO permanece ativo.
 # MEGA IA 3.97.43 — limpeza final: somente SCALPER PRO/FLEX podem ser selecionados; remove fallbacks visuais/operacionais de ChatGPT, IA Gráfica e motores antigos.
 # MEGA IA 3.97.42 — limpa fila 24h: somente SCALPER PRO/FLEX; BTC ONLY também no servidor; descarta pendências antigas ao trocar motor.
 # MEGA IA 3.97.36 — SCALPER PRO pré-alerta 10s + SCALPER FLEX mais solto (2,5x) + scanner rápido para não perder janela.
@@ -1607,8 +1608,8 @@ BACKGROUND_SCAN_SECONDS = max(1.0, min(60.0, float(os.getenv("BACKGROUND_SCAN_SE
 BACKGROUND_RESULT_SECONDS = max(3.0, min(30.0, float(os.getenv("BACKGROUND_RESULT_SECONDS", "5"))))
 BACKGROUND_DEFAULT_ENABLED = os.getenv("BACKGROUND_SIGNALS_ENABLED", "0").strip().lower() in ("1", "true", "on", "yes")
 BACKGROUND_DEFAULT_ENGINE = os.getenv("BACKGROUND_ENGINE", "SMART").strip().upper() or "SMART"
-if BACKGROUND_DEFAULT_ENGINE not in {"LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO"}:
-    BACKGROUND_DEFAULT_ENGINE = "SMART"
+if BACKGROUND_DEFAULT_ENGINE not in {"SCALPERPRO"}:
+    BACKGROUND_DEFAULT_ENGINE = "SCALPERPRO"
 BACKGROUND_DEFAULT_MARKET = os.getenv("BACKGROUND_MARKET", "OPEN").strip().upper() or "OPEN"
 BACKGROUND_DEFAULT_INTERVAL = os.getenv("BACKGROUND_INTERVAL", "1min").strip() or "1min"
 # Telegram do robô 24h é um estado do SERVIDOR. Por segurança começa OFF
@@ -27715,7 +27716,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     # 3.97.42 — servidor 24h isolado: somente os dois motores visíveis.
-    "SCALPINGASIA", "SCALPERPRO",
+    "SCALPERPRO",
 }
 
 
@@ -29114,8 +29115,8 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
 
     if not _symbol_allowed(symbol, requested_market) or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
-    if engine not in ("SCALPINGASIA", "SCALPERPRO"):
-        raise HTTPException(410, "Motor removido. Use SCALPER PRO ou SCALPER FLEX.")
+    if engine != "SCALPERPRO":
+        raise HTTPException(410, "Motor removido. Use somente SCALPER PRO.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
     if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "SESSIONBREAKOUT", "MONSTERSMC"):
@@ -30897,8 +30898,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Intervalo ou mercado inválido.")
     if symbol and not _symbol_allowed(symbol, market):
         raise HTTPException(400, "Ativo do radar inválido.")
-    if engine not in ("SCALPINGASIA", "SCALPERPRO"):
-        raise HTTPException(410, "Motor removido. Use SCALPER PRO ou SCALPER FLEX.")
+    if engine != "SCALPERPRO":
+        raise HTTPException(410, "Motor removido. Use somente SCALPER PRO.")
 
     if engine == "RTM":
         # Radar exclusivo: BTC/USD + pares JPY. Um símbolo manual fora da regra
@@ -33263,7 +33264,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <style>
     /* 3.97.11 — painel de motores enxuto: MOTOR REMOVIDO + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
-    #scalperProModeCard,#scalpingAsiaModeCard{display:flex !important}
+    #scalperProModeCard{display:flex !important}
+    #scalpingAsiaModeCard{display:none !important}
   </style>
 
 
@@ -34593,11 +34595,11 @@ try{
    'mega_streak_rev_power','mega_robot_power'].forEach(k=>localStorage.setItem(k,'OFFLINE'));
 }catch(_){}
 scalperProEnabled=localStorage.getItem('mega_scalper_pro_power')==='ONLINE';
-scalpingAsiaEnabled=localStorage.getItem('mega_scalping_asia_power')==='ONLINE';
+scalpingAsiaEnabled=false;
+try{localStorage.setItem('mega_scalping_asia_power','OFFLINE');}catch(_){}
 
 function selectedRobotEngine(){
   if(scalperProEnabled) return 'SCALPERPRO';
-  if(scalpingAsiaEnabled) return 'SCALPINGASIA';
   return 'OFF';
 }
 
@@ -34606,9 +34608,9 @@ function adoptBackgroundEngineState(d){
   if(typeof d.telegram_enabled==='boolean'){ telegramEnabled=!!d.telegram_enabled; }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(e!=='SCALPERPRO' && e!=='SCALPINGASIA') return;
+  if(e!=='SCALPERPRO') return;
   scalperProEnabled=(e==='SCALPERPRO');
-  scalpingAsiaEnabled=(e==='SCALPINGASIA');
+  scalpingAsiaEnabled=false;
   try{
     localStorage.setItem('mega_scalper_pro_power',scalperProEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_scalping_asia_power',scalpingAsiaEnabled?'ONLINE':'OFFLINE');
@@ -34618,7 +34620,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({SCALPINGASIA:'🌏 SCALPER FLEX',SCALPERPRO:'SCALPER PRO'})[e]||'SEM MOTOR';
+  return ({SCALPERPRO:'SCALPER PRO'})[e]||'SEM MOTOR';
 }
 
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
@@ -34707,7 +34709,7 @@ async function loadBacktest48(force=false){
 async function syncBackgroundBotState(opts={}){
   const selected=selectedRobotEngine();
   let explicitEngine=String(opts.engine||selected||'SMART').toUpperCase();
-  if(explicitEngine!=='SCALPINGASIA' && explicitEngine!=='SCALPERPRO') explicitEngine='SCALPERPRO';
+  if(explicitEngine!=='SCALPERPRO') explicitEngine='SCALPERPRO';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
   const payload={
@@ -34718,7 +34720,7 @@ async function syncBackgroundBotState(opts={}){
     // 3.96.95: ISMAEL TRADER precisa ser consultado várias vezes dentro da janela
     // de 20s. No bot 24h ele fixa o ativo que estava selecionado ao ligar o motor,
     // evitando dividir a janela entre todos os pares e perder o gatilho.
-    symbols:((explicitEngine==='SCALPERPRO' || explicitEngine==='SCALPINGASIA') ? [String((S&&S.value)||'BTC/USD')] : []),
+    symbols:(explicitEngine==='SCALPERPRO' ? [String((S&&S.value)||'BTC/USD')] : []),
     chat_id:chat||null,
     action:action,
     telegram_enabled:(action==='TELEGRAM_TOGGLE' ? !!telegramEnabled : null),
@@ -39140,7 +39142,7 @@ function applyRobotPowerState(){
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ Nenhum Scalper está online. Ative SCALPER PRO ou SCALPER FLEX.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ SCALPER PRO está offline. Ative o SCALPER PRO.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -39540,18 +39542,11 @@ async function setScalperProPower(enabled){
 }
 
 async function setScalpingAsiaPower(enabled){
-  scalpingAsiaEnabled=!!enabled;
-  if(scalpingAsiaEnabled){
-    scalperProEnabled=false;
-    rsiChannelsEnabled=false;rsiChannels2Enabled=false;minScalperEnabled=false;ismaelTraderEnabled=false;ismael98Enabled=false;aiEnabled=false;localAnalystEnabled=false;localAnalystFlexEnabled=false;megaMasterEnabled=false;rsiCrossEnabled=false;robotEnabled=false;
-    disableImportedEnginesForOtherEngine(); if(entryMode) entryMode.value='BIRTH'; if(interval) interval.value='1min';
-  }
-  try{localStorage.setItem('mega_scalping_asia_power',scalpingAsiaEnabled?'ONLINE':'OFFLINE');}catch(_){}
-  resetEngineVisualState();applyRobotPowerState();
-  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'SCALPINGASIA'});
-  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]); else await Promise.allSettled([perf()]);
-  scheduleBacktest48(true,200);
-  if(voiceEnabled) speak(scalpingAsiaEnabled?'Scalping Asia online.':'Scalping Asia offline.');
+  // 3.97.44 — SCALPER FLEX removido para teste isolado do SCALPER PRO.
+  scalpingAsiaEnabled=false;
+  try{localStorage.setItem('mega_scalping_asia_power','OFFLINE');}catch(_){}
+  applyRobotPowerState();
+  return;
 }
 
 async function setMinScalperPower(enabled){
@@ -40784,7 +40779,7 @@ if(elcodexPowerBtn) elcodexPowerBtn.onclick=()=>setImportedEnginePower('ELCODEX'
 if(shkHaPowerBtn) shkHaPowerBtn.onclick=()=>setImportedEnginePower('SHKHA',!shkHaEnabled);
 if(minScalperPowerBtn) minScalperPowerBtn.onclick=()=>setMinScalperPower(!minScalperEnabled);
 if(scalperProPowerBtn) scalperProPowerBtn.onclick=()=>setScalperProPower(!scalperProEnabled);
-if(scalpingAsiaPowerBtn) scalpingAsiaPowerBtn.onclick=()=>setScalpingAsiaPower(!scalpingAsiaEnabled);
+if(scalpingAsiaPowerBtn){scalpingAsiaPowerBtn.style.display='none'; scalpingAsiaPowerBtn.onclick=null;}
 if(rsiEaPowerBtn) rsiEaPowerBtn.onclick=()=>setRsiEaPower(!rsiCrossEnabled);
 if(ninjaHftPowerBtn){ ninjaHftPowerBtn.textContent=ninjaHftEnabled?'🟢 ONLINE':'🔴 OFFLINE'; ninjaHftPowerBtn.onclick=async()=>{ ninjaHftEnabled=!ninjaHftEnabled; if(ninjaHftEnabled){rsiCrossEnabled=false;rsiChannelsEnabled=false;rsiChannels2Enabled=false;} try{localStorage.setItem('mega_ninja_hft_power',ninjaHftEnabled?'ONLINE':'OFFLINE');localStorage.setItem('mega_rsi_ea_power','OFFLINE');localStorage.setItem('mega_rsi_channels_power','OFFLINE');localStorage.setItem('mega_rsi_channels2_power','OFFLINE');}catch(_){} ninjaHftPowerBtn.textContent=ninjaHftEnabled?'🟢 ONLINE':'🔴 OFFLINE'; await syncBackgroundBotState({action:(ninjaHftEnabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'NINJAHFT'}); if(ninjaHftEnabled) await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]); }; }
 if(rsiChannelsPowerBtn) rsiChannelsPowerBtn.onclick=()=>setRsiChannelsPower(!rsiChannelsEnabled);
