@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.50"
+APP_VERSION = "3.97.51"
+# MEGA IA 3.97.51 — SCALPER PRO alinhado em 10s: motor, pré-alerta, radar, painel e texto do backtest.
 # MEGA IA 3.97.50 — deixa somente SCALPER PRO e converte seleções antigas automaticamente para SCALPERPRO.
 # MEGA IA 3.97.49 — corrige SCALPER PRO: pré-alerta confirmado é promovido imediatamente ao painel e usa feed dedicado.
 # MEGA IA 3.97.44 — teste isolado: SCALPER FLEX removido do painel/seleção/background; somente SCALPER PRO permanece ativo.
@@ -187,7 +188,7 @@ def ismael98_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", cur
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # MOTOR REMOVIDO permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v211"
+PWA_VERSION = "v212"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -29166,7 +29167,7 @@ async def backtest48h_endpoint(
         "causal": True, "lookahead": False, "expiration_candles": 1, "gale": False,
         "timing_approximation": approximation,
         "timing_note": (
-            "Este motor usa pré-alerta nos 20s finais no ao vivo. O histórico OHLC não guarda o estado exato de 20s antes; o backtest usa a decisão causal do candle fechado como aproximação. Resultado agrupado com recuperação nos próximos 2 sinais confirmados."
+            "Este motor usa pré-alerta nos 10s finais no ao vivo. O histórico OHLC não guarda o estado exato de 10s antes; o backtest usa a decisão causal do candle fechado como aproximação. Resultado agrupado com recuperação nos próximos 2 sinais confirmados."
             if approximation else
             "Replay candle a candle, sem usar candles futuros; entrada na abertura seguinte e expiração de 1 candle. Resultado agrupado com recuperação nos próximos 2 sinais confirmados."
         ),
