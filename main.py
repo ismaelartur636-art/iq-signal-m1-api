@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.40"
+APP_VERSION = "3.97.41"
 # MEGA IA 3.97.36 — SCALPER PRO pré-alerta 10s + SCALPER FLEX mais solto (2,5x) + scanner rápido para não perder janela.
 # MEGA IA 3.97.35 — corrige visibilidade do card SCALPER PRO no painel; mantém SCALPER FLEX separado.
 # MEGA IA 3.97.33 — SCALPER PRO restaurado como motor separado (SMA15 + Envelopes 0,07%), mantendo 🌏 SCALPER FLEX.
@@ -1605,7 +1605,7 @@ BACKGROUND_SCAN_SECONDS = max(1.0, min(60.0, float(os.getenv("BACKGROUND_SCAN_SE
 BACKGROUND_RESULT_SECONDS = max(3.0, min(30.0, float(os.getenv("BACKGROUND_RESULT_SECONDS", "5"))))
 BACKGROUND_DEFAULT_ENABLED = os.getenv("BACKGROUND_SIGNALS_ENABLED", "0").strip().lower() in ("1", "true", "on", "yes")
 BACKGROUND_DEFAULT_ENGINE = os.getenv("BACKGROUND_ENGINE", "SMART").strip().upper() or "SMART"
-if BACKGROUND_DEFAULT_ENGINE not in {"SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "SCALPINGASIA", "SCALPERPRO"}:
+if BACKGROUND_DEFAULT_ENGINE not in {"LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO"}:
     BACKGROUND_DEFAULT_ENGINE = "SMART"
 BACKGROUND_DEFAULT_MARKET = os.getenv("BACKGROUND_MARKET", "OPEN").strip().upper() or "OPEN"
 BACKGROUND_DEFAULT_INTERVAL = os.getenv("BACKGROUND_INTERVAL", "1min").strip() or "1min"
@@ -1769,6 +1769,8 @@ SSB_REFERENCE_BARS = max(100, min(150, int(os.getenv("SSB_REFERENCE_BARS", "140"
 #
 # MEGA IA 3.96.24 — motores retirados do app a pedido do usuário.
 RETIRED_ENGINES = {
+    # 3.97.41 — removidos do app: os cinco primeiros cards + ChatGPT/IA Gráfica.
+    "RSICROSS", "NINJAHFT", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "SMART", "GRAPH_AI",
     "LARRY", "ALPHAX", "TAURUSRSIDIV", "INDICEMENT", "GOLDINV", "TTMSCALPER",
     "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE",
     "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX",
@@ -1893,7 +1895,7 @@ signal_release_state: Dict[str, Any] = {}
 # Depois que IA Gráfica ou Inteligência Artificial libera uma entrada, o mesmo
 # ativo fica bloqueado para NOVOS CALL/PUT até /result fechar a vela da entrada.
 # Todos os motores trabalham sem G1/G2; outros ativos continuam livres.
-AI_ASSET_CYCLE_ENGINES = {"GRAPH_AI", "SMART"}
+AI_ASSET_CYCLE_ENGINES = set()
 ai_asset_cycle_locks: Dict[str, Dict[str, Any]] = {}
 ai_asset_cycle_guard = threading.RLock()
 
@@ -33140,7 +33142,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 <div class="wrap">
   <div class="brand"><img class="brand-robot" src="__MEGA_IMAGE__" alt="Robô MEGA IA"> MEGA <span>IA</span><span class="brand-flag" aria-label="Bandeira do Brasil" title="Brasil">🇧🇷</span></div>
   <div class="subtitle">ANÁLISE EM TEMPO REAL • HORÁRIO DE BRASÍLIA</div>
-  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • CHATGPT ANALISTA • MEGA BOT • MEGA BOT FLEX • MEGA MASTER • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
+  <div id="buildBadge" class="label" style="margin-top:4px">Versão __APP_VERSION__ • MOTORES LOCAIS • SEM GALE • RECUPERAÇÃO NO PRÓXIMO SINAL • cTrader Open API</div>
   <div id="clock" style="font-size:22px;margin-top:4px"></div>
 
   <div class="app-power-card" id="appPowerCard">
@@ -33189,20 +33191,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
 
-  <div class="robot-mode-card" id="aiModeCard">
-    <img src="__MEGA_IMAGE__" alt="ChatGPT Analista">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">💬 CHATGPT ANALISTA</div>
-      <div class="robot-mode-desc" id="aiModeDesc">ChatGPT analisa os candles do gráfico e decide CALL, PUT ou NEUTRO • indicadores são apenas contexto • próxima vela • sem Gale.</div>
-    </div>
-    <button id="aiPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
 
   <div class="robot-mode-card" id="localAnalystModeCard">
     <img src="__MEGA_IMAGE__" alt="Mega Bot">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🤖 MEGA BOT</div>
-      <div class="robot-mode-desc" id="localAnalystModeDesc">100% local e sem API • leitura técnica avançada inspirada no ChatGPT com price action, tendência, estrutura, momentum, exaustão, rejeição, breakout, S/R, volatilidade, EMA, RSI, MACD, ADX, Bollinger e volume • próxima vela • sem Gale.</div>
+      <div class="robot-mode-desc" id="localAnalystModeDesc">100% local e sem API • leitura técnica avançada com price action, tendência, estrutura, momentum, exaustão, rejeição, breakout, S/R, volatilidade, EMA, RSI, MACD, ADX, Bollinger e volume • próxima vela • sem Gale.</div>
     </div>
     <button id="localAnalystPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -33273,52 +33267,13 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <style>
     /* 3.97.11 — painel de motores enxuto: MEGA FÚRIA + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
-    #rsiChannelsModeCard,#rsiChannels2ModeCard,#rsiEaModeCard,#ninjaHftModeCard,#minScalperModeCard,#scalperProModeCard,#scalpingAsiaModeCard{display:flex !important}
+    #scalperProModeCard,#scalpingAsiaModeCard{display:flex !important}
   </style>
 
-  <div class="robot-mode-card" id="rsiEaModeCard">
-    <img src="__MEGA_IMAGE__" alt="RSI EA MTF">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">📊 RSI EA MTF</div>
-      <div class="robot-mode-desc" id="rsiEaModeDesc">EMA13/30 M15 + RSI13 M5 + MACD M30 • candle fechado • próxima M1 • expira M1 • sem Gale.</div>
-    </div>
-    <button id="rsiEaPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
 
 
-  <div class="robot-mode-card" id="ninjaHftModeCard">
-    <img src="__MEGA_IMAGE__" alt="Ninja HFT">
-    <div class="robot-mode-copy"><div class="robot-mode-title">🥷 NINJA HFT</div>
-      <div class="robot-mode-desc" id="ninjaHftModeDesc">MA3 High/Low + microimpulso/range • M1 • próxima vela • expiração M1 • sem Gale.</div></div>
-    <button id="ninjaHftPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
 
-  <div class="robot-mode-card" id="rsiChannelsModeCard">
-    <img src="__MEGA_IMAGE__" alt="Mega Fúria">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🔥 MEGA FÚRIA</div>
-      <div class="robot-mode-desc" id="rsiChannelsModeDesc">RSI4 + canais dinâmicos • leitura M5 fechada • entrada na próxima vela M1 • expiração M1 • sem Gale.</div>
-    </div>
-    <button id="rsiChannelsPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
 
-  <div class="robot-mode-card" id="rsiChannels2ModeCard">
-    <img src="__MEGA_IMAGE__" alt="Memory Fusion">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🧠 MEMORY FUSION</div>
-      <div class="robot-mode-desc" id="rsiChannels2ModeDesc">Espelho 24H • sequência das 3 velas • memória 3/5/7 dias quando disponível • EMA9/21 • RSI14 • S/R • ATR • próxima M1 • sem Gale.</div>
-    </div>
-    <button id="rsiChannels2PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-
-  <div class="robot-mode-card" id="minScalperModeCard">
-    <img src="__MEGA_IMAGE__" alt="M-Sniper">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🎯 M-SNIPER</div>
-      <div class="robot-mode-desc" id="minScalperModeDesc">Vela forte M1 • pré-alerta 20s • entrada na próxima M1 • expiração M1 • sem Gale • sem grade.</div>
-    </div>
-    <button id="minScalperPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
 
   <div class="robot-mode-card" id="scalperProModeCard">
     <img src="__MEGA_IMAGE__" alt="Scalper Pro">
@@ -34654,6 +34609,8 @@ try{
 }catch(_){}
 
 function selectedRobotEngine(){
+  // 3.97.41: cinco motores antigos + ChatGPT/IA Gráfica removidos.
+
   if(scalperProEnabled) return 'SCALPERPRO';
   if(scalpingAsiaEnabled) return 'SCALPINGASIA';
   if(ninjaHftEnabled) return 'NINJAHFT';
@@ -34729,7 +34686,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({SMART:'CHATGPT ANALISTA',LOCALANALYST:'MEGA BOT',LOCALANALYSTFLEX:'MEGA BOT FLEX',MEGAMASTER:'MEGA MASTER',ISMAELTRADER:'ISMAEL TRADER',ISMAEL98:'ISMAEL 98',RSICHANNEL:'MEGA FÚRIA',RSICHANNEL2:'MEMORY FUSION',MINSCALPER:'1 MINUTE SCALPER',MOMENTUM:'MOMENTUM CHART',RSI4PERIOD:'4 PERIOD RSI PRO',SCALPINGASIA:'🌏 SCALPER FLEX',SCALPERPRO:'SCALPER PRO'})[e]||e||'SEM MOTOR';
+  return ({LOCALANALYST:'MEGA BOT',LOCALANALYSTFLEX:'MEGA BOT FLEX',MEGAMASTER:'MEGA MASTER',ISMAELTRADER:'ISMAEL TRADER',ISMAEL98:'ISMAEL 98',RSICHANNEL:'MEGA FÚRIA',RSICHANNEL2:'MEMORY FUSION',MINSCALPER:'1 MINUTE SCALPER',MOMENTUM:'MOMENTUM CHART',RSI4PERIOD:'4 PERIOD RSI PRO',SCALPINGASIA:'🌏 SCALPER FLEX',SCALPERPRO:'SCALPER PRO'})[e]||e||'SEM MOTOR';
 }
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
 function scheduleBacktest48(force=false,delay=260){
@@ -34817,7 +34774,7 @@ async function loadBacktest48(force=false){
 async function syncBackgroundBotState(opts={}){
   const selected=selectedRobotEngine();
   let explicitEngine=String(opts.engine||selected||'SMART').toUpperCase();
-  if(explicitEngine!=='SMART' && explicitEngine!=='LOCALANALYST' && explicitEngine!=='LOCALANALYSTFLEX' && explicitEngine!=='MEGAMASTER' && explicitEngine!=='ISMAELTRADER' && explicitEngine!=='ISMAEL98' && explicitEngine!=='RSICHANNEL' && explicitEngine!=='RSICHANNEL2' && explicitEngine!=='MINSCALPER' && explicitEngine!=='MOMENTUM' && explicitEngine!=='NINJAHFT' && explicitEngine!=='SCALPINGASIA' && explicitEngine!=='SCALPERPRO') explicitEngine='SMART';
+  if(explicitEngine!=='LOCALANALYST' && explicitEngine!=='LOCALANALYSTFLEX' && explicitEngine!=='MEGAMASTER' && explicitEngine!=='ISMAELTRADER' && explicitEngine!=='ISMAEL98' && explicitEngine!=='RSICHANNEL' && explicitEngine!=='RSICHANNEL2' && explicitEngine!=='MINSCALPER' && explicitEngine!=='MOMENTUM' && explicitEngine!=='NINJAHFT' && explicitEngine!=='SCALPINGASIA' && explicitEngine!=='SCALPERPRO') explicitEngine='SCALPERPRO';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
   const payload={
@@ -35728,7 +35685,7 @@ function renderHistory(){
     const triggerLine=trigger ? `<div class="label" style="margin-top:6px">🤖 RTM • Gatilho: <b>${trigger}</b>${triggerScore?` • ${Math.round(triggerScore)}%`:''}</div>` : '';
     const ek=currentScoreEngineKey(h);
     const engineLabels={
-      SMART:'💬 CHATGPT ANALISTA',LOCALANALYST:'🤖 MEGA BOT',LOCALANALYSTFLEX:'🤖 MEGA BOT FLEX',MEGAMASTER:'🧠 MEGA MASTER',
+      LOCALANALYST:'🤖 MEGA BOT',LOCALANALYSTFLEX:'🤖 MEGA BOT FLEX',MEGAMASTER:'🧠 MEGA MASTER',
       ISMAELTRADER:'🎯 ISMAEL TRADER',ISMAEL98:'💎 ISMAEL 98',RSICHANNEL:'📈 RSI CHANNELS',MINSCALPER:'⚡ 1 MINUTE SCALPER'
     };
     const engineLabel=engineLabels[ek]||'🗂️ OUTRO/ANTIGO';
@@ -36000,7 +35957,7 @@ let momentStudyUpdatedAt=0;
 function momentStudyEngineName(key){
   const names={
     GRAPH_AI:'🧠 IA GRÁFICA',
-    SMART:'💬 CHATGPT ANALISTA',
+    
     LOCALANALYST:'🤖 MEGA BOT',
     LOCALANALYSTFLEX:'🤖 MEGA BOT FLEX',
     MEGAMASTER:'🧠 MEGA MASTER',MONSTERSMC:'👾 MONSTER SMC',TSI:'⚡ MEGA ULTRA',MOMENTUM:'⚡ MOMENTUM CHART',FIGURES:'🕯️ FIGURES CANDLE',VASILY:'🎯 VASILY PIP SNIPER ZL',PLATINUM:'💎 PLATINUM',RSICROSS:'🔀 RSI EA MTF',
@@ -36197,7 +36154,7 @@ function engineScoreSnapshot(bucket){
 function renderEngineScoreBoard(bucket){
   if(!engineScoreGrid) return;
   const st=engineScoreSnapshot(bucket||emptyResultBucket());
-  const order=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER'];
+  const order=['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER'];
   if(st.OTHER.total>0) order.push('OTHER');
   engineScoreGrid.innerHTML=order.map(k=>{
     const x=st[k];
@@ -36370,7 +36327,7 @@ try{
 
 function paintEntryModeNote(){
   if(!entryMode || !entryModeNote) return;
-  const fixed=['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL'].includes(selectedRobotEngine());
+  const fixed=['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL'].includes(selectedRobotEngine());
   if(fixed){
     entryMode.value='BIRTH';
     if(entryScheduleLabel) entryScheduleLabel.textContent='⏱ CRONOGRAMA • NASCIMENTO / CANDLE FECHADO';
@@ -41122,7 +41079,7 @@ async function sig(announce=false){
       return;
     }
     cur=await get(
-      `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent(['SMART','LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER'].includes(engine)?'BIRTH':((entryMode&&entryMode.value)||'BIRTH'))}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`
+      `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent(['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER'].includes(engine)?'BIRTH':((entryMode&&entryMode.value)||'BIRTH'))}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`
     );
 
     // 3.64: quando o pré-alerta completo do Velocity já foi promovido a ALERTA,
@@ -41359,7 +41316,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SCALPERPRO'?'SCALPER PRO':ek==='SCALPINGASIA'?'🌏 SCALPER FLEX':ek==='MINSCALPER'?'M-SNIPER':ek==='RSICHANNEL2'?'MEMORY FUSION':ek==='RSICHANNEL'?'MEGA FÚRIA':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI EA MTF':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'IA GRÁFICA'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SCALPERPRO'?'SCALPER PRO':ek==='SCALPINGASIA'?'🌏 SCALPER FLEX':ek==='MINSCALPER'?'M-SNIPER':ek==='RSICHANNEL2'?'MEMORY FUSION':ek==='RSICHANNEL'?'MEGA FÚRIA':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI EA MTF':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'SEM MOTOR'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
