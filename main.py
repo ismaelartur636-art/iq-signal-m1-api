@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.42"
+APP_VERSION = "3.97.43"
+# MEGA IA 3.97.43 — limpeza final: somente SCALPER PRO/FLEX podem ser selecionados; remove fallbacks visuais/operacionais de ChatGPT, IA Gráfica e motores antigos.
 # MEGA IA 3.97.42 — limpa fila 24h: somente SCALPER PRO/FLEX; BTC ONLY também no servidor; descarta pendências antigas ao trocar motor.
 # MEGA IA 3.97.36 — SCALPER PRO pré-alerta 10s + SCALPER FLEX mais solto (2,5x) + scanner rápido para não perder janela.
 # MEGA IA 3.97.35 — corrige visibilidade do card SCALPER PRO no painel; mantém SCALPER FLEX separado.
@@ -58,13 +59,13 @@ APP_VERSION = "3.97.42"
 # MEGA IA 3.97.22 — cTrader mobile: botão Conectar usa navegação robusta com link real + fallback JS e feedback visível quando o OAuth não abre.
 # MEGA IA 3.97.21 — MEMORY FUSION: Espelho 24H + sequência 3 velas + similaridade OHLC + EMA9/21 + RSI14 + S/R + ATR; substitui SUPPLY DEMAND no segundo card; candle fechado, próxima M1, sem Gale.
 # MEGA IA 3.97.19 — corrige seleção/backtest do SUPPLY DEMAND; substitui o segundo RSI (RSICHANNEL2) por SUPPLY DEMAND [ORT] v3: zonas confirmadas, CALL em demanda, PUT em oferta, expiração M1.
-# MEGA IA 3.97.16 — dois motores RSI independentes: MEGA FÚRIA (M5 → próxima M1) e MEGA BOT (M5 → +2min → expira M1).
+# MEGA IA 3.97.16 — dois motores RSI independentes: MOTOR REMOVIDO (M5 → próxima M1) e MEGA BOT (M5 → +2min → expira M1).
 # MEGA IA 3.97.15 — RSI CHANNELS: leitura M5; pré-alerta na janela oficial de 20s; entrada exatamente 2 minutos após o pré-alerta; expiração M1 (60s).
 # MEGA IA 3.97.14 — painel limpo: oculta PLACAR POR MOTOR e ESTUDO ANTES DE OPERAR; mantém somente RSI CHANNELS visível.
 # MEGA IA 3.97.13 — RSI CHANNELS: leitura M5 fechada, entrada na próxima vela M1 e expiração fixa de 1 minuto.
 # MEGA IA 3.97.12 — RSI CHANNELS: leitura M5 fechada, entrada M1 e expiração fixa de 1 minuto.
 # MEGA IA 3.97.11 — RSI CHANNELS exclusivo: leitura técnica M5 fechada, disparo/entrada M1 e demais cards de motores removidos do painel.
-# MEGA IA 3.97.10 — corrige status do 4 PERIOD RSI PRO: remove fallback visual/backend “IA GRÁFICA” quando RSI4PERIOD está ativo.
+# MEGA IA 3.97.10 — corrige status do 4 PERIOD RSI PRO: remove fallback visual/backend “MOTOR REMOVIDO” quando RSI4PERIOD está ativo.
 # MEGA IA 3.97.06 — corrige painel sem controle: declara estado ISMAEL 98 antes da inicialização JS e restaura botões ON/OFF.
 # MEGA IA 3.97.09 — 4 PERIOD RSI PRO: M1 com confirmação obrigatória somente pelo RSI9 do M5 fechado; M15/M30/H1 deixam de bloquear.
 # MEGA IA 3.97.08 — completa 4 PERIOD RSI PRO: status/radar próprios e adaptador causal no Backtest 48H.
@@ -81,7 +82,7 @@ APP_VERSION = "3.97.42"
 # MEGA IA 3.96.92 — ISMAEL TRADER: sinal antecipado nos 20s finais para a próxima vela; remove descarte de 10s pós-abertura; radar e pré-sinais alinhados.
 # MEGA IA 3.96.91 — corrige o PLACAR POR MOTOR: 1 MINUTE SCALPER volta a aparecer com WIN/LOSS/assertividade separados.
 # MEGA IA 3.96.90 — destrava sinais: cTrader cai automaticamente para a multifuente quando falha/atrasa; RSI CHANNELS ganha reentrada FLEX nos 20s finais e pré-alerta coerente com o sinal oficial.
-# MEGA IA 3.96.89 — corrige o radar do 1 MINUTE SCALPER: usa o próprio motor e elimina o fallback legado da IA GRÁFICA.
+# MEGA IA 3.96.89 — corrige o radar do 1 MINUTE SCALPER: usa o próprio motor e elimina o fallback legado da MOTOR REMOVIDO.
 # MEGA IA 3.96.88 — restaura 1 MINUTE SCALPER e preserva RSI CHANNELS com pré-sinal oficial nos 20s finais para a próxima vela.
 # MEGA IA 3.96.87 — 1 MINUTE SCALPER integrado: 13 LWMAs no PRICE_TYPICAL, alinhamento fechado, próxima vela, rearm obrigatório e placar independente.
 # MEGA IA 3.96.87 — RSI CHANNELS: pré-sinal oficial nos 20s finais da vela atual, travado para entrada na próxima abertura; parâmetros originais preservados.
@@ -176,13 +177,13 @@ def ismael98_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", cur
 # MEGA IA 3.96.69 — adiciona MOMENTUM CHART puro: fórmula original MT4 Close[i]*100/Close[i+14], cruzamento causal do nível 100, candle fechado -> próxima vela.
 # M1 fechado -> próxima vela; Liquidity Sweep + FVG + Fibonacci 61,8% + confirmação flexível M5/M15 (1 de 2); sem Gale.
 # MEGA IA 3.96.64 — adiciona MEGA MASTER: leitura local ampliada com 15 famílias técnicas/contextuais, sem API.
-# MEGA IA 3.96.63 — placar separado por motor: CHATGPT ANALISTA, MEGA BOT e MEGA BOT FLEX.
+# MEGA IA 3.96.63 — placar separado por motor: MOTOR REMOVIDO, MEGA BOT e MEGA BOT FLEX.
 # Resultados antigos/sem identificação ficam fora dos sete placares atuais para não misturar desempenho.
 # MEGA IA 3.96.62 — adiciona MEGA BOT FLEX: mesma leitura multi-camada do MEGA BOT, com gate levemente mais solto.
 # Ele transforma as principais famílias de leitura usadas pelo ChatGPT em regras causais:
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
-# CHATGPT ANALISTA permanece separado e continua com decisão nativa do modelo.
+# MOTOR REMOVIDO permanece separado e continua com decisão nativa do modelo.
 PWA_VERSION = "v210"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
@@ -204,7 +205,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 GEMINI_MODEL_FALLBACKS = []
 OAI_MIN = float(os.getenv("OPENAI_MIN_CONFIDENCE", "70"))
 OAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "15"))
-# 3.96.53 — motor CHATGPT ANALISTA. Usa o modelo ChatGPT da API por padrão,
+# 3.96.53 — motor MOTOR REMOVIDO. Usa o modelo ChatGPT da API por padrão,
 # podendo ser trocado no Render por CHATGPT_MODEL sem mexer no código.
 CHATGPT_MODEL = os.getenv("CHATGPT_MODEL", "").strip() or "chat-latest"
 CHATGPT_MIN_CONFIDENCE = min(94.0, max(65.0, float(os.getenv("CHATGPT_MIN_CONFIDENCE", "78"))))
@@ -5937,7 +5938,7 @@ def _aggregate_closed_candles(rows, target_seconds=14400):
 
 
 async def graphic_ai_strategy(symbol, interval, cs, market="OPEN", request=None, iq_state=None, fetch_htf=True):
-    """IA GRÁFICA estrutural para o primeiro motor do painel.
+    """MOTOR REMOVIDO estrutural para o primeiro motor do painel.
 
     Não usa RSI, médias, MACD, Bollinger ou outro indicador técnico como gatilho.
     Trabalha com OHLC fechado, padrão de vela, regiões H1, estrutura de Dow no H4
@@ -5949,14 +5950,14 @@ async def graphic_ai_strategy(symbol, interval, cs, market="OPEN", request=None,
     if market != "OPEN":
         return {
             "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "risk": "HIGH", "strategy": "IA GRÁFICA",
+            "risk": "HIGH", "strategy": "MOTOR REMOVIDO",
             "reason": "IA Gráfica reservada ao mercado aberto nesta versão.",
             "engine": "GRAPH_AI",
         }
     if len(rows) < 30:
         return {
             "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "risk": "HIGH", "strategy": "IA GRÁFICA",
+            "risk": "HIGH", "strategy": "MOTOR REMOVIDO",
             "reason": "Aguardando histórico suficiente para leitura gráfica.",
             "engine": "GRAPH_AI",
         }
@@ -6099,7 +6100,7 @@ async def graphic_ai_strategy(symbol, interval, cs, market="OPEN", request=None,
     if calls and puts:
         return {
             "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "risk": "HIGH", "strategy": "IA GRÁFICA",
+            "risk": "HIGH", "strategy": "MOTOR REMOVIDO",
             "reason": "Gatilhos gráficos opostos apareceram no mesmo fechamento; entrada bloqueada.",
             "engine": "GRAPH_AI", "triggers": triggers, "diagnostics": diagnostics,
         }
@@ -6112,7 +6113,7 @@ async def graphic_ai_strategy(symbol, interval, cs, market="OPEN", request=None,
         risk = "LOW" if confidence >= 90 else "MEDIUM"
         return {
             "direction": best["direction"], "confidence": round(confidence, 1),
-            "confirmed": True, "risk": risk, "strategy": "IA GRÁFICA",
+            "confirmed": True, "risk": risk, "strategy": "MOTOR REMOVIDO",
             "reason": best["reason"], "trigger": best["source"],
             "engine": "GRAPH_AI", "triggers": triggers, "diagnostics": diagnostics,
             "non_repaint": True,
@@ -6120,7 +6121,7 @@ async def graphic_ai_strategy(symbol, interval, cs, market="OPEN", request=None,
 
     return {
         "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-        "risk": "HIGH", "strategy": "IA GRÁFICA",
+        "risk": "HIGH", "strategy": "MOTOR REMOVIDO",
         "reason": "IA Gráfica monitorando: aguardando padrão, região H1 ou reação Dow H4 em LTA/LTB.",
         "engine": "GRAPH_AI", "triggers": [], "diagnostics": diagnostics,
         "non_repaint": True,
@@ -14934,7 +14935,7 @@ def rsi_channels_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN",
     rows=list(cs or [])[-180:]
     live_snapshot=bool(allow_prealert and not current_candle_closed)
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
-          "strategy":"MEGA FÚRIA • RSI4 + CANAIS • LEITURA M5 • PRÓXIMA M1 • EXPIRA M1",
+          "strategy":"MOTOR REMOVIDO • RSI4 + CANAIS • LEITURA M5 • PRÓXIMA M1 • EXPIRA M1",
           "engine":"RSICHANNEL","provider":"LOCAL_RSI_CHANNELS_EARLY20_V111",
           "risk":"HIGH","closed_candles_only":not live_snapshot,"non_repaint":not live_snapshot,
           "non_repaint_after_release":True,"next_candle_entry":True,"expiry_seconds":60,"expiry_candles":1,"direct_win_only":True,
@@ -21021,7 +21022,7 @@ def local_analyst_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="O
 
 
 async def chatgpt_primary_signal(symbol, interval, cs, market="OPEN", moment_hint=None):
-    """CHATGPT ANALISTA — decisão nativa do modelo usando candles OHLCV fechados.
+    """MOTOR REMOVIDO — decisão nativa do modelo usando candles OHLCV fechados.
 
     O backend não calcula direção, não vota, não exige indicador e não aplica gate
     técnico depois da resposta. Ele apenas envia os candles crus ao modelo ChatGPT,
@@ -21034,7 +21035,7 @@ async def chatgpt_primary_signal(symbol, interval, cs, market="OPEN", moment_hin
         return {
             "available": True, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "setup": "NONE",
-            "strategy": "CHATGPT ANALISTA", "engine": "SMART",
+            "strategy": "MOTOR REMOVIDO", "engine": "SMART",
             "provider": "OPENAI_CHATGPT", "chatgpt_primary": True,
             "reason": f"CHATGPT coletando candles fechados ({len(rows)}/{need}).",
             "api_called": False, "next_candle_entry": True, "gale_signal": False,
@@ -21070,7 +21071,7 @@ async def chatgpt_primary_signal(symbol, interval, cs, market="OPEN", moment_hin
         out = {
             "available": False, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "setup": "NONE",
-            "strategy": "CHATGPT ANALISTA", "engine": "SMART",
+            "strategy": "MOTOR REMOVIDO", "engine": "SMART",
             "provider": "OPENAI_CHATGPT", "chatgpt_primary": True,
             "reason": "CHATGPT indisponível: configure OPENAI_API_KEY no servidor.",
             "api_called": False, "api_available": False, "fallback": False,
@@ -21093,7 +21094,7 @@ async def chatgpt_primary_signal(symbol, interval, cs, market="OPEN", moment_hin
         for x in rows[-CHATGPT_CANDLE_LIMIT:]
     ]
 
-    prompt = f"""Você é o CHATGPT ANALISTA do app MEGA IA.
+    prompt = f"""Você é o MOTOR REMOVIDO do app MEGA IA.
 
 Analise por conta própria o gráfico representado pelos candles OHLCV abaixo e decida a direção da PRÓXIMA vela completa.
 
@@ -21161,7 +21162,7 @@ CANDLES FECHADOS EM ORDEM CRONOLÓGICA (o último é o mais recente):
             "risk": risk,
             "setup": setup if confirmed else "NONE",
             "reason": reason or "ChatGPT não encontrou vantagem clara para a próxima vela.",
-            "strategy": "CHATGPT ANALISTA",
+            "strategy": "MOTOR REMOVIDO",
             "engine": "SMART",
             "provider": "OPENAI_CHATGPT",
             "model": CHATGPT_MODEL,
@@ -21194,7 +21195,7 @@ CANDLES FECHADOS EM ORDEM CRONOLÓGICA (o último é o mais recente):
         out = {
             "available": False, "direction": "NEUTRO", "confidence": 0.0,
             "confirmed": False, "risk": "HIGH", "setup": "NONE",
-            "strategy": "CHATGPT ANALISTA", "engine": "SMART",
+            "strategy": "MOTOR REMOVIDO", "engine": "SMART",
             "provider": "OPENAI_CHATGPT", "model": CHATGPT_MODEL,
             "chatgpt_primary": True, "native_model_decision": True,
             "local_gate_required": False,
@@ -21209,7 +21210,7 @@ CANDLES FECHADOS EM ORDEM CRONOLÓGICA (o último é o mais recente):
             "last_provider": "OPENAI_CHATGPT",
             "last_error": str(exc)[:220],
         })
-        print(f"[CHATGPT ANALISTA] {symbol} {interval} erro: {str(exc)[:180]}", flush=True)
+        print(f"[MOTOR REMOVIDO] {symbol} {interval} erro: {str(exc)[:180]}", flush=True)
         return out
 
 
@@ -22736,14 +22737,14 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         closed = raw[:-1] if len(raw) > 1 else raw
 
     # 33.78.0: dois motores independentes e selecionáveis no painel.
-    # IA GRÁFICA substitui o antigo Robô Principal/RSI e usa somente leitura estrutural de preço.
-    # CHATGPT ANALISTA recebe candles OHLCV fechados e decide a direção da próxima vela.
+    # MOTOR REMOVIDO substitui o antigo Robô Principal/RSI e usa somente leitura estrutural de preço.
+    # MOTOR REMOVIDO recebe candles OHLCV fechados e decide a direção da próxima vela.
     # Estrutura, S/R, price action, momentum e demais indicadores são contexto auxiliar,
     # sem exigir gatilho local antes da chamada OpenAI.
     if ai_only and SELECTABLE_ENGINES_ENABLED:
         tf_label = {'1min':'M1','5min':'M5','15min':'M15','30min':'M30'}.get(interval, interval)
         if engine == "SMART":
-            engine_title = "CHATGPT ANALISTA"
+            engine_title = "MOTOR REMOVIDO"
             engine_mode = "CHATGPT_PRIMARY_ANALYSIS"
         elif engine == "LOCALANALYST":
             engine_title = "MEGA BOT"
@@ -22893,7 +22894,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "ISMAEL 98"
             engine_mode = "ISMAEL98_SELECTIVE_CONFLUENCE_NEXT_CANDLE"
         elif engine in ("RSICHANNEL", "RSICHANNEL2"):
-            engine_title = "MEGA FÚRIA" if engine == "RSICHANNEL" else "MEMORY FUSION"
+            engine_title = "MOTOR REMOVIDO" if engine == "RSICHANNEL" else "MEMORY FUSION"
             engine_mode = "RSI4_M5_NEXT_M1" if engine == "RSICHANNEL" else "ORT_SUPPLY_DEMAND_V3_M1"
         elif engine == "MINSCALPER":
             engine_title = "M-SNIPER"
@@ -22976,7 +22977,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "BTC FORCE • MULTIATIVOS"
             engine_mode = "BTC_FORCE_STRUCTURE_NEXT_CANDLE"
         else:
-            engine_title = "IA GRÁFICA"
+            engine_title = "MOTOR REMOVIDO"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
         if market != "OPEN" and engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "SESSIONBREAKOUT", "MONSTERSMC"):
@@ -22987,7 +22988,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 source_state="READY",
             )
             out.update({
-                "strategy": "CHATGPT ANALISTA" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
+                "strategy": "MOTOR REMOVIDO" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
                 "mode": engine_mode,
                 "selected_engine": engine,
                 "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
@@ -23701,7 +23702,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 source_state="WAITING",
             )
             out.update({
-                "strategy": "CHATGPT ANALISTA" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
+                "strategy": "MOTOR REMOVIDO" if engine == "SMART" else ("EA" if engine == "EA" else f"{engine_title} {tf_label}"),
                 "mode": engine_mode,
                 "selected_engine": engine,
             })
@@ -23791,7 +23792,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             }.get(engine, "DISABLED")),
             "risk": str(analysis.get("risk", "HIGH") if engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "GRAPH_AI", "EA", "FORCE", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SESSIONBREAKOUT", "MONSTERSMC") else "HIGH").upper(),
             "strategy": (
-                "CHATGPT ANALISTA" if engine == "SMART"
+                "MOTOR REMOVIDO" if engine == "SMART"
                 else (analysis.get("strategy") or (
                     "EA RSI + VALUE CHART + XGBOOST" if engine == "EA"
                     else "ROBÔ RUBIK ADAPTADO" if engine == "RUBIK"
@@ -23840,7 +23841,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     else "NINJA HFT • MA3 HIGH/LOW + MICROIMPULSO • NEXT M1" if engine == "NINJAHFT"
                     else "RSI EA MTF • CANDLE FECHADO • NEXT CANDLE" if engine == "RSICROSS"
                     else "ISMAEL TRADER • EMA3/7 + RSI9 + ADX21 • NEXT CANDLE" if engine == "ISMAELTRADER"
-                    else "MEGA FÚRIA • LEITURA M5 • PRÓXIMA M1 • EXPIRA M1" if engine == "RSICHANNEL"
+                    else "MOTOR REMOVIDO • LEITURA M5 • PRÓXIMA M1 • EXPIRA M1" if engine == "RSICHANNEL"
                     else "MEMORY FUSION • ESPELHO 24H + SEQUÊNCIA + CONFLUÊNCIAS • EXPIRA M1" if engine == "RSICHANNEL2"
                     else "M-SNIPER • VELA FORTE M1 • EARLY20 • NEXT M1" if engine == "MINSCALPER"
                     else "STREAK REVERSAL • SEQUÊNCIA 2+2 • EMA100 + ATR100 • NEXT CANDLE" if engine == "STREAKREV"
@@ -23947,7 +23948,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     )
                 except Exception:
                     moment_gate = {"available": False, "required": False, "confirmed": False}
-                # 3.96.53 — no CHATGPT ANALISTA, ticks/EA são somente contexto.
+                # 3.96.53 — no MOTOR REMOVIDO, ticks/EA são somente contexto.
                 # Nem mesmo um hard_veto local pode cancelar uma decisão já confirmada
                 # pelo ChatGPT; registramos a divergência para diagnóstico.
                 if moment_gate.get("hard_veto"):
@@ -24113,7 +24114,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     ) if last_graph_signal_ts else 0
 
                     if graph_remaining > 0:
-                        base["status"] = "ONLINE • IA GRÁFICA • INTERVALO DE 4 MINUTOS"
+                        base["status"] = "ONLINE • MOTOR REMOVIDO • INTERVALO DE 4 MINUTOS"
                         base["reason"] = (
                             f"Novo sinal gráfico bloqueado por mais {graph_remaining}s "
                             "para manter no mínimo 4 minutos entre entradas."
@@ -24560,7 +24561,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "SESSIONBREAKOUT": "SINAL SMART SESSION BREAKOUT LIBERADO",
                         "STREAKREV": "SINAL STREAK REVERSAL LIBERADO",
                         "ISMAELTRADER": "SINAL ISMAEL TRADER LIBERADO",
-                        "RSICHANNEL": "SINAL MEGA FÚRIA LIBERADO",
+                        "RSICHANNEL": "SINAL MOTOR REMOVIDO LIBERADO",
                         "RSICHANNEL2": "SINAL SUPPLY DEMAND LIBERADO",
                         "MINSCALPER": "SINAL 1 MINUTE SCALPER LIBERADO",
                         "MONSTERSMC": "SINAL MONSTER SMC LIBERADO",
@@ -24583,7 +24584,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         "RSI4PERIOD": "SINAL 4 PERIOD RSI PRO LIBERADO",
                         "FORCE": "SINAL EA FORÇA DO MOVIMENTO LIBERADO",
                         "BIGRISE": "SINAL BTC FORCE MULTIATIVOS LIBERADO",
-                    }.get(engine, "SINAL IA GRÁFICA LIBERADO")),
+                    }.get(engine, "SINAL MOTOR REMOVIDO LIBERADO")),
                     "risk": str(analysis.get("risk", "MEDIUM") if engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SESSIONBREAKOUT", "MONSTERSMC") else "MEDIUM").upper(),
                     "entry_time": iso(entry),
                     "announce_time": iso(announce),
@@ -25859,7 +25860,7 @@ async def health():
             "model": OAI_MODEL or "gpt-5.6-terra",
             "chatgpt_model": CHATGPT_MODEL,
             "priority": 2,
-            "role": "CHATGPT ANALISTA + OUTROS FLUXOS OPENAI",
+            "role": "MOTOR REMOVIDO + OUTROS FLUXOS OPENAI",
             "last_provider": external_ai_runtime.get("last_provider"),
             "last_success_at": external_ai_runtime.get("last_success_at"),
             "last_error": external_ai_runtime.get("last_error"),
@@ -27723,7 +27724,7 @@ def _background_state_snapshot() -> Dict[str, Any]:
     return {
         "enabled": bool(background_bot_state.get("enabled")),
         "telegram_enabled": bool(background_bot_state.get("telegram_enabled")),
-        "engine": str(background_bot_state.get("engine") or "SMART"),
+        "engine": str(background_bot_state.get("engine") or "SCALPERPRO"),
         "market": str(background_bot_state.get("market") or "OPEN"),
         "interval": str(background_bot_state.get("interval") or "1min"),
         "robofibo_poc": bool(background_bot_state.get("robofibo_poc")),
@@ -27749,7 +27750,7 @@ def _background_save_state() -> None:
         data = {
             "enabled": bool(background_bot_state.get("enabled")),
             "telegram_enabled": bool(background_bot_state.get("telegram_enabled")),
-            "engine": str(background_bot_state.get("engine") or "SMART"),
+            "engine": str(background_bot_state.get("engine") or "SCALPERPRO"),
             "market": str(background_bot_state.get("market") or "OPEN"),
             "interval": str(background_bot_state.get("interval") or "1min"),
             "robofibo_poc": bool(background_bot_state.get("robofibo_poc")),
@@ -28105,10 +28106,10 @@ async def _background_bot_loop() -> None:
             # Com Telegram OFF o servidor continua analisando/contabilizando; apenas
             # o envio das mensagens fica bloqueado em _background_send_signal/result.
             if not bool(background_bot_state.get("telegram_enabled")):
-                current_engine = str(background_bot_state.get("engine") or "SMART").upper()
+                current_engine = str(background_bot_state.get("engine") or "SCALPERPRO").upper()
                 background_bot_state["status"] = f"ONLINE • {current_engine} • SERVIDOR 24H • TELEGRAM OFF"
 
-            engine = str(background_bot_state.get("engine") or "SMART").upper()
+            engine = str(background_bot_state.get("engine") or "SCALPERPRO").upper()
             market = str(background_bot_state.get("market") or "OPEN").upper()
             interval = str(background_bot_state.get("interval") or "1min")
             if engine not in _BACKGROUND_ENGINES or market not in VALID_MARKETS or interval not in INTERVALS:
@@ -28497,7 +28498,7 @@ def _engine_moment_scores(features, market="OPEN", iq_ready=False):
             "reason": "Leitura local ampliada: tendência curta e macro, estrutura, price action, S/R, rompimento/falso rompimento, pullback, momentum, divergência, Fibonacci, Stochastic, ATR, Bollinger, volume e pressão de candles."
         },
         {
-            "key":"SMART","name":"CHATGPT ANALISTA","score":smart,
+            "key":"SMART","name":"MOTOR REMOVIDO","score":smart,
             "supported":market in VALID_MARKETS,"operational":market in VALID_MARKETS and ai_ready,
             "reason": "ChatGPT analisa os candles diretamente e decide CALL/PUT/NEUTRO com decisão nativa do modelo."
         },
@@ -28665,12 +28666,12 @@ _BACKTEST48_SUPPORTED = {
     "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO",
 }
 _BACKTEST48_NAMES = {
-    "SMART": "CHATGPT ANALISTA",
+    "SMART": "MOTOR REMOVIDO",
     "LOCALANALYST": "MEGA BOT",
     "LOCALANALYSTFLEX": "MEGA BOT FLEX",
     "MEGAMASTER": "MEGA MASTER",
     "ISMAELTRADER": "ISMAEL TRADER",
-    "RSICHANNEL": "MEGA FÚRIA",
+    "RSICHANNEL": "MOTOR REMOVIDO",
     "RSICHANNEL2": "MEMORY FUSION",
     "MINSCALPER": "1 MINUTE SCALPER",
     "MOMENTUM": "MOMENTUM CHART",
@@ -28996,7 +28997,7 @@ async def backtest48h_endpoint(
         return {
             "ok": True, "supported": False, "engine": engine, "engine_name": name,
             "symbol": symbol, "interval": interval, "market": market,
-            "message": "CHATGPT ANALISTA usa decisão externa dinâmica. Para não inventar um resultado histórico nem fazer milhares de chamadas de IA, o Backtest 48H clássico fica disponível somente para os motores locais.",
+            "message": "MOTOR REMOVIDO usa decisão externa dinâmica. Para não inventar um resultado histórico nem fazer milhares de chamadas de IA, o Backtest 48H clássico fica disponível somente para os motores locais.",
         }
     if engine not in _BACKTEST48_SUPPORTED:
         return {
@@ -29106,23 +29107,15 @@ async def backtest48h_endpoint(
 
 
 @app.get("/signal-ai")
-async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "SMART", entry_mode: str = "BIRTH", robofibo_poc: bool = False):
+async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "SCALPERPRO", entry_mode: str = "BIRTH", robofibo_poc: bool = False):
     requested_market = (market or "OPEN").upper()
-    engine = (engine or "GRAPH_AI").upper()
+    engine = (engine or "SCALPERPRO").upper()
     entry_mode = normalize_entry_mode(entry_mode)
 
     if not _symbol_allowed(symbol, requested_market) or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
-    if engine == "RSI":
-        engine = "GRAPH_AI"
-    if engine == "RSIXOVER":
-        raise HTTPException(410, "RSI XOVER foi retirado do MEGA IA. Atualize o painel para escolher outro motor.")
-    if engine == "STREAKREV":
-        raise HTTPException(410, "STREAK REVERSAL foi retirado do MEGA IA. Atualize o painel para escolher outro motor.")
-    if engine in RETIRED_ENGINES:
-        engine = "SMART"
-    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "MOMENTUM", "SCALPINGASIA", "SCALPERPRO"):
-        raise HTTPException(400, "Motor inválido. Escolha um motor disponível no painel.")
+    if engine not in ("SCALPINGASIA", "SCALPERPRO"):
+        raise HTTPException(410, "Motor removido. Use SCALPER PRO ou SCALPER FLEX.")
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
     if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "SESSIONBREAKOUT", "MONSTERSMC"):
@@ -30089,13 +30082,13 @@ async def pre_signals(
         if not (RSICHANNEL_EARLY_MIN_REMAINING <= pre_remain <= RSICHANNEL_EARLY_WINDOW_BEFORE):
             return {
                 "ok":True,"engine":engine,"items":[],"seconds_to_entry":remain,
-                "message":f"{('MEGA FÚRIA' if engine=='RSICHANNEL' else 'MEMORY FUSION')} monitorando • pré-alerta abre nos 20s finais • faltam {pre_remain}s para a janela.",
+                "message":f"{('MOTOR REMOVIDO' if engine=='RSICHANNEL' else 'MEMORY FUSION')} monitorando • pré-alerta abre nos 20s finais • faltam {pre_remain}s para a janela.",
                 "non_repaint_after_release":True,"gale_signal":False,
             }
         target=symbol or "EUR/USD"
         state=_iq_session_state(request, required=False) if market == "IQ_OTC" else None
         if market == "IQ_OTC" and not state:
-            return {"ok":True,"engine":engine,"items":[],"seconds_to_entry":remain,"message":f"{('MEGA FÚRIA' if engine=='RSICHANNEL' else 'MEMORY FUSION')} OTC aguardando conexão com a IQ Option."}
+            return {"ok":True,"engine":engine,"items":[],"seconds_to_entry":remain,"message":f"{('MOTOR REMOVIDO' if engine=='RSICHANNEL' else 'MEMORY FUSION')} OTC aguardando conexão com a IQ Option."}
         try:
             raw=(await iq_ea_candles(state,target,RSICHANNEL_ANALYSIS_INTERVAL,180,regular_market=False)) if market == "IQ_OTC" else (await candles(target,RSICHANNEL_ANALYSIS_INTERVAL,180,"OPEN",None,request=request))
             closed5=_verified_closed_candles(raw,RSICHANNEL_ANALYSIS_INTERVAL)
@@ -30105,7 +30098,7 @@ async def pre_signals(
                 items=[{
                     "symbol":target,"direction":str(tech.get("direction")).upper(),
                     "confidence":float(tech.get("confidence") or 0.0),
-                    "strategy":("MEGA FÚRIA • M5 • PRÓXIMA M1 • EXPIRA M1" if engine=="RSICHANNEL" else "MEGA BOT • M5 • ENTRADA +2MIN • EXPIRA M1"),
+                    "strategy":("MOTOR REMOVIDO • M5 • PRÓXIMA M1 • EXPIRA M1" if engine=="RSICHANNEL" else "MEGA BOT • M5 • ENTRADA +2MIN • EXPIRA M1"),
                     "reason":str(tech.get("reason") or "RSI Channels confirmou reentrada."),
                     "entry_time":iso(entry_dt),"seconds_to_entry":remain,"prealert_only":False,
                     "early_signal_locked":True,
@@ -30116,10 +30109,10 @@ async def pre_signals(
                 "non_repaint_after_release":True,"gale_signal":False,
             }
         except Exception as exc:
-            return {"ok":True,"engine":engine,"items":[],"seconds_to_entry":remain,"message":f"{('MEGA FÚRIA' if engine=='RSICHANNEL' else 'MEMORY FUSION')} aguardando dados: {str(exc)[:120]}"}
+            return {"ok":True,"engine":engine,"items":[],"seconds_to_entry":remain,"message":f"{('MOTOR REMOVIDO' if engine=='RSICHANNEL' else 'MEMORY FUSION')} aguardando dados: {str(exc)[:120]}"}
 
     if engine in ("INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SESSIONBREAKOUT"):
-        _nm={"INDICEMENT":"INDICEMENT SMA 12/26","GOLDINV":"FOREX GOLD INVESTOR","TTMSCALPER":"TTM SCALPER SWING","FOREXMISSION":"FOREX MISSION","MONEYARROW":"BINARY MONEYARROW","LIQUIDEX":"LIQUIDEX","EUROFX2":"EURO FX2","EUROFX2TAURUS":"EURO FX2 + TAURUS","ATE":"ATE","FOREXSTAY":"FOREXSTAY SIGHT","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + TAURUS","FOREXSTAYPRO":"FOREXSTAY PRO","FOREXFLEX":"FOREX FLEX","SENEGALPRO":"SUPER SENEGAL PRO","VALUEMACD":"VALUE CHART + MACD","HOLYGRAIL":"HOLY GRAIL ORIGINAL","TRENDLINES":"TRENDLINES MTF","BBSTOCH":"BB STOCHRSI X REVERSAL","KAMIKAZE":"KAMIKAZE TREND SNIPER","FOREXMEGA":"FOREX MEGA LLC V10.21","BROOKYVERTEX":"BROOKY + VERTEX FLEX 30/70","MEGABOT":"MEGA BOT","BROOKYC3":"CONFLUÊNCIA 3 • BROOKY FLEX","UTBOT":"UT BOT ALERTS","ONEMINRSI":"ONE MINUTE + RSI","WPRADAPT":"WPR ADAPTIVE","TINGATINGA":"TINGA TINGA RSI 14","SUPERNOVA":"SUPER NOVA","ELCODEX":"ELCODEX SCALPER","TSI":"MEGA ULTRA","MOMENTUM":"MOMENTUM CHART","FIGURES":"FIGURES CANDLE","VASILY":"VASILY PIP SNIPER ZL","PLATINUM":"PLATINUM","STREAKREV":"STREAK REVERSAL","ISMAELTRADER":"ISMAEL TRADER","RSICHANNEL":"MEGA FÚRIA","RSICHANNEL2":"MEMORY FUSION","RSIXOVER":"RSI XOVER","RSICROSS":"RSI EA MTF","SESSIONBREAKOUT":"SMART SESSION BREAKOUT","MONSTERSMC":"MONSTER SMC"}[engine]
+        _nm={"INDICEMENT":"INDICEMENT SMA 12/26","GOLDINV":"FOREX GOLD INVESTOR","TTMSCALPER":"TTM SCALPER SWING","FOREXMISSION":"FOREX MISSION","MONEYARROW":"BINARY MONEYARROW","LIQUIDEX":"LIQUIDEX","EUROFX2":"EURO FX2","EUROFX2TAURUS":"EURO FX2 + TAURUS","ATE":"ATE","FOREXSTAY":"FOREXSTAY SIGHT","FOREXSTAYTAURUS":"FOREXSTAY SIGHT + TAURUS","FOREXSTAYPRO":"FOREXSTAY PRO","FOREXFLEX":"FOREX FLEX","SENEGALPRO":"SUPER SENEGAL PRO","VALUEMACD":"VALUE CHART + MACD","HOLYGRAIL":"HOLY GRAIL ORIGINAL","TRENDLINES":"TRENDLINES MTF","BBSTOCH":"BB STOCHRSI X REVERSAL","KAMIKAZE":"KAMIKAZE TREND SNIPER","FOREXMEGA":"FOREX MEGA LLC V10.21","BROOKYVERTEX":"BROOKY + VERTEX FLEX 30/70","MEGABOT":"MEGA BOT","BROOKYC3":"CONFLUÊNCIA 3 • BROOKY FLEX","UTBOT":"UT BOT ALERTS","ONEMINRSI":"ONE MINUTE + RSI","WPRADAPT":"WPR ADAPTIVE","TINGATINGA":"TINGA TINGA RSI 14","SUPERNOVA":"SUPER NOVA","ELCODEX":"ELCODEX SCALPER","TSI":"MEGA ULTRA","MOMENTUM":"MOMENTUM CHART","FIGURES":"FIGURES CANDLE","VASILY":"VASILY PIP SNIPER ZL","PLATINUM":"PLATINUM","STREAKREV":"STREAK REVERSAL","ISMAELTRADER":"ISMAEL TRADER","RSICHANNEL":"MOTOR REMOVIDO","RSICHANNEL2":"MEMORY FUSION","RSIXOVER":"RSI XOVER","RSICROSS":"RSI EA MTF","SESSIONBREAKOUT":"SMART SESSION BREAKOUT","MONSTERSMC":"MONSTER SMC"}[engine]
         return {"items":[],"engine":engine,"message":f"{_nm} usa confirmação em candle fechado; o app libera somente a entrada válida para a próxima vela, sem pré-sinal repintável.","non_repaint":True,"gale_signal":False}
     if engine == "LARRY":
         return {
@@ -30341,7 +30334,7 @@ async def pre_signals(
             "PLATINUM": "PLATINUM",
             "STREAKREV": "STREAK REVERSAL",
             "ISMAELTRADER": "ISMAEL TRADER",
-            "RSICHANNEL": "MEGA FÚRIA",
+            "RSICHANNEL": "MOTOR REMOVIDO",
     "RSICHANNEL2": "MEMORY FUSION",
             "RSICROSS": "RSI EA MTF",
             "SESSIONBREAKOUT": "SMART SESSION BREAKOUT",
@@ -30581,7 +30574,7 @@ async def pre_signals(
                         raw, symbol, interval, market, requested_direction,
                         seconds_to_entry, entry_dt,
                     )
-                    # CHATGPT ANALISTA não cria pré-sinal local. O tape é guardado
+                    # MOTOR REMOVIDO não cria pré-sinal local. O tape é guardado
                     # apenas como contexto para a próxima análise oficial do ChatGPT.
                 except Exception as exc:
                     moment_ea = {
@@ -30895,23 +30888,17 @@ async def chart_pre_signal(
         }
 
 @app.get("/radar")
-async def radar(request: Request, interval="1min", market="OPEN", engine: str = "SMART", symbol: str = "", robofibo_poc: bool = False):
+async def radar(request: Request, interval="1min", market="OPEN", engine: str = "SCALPERPRO", symbol: str = "", robofibo_poc: bool = False):
     market = (market or "OPEN").upper()
-    engine = (engine or "SMART").upper()
+    engine = (engine or "SCALPERPRO").upper()
     symbol = str(symbol or "").strip().upper()
 
     if interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Intervalo ou mercado inválido.")
     if symbol and not _symbol_allowed(symbol, market):
         raise HTTPException(400, "Ativo do radar inválido.")
-    if engine == "RSI":
-        engine = "SMART"
-    if engine == "RSIXOVER":
-        raise HTTPException(410, "RSI XOVER foi retirado do MEGA IA. Atualize o painel para escolher outro motor.")
-    if engine in RETIRED_ENGINES:
-        engine = "SMART"
-    if engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "MOMENTUM", "SCALPINGASIA", "SCALPERPRO"):
-        raise HTTPException(400, "Motor inválido. Escolha um motor disponível no painel.")
+    if engine not in ("SCALPINGASIA", "SCALPERPRO"):
+        raise HTTPException(410, "Motor removido. Use SCALPER PRO ou SCALPER FLEX.")
 
     if engine == "RTM":
         # Radar exclusivo: BTC/USD + pares JPY. Um símbolo manual fora da regra
@@ -31160,7 +31147,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 raw = await candles(sym, interval, 100, "OPEN", None, request=request)
         elif engine == "HOLYGRAIL":
             # HOLY GRAIL precisa ser lido pelo próprio núcleo também no radar.
-            # Antes ele caía no fallback genérico e o radar executava IA GRÁFICA.
+            # Antes ele caía no fallback genérico e o radar executava MOTOR REMOVIDO.
             if market == "IQ_OTC":
                 if not iq_state:
                     raise RuntimeError("Conecte a IQ Option para o HOLY GRAIL ORIGINAL analisar OTC.")
@@ -31168,7 +31155,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             else:
                 raw = await candles(sym, interval, 120, "OPEN", None, request=request)
         elif engine == "BBSTOCH":
-            # BB STOCHRSI usa o mesmo núcleo no painel e no radar: nada de IA GRÁFICA por engano.
+            # BB STOCHRSI usa o mesmo núcleo no painel e no radar: nada de MOTOR REMOVIDO por engano.
             if market == "IQ_OTC":
                 if not iq_state:
                     raise RuntimeError("Conecte a IQ Option para o BB STOCHRSI X REVERSAL analisar OTC.")
@@ -31502,7 +31489,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 status_text = (f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "HOLYGRAIL":
                 # Correção 3.96.27: o radar usa o MESMO motor selecionado no painel.
-                # Não permite mais que HOLYGRAIL seja analisado pela IA GRÁFICA.
+                # Não permite mais que HOLYGRAIL seja analisado pela MOTOR REMOVIDO.
                 tech = holy_grail_strategy(closed[-120:], symbol=sym, timeframe=interval, market=market)
                 engine_label = "HOLY GRAIL ORIGINAL"
                 direction = tech.get("direction", "NEUTRO") if tech.get("confirmed") else "NEUTRO"
@@ -31514,7 +31501,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 )
             elif engine == "TRENDLINES":
                 # Correção 3.96.33: o radar usa TRENDLINES MTF quando ele está selecionado.
-                # Assim o card de oportunidade não cai por engano na IA GRÁFICA.
+                # Assim o card de oportunidade não cai por engano na MOTOR REMOVIDO.
                 engine_label = "TRENDLINES MTF"
                 if interval != "1min":
                     tech = {
@@ -31980,7 +31967,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             elif engine == "SMART":
                 tech = await openai_direct_signal(sym, interval, closed, market)
                 direction = tech.get("direction", "NEUTRO") if tech.get("available") and tech.get("confirmed") else "NEUTRO"
-                engine_label = "CHATGPT ANALISTA"
+                engine_label = "MOTOR REMOVIDO"
                 if not tech.get("available"):
                     status_text = "CHATGPT • INDISPONÍVEL"
                 elif direction != "NEUTRO":
@@ -32070,18 +32057,18 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                     status_text = ("STREAK REVERSAL • OPORTUNIDADE ENCONTRADA"
                                    if direction in ("CALL", "PUT") else "STREAK REVERSAL • MONITORANDO • " + why)
             else:
-                # 3.96.89 — sem fallback para IA GRÁFICA.
+                # 3.96.89 — sem fallback para MOTOR REMOVIDO.
                 # Se algum motor válido não tiver ramo específico no radar, ele fica neutro
                 # com o próprio nome em vez de executar um motor antigo por engano.
                 _radar_names = {
-                    "SMART": "CHATGPT ANALISTA",
+                    "SMART": "MOTOR REMOVIDO",
                     "LOCALANALYST": "MEGA BOT",
                     "LOCALANALYSTFLEX": "MEGA BOT FLEX",
                     "MEGAMASTER": "MEGA MASTER",
                     "STREAKREV": "STREAK REVERSAL",
                     "ISMAELTRADER": "ISMAEL TRADER",
                     "ISMAEL98": "ISMAEL 98",
-                    "RSICHANNEL": "MEGA FÚRIA",
+                    "RSICHANNEL": "MOTOR REMOVIDO",
     "RSICHANNEL2": "MEMORY FUSION",
                     "MINSCALPER": "1 MINUTE SCALPER",
                 }
@@ -33274,7 +33261,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   <style>
-    /* 3.97.11 — painel de motores enxuto: MEGA FÚRIA + MEMORY FUSION visíveis */
+    /* 3.97.11 — painel de motores enxuto: MOTOR REMOVIDO + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
     #scalperProModeCard,#scalpingAsiaModeCard{display:flex !important}
   </style>
@@ -34441,7 +34428,7 @@ try{
    'mega_utbot_power','mega_one_minute_rsi_power']
    .forEach(k=>localStorage.setItem(k,'OFFLINE'));
 }catch(_){}
-// MEGA IA 3.96.53 — migração única: nesta atualização o CHATGPT ANALISTA
+// MEGA IA 3.96.53 — migração única: nesta atualização o MOTOR REMOVIDO
 // vira o motor ativo na primeira abertura. Depois disso, a escolha do usuário volta
 // a ser respeitada normalmente pelo localStorage.
 try{
@@ -34458,7 +34445,7 @@ try{
   }
 }catch(_){}
 
-// MEGA IA 3.96.86 — sete motores: CHATGPT ANALISTA, MEGA BOT, MEGA BOT FLEX, MEGA MASTER e STREAK REVERSAL.
+// MEGA IA 3.96.86 — sete motores: MOTOR REMOVIDO, MEGA BOT, MEGA BOT FLEX, MEGA MASTER e STREAK REVERSAL.
 // Indicadores retirados continuam forçados OFF, inclusive estados antigos do celular.
 robotEnabled=false; wprAdaptiveEnabled=false; tingaTingaEnabled=false; superNovaEnabled=false;
 elcodexEnabled=false; shkHaEnabled=false; sessionBreakoutEnabled=false;
@@ -34593,110 +34580,47 @@ if(localAnalystEnabled){
   }catch(_){}
 }
 
-// Se nenhum motor válido ficou ONLINE, nesta versão o fallback é CHATGPT ANALISTA.
-monsterSmcEnabled=false; tsiEnabled=false; figuresEnabled=false; vasilyEnabled=false; platinumEnabled=false;
-streakRevEnabled=false; try{localStorage.setItem('mega_streak_rev_power','OFFLINE')}catch(_){}
-if(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled) {ismaelTraderEnabled=false;rsiChannelsEnabled=false;minScalperEnabled=false;}
-if(minScalperEnabled){aiEnabled=false;localAnalystEnabled=false;localAnalystFlexEnabled=false;megaMasterEnabled=false;ismaelTraderEnabled=false;rsiChannelsEnabled=false;}
-if(!(aiEnabled||localAnalystEnabled||localAnalystFlexEnabled||megaMasterEnabled||ismaelTraderEnabled||rsiChannelsEnabled||rsiChannels2Enabled||minScalperEnabled||momentumEnabled)) aiEnabled=true;
-
-
-// 3.97.11 — modo exclusivo RSI CHANNELS. Outros motores ficam desligados e não podem assumir fallback.
+// 3.97.43 — LIMPEZA FINAL: nenhum motor legado pode assumir fallback.
+// Somente SCALPER PRO e SCALPER FLEX permanecem selecionáveis.
+aiEnabled=false; localAnalystEnabled=false; localAnalystFlexEnabled=false; megaMasterEnabled=false;
+ismaelTraderEnabled=false; ismael98Enabled=false; rsiChannelsEnabled=false; rsiChannels2Enabled=false;
+minScalperEnabled=false; momentumEnabled=false; rsi4PeriodEnabled=false; rsiCrossEnabled=false; ninjaHftEnabled=false;
+monsterSmcEnabled=false; tsiEnabled=false; figuresEnabled=false; vasilyEnabled=false; platinumEnabled=false; streakRevEnabled=false; robotEnabled=false;
 try{
-  // 3.97.18 — preserva o motor realmente escolhido pelo usuário.
-  // SUPPLY DEMAND (RSICHANNEL2) não pode cair no fallback CHATGPT/SMART ao recarregar.
-  const savedSupply=(localStorage.getItem('mega_rsi_channels2_power')==='ONLINE');
-  const savedFuria=(localStorage.getItem('mega_rsi_channels_power')==='ONLINE');
-  rsiChannels2Enabled=!!savedSupply;
-  rsiChannelsEnabled=!savedSupply && !!savedFuria;
-  if(!rsiChannels2Enabled && !rsiChannelsEnabled) rsiChannelsEnabled=true;
-  aiEnabled=false; localAnalystEnabled=false; localAnalystFlexEnabled=false; megaMasterEnabled=false;
-  ismaelTraderEnabled=false; ismael98Enabled=false; minScalperEnabled=false; momentumEnabled=false; rsi4PeriodEnabled=false; scalperProEnabled=localStorage.getItem('mega_scalper_pro_power')==='ONLINE'; scalpingAsiaEnabled=localStorage.getItem('mega_scalping_asia_power')==='ONLINE';
-  localStorage.setItem('mega_rsi_channels_power',rsiChannelsEnabled?'ONLINE':'OFFLINE');
-  localStorage.setItem('mega_rsi_channels2_power',rsiChannels2Enabled?'ONLINE':'OFFLINE');
-  ['mega_ai_power','mega_local_analyst_power','mega_local_analyst_flex_power','mega_master_power','mega_ismael_trader_power','mega_ismael98_power','mega_min_scalper_power','mega_momentum_power','mega_rsi4period_power'].forEach(k=>localStorage.setItem(k,'OFFLINE'));
+  ['mega_ai_power','mega_local_analyst_power','mega_local_analyst_flex_power','mega_master_power',
+   'mega_ismael_trader_power','mega_ismael98_power','mega_rsi_channels_power','mega_rsi_channels2_power',
+   'mega_min_scalper_power','mega_momentum_power','mega_rsi4period_power','mega_rsi_cross_power','mega_ninja_hft_power',
+   'mega_streak_rev_power','mega_robot_power'].forEach(k=>localStorage.setItem(k,'OFFLINE'));
 }catch(_){}
+scalperProEnabled=localStorage.getItem('mega_scalper_pro_power')==='ONLINE';
+scalpingAsiaEnabled=localStorage.getItem('mega_scalping_asia_power')==='ONLINE';
 
 function selectedRobotEngine(){
-  // 3.97.41: cinco motores antigos + ChatGPT/IA Gráfica removidos.
-
   if(scalperProEnabled) return 'SCALPERPRO';
   if(scalpingAsiaEnabled) return 'SCALPINGASIA';
-  if(ninjaHftEnabled) return 'NINJAHFT';
-  if(rsiCrossEnabled) return 'RSICROSS';
-  if(rsi4PeriodEnabled) return 'RSI4PERIOD';
-  if(minScalperEnabled) return 'MINSCALPER';
-  if(momentumEnabled) return 'MOMENTUM';
-  if(rsiChannels2Enabled) return 'RSICHANNEL2';
-  if(rsiChannelsEnabled) return 'RSICHANNEL';
-  if(ismael98Enabled) return 'ISMAEL98';
-  if(ismaelTraderEnabled) return 'ISMAELTRADER';
-  if(megaMasterEnabled) return 'MEGAMASTER';
-  if(localAnalystFlexEnabled) return 'LOCALANALYSTFLEX';
-  if(localAnalystEnabled) return 'LOCALANALYST';
-  if(aiEnabled) return 'SMART';
   return 'OFF';
 }
 
 function adoptBackgroundEngineState(d){
   if(!d || !d.server_side) return;
-  if(typeof d.telegram_enabled==='boolean'){
-    telegramEnabled=!!d.telegram_enabled;
-    try{localStorage.setItem(TELEGRAM_ENABLED_KEY,telegramEnabled?'1':'0');}catch(_){}
-    if(typeof paintTelegramSettings==='function') paintTelegramSettings();
-  }
+  if(typeof d.telegram_enabled==='boolean'){ telegramEnabled=!!d.telegram_enabled; }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(e!=='SMART' && e!=='LOCALANALYST' && e!=='LOCALANALYSTFLEX' && e!=='MEGAMASTER' && e!=='ISMAELTRADER' && e!=='ISMAEL98' && e!=='RSICHANNEL' && e!=='RSICHANNEL2' && e!=='MINSCALPER' && e!=='MOMENTUM' && e!=='RSICROSS' && e!=='NINJAHFT' && e!=='SCALPINGASIA' && e!=='SCALPERPRO') return;
-  aiEnabled=(e==='SMART');
-  localAnalystEnabled=(e==='LOCALANALYST');
-  localAnalystFlexEnabled=(e==='LOCALANALYSTFLEX');
-  megaMasterEnabled=(e==='MEGAMASTER');
-  monsterSmcEnabled=(e==='MONSTERSMC');
-  tsiEnabled=(e==='TSI');
-  momentumEnabled=(e==='MOMENTUM');
-  figuresEnabled=(e==='FIGURES');
-  vasilyEnabled=(e==='VASILY');
-  platinumEnabled=(e==='PLATINUM');
-  rsiCrossEnabled=(e==='RSICROSS');
-  streakRevEnabled=false;
-  ismaelTraderEnabled=(e==='ISMAELTRADER');
-  ismael98Enabled=(e==='ISMAEL98');
-  rsiChannelsEnabled=(e==='RSICHANNEL');
-  rsiChannels2Enabled=(e==='RSICHANNEL2');
-  minScalperEnabled=(e==='MINSCALPER');
-  ninjaHftEnabled=(e==='NINJAHFT');
+  if(e!=='SCALPERPRO' && e!=='SCALPINGASIA') return;
   scalperProEnabled=(e==='SCALPERPRO');
   scalpingAsiaEnabled=(e==='SCALPINGASIA');
-  robotEnabled=false; wprAdaptiveEnabled=false; tingaTingaEnabled=false; superNovaEnabled=false;
-  elcodexEnabled=false; shkHaEnabled=false; sessionBreakoutEnabled=false;
   try{
-    localStorage.setItem('mega_streak_rev_power',streakRevEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_ismael_trader_power',ismaelTraderEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_rsi_channels_power',rsiChannelsEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_rsi_channels2_power',rsiChannels2Enabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_min_scalper_power',minScalperEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_ai_power',aiEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_local_analyst_power',localAnalystEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_local_analyst_flex_power',localAnalystFlexEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_master_power',megaMasterEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_monster_smc_power',monsterSmcEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_tsi_power',tsiEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_momentum_power',momentumEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_figures_power',figuresEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_vasily_power',vasilyEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_platinum_power',platinumEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_rsi_xover_power','OFFLINE');
-    ['mega_robot_power','mega_wpr_adaptive_power','mega_tinga_tinga_power','mega_super_nova_power','mega_elcodex_power','mega_shk_ha_power','mega_session_breakout_power']
-      .forEach(k=>localStorage.setItem(k,'OFFLINE'));
+    localStorage.setItem('mega_scalper_pro_power',scalperProEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_scalping_asia_power',scalpingAsiaEnabled?'ONLINE':'OFFLINE');
   }catch(_){}
   if(typeof applyRobotPowerState==='function') applyRobotPowerState();
   if(typeof scheduleBacktest48==='function') scheduleBacktest48(false,250);
 }
 
 function backtest48Name(e){
-  return ({LOCALANALYST:'MEGA BOT',LOCALANALYSTFLEX:'MEGA BOT FLEX',MEGAMASTER:'MEGA MASTER',ISMAELTRADER:'ISMAEL TRADER',ISMAEL98:'ISMAEL 98',RSICHANNEL:'MEGA FÚRIA',RSICHANNEL2:'MEMORY FUSION',MINSCALPER:'1 MINUTE SCALPER',MOMENTUM:'MOMENTUM CHART',RSI4PERIOD:'4 PERIOD RSI PRO',SCALPINGASIA:'🌏 SCALPER FLEX',SCALPERPRO:'SCALPER PRO'})[e]||e||'SEM MOTOR';
+  return ({SCALPINGASIA:'🌏 SCALPER FLEX',SCALPERPRO:'SCALPER PRO'})[e]||'SEM MOTOR';
 }
+
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
 function scheduleBacktest48(force=false,delay=260){
   if(backtest48Timer) clearTimeout(backtest48Timer);
@@ -35965,7 +35889,7 @@ let momentStudyUpdatedAt=0;
 
 function momentStudyEngineName(key){
   const names={
-    GRAPH_AI:'🧠 IA GRÁFICA',
+    GRAPH_AI:'🧠 MOTOR REMOVIDO',
     
     LOCALANALYST:'🤖 MEGA BOT',
     LOCALANALYSTFLEX:'🤖 MEGA BOT FLEX',
@@ -36122,14 +36046,14 @@ function currentScoreEngineKey(item){
   if(normalized==='MEGAMASTER' || raw==='MEGAMASTER' || strategy.includes('MEGA MASTER')) return 'MEGAMASTER';
   if(normalized==='LOCALANALYSTFLEX' || raw==='LOCALANALYSTFLEX') return 'LOCALANALYSTFLEX';
   if(normalized==='LOCALANALYST' || raw==='LOCALANALYST') return 'LOCALANALYST';
-  if(normalized==='SMART' || raw==='SMART' || strategy.includes('CHATGPT ANALISTA')) return 'SMART';
+  if(normalized==='SMART' || raw==='SMART' || strategy.includes('MOTOR REMOVIDO')) return 'SMART';
   // Não transforma o MEGABOT legado no MEGA BOT atual: são motores diferentes.
   return 'OTHER';
 }
 
 function engineScoreSnapshot(bucket){
   const stats={
-    SMART:{key:'SMART',name:'💬 CHATGPT ANALISTA',wins:0,losses:0},
+    SMART:{key:'SMART',name:'💬 MOTOR REMOVIDO',wins:0,losses:0},
     LOCALANALYST:{key:'LOCALANALYST',name:'🤖 MEGA BOT',wins:0,losses:0},
     LOCALANALYSTFLEX:{key:'LOCALANALYSTFLEX',name:'🤖 MEGA BOT FLEX',wins:0,losses:0},
     MEGAMASTER:{key:'MEGAMASTER',name:'🧠 MEGA MASTER',wins:0,losses:0},
@@ -38517,7 +38441,7 @@ function applyRobotPowerState(){
   if(rsiEaPowerBtn){ rsiEaPowerBtn.textContent=rsiCrossEnabled?'🟢 ONLINE':'🔴 OFFLINE'; rsiEaPowerBtn.style.background=rsiCrossEnabled?'#0b7a3d':'#7d1d1d'; rsiEaPowerBtn.style.color='#fff'; rsiEaPowerBtn.style.borderColor=rsiCrossEnabled?'#16c56b':'#ff5252'; }
   if(rsiEaModeDesc) rsiEaModeDesc.textContent=rsiCrossEnabled?'ONLINE: RSI EA MTF • EMA13/30 M15 + RSI13 M5 + MACD M30 • próxima M1 • expira M1 • sem Gale.':'OFFLINE: RSI EA MTF pausado.';
   if(rsiChannelsPowerBtn){ rsiChannelsPowerBtn.textContent=rsiChannelsEnabled?'🟢 ONLINE':'🔴 OFFLINE'; rsiChannelsPowerBtn.style.background=rsiChannelsEnabled?'#0b7a3d':'#7d1d1d'; rsiChannelsPowerBtn.style.color='#fff'; rsiChannelsPowerBtn.style.borderColor=rsiChannelsEnabled?'#16c56b':'#ff5252'; }
-  if(rsiChannelsModeDesc) rsiChannelsModeDesc.textContent=rsiChannelsEnabled?'ONLINE: MEGA FÚRIA • RSI4 + canais • leitura M5 • próxima M1 • expira M1 • sem Gale.':'OFFLINE: Mega Fúria pausado.';
+  if(rsiChannelsModeDesc) rsiChannelsModeDesc.textContent=rsiChannelsEnabled?'ONLINE: MOTOR REMOVIDO • RSI4 + canais • leitura M5 • próxima M1 • expira M1 • sem Gale.':'OFFLINE: Mega Fúria pausado.';
   if(rsiChannels2PowerBtn){ rsiChannels2PowerBtn.textContent=rsiChannels2Enabled?'🟢 ONLINE':'🔴 OFFLINE'; rsiChannels2PowerBtn.style.background=rsiChannels2Enabled?'#0b7a3d':'#7d1d1d'; rsiChannels2PowerBtn.style.color='#fff'; rsiChannels2PowerBtn.style.borderColor=rsiChannels2Enabled?'#16c56b':'#ff5252'; }
   if(rsiChannels2ModeDesc) rsiChannels2ModeDesc.textContent=rsiChannels2Enabled?'ONLINE: SUPPLY DEMAND • [ORT] v3 • zonas confirmadas • CALL demanda / PUT oferta • expira M1 • sem Gale.':'OFFLINE: Supply Demand pausado.';
   if(scalperProPowerBtn){ scalperProPowerBtn.textContent=scalperProEnabled?'🟢 ONLINE':'🔴 OFFLINE'; scalperProPowerBtn.style.background=scalperProEnabled?'#0b7a3d':'#7d1d1d'; scalperProPowerBtn.style.color='#fff'; scalperProPowerBtn.style.borderColor=scalperProEnabled?'#16c56b':'#ff5252'; }
@@ -39168,7 +39092,7 @@ function applyRobotPowerState(){
     rad();
     loadPreSignals();
   }else if(engine==='RSICHANNEL'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MEGA FÚRIA ONLINE • LEITURA M5 • PRÓXIMA M1 • EXPIRA M1 • RSI4 + CANAIS';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTOR REMOVIDO ONLINE • LEITURA M5 • PRÓXIMA M1 • EXPIRA M1 • RSI4 + CANAIS';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">📡 RSI Channels • monitora RSI4 + canais dinâmicos e libera cruzamento/reentrada FLEX nos 20s finais para a próxima vela.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar RSI Channels ativo • procurando reentrada nos canais e preparando a janela de 20s</div>';
     rad();
@@ -39200,7 +39124,7 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar Mega Bot ativo • procurando confluência multi-camada CALL/PUT</div>';
     rad();
   }else if(engine==='SMART'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='CHATGPT ANALISTA ONLINE • MODO PRECISÃO • CALL / PUT / NEUTRO • PRÓXIMA VELA';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTOR REMOVIDO ONLINE • MODO PRECISÃO • CALL / PUT / NEUTRO • PRÓXIMA VELA';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">💬 ChatGPT Analista selecionado • indicadores locais são contexto; a decisão oficial vem do ChatGPT.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar ChatGPT ativo • analisando candles e procurando CALL/PUT para a próxima vela</div>';
     rad();
@@ -39210,13 +39134,13 @@ function applyRobotPowerState(){
     if(radar) radar.innerHTML='<div>📡 Radar 4 Period RSI Pro ativo • aguardando confirmação M5 dos RSIs MTF</div>';
     rad();
   }else if(engine==='GRAPH_AI'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='IA GRÁFICA ONLINE • PADRÕES + H1 + DOW H4 + LTA/LTB';
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTOR REMOVIDO ONLINE • PADRÕES + H1 + DOW H4 + LTA/LTB';
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Gráfica selecionada.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar da IA Gráfica ativo • procurando oportunidades</div>';
     rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ CHATGPT ANALISTA, MEGA BOT, MEGA BOT FLEX, MEGA MASTER e STREAK REVERSAL estão offline.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ Nenhum Scalper está online. Ative SCALPER PRO ou SCALPER FLEX.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -39711,7 +39635,7 @@ async function setRsiChannels2Power(enabled){
   try{localStorage.setItem('mega_rsi_channels2_power',rsiChannels2Enabled?'ONLINE':'OFFLINE');}catch(_){}
   resetEngineVisualState(); applyRobotPowerState();
   // 3.97.20 — atualiza o Backtest 48H imediatamente ao ligar/desligar SUPPLY DEMAND.
-  // Antes, o card podia continuar exibindo o resultado N/D do CHATGPT ANALISTA
+  // Antes, o card podia continuar exibindo o resultado N/D do MOTOR REMOVIDO
   // carregado antes da troca do motor, apesar de RSICHANNEL2 já estar ONLINE.
   scheduleBacktest48(true,80);
   await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'RSICHANNEL2'});
@@ -41325,7 +41249,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SCALPERPRO'?'SCALPER PRO':ek==='SCALPINGASIA'?'🌏 SCALPER FLEX':ek==='MINSCALPER'?'M-SNIPER':ek==='RSICHANNEL2'?'MEMORY FUSION':ek==='RSICHANNEL'?'MEGA FÚRIA':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI EA MTF':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'CHATGPT ANALISTA':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'SEM MOTOR'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='SCALPERPRO'?'SCALPER PRO':ek==='SCALPINGASIA'?'🌏 SCALPER FLEX':ek==='MINSCALPER'?'M-SNIPER':ek==='RSICHANNEL2'?'MEMORY FUSION':ek==='RSICHANNEL'?'MOTOR REMOVIDO':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI EA MTF':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'MOTOR REMOVIDO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'SEM MOTOR'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
   }finally{
     radarAutoBusy=false;
