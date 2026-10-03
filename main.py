@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.80"
+APP_VERSION = "3.97.81"
+# MEGA IA 3.97.81 — IQ Option: fechamento completo do socket antigo + validação de estabilidade do WebSocket antes de aceitar login/reconexão; reduz loops NoneType/sock e reconexões fantasma.
 # MEGA IA 3.97.80 — IQ Option: reconexão persistente; falhas transitórias não invalidam login e /otc-status tenta recuperar o WebSocket automaticamente.
 # MEGA IA 3.97.79 — painel: preserva CALL/PUT já promovido pelo radar até expiry_time; polling NEUTRO não apaga o sinal no mesmo segundo.
 # MEGA IA 3.97.78 — corrige PREDATOR PIPS no fluxo direto do painel e destrava PYRAMID 7 PRO: Bollinger 20/2 volta a ser o gatilho nativo; ATR/EMA ficam diagnósticos.
@@ -3477,13 +3478,26 @@ def _iq_close_state(state: Dict[str, Any] | None):
     if client is None:
         return
 
-    try:
-        api = getattr(client, "api", None)
-        close = getattr(api, "close", None)
-        if callable(close):
-            close()
-    except Exception:
-        pass
+    # Fecha todas as camadas conhecidas da iqoptionapi. Alguns forks deixam o
+    # WebSocket antigo vivo quando apenas api.close() e chamado; isso gera
+    # callbacks tardios com api.websocket=None e o erro "NoneType ... sock".
+    for target in (client, getattr(client, "api", None)):
+        if target is None:
+            continue
+        try:
+            close = getattr(target, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+        try:
+            ws = getattr(target, "websocket", None)
+            if ws is not None:
+                ws_close = getattr(ws, "close", None)
+                if callable(ws_close):
+                    ws_close()
+        except Exception:
+            pass
 
 
 def _cleanup_iq_sessions():
@@ -8145,10 +8159,20 @@ def _iq_abort_client(client):
     if client is None:
         return
     try:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
+    try:
         api = getattr(client, "api", None)
         close = getattr(api, "close", None)
         if callable(close):
             close()
+        ws = getattr(api, "websocket", None)
+        ws_close = getattr(ws, "close", None) if ws is not None else None
+        if callable(ws_close):
+            ws_close()
     except Exception:
         pass
 
@@ -8216,8 +8240,12 @@ def _iq_connect_fresh(email: str, password: str):
         _iq_abort_client(client)
         raise RuntimeError(_iq_reason_to_message(reason))
 
-    # Alguns forks retornam do connect() antes de check_connect refletir o estado.
-    deadline = time.monotonic() + 6.0
+    # Alguns forks retornam do connect() antes de o WebSocket estar realmente
+    # estabilizado. Nao basta ver check_connect=True uma unica vez: no problema
+    # observado ele conecta, recebe 401/fecha logo depois e o app aceita uma
+    # sessao fantasma. Exigimos uma pequena janela continua de estabilidade.
+    deadline = time.monotonic() + 8.0
+    stable_since = None
     connected = False
     while time.monotonic() < deadline:
         try:
@@ -8225,12 +8253,18 @@ def _iq_connect_fresh(email: str, password: str):
         except Exception:
             connected = False
         if connected:
-            break
+            if stable_since is None:
+                stable_since = time.monotonic()
+            if time.monotonic() - stable_since >= 2.0:
+                break
+        else:
+            stable_since = None
         time.sleep(0.20)
 
-    if not connected:
+    stable = bool(connected and stable_since is not None and time.monotonic() - stable_since >= 2.0)
+    if not stable:
         _iq_abort_client(client)
-        raise RuntimeError("A IQ Option autenticou, mas o WebSocket não permaneceu conectado.")
+        raise RuntimeError("A IQ Option abriu o WebSocket, mas ele caiu antes de estabilizar. Reconexao descartada para evitar loop de socket/401.")
 
     print("[IQ CONNECTOR] IQ Option conectada; sessão interna ativa", flush=True)
     return client
