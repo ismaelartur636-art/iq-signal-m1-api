@@ -44,6 +44,7 @@ from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
 APP_VERSION = "3.97.76"
 # MEGA IA 3.97.76 — sincroniza motor visível/backend: exclusividade central dos 7 motores + resposta do servidor autoritativa no clique.
+# MEGA IA 3.97.77 — radar→painel: oportunidade fresca do mesmo motor não é perdida ao trocar o ativo; se /signal-ai voltar NEUTRO no polling seguinte, promove o snapshot causal do radar para a próxima M1.
 # MEGA IA 3.97.75 — destrava motores EA recentes: MASYUK/PYRAMID/PREDATOR usam somente a regra nativa (sem adaptive gate) e SCALPER/DRAGON/MASYUK/PYRAMID/PREDATOR não perdem sinal por polling após 10s.
 # MEGA IA 3.97.68 — cTrader Trendbars: remove campo count incompatível do ProtoOAGetTrendbarsReq; usa fromTimestamp/toTimestamp + period + symbolId e recorta localmente. Corrige cTrader conectado com candles indisponíveis e queda indevida para Binance.
 # MEGA IA 3.97.69 — radar: fila avança sem congelar 10s e prioriza cripto 24/7 no fim de semana.
@@ -42047,6 +42048,49 @@ async function sendRadarOpportunityToRobot(items){
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
     if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='PREDATORPIPS'?'🐆 PREDATOR PIPS':ek==='PYRAMID7'?'🔺 PYRAMID 7 PRO':ek==='MASYUK'?'⚡ MASYUK V3':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='DRAGONFIREPRO'?'🔥 DRAGON FIRE PRO':ek==='DRAGONFIRE'?'🔥 DRAGON FIRE':ek==='SCALPERPRO'?'SCALPER PRO':ek==='SCALPINGASIA'?'🌏 SCALPER FLEX':ek==='MINSCALPER'?'M-SNIPER':ek==='RSICHANNEL2'?'MEMORY FUSION':ek==='RSICHANNEL'?'MOTOR REMOVIDO':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI EA MTF':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'MOTOR REMOVIDO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'SEM MOTOR'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
+
+    // 3.97.77 — O radar e o painel usam o mesmo motor, mas a segunda consulta
+    // de /signal-ai pode chegar alguns ms depois da virada e devolver NEUTRO.
+    // Nesse caso não apagamos uma oportunidade FRESCA que o próprio radar acabou
+    // de confirmar. Promovemos o snapshot do radar para a próxima abertura M1.
+    const afterDir=String((cur&&cur.direction)||'NEUTRO').toUpperCase();
+    if(afterDir==='NEUTRO' && radarOpportunityIsFresh(best) && selectedRobotEngine()!=='OFF'){
+      const stepMs=intervalSecondsValue((interval&&interval.value)||'1min')*1000;
+      const nowMs=Date.now();
+      const entryMs=Math.ceil(nowMs/stepMs)*stepMs;
+      const expiryMs=entryMs+stepMs;
+      cur={
+        source:'RADAR_CONFIRMED_PROMOTED',
+        selected_engine:selectedRobotEngine(),
+        engine:selectedRobotEngine(),
+        strategy:String(best.strategy||selectedRobotEngine()),
+        symbol:sym, interval:String((interval&&interval.value)||'1min'),
+        requested_market:'OPEN', market:'OPEN', direction:dir,
+        confidence:Number(best.confidence||0), confirmed:true,
+        entry_time:new Date(entryMs).toISOString(),
+        announce_time:String(best.updated_at||new Date().toISOString()),
+        expiry_time:new Date(expiryMs).toISOString(),
+        entry_mode:'BIRTH', risk:'MEDIUM',
+        status:String(best.status||'OPORTUNIDADE ENCONTRADA')+' • SINAL ENVIADO AO PAINEL',
+        reason:'Oportunidade fresca confirmada pelo radar do mesmo motor; snapshot preservado até a expiração.',
+        feed_source:String(best.feed_source||'MULTIFEED'),
+        feed_label:String(best.feed_source||'MULTIFEED').replaceAll('_',' '),
+        feed_fallback:best.feed_fallback===true,
+        promoted_from_radar:true
+      };
+      direction.textContent=dir;
+      direction.className='big '+(dir==='CALL'?'call':'put');
+      paintSignalAsset(sym);
+      confidence.textContent='Confiança: '+Number(cur.confidence||0).toFixed(0)+'%';
+      entry.textContent=ft(cur.entry_time);
+      countdown.textContent='Preparando entrada';
+      statusBox.textContent=cur.status;
+      risk.textContent='Risco: '+cur.risk;
+      if(dataFeedText) dataFeedText.textContent=cur.feed_label+(cur.feed_fallback?' • FALLBACK ATIVO':'');
+      rememberPendingTrade(cur);
+      maybeSendTelegramSignal(cur);
+      lastCountdownSignalKey=''; thirtyFive=false; five=false; entered=false;
+    }
   }finally{
     radarAutoBusy=false;
   }
