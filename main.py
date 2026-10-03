@@ -42,7 +42,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.84"
+APP_VERSION = "3.97.85"
+# MEGA IA 3.97.85 — adiciona BTC Binance e Bitcoin IQ Option como fontes separadas no seletor cripto; IQ usa candles regulares autenticados.
+# MEGA IA 3.97.84 — seletor rápido de criptos exibe somente o nome da moeda (Bitcoin, Ethereum etc.); internamente mantém pares /USD para obter cotação e candles.
 # MEGA IA 3.97.83 — adiciona BTC como opção separada no painel; usa o mesmo mercado BTC/USD internamente sem remover nenhum ativo.
 # MEGA IA 3.97.81 — IQ Option: fechamento completo do socket antigo + validação de estabilidade do WebSocket antes de aceitar login/reconexão; reduz loops NoneType/sock e reconexões fantasma.
 # MEGA IA 3.97.82 — painel: impede repetição acumulativa de “MANTIDO ATÉ A EXPIRAÇÃO” a cada polling; sinal continua preservado uma única vez até expirar.
@@ -1607,16 +1609,16 @@ SELECTABLE_ENGINES_ENABLED = True
 INTERVALS = {"1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1h": 3600, "4h": 14400}
 SYMBOLS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF",
-    "NZD/USD", "EUR/JPY", "GBP/JPY", "EUR/GBP", "BTC/USD", "BTC", "ETH/USD", "LTC/USD",
+    "NZD/USD", "EUR/JPY", "GBP/JPY", "EUR/GBP", "BTC/USD", "BTC", "BTC_IQ", "ETH/USD", "LTC/USD",
     "SOL/USD", "XRP/USD", "DOGE/USD", "ADA/USD", "BNB/USD",
     BINOMO_CRYPTO_IDX_SYMBOL,
 ]
-OTC_SYMBOLS = [s for s in SYMBOLS if s not in (BINOMO_CRYPTO_IDX_SYMBOL, "BTC")]
+OTC_SYMBOLS = [s for s in SYMBOLS if s not in (BINOMO_CRYPTO_IDX_SYMBOL, "BTC", "BTC_IQ")]
 
 def _market_data_symbol(symbol: str) -> str:
     """BTC é um alias visual separado; a cotação/execução usa o mercado BTC/USD."""
     value = str(symbol or "").strip().upper()
-    return "BTC/USD" if value == "BTC" else value
+    return "BTC/USD" if value in ("BTC", "BTC_IQ") else value
 
 # MEGA IA 3.96.1 — universo exclusivo da RTM.
 # A RTM só pode operar BTC/USD ou pares cujo nome contenha JPY.
@@ -8027,6 +8029,7 @@ def iq_active_candidates(symbol: str):
 
 def iq_regular_active_candidates(symbol: str):
     """Candidatos do mercado normal da IQ Option para espelhar o gráfico."""
+    symbol = _market_data_symbol(symbol)
     base = symbol.replace("/", "").upper()
     return list(dict.fromkeys([
         base,
@@ -8604,6 +8607,21 @@ async def candles(
         raise HTTPException(400, "Ativo ou intervalo inválido.")
     if symbol == BINOMO_CRYPTO_IDX_SYMBOL and market != "OPEN":
         raise HTTPException(400, "Crypto IDX usa somente o feed da Binomo no modo Mercado Aberto do app.")
+
+    # BTC_IQ é uma fonte explícita: Bitcoin Binárias da IQ Option no mercado regular.
+    # Mantemos separado do BTC/USD público para o usuário poder escolher a origem do gráfico/sinal.
+    if market == "OPEN" and str(symbol).upper() == "BTC_IQ":
+        if iq_state is None and request is not None:
+            iq_state = _iq_session_state(request, required=False)
+        if iq_state is None:
+            raise HTTPException(401, "Conecte a IQ Option para usar Bitcoin • IQ Option.")
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(iq_candles_blocking, iq_state, "BTC/USD", interval, max(80, int(n)), True),
+                timeout=IQ_CANDLE_TIMEOUT + 5,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(504, "A IQ Option demorou demais para responder aos candles do Bitcoin.")
 
     # MEGA IA 3.13: mercado OPEN é independente do login da IQ Option e usa
     # o roteador multifuente (Binance/Twelve Data/Yahoo conforme o ativo e disponibilidade).
@@ -28792,6 +28810,8 @@ async def _scalper_pro_candles(symbol: str, interval: str, n: int, market: str =
     """
     market = str(market or "OPEN").upper()
     n = max(20, min(int(n), 500))
+    if market == "OPEN" and str(symbol).upper() == "BTC_IQ":
+        return await candles(symbol, interval, n, market, iq_state, request=request)
     if market == "OPEN" and symbol in BINANCE_SYMBOLS:
         rows = await _binance_public_candles(symbol, interval, n)
         rows = _tag_feed_rows(rows, "BINANCE_PUBLIC", BINANCE_SYMBOLS.get(symbol))
@@ -33738,14 +33758,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
     <select id="cryptoQuickSelect" title="Escolha rápida de criptomoeda" style="font-weight:1000">
       <option value="">🪙 ESCOLHER CRIPTO</option>
-      <option value="BTC/USD">₿ Bitcoin • BTC/USD</option>
-      <option value="ETH/USD">◆ Ethereum • ETH/USD</option>
-      <option value="LTC/USD">Ł Litecoin • LTC/USD</option>
-      <option value="SOL/USD">◎ Solana • SOL/USD</option>
-      <option value="XRP/USD">✕ XRP • XRP/USD</option>
-      <option value="DOGE/USD">Ð Dogecoin • DOGE/USD</option>
-      <option value="ADA/USD">₳ Cardano • ADA/USD</option>
-      <option value="BNB/USD">◈ BNB • BNB/USD</option>
+      <option value="BTC/USD">₿ Bitcoin • Binance</option>
+      <option value="BTC_IQ">₿ Bitcoin • IQ Option</option>
+      <option value="ETH/USD">◆ Ethereum</option>
+      <option value="LTC/USD">Ł Litecoin</option>
+      <option value="SOL/USD">◎ Solana</option>
+      <option value="XRP/USD">✕ XRP</option>
+      <option value="DOGE/USD">Ð Dogecoin</option>
+      <option value="ADA/USD">₳ Cardano</option>
+      <option value="BNB/USD">◈ BNB</option>
     </select>
     <button id="btcOnlyBtn" type="button" style="display:none">₿ SÓ BTC/USD • OFF</button>
     <div id="btcOnlyNote" class="label" style="display:none;grid-column:1/-1">Modo BTC/USD ativo • painel, gráfico, pré-alerta e radar focados somente neste ativo.</div>
@@ -35747,7 +35768,7 @@ try{
 
 const syms=[
   'EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF',
-  'NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD','SOL/USD','XRP/USD','DOGE/USD','ADA/USD','BNB/USD','CRYPTO IDX'
+  'NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','BTC_IQ','ETH/USD','LTC/USD','SOL/USD','XRP/USD','DOGE/USD','ADA/USD','BNB/USD','CRYPTO IDX'
 ];
 const rtmSeedSyms=['BTC/USD','USD/JPY','EUR/JPY','GBP/JPY','AUD/JPY','CAD/JPY','CHF/JPY','NZD/JPY'];
 
@@ -35767,7 +35788,8 @@ if(cryptoQuickSelect){
     try{localStorage.setItem('mega_symbol',chosen);}catch(_){}
     S.dispatchEvent(new Event('change'));
     cur=null; lastSignalVoice=''; lastRadarAutoKey='';
-    if(statusBox) statusBox.textContent='🪙 '+chosen+' selecionado • analisando mercado';
+    const cryptoNames={'BTC/USD':'Bitcoin • Binance','BTC_IQ':'Bitcoin • IQ Option','ETH/USD':'Ethereum','LTC/USD':'Litecoin','SOL/USD':'Solana','XRP/USD':'XRP','DOGE/USD':'Dogecoin','ADA/USD':'Cardano','BNB/USD':'BNB'};
+    if(statusBox) statusBox.textContent='🪙 '+(cryptoNames[chosen]||chosen)+' selecionado • analisando mercado';
     if(appEnabled) await Promise.allSettled([sig(false),rad()]);
   });
 }
@@ -37213,11 +37235,14 @@ function fillSymbols(){
   }
 
   visibleSymbols.forEach(x=>{
-    if(isOtc && x==='CRYPTO IDX') return;
+    if(isOtc && (x==='CRYPTO IDX' || x==='BTC_IQ')) return;
     let extra=suffix;
+    let label=x;
+    if(!isOtc && x==='BTC/USD') label='Bitcoin • Binance';
+    if(!isOtc && x==='BTC_IQ') label='Bitcoin • IQ Option';
     if(!isOtc && x==='CRYPTO IDX') extra=' • BINOMO';
     else if(!isOtc && ctSet.has(String(x).toUpperCase())) extra=' • cTrader';
-    S.add(new Option(x+extra,x));
+    S.add(new Option(label+extra,x));
   });
 
   if(btcOnlyEnabled && engineNow!=='RTM'){
@@ -38101,7 +38126,7 @@ async function loadChart(){
   // 1) Mercado Aberto = cTrader quando a sessão está conectada e o ativo existe nela.
   // 2) Sem cTrader/ativo compatível, usa o roteador público de fallback.
   // 3) IQ OTC = candles reais OTC da sessão IQ Option.
-  if(iqSelected && !openMode && !iqConnected){
+  if((iqSelected && !openMode && !iqConnected) || ((S&&S.value==='BTC_IQ') && !iqConnected)){
     chartData=[];
     chartPreSignal=null;
     if(chartInfo) chartInfo.textContent='⚪ OTC IQ OPTION OFFLINE • CONECTE NA IQ OPTION';
@@ -38113,7 +38138,8 @@ async function loadChart(){
 
   try{
     // A IQ só espelha o gráfico no OTC. Em OPEN o roteador multifuente escolhe a fonte disponível.
-    const useIqMirror=iqSelected && !openMode && iqConnected;
+    const iqBitcoinSelected=(S && S.value==='BTC_IQ');
+    const useIqMirror=(iqBitcoinSelected && iqConnected) || (iqSelected && !openMode && iqConnected);
     const chartMarket=openMode ? 'OPEN' : market.value;
     const mirrorParam=useIqMirror?'&mirror_iq=true':'';
     const [d,pre]=await Promise.all([
@@ -38174,7 +38200,8 @@ async function loadChart(){
     let chartSourceLabel='MERCADO ABERTO • '+String(d.feed_label||d.feed_source||'MULTIFONTE').replaceAll('_',' ');
     if(openMode && ctraderConnected && String(d.feed_source||'').toUpperCase()!=='CTRADER_OPEN' && S.value!=='CRYPTO IDX')
       chartSourceLabel='⚠️ '+chartSourceLabel+' • cTrader conectada, candles indisponíveis';
-    if(useIqMirror && !openMode) chartSourceLabel='IQ OPTION • OTC';
+    if(useIqMirror && (S&&S.value==='BTC_IQ')) chartSourceLabel='IQ OPTION • BITCOIN';
+    else if(useIqMirror && !openMode) chartSourceLabel='IQ OPTION • OTC';
     else if(!openMode) chartSourceLabel=brokerName()+' • OTC';
 
     chartInfo.textContent=
