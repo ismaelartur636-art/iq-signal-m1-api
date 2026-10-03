@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.62"
-# MEGA IA 3.97.60 — corrige visibilidade do card PYRAMID 7 PRO no painel (CSS allowlist).\n# MEGA IA 3.97.59 — PYRAMID 7 PRO: Bollinger 20/2 breakout + ATR14 + EMA62/200, candle fechado, próxima M1, sem Grid/Pyramid/Average/Martingale/Gale.
+APP_VERSION = "3.97.63"
+# MEGA IA 3.97.63 — PYRAMID 7 PRO: corrige placar direto, migração de LOSS e identificação do motor; 1 operação = 1 resultado.\n# MEGA IA 3.97.60 — corrige visibilidade do card PYRAMID 7 PRO no painel (CSS allowlist).\n# MEGA IA 3.97.59 — PYRAMID 7 PRO: Bollinger 20/2 breakout + ATR14 + EMA62/200, candle fechado, próxima M1, sem Grid/Pyramid/Average/Martingale/Gale.
 # MEGA IA 3.97.58 — MASYUK V3 integrado como motor separado: PSAR 0.02/0.2 + LWMA7, CALL/PUT, próxima M1, sem Grid/Martingale/Gale.
 # MEGA IA 3.97.57 — SCALPER PRO: remove trava genérica pós-abertura que trocava ONLINE por AGUARDANDO PRÓXIMO FECHAMENTO; mantém monitoramento contínuo e pré-alerta próprio de 10s.
 # MEGA IA 3.97.56 — ROBO FIBO reativado como motor separado no painel/background; Fibonacci + RSI14 + EMA60, sem grid/martingale.
@@ -21944,7 +21944,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         engine = "GRAPH_AI"
     if engine in RETIRED_ENGINES:
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "MONSTERSMC", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SESSIONBREAKOUT", "MONSTERSMC"):
+    if engine not in ("GRAPH_AI", "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "MONSTERSMC", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
         engine = "GRAPH_AI"
     if engine == "RTM" and not _rtm_symbol_allowed(symbol):
         out = neutral_signal(
@@ -35802,8 +35802,10 @@ function normalizeResultBucket(x){
   // já contém uma linha por operação e permite corrigir um placar duplicado.
   if(!Object.keys(b.final_ops).length && b.history.length){
     b.history.forEach(h=>{
-      if(h && h.key && ['WIN','WIN G1','WIN G2','LOSS G2'].includes(String(h.result||'').toUpperCase())){
-        b.final_ops[String(h.key)]=String(h.result).toUpperCase();
+      if(h && (h.op_key||h.key) && ['WIN','WIN G1','WIN G2','LOSS','LOSS G2'].includes(String(h.result||'').toUpperCase())){
+        // Resultado direto sem Gale também precisa sobreviver ao reload.
+        // Usa op_key quando disponível para garantir 1 operação = 1 resultado.
+        b.final_ops[String(h.op_key||h.key)]=String(h.result).toUpperCase();
       }
     });
   }
@@ -36561,6 +36563,7 @@ function currentScoreEngineKey(item){
   const raw=String((item&&item.engine)||'').trim().toUpperCase();
   const strategy=String((item&&item.strategy)||'').trim().toUpperCase();
   const normalized=normalizeEngineKey(raw);
+  if(normalized==='PYRAMID7' || raw==='PYRAMID7' || strategy.includes('PYRAMID 7')) return 'PYRAMID7';
   if(normalized==='MINSCALPER' || raw==='MINSCALPER' || strategy.includes('1 MINUTE SCALPER')) return 'MINSCALPER';
   if(normalized==='RSICHANNEL' || raw==='RSICHANNEL' || strategy.includes('RSI CHANNELS')) return 'RSICHANNEL';
   if(normalized==='ISMAEL98' || raw==='ISMAEL98' || strategy.includes('ISMAEL 98')) return 'ISMAEL98';
@@ -36585,6 +36588,7 @@ function engineScoreSnapshot(bucket){
     ISMAEL98:{key:'ISMAEL98',name:'💎 ISMAEL 98',wins:0,losses:0},
     RSICHANNEL:{key:'RSICHANNEL',name:'📈 RSI CHANNELS',wins:0,losses:0},
     MINSCALPER:{key:'MINSCALPER',name:'⚡ 1 MINUTE SCALPER',wins:0,losses:0},
+    PYRAMID7:{key:'PYRAMID7',name:'🔺 PYRAMID 7 PRO',wins:0,losses:0},
     OTHER:{key:'OTHER',name:'🗂️ OUTROS / ANTIGOS',wins:0,losses:0}
   };
   const seen=new Set();
@@ -36610,7 +36614,7 @@ function engineScoreSnapshot(bucket){
 function renderEngineScoreBoard(bucket){
   if(!engineScoreGrid) return;
   const st=engineScoreSnapshot(bucket||emptyResultBucket());
-  const order=['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER'];
+  const order=['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER','PYRAMID7'];
   if(st.OTHER.total>0) order.push('OTHER');
   engineScoreGrid.innerHTML=order.map(k=>{
     const x=st[k];
