@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.66"
+APP_VERSION = "3.97.67"
+# MEGA IA 3.97.67 — cTrader Trendbars: envia count explicitamente em todas as requisições históricas, conforme ProtoOAGetTrendbarsReq.
 # MEGA IA 3.97.66 — cTrader candles: prioriza conta LIVE no catálogo (antes DEMO podia capturar o mesmo símbolo e devolver zero trendbars); mantém M1/cripto na Open API antes do fallback.
 # MEGA IA 3.97.65 — cTrader: reconhece BTCUSD com sufixo da corretora (ex.: BTCUSD.c/BTCUSDm) e mantém cTrader como fonte principal antes do fallback.
 # MEGA IA 3.97.64 — corrige persistência do motor: refresh não converte PYRAMID/PREDATOR/MASYUK/FIBO para SCALPER PRO.\n# MEGA IA 3.97.63 — PYRAMID 7 PRO: corrige placar direto, migração de LOSS e identificação do motor; 1 operação = 1 resultado.\n# MEGA IA 3.97.60 — corrige visibilidade do card PYRAMID 7 PRO no painel (CSS allowlist).\n# MEGA IA 3.97.59 — PYRAMID 7 PRO: Bollinger 20/2 breakout + ATR14 + EMA62/200, candle fechado, próxima M1, sem Grid/Pyramid/Average/Martingale/Gale.
@@ -25538,7 +25539,7 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
         _ctrader_application_auth(ws)
         _ctrader_account_auth(ws, token, account_id)
 
-        # 1) Janela curta e recente, sem count. É a tentativa preferida.
+        # 1) Janela curta e recente com count explícito. É a tentativa preferida.
         for fmt, period_value in attempts:
             payload = {
                 "ctidTraderAccountId": account_id,
@@ -25546,6 +25547,7 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
                 "toTimestamp": to_ms,
                 "period": period_value,
                 "symbolId": symbol_id,
+                "count": count,
             }
             try:
                 body = _ctrader_send_wait(
@@ -25555,7 +25557,7 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
                 candidate = body.get("trendbar") or body.get("trendbars") or []
                 dbg = _bars_debug(candidate)
                 dbg.update({
-                    "mode": "recent_window_no_count",
+                    "mode": "recent_window_with_count",
                     "format": fmt,
                     "period": str(period_value),
                     "response_period": body.get("period"),
@@ -25570,7 +25572,7 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
                         break
             except Exception as exc:
                 attempt_debug.append({
-                    "mode": "recent_window_no_count",
+                    "mode": "recent_window_with_count",
                     "format": fmt,
                     "period": str(period_value),
                     "error": str(exc)[:180],
@@ -25579,7 +25581,7 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
         # 2) Se a janela curta não trouxer HISTÓRICO SUFICIENTE, amplia
         # progressivamente. Isso também cobre domingo/reabertura, quando existem
         # poucos candles recentes mas precisamos alcançar a sessão anterior.
-        # Ainda sem `count`, para não correr o risco de receber o início da janela.
+        # Mantém `count` explícito conforme ProtoOAGetTrendbarsReq.
         if len(bars) < minimum_history:
             for factor in (4, 12):
                 expanded_from_ms = max(0, to_ms - int(primary_window_seconds * factor * 1000))
@@ -25590,6 +25592,7 @@ def _ctrader_candles_blocking(item: Dict[str, Any], symbol: str, interval: str, 
                     "toTimestamp": to_ms,
                     "period": period_value,
                     "symbolId": symbol_id,
+                    "count": count,
                 }
                 try:
                     body = _ctrader_send_wait(
