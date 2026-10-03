@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.83"
+APP_VERSION = "3.97.84"
 # MEGA IA 3.97.83 — adiciona BTC como opção separada no painel; usa o mesmo mercado BTC/USD internamente sem remover nenhum ativo.
 # MEGA IA 3.97.81 — IQ Option: fechamento completo do socket antigo + validação de estabilidade do WebSocket antes de aceitar login/reconexão; reduz loops NoneType/sock e reconexões fantasma.
 # MEGA IA 3.97.82 — painel: impede repetição acumulativa de “MANTIDO ATÉ A EXPIRAÇÃO” a cada polling; sinal continua preservado uma única vez até expirar.
@@ -1608,6 +1608,7 @@ INTERVALS = {"1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1h": 3600, "
 SYMBOLS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF",
     "NZD/USD", "EUR/JPY", "GBP/JPY", "EUR/GBP", "BTC/USD", "BTC", "ETH/USD", "LTC/USD",
+    "SOL/USD", "XRP/USD", "DOGE/USD", "ADA/USD", "BNB/USD",
     BINOMO_CRYPTO_IDX_SYMBOL,
 ]
 OTC_SYMBOLS = [s for s in SYMBOLS if s not in (BINOMO_CRYPTO_IDX_SYMBOL, "BTC")]
@@ -2048,13 +2049,19 @@ BINANCE_SYMBOLS = {
     "BTC": "BTCUSDT",
     "ETH/USD": "ETHUSDT",
     "LTC/USD": "LTCUSDT",
+    "SOL/USD": "SOLUSDT",
+    "XRP/USD": "XRPUSDT",
+    "DOGE/USD": "DOGEUSDT",
+    "ADA/USD": "ADAUSDT",
+    "BNB/USD": "BNBUSDT",
 }
 YAHOO_SYMBOLS = {
     "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "JPY=X",
     "AUD/USD": "AUDUSD=X", "USD/CAD": "CAD=X", "USD/CHF": "CHF=X",
     "NZD/USD": "NZDUSD=X", "EUR/JPY": "EURJPY=X", "GBP/JPY": "GBPJPY=X",
     "EUR/GBP": "EURGBP=X", "BTC/USD": "BTC-USD", "BTC": "BTC-USD", "ETH/USD": "ETH-USD",
-    "LTC/USD": "LTC-USD",
+    "LTC/USD": "LTC-USD", "SOL/USD": "SOL-USD", "XRP/USD": "XRP-USD",
+    "DOGE/USD": "DOGE-USD", "ADA/USD": "ADA-USD", "BNB/USD": "BNB-USD",
 }
 
 
@@ -33729,7 +33736,18 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
     <select id="symbol"></select>
 
-    <button id="btcOnlyBtn" type="button" style="font-weight:1000">₿ SÓ BTC/USD • OFF</button>
+    <select id="cryptoQuickSelect" title="Escolha rápida de criptomoeda" style="font-weight:1000">
+      <option value="">🪙 ESCOLHER CRIPTO</option>
+      <option value="BTC/USD">₿ Bitcoin • BTC/USD</option>
+      <option value="ETH/USD">◆ Ethereum • ETH/USD</option>
+      <option value="LTC/USD">Ł Litecoin • LTC/USD</option>
+      <option value="SOL/USD">◎ Solana • SOL/USD</option>
+      <option value="XRP/USD">✕ XRP • XRP/USD</option>
+      <option value="DOGE/USD">Ð Dogecoin • DOGE/USD</option>
+      <option value="ADA/USD">₳ Cardano • ADA/USD</option>
+      <option value="BNB/USD">◈ BNB • BNB/USD</option>
+    </select>
+    <button id="btcOnlyBtn" type="button" style="display:none">₿ SÓ BTC/USD • OFF</button>
     <div id="btcOnlyNote" class="label" style="display:none;grid-column:1/-1">Modo BTC/USD ativo • painel, gráfico, pré-alerta e radar focados somente neste ativo.</div>
 
     <button id="adaptiveLearningBtn" type="button" style="font-weight:1000">🧠 APRENDIZADO WIN DIRETO • ON</button>
@@ -35729,11 +35747,30 @@ try{
 
 const syms=[
   'EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF',
-  'NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD','CRYPTO IDX'
+  'NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','ETH/USD','LTC/USD','SOL/USD','XRP/USD','DOGE/USD','ADA/USD','BNB/USD','CRYPTO IDX'
 ];
 const rtmSeedSyms=['BTC/USD','USD/JPY','EUR/JPY','GBP/JPY','AUD/JPY','CAD/JPY','CHF/JPY','NZD/JPY'];
 
 const S=document.getElementById('symbol');
+const cryptoQuickSelect=document.getElementById('cryptoQuickSelect');
+if(cryptoQuickSelect){
+  cryptoQuickSelect.addEventListener('change',async()=>{
+    const chosen=String(cryptoQuickSelect.value||'').trim();
+    if(!chosen || !S) return;
+    // O seletor rápido apenas escolhe o ativo; não liga o antigo modo BTC-only.
+    if(btcOnlyEnabled){
+      btcOnlyEnabled=false;
+      try{localStorage.setItem('mega_btc_only_mode','OFF');}catch(_){}
+      fillSymbols();
+    }
+    if([...S.options].some(o=>o.value===chosen)) S.value=chosen;
+    try{localStorage.setItem('mega_symbol',chosen);}catch(_){}
+    S.dispatchEvent(new Event('change'));
+    cur=null; lastSignalVoice=''; lastRadarAutoKey='';
+    if(statusBox) statusBox.textContent='🪙 '+chosen+' selecionado • analisando mercado';
+    if(appEnabled) await Promise.allSettled([sig(false),rad()]);
+  });
+}
 
 let cur=null;
 
