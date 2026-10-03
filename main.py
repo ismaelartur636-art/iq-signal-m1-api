@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.79"
+APP_VERSION = "3.97.80"
+# MEGA IA 3.97.80 — IQ Option: reconexão persistente; falhas transitórias não invalidam login e /otc-status tenta recuperar o WebSocket automaticamente.
 # MEGA IA 3.97.79 — painel: preserva CALL/PUT já promovido pelo radar até expiry_time; polling NEUTRO não apaga o sinal no mesmo segundo.
 # MEGA IA 3.97.78 — corrige PREDATOR PIPS no fluxo direto do painel e destrava PYRAMID 7 PRO: Bollinger 20/2 volta a ser o gatilho nativo; ATR/EMA ficam diagnósticos.
 # MEGA IA 3.97.76 — sincroniza motor visível/backend: exclusividade central dos 7 motores + resposta do servidor autoritativa no clique.
@@ -2607,7 +2608,7 @@ IQ_RECONNECT_BASE = float(os.getenv("IQ_RECONNECT_BASE", "4"))
 IQ_RECONNECT_MAX = float(os.getenv("IQ_RECONNECT_MAX", "45"))
 # Depois de algumas falhas consecutivas, paramos de reutilizar uma autorização
 # possivelmente inválida. Isso evita loop de WebSocket 401 e libera novo login.
-IQ_RECONNECT_MAX_FAILURES = max(1, int(os.getenv("IQ_RECONNECT_MAX_FAILURES", "3")))
+IQ_RECONNECT_MAX_FAILURES = max(3, int(os.getenv("IQ_RECONNECT_MAX_FAILURES", "12")))
 iq_sessions: Dict[str, Dict[str, Any]] = {}
 
 # BINOMO — sessão separada e somente para leitura do Crypto IDX.
@@ -8297,19 +8298,18 @@ def _iq_reconnect_state(state: Dict[str, Any]):
             # quando o fork não repassa o 401 no texto, 3 falhas consecutivas encerram
             # a autorização antiga e deixam o próximo login começar limpo.
             auth_failure = _iq_is_auth_failure(msg)
-            too_many_failures = failures >= IQ_RECONNECT_MAX_FAILURES
-            if auth_failure or too_many_failures:
-                why = msg if auth_failure else (
-                    f"{msg}. Reconexão falhou {failures} vezes consecutivas."
-                )
+            # Só invalida o login quando a própria IQ rejeita a autorização.
+            # Quedas de rede/WebSocket/Render podem se repetir várias vezes e NÃO
+            # devem apagar a sessão nem obrigar o usuário a digitar a senha de novo.
+            if auth_failure:
+                why = msg
                 _iq_require_fresh_login(state, why)
                 print(
-                    f"[IQ RECONNECT] sessão invalidada; novo login necessário • {why[:180]}",
+                    f"[IQ RECONNECT] autorização realmente recusada; novo login necessário • {why[:180]}",
                     flush=True,
                 )
                 raise RuntimeError(
-                    "A sessão da IQ Option foi encerrada para evitar novas tentativas 401. "
-                    "Faça login novamente."
+                    "A autorização da IQ Option foi recusada. Faça login novamente."
                 )
 
             delay = _iq_reconnect_delay(failures)
@@ -26871,6 +26871,20 @@ async def otc_status(request: Request, broker: str = "IQ_OPTION"):
         required=False,
     )
     connected = _iq_connected(state)
+
+    # Se a sessão existe mas o WebSocket caiu, o próprio status tenta recuperar
+    # a conexão. Isso evita ficar preso em RECONECTANDO até outra rota usar a IQ.
+    if state and not connected and not state.get("reauth_required"):
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(_iq_reconnect_state, state),
+                timeout=IQ_CONNECT_TIMEOUT + 3,
+            )
+            connected = _iq_connected(state)
+        except Exception as exc:
+            connected = False
+            if not state.get("reauth_required"):
+                state["last_error"] = str(exc)[:260]
 
     reauth_required = bool(state and state.get("reauth_required"))
     last_error = str(state.get("last_error") or "")[:220] if state else ""
