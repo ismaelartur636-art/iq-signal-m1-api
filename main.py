@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.55"
+APP_VERSION = "3.97.56"
+# MEGA IA 3.97.56 — ROBO FIBO reativado como motor separado no painel/background; Fibonacci + RSI14 + EMA60, sem grid/martingale.
 # MEGA IA 3.97.54 — DRAGON FIRE integrado como segundo motor: 4 fechamentos consecutivos, próxima M1, sem Grid/Martingale/Gale.
 # MEGA IA 3.97.53 — SCALPER PRO restaurado ao gatilho original do EA Scalping Asia: Open fora do Envelope e preço atual reentra; mantém pré-alerta 10s, próxima M1, sem Gale.
 # MEGA IA 3.97.55 — DRAGON FIRE PRO: mesma sequência de 4 fechamentos com rearme obrigatório; um sinal por movimento.
@@ -27762,7 +27763,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     # 3.97.42 — servidor 24h isolado: somente os dois motores visíveis.
-    "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO",
+    "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI",
 }
 
 
@@ -28811,7 +28812,7 @@ def scalping_asia_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
 # -----------------------------------------------------------------------------
 _BACKTEST48_SUPPORTED = {
     "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER",
-    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO",
+    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI",
 }
 _BACKTEST48_NAMES = {
     "SMART": "MOTOR REMOVIDO",
@@ -28828,6 +28829,7 @@ _BACKTEST48_NAMES = {
     "SCALPERPRO": "SCALPER PRO",
     "DRAGONFIRE": "🔥 DRAGON FIRE",
     "DRAGONFIREPRO": "🔥 DRAGON FIRE PRO",
+    "FIBORSI": "🌀 ROBO FIBO",
 }
 _backtest48_history_cache: Dict[str, Any] = {}
 _backtest48_result_cache: Dict[str, Any] = {}
@@ -29268,8 +29270,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
 
     if not _symbol_allowed(symbol, requested_market) or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
-    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO"):
-        # Compatibilidade: motores antigos continuam bloqueados; somente os dois atuais são aceitos.
+    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI"):
         engine = "SCALPERPRO"
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
@@ -30037,7 +30038,7 @@ async def pre_signals(
     market = (market or "OPEN").upper()
     engine = str(engine or "SMART").upper()
     # 3.97.54 — somente SCALPER PRO e DRAGON FIRE são operacionais.
-    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO"):
+    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI"):
         engine = "SCALPERPRO"
     limit = max(1, min(int(limit), 4))
 
@@ -31087,7 +31088,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Intervalo ou mercado inválido.")
     if symbol and not _symbol_allowed(symbol, market):
         raise HTTPException(400, "Ativo do radar inválido.")
-    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO"):
+    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI"):
         engine = "SCALPERPRO"
 
     if engine == "RTM":
@@ -33469,7 +33470,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <style>
     /* 3.97.11 — painel de motores enxuto: MOTOR REMOVIDO + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
-    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard{display:flex !important}
+    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard{display:flex !important}
     #scalpingAsiaModeCard{display:none !important}
   </style>
 
@@ -33477,6 +33478,15 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
 
 
+
+  <div class="robot-mode-card" id="roboFiboModeCard">
+    <img src="__MEGA_IMAGE__" alt="Robo Fibo">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">🌀 ROBO FIBO</div>
+      <div class="robot-mode-desc" id="roboFiboModeDesc">Fibonacci 23,6/38,2/50/61,8/76,4 + RSI14 + EMA60 • candle fechado • próxima M1 • expiração M1 • sem Grid • sem Martingale • sem Gale.</div>
+    </div>
+    <button id="roboFiboPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
 
   <div class="robot-mode-card" id="scalperProModeCard">
     <img src="__MEGA_IMAGE__" alt="Scalper Pro">
@@ -34610,10 +34620,10 @@ try{
 // MEGA IA 3.96.7 — motores removidos do painel ficam forçados OFF, inclusive
 // quando existir estado antigo no localStorage do celular.
 blackbookEnabled=false; rtmEnabled=false; bobSenegalEnabled=false; taurusSenegalEnabled=false; taurusEaEnabled=false;
-rsiDivBbEnabled=false; tmaRsiEnabled=false; tlbRsiEnabled=false; tripleRsiEnabled=false; roboFiboEnabled=false; combinerEnabled=false;
+rsiDivBbEnabled=false; tmaRsiEnabled=false; tlbRsiEnabled=false; tripleRsiEnabled=false; combinerEnabled=false;
 try{
   ['mega_blackbook_power','mega_rtm_ea_power','mega_bob_senegal_power','mega_taurus_senegal_power','mega_taurus_ea_power',
-   'mega_rsidivbb_power','mega_tmarsi_power','mega_tlbrsi_power','mega_triprsi_power','mega_robofibo_power','mega_combiner_power']
+   'mega_rsidivbb_power','mega_tmarsi_power','mega_tlbrsi_power','mega_triprsi_power','mega_combiner_power']
    .forEach(k=>localStorage.setItem(k,'OFFLINE'));
 }catch(_){}
 
@@ -34817,12 +34827,15 @@ try{
 scalperProEnabled=localStorage.getItem('mega_scalper_pro_power')==='ONLINE';
 dragonFireEnabled=localStorage.getItem('mega_dragon_fire_power')==='ONLINE';
 dragonFireProEnabled=localStorage.getItem('mega_dragon_fire_pro_power')==='ONLINE';
+roboFiboEnabled=localStorage.getItem('mega_robofibo_power')==='ONLINE';
+if(roboFiboEnabled){ dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; }
 if(dragonFireProEnabled){ dragonFireEnabled=false; scalperProEnabled=false; }
 if(dragonFireEnabled) scalperProEnabled=false;
 scalpingAsiaEnabled=false;
 try{localStorage.setItem('mega_scalping_asia_power','OFFLINE');}catch(_){}
 
 function selectedRobotEngine(){
+  if(roboFiboEnabled) return 'FIBORSI';
   if(dragonFireProEnabled) return 'DRAGONFIREPRO';
   if(dragonFireEnabled) return 'DRAGONFIRE';
   if(scalperProEnabled) return 'SCALPERPRO';
@@ -34834,12 +34847,14 @@ function adoptBackgroundEngineState(d){
   if(typeof d.telegram_enabled==='boolean'){ telegramEnabled=!!d.telegram_enabled; }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(e!=='SCALPERPRO' && e!=='DRAGONFIRE' && e!=='DRAGONFIREPRO') return;
+  if(e!=='SCALPERPRO' && e!=='DRAGONFIRE' && e!=='DRAGONFIREPRO' && e!=='FIBORSI') return;
+  roboFiboEnabled=(e==='FIBORSI');
   dragonFireProEnabled=(e==='DRAGONFIREPRO');
   dragonFireEnabled=(e==='DRAGONFIRE');
   scalperProEnabled=(e==='SCALPERPRO');
   scalpingAsiaEnabled=false;
   try{
+    localStorage.setItem('mega_robofibo_power',roboFiboEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_scalper_pro_power',scalperProEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_dragon_fire_power',dragonFireEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_dragon_fire_pro_power',dragonFireProEnabled?'ONLINE':'OFFLINE');
@@ -34850,7 +34865,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({SCALPERPRO:'SCALPER PRO',DRAGONFIRE:'🔥 DRAGON FIRE',DRAGONFIREPRO:'🔥 DRAGON FIRE PRO'})[e]||'SEM MOTOR';
+  return ({FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO',DRAGONFIRE:'🔥 DRAGON FIRE',DRAGONFIREPRO:'🔥 DRAGON FIRE PRO'})[e]||'SEM MOTOR';
 }
 
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
@@ -39762,6 +39777,7 @@ async function setPlatinumPower(enabled){
 async function setScalperProPower(enabled){
   scalperProEnabled=!!enabled;
   if(scalperProEnabled){
+    roboFiboEnabled=false; try{localStorage.setItem('mega_robofibo_power','OFFLINE');}catch(_){}
     dragonFireProEnabled=false; try{localStorage.setItem('mega_dragon_fire_pro_power','OFFLINE');}catch(_){}
     dragonFireEnabled=false; try{localStorage.setItem('mega_dragon_fire_power','OFFLINE');}catch(_){}
     scalpingAsiaEnabled=false;rsiChannelsEnabled=false;rsiChannels2Enabled=false;minScalperEnabled=false;ismaelTraderEnabled=false;ismael98Enabled=false;aiEnabled=false;localAnalystEnabled=false;localAnalystFlexEnabled=false;megaMasterEnabled=false;rsiCrossEnabled=false;robotEnabled=false;
@@ -39778,6 +39794,7 @@ async function setScalperProPower(enabled){
 async function setDragonFirePower(enabled){
   dragonFireEnabled=!!enabled;
   if(dragonFireEnabled){
+    roboFiboEnabled=false; try{localStorage.setItem('mega_robofibo_power','OFFLINE');}catch(_){}
     dragonFireProEnabled=false; try{localStorage.setItem('mega_dragon_fire_pro_power','OFFLINE');}catch(_){}
     scalperProEnabled=false; scalpingAsiaEnabled=false;
     try{localStorage.setItem('mega_scalper_pro_power','OFFLINE');}catch(_){}
@@ -39794,6 +39811,7 @@ async function setDragonFirePower(enabled){
 async function setDragonFireProPower(enabled){
   dragonFireProEnabled=!!enabled;
   if(dragonFireProEnabled){
+    roboFiboEnabled=false; try{localStorage.setItem('mega_robofibo_power','OFFLINE');}catch(_){}
     dragonFireEnabled=false; scalperProEnabled=false; scalpingAsiaEnabled=false;
     try{localStorage.setItem('mega_dragon_fire_power','OFFLINE');localStorage.setItem('mega_scalper_pro_power','OFFLINE');}catch(_){}
     if(entryMode) entryMode.value='BIRTH'; if(interval) interval.value='1min';
@@ -40563,6 +40581,9 @@ function disableRoboFiboForOtherEngine(){
 async function setRoboFiboPower(enabled){
   roboFiboEnabled=!!enabled;
   if(roboFiboEnabled){
+    scalperProEnabled=false; dragonFireEnabled=false; dragonFireProEnabled=false;
+    try{localStorage.setItem('mega_scalper_pro_power','OFFLINE');localStorage.setItem('mega_dragon_fire_power','OFFLINE');localStorage.setItem('mega_dragon_fire_pro_power','OFFLINE');}catch(_){}
+    if(entryMode) entryMode.value='BIRTH'; if(interval) interval.value='1min';
     tlbRsiEnabled=false; rsiDivBbEnabled=false; robotEnabled=false; aiEnabled=false; eaEnabled=false; rubikEnabled=false; forceEnabled=false; bigriseEnabled=false;
     larryEnabled=false; rangeEnabled=false; velocityEnabled=false; sniperEnabled=false; combinerEnabled=false; alphaxEnabled=false;
     presidenEnabled=false; rapidEnabled=false; suntzuEnabled=false; samuraiEnabled=false; volumePocEnabled=false; volumePocAiEnabled=false; rsiMonEnabled=false; rsi5Enabled=false;
