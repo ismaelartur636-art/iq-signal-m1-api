@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.72"
+APP_VERSION = "3.97.73"
 # MEGA IA 3.97.68 — cTrader Trendbars: remove campo count incompatível do ProtoOAGetTrendbarsReq; usa fromTimestamp/toTimestamp + period + symbolId e recorta localmente. Corrige cTrader conectado com candles indisponíveis e queda indevida para Binance.
 # MEGA IA 3.97.69 — radar: fila avança sem congelar 10s e prioriza cripto 24/7 no fim de semana.
 # MEGA IA 3.97.71 — sincroniza frescor entre roteador, /signal-ai e radar: evita STATUS preso em “AGUARDANDO DADOS ATUALIZADOS” quando o mesmo candle cTrader já foi aceito pelo radar.
@@ -23798,7 +23798,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": (f"ONLINE • SCALPER PRO • MONITORANDO MERCADO" if engine == "SCALPERPRO" else f"ONLINE • {engine_title} {tf_label} MONITORANDO"),
-            "ai_confirmed": bool(engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SESSIONBREAKOUT", "MONSTERSMC") and analysis.get("confirmed")),
+            "ai_confirmed": bool(engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC") and analysis.get("confirmed")),
             "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                 "LOCALANALYST": "LOCAL_ANALYST_PRO",
                 "LOCALANALYSTFLEX": "LOCAL_ANALYST_FLEX",
@@ -24840,9 +24840,35 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
 
                 release_state["active_signal"] = dict(base) if base.get("direction") in ("CALL", "PUT") else None
             else:
+                # 3.97.73 — mantém o sinal já liberado visível no painel até a expiração.
+                # Antes, no polling seguinte o mesmo fingerprint virava NEUTRO /
+                # "SINAL JÁ UTILIZADO", fazendo oportunidades vistas no radar
+                # (ex.: PREDATOR PIPS) não permanecerem no painel/cronograma.
+                active_signal = release_state.get("active_signal")
+                if active_signal and active_signal.get("direction") in ("CALL", "PUT") and active_signal.get("expiry_time"):
+                    try:
+                        if now() < parse_dt(active_signal["expiry_time"]):
+                            held = dict(active_signal)
+                            held["signal_held_until_expiry"] = True
+                            cache[key] = (time.time(), held)
+                            return held
+                    except Exception:
+                        pass
                 base["status"] = f"ONLINE • {engine_title} • SINAL JÁ UTILIZADO"
                 base["reason"] = f"Este sinal {interval} já foi liberado; aguardando uma nova oportunidade."
         else:
+            # Não apaga um CALL/PUT ainda válido só porque uma nova leitura ficou
+            # neutra durante a mesma operação. O painel deve segurá-lo até expirar.
+            active_signal = release_state.get("active_signal")
+            if active_signal and active_signal.get("direction") in ("CALL", "PUT") and active_signal.get("expiry_time"):
+                try:
+                    if now() < parse_dt(active_signal["expiry_time"]):
+                        held = dict(active_signal)
+                        held["signal_held_until_expiry"] = True
+                        cache[key] = (time.time(), held)
+                        return held
+                except Exception:
+                    pass
             release_state["active_signal"] = None
 
         cache[key] = (time.time(), base)
