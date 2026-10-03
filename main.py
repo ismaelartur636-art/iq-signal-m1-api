@@ -22681,13 +22681,20 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         cache[key] = (time.time(), out)
         return out
 
-    if len(raw) < 25:
+    # 3.97.39 — mínimo de candles por motor.
+    # SCALPER PRO usa SMA15 e precisa de 17 candles, não do bloqueio genérico de 25.
+    # O bloqueio global fazia o painel mostrar AGUARDANDO DADOS mesmo quando o
+    # radar já tinha histórico suficiente para calcular o Envelopes.
+    min_raw_required = 17 if engine == "SCALPERPRO" else 25
+    if len(raw) < min_raw_required:
         out = neutral_signal(
             symbol, interval, market,
             "AGUARDANDO DADOS",
-            "Ainda não há candles suficientes para uma análise segura.",
+            f"Candles recebidos: {len(raw)}/{min_raw_required}. Aguardando histórico mínimo do {('SCALPER PRO' if engine == 'SCALPERPRO' else 'motor')}.",
             source_state="WAITING",
         )
+        out["candles_received"] = len(raw)
+        out["candles_required"] = min_raw_required
         cache[key] = (time.time(), out)
         return out
 
