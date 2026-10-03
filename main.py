@@ -42,9 +42,10 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.51"
+APP_VERSION = "3.97.52"
 # MEGA IA 3.97.51 — SCALPER PRO alinhado em 10s: motor, pré-alerta, radar, painel e texto do backtest.
 # MEGA IA 3.97.50 — deixa somente SCALPER PRO e converte seleções antigas automaticamente para SCALPERPRO.
+# MEGA IA 3.97.52 — SCALPER PRO: status neutro passa a mostrar MONITORANDO MERCADO/AGUARDANDO OPORTUNIDADE; AGUARDANDO DADOS fica reservado a falha real de fonte/análise.
 # MEGA IA 3.97.49 — corrige SCALPER PRO: pré-alerta confirmado é promovido imediatamente ao painel e usa feed dedicado.
 # MEGA IA 3.97.44 — teste isolado: SCALPER FLEX removido do painel/seleção/background; somente SCALPER PRO permanece ativo.
 # MEGA IA 3.97.43 — limpeza final: somente SCALPER PRO/FLEX podem ser selecionados; remove fallbacks visuais/operacionais de ChatGPT, IA Gráfica e motores antigos.
@@ -23732,6 +23733,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             else:
                 analysis = await graphic_ai_strategy(symbol, interval, engine_closed, market, request=request, iq_state=iq_state)
         except Exception as exc:
+            # Exceção aqui representa indisponibilidade real de dados/análise.
+            # Em estado neutro normal, SCALPER PRO usa MONITORANDO MERCADO.
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • AGUARDANDO DADOS",
@@ -23753,7 +23756,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "direction": "NEUTRO",
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
-            "status": f"ONLINE • {engine_title} {tf_label} MONITORANDO",
+            "status": (f"ONLINE • SCALPER PRO • MONITORANDO MERCADO" if engine == "SCALPERPRO" else f"ONLINE • {engine_title} {tf_label} MONITORANDO"),
             "ai_confirmed": bool(engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "SESSIONBREAKOUT", "MONSTERSMC") and analysis.get("confirmed")),
             "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                 "LOCALANALYST": "LOCAL_ANALYST_PRO",
