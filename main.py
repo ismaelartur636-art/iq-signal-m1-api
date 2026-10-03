@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.75"
+APP_VERSION = "3.97.76"
+# MEGA IA 3.97.76 — sincroniza motor visível/backend: exclusividade central dos 7 motores + resposta do servidor autoritativa no clique.
 # MEGA IA 3.97.75 — destrava motores EA recentes: MASYUK/PYRAMID/PREDATOR usam somente a regra nativa (sem adaptive gate) e SCALPER/DRAGON/MASYUK/PYRAMID/PREDATOR não perdem sinal por polling após 10s.
 # MEGA IA 3.97.68 — cTrader Trendbars: remove campo count incompatível do ProtoOAGetTrendbarsReq; usa fromTimestamp/toTimestamp + period + symbolId e recorta localmente. Corrige cTrader conectado com candles indisponíveis e queda indevida para Binance.
 # MEGA IA 3.97.69 — radar: fila avança sem congelar 10s e prioriza cripto 24/7 no fim de semana.
@@ -35170,6 +35171,30 @@ if(dragonFireEnabled) scalperProEnabled=false;
 scalpingAsiaEnabled=false;
 try{localStorage.setItem('mega_scalping_asia_power','OFFLINE');}catch(_){}
 
+// 3.97.76 — uma única fonte de verdade para os 7 motores visíveis.
+// Evita dois flags ONLINE ao mesmo tempo e elimina divergência botão/status/radar/backend.
+function setExclusiveVisibleEngine(engine){
+  const e=String(engine||'OFF').toUpperCase();
+  predatorPipsEnabled=(e==='PREDATORPIPS');
+  pyramid7Enabled=(e==='PYRAMID7');
+  masyukEnabled=(e==='MASYUK');
+  roboFiboEnabled=(e==='FIBORSI');
+  dragonFireProEnabled=(e==='DRAGONFIREPRO');
+  dragonFireEnabled=(e==='DRAGONFIRE');
+  scalperProEnabled=(e==='SCALPERPRO');
+  scalpingAsiaEnabled=false;
+  try{
+    localStorage.setItem('mega_predator_pips_power',predatorPipsEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_pyramid7_power',pyramid7Enabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_masyuk_power',masyukEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_robofibo_power',roboFiboEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_dragon_fire_pro_power',dragonFireProEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_dragon_fire_power',dragonFireEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_scalper_pro_power',scalperProEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_scalping_asia_power','OFFLINE');
+  }catch(_){}
+}
+
 function selectedRobotEngine(){
   if(predatorPipsEnabled) return 'PREDATORPIPS';
   if(pyramid7Enabled) return 'PYRAMID7';
@@ -35322,7 +35347,15 @@ async function syncBackgroundBotState(opts={}){
   };
   try{
     const d=await post('/background-bot/state',payload);
-    if(action==='PASSIVE') adoptBackgroundEngineState(d);
+    // 3.97.76: resposta do servidor é autoritativa também no clique explícito.
+    // Assim botão, motor selecionado, radar, backtest e bot 24h não ficam em engines diferentes.
+    if(d && d.server_side){
+      if(d.enabled) adoptBackgroundEngineState(d);
+      else if(action==='DEACTIVATE_ENGINE' && String(d.engine||'').toUpperCase()===explicitEngine){
+        setExclusiveVisibleEngine('OFF');
+        if(typeof applyRobotPowerState==='function') applyRobotPowerState();
+      }
+    }
     return d;
   }catch(err){
     console.warn('[MEGA IA] segundo plano',err);
@@ -40135,6 +40168,7 @@ async function setPlatinumPower(enabled){
 
 async function setPredatorPipsPower(enabled){
   predatorPipsEnabled=!!enabled;
+  if(predatorPipsEnabled) setExclusiveVisibleEngine('PREDATORPIPS');
   if(predatorPipsEnabled){
     pyramid7Enabled=false; masyukEnabled=false; roboFiboEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; scalpingAsiaEnabled=false;
     try{
@@ -40154,6 +40188,7 @@ async function setPredatorPipsPower(enabled){
 
 async function setPyramid7Power(enabled){
   pyramid7Enabled=!!enabled;
+  if(pyramid7Enabled) setExclusiveVisibleEngine('PYRAMID7');
   if(pyramid7Enabled){
     predatorPipsEnabled=false; try{localStorage.setItem('mega_predator_pips_power','OFFLINE');}catch(_){}
     masyukEnabled=false; roboFiboEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; scalpingAsiaEnabled=false;
@@ -40174,6 +40209,7 @@ async function setPyramid7Power(enabled){
 
 async function setMasyukPower(enabled){
   masyukEnabled=!!enabled;
+  if(masyukEnabled) setExclusiveVisibleEngine('MASYUK');
   if(masyukEnabled){
     pyramid7Enabled=false; try{localStorage.setItem('mega_pyramid7_power','OFFLINE');}catch(_){}
     roboFiboEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; scalpingAsiaEnabled=false;
@@ -40190,6 +40226,7 @@ async function setMasyukPower(enabled){
 
 async function setScalperProPower(enabled){
   scalperProEnabled=!!enabled;
+  if(scalperProEnabled) setExclusiveVisibleEngine('SCALPERPRO');
   if(scalperProEnabled){
     pyramid7Enabled=false; try{localStorage.setItem('mega_pyramid7_power','OFFLINE');}catch(_){}
     masyukEnabled=false; try{localStorage.setItem('mega_masyuk_power','OFFLINE');}catch(_){}
@@ -40209,6 +40246,7 @@ async function setScalperProPower(enabled){
 
 async function setDragonFirePower(enabled){
   dragonFireEnabled=!!enabled;
+  if(dragonFireEnabled) setExclusiveVisibleEngine('DRAGONFIRE');
   if(dragonFireEnabled){
     masyukEnabled=false; try{localStorage.setItem('mega_masyuk_power','OFFLINE');}catch(_){}
     roboFiboEnabled=false; try{localStorage.setItem('mega_robofibo_power','OFFLINE');}catch(_){}
@@ -40227,6 +40265,7 @@ async function setDragonFirePower(enabled){
 
 async function setDragonFireProPower(enabled){
   dragonFireProEnabled=!!enabled;
+  if(dragonFireProEnabled) setExclusiveVisibleEngine('DRAGONFIREPRO');
   if(dragonFireProEnabled){
     masyukEnabled=false; try{localStorage.setItem('mega_masyuk_power','OFFLINE');}catch(_){}
     roboFiboEnabled=false; try{localStorage.setItem('mega_robofibo_power','OFFLINE');}catch(_){}
@@ -40998,6 +41037,7 @@ function disableRoboFiboForOtherEngine(){
 
 async function setRoboFiboPower(enabled){
   roboFiboEnabled=!!enabled;
+  if(roboFiboEnabled) setExclusiveVisibleEngine('FIBORSI');
   if(roboFiboEnabled){
     masyukEnabled=false; try{localStorage.setItem('mega_masyuk_power','OFFLINE');}catch(_){}
     scalperProEnabled=false; dragonFireEnabled=false; dragonFireProEnabled=false;
