@@ -42,8 +42,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.68"
+APP_VERSION = "3.97.69"
 # MEGA IA 3.97.68 — cTrader Trendbars: remove campo count incompatível do ProtoOAGetTrendbarsReq; usa fromTimestamp/toTimestamp + period + symbolId e recorta localmente. Corrige cTrader conectado com candles indisponíveis e queda indevida para Binance.
+# MEGA IA 3.97.69 — radar: fila avança sem congelar 10s e prioriza cripto 24/7 no fim de semana.
 # MEGA IA 3.97.67 — cTrader Trendbars: envia count explicitamente em todas as requisições históricas, conforme ProtoOAGetTrendbarsReq.
 # MEGA IA 3.97.66 — cTrader candles: prioriza conta LIVE no catálogo (antes DEMO podia capturar o mesmo símbolo e devolver zero trendbars); mantém M1/cripto na Open API antes do fallback.
 # MEGA IA 3.97.65 — cTrader: reconhece BTCUSD com sufixo da corretora (ex.: BTCUSD.c/BTCUSDm) e mantém cTrader como fonte principal antes do fallback.
@@ -31332,7 +31333,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     # várias vezes quase ao mesmo tempo, mas permite que o índice avance de
     # verdade. O cache antigo de 9 minutos fazia apenas um ativo ser lido por
     # vários minutos e deixava o restante preso em AGUARDANDO LEITURA.
-    if previous and (time.time() - float(previous[0])) < 10.0:
+    # 3.97.69 — radar não pode ficar 10 s congelado enquanto o gráfico já recebe candles.
+    # O snapshot curto mantém proteção contra chamadas duplicadas, mas deixa a fila avançar.
+    if previous and (time.time() - float(previous[0])) < 2.0:
         return list(previous[1])
     suffix = "" if market == "OPEN" else " • IQ OTC"
 
@@ -31356,6 +31359,15 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     # começar a ser analisado e evitamos estourar a cota da fonte de dados.
     scan_symbols = [symbol] if symbol else list(SYMBOLS if market == "OPEN" else OTC_SYMBOLS)
     if market == "OPEN":
+        # 3.97.69 — em fim de semana o Forex OPEN não forma candles. Prioriza os
+        # cripto 24/7 para o radar não parecer parado enquanto BTC/ETH/LTC estão vivos.
+        try:
+            if now().weekday() >= 5 and not symbol:
+                crypto_live = [x for x in scan_symbols if x in BINANCE_SYMBOLS]
+                others = [x for x in scan_symbols if x not in BINANCE_SYMBOLS]
+                scan_symbols = crypto_live + others
+        except Exception:
+            pass
         ws_active = _td_ws_active_symbols()
         for row in out:
             base = str(row.get("base_symbol") or "").strip()
