@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.82"
+APP_VERSION = "3.97.83"
+# MEGA IA 3.97.83 — adiciona BTC como opção separada no painel; usa o mesmo mercado BTC/USD internamente sem remover nenhum ativo.
 # MEGA IA 3.97.81 — IQ Option: fechamento completo do socket antigo + validação de estabilidade do WebSocket antes de aceitar login/reconexão; reduz loops NoneType/sock e reconexões fantasma.
 # MEGA IA 3.97.82 — painel: impede repetição acumulativa de “MANTIDO ATÉ A EXPIRAÇÃO” a cada polling; sinal continua preservado uma única vez até expirar.
 # MEGA IA 3.97.80 — IQ Option: reconexão persistente; falhas transitórias não invalidam login e /otc-status tenta recuperar o WebSocket automaticamente.
@@ -1606,10 +1607,15 @@ SELECTABLE_ENGINES_ENABLED = True
 INTERVALS = {"1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1h": 3600, "4h": 14400}
 SYMBOLS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF",
-    "NZD/USD", "EUR/JPY", "GBP/JPY", "EUR/GBP", "BTC/USD", "ETH/USD", "LTC/USD",
+    "NZD/USD", "EUR/JPY", "GBP/JPY", "EUR/GBP", "BTC/USD", "BTC", "ETH/USD", "LTC/USD",
     BINOMO_CRYPTO_IDX_SYMBOL,
 ]
-OTC_SYMBOLS = [s for s in SYMBOLS if s != BINOMO_CRYPTO_IDX_SYMBOL]
+OTC_SYMBOLS = [s for s in SYMBOLS if s not in (BINOMO_CRYPTO_IDX_SYMBOL, "BTC")]
+
+def _market_data_symbol(symbol: str) -> str:
+    """BTC é um alias visual separado; a cotação/execução usa o mercado BTC/USD."""
+    value = str(symbol or "").strip().upper()
+    return "BTC/USD" if value == "BTC" else value
 
 # MEGA IA 3.96.1 — universo exclusivo da RTM.
 # A RTM só pode operar BTC/USD ou pares cujo nome contenha JPY.
@@ -1997,7 +2003,7 @@ TD_WS_REQUESTED_SYMBOLS = [
     if s.strip()
 ]
 # remove duplicatas preservando a ordem e limita aos ativos conhecidos do app
-TD_WS_REQUESTED_SYMBOLS = list(dict.fromkeys([s for s in TD_WS_REQUESTED_SYMBOLS if s in SYMBOLS and s != BINOMO_CRYPTO_IDX_SYMBOL]))
+TD_WS_REQUESTED_SYMBOLS = list(dict.fromkeys([s for s in TD_WS_REQUESTED_SYMBOLS if s in SYMBOLS and s not in (BINOMO_CRYPTO_IDX_SYMBOL, "BTC")]))
 TD_WS_RECONNECT_MAX = float(os.getenv("TWELVE_DATA_WS_RECONNECT_MAX", "30"))
 TD_WS_FRESH_SECONDS = float(os.getenv("TWELVE_DATA_WS_FRESH_SECONDS", "90"))
 
@@ -2039,6 +2045,7 @@ binomo_quote_ws_bars: Dict[str, list] = {}
 
 BINANCE_SYMBOLS = {
     "BTC/USD": "BTCUSDT",
+    "BTC": "BTCUSDT",
     "ETH/USD": "ETHUSDT",
     "LTC/USD": "LTCUSDT",
 }
@@ -2046,7 +2053,7 @@ YAHOO_SYMBOLS = {
     "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "JPY=X",
     "AUD/USD": "AUDUSD=X", "USD/CAD": "CAD=X", "USD/CHF": "CHF=X",
     "NZD/USD": "NZDUSD=X", "EUR/JPY": "EURJPY=X", "GBP/JPY": "GBPJPY=X",
-    "EUR/GBP": "EURGBP=X", "BTC/USD": "BTC-USD", "ETH/USD": "ETH-USD",
+    "EUR/GBP": "EURGBP=X", "BTC/USD": "BTC-USD", "BTC": "BTC-USD", "ETH/USD": "ETH-USD",
     "LTC/USD": "LTC-USD",
 }
 
@@ -7852,7 +7859,9 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
     exclusivamente na Binomo.
     """
     n = max(20, min(int(n), 500))
-    key = _open_feed_status_key(symbol, interval)
+    requested_symbol = str(symbol or "").strip().upper()
+    feed_symbol = _market_data_symbol(requested_symbol)
+    key = _open_feed_status_key(requested_symbol, interval)
     ctrader_session_id = None
     ctrader_item = None
     if request is not None:
@@ -7863,8 +7872,8 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
     # 3.97.74 — BTC/USD: se existe sessão cTrader, força a tentativa na Open API.
     # O catálogo em cache pode não listar BTC momentaneamente; _ctrader_candles atualiza
     # o catálogo e reconhece sufixos (BTCUSD.c/BTCUSDm/etc.).
-    force_ctrader_btc = bool(ctrader_item and str(symbol or "").upper() == "BTC/USD")
-    ctrader_symbol_ok = _ctrader_symbol_supported(ctrader_item, symbol) or force_ctrader_btc
+    force_ctrader_btc = bool(ctrader_item and feed_symbol == "BTC/USD")
+    ctrader_symbol_ok = _ctrader_symbol_supported(ctrader_item, feed_symbol) or force_ctrader_btc
     cache_key = key + (f"|CTRADER:{ctrader_session_id}" if ctrader_item and ctrader_symbol_ok else "")
     now_ts = time.time()
     cached = public_feed_cache.get(cache_key)
@@ -7902,7 +7911,7 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
             # cTrader continua sendo a fonte PRINCIPAL quando a sessão possui o ativo.
             if ctrader_item and ctrader_symbol_ok:
                 async def _ct_provider(sym, tf, count):
-                    return await _ctrader_candles(ctrader_item, sym, tf, count)
+                    return await _ctrader_candles(ctrader_item, _market_data_symbol(sym), tf, count)
                 providers.append(("CTRADER_OPEN", _ct_provider))
 
             # Sem modo estrito (ou sem ativo cTrader), usa o roteador normal.
@@ -7914,7 +7923,7 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
         if not MULTIFEED_ENABLED and symbol != BINOMO_CRYPTO_IDX_SYMBOL:
             if ctrader_item and ctrader_symbol_ok:
                 async def _ct_only_provider(sym, tf, count):
-                    return await _ctrader_candles(ctrader_item, sym, tf, count)
+                    return await _ctrader_candles(ctrader_item, _market_data_symbol(sym), tf, count)
                 providers = [("CTRADER_OPEN", _ct_only_provider)]
             else:
                 if not TD_KEY:
@@ -7924,7 +7933,7 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
         errors = []
         for idx, (source, provider) in enumerate(providers):
             try:
-                rows = await provider(symbol, interval, n)
+                rows = await provider(feed_symbol, interval, n)
                 rows = _tag_feed_rows(rows, source, (BINANCE_SYMBOLS.get(symbol) if source == "BINANCE_PUBLIC" else YAHOO_SYMBOLS.get(symbol) if source == "YAHOO_PUBLIC" else BINOMO_CRYPTO_IDX_RIC if source == "BINOMO_CRYPTO_IDX" else symbol))
                 if len(rows) < n:
                     raise RuntimeError(f"Fonte retornou poucos candles ({len(rows)}/{n}).")
@@ -26639,6 +26648,9 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
 
     if symbol not in SYMBOLS:
         raise HTTPException(400, "Ativo inválido para AUTO ENTRADA.")
+    # BTC é exibido separadamente, mas a IQ Option executa no instrumento BTC/USD.
+    if symbol == "BTC":
+        symbol = "BTC/USD"
     if interval not in INTERVALS:
         raise HTTPException(400, "Intervalo inválido para AUTO ENTRADA.")
     if direction not in ("CALL", "PUT"):
