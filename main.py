@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.65"
+APP_VERSION = "3.97.66"
+# MEGA IA 3.97.66 — cTrader candles: prioriza conta LIVE no catálogo (antes DEMO podia capturar o mesmo símbolo e devolver zero trendbars); mantém M1/cripto na Open API antes do fallback.
 # MEGA IA 3.97.65 — cTrader: reconhece BTCUSD com sufixo da corretora (ex.: BTCUSD.c/BTCUSDm) e mantém cTrader como fonte principal antes do fallback.
 # MEGA IA 3.97.64 — corrige persistência do motor: refresh não converte PYRAMID/PREDATOR/MASYUK/FIBO para SCALPER PRO.\n# MEGA IA 3.97.63 — PYRAMID 7 PRO: corrige placar direto, migração de LOSS e identificação do motor; 1 operação = 1 resultado.\n# MEGA IA 3.97.60 — corrige visibilidade do card PYRAMID 7 PRO no painel (CSS allowlist).\n# MEGA IA 3.97.59 — PYRAMID 7 PRO: Bollinger 20/2 breakout + ATR14 + EMA62/200, candle fechado, próxima M1, sem Grid/Pyramid/Average/Martingale/Gale.
 # MEGA IA 3.97.58 — MASYUK V3 integrado como motor separado: PSAR 0.02/0.2 + LWMA7, CALL/PUT, próxima M1, sem Grid/Martingale/Gale.
@@ -25371,9 +25372,11 @@ def _ctrader_refresh_catalog_blocking(item: Dict[str, Any], force: bool = False)
             return {"accounts": list(item.get("accounts") or []), "symbols_map": dict(cached)}
 
     accounts = _ctrader_fetch_accounts_blocking(item)
-    # Demo primeiro durante desenvolvimento; se o mesmo símbolo existir em
-    # várias contas, a primeira conta será usada apenas como fonte de preço.
-    accounts.sort(key=lambda a: (1 if _ctrader_bool(a.get("isLive")) else 0, int(a.get("ctidTraderAccountId") or 0)))
+    # 3.97.66 — LIVE primeiro. Antes o catálogo colocava DEMO primeiro e, como
+    # symbol_map usa setdefault, um BTCUSD/LTCUSD existente nas duas contas podia
+    # ficar preso ao symbolId da DEMO. A conexão aparecia OK, mas a consulta de
+    # trendbars retornava zero e o roteador caía para Binance/Twelve Data.
+    accounts.sort(key=lambda a: (0 if _ctrader_bool(a.get("isLive")) else 1, int(a.get("ctidTraderAccountId") or 0)))
     symbol_map = {}
     errors = []
     for acc in accounts:
