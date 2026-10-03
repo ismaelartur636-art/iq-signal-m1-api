@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.47"
+APP_VERSION = "3.97.48"
 # MEGA IA 3.97.44 — teste isolado: SCALPER FLEX removido do painel/seleção/background; somente SCALPER PRO permanece ativo.
 # MEGA IA 3.97.43 — limpeza final: somente SCALPER PRO/FLEX podem ser selecionados; remove fallbacks visuais/operacionais de ChatGPT, IA Gráfica e motores antigos.
 # MEGA IA 3.97.42 — limpa fila 24h: somente SCALPER PRO/FLEX; BTC ONLY também no servidor; descarta pendências antigas ao trocar motor.
@@ -21823,6 +21823,11 @@ def _ai_asset_cycle_block_signal(symbol: str, interval: str, market: str, engine
     return out
 
 
+# 3.97.48 — ponte única entre pré-alerta SCALPER PRO e painel oficial.
+# O pré-alerta confirmado fica travado até a abertura/entrada, evitando que /signal
+# recalcule a fonte e volte para AGUARDANDO/PROCURANDO DADOS.
+scalper_pro_prealert_latch = {}
+
 async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH", robofibo_poc: bool = False):
     market = (market or "OPEN").upper()
     if not _symbol_allowed(symbol, market) or interval not in INTERVALS:
@@ -21832,6 +21837,31 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     if engine in RETIRED_ENGINES:
         engine = "GRAPH_AI"
     entry_mode = normalize_entry_mode(entry_mode)
+
+    # 3.97.48 — se /pre-signals já confirmou o Scalper Pro, o painel usa a MESMA decisão.
+    if engine == "SCALPERPRO":
+        _sp_key = (str(symbol).upper(), str(interval), str(market).upper())
+        _latched = scalper_pro_prealert_latch.get(_sp_key)
+        if _latched:
+            _entry_dt = _latched.get("entry_dt")
+            _valid_until = _latched.get("valid_until")
+            if _entry_dt and _valid_until and now() <= _valid_until:
+                _dir = str(_latched.get("direction") or "").upper()
+                if _dir in ("CALL", "PUT"):
+                    _expiry_dt = _entry_dt + timedelta(seconds=INTERVALS[interval])
+                    return {
+                        "symbol": symbol, "interval": interval, "market": market,
+                        "direction": _dir, "confidence": float(_latched.get("confidence") or 76.0),
+                        "entry_time": iso(_entry_dt), "announce_time": iso(now()), "expiry_time": iso(_expiry_dt),
+                        "status": "SINAL LIBERADO • SCALPER PRO", "ai_confirmed": False, "risk": "MEDIUM",
+                        "strategy": "SCALPER PRO",
+                        "reason": str(_latched.get("reason") or "Pré-alerta SCALPER PRO confirmado e travado para a próxima vela."),
+                        "non_repaint": True, "non_repaint_after_release": True,
+                        "early_signal_locked": True, "source_state": "READY", "entry_mode": "BIRTH",
+                        "technical": {"engine":"SCALPERPRO","prealert_latched":True},
+                    }
+            else:
+                scalper_pro_prealert_latch.pop(_sp_key, None)
     if engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER"):
         # Motores estritamente fechados operam na abertura imediatamente seguinte.
         # ISMAEL TRADER usa snapshot oficial nos 20s finais para a próxima abertura.
@@ -30047,8 +30077,16 @@ async def pre_signals(
             tech=scalper_pro_strategy(raw[-260:],symbol=target,timeframe=interval,market=market,current_candle_closed=False,allow_prealert=True)
             items=[]
             if tech.get("confirmed") and str(tech.get("direction") or "").upper() in ("CALL","PUT"):
-                items=[{"symbol":target,"direction":str(tech.get("direction")).upper(),"confidence":float(tech.get("confidence") or 0.0),
-                        "strategy":"SCALPER PRO • PRÉ-ALERTA 10S","reason":str(tech.get("reason") or "SCALPER PRO confirmou reentrada no Envelopes SMA15 0,07%."),
+                _sp_direction=str(tech.get("direction")).upper()
+                _sp_reason=str(tech.get("reason") or "SCALPER PRO confirmou reentrada no Envelopes SMA15 0,07%.")
+                # Trava a mesma decisão para /signal/painel até poucos segundos após a abertura.
+                scalper_pro_prealert_latch[(str(target).upper(), str(interval), str(market).upper())] = {
+                    "direction": _sp_direction, "confidence": float(tech.get("confidence") or 0.0),
+                    "reason": _sp_reason, "entry_dt": entry_dt,
+                    "valid_until": entry_dt + timedelta(seconds=12), "created_at": now(),
+                }
+                items=[{"symbol":target,"direction":_sp_direction,"confidence":float(tech.get("confidence") or 0.0),
+                        "strategy":"SCALPER PRO • PRÉ-ALERTA 10S","reason":_sp_reason,
                         "entry_time":iso(entry_dt),"seconds_to_entry":remain,"prealert_only":False,"early_signal_locked":True}]
             return {"ok":True,"engine":"SCALPERPRO","items":items,"seconds_to_entry":remain,
                     "message":str(tech.get("reason") or "SCALPER PRO monitorando reentrada no Envelopes SMA15 0,07%."),
