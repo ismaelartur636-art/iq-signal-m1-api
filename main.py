@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.48"
+APP_VERSION = "3.97.49"
+# MEGA IA 3.97.49 — corrige SCALPER PRO: pré-alerta confirmado é promovido imediatamente ao painel e usa feed dedicado.
 # MEGA IA 3.97.44 — teste isolado: SCALPER FLEX removido do painel/seleção/background; somente SCALPER PRO permanece ativo.
 # MEGA IA 3.97.43 — limpeza final: somente SCALPER PRO/FLEX podem ser selecionados; remove fallbacks visuais/operacionais de ChatGPT, IA Gráfica e motores antigos.
 # MEGA IA 3.97.42 — limpa fila 24h: somente SCALPER PRO/FLEX; BTC ONLY também no servidor; descarta pendências antigas ao trocar motor.
@@ -30073,7 +30074,7 @@ async def pre_signals(
         if market == "IQ_OTC" and not state:
             return {"ok":True,"engine":"SCALPERPRO","items":[],"seconds_to_entry":remain,"message":"SCALPER PRO OTC aguardando conexão com a IQ Option."}
         try:
-            raw=(await iq_ea_candles(state,target,interval,260,regular_market=False)) if market == "IQ_OTC" else (await candles(target,interval,260,"OPEN",None,request=request))
+            raw=(await iq_ea_candles(state,target,interval,260,regular_market=False)) if market == "IQ_OTC" else (await _scalper_pro_candles(target,interval,260,"OPEN",None,request=request))
             tech=scalper_pro_strategy(raw[-260:],symbol=target,timeframe=interval,market=market,current_candle_closed=False,allow_prealert=True)
             items=[]
             if tech.get("confirmed") and str(tech.get("direction") or "").upper() in ("CALL","PUT"):
@@ -41028,6 +41029,55 @@ function promoteVelocityPreAlertToOfficial(item){
   return true;
 }
 
+
+function promoteScalperProPreAlertToOfficial(item){
+  if(!item || selectedRobotEngine()!=='SCALPERPRO') return false;
+  const dir=String(item.direction||'').toUpperCase();
+  if(dir!=='CALL' && dir!=='PUT' || !item.entry_time) return false;
+
+  const entryMs=Date.parse(item.entry_time);
+  if(!Number.isFinite(entryMs)) return false;
+  const stepMs=intervalSecondsValue((interval&&interval.value)||'1min')*1000;
+  const sym=String(item.symbol||((S&&S.value)||''));
+  const intv=String((interval&&interval.value)||'1min');
+  const mkt=String((market&&market.value)||'OPEN');
+
+  const signal={
+    source:'SCALPERPRO_PRE_ALERT_LOCKED',
+    selected_engine:'SCALPERPRO',
+    mode:'SCALPERPRO',
+    strategy:'SCALPER PRO',
+    symbol:sym,
+    interval:intv,
+    requested_market:mkt,
+    market:mkt,
+    direction:dir,
+    confidence:Number(item.confidence||76),
+    entry_time:item.entry_time,
+    expiry_time:new Date(entryMs+stepMs).toISOString(),
+    entry_mode:'BIRTH',
+    risk:'MEDIUM',
+    status:'SINAL LIBERADO • SCALPER PRO',
+    reason:String(item.reason||'Pré-alerta SCALPER PRO confirmado para a próxima vela.'),
+    promoted_from_prealert:true,
+    early_signal_locked:true
+  };
+
+  cur=signal;
+  direction.textContent=dir;
+  direction.className='big '+(dir==='CALL'?'call':'put');
+  paintSignalAsset(sym);
+  confidence.textContent='Confiança: '+Math.round(signal.confidence)+'%';
+  entry.textContent=ft(signal.entry_time);
+  countdown.textContent='SINAL CONFIRMADO • entrada na próxima vela';
+  statusBox.textContent=signal.status;
+  if(risk) risk.textContent='Risco: '+signal.risk+' • pré-alerta travado';
+
+  rememberPendingTrade(signal);
+  maybeSendTelegramSignal(signal);
+  return true;
+}
+
 function renderVelocityPreviewOnMain(data){
   const d=data||{};
   const diag=(d.technical&&d.technical.diagnostics)?d.technical.diagnostics:(d.diagnostics||{});
@@ -41486,6 +41536,11 @@ async function loadPreSignals(){
     // no painel/robô para a próxima vela. Ele não espera o fechamento.
     if(engine==='VELOCITY' && items[0]){
       promoteVelocityPreAlertToOfficial(items[0]);
+    }
+    // 3.97.49 — SCALPER PRO confirmado no pré-alerta entra imediatamente no painel.
+    // Não depende do próximo polling de /signal-ai para deixar de mostrar "procurando dados".
+    if(engine==='SCALPERPRO' && items[0]){
+      promoteScalperProPreAlertToOfficial(items[0]);
     }
 
     if(preSignals){
