@@ -42,11 +42,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.99"
+APP_VERSION = "3.98.00"
 # MEGA IA 3.97.98 — painel: CALL/PUT promovido pelo radar fica travado até a expiração mesmo se o polling seguinte der NEUTRO/erro; resultado BTC/Binance é apurado direto na mesma fonte com retry rápido.
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
 # MEGA IA 3.97.97 — corrige MEGA MONEY EA preso em FONTE EM ESPERA: o ramo agora carrega candles e BTC/USD OPEN usa Binance diretamente.
 # MEGA IA 3.97.99 — resultado imediato: normaliza aliases da fonte (BINANCE PÚBLICA/BINANCE_PUBLIC) para não rejeitar o candle fechado da própria Binance.
+# MEGA IA 3.98.00 — resultado com recuperação por próximos sinais: LOSS só fecha após 2 recuperações; WIN em REC1/REC2 encerra a sequência; Telegram recebe apenas o desfecho final.
 # MEGA IA 3.97.94 — Telegram: placar final automático ao desligar envio (sessão, horários, WIN/LOSS e aproveitamento).
 # MEGA IA 3.97.94 — histórico mostra o indicador/motor real gravado em cada sinal; remove OUTRO/ANTIGO dos novos resultados.
 # MEGA IA 3.97.93 — SIDUS EA V3.20 FLEX: crossover WMA5/8 ganha memória causal de até 3 candles; mantém túnel EMA18/28, próxima M1 e sem Gale.
@@ -43266,6 +43267,55 @@ function cd(){
   }
 }
 
+// 3.98.00 — recuperação por PRÓXIMOS SINAIS (não é Gale por vela).
+// Um LOSS intermediário não entra no placar/histórico/Telegram.
+// stage 0 = entrada normal; 1 = aguardando REC 1; 2 = aguardando REC 2.
+const RESULT_RECOVERY_KEY='mega_result_recovery_v1';
+let resultRecoveryState={stage:0,started_at:'',last_loss_trade:null};
+function loadResultRecoveryState(){
+  try{
+    const x=JSON.parse(localStorage.getItem(RESULT_RECOVERY_KEY)||'{}')||{};
+    resultRecoveryState={
+      stage:Math.max(0,Math.min(2,Number(x.stage||0))),
+      started_at:String(x.started_at||''),
+      last_loss_trade:(x.last_loss_trade&&typeof x.last_loss_trade==='object')?x.last_loss_trade:null
+    };
+  }catch(_){ resultRecoveryState={stage:0,started_at:'',last_loss_trade:null}; }
+}
+function saveResultRecoveryState(){
+  try{ localStorage.setItem(RESULT_RECOVERY_KEY,JSON.stringify(resultRecoveryState)); }catch(_){ }
+}
+function clearResultRecoveryState(){
+  resultRecoveryState={stage:0,started_at:'',last_loss_trade:null};
+  saveResultRecoveryState();
+}
+loadResultRecoveryState();
+
+function resolveRecoveryOutcome(trade,x){
+  const raw=String((x&&x.result)||'').toUpperCase().trim();
+  const stage=Math.max(0,Math.min(2,Number(resultRecoveryState.stage||0)));
+  if(raw==='DRAW' || !['WIN','LOSS'].includes(raw)){
+    return {final:false,draw:raw==='DRAW',label:raw,stage};
+  }
+  if(raw==='WIN'){
+    const label=stage===1?'WIN G1':(stage===2?'WIN G2':'WIN');
+    clearResultRecoveryState();
+    return {final:true,label,accounting:'WIN',stage};
+  }
+  // LOSS: as duas primeiras perdas apenas armam a recuperação no próximo sinal real.
+  if(stage<2){
+    resultRecoveryState={
+      stage:stage+1,
+      started_at:resultRecoveryState.started_at||String((trade&&trade.entry_time)||new Date().toISOString()),
+      last_loss_trade:{symbol:trade&&trade.symbol||'',direction:trade&&trade.direction||'',entry_time:trade&&trade.entry_time||'',expiry_time:trade&&trade.expiry_time||''}
+    };
+    saveResultRecoveryState();
+    return {final:false,label:stage===0?'REC 1 PENDENTE':'REC 2 PENDENTE',stage:stage+1};
+  }
+  clearResultRecoveryState();
+  return {final:true,label:'LOSS G2',accounting:'LOSS',stage:2};
+}
+
 async function resultCheck(){
   if(resultBusy) return;
 
@@ -43323,60 +43373,69 @@ async function resultCheck(){
       return;
     }
 
-    // A vela da entrada é o resultado final. Não existe acompanhamento G1/G2.
-    const accountingChanged=registerPersistentResult(t,x);
-    if(accountingChanged){
-      // Atualiza WIN/LOSS na tela imediatamente.
-      paintPersistentResults();
-      // Sincroniza depois, sem permitir que o servidor zere o placar local.
-      await perf();
-    }
+    // 3.98.00 — decide o desfecho da SEQUÊNCIA antes de mexer no placar/Telegram.
+    // LOSS normal e LOSS da REC 1 ficam ocultos; o próximo sinal real assume a recuperação.
+    const recovery=resolveRecoveryOutcome(t,x);
 
     if(galeStageStatus && !x.result){
-      galeStageStatus.textContent='⏳ Aguardando resultado direto da entrada';
+      galeStageStatus.textContent='⏳ Aguardando resultado da entrada';
     }
 
     if(x.result){
-      result.textContent=x.result;
-
-      if(galeLastResult){
-        galeLastResult.textContent=x.result;
-        galeLastResult.className='big '+(String(x.result).startsWith('WIN')?'call':'put');
-      }
-
-      if(galeStageStatus){
-        galeStageStatus.textContent=
-          x.result==='WIN' ? '✅ WIN direto • sem Gale' :
-          x.result==='LOSS' ? '❌ LOSS direto • recuperação somente no próximo sinal' :
-          '⚪ DRAW • sem Gale';
-      }
-
       const k=t.symbol+'|'+t.direction+'|'+t.expiry_time;
 
-      // Resultado visual: dinheiro sobe no WIN e desce no LOSS.
-      // Sem aviso de voz, conforme configuração do painel.
+      if(!recovery.final){
+        if(recovery.draw){
+          result.textContent='DRAW';
+          if(galeStageStatus) galeStageStatus.textContent='⚪ DRAW • recuperação permanece no próximo sinal';
+        }else{
+          // Não mostra LOSS e não contabiliza: informa apenas que a recuperação está pendente.
+          result.textContent=recovery.stage===1?'REC 1':'REC 2';
+          if(galeLastResult){
+            galeLastResult.textContent=recovery.stage===1?'REC 1 PENDENTE':'REC 2 PENDENTE';
+            galeLastResult.className='big';
+          }
+          if(galeStageStatus){
+            galeStageStatus.textContent=recovery.stage===1
+              ? '⏳ Entrada perdeu • LOSS oculto • aguardando REC 1 no próximo sinal'
+              : '⏳ REC 1 perdeu • LOSS oculto • aguardando REC 2 no próximo sinal';
+          }
+        }
+        // A operação física terminou; libera a fila. O estado de recuperação continua salvo.
+        promoteNextPendingTrade();
+        return;
+      }
+
+      // Só o desfecho final entra no placar/histórico: WIN, WIN G1, WIN G2 ou LOSS G2.
+      const finalX={...x,result:recovery.accounting,entry_result:recovery.accounting};
+      const accountingChanged=registerPersistentResult(t,finalX);
+      if(accountingChanged){
+        paintPersistentResults();
+        await perf();
+      }
+
+      result.textContent=recovery.label;
+      if(galeLastResult){
+        galeLastResult.textContent=recovery.label;
+        galeLastResult.className='big '+(recovery.accounting==='WIN'?'call':'put');
+      }
+      if(galeStageStatus){
+        galeStageStatus.textContent=
+          recovery.label==='WIN' ? '✅ WIN direto • sequência encerrada' :
+          recovery.label==='WIN G1' ? '✅ WIN • recuperação 1 concluída' :
+          recovery.label==='WIN G2' ? '✅ WIN • recuperação 2 concluída' :
+          '❌ LOSS FINAL • perdeu entrada + REC 1 + REC 2';
+      }
+
       if(k!==moneyFxKey){
         moneyFxKey=k;
-        if(String(x.result||'').toUpperCase().startsWith('WIN')){
-          playMoneyRain('WIN');
-        }else if(String(x.result||'').toUpperCase().startsWith('LOSS')){
-          playMoneyRain('LOSS');
-        }
+        playMoneyRain(recovery.accounting==='WIN'?'WIN':'LOSS');
       }
+      if(k!==reskey) reskey=k;
 
-      if(k!==reskey){
-        reskey=k;
-      }
-
-      // Envia o resultado FINAL uma única vez ao grupo Telegram: WIN ou LOSS.
-      if(['WIN','LOSS'].includes(String(x.result||'').toUpperCase())){
-        await maybeSendTelegramResult(t,x);
-      }
-
-      // Atualiza também os dados do servidor após o resultado final.
+      // Telegram recebe SOMENTE o desfecho final da sequência.
+      await maybeSendTelegramResult(t,{...x,result:recovery.label});
       await perf();
-
-      // Finalizada: passa para a próxima operação que estiver aguardando resultado.
       promoteNextPendingTrade();
     }
 
