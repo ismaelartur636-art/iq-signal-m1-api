@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.88"
+APP_VERSION = "3.97.89"
+# MEGA IA 3.97.89 — corrige visibilidade do card PAUL MACD no painel e completa registro no Backtest 48H.
 # MEGA IA 3.97.88 — PAUL MACD integrado: MACD 10/20/7 M1 + confirmação direcional M5, próxima M1, sem grid/Martingale/Gale.
 # MEGA IA 3.97.87 — SIDUS EA V3.20 integrado como motor separado; adaptação causal do crossover, próxima M1, sem gestão MT4/Martingale/Gale.
 # MEGA IA 3.97.86 — corrige BTC/USD travado: radar pode enviar CALL/PUT do próprio BTC ao painel sem permitir troca automática de ativo.
@@ -29232,7 +29233,7 @@ def scalping_asia_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
 # -----------------------------------------------------------------------------
 _BACKTEST48_SUPPORTED = {
     "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER",
-    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "MASYUK", "PYRAMID7", "PREDATORPIPS",
+    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "PAULMACD", "MASYUK", "PYRAMID7", "PREDATORPIPS",
 }
 _BACKTEST48_NAMES = {
     "SMART": "MOTOR REMOVIDO",
@@ -29250,6 +29251,8 @@ _BACKTEST48_NAMES = {
     "DRAGONFIRE": "🔥 DRAGON FIRE",
     "DRAGONFIREPRO": "🔥 DRAGON FIRE PRO",
     "FIBORSI": "🌀 ROBO FIBO",
+    "SIDUS320": "🎯 SIDUS EA V3.20",
+    "PAULMACD": "📈 PAUL MACD M1 + M5",
     "MASYUK": "⚡ MASYUK V3",
     "PYRAMID7": "🔺 PYRAMID 7 PRO",
 }
@@ -33990,8 +33993,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <style>
     /* 3.97.11 — painel de motores enxuto: MOTOR REMOVIDO + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
-    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#sidus320ModeCard,#masyukModeCard,#pyramid7ModeCard,#predatorPipsModeCard{display:flex !important}
-    #scalperProModeCard .robot-mode-desc,#dragonFireModeCard .robot-mode-desc,#dragonFireProModeCard .robot-mode-desc,#roboFiboModeCard .robot-mode-desc,#sidus320ModeCard .robot-mode-desc,#masyukModeCard .robot-mode-desc,#pyramid7ModeCard .robot-mode-desc,#predatorPipsModeCard .robot-mode-desc{display:none !important}
+    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#paulMacdModeCard,#sidus320ModeCard,#masyukModeCard,#pyramid7ModeCard,#predatorPipsModeCard{display:flex !important}
+    #scalperProModeCard .robot-mode-desc,#dragonFireModeCard .robot-mode-desc,#dragonFireProModeCard .robot-mode-desc,#roboFiboModeCard .robot-mode-desc,#paulMacdModeCard .robot-mode-desc,#sidus320ModeCard .robot-mode-desc,#masyukModeCard .robot-mode-desc,#pyramid7ModeCard .robot-mode-desc,#predatorPipsModeCard .robot-mode-desc{display:none !important}
     #scalpingAsiaModeCard{display:none !important}
   </style>
 
