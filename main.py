@@ -42,11 +42,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.02"
+APP_VERSION = "3.98.04"
 # MEGA IA 3.97.98 — painel: CALL/PUT promovido pelo radar fica travado até a expiração mesmo se o polling seguinte der NEUTRO/erro; resultado BTC/Binance é apurado direto na mesma fonte com retry rápido.
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
 # MEGA IA 3.97.97 — corrige MEGA MONEY EA preso em FONTE EM ESPERA: o ramo agora carrega candles e BTC/USD OPEN usa Binance diretamente.
 # MEGA IA 3.97.99 — resultado imediato: normaliza aliases da fonte (BINANCE PÚBLICA/BINANCE_PUBLIC) para não rejeitar o candle fechado da própria Binance.
+# MEGA IA 3.98.04 — Telegram usa o mesmo desfecho final do histórico: WIN DIRETO, WIN REC 1, WIN REC 2 ou LOSS REC 2; LOSS intermediário não é enviado.
 # MEGA IA 3.98.02 — histórico/resultados exibem o desfecho real da sequência: WIN DIRETO, WIN REC 1, WIN REC 2 ou LOSS REC 2; perdas intermediárias continuam ocultas.
 # MEGA IA 3.98.01 — corrige avanço duplicado da recuperação: a mesma operação LOSS não pode consumir REC1 e REC2; LOSS G2 somente após três operações distintas (entrada + REC1 + REC2).
 # MEGA IA 3.98.00 — resultado com recuperação por próximos sinais: LOSS só fecha após 2 recuperações; WIN em REC1/REC2 encerra a sequência; Telegram recebe apenas o desfecho final.
@@ -27763,10 +27764,16 @@ def _tg_signal_text(body: TelegramSignalBody) -> str:
     direction = str(body.direction or "NEUTRO").upper()
     market_label = "MERCADO ABERTO" if str(body.market or "OPEN").upper() == "OPEN" else "OTC • IQ OPTION"
     result_label = str(body.result or "").upper().strip()
+    result_display = {
+        "WIN": "WIN DIRETO",
+        "WIN G1": "WIN REC 1",
+        "WIN G2": "WIN REC 2",
+        "LOSS G2": "LOSS REC 2",
+    }.get(result_label, result_label)
     if result_label.startswith("WIN"):
         return (
             f"🏆 MEGA IA • RESULTADO\n"
-            f"✅ {result_label}\n"
+            f"✅ {result_display}\n"
             f"📊 {body.symbol} • {direction}\n"
             f"🕐 Período: {body.interval}\n"
             f"⏱ Entrada: {_tg_display_time(body.entry_time)}\n"
@@ -27775,7 +27782,7 @@ def _tg_signal_text(body: TelegramSignalBody) -> str:
     if result_label.startswith("LOSS"):
         return (
             f"📉 MEGA IA • RESULTADO\n"
-            f"❌ {result_label}\n"
+            f"❌ {result_display}\n"
             f"📊 {body.symbol} • {direction}\n"
             f"🕐 Período: {body.interval}\n"
             f"⏱ Entrada: {_tg_display_time(body.entry_time)}\n"
@@ -28026,8 +28033,10 @@ async def telegram_send(body: TelegramSignalBody):
         if not bool(background_bot_state.get("telegram_enabled")):
             raise HTTPException(409, "Telegram automático está OFF no painel.")
         if result_label:
-            if result_label not in ("WIN", "LOSS"):
-                raise HTTPException(400, "Somente resultados finais WIN/LOSS podem ser enviados automaticamente ao Telegram.")
+            # 3.98.04 — aceita somente DESFECHOS finais da sequência.
+            # LOSS intermediário não chega aqui; REC1/REC2 usam os próximos sinais reais.
+            if result_label not in ("WIN", "WIN G1", "WIN G2", "LOSS G2"):
+                raise HTTPException(400, "Somente resultados finais WIN DIRETO/WIN REC 1/WIN REC 2/LOSS REC 2 podem ser enviados automaticamente ao Telegram.")
         elif direction not in ("CALL", "PUT"):
             raise HTTPException(400, "Somente sinais CALL ou PUT confirmados podem ser enviados.")
     return await _tg_send(body)
@@ -38968,7 +38977,8 @@ async function maybeSendTelegramResult(trade,outcome){
     });
     telegramLastWinKey=key;
     try{ localStorage.setItem(TELEGRAM_LAST_WIN_KEY,key); }catch(_){ }
-    if(telegramSendStatus) telegramSendStatus.textContent=(resultLabel.startsWith('WIN')?'🏆 ':'❌ ')+'Resultado enviado ao grupo: '+(trade.symbol||'--')+' • '+resultLabel;
+    const telegramResultDisplay=resultLabel==='WIN'?'WIN DIRETO':(resultLabel==='WIN G1'?'WIN REC 1':(resultLabel==='WIN G2'?'WIN REC 2':(resultLabel==='LOSS G2'?'LOSS REC 2':resultLabel)));
+    if(telegramSendStatus) telegramSendStatus.textContent=(resultLabel.startsWith('WIN')?'🏆 ':'❌ ')+'Resultado enviado ao grupo: '+(trade.symbol||'--')+' • '+telegramResultDisplay;
   }catch(e){
     if(telegramSendStatus) telegramSendStatus.textContent='❌ Falha ao enviar resultado: '+String(e&&e.message?e.message:e);
   }
