@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.90"
+APP_VERSION = "3.97.91"
+# MEGA IA 3.97.91 — QUASMOD 2 FLEX: mantém S1/S2 originais, mas flexibiliza zonas RSI/CCI/SMA e toque dos extremos para aumentar sinais sem Gale.
 # MEGA IA 3.97.90 — QUASMOD 2 integrado como motor separado: CCI/RSI/SMA M15 + extremos/CCI M5, próxima M1, sem Recovery/Martingale/Gale.
 # MEGA IA 3.97.89 — corrige visibilidade do card PAUL MACD no painel e completa registro no Backtest 48H.
 # MEGA IA 3.97.88 — PAUL MACD integrado: MACD 10/20/7 M1 + confirmação direcional M5, próxima M1, sem grid/Martingale/Gale.
@@ -28897,7 +28898,7 @@ def quasmod2_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     """
     rows=list(cs or [])[-900:]
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
-          "strategy":"🧩 QUASMOD 2","engine":"QUASMOD2","provider":"QUASMOD2_S1_S2_CAUSAL",
+          "strategy":"🧩 QUASMOD 2","engine":"QUASMOD2","provider":"QUASMOD2_S1_S2_FLEX25",
           "next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,
           "recovery":False,"grid":False,"martingale":False,"closed_candles_only":True,"non_repaint_after_release":True}
     if len(rows)<300: return {**base,"reason":f"QUASMOD 2 coletando candles ({len(rows)}/300)."}
@@ -28921,18 +28922,28 @@ def quasmod2_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         if len(m15)<22 or len(m5)<276:return {**base,"reason":"QUASMOD 2 aguardando histórico M5/M15 suficiente."}
         c15=[float(x['close']) for x in m15]; c5=[float(x['close']) for x in m5]
         cci8=cci_v(m15,8); r6=rsi_v(c15,6); r20=rsi_v(c15,20); ma=sma_v(c15,20)
-        s1_call=cci8>0 and r6>50 and r20>=50 and c15[-1]>=ma
-        s1_put=cci8<0 and r6<50 and r20<=50 and c15[-1]<=ma
+        # FLEX ~25%: preserva a direção do S1, mas usa uma pequena zona neutra ao redor de 50/zero
+        # e tolerância mínima em torno da SMA para não perder oportunidade por poucos pontos.
+        recent_ranges=[float(x['high'])-float(x['low']) for x in m15[-14:]]
+        avg_range15=(sum(recent_ranges)/len(recent_ranges)) if recent_ranges else 0.0
+        ma_tol=avg_range15*0.12
+        s1_call=cci8>-18 and r6>47 and r20>=47 and c15[-1]>=ma-ma_tol
+        s1_put=cci8<18 and r6<53 and r20<=53 and c15[-1]<=ma+ma_tol
         cci168=cci_v(m5,168); cci275=cci_v(m5,275); prev=m5[-13:-1]; lo=min(float(x['low']) for x in prev); hi=max(float(x['high']) for x in prev); last=m5[-1]
-        s2_call=float(last['low'])<=lo and float(last['close'])>lo and cci168<0 and cci275<0
-        s2_put=float(last['high'])>=hi and float(last['close'])<hi and cci168>0 and cci275>0
+        recent5_ranges=[float(x['high'])-float(x['low']) for x in m5[-14:]]
+        avg_range5=(sum(recent5_ranges)/len(recent5_ranges)) if recent5_ranges else 0.0
+        extreme_tol=avg_range5*0.18
+        # S2 continua sendo reversão nos extremos, porém aceita aproximação da zona e um CCI longo
+        # claramente extremo com o outro ainda perto do zero.
+        s2_call=float(last['low'])<=lo+extreme_tol and float(last['close'])>lo-extreme_tol and cci168<15 and cci275<15 and (cci168<0 or cci275<0)
+        s2_put=float(last['high'])>=hi-extreme_tol and float(last['close'])<hi+extreme_tol and cci168>-15 and cci275>-15 and (cci168>0 or cci275>0)
         call=s1_call or s2_call; put=s1_put or s2_put
         direction='CALL' if call and not put else ('PUT' if put and not call else 'NEUTRO')
         diag={"s1_call":s1_call,"s1_put":s1_put,"s2_call":s2_call,"s2_put":s2_put,"cci8_m15":round(cci8,2),"rsi6_m15":round(r6,2),"rsi20_m15":round(r20,2),"cci168_m5":round(cci168,2),"cci275_m5":round(cci275,2)}
-        if direction=='NEUTRO': return {**base,"reason":"QUASMOD 2 monitorando S1 M15 e S2 M5.","diagnostics":diag}
+        if direction=='NEUTRO': return {**base,"reason":"QUASMOD 2 FLEX monitorando S1 M15 e S2 M5.","diagnostics":diag}
         votes=int(s1_call or s1_put)+int(s2_call or s2_put); conf=84.0 if votes>=2 else 78.0
         stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or '')
-        return {**base,"direction":direction,"confidence":conf,"confirmed":True,"risk":"LOW" if votes>=2 else "MEDIUM","reason":f"{direction} QUASMOD 2 • regra S1/S2 confirmada • próxima M1 • sem Recovery/Gale.","event_key":f"QUASMOD2:{direction}:{stamp}","diagnostics":diag}
+        return {**base,"direction":direction,"confidence":conf,"confirmed":True,"risk":"LOW" if votes>=2 else "MEDIUM","reason":f"{direction} QUASMOD 2 FLEX • S1/S2 confirmado • próxima M1 • sem Recovery/Gale.","event_key":f"QUASMOD2:{direction}:{stamp}","diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"QUASMOD 2 aguardando leitura válida: {str(exc)[:100]}"}
 
