@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.97"
+APP_VERSION = "3.97.98"
+# MEGA IA 3.97.98 — painel: CALL/PUT promovido pelo radar fica travado até a expiração mesmo se o polling seguinte der NEUTRO/erro; resultado BTC/Binance é apurado direto na mesma fonte com retry rápido.
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
 # MEGA IA 3.97.97 — corrige MEGA MONEY EA preso em FONTE EM ESPERA: o ramo agora carrega candles e BTC/USD OPEN usa Binance diretamente.
 # MEGA IA 3.97.94 — Telegram: placar final automático ao desligar envio (sessão, horários, WIN/LOSS e aproveitamento).
@@ -33720,7 +33721,7 @@ async def result(
                 "stage": "ENTRADA",
                 "result": None,
                 "entry_result": None,
-                "retry_after": 15,
+                "retry_after": 3,
                 "message": str(exc.detail)[:220],
             }
         except Exception as exc:
@@ -33729,7 +33730,7 @@ async def result(
                 "stage": "ENTRADA",
                 "result": None,
                 "entry_result": None,
-                "retry_after": 15,
+                "retry_after": 3,
                 "message": str(exc)[:220],
             }
 
@@ -33785,6 +33786,21 @@ async def result(
                 return found
 
         elif market == "OPEN":
+            # 3.97.98 — se o sinal nasceu na Binance (ex.: BTC/USD do radar),
+            # apura o resultado diretamente na mesma fonte. Antes o roteador podia
+            # devolver cTrader; a checagem de compatibilidade rejeitava a vela e o
+            # resultado ficava aguardando por muitos minutos.
+            if "BINANCE" in expected_result_feed:
+                try:
+                    fresh_binance = await _binance_public_candles(symbol, interval, 140)
+                except Exception:
+                    fresh_binance = []
+                if fresh_binance:
+                    cs = fresh_binance
+                    found = candle_near(target_dt)
+                    if found:
+                        return found
+
             cache_key = f"{symbol}|{interval}"
             _invalidate_preexpiry_open_result_cache(symbol, interval, expiry_dt)
             old_public_cache = public_feed_cache.pop(cache_key, None)
@@ -33861,7 +33877,7 @@ async def result(
             "stage": stage,
             "result": None,
             "entry_result": entry_result,
-            "retry_after": 15,
+            "retry_after": 3,
         }
         if g1_result is not None:
             out["g1_result"] = g1_result
@@ -36362,11 +36378,12 @@ let megaVoices=[];
 let chartData=[];
 let chartPreSignal=null;
 let resultBusy=false;
+let panelSignalLock=null;
 let pendingTrade=null;
 let pendingTradeQueue=[];
 let lastCountdownSignalKey='';
 let lastChartSignalVoice='';
-const RESULT_RETRY_MS=15000;
+const RESULT_RETRY_MS=3000;
 const RESULT_MAX_PENDING_AGE_MS=30*60*1000;
 
 const RESULT_STATS_KEY='mega_result_stats_v33741';
@@ -42543,7 +42560,13 @@ async function sig(announce=false){
     // 3.97.79 — guarda o sinal que já está visível ANTES do novo polling.
     // O radar pode promover um CALL/PUT localmente e, alguns ms depois, /signal-ai
     // ainda responder NEUTRO. Sem esta retenção, o painel piscava e apagava o sinal.
-    const previousPanelSignal=(cur&&typeof cur==='object')?{...cur}:null;
+    const lockExpiryMs=Date.parse(String((panelSignalLock&&panelSignalLock.expiry_time)||''));
+    const lockEngine=String((panelSignalLock&&(panelSignalLock.selected_engine||panelSignalLock.engine))||'').toUpperCase();
+    const lockSameSymbol=String((panelSignalLock&&panelSignalLock.symbol)||'')===String((S&&S.value)||'');
+    const lockSameEngine=!lockEngine||lockEngine===String(engine||'').toUpperCase();
+    const lockAlive=panelSignalLock && Number.isFinite(lockExpiryMs) && lockExpiryMs>Date.now() && lockSameSymbol && lockSameEngine;
+    if(panelSignalLock && !lockAlive) panelSignalLock=null;
+    const previousPanelSignal=lockAlive?{...panelSignalLock}:((cur&&typeof cur==='object')?{...cur}:null);
     const serverSignal=await get(
       `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent(['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER'].includes(engine)?'BIRTH':((entryMode&&entryMode.value)||'BIRTH'))}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`
     );
@@ -42557,11 +42580,15 @@ async function sig(announce=false){
     const previousSameInterval=String((previousPanelSignal&&previousPanelSignal.interval)||'')===String((interval&&interval.value)||'');
     const previousEngine=String((previousPanelSignal&&(previousPanelSignal.selected_engine||previousPanelSignal.engine))||'').toUpperCase();
     const previousSameEngine=!previousEngine||previousEngine===String(engine||'').toUpperCase();
-    if(serverDirection==='NEUTRO' && (previousDirection==='CALL'||previousDirection==='PUT') && previousStillAlive && previousSameSymbol && previousSameInterval && previousSameEngine){
+    if(serverDirection==='NEUTRO' && (previousDirection==='CALL'||previousDirection==='PUT') && previousStillAlive && previousSameSymbol && (previousSameInterval||!previousPanelSignal.interval) && previousSameEngine){
       const heldBaseStatus=String(previousPanelSignal.status||'SINAL CONFIRMADO')
         .replace(/(?:\s*•\s*MANTIDO ATÉ A EXPIRAÇÃO)+/gi,'')
         .trim();
       cur={...previousPanelSignal,signal_held_until_expiry:true,status:heldBaseStatus+' • MANTIDO ATÉ A EXPIRAÇÃO'};
+      panelSignalLock={...cur};
+    }else if(serverDirection==='CALL'||serverDirection==='PUT'){
+      const serverExpiryMs=Date.parse(String((serverSignal&&serverSignal.expiry_time)||''));
+      if(Number.isFinite(serverExpiryMs) && serverExpiryMs>Date.now()) panelSignalLock={...serverSignal};
     }
 
     // 3.64: quando o pré-alerta completo do Velocity já foi promovido a ALERTA,
@@ -42684,14 +42711,32 @@ async function sig(announce=false){
     const isDataSource=low.includes('twelve data') || low.includes('candle') || low.includes('limite da api') || low.includes('credit');
     const isServer=low.includes('http 502') || low.includes('http 503') || low.includes('http 504') || low.includes('failed to fetch') || low.includes('network');
 
-    statusBox.textContent=(isDataSource
-      ? 'DADOS DE MERCADO EM ESPERA • '+msg
-      : (isServer ? 'SERVIDOR RECONECTANDO • '+msg : 'ERRO DE COMUNICAÇÃO • '+msg));
-    direction.textContent='NEUTRO';
-    direction.className='big neutral';
-    entry.textContent='AGUARDANDO DADOS';
-    countdown.textContent='Sem entrada confirmada';
-    if(dataFeedText) dataFeedText.textContent='⚠️ Fonte temporariamente indisponível • fallback automático em andamento';
+    const catchExpiryMs=Date.parse(String((panelSignalLock&&panelSignalLock.expiry_time)||''));
+    const catchEngine=String((panelSignalLock&&(panelSignalLock.selected_engine||panelSignalLock.engine))||'').toUpperCase();
+    const catchLockAlive=panelSignalLock && Number.isFinite(catchExpiryMs) && catchExpiryMs>Date.now()
+      && String(panelSignalLock.symbol||'')===String((S&&S.value)||'')
+      && (!catchEngine||catchEngine===String(selectedRobotEngine()||'').toUpperCase());
+    if(catchLockAlive){
+      cur={...panelSignalLock,signal_held_until_expiry:true};
+      direction.textContent=cur.direction;
+      direction.className='big '+(cur.direction==='CALL'?'call':'put');
+      confidence.textContent='Confiança: '+Number(cur.confidence||0).toFixed(0)+'%';
+      entry.textContent=ft(cur.entry_time);
+      countdown.textContent='Sinal mantido até a expiração';
+      statusBox.textContent=String(cur.status||'SINAL CONFIRMADO').replace(/(?:\s*•\s*MANTIDO ATÉ A EXPIRAÇÃO)+/gi,'')+' • MANTIDO ATÉ A EXPIRAÇÃO';
+      risk.textContent='Risco: '+(cur.risk||'--');
+      if(dataFeedText) dataFeedText.textContent=String(cur.feed_label||cur.feed_source||'MULTIFONTE').replaceAll('_',' ')+' • SINAL PRESERVADO';
+    }else{
+      panelSignalLock=null;
+      statusBox.textContent=(isDataSource
+        ? 'DADOS DE MERCADO EM ESPERA • '+msg
+        : (isServer ? 'SERVIDOR RECONECTANDO • '+msg : 'ERRO DE COMUNICAÇÃO • '+msg));
+      direction.textContent='NEUTRO';
+      direction.className='big neutral';
+      entry.textContent='AGUARDANDO DADOS';
+      countdown.textContent='Sem entrada confirmada';
+      if(dataFeedText) dataFeedText.textContent='⚠️ Fonte temporariamente indisponível • fallback automático em andamento';
+    }
 
     // Evita repetir a mesma fala a cada polling de 5 segundos.
     const nowVoice=Date.now();
@@ -42848,6 +42893,7 @@ async function sendRadarOpportunityToRobot(items){
         feed_fallback:best.feed_fallback===true,
         promoted_from_radar:true
       };
+      panelSignalLock={...cur};
       direction.textContent=dir;
       direction.className='big '+(dir==='CALL'?'call':'put');
       paintSignalAsset(sym);
@@ -43570,7 +43616,7 @@ setInterval(()=>{
 },2000);
 
 // Resultado das operações abertas.
-setInterval(()=>{ if(megaCanPoll()) resultCheck(); },10000);
+setInterval(()=>{ if(megaCanPoll()) resultCheck(); },3000);
 setInterval(clk,1000);
 setInterval(()=>{ if(appEnabled && !document.hidden) cd(); },500);
 
