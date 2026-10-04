@@ -42,8 +42,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.96"
+APP_VERSION = "3.97.97"
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
+# MEGA IA 3.97.97 — corrige MEGA MONEY EA preso em FONTE EM ESPERA: o ramo agora carrega candles e BTC/USD OPEN usa Binance diretamente.
 # MEGA IA 3.97.94 — Telegram: placar final automático ao desligar envio (sessão, horários, WIN/LOSS e aproveitamento).
 # MEGA IA 3.97.94 — histórico mostra o indicador/motor real gravado em cada sinal; remove OUTRO/ANTIGO dos novos resultados.
 # MEGA IA 3.97.93 — SIDUS EA V3.20 FLEX: crossover WMA5/8 ganha memória causal de até 3 candles; mantém túnel EMA18/28, próxima M1 e sem Gale.
@@ -22586,7 +22587,35 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             else:
                 raw = await candles(symbol, interval, 180, "OPEN", None, request=request)
         elif engine == "MONEYPILE":
-            source_status = "MEGA MONEY EA • FONTE EM ESPERA" if market == "OPEN" else "MEGA MONEY EA • IQ OPTION OTC EM ESPERA"
+            # 3.97.97 — correção real do MEGA MONEY EA: este ramo antes apenas
+            # definia um texto de status e NÃO carregava `raw`, fazendo o fluxo cair
+            # em exceção e mostrar FONTE EM ESPERA mesmo com BTC/USD vivo no radar.
+            if market == "IQ_OTC":
+                if not iq_state:
+                    out = neutral_signal(
+                        symbol, interval, market,
+                        "MEGA MONEY EA • IQ OPTION OFFLINE",
+                        "Conecte a IQ Option para o MEGA MONEY EA analisar candles OTC reais.",
+                        source_state="WAITING",
+                    )
+                    out.update({"strategy":"💵 MEGA MONEY EA","selected_engine":engine,"feed_source":"IQ_OPTION_OTC"})
+                    cache[key] = (time.time(), out)
+                    return out
+                raw = await iq_ea_candles(iq_state, symbol, interval, 500, regular_market=False)
+            elif str(symbol or "").upper() in BINANCE_SYMBOLS:
+                # Cripto OPEN usa Binance diretamente neste motor. Assim painel e
+                # radar não divergem por causa de sessão cTrader/Twelve Data antiga.
+                raw = await _binance_public_candles(str(symbol or "").upper(), interval, 500)
+                raw = _tag_feed_rows(raw, "BINANCE_PUBLIC", BINANCE_SYMBOLS.get(str(symbol or "").upper()))
+                if len(raw) < 180:
+                    raise HTTPException(503, f"MEGA MONEY EA: Binance retornou poucos candles ({len(raw)}/180).")
+                age = _open_rows_age_seconds(raw)
+                fresh_limit = max(150.0, float(INTERVALS.get(interval, 60)) * 2.5)
+                if age > fresh_limit:
+                    raise HTTPException(503, f"MEGA MONEY EA: Binance com candles antigos ({int(age)}s).")
+                _record_open_feed_status(symbol, interval, "BINANCE_PUBLIC", source_symbol=BINANCE_SYMBOLS.get(str(symbol or "").upper()), rows=raw, fallback=False)
+            else:
+                raw = await candles(symbol, interval, 500, "OPEN", None, request=request)
         elif engine == "FORCE" and market == "IQ_OTC":
             if not iq_state:
                 out = neutral_signal(
