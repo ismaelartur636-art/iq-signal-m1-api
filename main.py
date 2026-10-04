@@ -42,11 +42,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.05"
+APP_VERSION = "3.98.06"
 # MEGA IA 3.97.98 — painel: CALL/PUT promovido pelo radar fica travado até a expiração mesmo se o polling seguinte der NEUTRO/erro; resultado BTC/Binance é apurado direto na mesma fonte com retry rápido.
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
 # MEGA IA 3.97.97 — corrige MEGA MONEY EA preso em FONTE EM ESPERA: o ramo agora carrega candles e BTC/USD OPEN usa Binance diretamente.
 # MEGA IA 3.97.99 — resultado imediato: normaliza aliases da fonte (BINANCE PÚBLICA/BINANCE_PUBLIC) para não rejeitar o candle fechado da própria Binance.
+# MEGA IA 3.98.06 — adiciona aba Gestão visível no painel para escolher Recuperação, Gale 1 ou Gale 2; mantém o seletor existente sincronizado.
 # MEGA IA 3.98.05 — Gestão selecionável: mantém Recuperação no Próximo Sinal e adiciona Gale 1/Gale 2.
 # MEGA IA 3.98.04 — Telegram usa o mesmo desfecho final do histórico: WIN DIRETO, WIN REC 1, WIN REC 2 ou LOSS REC 2; LOSS intermediário não é enviado.
 # MEGA IA 3.98.02 — histórico/resultados exibem o desfecho real da sequência: WIN DIRETO, WIN REC 1, WIN REC 2 ou LOSS REC 2; perdas intermediárias continuam ocultas.
@@ -34526,6 +34527,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button class="tabbtn" id="tabResults">🎯 Resultados</button>
     <button class="tabbtn" id="tabValues">💰 Valores</button>
     <button class="tabbtn" id="tabHistory">🗓️ Histórico 15 dias</button>
+    <button class="tabbtn" id="tabManagement">⚙️ Gestão</button>
     <button class="tabbtn" id="tabCompatibility">🧪 Compatibilidade</button>
     <button class="tabbtn" id="tabTelegram">✈️ Telegram</button>
     <button class="tabbtn" id="tabAccount">🏦 Corretora</button>
@@ -34792,6 +34794,30 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div id="historyList" style="display:grid;gap:8px;margin-top:12px"></div>
       <div class="label" style="margin-top:12px;line-height:1.5">
         O histórico guarda o resultado de cada entrada neste aparelho por até 15 dias: WIN, LOSS ou DRAW. Não existe G1/G2.
+      </div>
+    </div>
+  </div>
+
+
+  <div id="managementTab" class="tab">
+    <div class="card">
+      <h2 style="margin-top:0">⚙️ Gestão</h2>
+      <div class="label">ESCOLHA COMO O APP TRATA UMA ENTRADA QUE TERMINA EM LOSS</div>
+      <div class="card" style="margin-top:12px;border-color:#38bdf8">
+        <div style="font-weight:1000">MODO DE GESTÃO</div>
+        <select id="managementModeSelect" style="width:100%;margin-top:10px;font-weight:900">
+          <option value="RECOVERY">RECUPERAÇÃO NO PRÓXIMO SINAL</option>
+          <option value="G1">GALE 1</option>
+          <option value="G2">GALE 2</option>
+        </select>
+        <div id="managementModeStatus" class="label" style="margin-top:10px;line-height:1.5">
+          Recuperação no próximo sinal selecionada.
+        </div>
+      </div>
+      <div class="label" style="margin-top:12px;line-height:1.55">
+        <b>Recuperação no próximo sinal:</b> mantém a gestão que já existia e espera o próximo sinal real do indicador.
+        <br><b>Gale 1:</b> após LOSS, acompanha uma vela seguinte na mesma direção.
+        <br><b>Gale 2:</b> após LOSS, permite Gale 1 e, se necessário, Gale 2 nas duas velas seguintes.
       </div>
     </div>
   </div>
@@ -38183,6 +38209,33 @@ if(autoTradeGale){
   autoTradeGale.onchange=()=>{
     const mode=String(autoTradeGale.value||'RECOVERY').toUpperCase();
     try{ localStorage.setItem('mega_management_mode',mode); }catch(_){}
+    if(typeof syncManagementTab==='function') syncManagementTab(mode);
+    clearResultRecoveryState();
+    updateAutoTradePreview();
+    if(galeStageStatus) galeStageStatus.textContent=mode==='RECOVERY'?'Gestão: recuperação nos próximos sinais.':(mode==='G1'?'Gestão: Gale 1 na vela seguinte.':'Gestão: Gale 1 + Gale 2 nas duas velas seguintes.');
+  };
+}
+
+// 3.98.06 — aba Gestão: seletor visível e sincronizado com o modo já existente.
+const managementModeSelect=document.getElementById('managementModeSelect');
+const managementModeStatus=document.getElementById('managementModeStatus');
+function syncManagementTab(mode){
+  mode=String(mode||'RECOVERY').toUpperCase();
+  if(!['RECOVERY','G1','G2'].includes(mode)) mode='RECOVERY';
+  if(managementModeSelect) managementModeSelect.value=mode;
+  if(autoTradeGale) autoTradeGale.value=mode;
+  if(managementModeStatus){
+    managementModeStatus.textContent=mode==='RECOVERY'
+      ? '✅ Recuperação no próximo sinal selecionada.'
+      : (mode==='G1' ? '✅ Gale 1 selecionado: uma vela seguinte após LOSS.' : '✅ Gale 2 selecionado: até duas velas seguintes após LOSS.');
+  }
+}
+if(managementModeSelect){
+  syncManagementTab(String(localStorage.getItem('mega_management_mode')||'RECOVERY'));
+  managementModeSelect.onchange=()=>{
+    const mode=String(managementModeSelect.value||'RECOVERY').toUpperCase();
+    try{ localStorage.setItem('mega_management_mode',mode); }catch(_){}
+    syncManagementTab(mode);
     clearResultRecoveryState();
     updateAutoTradePreview();
     if(galeStageStatus) galeStageStatus.textContent=mode==='RECOVERY'?'Gestão: recuperação nos próximos sinais.':(mode==='G1'?'Gestão: Gale 1 na vela seguinte.':'Gestão: Gale 1 + Gale 2 nas duas velas seguintes.');
@@ -39085,6 +39138,7 @@ function showTab(which){
   const results=which==='results';
   const values=which==='values';
   const history=which==='history';
+  const management=which==='management';
   const compatibility=which==='compatibility';
   const telegram=which==='telegram';
   const account=which==='account';
@@ -39095,6 +39149,7 @@ function showTab(which){
   resultsTab.classList.toggle('active',results);
   valuesTab.classList.toggle('active',values);
   historyTab.classList.toggle('active',history);
+  managementTab.classList.toggle('active',management);
   compatibilityTab.classList.toggle('active',compatibility);
   telegramTab.classList.toggle('active',telegram);
   accountTab.classList.toggle('active',account);
@@ -39105,6 +39160,7 @@ function showTab(which){
   tabResults.classList.toggle('active',results);
   tabValues.classList.toggle('active',values);
   tabHistory.classList.toggle('active',history);
+  tabManagement.classList.toggle('active',management);
   tabCompatibility.classList.toggle('active',compatibility);
   tabTelegram.classList.toggle('active',telegram);
   tabAccount.classList.toggle('active',account);
@@ -39150,6 +39206,7 @@ if(tabVelocity) tabVelocity.onclick=()=>showTab('velocity');
 tabResults.onclick=()=>showTab('results');
 tabValues.onclick=()=>showTab('values');
 tabHistory.onclick=()=>showTab('history');
+tabManagement.onclick=()=>showTab('management');
 tabCompatibility.onclick=()=>showTab('compatibility');
 tabTelegram.onclick=()=>showTab('telegram');
 tabAccount.onclick=()=>showTab('account');
