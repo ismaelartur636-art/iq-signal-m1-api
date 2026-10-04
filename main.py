@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.92"
+APP_VERSION = "3.97.93"
+# MEGA IA 3.97.93 — SIDUS EA V3.20 FLEX: crossover WMA5/8 ganha memória causal de até 3 candles; mantém túnel EMA18/28, próxima M1 e sem Gale.
 # MEGA IA 3.97.92 — adiciona MONEY PILE EA: direção do candle fechado + RSI14 H1, próxima M1; sem grid/lotes/Martingale/Gale.
 # MEGA IA 3.97.91 — adiciona EA MILIONÁRIO: RSI14 x média RSI10 + LWMA140 M5 + Bears Power50; próxima M1; sem grid/lotes/Martingale/Gale.
 # MEGA IA 3.97.90 — adiciona PAUL MACD M1: mesmo MACD 10/20/7, confirmação no próprio M1, próxima M1, sem grid/Martingale/Gale.
@@ -29072,14 +29073,13 @@ def millionaire_ea_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN
 
 
 def sidus_v320_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """SIDUS EA V3.20 — adaptação causal para opções binárias.
-    O EA recebido terceiriza o gatilho ao indicador sidus-crossover_signal; no app usamos
-    a estrutura clássica Sidus (EMA18/28 + WMA5/8) e somente candle fechado.
-    Gestão de ordens, SL/TP, trailing e martingale do MT4 não são usados.
+    """SIDUS EA V3.20 FLEX — adaptação causal mais solta para opções binárias.
+    Mantém EMA18/28 + WMA5/8, mas aceita um crossover ocorrido em até 3 candles fechados.
+    Isso evita perder a oportunidade por polling sem transformar mero alinhamento em sinal contínuo.
     """
     rows=list(cs or [])
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
-          "strategy":"🎯 SIDUS EA V3.20","engine":"SIDUS320","provider":"SIDUS_V320_CAUSAL_ADAPTER",
+          "strategy":"🎯 SIDUS EA V3.20","engine":"SIDUS320","provider":"SIDUS_V320_CAUSAL_FLEX_V2",
           "next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,
           "grid":False,"martingale":False,"closed_candles_only":True,"non_repaint_after_release":True}
     if len(rows)<40:
@@ -29090,26 +29090,43 @@ def sidus_v320_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
             a=2.0/(period+1.0); out=[vals[0]]
             for v in vals[1:]: out.append(a*v+(1-a)*out[-1])
             return out
-        def _wma(vals, period, end=None):
-            vv=vals[:end] if end is not None else vals
-            q=vv[-period:]; den=period*(period+1)/2.0
+        def _wma_at(vals, period, end_idx):
+            q=vals[end_idx-period+1:end_idx+1]; den=period*(period+1)/2.0
             return sum(v*(i+1) for i,v in enumerate(q))/den
         e18=_ema_series(closes,18); e28=_ema_series(closes,28)
-        w5=_wma(closes,5); w8=_wma(closes,8); pw5=_wma(closes,5,-1); pw8=_wma(closes,8,-1)
+        w5=_wma_at(closes,5,len(closes)-1); w8=_wma_at(closes,8,len(closes)-1)
         tunnel_up=e18[-1]>e28[-1]; tunnel_dn=e18[-1]<e28[-1]
-        cross_up=pw5<=pw8 and w5>w8
-        cross_dn=pw5>=pw8 and w5<w8
-        call=cross_up and tunnel_up and closes[-1]>e18[-1]
-        put=cross_dn and tunnel_dn and closes[-1]<e18[-1]
+
+        # FLEX: o cruzamento pode ter acontecido no último, penúltimo ou antepenúltimo candle.
+        # A chave do evento usa o candle real do cruzamento, evitando repetir o mesmo sinal.
+        cross_up_idx=None; cross_dn_idx=None
+        first=max(8,len(closes)-3)
+        for i in range(first,len(closes)):
+            c5=_wma_at(closes,5,i); c8=_wma_at(closes,8,i)
+            p5=_wma_at(closes,5,i-1); p8=_wma_at(closes,8,i-1)
+            if p5<=p8 and c5>c8: cross_up_idx=i
+            if p5>=p8 and c5<c8: cross_dn_idx=i
+
+        aligned_up=w5>w8
+        aligned_dn=w5<w8
+        # O preço não precisa mais superar estritamente a EMA18: basta continuar do lado correto
+        # do túnel pela média rápida/lenta e preservar o alinhamento WMA.
+        call=cross_up_idx is not None and aligned_up and tunnel_up
+        put=cross_dn_idx is not None and aligned_dn and tunnel_dn
         direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
-        diag={"ema18":round(e18[-1],10),"ema28":round(e28[-1],10),"wma5":round(w5,10),"wma8":round(w8,10),"cross_up":cross_up,"cross_down":cross_dn}
+        diag={"ema18":round(e18[-1],10),"ema28":round(e28[-1],10),"wma5":round(w5,10),"wma8":round(w8,10),
+              "cross_up_recent":cross_up_idx is not None,"cross_down_recent":cross_dn_idx is not None,
+              "cross_memory_bars":3}
         if direction=="NEUTRO":
-            return {**base,"reason":"SIDUS monitorando crossover WMA 5/8 alinhado ao túnel EMA 18/28.","diagnostics":diag}
+            return {**base,"reason":"SIDUS FLEX monitorando crossover WMA 5/8 (memória 3 candles) alinhado ao túnel EMA 18/28.","diagnostics":diag}
+        cross_idx=cross_up_idx if direction=="CALL" else cross_dn_idx
         spread=abs(w5-w8)/max(abs(closes[-1]),1e-12)
-        confidence=round(min(90.0,78.0+spread*100000),1)
-        stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
+        age=(len(closes)-1)-int(cross_idx)
+        confidence=round(min(89.0,76.0+spread*100000-max(0,age)*1.5),1)
+        cross_row=rows[int(cross_idx)]
+        stamp=str(cross_row.get("datetime") or cross_row.get("timestamp") or cross_idx)
         return {**base,"direction":direction,"confidence":confidence,"confirmed":True,"risk":"LOW" if confidence>=84 else "MEDIUM",
-                "reason":f"{direction} SIDUS • crossover confirmado e alinhado ao túnel • próxima M1 • sem Gale.",
+                "reason":f"{direction} SIDUS FLEX • crossover recente + túnel confirmado • próxima M1 • sem Gale.",
                 "event_key":f"SIDUS320:{direction}:{stamp}","diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"SIDUS aguardando leitura válida: {str(exc)[:100]}"}
@@ -39593,7 +39610,7 @@ function applyRobotPowerState(){
   if(moneyPilePowerBtn){ moneyPilePowerBtn.textContent=moneyPileEnabled?'🟢 ONLINE':'🔴 OFFLINE'; moneyPilePowerBtn.style.background=moneyPileEnabled?'#0b7a3d':'#7d1d1d'; moneyPilePowerBtn.style.color='#fff'; moneyPilePowerBtn.style.borderColor=moneyPileEnabled?'#16c56b':'#ff5252'; }
   if(moneyPileModeDesc) moneyPileModeDesc.textContent=moneyPileEnabled?'ONLINE: direção do candle + RSI14 H1 • próxima M1 • sem Grid/Martingale/Gale.':'OFFLINE: MONEY PILE EA pausado.';
   if(sidus320PowerBtn){ sidus320PowerBtn.textContent=sidus320Enabled?'🟢 ONLINE':'🔴 OFFLINE'; sidus320PowerBtn.style.background=sidus320Enabled?'#0b7a3d':'#7d1d1d'; sidus320PowerBtn.style.color='#fff'; sidus320PowerBtn.style.borderColor=sidus320Enabled?'#16c56b':'#ff5252'; }
-  if(sidus320ModeDesc) sidus320ModeDesc.textContent=sidus320Enabled?'ONLINE: crossover Sidus causal • próxima M1 • sem Martingale/Gale.':'OFFLINE: SIDUS EA V3.20 pausado.';
+  if(sidus320ModeDesc) sidus320ModeDesc.textContent=sidus320Enabled?'ONLINE: Sidus FLEX • crossover até 3 candles + túnel EMA • próxima M1 • sem Gale.':'OFFLINE: SIDUS EA V3.20 pausado.';
   if(predatorPipsPowerBtn){ predatorPipsPowerBtn.textContent=predatorPipsEnabled?'🟢 ONLINE':'🔴 OFFLINE'; predatorPipsPowerBtn.style.background=predatorPipsEnabled?'#0b7a3d':'#7d1d1d'; predatorPipsPowerBtn.style.color='#fff'; predatorPipsPowerBtn.style.borderColor=predatorPipsEnabled?'#16c56b':'#ff5252'; }
   if(predatorPipsModeDesc) predatorPipsModeDesc.textContent=predatorPipsEnabled?'ONLINE: MA100 ±60 pontos + confirmação causal • próxima M1 • sem Grid/Martingale/Gale.':'OFFLINE: PREDATOR PIPS pausado.';
   if(pyramid7PowerBtn){ pyramid7PowerBtn.textContent=pyramid7Enabled?'🟢 ONLINE':'🔴 OFFLINE'; pyramid7PowerBtn.style.background=pyramid7Enabled?'#0b7a3d':'#7d1d1d'; pyramid7PowerBtn.style.color='#fff'; pyramid7PowerBtn.style.borderColor=pyramid7Enabled?'#16c56b':'#ff5252'; }
