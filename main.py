@@ -42,9 +42,11 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.93"
+APP_VERSION = "3.97.94"
+# MEGA IA 3.97.94 — Telegram: placar final automático ao desligar envio (sessão, horários, WIN/LOSS e aproveitamento).
+# MEGA IA 3.97.94 — histórico mostra o indicador/motor real gravado em cada sinal; remove OUTRO/ANTIGO dos novos resultados.
 # MEGA IA 3.97.93 — SIDUS EA V3.20 FLEX: crossover WMA5/8 ganha memória causal de até 3 candles; mantém túnel EMA18/28, próxima M1 e sem Gale.
-# MEGA IA 3.97.92 — adiciona MONEY PILE EA: direção do candle fechado + RSI14 H1, próxima M1; sem grid/lotes/Martingale/Gale.
+# MEGA IA 3.97.92 — adiciona MEGA MONEY EA: direção do candle fechado + RSI14 H1, próxima M1; sem grid/lotes/Martingale/Gale.
 # MEGA IA 3.97.91 — adiciona EA MILIONÁRIO: RSI14 x média RSI10 + LWMA140 M5 + Bears Power50; próxima M1; sem grid/lotes/Martingale/Gale.
 # MEGA IA 3.97.90 — adiciona PAUL MACD M1: mesmo MACD 10/20/7, confirmação no próprio M1, próxima M1, sem grid/Martingale/Gale.
 # MEGA IA 3.97.89 — corrige visibilidade do card PAUL MACD no painel e completa registro no Backtest 48H.
@@ -1845,6 +1847,9 @@ background_bot_state: Dict[str, Any] = {
     "status": "INICIANDO",
     "pending_trades": [],
     "robofibo_poc": False,
+    # Sessão do Telegram: placar reinicia a cada ON e fecha automaticamente no OFF.
+    "telegram_session_started_at": None,
+    "telegram_session_results": [],
 }
 
 
@@ -22582,7 +22587,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             else:
                 raw = await candles(symbol, interval, 180, "OPEN", None, request=request)
         elif engine == "MONEYPILE":
-            source_status = "MONEY PILE EA • FONTE EM ESPERA" if market == "OPEN" else "MONEY PILE EA • IQ OPTION OTC EM ESPERA"
+            source_status = "MEGA MONEY EA • FONTE EM ESPERA" if market == "OPEN" else "MEGA MONEY EA • IQ OPTION OTC EM ESPERA"
         elif engine == "FORCE" and market == "IQ_OTC":
             if not iq_state:
                 out = neutral_signal(
@@ -27756,6 +27761,59 @@ def _tg_signal_text(body: TelegramSignalBody) -> str:
     )
 
 
+def _tg_session_start() -> None:
+    background_bot_state["telegram_session_started_at"] = iso(now())
+    background_bot_state["telegram_session_results"] = []
+
+
+def _tg_session_record(body: TelegramSignalBody) -> None:
+    if body.test or not bool(background_bot_state.get("telegram_enabled")):
+        return
+    result = str(body.result or "").upper().strip()
+    # O placar final é direto: WIN x LOSS. DRAW fica fora do placar.
+    if result not in ("WIN", "LOSS"):
+        return
+    rows = background_bot_state.setdefault("telegram_session_results", [])
+    key = "|".join([str(body.symbol), str(body.direction).upper(), str(body.entry_time or ""), result])
+    if any(str(x.get("key") or "") == key for x in rows if isinstance(x, dict)):
+        return
+    rows.append({
+        "key": key, "symbol": str(body.symbol or "--"),
+        "direction": str(body.direction or "NEUTRO").upper(),
+        "interval": str(body.interval or "1min"), "entry_time": body.entry_time,
+        "result": result, "recorded_at": iso(now()),
+    })
+    background_bot_state["telegram_session_results"] = rows[-200:]
+
+
+def _tg_session_summary_text() -> str:
+    rows = [x for x in (background_bot_state.get("telegram_session_results") or []) if isinstance(x, dict)]
+    started = _tg_display_time(background_bot_state.get("telegram_session_started_at"))
+    ended = now().astimezone(BR_TZ).strftime("%H:%M:%S")
+    wins = sum(1 for x in rows if str(x.get("result") or "").upper() == "WIN")
+    losses = sum(1 for x in rows if str(x.get("result") or "").upper() == "LOSS")
+    total = wins + losses
+    accuracy = (wins / total * 100.0) if total else 0.0
+    lines = ["🏁 MEGA IA • RESULTADO FINAL", f"🕒 Sessão: {started} às {ended}", ""]
+    if rows:
+        for x in rows:
+            win = str(x.get("result") or "").upper() == "WIN"
+            mark = "✅" if win else "❌"
+            color = "🟢" if win else "🔴"
+            lines.append(f"{mark} {x.get('symbol') or '--'} — {x.get('result')} {color} • {_tg_display_time(x.get('entry_time'))}")
+    else:
+        lines.append("⚪ Nenhum resultado WIN/LOSS fechado nesta sessão.")
+    lines.extend(["", "📊 PLACAR FINAL", f"🟢 {wins} WIN", f"🔴 {losses} LOSS", "", f"🏆 {wins} × {losses}", f"🎯 Aproveitamento: {accuracy:.1f}%"])
+    return "\n".join(lines)
+
+
+async def _tg_send_session_summary(chat_id: str | None = None) -> dict:
+    cid = _tg_chat_id(chat_id or str(background_bot_state.get("chat_id") or "").strip() or None)
+    return await _tg_request("sendMessage", {
+        "chat_id": cid, "text": _tg_session_summary_text(), "disable_web_page_preview": True,
+    })
+
+
 async def _tg_request(method: str, payload: dict | None = None) -> dict:
     if not TELEGRAM_BOT_TOKEN:
         raise HTTPException(
@@ -27806,6 +27864,7 @@ async def _tg_send(body: TelegramSignalBody) -> dict:
     result = data.get("result") or {}
     if dedupe_key:
         telegram_sent_cache[dedupe_key] = time.time()
+    _tg_session_record(body)
     return {
         "ok": True,
         "duplicate": False,
@@ -27995,6 +28054,8 @@ def _background_save_state() -> None:
             "status": str(background_bot_state.get("status") or "OFFLINE"),
             "pending_trades": list(background_bot_state.get("pending_trades") or [])[-80:],
             "sent_signal_keys": list(background_bot_state.get("sent_signal_keys") or [])[-240:],
+            "telegram_session_started_at": background_bot_state.get("telegram_session_started_at"),
+            "telegram_session_results": list(background_bot_state.get("telegram_session_results") or [])[-200:],
         }
         tmp = BACKGROUND_STATE_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -28047,6 +28108,8 @@ def _background_load_state() -> None:
             "status": ("OFFLINE • MOTOR REMOVIDO" if invalid_saved_engine else str(data.get("status") or "CARREGADO")),
             "pending_trades": list(data.get("pending_trades") or [])[-80:],
             "sent_signal_keys": list(data.get("sent_signal_keys") or [])[-240:],
+            "telegram_session_started_at": data.get("telegram_session_started_at"),
+            "telegram_session_results": list(data.get("telegram_session_results") or [])[-200:],
             "last_error": "",
         })
     except Exception as exc:
@@ -28532,7 +28595,17 @@ async def background_bot_set_state(body: BackgroundBotStateBody):
                 raise HTTPException(400, "Informe telegram_enabled no botão Telegram.")
 
             tg_on = bool(body.telegram_enabled)
+            was_on = bool(background_bot_state.get("telegram_enabled"))
+            # Ao apertar OFF, fecha primeiro a sessão no Telegram enquanto o envio ainda está autorizado.
+            if was_on and not tg_on:
+                try:
+                    await _tg_send_session_summary(str(background_bot_state.get("chat_id") or "").strip() or None)
+                except Exception as exc:
+                    # O OFF continua funcionando mesmo se o Telegram estiver temporariamente indisponível.
+                    background_bot_state["last_error"] = f"placar Telegram: {str(exc)[:160]}"
             background_bot_state["telegram_enabled"] = tg_on
+            if tg_on and not was_on:
+                _tg_session_start()
             current_engine = str(background_bot_state.get("engine") or BACKGROUND_DEFAULT_ENGINE).upper()
             if current_engine not in _BACKGROUND_ENGINES:
                 current_engine = "SCALPERPRO"
@@ -28976,13 +29049,13 @@ def paul_macd_m1_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN")
         return {**base,"reason":f"PAUL MACD M1 aguardando leitura válida: {str(exc)[:100]}"}
 
 def money_pile_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """MONEY PILE EA — núcleo direcional adaptado do EA original, sem grade/lotes.
+    """MEGA MONEY EA — núcleo direcional adaptado do EA original, sem grade/lotes.
     O original abre na direção do movimento recente e usa RSI14 H1 como filtro permissivo (30/70).
     Aqui a decisão usa somente candle M1 fechado e H1 causal agregado, com entrada na próxima M1.
     """
     rows=list(cs or [])[-1000:]
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
-          "strategy":"💵 MONEY PILE EA","engine":"MONEYPILE","provider":"MONEY_PILE_PRICE_ACTION_RSI14_H1",
+          "strategy":"💵 MEGA MONEY EA","engine":"MONEYPILE","provider":"MONEY_PILE_PRICE_ACTION_RSI14_H1",
           "next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,
           "grid":False,"martingale":False,"closed_candles_only":True,"non_repaint_after_release":True}
     if len(rows)<180: return {**base,"reason":f"MONEY PILE coletando candles ({len(rows)}/180)."}
@@ -29414,7 +29487,7 @@ _BACKTEST48_NAMES = {
     "PAULMACD": "📈 PAUL MACD M1 + M5",
     "PAULMACDM1": "📈 PAUL MACD M1",
     "MILLIONEA": "💰 EA MILIONÁRIO",
-    "MONEYPILE": "💵 MONEY PILE EA",
+    "MONEYPILE": "💵 MEGA MONEY EA",
     "MASYUK": "⚡ MASYUK V3",
     "PYRAMID7": "🔺 PYRAMID 7 PRO",
 }
@@ -32496,7 +32569,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "MONEYPILE":
                 tech=money_pile_strategy(closed[-1000:],symbol=sym,timeframe=interval,market=market)
-                engine_label="💵 MONEY PILE EA"
+                engine_label="💵 MEGA MONEY EA"
                 direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why=str(tech.get("reason") or "MONEY PILE monitorando direção + RSI14 H1.").replace("\n"," ")[:120]
                 status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
@@ -34218,9 +34291,9 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
   
   <div class="robot-mode-card" id="moneyPileModeCard">
-    <img src="__MEGA_IMAGE__" alt="Money Pile EA">
+    <img src="__MEGA_IMAGE__" alt="Mega Money EA">
     <div class="robot-mode-info">
-      <div class="robot-mode-title">💵 MONEY PILE EA</div>
+      <div class="robot-mode-title">💵 MEGA MONEY EA</div>
       <div class="robot-mode-desc" id="moneyPileModeDesc">Direção do candle + RSI14 H1 • próxima M1 • expiração M1 • sem Grid • sem Martingale • sem Gale.</div>
     </div>
     <button id="moneyPilePowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
@@ -35726,7 +35799,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MONEY PILE EA',SIDUS320:'🎯 SIDUS EA V3.20',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MASYUK:'⚡ MASYUK V3',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO',DRAGONFIRE:'🔥 DRAGON FIRE',DRAGONFIREPRO:'🔥 DRAGON FIRE PRO'})[e]||'SEM MOTOR';
+  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',SIDUS320:'🎯 SIDUS EA V3.20',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MASYUK:'⚡ MASYUK V3',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO',DRAGONFIRE:'🔥 DRAGON FIRE',DRAGONFIREPRO:'🔥 DRAGON FIRE PRO'})[e]||'SEM MOTOR';
 }
 
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
@@ -36753,13 +36826,22 @@ function renderHistory(){
     const trigger=String(h.trigger_indicator||'').trim();
     const triggerScore=Number(h.trigger_score||0);
     const triggerLine=trigger ? `<div class="label" style="margin-top:6px">🤖 RTM • Gatilho: <b>${trigger}</b>${triggerScore?` • ${Math.round(triggerScore)}%`:''}</div>` : '';
+    // Mostra no histórico o indicador/motor que realmente gerou o sinal.
+    // A estratégia é gravada junto com a operação no nascimento do sinal;
+    // se ela não existir (registro legado), usamos a chave do motor como fallback.
     const ek=currentScoreEngineKey(h);
     const engineLabels={
       LOCALANALYST:'🤖 MEGA BOT',LOCALANALYSTFLEX:'🤖 MEGA BOT FLEX',MEGAMASTER:'🧠 MEGA MASTER',
-      ISMAELTRADER:'🎯 ISMAEL TRADER',ISMAEL98:'💎 ISMAEL 98',RSICHANNEL:'📈 RSI CHANNELS',MINSCALPER:'⚡ 1 MINUTE SCALPER'
+      ISMAELTRADER:'🎯 ISMAEL TRADER',ISMAEL98:'💎 ISMAEL 98',RSICHANNEL:'📈 RSI CHANNELS',MINSCALPER:'⚡ 1 MINUTE SCALPER',
+      SCALPERPRO:'🌏 SCALPER PRO',DRAGONFIRE:'🐉 DRAGON FIRE',DRAGONFIREPRO:'🐉 DRAGON FIRE PRO',
+      SIDUS320:'🎯 SIDUS EA V3.20',PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',
+      MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',MASYUK:'⚡ MASYUK V3',
+      PYRAMID7:'🔺 PYRAMID 7 PRO',PREDATORPIPS:'🐆 PREDATOR PIPS',FIBORSI:'📐 ROBO FIBO'
     };
-    const engineLabel=engineLabels[ek]||'🗂️ OUTRO/ANTIGO';
-    const engineLine=`<div class="label" style="margin-top:6px">Motor: <b>${engineLabel}</b></div>`;
+    const savedStrategy=String(h.strategy||'').trim();
+    const rawEngine=String(h.engine||'').trim();
+    const engineLabel=savedStrategy || engineLabels[ek] || engineLabels[rawEngine.toUpperCase()] || rawEngine || '🗂️ OUTRO/ANTIGO';
+    const engineLine=`<div class="label" style="margin-top:6px">Indicador: <b>${engineLabel}</b></div>`;
     return `<div class="card" style="padding:12px">
       <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap">
         <div><b>${date}</b><div class="label">${time} • Brasília</div></div>
@@ -37176,7 +37258,7 @@ function currentScoreEngineKey(item){
   const strategy=String((item&&item.strategy)||'').trim().toUpperCase();
   const normalized=normalizeEngineKey(raw);
   if(normalized==='MILLIONEA' || raw==='MILLIONEA' || strategy.includes('EA MILIONÁRIO')) return 'MILLIONEA';
-  if(normalized==='MONEYPILE' || raw==='MONEYPILE' || strategy.includes('MONEY PILE')) return 'MONEYPILE';
+  if(normalized==='MONEYPILE' || raw==='MONEYPILE' || (strategy.includes('MONEY PILE') || strategy.includes('MEGA MONEY'))) return 'MONEYPILE';
   if(normalized==='PAULMACDM1' || raw==='PAULMACDM1' || strategy.includes('PAUL MACD M1 •')) return 'PAULMACDM1';
   if(normalized==='PAULMACD' || raw==='PAULMACD' || strategy.includes('PAUL MACD')) return 'PAULMACD';
   if(normalized==='SIDUS320' || raw==='SIDUS320' || strategy.includes('SIDUS EA')) return 'SIDUS320';
@@ -37208,7 +37290,7 @@ function engineScoreSnapshot(bucket){
     PAULMACD:{key:'PAULMACD',name:'📈 PAUL MACD M1 + M5',wins:0,losses:0},
     PAULMACDM1:{key:'PAULMACDM1',name:'📈 PAUL MACD M1',wins:0,losses:0},
     MILLIONEA:{key:'MILLIONEA',name:'💰 EA MILIONÁRIO',wins:0,losses:0},
-    MONEYPILE:{key:'MONEYPILE',name:'💵 MONEY PILE EA',wins:0,losses:0},
+    MONEYPILE:{key:'MONEYPILE',name:'💵 MEGA MONEY EA',wins:0,losses:0},
     SIDUS320:{key:'SIDUS320',name:'🎯 SIDUS EA V3.20',wins:0,losses:0},
     PYRAMID7:{key:'PYRAMID7',name:'🔺 PYRAMID 7 PRO',wins:0,losses:0},
     OTHER:{key:'OTHER',name:'🗂️ OUTROS / ANTIGOS',wins:0,losses:0}
@@ -38831,7 +38913,7 @@ if(telegramToggle){
       paintTelegramSettings();
       if(telegramSendStatus) telegramSendStatus.textContent=telegramEnabled
         ?'🟢 Telegram ON no servidor • sinais e resultados autorizados.'
-        :'🔴 Telegram OFF no servidor • nenhum sinal ou resultado será enviado.';
+        :'🔴 Telegram OFF • placar final da sessão enviado ao grupo.';
     }catch(e){
       telegramEnabled=previous;
       try{ localStorage.setItem(TELEGRAM_ENABLED_KEY,telegramEnabled?'1':'0'); }catch(_){ }
@@ -39608,7 +39690,7 @@ function applyRobotPowerState(){
   if(millionEaPowerBtn){ millionEaPowerBtn.textContent=millionEaEnabled?'🟢 ONLINE':'🔴 OFFLINE'; millionEaPowerBtn.style.background=millionEaEnabled?'#0b7a3d':'#7d1d1d'; millionEaPowerBtn.style.color='#fff'; millionEaPowerBtn.style.borderColor=millionEaEnabled?'#16c56b':'#ff5252'; }
   if(millionEaModeDesc) millionEaModeDesc.textContent=millionEaEnabled?'ONLINE: RSI/MARSI + LWMA140 M5 + Bears Power50 • próxima M1 • sem Gale.':'OFFLINE: EA MILIONÁRIO pausado.';
   if(moneyPilePowerBtn){ moneyPilePowerBtn.textContent=moneyPileEnabled?'🟢 ONLINE':'🔴 OFFLINE'; moneyPilePowerBtn.style.background=moneyPileEnabled?'#0b7a3d':'#7d1d1d'; moneyPilePowerBtn.style.color='#fff'; moneyPilePowerBtn.style.borderColor=moneyPileEnabled?'#16c56b':'#ff5252'; }
-  if(moneyPileModeDesc) moneyPileModeDesc.textContent=moneyPileEnabled?'ONLINE: direção do candle + RSI14 H1 • próxima M1 • sem Grid/Martingale/Gale.':'OFFLINE: MONEY PILE EA pausado.';
+  if(moneyPileModeDesc) moneyPileModeDesc.textContent=moneyPileEnabled?'ONLINE: direção do candle + RSI14 H1 • próxima M1 • sem Grid/Martingale/Gale.':'OFFLINE: MEGA MONEY EA pausado.';
   if(sidus320PowerBtn){ sidus320PowerBtn.textContent=sidus320Enabled?'🟢 ONLINE':'🔴 OFFLINE'; sidus320PowerBtn.style.background=sidus320Enabled?'#0b7a3d':'#7d1d1d'; sidus320PowerBtn.style.color='#fff'; sidus320PowerBtn.style.borderColor=sidus320Enabled?'#16c56b':'#ff5252'; }
   if(sidus320ModeDesc) sidus320ModeDesc.textContent=sidus320Enabled?'ONLINE: Sidus FLEX • crossover até 3 candles + túnel EMA • próxima M1 • sem Gale.':'OFFLINE: SIDUS EA V3.20 pausado.';
   if(predatorPipsPowerBtn){ predatorPipsPowerBtn.textContent=predatorPipsEnabled?'🟢 ONLINE':'🔴 OFFLINE'; predatorPipsPowerBtn.style.background=predatorPipsEnabled?'#0b7a3d':'#7d1d1d'; predatorPipsPowerBtn.style.color='#fff'; predatorPipsPowerBtn.style.borderColor=predatorPipsEnabled?'#16c56b':'#ff5252'; }
@@ -40744,7 +40826,7 @@ async function setMoneyPilePower(enabled){
   applyRobotPowerState();
   await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'MONEYPILE'});
   scheduleBacktest48(true,200);
-  if(voiceEnabled) speak(moneyPileEnabled?'Money Pile online.':'Money Pile offline.');
+  if(voiceEnabled) speak(moneyPileEnabled?'Mega Money EA online.':'Mega Money EA offline.');
 }
 
 async function setSidus320Power(enabled){
@@ -42679,7 +42761,7 @@ async function sendRadarOpportunityToRobot(items){
     lastSignalVoice='';
     lastCountdownSignalKey='';
     if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='MILLIONEA'?'💰 EA MILIONÁRIO':ek==='MONEYPILE'?'💵 MONEY PILE EA':ek==='PAULMACD'?'📈 PAUL MACD M1 + M5':ek==='SIDUS320'?'🎯 SIDUS EA V3.20':ek==='PREDATORPIPS'?'🐆 PREDATOR PIPS':ek==='PYRAMID7'?'🔺 PYRAMID 7 PRO':ek==='MASYUK'?'⚡ MASYUK V3':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='DRAGONFIREPRO'?'🔥 DRAGON FIRE PRO':ek==='DRAGONFIRE'?'🔥 DRAGON FIRE':ek==='SCALPERPRO'?'SCALPER PRO':ek==='SCALPINGASIA'?'🌏 SCALPER FLEX':ek==='MINSCALPER'?'M-SNIPER':ek==='RSICHANNEL2'?'MEMORY FUSION':ek==='RSICHANNEL'?'MOTOR REMOVIDO':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI EA MTF':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'MOTOR REMOVIDO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'SEM MOTOR'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
+    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='MILLIONEA'?'💰 EA MILIONÁRIO':ek==='MONEYPILE'?'💵 MEGA MONEY EA':ek==='PAULMACD'?'📈 PAUL MACD M1 + M5':ek==='SIDUS320'?'🎯 SIDUS EA V3.20':ek==='PREDATORPIPS'?'🐆 PREDATOR PIPS':ek==='PYRAMID7'?'🔺 PYRAMID 7 PRO':ek==='MASYUK'?'⚡ MASYUK V3':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='DRAGONFIREPRO'?'🔥 DRAGON FIRE PRO':ek==='DRAGONFIRE'?'🔥 DRAGON FIRE':ek==='SCALPERPRO'?'SCALPER PRO':ek==='SCALPINGASIA'?'🌏 SCALPER FLEX':ek==='MINSCALPER'?'M-SNIPER':ek==='RSICHANNEL2'?'MEMORY FUSION':ek==='RSICHANNEL'?'MOTOR REMOVIDO':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI EA MTF':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'MOTOR REMOVIDO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'SEM MOTOR'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
     await sig(true);
 
     // 3.97.77 — O radar e o painel usam o mesmo motor, mas a segunda consulta
