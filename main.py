@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.94"
+APP_VERSION = "3.97.96"
+# MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
 # MEGA IA 3.97.94 — Telegram: placar final automático ao desligar envio (sessão, horários, WIN/LOSS e aproveitamento).
 # MEGA IA 3.97.94 — histórico mostra o indicador/motor real gravado em cada sinal; remove OUTRO/ANTIGO dos novos resultados.
 # MEGA IA 3.97.93 — SIDUS EA V3.20 FLEX: crossover WMA5/8 ganha memória causal de até 3 candles; mantém túnel EMA18/28, próxima M1 e sem Gale.
@@ -7983,12 +7984,11 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
                     source == "CTRADER_OPEN"
                     and MULTIFEED_ENABLED
                     and public_fallbacks
-                    and not (ctrader_item and str(symbol or "").upper() == "BTC/USD")
                     and not any(src != "CTRADER_OPEN" for src, _ in providers)
                 ):
                     # 3.96.90 — cTrader continua sendo tentada PRIMEIRO, mas uma
                     # falha real desta leitura (timeout, candle antigo, histórico curto,
-                    # sessão oscilando etc.) não pode deixar o robô preso em
+                    # sessão oscilando etc.) — inclusive BTC/USD — não pode deixar o robô preso em
                     # "AGUARDANDO DADOS ATUALIZADOS". A multifuente assume só nesta
                     # requisição; na próxima leitura a cTrader volta a ser a primeira.
                     providers.extend(public_fallbacks)
@@ -7999,12 +7999,11 @@ async def candles_open(symbol, interval, n=80, request: Request | None = None):
                     source == "CTRADER_OPEN"
                     and MULTIFEED_ENABLED
                     and public_fallbacks
-                    and not (ctrader_item and str(symbol or "").upper() == "BTC/USD")
                     and not any(src != "CTRADER_OPEN" for src, _ in providers)
                 ):
                     # 3.96.90 — cTrader continua sendo tentada PRIMEIRO, mas uma
                     # falha real desta leitura (timeout, candle antigo, histórico curto,
-                    # sessão oscilando etc.) não pode deixar o robô preso em
+                    # sessão oscilando etc.) — inclusive BTC/USD — não pode deixar o robô preso em
                     # "AGUARDANDO DADOS ATUALIZADOS". A multifuente assume só nesta
                     # requisição; na próxima leitura a cTrader volta a ser a primeira.
                     providers.extend(public_fallbacks)
@@ -34246,7 +34245,18 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="millionEaPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
+  <div id="megaEaFolder" class="mega-ea-folder" role="button" tabindex="0" aria-expanded="false">
+    <div class="mega-ea-folder-title">⚡ MEGA EA</div>
+    <div class="mega-ea-folder-hint" id="megaEaFolderHint">Toque para escolher o indicador</div>
+  </div>
+
   <style>
+    /* 3.97.96 — indicadores recolhidos dentro da pasta MEGA EA. */
+    .mega-ea-folder{display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;min-height:92px;margin:10px 0 12px;padding:16px;border:1px solid #2f86ff;border-radius:16px;background:linear-gradient(180deg,rgba(15,45,76,.96),rgba(6,25,44,.96));box-shadow:0 0 20px rgba(47,134,255,.18);cursor:pointer;user-select:none}
+    .mega-ea-folder-title{font-size:30px;font-weight:1000;letter-spacing:1.2px;color:#7fd3ff;text-shadow:0 0 14px rgba(66,190,255,.45)}
+    .mega-ea-folder-hint{font-size:12px;font-weight:800;opacity:.78}
+    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #masyukModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
+
     /* 3.97.11 — painel de motores enxuto: MOTOR REMOVIDO + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
     #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#paulMacdModeCard,#paulMacdM1ModeCard,#sidus320ModeCard,#masyukModeCard,#pyramid7ModeCard,#predatorPipsModeCard,#millionEaModeCard,#moneyPileModeCard{display:flex !important}
@@ -34362,6 +34372,22 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </div>
     <button id="dragonFireProPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
+
+  <script>
+  // 3.97.96 — MEGA EA funciona como pasta: fechada por padrão e abre/fecha os indicadores.
+  document.addEventListener('DOMContentLoaded',()=>{
+    const folder=document.getElementById('megaEaFolder');
+    const hint=document.getElementById('megaEaFolderHint');
+    if(!folder) return;
+    const toggleMegaEaFolder=()=>{
+      const open=document.body.classList.toggle('mega-ea-open');
+      folder.setAttribute('aria-expanded',open?'true':'false');
+      if(hint) hint.textContent=open?'Toque para esconder os indicadores':'Toque para escolher o indicador';
+    };
+    folder.addEventListener('click',toggleMegaEaFolder);
+    folder.addEventListener('keydown',(ev)=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();toggleMegaEaFolder();}});
+  });
+  </script>
 
   <div class="card" id="backtest48Card" style="margin-top:14px;border-color:#2f86ff">
     <div style="display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap">
