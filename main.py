@@ -42,11 +42,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.01"
+APP_VERSION = "3.98.02"
 # MEGA IA 3.97.98 — painel: CALL/PUT promovido pelo radar fica travado até a expiração mesmo se o polling seguinte der NEUTRO/erro; resultado BTC/Binance é apurado direto na mesma fonte com retry rápido.
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
 # MEGA IA 3.97.97 — corrige MEGA MONEY EA preso em FONTE EM ESPERA: o ramo agora carrega candles e BTC/USD OPEN usa Binance diretamente.
 # MEGA IA 3.97.99 — resultado imediato: normaliza aliases da fonte (BINANCE PÚBLICA/BINANCE_PUBLIC) para não rejeitar o candle fechado da própria Binance.
+# MEGA IA 3.98.02 — histórico/resultados exibem o desfecho real da sequência: WIN DIRETO, WIN REC 1, WIN REC 2 ou LOSS REC 2; perdas intermediárias continuam ocultas.
 # MEGA IA 3.98.01 — corrige avanço duplicado da recuperação: a mesma operação LOSS não pode consumir REC1 e REC2; LOSS G2 somente após três operações distintas (entrada + REC1 + REC2).
 # MEGA IA 3.98.00 — resultado com recuperação por próximos sinais: LOSS só fecha após 2 recuperações; WIN em REC1/REC2 encerra a sequência; Telegram recebe apenas o desfecho final.
 # MEGA IA 3.97.94 — Telegram: placar final automático ao desligar envio (sessão, horários, WIN/LOSS e aproveitamento).
@@ -36914,6 +36915,7 @@ function renderHistory(){
     const r=String(h.result||'--').toUpperCase();
     const isWin=r.startsWith('WIN');
     const resultStyle=isWin?'color:#31f58a':'color:#ff5577';
+    const resultLabel=r==='WIN'?'WIN DIRETO':(r==='WIN G1'?'WIN REC 1':(r==='WIN G2'?'WIN REC 2':(r==='LOSS G2'?'LOSS REC 2':r)));
     const dir=String(h.direction||'').toUpperCase();
     const dirIcon=dir==='CALL'?'⬆️':(dir==='PUT'?'⬇️':'');
     const trigger=String(h.trigger_indicator||'').trim();
@@ -36940,7 +36942,7 @@ function renderHistory(){
         <div><b>${date}</b><div class="label">${time} • Brasília</div></div>
         <div style="text-align:right"><b>${h.symbol||'--'} • ${h.interval||'--'}</b><div class="label">${dirIcon} ${dir||'--'}</div></div>
       </div>
-      <div style="margin-top:8px;font-size:20px;font-weight:1000;${resultStyle}">${isWin?'✅':'❌'} ${r}</div>
+      <div style="margin-top:8px;font-size:20px;font-weight:1000;${resultStyle}">${isWin?'✅':'❌'} ${resultLabel}</div>
       ${engineLine}
       ${triggerLine}
     </div>`;
@@ -36980,7 +36982,7 @@ function registerPersistentResult(t,x){
   }
 
   const r=String(x.result||'').toUpperCase();
-  const finalAllowed=['WIN','LOSS'].includes(r);
+  const finalAllowed=['WIN','WIN G1','WIN G2','LOSS G2'].includes(r);
   if(finalAllowed){
     b.final_ops=b.final_ops||{};
     let newFinal=false;
@@ -43430,7 +43432,7 @@ async function resultCheck(){
       }
 
       // Só o desfecho final entra no placar/histórico: WIN, WIN G1, WIN G2 ou LOSS G2.
-      const finalX={...x,result:recovery.accounting,entry_result:recovery.accounting};
+      const finalX={...x,result:recovery.label,entry_result:recovery.accounting,accounting_result:recovery.accounting};
       const accountingChanged=registerPersistentResult(t,finalX);
       if(accountingChanged){
         paintPersistentResults();
