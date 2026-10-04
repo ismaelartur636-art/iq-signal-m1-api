@@ -42,10 +42,11 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.97.98"
+APP_VERSION = "3.97.99"
 # MEGA IA 3.97.98 — painel: CALL/PUT promovido pelo radar fica travado até a expiração mesmo se o polling seguinte der NEUTRO/erro; resultado BTC/Binance é apurado direto na mesma fonte com retry rápido.
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
 # MEGA IA 3.97.97 — corrige MEGA MONEY EA preso em FONTE EM ESPERA: o ramo agora carrega candles e BTC/USD OPEN usa Binance diretamente.
+# MEGA IA 3.97.99 — resultado imediato: normaliza aliases da fonte (BINANCE PÚBLICA/BINANCE_PUBLIC) para não rejeitar o candle fechado da própria Binance.
 # MEGA IA 3.97.94 — Telegram: placar final automático ao desligar envio (sessão, horários, WIN/LOSS e aproveitamento).
 # MEGA IA 3.97.94 — histórico mostra o indicador/motor real gravado em cada sinal; remove OUTRO/ANTIGO dos novos resultados.
 # MEGA IA 3.97.93 — SIDUS EA V3.20 FLEX: crossover WMA5/8 ganha memória causal de até 3 candles; mantém túnel EMA18/28, próxima M1 e sem Gale.
@@ -33521,13 +33522,31 @@ async def reset_performance(request: Request, market="OPEN"):
 
 
 def _result_feed_compatible(expected: str, observed: str) -> bool:
-    expected = str(expected or "").upper()
-    observed = str(observed or "").upper()
-    if not expected or expected == "UNKNOWN":
+    # 3.97.99 — o frontend pode guardar o rótulo humano da fonte (ex.:
+    # "BINANCE PÚBLICA"), enquanto os candles carregam a chave técnica
+    # "BINANCE_PUBLIC". Antes essa diferença fazia candle_near() rejeitar a
+    # vela correta para sempre e o card RESULTADO ficava em --.
+    def canonical(value: str) -> str:
+        import unicodedata
+        raw = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
+        raw = re.sub(r"[^A-Z0-9]+", "_", raw.upper()).strip("_")
+        if raw in ("BINANCE", "BINANCE_PUBLIC", "BINANCE_PUBLICA", "BINANCE_SPOT"):
+            return "BINANCE_PUBLIC"
+        if raw.startswith("TWELVE_DATA") or raw in ("TWELVEDATA", "TD"):
+            return "TWELVE_DATA"
+        if raw.startswith("CTRADER"):
+            return "CTRADER"
+        if raw in ("MULTIFEED", "MULTIFONTE", "AUTOMATICA", "AUTOMATICO"):
+            return "MULTIFEED"
+        return raw
+
+    expected_key = canonical(expected)
+    observed_key = canonical(observed)
+    if not expected_key or expected_key == "UNKNOWN" or expected_key == "MULTIFEED":
         return True
-    if expected.startswith("TWELVE_DATA") and observed.startswith("TWELVE_DATA"):
+    if expected_key == "TWELVE_DATA" and observed_key == "TWELVE_DATA":
         return True  # WS e REST do mesmo provedor/preço.
-    return expected == observed
+    return expected_key == observed_key
 
 
 def _cached_open_candles_for_result(symbol: str, interval: str, n: int = 100, *, request=None, completed_after=None):
