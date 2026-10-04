@@ -42,11 +42,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.04"
+APP_VERSION = "3.98.05"
 # MEGA IA 3.97.98 — painel: CALL/PUT promovido pelo radar fica travado até a expiração mesmo se o polling seguinte der NEUTRO/erro; resultado BTC/Binance é apurado direto na mesma fonte com retry rápido.
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
 # MEGA IA 3.97.97 — corrige MEGA MONEY EA preso em FONTE EM ESPERA: o ramo agora carrega candles e BTC/USD OPEN usa Binance diretamente.
 # MEGA IA 3.97.99 — resultado imediato: normaliza aliases da fonte (BINANCE PÚBLICA/BINANCE_PUBLIC) para não rejeitar o candle fechado da própria Binance.
+# MEGA IA 3.98.05 — Gestão selecionável: mantém Recuperação no Próximo Sinal e adiciona Gale 1/Gale 2.
 # MEGA IA 3.98.04 — Telegram usa o mesmo desfecho final do histórico: WIN DIRETO, WIN REC 1, WIN REC 2 ou LOSS REC 2; LOSS intermediário não é enviado.
 # MEGA IA 3.98.02 — histórico/resultados exibem o desfecho real da sequência: WIN DIRETO, WIN REC 1, WIN REC 2 ou LOSS REC 2; perdas intermediárias continuam ocultas.
 # MEGA IA 3.98.01 — corrige avanço duplicado da recuperação: a mesma operação LOSS não pode consumir REC1 e REC2; LOSS G2 somente após três operações distintas (entrada + REC1 + REC2).
@@ -27768,6 +27769,7 @@ def _tg_signal_text(body: TelegramSignalBody) -> str:
         "WIN": "WIN DIRETO",
         "WIN G1": "WIN REC 1",
         "WIN G2": "WIN REC 2",
+        "LOSS G1": "LOSS GALE 1",
         "LOSS G2": "LOSS REC 2",
     }.get(result_label, result_label)
     if result_label.startswith("WIN"):
@@ -28035,7 +28037,7 @@ async def telegram_send(body: TelegramSignalBody):
         if result_label:
             # 3.98.04 — aceita somente DESFECHOS finais da sequência.
             # LOSS intermediário não chega aqui; REC1/REC2 usam os próximos sinais reais.
-            if result_label not in ("WIN", "WIN G1", "WIN G2", "LOSS G2"):
+            if result_label not in ("WIN", "WIN G1", "WIN G2", "LOSS G1", "LOSS G2"):
                 raise HTTPException(400, "Somente resultados finais WIN DIRETO/WIN REC 1/WIN REC 2/LOSS REC 2 podem ser enviados automaticamente ao Telegram.")
         elif direction not in ("CALL", "PUT"):
             raise HTTPException(400, "Somente sinais CALL ou PUT confirmados podem ser enviados.")
@@ -33668,6 +33670,7 @@ async def result(
     expiry_time="",
     market="OPEN",
     direct_only: bool = False,
+    gale_levels: int = 0,
     engine: str = "",
     feed_source: str = "",
 ):
@@ -33688,7 +33691,9 @@ async def result(
     # MEGA IA 3.96.7 — regra global: SEM GALE para todos os motores.
     # Um LOSS encerra a entrada atual. A recuperação de valor, quando usada,
     # é preparada exclusivamente para o próximo sinal confirmado.
-    direct_only = True
+    gale_levels = max(0, min(2, int(gale_levels or 0)))
+    if gale_levels <= 0:
+        direct_only = True
 
     # EA Tripla usa multifuente no OPEN e IQ somente no OTC.
     # Não exigir sessão IQ para apurar resultado da EA em mercado aberto.
@@ -33705,7 +33710,7 @@ async def result(
 
     state = _iq_session_state(request, required=True) if (market == "IQ_OTC" or ea_iq_result) else None
     store = state.setdefault("results", {}) if market == "IQ_OTC" else results.setdefault(market, {})
-    mode_key = "DIRECT" if direct_only else "GALE"
+    mode_key = "DIRECT" if direct_only else f"GALE{gale_levels}"
     # Usa o instante normalizado, não a representação textual do horário.
     # Assim 03:16:00Z e 00:16:00-03:00 apontam para a mesma operação.
     canonical_expiry = _canonical_time_key(expiry_time)
@@ -34006,6 +34011,35 @@ async def result(
     # Compatibilidade: quem pedir apenas a primeira vela recebe LOSS direto.
     if direct_only:
         return finalize("LOSS", "ENTRADA", base, "LOSS", final_expiry_dt=expiry_dt)
+
+    # 3.98.05 — Gale opcional: mesma direção nas velas consecutivas.
+    g1_expiry = expiry_dt + step
+    if now() < g1_expiry:
+        return pending_payload("G1", g1_expiry, entry_result="LOSS")
+    g1 = await ensure_candle(expiry_dt)
+    if not g1:
+        return waiting_candle("G1", entry_result="LOSS")
+    g1_result = candle_result(g1)
+    if g1_result == "EMPATE": g1_result = "DRAW"
+    if g1_result == "WIN":
+        return finalize("WIN G1", "G1", g1, "LOSS", g1_result="WIN", final_expiry_dt=g1_expiry)
+    if gale_levels == 1:
+        if g1_result == "DRAW": return finalize("DRAW", "G1", g1, "LOSS", g1_result="DRAW", final_expiry_dt=g1_expiry)
+        return finalize("LOSS G1", "G1", g1, "LOSS", g1_result="LOSS", final_expiry_dt=g1_expiry)
+
+    g2_expiry = expiry_dt + step * 2
+    if now() < g2_expiry:
+        return pending_payload("G2", g2_expiry, entry_result="LOSS", g1_result=g1_result)
+    g2 = await ensure_candle(expiry_dt + step)
+    if not g2:
+        return waiting_candle("G2", entry_result="LOSS", g1_result=g1_result)
+    g2_result = candle_result(g2)
+    if g2_result == "EMPATE": g2_result = "DRAW"
+    if g2_result == "WIN":
+        return finalize("WIN G2", "G2", g2, "LOSS", g1_result=g1_result, g2_result="WIN", final_expiry_dt=g2_expiry)
+    if g2_result == "DRAW":
+        return finalize("DRAW", "G2", g2, "LOSS", g1_result=g1_result, g2_result="DRAW", final_expiry_dt=g2_expiry)
+    return finalize("LOSS G2", "G2", g2, "LOSS", g1_result=g1_result, g2_result="LOSS", final_expiry_dt=g2_expiry)
 
 
 
@@ -34960,8 +34994,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
           </div>
           <div>
             <div class="label">MODO DE OPERAÇÃO</div>
-            <select id="autoTradeGale" disabled style="width:100%;margin-top:5px">
-              <option value="0">SEM GALE</option>
+            <select id="autoTradeGale" style="width:100%;margin-top:5px">
+              <option value="RECOVERY">RECUPERAÇÃO NO PRÓXIMO SINAL</option>
+              <option value="G1">GALE 1</option>
+              <option value="G2">GALE 2</option>
             </select>
           </div>
           <div style="display:none">
@@ -36322,7 +36358,8 @@ try{
     autoTradeAmount.value=String(Math.max(1,Math.min(1000,savedAutoAmount)));
   }
   if(autoTradeGale){
-    autoTradeGale.value='0';
+    const savedManagement=String(localStorage.getItem('mega_management_mode')||'RECOVERY').toUpperCase();
+    autoTradeGale.value=['RECOVERY','G1','G2'].includes(savedManagement)?savedManagement:'RECOVERY';
   }
   if(autoTradeGaleMultiplier && Number.isFinite(savedAutoGaleMultiplier)){
     autoTradeGaleMultiplier.value=String(Math.max(1,Math.min(5,savedAutoGaleMultiplier)));
@@ -36924,7 +36961,7 @@ function renderHistory(){
     const r=String(h.result||'--').toUpperCase();
     const isWin=r.startsWith('WIN');
     const resultStyle=isWin?'color:#31f58a':'color:#ff5577';
-    const resultLabel=r==='WIN'?'WIN DIRETO':(r==='WIN G1'?'WIN REC 1':(r==='WIN G2'?'WIN REC 2':(r==='LOSS G2'?'LOSS REC 2':r)));
+    const resultLabel=r==='WIN'?'WIN DIRETO':(r==='WIN G1'?'WIN REC 1':(r==='WIN G2'?'WIN REC 2':(r==='LOSS G1'?'LOSS GALE 1':(r==='LOSS G2'?'LOSS REC 2':r))));
     const dir=String(h.direction||'').toUpperCase();
     const dirIcon=dir==='CALL'?'⬆️':(dir==='PUT'?'⬇️':'');
     const trigger=String(h.trigger_indicator||'').trim();
@@ -38142,9 +38179,14 @@ if(autoTradeAmount){
 }
 
 if(autoTradeGale){
-  autoTradeGale.value='0';
-  autoTradeGale.disabled=true;
-  try{ localStorage.setItem('mega_auto_trade_gale','0'); }catch(_){}
+  autoTradeGale.disabled=false;
+  autoTradeGale.onchange=()=>{
+    const mode=String(autoTradeGale.value||'RECOVERY').toUpperCase();
+    try{ localStorage.setItem('mega_management_mode',mode); }catch(_){}
+    clearResultRecoveryState();
+    updateAutoTradePreview();
+    if(galeStageStatus) galeStageStatus.textContent=mode==='RECOVERY'?'Gestão: recuperação nos próximos sinais.':(mode==='G1'?'Gestão: Gale 1 na vela seguinte.':'Gestão: Gale 1 + Gale 2 nas duas velas seguintes.');
+  };
 }
 
 if(autoTradeGaleMultiplier){
@@ -38956,7 +38998,7 @@ async function maybeSendTelegramSignal(signal){
 async function maybeSendTelegramResult(trade,outcome){
   if(!telegramEnabled || !trade || !outcome || telegramBusy) return;
   const resultLabel=String(outcome.result||'').toUpperCase().trim();
-  if(!['WIN','LOSS','WIN G1','WIN G2','LOSS G2'].includes(resultLabel)) return;
+  if(!['WIN','LOSS','WIN G1','WIN G2','LOSS G1','LOSS G2'].includes(resultLabel)) return;
   const chat_id=saveTelegramChatId();
   if(!chat_id) return;
   const key=[trade.symbol,trade.interval,trade.direction,trade.entry_time,resultLabel].join('|');
@@ -38977,7 +39019,7 @@ async function maybeSendTelegramResult(trade,outcome){
     });
     telegramLastWinKey=key;
     try{ localStorage.setItem(TELEGRAM_LAST_WIN_KEY,key); }catch(_){ }
-    const telegramResultDisplay=resultLabel==='WIN'?'WIN DIRETO':(resultLabel==='WIN G1'?'WIN REC 1':(resultLabel==='WIN G2'?'WIN REC 2':(resultLabel==='LOSS G2'?'LOSS REC 2':resultLabel)));
+    const telegramResultDisplay=resultLabel==='WIN'?'WIN DIRETO':(resultLabel==='WIN G1'?'WIN REC 1':(resultLabel==='WIN G2'?'WIN REC 2':(resultLabel==='LOSS G1'?'LOSS GALE 1':(resultLabel==='LOSS G2'?'LOSS REC 2':resultLabel))));
     if(telegramSendStatus) telegramSendStatus.textContent=(resultLabel.startsWith('WIN')?'🏆 ':'❌ ')+'Resultado enviado ao grupo: '+(trade.symbol||'--')+' • '+telegramResultDisplay;
   }catch(e){
     if(telegramSendStatus) telegramSendStatus.textContent='❌ Falha ao enviar resultado: '+String(e&&e.message?e.message:e);
@@ -43280,6 +43322,12 @@ function cd(){
   }
 }
 
+// 3.98.05 — modo de gestão selecionável.
+function currentManagementMode(){
+  const v=String((autoTradeGale&&autoTradeGale.value)||localStorage.getItem('mega_management_mode')||'RECOVERY').toUpperCase();
+  return ['RECOVERY','G1','G2'].includes(v)?v:'RECOVERY';
+}
+
 // 3.98.00 — recuperação por PRÓXIMOS SINAIS (não é Gale por vela).
 // Um LOSS intermediário não entra no placar/histórico/Telegram.
 // stage 0 = entrada normal; 1 = aguardando REC 1; 2 = aguardando REC 2.
@@ -43311,6 +43359,16 @@ function resolveRecoveryOutcome(trade,x){
   const last=resultRecoveryState.last_loss_trade||null;
   const lastKey=last ? [String(last.symbol||''),String(last.direction||''),String(last.expiry_time||'')].join('|') : '';
 
+  const management=currentManagementMode();
+  if(management!=='RECOVERY'){
+    if(['WIN','WIN G1','WIN G2','LOSS G1','LOSS G2'].includes(raw)){
+      const isWin=raw.startsWith('WIN');
+      clearResultRecoveryState();
+      return {final:true,label:raw,accounting:isWin?'WIN':'LOSS',stage:raw.includes('G2')?2:(raw.includes('G1')?1:0)};
+    }
+    if(raw==='DRAW') return {final:true,draw:true,label:'DRAW',accounting:'DRAW',stage:0};
+    return {final:false,label:raw,stage};
+  }
   if(raw==='DRAW' || !['WIN','LOSS'].includes(raw)){
     return {final:false,draw:raw==='DRAW',label:raw,stage};
   }
@@ -43392,7 +43450,7 @@ async function resultCheck(){
     pendingTrade=t;
 
     const x=await get(
-      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=${t.direct_only?'true':'false'}&engine=${encodeURIComponent(t.engine||'')}&feed_source=${encodeURIComponent(t.feed_source||'')}`
+      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=${currentManagementMode()==='RECOVERY'?'true':'false'}&gale_levels=${currentManagementMode()==='G2'?2:(currentManagementMode()==='G1'?1:0)}&engine=${encodeURIComponent(t.engine||'')}&feed_source=${encodeURIComponent(t.feed_source||'')}`
     );
 
     if(x && !x.result && (x.status==='AGUARDANDO_FONTE' || String(x.status||'').startsWith('AGUARDANDO'))){
