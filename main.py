@@ -42,11 +42,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.00"
+APP_VERSION = "3.98.01"
 # MEGA IA 3.97.98 — painel: CALL/PUT promovido pelo radar fica travado até a expiração mesmo se o polling seguinte der NEUTRO/erro; resultado BTC/Binance é apurado direto na mesma fonte com retry rápido.
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
 # MEGA IA 3.97.97 — corrige MEGA MONEY EA preso em FONTE EM ESPERA: o ramo agora carrega candles e BTC/USD OPEN usa Binance diretamente.
 # MEGA IA 3.97.99 — resultado imediato: normaliza aliases da fonte (BINANCE PÚBLICA/BINANCE_PUBLIC) para não rejeitar o candle fechado da própria Binance.
+# MEGA IA 3.98.01 — corrige avanço duplicado da recuperação: a mesma operação LOSS não pode consumir REC1 e REC2; LOSS G2 somente após três operações distintas (entrada + REC1 + REC2).
 # MEGA IA 3.98.00 — resultado com recuperação por próximos sinais: LOSS só fecha após 2 recuperações; WIN em REC1/REC2 encerra a sequência; Telegram recebe apenas o desfecho final.
 # MEGA IA 3.97.94 — Telegram: placar final automático ao desligar envio (sessão, horários, WIN/LOSS e aproveitamento).
 # MEGA IA 3.97.94 — histórico mostra o indicador/motor real gravado em cada sinal; remove OUTRO/ANTIGO dos novos resultados.
@@ -43294,15 +43295,36 @@ loadResultRecoveryState();
 function resolveRecoveryOutcome(trade,x){
   const raw=String((x&&x.result)||'').toUpperCase().trim();
   const stage=Math.max(0,Math.min(2,Number(resultRecoveryState.stage||0)));
+  const tradeKey=[String(trade&&trade.symbol||''),String(trade&&trade.direction||''),String(trade&&trade.expiry_time||'')].join('|');
+  const last=resultRecoveryState.last_loss_trade||null;
+  const lastKey=last ? [String(last.symbol||''),String(last.direction||''),String(last.expiry_time||'')].join('|') : '';
+
   if(raw==='DRAW' || !['WIN','LOSS'].includes(raw)){
     return {final:false,draw:raw==='DRAW',label:raw,stage};
   }
+
+  // 3.98.01: uma mesma operação pode ser consultada mais de uma vez pelo polling.
+  // Ela NUNCA pode avançar duas etapas da recuperação. Sem esta trava, o LOSS da
+  // entrada podia armar REC1 e a segunda leitura do MESMO LOSS já armar REC2.
+  if(raw==='LOSS' && tradeKey && lastKey && tradeKey===lastKey){
+    return {
+      final:false,
+      duplicate:true,
+      label:stage===1?'REC 1 PENDENTE':'REC 2 PENDENTE',
+      stage
+    };
+  }
+
   if(raw==='WIN'){
     const label=stage===1?'WIN G1':(stage===2?'WIN G2':'WIN');
     clearResultRecoveryState();
     return {final:true,label,accounting:'WIN',stage};
   }
-  // LOSS: as duas primeiras perdas apenas armam a recuperação no próximo sinal real.
+
+  // Cada LOSS de uma OPERAÇÃO DISTINTA avança exatamente uma etapa:
+  // entrada LOSS -> stage 1 (aguarda REC1)
+  // REC1 LOSS    -> stage 2 (aguarda REC2)
+  // REC2 LOSS    -> LOSS G2 final.
   if(stage<2){
     resultRecoveryState={
       stage:stage+1,
@@ -43312,6 +43334,7 @@ function resolveRecoveryOutcome(trade,x){
     saveResultRecoveryState();
     return {final:false,label:stage===0?'REC 1 PENDENTE':'REC 2 PENDENTE',stage:stage+1};
   }
+
   clearResultRecoveryState();
   return {final:true,label:'LOSS G2',accounting:'LOSS',stage:2};
 }
