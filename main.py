@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.26"
+APP_VERSION = "3.98.27"
+# MEGA IA 3.98.27 — Telegram→IQ no mesmo serviço: após o grupo aceitar o sinal, agenda a ordem Binária/Turbo em cliente IQ dedicado; padrão PRACTICE; estratégias preservadas.
 # MEGA IA 3.98.26 — Telegram Bridge: sinais confirmados incluem linha MEGA_EXEC v1 para executor IQ separado; estratégia dos motores preservada.
 # MEGA IA 3.98.23 — AUTO IQ: executa somente OPÇÕES BINÁRIAS/TURBO; DIGITAL removido da autoentrada e da validação de disponibilidade.
 # MEGA IA 3.98.22 — IQ 401: para reconexão automática após rejeição de autorização e exige login novo, evitando loop de WebSocket 401.\n# MEGA IA 3.98.21 — AUTO IQ: valida DIGITAL imediatamente antes da ordem, invalida catálogo após recusa e evita tentar instrumento digital indisponível.
@@ -28027,6 +28028,133 @@ async def _tg_request(method: str, payload: dict | None = None) -> dict:
         raise HTTPException(502, f"Falha ao comunicar com Telegram: {str(exc)[:220]}")
 
 
+# MEGA IA 3.98.27 — executor Telegram -> IQ embutido no mesmo Web Service.
+# A ordem só é agendada DEPOIS que o Telegram confirma o envio da mensagem ao grupo.
+# Usa credenciais próprias via Environment Variables e não interfere no login IQ do painel.
+TG_IQ_EXEC_ENABLED = os.getenv("TG_IQ_EXEC_ENABLED", "0").strip().lower() in ("1", "true", "on", "yes")
+TG_IQ_EMAIL = os.getenv("TG_IQ_EMAIL", "").strip()
+TG_IQ_PASSWORD = os.getenv("TG_IQ_PASSWORD", "")
+TG_IQ_ACCOUNT = os.getenv("TG_IQ_ACCOUNT", "PRACTICE").strip().upper()
+TG_IQ_AMOUNT = max(1.0, float(os.getenv("TG_IQ_AMOUNT", "2")))
+TG_IQ_MAX_LATE_SECONDS = max(2, int(os.getenv("TG_IQ_MAX_LATE_SECONDS", "8")))
+_tg_iq_client = None
+_tg_iq_lock = threading.RLock()
+_tg_iq_scheduled: set[str] = set()
+
+
+def _tg_iq_parse_dt(value: str | None) -> datetime:
+    raw = str(value or "").strip()
+    if not raw:
+        raise RuntimeError("horário do sinal ausente")
+    d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=UTC)
+    return d.astimezone(UTC)
+
+
+def _tg_iq_connect_blocking():
+    global _tg_iq_client
+    if IQ_Option is None:
+        raise RuntimeError("iqoptionapi indisponível")
+    with _tg_iq_lock:
+        if _tg_iq_client is not None:
+            try:
+                if _tg_iq_client.check_connect():
+                    return _tg_iq_client
+            except Exception:
+                pass
+            try:
+                _tg_iq_client.close()
+            except Exception:
+                pass
+            _tg_iq_client = None
+        if not TG_IQ_EMAIL or not TG_IQ_PASSWORD:
+            raise RuntimeError("configure TG_IQ_EMAIL e TG_IQ_PASSWORD no Render")
+        client = IQ_Option(TG_IQ_EMAIL, TG_IQ_PASSWORD)
+        result = client.connect()
+        ok = bool(result[0]) if isinstance(result, (tuple, list)) and result else bool(result)
+        reason = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else result
+        if not ok:
+            raise RuntimeError(f"login IQ recusado: {reason}")
+        account = "REAL" if TG_IQ_ACCOUNT == "REAL" else "PRACTICE"
+        client.change_balance(account)
+        _tg_iq_client = client
+        return client
+
+
+def _tg_iq_candidates(symbol: str, market: str) -> list[str]:
+    base = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
+    if not base:
+        return []
+    if str(market or "OPEN").upper() == "IQ_OTC":
+        return [f"{base}-OTC", f"{base}-OTC-op"]
+    return [base]
+
+
+def _tg_iq_place_blocking(body: TelegramSignalBody) -> tuple[str, Any]:
+    entry = _tg_iq_parse_dt(body.entry_time)
+    expiry = _tg_iq_parse_dt(body.expiry_time)
+    now_utc = datetime.now(UTC)
+    late = (now_utc - entry).total_seconds()
+    if late > TG_IQ_MAX_LATE_SECONDS:
+        raise RuntimeError(f"sinal atrasado {late:.1f}s; entrada bloqueada")
+    if expiry <= entry:
+        raise RuntimeError("expiração inválida")
+    direction = str(body.direction or "").upper()
+    if direction not in ("CALL", "PUT"):
+        raise RuntimeError("direção inválida")
+    action = "call" if direction == "CALL" else "put"
+    client = _tg_iq_connect_blocking()
+    errors = []
+    with _tg_iq_lock:
+        for active in _tg_iq_candidates(body.symbol, body.market):
+            try:
+                raw = getattr(client, "buy_by_raw_expirations", None)
+                if callable(raw):
+                    result = raw(TG_IQ_AMOUNT, active, action, int(expiry.timestamp()))
+                else:
+                    mins = max(1, int(round((expiry - entry).total_seconds() / 60.0)))
+                    result = client.buy(TG_IQ_AMOUNT, active, action, mins)
+                if isinstance(result, (tuple, list)) and len(result) >= 2:
+                    ok, order_id = bool(result[0]), result[1]
+                else:
+                    ok, order_id = bool(result), result
+                if ok:
+                    return active, order_id
+                errors.append(f"{active}: {result}")
+            except Exception as exc:
+                errors.append(f"{active}: {exc}")
+    raise RuntimeError(" | ".join(errors[-3:]) or "IQ recusou a ordem")
+
+
+async def _tg_iq_execute_after_group(body: TelegramSignalBody) -> None:
+    key = "|".join([str(body.symbol), str(body.direction), str(body.entry_time), str(body.market)])
+    if key in _tg_iq_scheduled:
+        return
+    _tg_iq_scheduled.add(key)
+    try:
+        entry = _tg_iq_parse_dt(body.entry_time)
+        wait = (entry - datetime.now(UTC)).total_seconds()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        active, order_id = await asyncio.to_thread(_tg_iq_place_blocking, body)
+        print(f"[TG→IQ OK] {active} {str(body.direction).upper()} valor={TG_IQ_AMOUNT:.2f} conta={TG_IQ_ACCOUNT} ordem={order_id}", flush=True)
+    except Exception as exc:
+        print(f"[TG→IQ BLOQUEADO] {body.symbol} {body.direction}: {exc}", flush=True)
+    finally:
+        # mantém dedupe por algumas horas sem crescimento ilimitado
+        if len(_tg_iq_scheduled) > 1000:
+            _tg_iq_scheduled.clear()
+
+
+def _tg_iq_schedule_after_group(body: TelegramSignalBody) -> None:
+    if not TG_IQ_EXEC_ENABLED or body.test or body.result:
+        return
+    if str(body.direction or "").upper() not in ("CALL", "PUT"):
+        return
+    asyncio.create_task(_tg_iq_execute_after_group(body), name="telegram-iq-order")
+
+
 async def _tg_send(body: TelegramSignalBody) -> dict:
     chat_id = _tg_chat_id(body.chat_id)
     dedupe_key = None
@@ -28050,6 +28178,8 @@ async def _tg_send(body: TelegramSignalBody) -> dict:
         "text": _tg_signal_text(body),
         "disable_web_page_preview": True,
     })
+    # Só agenda a IQ depois que o Telegram confirmou que a mensagem caiu no grupo.
+    _tg_iq_schedule_after_group(body)
     result = data.get("result") or {}
     if dedupe_key:
         telegram_sent_cache[dedupe_key] = time.time()
