@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.20"
+APP_VERSION = "3.98.22"
+# MEGA IA 3.98.22 — IQ 401: para reconexão automática após rejeição de autorização e exige login novo, evitando loop de WebSocket 401.\n# MEGA IA 3.98.21 — AUTO IQ: valida DIGITAL imediatamente antes da ordem, invalida catálogo após recusa e evita tentar instrumento digital indisponível.
 # MEGA IA 3.98.20 — corrige gatilho MEGA HFT que estava praticamente impossível; valida boot do app.
 # MEGA IA 3.98.19 — corrige JS dos botões, remove Dragon Fire/Pro e trava varredura por PARIDADES/CRIPTO.
 # MEGA IA 3.98.18 — adiciona MEGA HFT (desvio 20 + volume/VWAP + OBV + A/D), substitui MEGA HFT e remove Dragon Fire/Dragon Fire Pro do painel e seleção.
@@ -8331,6 +8332,21 @@ def _iq_reconnect_delay(failure_count: int) -> float:
     return min(IQ_RECONNECT_MAX, IQ_RECONNECT_BASE * (2 ** min(failure_count - 1, 4)))
 
 
+def _iq_mark_reauth_after_unstable_reconnects(state: Dict[str, Any], message: str, failures: int) -> bool:
+    """Evita loop infinito quando o fork perde o WS/401 sem devolver '401' no exception."""
+    low = str(message or "").lower()
+    websocket_auth_like = any(x in low for x in (
+        "websocket", "socket", "handshake", "connection closed",
+        "não confirmou a conexão", "caiu antes de estabilizar",
+    ))
+    # Um 401 explícito invalida imediatamente. Para erro genérico de WS, só após
+    # 3 tentativas consecutivas, reduzindo falso positivo por queda transitória.
+    if _iq_is_auth_failure(message) or (websocket_auth_like and int(failures) >= 3):
+        _iq_require_fresh_login(state, message)
+        return True
+    return False
+
+
 def _iq_reconnect_state(state: Dict[str, Any]):
     if state.get("reauth_required"):
         raise RuntimeError(
@@ -8387,19 +8403,17 @@ def _iq_reconnect_state(state: Dict[str, Any]):
             # 401/autorização inválida não deve ficar em reconexão infinita. Mesmo
             # quando o fork não repassa o 401 no texto, 3 falhas consecutivas encerram
             # a autorização antiga e deixam o próximo login começar limpo.
-            auth_failure = _iq_is_auth_failure(msg)
-            # Só invalida o login quando a própria IQ rejeita a autorização.
-            # Quedas de rede/WebSocket/Render podem se repetir várias vezes e NÃO
-            # devem apagar a sessão nem obrigar o usuário a digitar a senha de novo.
-            if auth_failure:
+            # 401 explícito: invalida imediatamente. Alguns forks apenas fecham o
+            # WebSocket e escondem o status HTTP; nesse caso 3 falhas consecutivas
+            # também encerram a sessão antiga para impedir reconexão infinita.
+            if _iq_mark_reauth_after_unstable_reconnects(state, msg, failures):
                 why = msg
-                _iq_require_fresh_login(state, why)
                 print(
-                    f"[IQ RECONNECT] autorização realmente recusada; novo login necessário • {why[:180]}",
+                    f"[IQ RECONNECT] sessão rejeitada/instável; novo login necessário • {why[:180]}",
                     flush=True,
                 )
                 raise RuntimeError(
-                    "A autorização da IQ Option foi recusada. Faça login novamente."
+                    "A sessão da IQ Option perdeu a autorização. Faça login novamente."
                 )
 
             delay = _iq_reconnect_delay(failures)
@@ -26689,6 +26703,33 @@ def _iq_select_account_blocking(state: Dict[str, Any], account: str):
     return confirmed_mode, balance
 
 
+
+def _iq_digital_tradeable_blocking(state: Dict[str, Any], active: str, expiry_minutes: int):
+    """Confirma se o DIGITAL está negociável agora antes de enviar dinheiro real."""
+    client = state.get("client") if state else None
+    checker = getattr(client, "get_digital_current_profit", None) if client is not None else None
+    if not callable(checker):
+        return True, "validação DIGITAL não disponível neste fork"
+    try:
+        sync_lock = state.get("sync_lock")
+        if sync_lock is None:
+            sync_lock = threading.RLock()
+            state["sync_lock"] = sync_lock
+        with sync_lock:
+            profit = checker(active, int(expiry_minutes))
+        if isinstance(profit, bool):
+            return bool(profit), f"profit={profit}"
+        if profit is None:
+            return False, "DIGITAL sem payout/instrumento disponível"
+        value = float(profit)
+        if value <= 0:
+            return False, f"DIGITAL indisponível/payout={value}"
+        return True, f"payout={value}"
+    except Exception as exc:
+        # Em erro de consulta não inventa disponibilidade para conta REAL.
+        return False, f"falha ao validar DIGITAL: {str(exc)[:120]}"
+
+
 def _iq_place_order_blocking(state: Dict[str, Any], symbol: str, interval: str, direction: str, amount: float, market: str, account: str = "PRACTICE"):
     client = _iq_reconnect_state(state)
     if not _iq_connected(state):
@@ -26754,6 +26795,13 @@ def _iq_place_order_blocking(state: Dict[str, Any], symbol: str, interval: str, 
         if tag in attempted:
             return None
         attempted.add(tag)
+
+        tradeable, tradeable_detail = _iq_digital_tradeable_blocking(state, active, expiry_minutes)
+        if not tradeable:
+            errors.append(f"DIGITAL {active}: bloqueado antes da ordem ({tradeable_detail})")
+            state.pop("auto_open_time_cache", None)
+            return None
+
         methods = [
             ("buy_digital_spot_v2", getattr(client, "buy_digital_spot_v2", None)),
             ("buy_digital_spot", getattr(client, "buy_digital_spot", None)),
@@ -26770,8 +26818,15 @@ def _iq_place_order_blocking(state: Dict[str, Any], symbol: str, interval: str, 
                     return finish(order_id, active, "DIGITAL", method_name.upper())
                 detail = str(order_id) if order_id not in (None, "") else "ordem recusada"
                 errors.append(f"DIGITAL {active}/{method_name}: {detail}")
+                if "Invalid Instrument" in detail or "asset is not available" in detail or "4006" in detail:
+                    state.pop("auto_open_time_cache", None)
+                    break
             except Exception as exc:
-                errors.append(f"DIGITAL {active}/{method_name}: {str(exc) or exc.__class__.__name__}")
+                err_text = str(exc) or exc.__class__.__name__
+                errors.append(f"DIGITAL {active}/{method_name}: {err_text}")
+                if "Invalid Instrument" in err_text or "asset is not available" in err_text or "4006" in err_text:
+                    state.pop("auto_open_time_cache", None)
+                    break
         if not available_method:
             errors.append("DIGITAL: método de compra indisponível nesta iqoptionapi")
         return None
