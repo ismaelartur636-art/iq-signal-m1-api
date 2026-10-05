@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.16"
+APP_VERSION = "3.98.17"
+# MEGA IA 3.98.17 — corrige botão ONLINE/OFFLINE do MEGA PREMIUM: sincronização com backend preserva MEGAPREMIUM sem converter para SCALPERPRO.
 # MEGA IA 3.98.16 — adiciona MEGA PREMIUM: MY 911 MTF Ichimoku 9/26/56, pré-alerta 20s, confirmação pela seta original, próxima M1.
 # MEGA IA 3.98.15 — resultados/Telegram: fecha operações vencidas antes do placar final e não perde contabilização se o envio ao Telegram falhar.
 # MEGA IA 3.98.14 — autoentrada IQ valida carteira REAL/PRACTICE e saldo antes da ordem; execução usa somente modalidades/ativos abertos do catálogo quando disponível.
@@ -36077,7 +36078,8 @@ roboFiboEnabled=localStorage.getItem('mega_robofibo_power')==='ONLINE';
 if(roboFiboEnabled){ pyramid7Enabled=false; masyukEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; }
 if(paulMacdM1Enabled){ paulMacdEnabled=false; sidus320Enabled=false; predatorPipsEnabled=false; pyramid7Enabled=false; masyukEnabled=false; roboFiboEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; }
 if(paulMacdEnabled){ paulMacdM1Enabled=false; sidus320Enabled=false; predatorPipsEnabled=false; pyramid7Enabled=false; masyukEnabled=false; roboFiboEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; }
-if(sidus320Enabled){ paulMacdM1Enabled=false; paulMacdEnabled=false; predatorPipsEnabled=false; pyramid7Enabled=false; masyukEnabled=false; roboFiboEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; }
+if(megaPremiumEnabled){ paulMacdM1Enabled=false; paulMacdEnabled=false; millionEaEnabled=false; moneyPileEnabled=false; sidus320Enabled=false; predatorPipsEnabled=false; pyramid7Enabled=false; masyukEnabled=false; roboFiboEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; }
+if(sidus320Enabled){ paulMacdM1Enabled=false; paulMacdEnabled=false; megaPremiumEnabled=false; predatorPipsEnabled=false; pyramid7Enabled=false; masyukEnabled=false; roboFiboEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; }
 if(predatorPipsEnabled){ paulMacdM1Enabled=false; sidus320Enabled=false; pyramid7Enabled=false; masyukEnabled=false; roboFiboEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; }
 if(pyramid7Enabled){ paulMacdM1Enabled=false; sidus320Enabled=false; predatorPipsEnabled=false; masyukEnabled=false; roboFiboEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; }
 if(masyukEnabled){ paulMacdM1Enabled=false; sidus320Enabled=false; pyramid7Enabled=false; roboFiboEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; }
@@ -36180,7 +36182,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',SIDUS320:'🎯 SIDUS EA V3.20',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MASYUK:'⚡ MASYUK V3',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO',DRAGONFIRE:'🔥 DRAGON FIRE',DRAGONFIREPRO:'🔥 DRAGON FIRE PRO'})[e]||'SEM MOTOR';
+  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',SIDUS320:'🎯 SIDUS EA V3.20',MEGAPREMIUM:'💎 MEGA PREMIUM',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MASYUK:'⚡ MASYUK V3',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO',DRAGONFIRE:'🔥 DRAGON FIRE',DRAGONFIREPRO:'🔥 DRAGON FIRE PRO'})[e]||'SEM MOTOR';
 }
 
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
@@ -36272,7 +36274,7 @@ async function syncBackgroundBotState(opts={}){
   // 3.97.64 — preserva o motor realmente escolhido ao sincronizar/recarregar.
   // Antes, PYRAMID7/PREDATORPIPS/MASYUK/FIBORSI eram convertidos para SCALPERPRO
   // no servidor; no refresh o estado do servidor voltava e trocava o motor na tela.
-  const backgroundEngines=new Set(['PAULMACD','PAULMACDM1','MILLIONEA','MONEYPILE','SIDUS320','SCALPERPRO','DRAGONFIRE','DRAGONFIREPRO','FIBORSI','MASYUK','PYRAMID7','PREDATORPIPS']);
+  const backgroundEngines=new Set(['PAULMACD','PAULMACDM1','MILLIONEA','MONEYPILE','SIDUS320','MEGAPREMIUM','SCALPERPRO','DRAGONFIRE','DRAGONFIREPRO','FIBORSI','MASYUK','PYRAMID7','PREDATORPIPS']);
   if(!backgroundEngines.has(explicitEngine)) explicitEngine='SCALPERPRO';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
