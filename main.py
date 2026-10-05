@@ -42,7 +42,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.34"
+APP_VERSION = "3.98.36"
+# MEGA IA 3.98.36 — TSR 2016: evento único/rearme; impede repetir CALL/PUT em velas consecutivas enquanto a mesma condição permanecer ativa.
+# MEGA IA 3.98.35 — Telegram/autoexec seguem exclusivamente o ativo selecionado no painel; scanner não mistura Forex com BTC/cripto.
 # MEGA IA 3.98.34 — trava anti-duplicação global: 1 entrada física = 1 sinal/resultado; limpa duplicados antigos do histórico e protege TSR 2016 no painel/Telegram/autoentrada.
 # MEGA IA 3.98.33 — corrige visibilidade e sincronização do botão TSR 2016.
 # MEGA IA 3.98.32 — integra TSR 2016: LWMA25 + Stochastic 32/12/12, próxima M1, sem grid/Martingale/Gale.
@@ -29510,10 +29512,16 @@ def tsr2016_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", curr
                 lo=min(lows[j-kp+1:j+1]); hi=max(highs[j-kp+1:j+1]); ks.append(50.0 if hi<=lo else 100.0*(closes[j]-lo)/(hi-lo))
             return sum(ks)/len(ks)
         ma=lwma(closes,25); ma_prev=lwma(closes[:-1],25)
-        k=stoch_at(len(rows)-1); kp=stoch_at(len(rows)-2)
+        ma_prev2=lwma(closes[:-2],25)
+        k=stoch_at(len(rows)-1); kp=stoch_at(len(rows)-2); kp2=stoch_at(len(rows)-3)
         # Adaptação do primeiro gatilho do EA: tendência pela LWMA + impulso do Stochastic.
-        call=closes[-1]>ma and ma>=ma_prev and k>kp and k<80
-        put=closes[-1]<ma and ma<=ma_prev and k<kp and k>20
+        call_condition=closes[-1]>ma and ma>=ma_prev and k>kp and k<80
+        put_condition=closes[-1]<ma and ma<=ma_prev and k<kp and k>20
+        prev_call_condition=closes[-2]>ma_prev and ma_prev>=ma_prev2 and kp>kp2 and kp<80
+        prev_put_condition=closes[-2]<ma_prev and ma_prev<=ma_prev2 and kp<kp2 and kp>20
+        # Evento único: dispara somente na transição para a condição; não repete em cada vela.
+        call=bool(call_condition and not prev_call_condition)
+        put=bool(put_condition and not prev_put_condition)
         direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
         diag={"lwma25":round(ma,10),"lwma25_prev":round(ma_prev,10),"stoch_32_12_12":round(k,2),"stoch_prev":round(kp,2)}
         if direction=="NEUTRO": return {**base,"reason":"TSR 2016 monitorando LWMA25 + Stochastic 32/12/12.","diagnostics":diag}
@@ -39682,6 +39690,12 @@ async function testTelegram(){
 }
 
 async function maybeSendTelegramSignal(signal){
+  // 3.98.35 — Telegram envia SOMENTE o ativo que o usuário está analisando.
+  // O radar pode continuar varrendo outros ativos, mas eles não vazam para o grupo.
+  const selectedTelegramSymbol=String((S&&S.value)||'').trim().toUpperCase().replace(/[\s_-]/g,'/');
+  const incomingTelegramSymbol=String((signal&&signal.symbol)||'').trim().toUpperCase().replace(/[\s_-]/g,'/');
+  const normTelegramSymbol=(v)=>v.replace(/\/+/g,'/').replace('BTCUSDT','BTC/USD').replace('BTCUSD','BTC/USD');
+  if(selectedTelegramSymbol && normTelegramSymbol(incomingTelegramSymbol)!==normTelegramSymbol(selectedTelegramSymbol)) return;
   if(!telegramEnabled || !signal || telegramBusy) return;
   const dir=String(signal.direction||'').toUpperCase();
   if((dir!=='CALL'&&dir!=='PUT') || !signal.entry_time) return;
@@ -39714,6 +39728,11 @@ async function maybeSendTelegramSignal(signal){
 }
 
 async function maybeSendTelegramResult(trade,outcome){
+  // 3.98.35 — resultado no Telegram também pertence somente ao ativo selecionado.
+  const selectedResultSymbol=String((S&&S.value)||'').trim().toUpperCase().replace(/[\s_-]/g,'/');
+  const incomingResultSymbol=String((trade&&trade.symbol)||'').trim().toUpperCase().replace(/[\s_-]/g,'/');
+  const normResultSymbol=(v)=>v.replace(/\/+/g,'/').replace('BTCUSDT','BTC/USD').replace('BTCUSD','BTC/USD');
+  if(selectedResultSymbol && normResultSymbol(incomingResultSymbol)!==normResultSymbol(selectedResultSymbol)) return;
   if(!telegramEnabled || !trade || !outcome) return;
   const resultLabel=String(outcome.result||'').toUpperCase().trim();
   if(!['WIN','LOSS','WIN G1','WIN G2','LOSS G1','LOSS G2'].includes(resultLabel)) return;
