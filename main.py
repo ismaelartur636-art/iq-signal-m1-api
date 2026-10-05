@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.19"
+APP_VERSION = "3.98.20"
+# MEGA IA 3.98.20 — corrige gatilho MEGA HFT que estava praticamente impossível; valida boot do app.
 # MEGA IA 3.98.19 — corrige JS dos botões, remove Dragon Fire/Pro e trava varredura por PARIDADES/CRIPTO.
 # MEGA IA 3.98.18 — adiciona MEGA HFT (desvio 20 + volume/VWAP + OBV + A/D), substitui MEGA HFT e remove Dragon Fire/Dragon Fire Pro do painel e seleção.
 # MEGA IA 3.98.17 — corrige botão ONLINE/OFFLINE do MEGA PREMIUM: sincronização com backend preserva MEGAPREMIUM sem converter para SCALPERPRO.
@@ -246,7 +247,7 @@ def ismael98_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", cur
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # MOTOR REMOVIDO permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v217"
+PWA_VERSION = "v218"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -29493,16 +29494,22 @@ def mega_hft_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
             ad[i]=running_ad; prev=c[i]
         mean_ad=sum(ad)/20.0
         last=c[-1]
-        sell=(last>mean+2.0*dev and meanv<meanl and obv[-1]<mean_obv and ad[-1]<mean_ad)
-        buy=(last<mean-2.0*dev and meanv>meanh and obv[-1]>mean_obv and ad[-1]>mean_ad)
+        # 3.98.20 — o filtro anterior comparava o preço ponderado por volume com
+        # a MÉDIA das máximas/mínimas de 20 candles. Na prática isso tornava a
+        # confluência quase impossível e o MEGA HFT permanecia ONLINE sem sinal.
+        # Mantemos o gatilho nativo de extremo 2σ e as confirmações de fluxo OBV/A-D.
+        avg_vol=sum(v)/20.0
+        vol_ok=(v[-1] >= avg_vol*0.60) if avg_vol>0 else True
+        sell=(last>mean+2.0*dev and obv[-1]<mean_obv and ad[-1]<mean_ad and vol_ok)
+        buy=(last<mean-2.0*dev and obv[-1]>mean_obv and ad[-1]>mean_ad and vol_ok)
         direction="PUT" if sell and not buy else ("CALL" if buy and not sell else "NEUTRO")
         z=abs(last-mean)/max(dev,1e-12)
         diag={"mean20":round(mean,8),"std20":round(dev,8),"zscore":round(z,2),
               "volume_weighted_price":round(meanv,8),"mean_high20":round(meanh,8),
               "mean_low20":round(meanl,8),"obv":round(obv[-1],2),"obv_mean":round(mean_obv,2),
-              "ad":round(ad[-1],4),"ad_mean":round(mean_ad,4)}
+              "ad":round(ad[-1],4),"ad_mean":round(mean_ad,4),"volume_ok":bool(vol_ok)}
         if direction=="NEUTRO":
-            return {**base,"reason":"MEGA HFT monitorando extremo 2σ + Volume + OBV + A/D.","diagnostics":diag}
+            return {**base,"reason":"MEGA HFT monitorando extremo 2σ + volume + OBV + A/D.","diagnostics":diag}
         conf=round(min(94.0,78.0+min(10.0,max(0.0,z-2.0)*8.0)+6.0),1)
         stamp=str(r[-1].get("datetime") or r[-1].get("timestamp") or "")
         return {**base,"direction":direction,"confidence":conf,"confirmed":True,"risk":"LOW",
