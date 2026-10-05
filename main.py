@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.29"
+APP_VERSION = "3.98.30"
+# MEGA IA 3.98.30 — MEGA PREMIUM PROTEGIDO libera com 3 de 4 proteções aprovadas; oculta MEGA_EXEC do Telegram sem afetar a autoentrada IQ interna.
 # MEGA IA 3.98.29 — adiciona MEGA PREMIUM PROTEGIDO como motor separado; original preservado; proteção por horário, volatilidade/lateralização e tendência.
 # MEGA IA 3.98.28 — IQ Option: conexão persistente; queda genérica de WebSocket não invalida login, reconexão automática mantém a sessão e só exige novo login em falha explícita de autorização.
 # MEGA IA 3.98.27 — Telegram→IQ no mesmo serviço: após o grupo aceitar o sinal, agenda a ordem Binária/Turbo em cliente IQ dedicado; padrão PRACTICE; estratégias preservadas.
@@ -27952,8 +27953,7 @@ def _tg_signal_text(body: TelegramSignalBody) -> str:
         f"⌛ Expiração: {_tg_display_time(body.expiry_time)}\n"
         f"🕐 Período: {body.interval}\n"
         f"🌐 Mercado: {market_label}\n"
-        f"⚠️ Risco: {str(body.risk or '--').upper()}\n"
-        f"{exec_line}"
+        f"⚠️ Risco: {str(body.risk or '--').upper()}"
     )
 
 
@@ -29567,15 +29567,16 @@ def mega_premium_protected_strategy(cs, symbol="EUR/USD", timeframe="1min", mark
         force_ok=body>=0.28
         diag=dict(original.get("diagnostics") or {})
         diag.update({"pro_hour_br":hour,"pro_hour_ok":hour_ok,"pro_vol_ratio":round(vol_ratio,3),"pro_volatility_ok":volatility_ok,"pro_trend_ok":trend_ok,"pro_body_ratio":round(body,3),"pro_force_ok":force_ok})
-        blocked=[]
-        if not hour_ok: blocked.append("horário protegido")
-        if not volatility_ok: blocked.append("volatilidade/lateralização")
-        if not trend_ok: blocked.append("tendência de contexto")
-        if not force_ok: blocked.append("vela sem força")
-        if blocked:
-            return {**base,"direction":"NEUTRO","confirmed":False,"confidence":0.0,"risk":"MEDIUM","reason":"MEGA PREMIUM PROTEGIDO bloqueou o sinal original: "+", ".join(blocked)+".","diagnostics":diag}
+        checks={"horário":hour_ok,"volatilidade/lateralização":volatility_ok,"tendência de contexto":trend_ok,"força da vela":force_ok}
+        approved=[name for name,ok in checks.items() if ok]
+        blocked=[name for name,ok in checks.items() if not ok]
+        votes=len(approved)
+        diag.update({"pro_votes":votes,"pro_required_votes":3,"pro_approved":approved,"pro_blocked":blocked})
+        if votes < 3:
+            return {**base,"direction":"NEUTRO","confirmed":False,"confidence":0.0,"risk":"MEDIUM","reason":f"MEGA PREMIUM PROTEGIDO bloqueou o sinal original: {votes}/4 proteções aprovadas; mínimo 3/4. Falhou: "+", ".join(blocked)+".","diagnostics":diag}
         stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
-        return {**base,"confidence":90.0,"risk":"LOW","reason":f"{d} MEGA PREMIUM PROTEGIDO • gatilho original + horário + volatilidade + tendência + força aprovados • próxima M1.","event_key":f"MEGAPREMIUMPRO:{d}:{stamp}","diagnostics":diag}
+        conf=88.0 if votes==3 else 92.0
+        return {**base,"confidence":conf,"risk":("LOW" if votes==4 else "MEDIUM"),"reason":f"{d} MEGA PREMIUM PROTEGIDO • gatilho original + {votes}/4 proteções aprovadas • próxima M1.","event_key":f"MEGAPREMIUMPRO:{d}:{stamp}","diagnostics":diag}
     except Exception as exc:
         return {**base,"direction":"NEUTRO","confirmed":False,"confidence":0.0,"reason":f"MEGA PREMIUM PROTEGIDO aguardando filtros: {str(exc)[:90]}"}
 
