@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.14"
+APP_VERSION = "3.98.15"
+# MEGA IA 3.98.15 — resultados/Telegram: fecha operações vencidas antes do placar final e não perde contabilização se o envio ao Telegram falhar.
 # MEGA IA 3.98.14 — autoentrada IQ valida carteira REAL/PRACTICE e saldo antes da ordem; execução usa somente modalidades/ativos abertos do catálogo quando disponível.
 # MEGA IA 3.98.13 — restaura seletor IQ Option PRACTICE/REAL na autoentrada; REAL exige escolha e confirmação explícitas.
 # MEGA IA 3.98.12 — IQ Option conectada passa a ser fonte principal dos candles OPEN; multifuente fica como fallback.
@@ -27929,7 +27930,7 @@ def _tg_session_summary_text() -> str:
     lines = ["🏁 MEGA IA • RESULTADO FINAL", f"🕒 Sessão: {started} às {ended}", ""]
     if rows:
         for x in rows:
-            win = str(x.get("result") or "").upper() == "WIN"
+            win = str(x.get("result") or "").upper().startswith("WIN")
             mark = "✅" if win else "❌"
             color = "🟢" if win else "🔴"
             lines.append(f"{mark} {x.get('symbol') or '--'} — {x.get('result')} {color} • {_tg_display_time(x.get('entry_time'))}")
@@ -28471,6 +28472,10 @@ async def _background_settle_pending() -> None:
             if not result_label:
                 keep.append(trade)
                 continue
+            # 3.98.15 — contabiliza PRIMEIRO. Uma falha temporária do Telegram
+            # nunca pode impedir WIN/LOSS de entrar no placar/histórico.
+            _background_accounting_finish(trade, result_label, candle, iq_state)
+
             # Telegram atual só aceita WIN/LOSS. Empate é contabilizado, mas não
             # dispara mensagem de perda falsa.
             if (
@@ -28478,8 +28483,11 @@ async def _background_settle_pending() -> None:
                 and bool(background_bot_state.get("telegram_enabled"))
                 and bool(trade.get("telegram_notify", True))
             ):
-                await _background_send_result(trade, result_label)
-            _background_accounting_finish(trade, result_label, candle, iq_state)
+                try:
+                    await _background_send_result(trade, result_label)
+                except Exception as exc:
+                    # Resultado já ficou salvo; registra somente a falha de notificação.
+                    background_bot_state["last_error"] = f"resultado Telegram: {str(exc)[:160]}"
             _release_ai_asset_cycle_lock(
                 str(trade.get("market") or "OPEN").upper(),
                 str(trade.get("symbol") or ""),
@@ -28730,8 +28738,14 @@ async def background_bot_set_state(body: BackgroundBotStateBody):
 
             tg_on = bool(body.telegram_enabled)
             was_on = bool(background_bot_state.get("telegram_enabled"))
-            # Ao apertar OFF, fecha primeiro a sessão no Telegram enquanto o envio ainda está autorizado.
+            # 3.98.15 — ao apertar OFF, primeiro tenta fechar todas as operações
+            # cuja expiração já passou. Só depois monta o placar final da sessão.
+            # Antes o resumo podia sair 0x0 mesmo havendo sinais já expirados.
             if was_on and not tg_on:
+                try:
+                    await _background_settle_pending()
+                except Exception as exc:
+                    background_bot_state["last_error"] = f"fechamento antes do placar: {str(exc)[:160]}"
                 try:
                     await _tg_send_session_summary(str(background_bot_state.get("chat_id") or "").strip() or None)
                 except Exception as exc:
