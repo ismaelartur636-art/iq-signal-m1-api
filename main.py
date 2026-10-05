@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.15"
+APP_VERSION = "3.98.16"
+# MEGA IA 3.98.16 — adiciona MEGA PREMIUM: MY 911 MTF Ichimoku 9/26/56, pré-alerta 20s, confirmação pela seta original, próxima M1.
 # MEGA IA 3.98.15 — resultados/Telegram: fecha operações vencidas antes do placar final e não perde contabilização se o envio ao Telegram falhar.
 # MEGA IA 3.98.14 — autoentrada IQ valida carteira REAL/PRACTICE e saldo antes da ordem; execução usa somente modalidades/ativos abertos do catálogo quando disponível.
 # MEGA IA 3.98.13 — restaura seletor IQ Option PRACTICE/REAL na autoentrada; REAL exige escolha e confirmação explícitas.
@@ -22096,14 +22097,14 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     elif engine == "ISMAEL98":
         # ISMAEL 98 faz snapshot seletivo nos 20s finais e entra na próxima abertura.
         entry_mode = "MIDDLE"
-    elif engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+    elif engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
         # Motores importados: confirmação causal em candle fechado e entrada na próxima vela.
         entry_mode = "BIRTH"
     if engine == "RSI":
         engine = "GRAPH_AI"
     if engine in RETIRED_ENGINES:
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "MONSTERSMC", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+    if engine not in ("GRAPH_AI", "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "MONSTERSMC", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
         engine = "GRAPH_AI"
     if engine == "RTM" and not _rtm_symbol_allowed(symbol):
         out = neutral_signal(
@@ -22696,7 +22697,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 request_n = 1000
             elif engine in ("MEGAMASTER", "MONSTERSMC", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "MINSCALPER"):
                 request_n = 320
-            elif engine in ("KAMIKAZE", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+            elif engine in ("KAMIKAZE", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
                 request_n = 1300 if engine == "RSICROSS" else (1000 if engine == "SCALPINGASIA" else (260 if engine == "SCALPERPRO" else 260))
             elif engine == "SMART" and market == "OPEN":
                 request_n = 240
@@ -23225,7 +23226,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             engine_title = "MOTOR REMOVIDO"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+        if market != "OPEN" and engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -23440,7 +23441,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 engine_closed = closed[-260:]
             elif engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "EA"):
                 engine_closed = closed[-220:]
-            elif engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "RSI5", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+            elif engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "RSI5", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
                 engine_closed = closed[-120:]
             else:
                 engine_closed = closed[-90:] if len(closed) > 90 else closed
@@ -23645,6 +23646,16 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis["seconds_to_entry_snapshot"]=round(_min_remaining,1)
             elif engine == "SIDUS320":
                 analysis=sidus_v320_strategy(engine_closed[-120:],symbol=symbol,timeframe=interval,market=market)
+            elif engine == "MEGAPREMIUM":
+                _mp_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                _mp_early=1 <= _mp_remaining <= 20
+                if _mp_early:
+                    analysis=mega_premium_strategy(raw[-160:],symbol=symbol,timeframe=interval,market=market,current_candle_closed=False,allow_prealert=True)
+                else:
+                    analysis=mega_premium_strategy(engine_closed[-160:],symbol=symbol,timeframe=interval,market=market,current_candle_closed=True,allow_prealert=False)
+                    if analysis.get("confirmed"):
+                        analysis={**analysis,"direction":"NEUTRO","confirmed":False,"confidence":0.0,"reason":f"MEGA PREMIUM confirmado; aguardando pré-alerta de 20s • faltam {int(_mp_remaining)}s.","early_signal_window":False}
+                analysis["seconds_to_entry_snapshot"]=round(_mp_remaining,1)
             elif engine == "PAULMACD":
                 analysis=paul_macd_strategy(engine_closed[-320:],symbol=symbol,timeframe=interval,market=market)
             elif engine == "PAULMACDM1":
@@ -23984,7 +23995,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": (f"ONLINE • SCALPER PRO • MONITORANDO MERCADO" if engine == "SCALPERPRO" else f"ONLINE • {engine_title} {tf_label} MONITORANDO"),
-            "ai_confirmed": bool(engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "PAULMACD", "PAULMACDM1", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC") and analysis.get("confirmed")),
+            "ai_confirmed": bool(engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC") and analysis.get("confirmed")),
             "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                 "LOCALANALYST": "LOCAL_ANALYST_PRO",
                 "LOCALANALYSTFLEX": "LOCAL_ANALYST_FLEX",
@@ -24759,7 +24770,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 else:
                     # CLOSED_PANEL_ENGINES jamais carregam sinal de uma barra antiga
                     # para a vela subsequente após a janela de nascimento.
-                    if ai_only and engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS"):
+                    if ai_only and engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS"):
                         elapsed = max(0.0, (now() - current_boundary(interval)).total_seconds())
                         if elapsed > 10.0 or not _last_closed_matches_current_open(engine_closed, interval):
                             base.update({
@@ -24979,7 +24990,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -28140,7 +28151,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     # 3.97.42 — servidor 24h isolado: somente os dois motores visíveis.
-    "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS",
+    "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "MEGAPREMIUM",
 }
 
 
@@ -28277,7 +28288,7 @@ def _background_symbols_for_state() -> list[str]:
         return configured
     # 3.97.42: com apenas Scalper Pro/Flex no app, não varrer pares antigos
     # silenciosamente. Mercado aberto fica em BTC/USD até o painel enviar outro ativo.
-    if market == "OPEN" and engine in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SCALPINGASIA", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS"):
+    if market == "OPEN" and engine in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SCALPINGASIA", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS"):
         return ["BTC/USD"] if "BTC/USD" in allowed else []
     return []
 
@@ -29293,6 +29304,48 @@ def millionaire_ea_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN
         return {**base,"reason":f"EA MILIONÁRIO aguardando leitura válida: {str(exc)[:100]}"}
 
 
+def mega_premium_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
+    """MEGA PREMIUM — adaptação causal do MY 911 MTF recebido.
+    Parâmetros originais: Ichimoku 9/26/56, use233=False. A confirmação oficial
+    replica a seta: fechamento acima/abaixo de Kijun e da nuvem, candle direcional
+    e toque da nuvem na vela do sinal ou anterior. Pré-alerta: 20s finais.
+    """
+    rows=list(cs or [])[-320:]
+    live_snapshot=bool(allow_prealert and not current_candle_closed)
+    base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
+          "strategy":"💎 MEGA PREMIUM","engine":"MEGAPREMIUM","provider":"MY_911_MTF_ICHIMOKU_CAUSAL_V1",
+          "next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,
+          "grid":False,"martingale":False,"closed_candles_only":not live_snapshot,"non_repaint_after_release":True,
+          "prealert_seconds":20,"early_signal_window":live_snapshot}
+    if len(rows)<90:
+        return {**base,"reason":f"MEGA PREMIUM coletando candles ({len(rows)}/90)."}
+    try:
+        highs=[float(x.get("high",0) or 0) for x in rows]; lows=[float(x.get("low",0) or 0) for x in rows]
+        opens=[float(x.get("open",0) or 0) for x in rows]; closes=[float(x.get("close",0) or 0) for x in rows]
+        def mid(period, end):
+            a=max(0,end-period+1); return (max(highs[a:end+1])+min(lows[a:end+1]))/2.0
+        i=len(rows)-1
+        tenkan=mid(9,i); kijun=mid(26,i)
+        # Valor causal da nuvem correspondente à lógica do indicador, sem candle futuro.
+        span_a=(tenkan+kijun)/2.0; span_b=mid(56,i)
+        p_tenkan=mid(9,i-1); p_kijun=mid(26,i-1); p_span_a=(p_tenkan+p_kijun)/2.0; p_span_b=mid(56,i-1)
+        call=(closes[i]>=kijun and closes[i]>=span_a and closes[i]>=span_b and closes[i]>opens[i]
+              and (lows[i]<span_a or lows[i-1]<p_span_a or lows[i]<span_b or lows[i-1]<p_span_b))
+        put=(closes[i]<=kijun and closes[i]<=span_a and closes[i]<=span_b and closes[i]<opens[i]
+             and (highs[i]>span_a or highs[i-1]>p_span_a or highs[i]>span_b or highs[i-1]>p_span_b))
+        direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
+        diag={"tenkan9":round(tenkan,10),"kijun26":round(kijun,10),"span_a":round(span_a,10),"span_b56":round(span_b,10),"use233":False,"prealert20":live_snapshot}
+        if direction=="NEUTRO":
+            return {**base,"reason":"MEGA PREMIUM monitorando a condição original da seta MY 911 (Ichimoku 9/26/56).","diagnostics":diag}
+        stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
+        conf=86.0
+        return {**base,"direction":direction,"confidence":conf,"confirmed":True,"risk":"LOW",
+                "reason":f"{direction} MEGA PREMIUM • condição MY 911 confirmada • próxima M1 • pré-alerta 20s • sem Gale.",
+                "event_key":f"MEGAPREMIUM:{direction}:{stamp}","early_signal_locked":live_snapshot,"diagnostics":diag}
+    except Exception as exc:
+        return {**base,"reason":f"MEGA PREMIUM aguardando leitura válida: {str(exc)[:100]}"}
+
+
 def sidus_v320_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     """SIDUS EA V3.20 FLEX — adaptação causal mais solta para opções binárias.
     Mantém EMA18/28 + WMA5/8, mas aceita um crossover ocorrido em até 3 candles fechados.
@@ -29613,7 +29666,7 @@ def scalping_asia_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
 # -----------------------------------------------------------------------------
 _BACKTEST48_SUPPORTED = {
     "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER",
-    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS",
+    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS",
 }
 _BACKTEST48_NAMES = {
     "SMART": "MOTOR REMOVIDO",
@@ -29632,6 +29685,7 @@ _BACKTEST48_NAMES = {
     "DRAGONFIREPRO": "🔥 DRAGON FIRE PRO",
     "FIBORSI": "🌀 ROBO FIBO",
     "SIDUS320": "🎯 SIDUS EA V3.20",
+    "MEGAPREMIUM": "💎 MEGA PREMIUM",
     "PAULMACD": "📈 PAUL MACD M1 + M5",
     "PAULMACDM1": "📈 PAUL MACD M1",
     "MILLIONEA": "💰 EA MILIONÁRIO",
@@ -29934,6 +29988,8 @@ def _backtest48_eval(engine: str, hist: list, symbol: str, interval: str, market
         return scalping_asia_strategy(hist[-1001:], symbol=symbol, timeframe=interval, market=market, current_candle_closed=True, allow_prealert=False)
     if engine == "SIDUS320":
         return sidus_v320_strategy(hist[-120:], symbol=symbol, timeframe=interval, market=market)
+    if engine == "MEGAPREMIUM":
+        return mega_premium_strategy(hist[-160:], symbol=symbol, timeframe=interval, market=market)
     if engine == "PAULMACD":
         return paul_macd_strategy(hist[-320:], symbol=symbol, timeframe=interval, market=market)
     if engine == "PAULMACDM1":
@@ -30094,11 +30150,11 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
 
     if not _symbol_allowed(symbol, requested_market) or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
-    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS"):
+    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS"):
         engine = "SCALPERPRO"
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+    if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
         fallback_twelve = False
         effective_market = requested_market
     else:
@@ -30133,7 +30189,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_label"] = _feed_source_label(_fs) if _fs != "MULTIFEED" else "Multifuente • RTM interno"
                     data["feed_fallback"] = bool(data.get("feed_fallback", False))
                     data["feed_message"] = "RTM MULTI + TAURUS analisado dentro do app por gatilhos individuais confirmados pelo Taurus; o bridge MT4 ficou opcional."
-            elif engine in ("INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+            elif engine in ("INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
                     feed_src = str(feed_info.get("source") or "MULTIFEED")
@@ -30862,7 +30918,7 @@ async def pre_signals(
     market = (market or "OPEN").upper()
     engine = str(engine or "SMART").upper()
     # 3.97.54 — somente SCALPER PRO e DRAGON FIRE são operacionais.
-    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS"):
+    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS"):
         engine = "SCALPERPRO"
     limit = max(1, min(int(limit), 4))
 
@@ -31932,7 +31988,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Intervalo ou mercado inválido.")
     if symbol and not _symbol_allowed(symbol, market):
         raise HTTPException(400, "Ativo do radar inválido.")
-    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS"):
+    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS"):
         engine = "SCALPERPRO"
 
     if engine == "RTM":
@@ -32134,6 +32190,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 raw=await iq_ea_candles(iq_state,sym,interval,160,regular_market=False)
             else:
                 raw=await candles(sym,interval,160,"OPEN",None,request=request)
+        elif engine == "MEGAPREMIUM":
+            if market == "IQ_OTC":
+                if not iq_state: raise RuntimeError("Conecte a IQ Option para o MEGA PREMIUM analisar OTC.")
+                raw=await iq_ea_candles(iq_state,sym,interval,180,regular_market=False)
+            else:
+                raw=await candles(sym,interval,180,"OPEN",None,request=request)
         elif engine == "MASYUK":
             if market == "IQ_OTC":
                 if not iq_state: raise RuntimeError("Conecte a IQ Option para o MASYUK V3 analisar OTC.")
@@ -32377,7 +32439,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         elif len(raw) >= 25:
             # Os sinais STREAKREV trabalham com timestamps verificáveis para
             # usar a mesma última vela FECHADA do motor oficial /signal-ai.
-            closed = (_verified_closed_candles(raw, interval) if engine in ("STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIREPRO", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS")
+            closed = (_verified_closed_candles(raw, interval) if engine in ("STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS")
                       else (raw[:-1] if len(raw) > 1 else raw))
             if engine == "EA":
                 tech = await ea_xgboost_strategy(closed, sym, interval, market=market)
@@ -32743,6 +32805,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 engine_label="🎯 SIDUS EA V3.20"
                 direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why=str(tech.get("reason") or "SIDUS monitorando crossover.").replace("\n"," ")[:120]
+                status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
+            elif engine == "MEGAPREMIUM":
+                tech=mega_premium_strategy(closed[-160:],symbol=sym,timeframe=interval,market=market)
+                engine_label="💎 MEGA PREMIUM"
+                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why=str(tech.get("reason") or "MEGA PREMIUM monitorando a seta MY 911.").replace("\n"," ")[:120]
                 status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "MASYUK":
                 tech=masyuk_v3_strategy(closed[-120:],symbol=sym,timeframe=interval,market=market)
@@ -33228,7 +33296,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "engine": engine,
                 "strategy": str(tech.get("strategy") or ""),
             }
-            if item.get("direction") in ("CALL", "PUT") and engine not in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+            if item.get("direction") in ("CALL", "PUT") and engine not in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MASYUK", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
                 radar_probe = {
                     "symbol": sym, "market": market, "interval": interval,
                     "direction": item.get("direction"), "confidence": item.get("confidence"),
@@ -34491,12 +34559,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     .mega-ea-folder{display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;min-height:92px;margin:10px 0 12px;padding:16px;border:1px solid #2f86ff;border-radius:16px;background:linear-gradient(180deg,rgba(15,45,76,.96),rgba(6,25,44,.96));box-shadow:0 0 20px rgba(47,134,255,.18);cursor:pointer;user-select:none}
     .mega-ea-folder-title{font-size:30px;font-weight:1000;letter-spacing:1.2px;color:#7fd3ff;text-shadow:0 0 14px rgba(66,190,255,.45)}
     .mega-ea-folder-hint{font-size:12px;font-weight:800;opacity:.78}
-    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #masyukModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
+    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #megaPremiumModeCard,body:not(.mega-ea-open) #masyukModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
 
     /* 3.97.11 — painel de motores enxuto: MOTOR REMOVIDO + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
-    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#paulMacdModeCard,#paulMacdM1ModeCard,#sidus320ModeCard,#masyukModeCard,#pyramid7ModeCard,#predatorPipsModeCard,#millionEaModeCard,#moneyPileModeCard{display:flex !important}
-    #scalperProModeCard .robot-mode-desc,#dragonFireModeCard .robot-mode-desc,#dragonFireProModeCard .robot-mode-desc,#roboFiboModeCard .robot-mode-desc,#paulMacdModeCard .robot-mode-desc,#paulMacdM1ModeCard .robot-mode-desc,#sidus320ModeCard .robot-mode-desc,#masyukModeCard .robot-mode-desc,#pyramid7ModeCard .robot-mode-desc,#predatorPipsModeCard .robot-mode-desc,#millionEaModeCard .robot-mode-desc,#moneyPileModeCard .robot-mode-desc{display:none !important}
+    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#paulMacdModeCard,#paulMacdM1ModeCard,#sidus320ModeCard,#megaPremiumModeCard,#masyukModeCard,#pyramid7ModeCard,#predatorPipsModeCard,#millionEaModeCard,#moneyPileModeCard{display:flex !important}
+    #scalperProModeCard .robot-mode-desc,#dragonFireModeCard .robot-mode-desc,#dragonFireProModeCard .robot-mode-desc,#roboFiboModeCard .robot-mode-desc,#paulMacdModeCard .robot-mode-desc,#paulMacdM1ModeCard .robot-mode-desc,#sidus320ModeCard .robot-mode-desc,#megaPremiumModeCard .robot-mode-desc,#masyukModeCard .robot-mode-desc,#pyramid7ModeCard .robot-mode-desc,#predatorPipsModeCard .robot-mode-desc,#millionEaModeCard .robot-mode-desc,#moneyPileModeCard .robot-mode-desc{display:none !important}
     #scalpingAsiaModeCard{display:none !important}
   </style>
 
@@ -34553,7 +34621,16 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="sidus320PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
-  <div class="robot-mode-card" id="predatorPipsModeCard">
+  
+  <div class="robot-mode-card" id="megaPremiumModeCard">
+    <img src="__MEGA_IMAGE__" alt="Mega Premium">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">💎 MEGA PREMIUM</div>
+      <div class="robot-mode-desc" id="megaPremiumModeDesc">MY 911 MTF • Ichimoku 9/26/56 • pré-alerta 20s antes da possível seta • próxima M1 • expiração M1 • sem Gale.</div>
+    </div>
+    <button id="megaPremiumPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+<div class="robot-mode-card" id="predatorPipsModeCard">
     <img src="__MEGA_IMAGE__" alt="Predator Pips">
     <div class="robot-mode-copy">
       <div class="robot-mode-title">🐆 PREDATOR PIPS</div>
@@ -35407,6 +35484,8 @@ const moneyPilePowerBtn=document.getElementById('moneyPilePowerBtn');
 const moneyPileModeDesc=document.getElementById('moneyPileModeDesc');
 const sidus320PowerBtn=document.getElementById('sidus320PowerBtn');
 const sidus320ModeDesc=document.getElementById('sidus320ModeDesc');
+const megaPremiumPowerBtn=document.getElementById('megaPremiumPowerBtn');
+const megaPremiumModeDesc=document.getElementById('megaPremiumModeDesc');
 const predatorPipsPowerBtn=document.getElementById('predatorPipsPowerBtn');
 const predatorPipsModeDesc=document.getElementById('predatorPipsModeDesc');
 const pyramid7PowerBtn=document.getElementById('pyramid7PowerBtn');
@@ -35988,6 +36067,7 @@ paulMacdM1Enabled=localStorage.getItem('mega_paul_macd_m1_power')==='ONLINE';
 millionEaEnabled=localStorage.getItem('mega_million_ea_power')==='ONLINE';
 let moneyPileEnabled=localStorage.getItem('mega_money_pile_power')==='ONLINE';
 sidus320Enabled=localStorage.getItem('mega_sidus320_power')==='ONLINE';
+megaPremiumEnabled=localStorage.getItem('mega_premium_power')==='ONLINE';
 predatorPipsEnabled=localStorage.getItem('mega_predator_pips_power')==='ONLINE';
 pyramid7Enabled=localStorage.getItem('mega_pyramid7_power')==='ONLINE';
 masyukEnabled=localStorage.getItem('mega_masyuk_power')==='ONLINE';
@@ -36015,6 +36095,7 @@ function setExclusiveVisibleEngine(engine){
   millionEaEnabled=(e==='MILLIONEA');
   moneyPileEnabled=(e==='MONEYPILE');
   sidus320Enabled=(e==='SIDUS320');
+  megaPremiumEnabled=(e==='MEGAPREMIUM');
   predatorPipsEnabled=(e==='PREDATORPIPS');
   pyramid7Enabled=(e==='PYRAMID7');
   masyukEnabled=(e==='MASYUK');
@@ -36029,6 +36110,7 @@ function setExclusiveVisibleEngine(engine){
     localStorage.setItem('mega_million_ea_power',millionEaEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_money_pile_power',moneyPileEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_sidus320_power',sidus320Enabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_premium_power',megaPremiumEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_predator_pips_power',predatorPipsEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_pyramid7_power',pyramid7Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_masyuk_power',masyukEnabled?'ONLINE':'OFFLINE');
@@ -36046,6 +36128,7 @@ function selectedRobotEngine(){
   if(millionEaEnabled) return 'MILLIONEA';
   if(moneyPileEnabled) return 'MONEYPILE';
   if(sidus320Enabled) return 'SIDUS320';
+  if(megaPremiumEnabled) return 'MEGAPREMIUM';
   if(predatorPipsEnabled) return 'PREDATORPIPS';
   if(pyramid7Enabled) return 'PYRAMID7';
   if(masyukEnabled) return 'MASYUK';
@@ -36061,12 +36144,13 @@ function adoptBackgroundEngineState(d){
   if(typeof d.telegram_enabled==='boolean'){ telegramEnabled=!!d.telegram_enabled; }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(e!=='PAULMACD' && e!=='PAULMACDM1' && e!=='MILLIONEA' && e!=='MONEYPILE' && e!=='SIDUS320' && e!=='SCALPERPRO' && e!=='DRAGONFIRE' && e!=='DRAGONFIREPRO' && e!=='FIBORSI' && e!=='MASYUK' && e!=='PYRAMID7' && e!=='PREDATORPIPS') return;
+  if(e!=='PAULMACD' && e!=='PAULMACDM1' && e!=='MILLIONEA' && e!=='MONEYPILE' && e!=='SIDUS320' && e!=='MEGAPREMIUM' && e!=='SCALPERPRO' && e!=='DRAGONFIRE' && e!=='DRAGONFIREPRO' && e!=='FIBORSI' && e!=='MASYUK' && e!=='PYRAMID7' && e!=='PREDATORPIPS') return;
   paulMacdEnabled=(e==='PAULMACD');
   paulMacdM1Enabled=(e==='PAULMACDM1');
   millionEaEnabled=(e==='MILLIONEA');
   moneyPileEnabled=(e==='MONEYPILE');
   sidus320Enabled=(e==='SIDUS320');
+  megaPremiumEnabled=(e==='MEGAPREMIUM');
   predatorPipsEnabled=(e==='PREDATORPIPS');
   pyramid7Enabled=(e==='PYRAMID7');
   masyukEnabled=(e==='MASYUK');
@@ -36081,6 +36165,7 @@ function adoptBackgroundEngineState(d){
     localStorage.setItem('mega_million_ea_power',millionEaEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_money_pile_power',moneyPileEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_sidus320_power',sidus320Enabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_premium_power',megaPremiumEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_predator_pips_power',predatorPipsEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_pyramid7_power',pyramid7Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_masyuk_power',masyukEnabled?'ONLINE':'OFFLINE');
@@ -40104,6 +40189,7 @@ function applyRobotPowerState(){
   if(millionEaModeDesc) millionEaModeDesc.textContent=millionEaEnabled?'ONLINE: RSI/MARSI + LWMA140 M5 + Bears Power50 • próxima M1 • sem Gale.':'OFFLINE: EA MILIONÁRIO pausado.';
   if(moneyPilePowerBtn){ moneyPilePowerBtn.textContent=moneyPileEnabled?'🟢 ONLINE':'🔴 OFFLINE'; moneyPilePowerBtn.style.background=moneyPileEnabled?'#0b7a3d':'#7d1d1d'; moneyPilePowerBtn.style.color='#fff'; moneyPilePowerBtn.style.borderColor=moneyPileEnabled?'#16c56b':'#ff5252'; }
   if(moneyPileModeDesc) moneyPileModeDesc.textContent=moneyPileEnabled?'ONLINE: direção do candle + RSI14 H1 • próxima M1 • sem Grid/Martingale/Gale.':'OFFLINE: MEGA MONEY EA pausado.';
+  if(megaPremiumPowerBtn){ megaPremiumPowerBtn.textContent=megaPremiumEnabled?'🟢 ONLINE':'🔴 OFFLINE'; megaPremiumPowerBtn.style.background=megaPremiumEnabled?'#0b7a3d':'#7d1d1d'; megaPremiumPowerBtn.style.color='#fff'; megaPremiumPowerBtn.style.borderColor=megaPremiumEnabled?'#16c56b':'#ff5252'; }
   if(sidus320PowerBtn){ sidus320PowerBtn.textContent=sidus320Enabled?'🟢 ONLINE':'🔴 OFFLINE'; sidus320PowerBtn.style.background=sidus320Enabled?'#0b7a3d':'#7d1d1d'; sidus320PowerBtn.style.color='#fff'; sidus320PowerBtn.style.borderColor=sidus320Enabled?'#16c56b':'#ff5252'; }
   if(sidus320ModeDesc) sidus320ModeDesc.textContent=sidus320Enabled?'ONLINE: Sidus FLEX • crossover até 3 candles + túnel EMA • próxima M1 • sem Gale.':'OFFLINE: SIDUS EA V3.20 pausado.';
   if(predatorPipsPowerBtn){ predatorPipsPowerBtn.textContent=predatorPipsEnabled?'🟢 ONLINE':'🔴 OFFLINE'; predatorPipsPowerBtn.style.background=predatorPipsEnabled?'#0b7a3d':'#7d1d1d'; predatorPipsPowerBtn.style.color='#fff'; predatorPipsPowerBtn.style.borderColor=predatorPipsEnabled?'#16c56b':'#ff5252'; }
@@ -41240,6 +41326,19 @@ async function setMoneyPilePower(enabled){
   await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'MONEYPILE'});
   scheduleBacktest48(true,200);
   if(voiceEnabled) speak(moneyPileEnabled?'Mega Money EA online.':'Mega Money EA offline.');
+}
+
+
+async function setMegaPremiumPower(enabled){
+  megaPremiumEnabled=!!enabled;
+  if(megaPremiumEnabled) setExclusiveVisibleEngine('MEGAPREMIUM');
+  try{localStorage.setItem('mega_premium_power',megaPremiumEnabled?'ONLINE':'OFFLINE');}catch(_){}
+  if(megaPremiumEnabled){ if(entryMode) entryMode.value='BIRTH'; if(interval) interval.value='1min'; }
+  resetEngineVisualState(); applyRobotPowerState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'MEGAPREMIUM'});
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]); else await Promise.allSettled([perf()]);
+  scheduleBacktest48(true,200);
+  if(voiceEnabled) speak(megaPremiumEnabled?'Mega Premium online.':'Mega Premium offline.');
 }
 
 async function setSidus320Power(enabled){
@@ -42616,6 +42715,7 @@ if(paulMacdM1PowerBtn) paulMacdM1PowerBtn.onclick=()=>setPaulMacdM1Power(!paulMa
 if(millionEaPowerBtn) millionEaPowerBtn.onclick=()=>setMillionEaPower(!millionEaEnabled);
 if(moneyPilePowerBtn) moneyPilePowerBtn.onclick=()=>setMoneyPilePower(!moneyPileEnabled);
 if(sidus320PowerBtn) sidus320PowerBtn.onclick=()=>setSidus320Power(!sidus320Enabled);
+if(megaPremiumPowerBtn) megaPremiumPowerBtn.onclick=()=>setMegaPremiumPower(!megaPremiumEnabled);
 if(predatorPipsPowerBtn) predatorPipsPowerBtn.onclick=()=>setPredatorPipsPower(!predatorPipsEnabled);
 if(pyramid7PowerBtn) pyramid7PowerBtn.onclick=()=>setPyramid7Power(!pyramid7Enabled);
 if(masyukPowerBtn) masyukPowerBtn.onclick=()=>setMasyukPower(!masyukEnabled);
