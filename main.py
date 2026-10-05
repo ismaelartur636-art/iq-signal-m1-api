@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.18"
+APP_VERSION = "3.98.19"
+# MEGA IA 3.98.19 — corrige JS dos botões, remove Dragon Fire/Pro e trava varredura por PARIDADES/CRIPTO.
 # MEGA IA 3.98.18 — adiciona MEGA HFT (desvio 20 + volume/VWAP + OBV + A/D), substitui MEGA HFT e remove Dragon Fire/Dragon Fire Pro do painel e seleção.
 # MEGA IA 3.98.17 — corrige botão ONLINE/OFFLINE do MEGA PREMIUM: sincronização com backend preserva MEGAPREMIUM sem converter para SCALPERPRO.
 # MEGA IA 3.98.16 — adiciona MEGA PREMIUM: MY 911 MTF Ichimoku 9/26/56, pré-alerta 20s, confirmação pela seta original, próxima M1.
@@ -28153,7 +28154,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     # 3.97.42 — servidor 24h isolado: somente os dois motores visíveis.
-    "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "MEGAPREMIUM",
+    "SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "MEGAPREMIUM",
 }
 
 
@@ -28288,10 +28289,8 @@ def _background_symbols_for_state() -> list[str]:
     configured = [x for x in configured if x in allowed and _symbol_allowed(x, market)]
     if configured:
         return configured
-    # 3.97.42: com apenas Scalper Pro/Flex no app, não varrer pares antigos
-    # silenciosamente. Mercado aberto fica em BTC/USD até o painel enviar outro ativo.
-    if market == "OPEN" and engine in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SCALPINGASIA", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
-        return ["BTC/USD"] if "BTC/USD" in allowed else []
+    # 3.98.19 — nunca escolher BTC silenciosamente. O painel envia explicitamente
+    # os ativos da aba PARIDADES ou CRIPTO; sem escopo configurado, não varre nada.
     return []
 
 
@@ -29669,7 +29668,7 @@ def scalping_asia_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
 # -----------------------------------------------------------------------------
 _BACKTEST48_SUPPORTED = {
     "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER",
-    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS",
+    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS",
 }
 _BACKTEST48_NAMES = {
     "SMART": "MOTOR REMOVIDO",
@@ -30153,7 +30152,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
 
     if not _symbol_allowed(symbol, requested_market) or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
-    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
+    if engine not in ("SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
         engine = "SCALPERPRO"
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
@@ -30921,7 +30920,7 @@ async def pre_signals(
     market = (market or "OPEN").upper()
     engine = str(engine or "SMART").upper()
     # 3.97.54 — somente SCALPER PRO e DRAGON FIRE são operacionais.
-    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
+    if engine not in ("SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
         engine = "SCALPERPRO"
     limit = max(1, min(int(limit), 4))
 
@@ -31991,7 +31990,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Intervalo ou mercado inválido.")
     if symbol and not _symbol_allowed(symbol, market):
         raise HTTPException(400, "Ativo do radar inválido.")
-    if engine not in ("SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
+    if engine not in ("SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
         engine = "SCALPERPRO"
 
     if engine == "RTM":
@@ -34673,24 +34672,10 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
 
-  <div class="robot-mode-card" id="dragonFireModeCard">
-    <img src="__MEGA_IMAGE__" alt="Dragon Fire">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🔥 DRAGON FIRE</div>
-      <div class="robot-mode-desc">4 fechamentos consecutivos • próxima M1 • expiração M1 • sem Grid • sem Martingale • sem Gale.</div>
-    </div>
-    <button id="dragonFirePowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
+  
 
 
-  <div class="robot-mode-card" id="dragonFireProModeCard">
-    <img src="__MEGA_IMAGE__" alt="Dragon Fire Pro">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🔥 DRAGON FIRE PRO</div>
-      <div class="robot-mode-desc">Mesma estratégia de 4 fechamentos • 1 sinal por sequência • rearme após quebra • próxima M1 • expiração M1 • sem Gale.</div>
-    </div>
-    <button id="dragonFireProPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
+  
 
   <script>
   // 3.97.96 — MEGA EA funciona como pasta: fechada por padrão e abre/fecha os indicadores.
@@ -36077,8 +36062,9 @@ megaPremiumEnabled=localStorage.getItem('mega_premium_power')==='ONLINE';
 predatorPipsEnabled=localStorage.getItem('mega_predator_pips_power')==='ONLINE';
 pyramid7Enabled=localStorage.getItem('mega_pyramid7_power')==='ONLINE';
 megaHftEnabled=localStorage.getItem('mega_hft_power')==='ONLINE';
-dragonFireEnabled=localStorage.getItem('mega_dragon_fire_power')==='ONLINE';
-dragonFireProEnabled=localStorage.getItem('mega_dragon_fire_pro_power')==='ONLINE';
+dragonFireEnabled=false;
+dragonFireProEnabled=false;
+try{localStorage.setItem('mega_dragon_fire_power','OFFLINE');localStorage.setItem('mega_dragon_fire_pro_power','OFFLINE');}catch(_){}
 roboFiboEnabled=localStorage.getItem('mega_robofibo_power')==='ONLINE';
 if(roboFiboEnabled){ pyramid7Enabled=false; megaHftEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; }
 if(paulMacdM1Enabled){ paulMacdEnabled=false; sidus320Enabled=false; predatorPipsEnabled=false; pyramid7Enabled=false; megaHftEnabled=false; roboFiboEnabled=false; dragonFireProEnabled=false; dragonFireEnabled=false; scalperProEnabled=false; }
@@ -36141,8 +36127,6 @@ function selectedRobotEngine(){
   if(pyramid7Enabled) return 'PYRAMID7';
   if(megaHftEnabled) return 'MEGAHFT';
   if(roboFiboEnabled) return 'FIBORSI';
-  if(dragonFireProEnabled) return 'DRAGONFIREPRO';
-  if(dragonFireEnabled) return 'DRAGONFIRE';
   if(scalperProEnabled) return 'SCALPERPRO';
   return 'OFF';
 }
@@ -36152,7 +36136,7 @@ function adoptBackgroundEngineState(d){
   if(typeof d.telegram_enabled==='boolean'){ telegramEnabled=!!d.telegram_enabled; }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(e!=='PAULMACD' && e!=='PAULMACDM1' && e!=='MILLIONEA' && e!=='MONEYPILE' && e!=='SIDUS320' && e!=='MEGAPREMIUM' && e!=='SCALPERPRO' && e!=='DRAGONFIRE' && e!=='DRAGONFIREPRO' && e!=='FIBORSI' && e!=='MEGAHFT' && e!=='PYRAMID7' && e!=='PREDATORPIPS') return;
+  if(e!=='PAULMACD' && e!=='PAULMACDM1' && e!=='MILLIONEA' && e!=='MONEYPILE' && e!=='SIDUS320' && e!=='MEGAPREMIUM' && e!=='SCALPERPRO' && e!=='FIBORSI' && e!=='MEGAHFT' && e!=='PYRAMID7' && e!=='PREDATORPIPS') return;
   paulMacdEnabled=(e==='PAULMACD');
   paulMacdM1Enabled=(e==='PAULMACDM1');
   millionEaEnabled=(e==='MILLIONEA');
@@ -36188,7 +36172,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',SIDUS320:'🎯 SIDUS EA V3.20',MEGAPREMIUM:'💎 MEGA PREMIUM',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MEGAHFT:'⚡ MEGA HFT',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO',DRAGONFIRE:'🔥 DRAGON FIRE',DRAGONFIREPRO:'🔥 DRAGON FIRE PRO'})[e]||'SEM MOTOR';
+  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',SIDUS320:'🎯 SIDUS EA V3.20',MEGAPREMIUM:'💎 MEGA PREMIUM',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MEGAHFT:'⚡ MEGA HFT',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO'})[e]||'SEM MOTOR';
 }
 
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
@@ -36280,19 +36264,19 @@ async function syncBackgroundBotState(opts={}){
   // 3.97.64 — preserva o motor realmente escolhido ao sincronizar/recarregar.
   // Antes, PYRAMID7/PREDATORPIPS/MEGAHFT/FIBORSI eram convertidos para SCALPERPRO
   // no servidor; no refresh o estado do servidor voltava e trocava o motor na tela.
-  const backgroundEngines=new Set(['PAULMACD','PAULMACDM1','MILLIONEA','MONEYPILE','SIDUS320','MEGAPREMIUM','SCALPERPRO','DRAGONFIRE','DRAGONFIREPRO','FIBORSI','MEGAHFT','PYRAMID7','PREDATORPIPS']);
+  const backgroundEngines=new Set(['PAULMACD','PAULMACDM1','MILLIONEA','MONEYPILE','SIDUS320','MEGAPREMIUM','SCALPERPRO','FIBORSI','MEGAHFT','PYRAMID7','PREDATORPIPS']);
   if(!backgroundEngines.has(explicitEngine)) explicitEngine='SCALPERPRO';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
   const payload={
-    enabled:!!(appEnabled && selected!=='OFF' && telegramEnabled),
+    enabled:!!(appEnabled && selected!=='OFF'),
     engine:(explicitEngine==='OFF'?'SMART':explicitEngine),
     market:String((market && market.value)||'OPEN'),
     interval:String((interval && interval.value)||'1min'),
     // 3.96.95: ISMAEL TRADER precisa ser consultado várias vezes dentro da janela
     // de 20s. No bot 24h ele fixa o ativo que estava selecionado ao ligar o motor,
     // evitando dividir a janela entre todos os pares e perder o gatilho.
-    symbols:(explicitEngine==='SCALPERPRO' ? [String((S&&S.value)||'BTC/USD')] : []),
+    symbols:syms.filter(x=>assetAllowedByTab(x)),
     chat_id:chat||null,
     action:action,
     telegram_enabled:(action==='TELEGRAM_TOGGLE' ? !!telegramEnabled : null),
@@ -38168,7 +38152,7 @@ if(assetClassMode){
     if(S && S.value){ try{localStorage.setItem('mega_symbol',S.value);}catch(_){} }
     if(radar) radar.innerHTML='<div>📡 Atualizando radar para '+(activeAssetClass()==='CRYPTO'?'CRIPTO':'PARIDADES')+'...</div>';
     if(statusBox) statusBox.textContent=(activeAssetClass()==='CRYPTO'?'₿ CRIPTO':'💱 PARIDADES')+' • analisando somente este grupo';
-    try{ await Promise.allSettled([sig(false),rad(),loadPreSignals()]); }catch(_){}
+    try{ await syncBackgroundBotState(); await Promise.allSettled([sig(false),rad(),loadPreSignals()]); }catch(_){}
   });
 }
 
@@ -41402,7 +41386,7 @@ async function setPyramid7Power(enabled){
   if(voiceEnabled) speak(pyramid7Enabled?'Pyramid 7 Pro online.':'Pyramid 7 Pro offline.');
 }
 
-async function setMega HFTPower(enabled){
+async function setMegaHftPower(enabled){
   megaHftEnabled=!!enabled;
   if(megaHftEnabled) setExclusiveVisibleEngine('MEGAHFT');
   if(megaHftEnabled){
@@ -42726,7 +42710,7 @@ if(sidus320PowerBtn) sidus320PowerBtn.onclick=()=>setSidus320Power(!sidus320Enab
 if(megaPremiumPowerBtn) megaPremiumPowerBtn.onclick=()=>setMegaPremiumPower(!megaPremiumEnabled);
 if(predatorPipsPowerBtn) predatorPipsPowerBtn.onclick=()=>setPredatorPipsPower(!predatorPipsEnabled);
 if(pyramid7PowerBtn) pyramid7PowerBtn.onclick=()=>setPyramid7Power(!pyramid7Enabled);
-if(megaHftPowerBtn) megaHftPowerBtn.onclick=()=>setMega HFTPower(!megaHftEnabled);
+if(megaHftPowerBtn) megaHftPowerBtn.onclick=()=>setMegaHftPower(!megaHftEnabled);
 if(scalperProPowerBtn) scalperProPowerBtn.onclick=()=>setScalperProPower(!scalperProEnabled);
 if(dragonFirePowerBtn) dragonFirePowerBtn.onclick=()=>setDragonFirePower(!dragonFireEnabled);
 if(dragonFireProPowerBtn) dragonFireProPowerBtn.onclick=()=>setDragonFireProPower(!dragonFireProEnabled);
