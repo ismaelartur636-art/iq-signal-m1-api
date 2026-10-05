@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.23"
+APP_VERSION = "3.98.24"
+# MEGA IA 3.98.24 — AUTO IQ BINÁRIAS: usa vencimento bruto sincronizado com o relógio da IQ quando o fork suporta buy_by_raw_expirations; fallback seguro para buy().
 # MEGA IA 3.98.23 — AUTO IQ: executa somente OPÇÕES BINÁRIAS/TURBO; DIGITAL removido da autoentrada e da validação de disponibilidade.
 # MEGA IA 3.98.22 — IQ 401: para reconexão automática após rejeição de autorização e exige login novo, evitando loop de WebSocket 401.\n# MEGA IA 3.98.21 — AUTO IQ: valida DIGITAL imediatamente antes da ordem, invalida catálogo após recusa e evita tentar instrumento digital indisponível.
 # MEGA IA 3.98.20 — corrige gatilho MEGA HFT que estava praticamente impossível; valida boot do app.
@@ -26762,20 +26763,61 @@ def _iq_place_order_blocking(state: Dict[str, Any], symbol: str, interval: str, 
 
     def try_binary(active, book_name="turbo"):
         buyer = getattr(client, "buy", None)
-        if not callable(buyer):
-            errors.append("BINARY: função buy() indisponível")
+        raw_buyer = getattr(client, "buy_by_raw_expirations", None)
+        if not callable(buyer) and not callable(raw_buyer):
+            errors.append("BINARY: funções de compra indisponíveis")
             return None
         tag = ("BINARY", active)
         if tag in attempted:
             return None
         attempted.add(tag)
+
+        # A iqoptionapi antiga calcula o vencimento internamente em buy() e há forks
+        # com cálculo incorreto para 1–5 minutos. Preferimos o vencimento bruto,
+        # sincronizado com o relógio do servidor da própria IQ. A regra abaixo segue
+        # a janela oficial da biblioteca: após 30 s do minuto, pula um vencimento.
         try:
-            result = buyer(float(amount), active, action, expiry_minutes)
-            ok, order_id = _iq_parse_buy_result(result)
-            if ok:
-                return finish(order_id, active, "BINARY", book_name.upper())
-            detail = str(order_id) if order_id not in (None, "") else "ordem recusada"
-            errors.append(f"{book_name.upper()} {active}: {detail}")
+            server_ts = None
+            ts_getter = getattr(client, "get_server_timestamp", None)
+            if callable(ts_getter):
+                try:
+                    server_ts = float(ts_getter() or 0)
+                except Exception:
+                    server_ts = None
+            if not server_ts:
+                api_obj = getattr(client, "api", None)
+                timesync = getattr(api_obj, "timesync", None) if api_obj is not None else None
+                try:
+                    server_ts = float(getattr(timesync, "server_timestamp", 0) or 0)
+                except Exception:
+                    server_ts = None
+            if not server_ts:
+                server_ts = time.time()
+
+            base_minute = int(server_ts // 60) * 60
+            extra_minute = 1 if (server_ts % 60) > 30 else 0
+            raw_expired = base_minute + 60 * (expiry_minutes + extra_minute)
+            option_name = "turbo" if expiry_minutes <= 5 else "binary"
+
+            if callable(raw_buyer):
+                result = raw_buyer(float(amount), active, action, option_name, int(raw_expired))
+                ok, order_id = _iq_parse_buy_result(result)
+                if ok:
+                    placed = finish(order_id, active, "BINARY", f"{option_name.upper()}_RAW")
+                    placed["raw_expiration"] = int(raw_expired)
+                    placed["server_timestamp"] = int(server_ts)
+                    return placed
+                detail = str(order_id) if order_id not in (None, "") else "ordem recusada"
+                errors.append(f"{option_name.upper()} RAW {active}: {detail}")
+
+            # Compatibilidade com forks que não implementam compra por vencimento bruto.
+            if callable(buyer):
+                result = buyer(float(amount), active, action, expiry_minutes)
+                ok, order_id = _iq_parse_buy_result(result)
+                if ok:
+                    return finish(order_id, active, "BINARY", book_name.upper())
+                detail = str(order_id) if order_id not in (None, "") else "ordem recusada"
+                errors.append(f"{book_name.upper()} {active}: {detail}")
         except Exception as exc:
             errors.append(f"{book_name.upper()} {active}: {str(exc) or exc.__class__.__name__}")
         return None
