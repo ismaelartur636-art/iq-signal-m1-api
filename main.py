@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.36"
+APP_VERSION = "3.98.37"
+# MEGA IA 3.98.37 — trava total por ativo selecionado: painel/radar/bot 24h/Telegram/histórico operacional não misturam outros pares.
 # MEGA IA 3.98.36 — TSR 2016: evento único/rearme; impede repetir CALL/PUT em velas consecutivas enquanto a mesma condição permanecer ativa.
 # MEGA IA 3.98.35 — Telegram/autoexec seguem exclusivamente o ativo selecionado no painel; scanner não mistura Forex com BTC/cripto.
 # MEGA IA 3.98.34 — trava anti-duplicação global: 1 entrada física = 1 sinal/resultado; limpa duplicados antigos do histórico e protege TSR 2016 no painel/Telegram/autoentrada.
@@ -28980,9 +28981,26 @@ async def background_bot_set_state(body: BackgroundBotStateBody):
             background_bot_state["last_error"] = ""
 
         elif action == "PASSIVE":
-            # Abrir o app, mudar de aba, ativo, mercado ou intervalo não pode
-            # trocar o motor que está trabalhando 24h no servidor.
-            pass
+            # 3.98.37 — mantém o motor travado, mas o ESCOPO acompanha o ativo
+            # atualmente selecionado no painel. Assim o bot 24h nunca continua
+            # varrendo ETH/DOGE/Forex quando o usuário está em BTC/USD (ou vice-versa).
+            old_symbols = [str(x).upper() for x in (background_bot_state.get("symbols") or [])]
+            if symbols and old_symbols != symbols:
+                background_bot_state["symbols"] = symbols
+                background_bot_state["scan_index"] = 0
+                # Descarta somente pendências de outros ativos para que não apareçam
+                # depois como resultados novos no painel/Telegram.
+                background_bot_state["pending_trades"] = [
+                    t for t in (background_bot_state.get("pending_trades") or [])
+                    if str((t or {}).get("symbol") or "").upper() in symbols
+                ]
+                background_bot_state["last_signal"] = None
+                background_bot_state["last_result"] = None
+                background_bot_state["sent_signal_keys"] = [
+                    k for k in (background_bot_state.get("sent_signal_keys") or [])
+                    if any(f"|{sym}|" in str(k) for sym in symbols)
+                ]
+            background_bot_state["interval"] = interval
 
         else:
             raise HTTPException(400, "Ação de segundo plano inválida.")
@@ -36630,7 +36648,7 @@ async function syncBackgroundBotState(opts={}){
     // 3.96.95: ISMAEL TRADER precisa ser consultado várias vezes dentro da janela
     // de 20s. No bot 24h ele fixa o ativo que estava selecionado ao ligar o motor,
     // evitando dividir a janela entre todos os pares e perder o gatilho.
-    symbols:syms.filter(x=>assetAllowedByTab(x)),
+    symbols:(S && S.value ? [String(S.value)] : []),
     chat_id:chat||null,
     action:action,
     telegram_enabled:(action==='TELEGRAM_TOGGLE' ? !!telegramEnabled : null),
@@ -43701,9 +43719,10 @@ async function sendRadarOpportunityToRobot(items){
   const dir=String(best.direction||'').toUpperCase();
   if(!sym) return;
 
-  // BTC/USD travado manualmente: aceita sinal do próprio BTC/USD, mas nunca muda
-  // automaticamente para outro ativo encontrado pelo radar.
-  if(btcOnlyEnabled && S.value==='BTC/USD' && sym!=='BTC/USD') return;
+  // 3.98.37 — o radar nunca troca o ativo escolhido pelo usuário.
+  // Só promove uma oportunidade se ela pertencer exatamente ao ativo em análise.
+  const selectedPanelSymbol=String((S&&S.value)||'').trim().toUpperCase();
+  if(selectedPanelSymbol && String(sym||'').trim().toUpperCase()!==selectedPanelSymbol) return;
 
   // Não abandona uma operação que já foi liberada e ainda não expirou.
   if(robotHasActiveSignal() && cur && cur.symbol!==sym) return;
@@ -43843,12 +43862,18 @@ async function rad(){
   try{
     const engine=selectedRobotEngine();
     if(engine==='OFF'){ radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>'; return; }
-    const onlySymbol=(engine==='RTM')?'':(btcOnlyEnabled?'&symbol='+encodeURIComponent('BTC/USD'):'');
+    // 3.98.37 — radar trabalha somente no ativo escolhido no seletor.
+    const selectedRadarSymbol=String((S&&S.value)||'').trim();
+    const onlySymbol=selectedRadarSymbol?'&symbol='+encodeURIComponent(selectedRadarSymbol):'';
     const assetClass=activeAssetClass();
     const items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&asset_class=${encodeURIComponent(assetClass)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}${onlySymbol}`);
     // Uma resposta antiga do motor anterior não pode reaparecer após trocar ONLINE/OFFLINE.
     if(engine!==selectedRobotEngine()) return;
-    const list=(Array.isArray(items)?items:[]).filter(item=>assetAllowedByTab(radarBaseSymbol(item)));
+    const list=(Array.isArray(items)?items:[]).filter(item=>{
+      const rs=String(radarBaseSymbol(item)||'').trim().toUpperCase();
+      const selected=String((S&&S.value)||'').trim().toUpperCase();
+      return assetAllowedByTab(radarBaseSymbol(item)) && (!selected || rs===selected);
+    });
     if(!list.length){
       radar.innerHTML='<div>📡 Radar ativo • aguardando leitura</div>';
       return;
