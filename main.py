@@ -42,11 +42,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.06"
+APP_VERSION = "3.98.07"
 # MEGA IA 3.97.98 — painel: CALL/PUT promovido pelo radar fica travado até a expiração mesmo se o polling seguinte der NEUTRO/erro; resultado BTC/Binance é apurado direto na mesma fonte com retry rápido.
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
 # MEGA IA 3.97.97 — corrige MEGA MONEY EA preso em FONTE EM ESPERA: o ramo agora carrega candles e BTC/USD OPEN usa Binance diretamente.
 # MEGA IA 3.97.99 — resultado imediato: normaliza aliases da fonte (BINANCE PÚBLICA/BINANCE_PUBLIC) para não rejeitar o candle fechado da própria Binance.
+# MEGA IA 3.98.07 — Telegram: serializa envios para não descartar LOSS REC 2 quando outro envio está em andamento; placar da sessão reconhece resultados finais de recuperação.
 # MEGA IA 3.98.06 — adiciona aba Gestão visível no painel para escolher Recuperação, Gale 1 ou Gale 2; mantém o seletor existente sincronizado.
 # MEGA IA 3.98.05 — Gestão selecionável: mantém Recuperação no Próximo Sinal e adiciona Gale 1/Gale 2.
 # MEGA IA 3.98.04 — Telegram usa o mesmo desfecho final do histórico: WIN DIRETO, WIN REC 1, WIN REC 2 ou LOSS REC 2; LOSS intermediário não é enviado.
@@ -27813,8 +27814,10 @@ def _tg_session_record(body: TelegramSignalBody) -> None:
     if body.test or not bool(background_bot_state.get("telegram_enabled")):
         return
     result = str(body.result or "").upper().strip()
-    # O placar final é direto: WIN x LOSS. DRAW fica fora do placar.
-    if result not in ("WIN", "LOSS"):
+    # 3.98.07 — resultados finais da recuperação também entram na sessão.
+    # O placar continua contabilizando apenas WIN x LOSS, mas preserva o rótulo
+    # final para WIN REC 1 / WIN REC 2 / LOSS REC 2.
+    if result not in ("WIN", "LOSS", "WIN G1", "WIN G2", "LOSS G1", "LOSS G2"):
         return
     rows = background_bot_state.setdefault("telegram_session_results", [])
     key = "|".join([str(body.symbol), str(body.direction).upper(), str(body.entry_time or ""), result])
@@ -27833,8 +27836,8 @@ def _tg_session_summary_text() -> str:
     rows = [x for x in (background_bot_state.get("telegram_session_results") or []) if isinstance(x, dict)]
     started = _tg_display_time(background_bot_state.get("telegram_session_started_at"))
     ended = now().astimezone(BR_TZ).strftime("%H:%M:%S")
-    wins = sum(1 for x in rows if str(x.get("result") or "").upper() == "WIN")
-    losses = sum(1 for x in rows if str(x.get("result") or "").upper() == "LOSS")
+    wins = sum(1 for x in rows if str(x.get("result") or "").upper().startswith("WIN"))
+    losses = sum(1 for x in rows if str(x.get("result") or "").upper().startswith("LOSS"))
     total = wins + losses
     accuracy = (wins / total * 100.0) if total else 0.0
     lines = ["🏁 MEGA IA • RESULTADO FINAL", f"🕒 Sessão: {started} às {ended}", ""]
@@ -38986,7 +38989,15 @@ async function findTelegramGroups(){
 }
 
 async function sendTelegramPayload(payload){
-  if(telegramBusy) return null;
+  // 3.98.07 — nunca descarta um resultado porque outro envio está em andamento.
+  // Aguarda o envio atual terminar e então envia este payload. Isso é essencial
+  // para LOSS REC 2, que pode fechar no mesmo instante em que o próximo sinal nasce.
+  let waits=0;
+  while(telegramBusy && waits<100){
+    await new Promise(resolve=>setTimeout(resolve,100));
+    waits++;
+  }
+  if(telegramBusy) throw new Error('Telegram ocupado por tempo excessivo; resultado preservado para nova tentativa.');
   telegramBusy=true;
   try{
     return await post('/telegram-send',payload);
@@ -39049,7 +39060,7 @@ async function maybeSendTelegramSignal(signal){
 }
 
 async function maybeSendTelegramResult(trade,outcome){
-  if(!telegramEnabled || !trade || !outcome || telegramBusy) return;
+  if(!telegramEnabled || !trade || !outcome) return;
   const resultLabel=String(outcome.result||'').toUpperCase().trim();
   if(!['WIN','LOSS','WIN G1','WIN G2','LOSS G1','LOSS G2'].includes(resultLabel)) return;
   const chat_id=saveTelegramChatId();
