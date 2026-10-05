@@ -42,11 +42,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.08"
+APP_VERSION = "3.98.09"
 # MEGA IA 3.97.98 — painel: CALL/PUT promovido pelo radar fica travado até a expiração mesmo se o polling seguinte der NEUTRO/erro; resultado BTC/Binance é apurado direto na mesma fonte com retry rápido.
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
 # MEGA IA 3.97.97 — corrige MEGA MONEY EA preso em FONTE EM ESPERA: o ramo agora carrega candles e BTC/USD OPEN usa Binance diretamente.
 # MEGA IA 3.97.99 — resultado imediato: normaliza aliases da fonte (BINANCE PÚBLICA/BINANCE_PUBLIC) para não rejeitar o candle fechado da própria Binance.
+# MEGA IA 3.98.09 — corrige placar em tempo real: LOSS direto do servidor não encerra antecipadamente a recuperação/Gale; resultado final atualiza o ledger local e o histórico mesmo após sincronização automática.
 # MEGA IA 3.98.08 — corrige placar principal: conta WIN DIRETO + WIN REC 1 + WIN REC 2 e LOSS final; reconhece LOSS G1 no modo Gale 1.
 # MEGA IA 3.98.07 — Telegram: serializa envios para não descartar LOSS REC 2 quando outro envio está em andamento; placar da sessão reconhece resultados finais de recuperação.
 # MEGA IA 3.98.06 — adiciona aba Gestão visível no painel para escolher Recuperação, Gale 1 ou Gale 2; mantém o seletor existente sincronizado.
@@ -236,7 +237,7 @@ def ismael98_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", cur
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # MOTOR REMOVIDO permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v216"
+PWA_VERSION = "v217"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -37029,7 +37030,11 @@ function isResultAlreadyCounted(t){
   const key=resultOperationKey(t);
   if(!key) return false;
   const b=persistentResults[resultMarket(t.market)]||emptyResultBucket();
-  return !!(b.final_ops && b.final_ops[key]) || b.processed_keys.includes(key);
+  const saved=String((b.final_ops&&b.final_ops[key])||'').toUpperCase();
+  // 3.98.09 — LOSS da primeira vela é apenas diagnóstico quando há
+  // Recuperação/Gale. Ele não pode fazer a fila considerar a operação encerrada.
+  if(saved==='LOSS' && ['RECOVERY','G1','G2'].includes(currentManagementMode())) return false;
+  return !!saved || b.processed_keys.includes(key);
 }
 
 function registerPersistentResult(t,x){
@@ -37062,7 +37067,11 @@ function registerPersistentResult(t,x){
   if(finalAllowed){
     b.final_ops=b.final_ops||{};
     let newFinal=false;
-    if(!b.final_ops[opKey]){
+    const previousFinal=String(b.final_ops[opKey]||'').toUpperCase();
+    // 3.98.09 — o fechamento oficial do /result é autoritativo. Se /performance
+    // tiver sincronizado antes um LOSS direto da vela inicial, substitui pelo
+    // desfecho real da sequência (WIN REC 1/2 ou LOSS REC 2).
+    if(previousFinal!==r){
       b.final_ops[opKey]=r;
       recountFinalBucket(b);
       changed=true;
@@ -37070,8 +37079,8 @@ function registerPersistentResult(t,x){
     }
 
     // Histórico detalhado: exatamente uma linha para a mesma operação.
-    const historyExists=(b.history||[]).some(h=>h && (h.op_key===opKey || h.key===key));
-    if(!historyExists){
+    const historyRow=(b.history||[]).find(h=>h && (h.op_key===opKey || h.key===key));
+    if(!historyRow){
       const stamp=t.entry_time||t.expiry_time||new Date().toISOString();
       b.history=(b.history||[]);
       b.history.push({
@@ -37093,6 +37102,10 @@ function registerPersistentResult(t,x){
         entry_mode:String(t.entry_mode||'')
       });
       pruneHistory(b);
+      changed=true;
+    }else if(String(historyRow.result||'').toUpperCase()!==r){
+      historyRow.result=r;
+      historyRow.entry_result=entryResult||historyRow.entry_result||'';
       changed=true;
     }
 
@@ -37134,6 +37147,9 @@ function mergeServerPerformance(p,m){
     if(!x || !x.direct_only) return;
     const r=String(x.result||'').toUpperCase();
     if(r!=='WIN' && r!=='LOSS') return;
+    // 3.98.09 — LOSS direto do servidor não é LOSS FINAL quando a gestão
+    // possui recuperação/Gale. O /result do navegador decide o desfecho final.
+    if(r==='LOSS' && ['RECOVERY','G1','G2'].includes(currentManagementMode())) return;
     const t={
       market:m,
       symbol:String(x.symbol||''),
