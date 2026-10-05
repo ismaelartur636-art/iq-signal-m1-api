@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.13"
+APP_VERSION = "3.98.14"
+# MEGA IA 3.98.14 — autoentrada IQ valida carteira REAL/PRACTICE e saldo antes da ordem; execução usa somente modalidades/ativos abertos do catálogo quando disponível.
 # MEGA IA 3.98.13 — restaura seletor IQ Option PRACTICE/REAL na autoentrada; REAL exige escolha e confirmação explícitas.
 # MEGA IA 3.98.12 — IQ Option conectada passa a ser fonte principal dos candles OPEN; multifuente fica como fallback.
 # MEGA IA 3.98.10 — filtro de classe de ativos: PARIDADES e CRIPTO separam seletor, radar e varredura automática sem alterar estratégias.
@@ -26631,20 +26632,55 @@ def _iq_auto_capability_blocking(state: Dict[str, Any], symbol: str, interval: s
     }
 
 
+def _iq_select_account_blocking(state: Dict[str, Any], account: str):
+    """Seleciona e confirma a carteira IQ antes de qualquer ordem."""
+    client = _iq_reconnect_state(state)
+    if not _iq_connected(state):
+        raise RuntimeError("IQ Option desconectada.")
+    account = str(account or "PRACTICE").upper()
+    if account not in ("PRACTICE", "REAL"):
+        raise RuntimeError("Conta IQ inválida. Use PRACTICE ou REAL.")
+    changer = getattr(client, "change_balance", None)
+    if not callable(changer):
+        raise RuntimeError("A biblioteca IQ não permite selecionar a carteira de negociação.")
+    changed = changer(account)
+    if changed is False:
+        raise RuntimeError(f"A IQ Option recusou a seleção da conta {account}.")
+    # Confirma o modo quando o fork expõe get_balance_mode().
+    mode_getter = getattr(client, "get_balance_mode", None)
+    confirmed_mode = account
+    if callable(mode_getter):
+        try:
+            mode = str(mode_getter() or "").upper()
+            if mode in ("PRACTICE", "REAL"):
+                confirmed_mode = mode
+                if mode != account:
+                    raise RuntimeError(f"Carteira solicitada {account}, mas a IQ confirmou {mode}.")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+    balance = None
+    balance_getter = getattr(client, "get_balance", None)
+    if callable(balance_getter):
+        try:
+            balance = float(balance_getter())
+        except Exception:
+            balance = None
+    state["auto_account"] = confirmed_mode
+    state["auto_balance"] = balance
+    state["auto_account_verified_at"] = time.time()
+    return confirmed_mode, balance
+
+
 def _iq_place_order_blocking(state: Dict[str, Any], symbol: str, interval: str, direction: str, amount: float, market: str, account: str = "PRACTICE"):
     client = _iq_reconnect_state(state)
     if not _iq_connected(state):
         raise RuntimeError("IQ Option desconectada.")
 
-    account = str(account or "PRACTICE").upper()
-    if account not in ("PRACTICE", "REAL"):
-        raise RuntimeError("Conta IQ inválida. Use PRACTICE ou REAL.")
-    changer = getattr(client, "change_balance", None)
-    if callable(changer):
-        changed = changer(account)
-        if changed is False:
-            raise RuntimeError(f"Não foi possível selecionar a conta {account}.")
-    state["auto_account"] = account
+    account, confirmed_balance = _iq_select_account_blocking(state, account)
+    if confirmed_balance is not None and confirmed_balance < float(amount):
+        raise RuntimeError(f"Saldo insuficiente na conta {account}: {confirmed_balance:.2f}.")
 
     action = "call" if direction == "CALL" else "put"
     expiry_minutes = max(1, int(round(iq_seconds(interval) / 60)))
@@ -26670,6 +26706,7 @@ def _iq_place_order_blocking(state: Dict[str, Any], symbol: str, interval: str, 
             "amount": round(float(amount), 2),
             "expiry_minutes": expiry_minutes,
             "account": account,
+            "balance_before": confirmed_balance,
             "order_type": order_type,
             "market_book": book_name,
         }
@@ -26976,6 +27013,8 @@ async def iq_auto_status(request: Request):
     return {
         "connected": _iq_connected(state),
         "account": str(state.get("auto_account") or "PRACTICE"),
+        "balance": state.get("auto_balance"),
+        "account_verified_at": state.get("auto_account_verified_at", 0),
         "orders": orders,
     }
 
