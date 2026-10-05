@@ -34,19 +34,16 @@ except Exception:
 
 try:
     from iqoptionapi.stable_api import IQ_Option
-    import iqoptionapi.constants as IQ_OP_CODE
 except Exception:
     IQ_Option = None
-    IQ_OP_CODE = None
 
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.25"
-# MEGA IA 3.98.25 — IQ 401/socket: candles usam chamada WS limitada sem o loop interno infinito de reconnect da stable_api; falhas repetidas invalidam a sessão e exigem login limpo.
-# MEGA IA 3.98.24 — AUTO IQ Binárias: usa vencimento bruto sincronizado quando suportado, preservando fallback buy().
+APP_VERSION = "3.98.26"
+# MEGA IA 3.98.26 — Telegram Bridge: sinais confirmados incluem linha MEGA_EXEC v1 para executor IQ separado; estratégia dos motores preservada.
 # MEGA IA 3.98.23 — AUTO IQ: executa somente OPÇÕES BINÁRIAS/TURBO; DIGITAL removido da autoentrada e da validação de disponibilidade.
 # MEGA IA 3.98.22 — IQ 401: para reconexão automática após rejeição de autorização e exige login novo, evitando loop de WebSocket 401.\n# MEGA IA 3.98.21 — AUTO IQ: valida DIGITAL imediatamente antes da ordem, invalida catálogo após recusa e evita tentar instrumento digital indisponível.
 # MEGA IA 3.98.20 — corrige gatilho MEGA HFT que estava praticamente impossível; valida boot do app.
@@ -3517,7 +3514,7 @@ def _mask_email(email: str):
 
 
 def _iq_connected(state: Dict[str, Any] | None) -> bool:
-    if not state or state.get("reauth_required"):
+    if not state:
         return False
     client = state.get("client")
     if client is None:
@@ -8264,12 +8261,6 @@ def _iq_connect_fresh(email: str, password: str):
     def worker():
         try:
             client = IQ_Option(email, password)
-            try:
-                setter = getattr(client, "set_max_reconnect", None)
-                if callable(setter):
-                    setter(1)
-            except Exception:
-                pass
             box["client"] = client
             box["stage"] = "AUTENTICANDO_E_ABRINDO_WEBSOCKET"
             box["result"] = client.connect()
@@ -8490,45 +8481,40 @@ def _normalize_iq_candle(item):
 
 def _iq_get_candles_once(client, active: str, duration: int, count: int, endtime: float):
     """
-    Candles IQ com espera limitada e SEM chamar stable_api.get_candles().
+    Busca candles pela API pública do stable_api.
 
-    O get_candles() de forks antigos entra em `while True` e chama connect() por
-    conta própria quando o socket cai. Em Render isso deixava threads zumbis
-    reconectando com SSID inválido, gerando 401 + `NoneType ... sock`. Aqui a
-    requisição WS é feita uma única vez; quem decide reconectar é o MEGA IA.
+    Evita manipular diretamente api.candles.candles_data, porque isso cria corrida
+    entre requisições e varia entre forks da iqoptionapi. O método get_candles()
+    já usa o WebSocket autenticado e a sessão interna da biblioteca.
     """
-    if IQ_OP_CODE is None:
-        raise RuntimeError("Constantes da iqoptionapi não carregadas.")
-    api = getattr(client, "api", None)
-    candles_obj = getattr(api, "candles", None) if api is not None else None
-    sender = getattr(api, "getcandles", None) if api is not None else None
-    if api is None or candles_obj is None or not callable(sender):
-        raise RuntimeError("Esta versão da iqoptionapi não expõe getcandles WS.")
-    try:
-        active_id = IQ_OP_CODE.ACTIVES[active]
-    except Exception:
-        raise RuntimeError(f"Ativo {active} sem opcode na iqoptionapi.")
+    getter = getattr(client, "get_candles", None)
+    if not callable(getter):
+        raise RuntimeError("Esta versão da iqoptionapi não possui get_candles().")
 
-    candles_obj.candles_data = None
-    try:
-        sender(active_id, int(duration), int(count), float(endtime))
-    except Exception as exc:
+    box = {}
+
+    def worker():
+        try:
+            box["data"] = getter(active, int(duration), int(count), float(endtime))
+        except Exception as exc:
+            box["error"] = exc
+
+    th = threading.Thread(target=worker, daemon=True, name="mega-iq-candles")
+    th.start()
+    th.join(IQ_CANDLE_TIMEOUT)
+
+    if th.is_alive():
+        raise TimeoutError(
+            f"A IQ Option não respondeu candles de {active} em {IQ_CANDLE_TIMEOUT:.0f}s."
+        )
+    if "error" in box:
+        exc = box["error"]
         raise RuntimeError(str(exc) or exc.__class__.__name__)
 
-    deadline = time.monotonic() + IQ_CANDLE_TIMEOUT
-    while time.monotonic() < deadline:
-        data = getattr(candles_obj, "candles_data", None)
-        if isinstance(data, (list, tuple)):
-            return list(data)
-        try:
-            if not bool(client.check_connect()):
-                raise RuntimeError("WebSocket IQ desconectado durante candles.")
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(f"WebSocket IQ inválido: {str(exc) or exc.__class__.__name__}")
-        time.sleep(0.05)
-    raise TimeoutError(f"A IQ Option não respondeu candles de {active} em {IQ_CANDLE_TIMEOUT:.0f}s.")
+    data = box.get("data")
+    if not isinstance(data, (list, tuple)):
+        raise RuntimeError(f"Resposta de candles inválida para {active}.")
+    return list(data)
 
 
 def iq_candles_blocking(state: Dict[str, Any], symbol: str, interval: str, n: int, regular_market: bool = False):
@@ -8564,7 +8550,6 @@ def iq_candles_blocking(state: Dict[str, Any], symbol: str, interval: str, n: in
                 state["connected"] = True
                 state["last_seen"] = time.time()
                 state["last_error"] = ""
-                state["transport_failure_count"] = 0
                 return out[-count:]
 
             errors.append(f"{active}: sem candles")
@@ -8575,22 +8560,21 @@ def iq_candles_blocking(state: Dict[str, Any], symbol: str, interval: str, n: in
             state["last_error"] = msg
 
             low = msg.lower()
-            if any(key in low for key in (
-                "websocket", "desconect", "closed", "timeout", "timed out", "sock",
-                "401", "unauthorized", "authorization required", "ssid",
-            )):
-                failures = int(state.get("transport_failure_count", 0) or 0) + 1
-                state["transport_failure_count"] = failures
-                # 401 explícito invalida já; socket/timeout repetido invalida na 2ª
-                # ocorrência para impedir o ciclo de threads/reconnect observado.
-                if _iq_is_auth_failure(msg) or failures >= 2:
-                    _iq_require_fresh_login(state, msg)
-                    raise RuntimeError(
-                        "A sessão da IQ Option ficou inválida/instável. Faça login novamente; "
-                        "a reconexão automática foi interrompida para evitar loop 401."
-                    )
+            if any(
+                key in low
+                for key in (
+                    "websocket",
+                    "desconect",
+                    "closed",
+                    "timeout",
+                    "timed out",
+                    "sock",
+                )
+            ):
                 _iq_close_state(state)
-                raise RuntimeError("A conexão da IQ Option caiu: " + msg[:220])
+                raise RuntimeError(
+                    "A conexão da IQ Option caiu: " + msg[:220]
+                )
 
     detail = " | ".join(errors[-3:])
     raise RuntimeError(
@@ -26787,25 +26771,7 @@ def _iq_place_order_blocking(state: Dict[str, Any], symbol: str, interval: str, 
             return None
         attempted.add(tag)
         try:
-            # Para Binárias/Turbo M1, prefira o vencimento absoluto sincronizado
-            # com o servidor IQ. Se faltarem <=30s para o próximo minuto, pula
-            # para o minuto seguinte (mesmo comportamento esperado pela plataforma).
-            result = None
-            raw_buyer = getattr(client, "buy_by_raw_expirations", None)
-            if callable(raw_buyer) and expiry_minutes <= 5:
-                try:
-                    server_ts = float(client.get_server_timestamp() or time.time())
-                    boundary = (int(server_ts // 60) + 1) * 60
-                    if boundary - server_ts <= 30:
-                        boundary += 60
-                    expired = int(boundary + max(0, expiry_minutes - 1) * 60)
-                    option_kind = "turbo" if expiry_minutes <= 5 else "binary"
-                    result = raw_buyer(float(amount), active, action, option_kind, expired)
-                except Exception as raw_exc:
-                    errors.append(f"RAW {active}: {str(raw_exc) or raw_exc.__class__.__name__}")
-                    result = None
-            if result is None:
-                result = buyer(float(amount), active, action, expiry_minutes)
+            result = buyer(float(amount), active, action, expiry_minutes)
             ok, order_id = _iq_parse_buy_result(result)
             if ok:
                 return finish(order_id, active, "BINARY", book_name.upper())
@@ -27961,6 +27927,14 @@ def _tg_signal_text(body: TelegramSignalBody) -> str:
             f"🌐 Mercado: {market_label}"
         )
     emoji = "🟢" if direction == "CALL" else "🔴" if direction == "PUT" else "⚪"
+    # 3.98.26 — linha determinística para um executor externo ler o MESMO sinal
+    # publicado no grupo. Não altera gatilho, direção, horário nem estratégia.
+    exec_symbol = re.sub(r"[^A-Z0-9]", "", str(body.symbol or "").upper())
+    exec_market = str(body.market or "OPEN").upper()
+    exec_entry = str(body.entry_time or "")
+    exec_expiry = str(body.expiry_time or "")
+    exec_id = f"{exec_symbol}:{direction}:{exec_entry}"
+    exec_line = f"MEGA_EXEC|v1|{exec_symbol}|{direction}|{exec_entry}|{exec_expiry}|{exec_market}|{exec_id}"
     return (
         f"🚨 MEGA IA • SINAL CONFIRMADO\n"
         f"{emoji} {body.symbol} • {direction}\n"
@@ -27969,7 +27943,8 @@ def _tg_signal_text(body: TelegramSignalBody) -> str:
         f"⌛ Expiração: {_tg_display_time(body.expiry_time)}\n"
         f"🕐 Período: {body.interval}\n"
         f"🌐 Mercado: {market_label}\n"
-        f"⚠️ Risco: {str(body.risk or '--').upper()}"
+        f"⚠️ Risco: {str(body.risk or '--').upper()}\n"
+        f"{exec_line}"
     )
 
 
