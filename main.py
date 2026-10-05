@@ -42,11 +42,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.07"
+APP_VERSION = "3.98.08"
 # MEGA IA 3.97.98 — painel: CALL/PUT promovido pelo radar fica travado até a expiração mesmo se o polling seguinte der NEUTRO/erro; resultado BTC/Binance é apurado direto na mesma fonte com retry rápido.
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
 # MEGA IA 3.97.97 — corrige MEGA MONEY EA preso em FONTE EM ESPERA: o ramo agora carrega candles e BTC/USD OPEN usa Binance diretamente.
 # MEGA IA 3.97.99 — resultado imediato: normaliza aliases da fonte (BINANCE PÚBLICA/BINANCE_PUBLIC) para não rejeitar o candle fechado da própria Binance.
+# MEGA IA 3.98.08 — corrige placar principal: conta WIN DIRETO + WIN REC 1 + WIN REC 2 e LOSS final; reconhece LOSS G1 no modo Gale 1.
 # MEGA IA 3.98.07 — Telegram: serializa envios para não descartar LOSS REC 2 quando outro envio está em andamento; placar da sessão reconhece resultados finais de recuperação.
 # MEGA IA 3.98.06 — adiciona aba Gestão visível no painel para escolher Recuperação, Gale 1 ou Gale 2; mantém o seletor existente sincronizado.
 # MEGA IA 3.98.05 — Gestão selecionável: mantém Recuperação no Próximo Sinal e adiciona Gale 1/Gale 2.
@@ -235,7 +236,7 @@ def ismael98_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", cur
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # MOTOR REMOVIDO permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v215"
+PWA_VERSION = "v216"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -36656,7 +36657,7 @@ function normalizeResultBucket(x){
   // já contém uma linha por operação e permite corrigir um placar duplicado.
   if(!Object.keys(b.final_ops).length && b.history.length){
     b.history.forEach(h=>{
-      if(h && (h.op_key||h.key) && ['WIN','WIN G1','WIN G2','LOSS','LOSS G2'].includes(String(h.result||'').toUpperCase())){
+      if(h && (h.op_key||h.key) && ['WIN','WIN G1','WIN G2','LOSS','LOSS G1','LOSS G2'].includes(String(h.result||'').toUpperCase())){
         // Resultado direto sem Gale também precisa sobreviver ao reload.
         // Usa op_key quando disponível para garantir 1 operação = 1 resultado.
         b.final_ops[String(h.op_key||h.key)]=String(h.result).toUpperCase();
@@ -36738,7 +36739,7 @@ function recountFinalBucket(b){
   b.win_direct=vals.filter(v=>v==='WIN').length;
   b.win_g1=vals.filter(v=>v==='WIN G1').length;
   b.win_g2=vals.filter(v=>v==='WIN G2').length;
-  b.loss_g2=vals.filter(v=>v==='LOSS G2' || v==='LOSS').length;
+  b.loss_g2=vals.filter(v=>v==='LOSS G1' || v==='LOSS G2' || v==='LOSS').length;
 }
 
 function loadPersistentResults(){
@@ -37057,7 +37058,7 @@ function registerPersistentResult(t,x){
   }
 
   const r=String(x.result||'').toUpperCase();
-  const finalAllowed=['WIN','WIN G1','WIN G2','LOSS G2'].includes(r);
+  const finalAllowed=['WIN','WIN G1','WIN G2','LOSS G1','LOSS G2'].includes(r);
   if(finalAllowed){
     b.final_ops=b.final_ops||{};
     let newFinal=false;
@@ -37516,8 +37517,8 @@ function paintPersistentResults(){
   const m=activeResultMarket();
   const b=persistentResults[m]||emptyResultBucket();
   if(Object.keys(b.final_ops||{}).length) recountFinalBucket(b);
-  // Placar principal = resultado direto da entrada; sem G1/G2.
-  const totalWins=Number(b.win_direct||0);
+  // Placar principal = desfecho FINAL da sequência. Recuperações vencedoras também são WIN.
+  const totalWins=Number(b.win_direct||0)+Number(b.win_g1||0)+Number(b.win_g2||0);
   const totalLosses=Number(b.loss_g2||0);
   const total=totalWins+totalLosses;
   const acc=total?((totalWins/total)*100):0;
