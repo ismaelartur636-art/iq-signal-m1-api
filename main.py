@@ -34,16 +34,19 @@ except Exception:
 
 try:
     from iqoptionapi.stable_api import IQ_Option
+    import iqoptionapi.constants as IQ_OP_CODE
 except Exception:
     IQ_Option = None
+    IQ_OP_CODE = None
 
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.24"
-# MEGA IA 3.98.24 — AUTO IQ BINÁRIAS: usa vencimento bruto sincronizado com o relógio da IQ quando o fork suporta buy_by_raw_expirations; fallback seguro para buy().
+APP_VERSION = "3.98.25"
+# MEGA IA 3.98.25 — IQ 401/socket: candles usam chamada WS limitada sem o loop interno infinito de reconnect da stable_api; falhas repetidas invalidam a sessão e exigem login limpo.
+# MEGA IA 3.98.24 — AUTO IQ Binárias: usa vencimento bruto sincronizado quando suportado, preservando fallback buy().
 # MEGA IA 3.98.23 — AUTO IQ: executa somente OPÇÕES BINÁRIAS/TURBO; DIGITAL removido da autoentrada e da validação de disponibilidade.
 # MEGA IA 3.98.22 — IQ 401: para reconexão automática após rejeição de autorização e exige login novo, evitando loop de WebSocket 401.\n# MEGA IA 3.98.21 — AUTO IQ: valida DIGITAL imediatamente antes da ordem, invalida catálogo após recusa e evita tentar instrumento digital indisponível.
 # MEGA IA 3.98.20 — corrige gatilho MEGA HFT que estava praticamente impossível; valida boot do app.
@@ -3514,7 +3517,7 @@ def _mask_email(email: str):
 
 
 def _iq_connected(state: Dict[str, Any] | None) -> bool:
-    if not state:
+    if not state or state.get("reauth_required"):
         return False
     client = state.get("client")
     if client is None:
@@ -8261,6 +8264,12 @@ def _iq_connect_fresh(email: str, password: str):
     def worker():
         try:
             client = IQ_Option(email, password)
+            try:
+                setter = getattr(client, "set_max_reconnect", None)
+                if callable(setter):
+                    setter(1)
+            except Exception:
+                pass
             box["client"] = client
             box["stage"] = "AUTENTICANDO_E_ABRINDO_WEBSOCKET"
             box["result"] = client.connect()
@@ -8481,40 +8490,45 @@ def _normalize_iq_candle(item):
 
 def _iq_get_candles_once(client, active: str, duration: int, count: int, endtime: float):
     """
-    Busca candles pela API pública do stable_api.
+    Candles IQ com espera limitada e SEM chamar stable_api.get_candles().
 
-    Evita manipular diretamente api.candles.candles_data, porque isso cria corrida
-    entre requisições e varia entre forks da iqoptionapi. O método get_candles()
-    já usa o WebSocket autenticado e a sessão interna da biblioteca.
+    O get_candles() de forks antigos entra em `while True` e chama connect() por
+    conta própria quando o socket cai. Em Render isso deixava threads zumbis
+    reconectando com SSID inválido, gerando 401 + `NoneType ... sock`. Aqui a
+    requisição WS é feita uma única vez; quem decide reconectar é o MEGA IA.
     """
-    getter = getattr(client, "get_candles", None)
-    if not callable(getter):
-        raise RuntimeError("Esta versão da iqoptionapi não possui get_candles().")
+    if IQ_OP_CODE is None:
+        raise RuntimeError("Constantes da iqoptionapi não carregadas.")
+    api = getattr(client, "api", None)
+    candles_obj = getattr(api, "candles", None) if api is not None else None
+    sender = getattr(api, "getcandles", None) if api is not None else None
+    if api is None or candles_obj is None or not callable(sender):
+        raise RuntimeError("Esta versão da iqoptionapi não expõe getcandles WS.")
+    try:
+        active_id = IQ_OP_CODE.ACTIVES[active]
+    except Exception:
+        raise RuntimeError(f"Ativo {active} sem opcode na iqoptionapi.")
 
-    box = {}
-
-    def worker():
-        try:
-            box["data"] = getter(active, int(duration), int(count), float(endtime))
-        except Exception as exc:
-            box["error"] = exc
-
-    th = threading.Thread(target=worker, daemon=True, name="mega-iq-candles")
-    th.start()
-    th.join(IQ_CANDLE_TIMEOUT)
-
-    if th.is_alive():
-        raise TimeoutError(
-            f"A IQ Option não respondeu candles de {active} em {IQ_CANDLE_TIMEOUT:.0f}s."
-        )
-    if "error" in box:
-        exc = box["error"]
+    candles_obj.candles_data = None
+    try:
+        sender(active_id, int(duration), int(count), float(endtime))
+    except Exception as exc:
         raise RuntimeError(str(exc) or exc.__class__.__name__)
 
-    data = box.get("data")
-    if not isinstance(data, (list, tuple)):
-        raise RuntimeError(f"Resposta de candles inválida para {active}.")
-    return list(data)
+    deadline = time.monotonic() + IQ_CANDLE_TIMEOUT
+    while time.monotonic() < deadline:
+        data = getattr(candles_obj, "candles_data", None)
+        if isinstance(data, (list, tuple)):
+            return list(data)
+        try:
+            if not bool(client.check_connect()):
+                raise RuntimeError("WebSocket IQ desconectado durante candles.")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"WebSocket IQ inválido: {str(exc) or exc.__class__.__name__}")
+        time.sleep(0.05)
+    raise TimeoutError(f"A IQ Option não respondeu candles de {active} em {IQ_CANDLE_TIMEOUT:.0f}s.")
 
 
 def iq_candles_blocking(state: Dict[str, Any], symbol: str, interval: str, n: int, regular_market: bool = False):
@@ -8550,6 +8564,7 @@ def iq_candles_blocking(state: Dict[str, Any], symbol: str, interval: str, n: in
                 state["connected"] = True
                 state["last_seen"] = time.time()
                 state["last_error"] = ""
+                state["transport_failure_count"] = 0
                 return out[-count:]
 
             errors.append(f"{active}: sem candles")
@@ -8560,21 +8575,22 @@ def iq_candles_blocking(state: Dict[str, Any], symbol: str, interval: str, n: in
             state["last_error"] = msg
 
             low = msg.lower()
-            if any(
-                key in low
-                for key in (
-                    "websocket",
-                    "desconect",
-                    "closed",
-                    "timeout",
-                    "timed out",
-                    "sock",
-                )
-            ):
+            if any(key in low for key in (
+                "websocket", "desconect", "closed", "timeout", "timed out", "sock",
+                "401", "unauthorized", "authorization required", "ssid",
+            )):
+                failures = int(state.get("transport_failure_count", 0) or 0) + 1
+                state["transport_failure_count"] = failures
+                # 401 explícito invalida já; socket/timeout repetido invalida na 2ª
+                # ocorrência para impedir o ciclo de threads/reconnect observado.
+                if _iq_is_auth_failure(msg) or failures >= 2:
+                    _iq_require_fresh_login(state, msg)
+                    raise RuntimeError(
+                        "A sessão da IQ Option ficou inválida/instável. Faça login novamente; "
+                        "a reconexão automática foi interrompida para evitar loop 401."
+                    )
                 _iq_close_state(state)
-                raise RuntimeError(
-                    "A conexão da IQ Option caiu: " + msg[:220]
-                )
+                raise RuntimeError("A conexão da IQ Option caiu: " + msg[:220])
 
     detail = " | ".join(errors[-3:])
     raise RuntimeError(
@@ -26763,61 +26779,38 @@ def _iq_place_order_blocking(state: Dict[str, Any], symbol: str, interval: str, 
 
     def try_binary(active, book_name="turbo"):
         buyer = getattr(client, "buy", None)
-        raw_buyer = getattr(client, "buy_by_raw_expirations", None)
-        if not callable(buyer) and not callable(raw_buyer):
-            errors.append("BINARY: funções de compra indisponíveis")
+        if not callable(buyer):
+            errors.append("BINARY: função buy() indisponível")
             return None
         tag = ("BINARY", active)
         if tag in attempted:
             return None
         attempted.add(tag)
-
-        # A iqoptionapi antiga calcula o vencimento internamente em buy() e há forks
-        # com cálculo incorreto para 1–5 minutos. Preferimos o vencimento bruto,
-        # sincronizado com o relógio do servidor da própria IQ. A regra abaixo segue
-        # a janela oficial da biblioteca: após 30 s do minuto, pula um vencimento.
         try:
-            server_ts = None
-            ts_getter = getattr(client, "get_server_timestamp", None)
-            if callable(ts_getter):
+            # Para Binárias/Turbo M1, prefira o vencimento absoluto sincronizado
+            # com o servidor IQ. Se faltarem <=30s para o próximo minuto, pula
+            # para o minuto seguinte (mesmo comportamento esperado pela plataforma).
+            result = None
+            raw_buyer = getattr(client, "buy_by_raw_expirations", None)
+            if callable(raw_buyer) and expiry_minutes <= 5:
                 try:
-                    server_ts = float(ts_getter() or 0)
-                except Exception:
-                    server_ts = None
-            if not server_ts:
-                api_obj = getattr(client, "api", None)
-                timesync = getattr(api_obj, "timesync", None) if api_obj is not None else None
-                try:
-                    server_ts = float(getattr(timesync, "server_timestamp", 0) or 0)
-                except Exception:
-                    server_ts = None
-            if not server_ts:
-                server_ts = time.time()
-
-            base_minute = int(server_ts // 60) * 60
-            extra_minute = 1 if (server_ts % 60) > 30 else 0
-            raw_expired = base_minute + 60 * (expiry_minutes + extra_minute)
-            option_name = "turbo" if expiry_minutes <= 5 else "binary"
-
-            if callable(raw_buyer):
-                result = raw_buyer(float(amount), active, action, option_name, int(raw_expired))
-                ok, order_id = _iq_parse_buy_result(result)
-                if ok:
-                    placed = finish(order_id, active, "BINARY", f"{option_name.upper()}_RAW")
-                    placed["raw_expiration"] = int(raw_expired)
-                    placed["server_timestamp"] = int(server_ts)
-                    return placed
-                detail = str(order_id) if order_id not in (None, "") else "ordem recusada"
-                errors.append(f"{option_name.upper()} RAW {active}: {detail}")
-
-            # Compatibilidade com forks que não implementam compra por vencimento bruto.
-            if callable(buyer):
+                    server_ts = float(client.get_server_timestamp() or time.time())
+                    boundary = (int(server_ts // 60) + 1) * 60
+                    if boundary - server_ts <= 30:
+                        boundary += 60
+                    expired = int(boundary + max(0, expiry_minutes - 1) * 60)
+                    option_kind = "turbo" if expiry_minutes <= 5 else "binary"
+                    result = raw_buyer(float(amount), active, action, option_kind, expired)
+                except Exception as raw_exc:
+                    errors.append(f"RAW {active}: {str(raw_exc) or raw_exc.__class__.__name__}")
+                    result = None
+            if result is None:
                 result = buyer(float(amount), active, action, expiry_minutes)
-                ok, order_id = _iq_parse_buy_result(result)
-                if ok:
-                    return finish(order_id, active, "BINARY", book_name.upper())
-                detail = str(order_id) if order_id not in (None, "") else "ordem recusada"
-                errors.append(f"{book_name.upper()} {active}: {detail}")
+            ok, order_id = _iq_parse_buy_result(result)
+            if ok:
+                return finish(order_id, active, "BINARY", book_name.upper())
+            detail = str(order_id) if order_id not in (None, "") else "ordem recusada"
+            errors.append(f"{book_name.upper()} {active}: {detail}")
         except Exception as exc:
             errors.append(f"{book_name.upper()} {active}: {str(exc) or exc.__class__.__name__}")
         return None
