@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.27"
+APP_VERSION = "3.98.28"
+# MEGA IA 3.98.28 — IQ Option: conexão persistente; queda genérica de WebSocket não invalida login, reconexão automática mantém a sessão e só exige novo login em falha explícita de autorização.
 # MEGA IA 3.98.27 — Telegram→IQ no mesmo serviço: após o grupo aceitar o sinal, agenda a ordem Binária/Turbo em cliente IQ dedicado; padrão PRACTICE; estratégias preservadas.
 # MEGA IA 3.98.26 — Telegram Bridge: sinais confirmados incluem linha MEGA_EXEC v1 para executor IQ separado; estratégia dos motores preservada.
 # MEGA IA 3.98.23 — AUTO IQ: executa somente OPÇÕES BINÁRIAS/TURBO; DIGITAL removido da autoentrada e da validação de disponibilidade.
@@ -2660,7 +2661,7 @@ async def _stop_twelve_data_websocket():
 # O login é feito somente pelo painel; não há credenciais IQ no Render.
 IQ_SESSION_COOKIE = "mega_iq_session"
 IQ_SESSION_TTL = int(os.getenv("IQ_SESSION_TTL", "43200"))
-IQ_CONNECT_TIMEOUT = float(os.getenv("IQ_CONNECT_TIMEOUT", "32"))
+IQ_CONNECT_TIMEOUT = float(os.getenv("IQ_CONNECT_TIMEOUT", "35"))
 IQ_CANDLE_TIMEOUT = float(os.getenv("IQ_CANDLE_TIMEOUT", "15"))
 IQ_CANDLE_CACHE_TTL = float(os.getenv("IQ_CANDLE_CACHE_TTL", "3"))
 IQ_RECONNECT_BASE = float(os.getenv("IQ_RECONNECT_BASE", "4"))
@@ -8336,15 +8337,14 @@ def _iq_reconnect_delay(failure_count: int) -> float:
 
 
 def _iq_mark_reauth_after_unstable_reconnects(state: Dict[str, Any], message: str, failures: int) -> bool:
-    """Evita loop infinito quando o fork perde o WS/401 sem devolver '401' no exception."""
-    low = str(message or "").lower()
-    websocket_auth_like = any(x in low for x in (
-        "websocket", "socket", "handshake", "connection closed",
-        "não confirmou a conexão", "caiu antes de estabilizar",
-    ))
-    # Um 401 explícito invalida imediatamente. Para erro genérico de WS, só após
-    # 3 tentativas consecutivas, reduzindo falso positivo por queda transitória.
-    if _iq_is_auth_failure(message) or (websocket_auth_like and int(failures) >= 3):
+    """Só invalida a sessão quando há evidência explícita de falha de autorização.
+
+    Queda de WebSocket/handshake/connection closed é tratada como falha transitória.
+    Isso é importante no Render, onde o socket pode cair sem que a sessão IQ tenha
+    perdido as credenciais. O contador continua controlando o backoff, mas não
+    transforma uma oscilação de rede em logout forçado.
+    """
+    if _iq_is_auth_failure(message):
         _iq_require_fresh_login(state, message)
         return True
     return False
@@ -8403,12 +8403,9 @@ def _iq_reconnect_state(state: Dict[str, Any]):
             msg = str(exc) or exc.__class__.__name__
             failures = int(state.get("failure_count", 0) or 0) + 1
 
-            # 401/autorização inválida não deve ficar em reconexão infinita. Mesmo
-            # quando o fork não repassa o 401 no texto, 3 falhas consecutivas encerram
-            # a autorização antiga e deixam o próximo login começar limpo.
-            # 401 explícito: invalida imediatamente. Alguns forks apenas fecham o
-            # WebSocket e escondem o status HTTP; nesse caso 3 falhas consecutivas
-            # também encerram a sessão antiga para impedir reconexão infinita.
+            # Só uma rejeição explícita de autorização exige novo login.
+            # Erros genéricos de WebSocket continuam em reconexão com backoff;
+            # não apagamos uma sessão válida por oscilação transitória do socket.
             if _iq_mark_reauth_after_unstable_reconnects(state, msg, failures):
                 why = msg
                 print(
