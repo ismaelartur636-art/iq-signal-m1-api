@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.10"
+APP_VERSION = "3.98.11"
+# MEGA IA 3.98.11 — IQ Option: seletor explícito PRACTICE/REAL para autoentrada; PRACTICE continua padrão e conta REAL nunca é escolhida automaticamente.
 # MEGA IA 3.98.10 — filtro de classe de ativos: PARIDADES e CRIPTO separam seletor, radar e varredura automática sem alterar estratégias.
 # MEGA IA 3.97.98 — painel: CALL/PUT promovido pelo radar fica travado até a expiração mesmo se o polling seguinte der NEUTRO/erro; resultado BTC/Binance é apurado direto na mesma fonte com retry rápido.
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
@@ -2682,6 +2683,7 @@ class IQAutoOrderBody(BaseModel):
     market: str = "OPEN"
     amount: float = 1.0
     stage: str = "ENTRADA"
+    account: str = "PRACTICE"
 
 
 class IQAutoOrderResultBody(BaseModel):
@@ -26595,16 +26597,21 @@ def _iq_auto_capability_blocking(state: Dict[str, Any], symbol: str, interval: s
     }
 
 
-def _iq_place_demo_order_blocking(state: Dict[str, Any], symbol: str, interval: str, direction: str, amount: float, market: str):
+def _iq_place_order_blocking(state: Dict[str, Any], symbol: str, interval: str, direction: str, amount: float, market: str, account: str = "PRACTICE"):
     client = _iq_reconnect_state(state)
     if not _iq_connected(state):
         raise RuntimeError("IQ Option desconectada.")
 
+    account = str(account or "PRACTICE").upper()
+    if account not in ("PRACTICE", "REAL"):
+        raise RuntimeError("Conta IQ inválida. Use PRACTICE ou REAL.")
     changer = getattr(client, "change_balance", None)
-    if callable(changer):
-        changed = changer("PRACTICE")
-        if changed is False:
-            raise RuntimeError("Não foi possível selecionar a conta DEMO/PRACTICE.")
+    if not callable(changer):
+        raise RuntimeError("Esta iqoptionapi não permite selecionar PRACTICE/REAL com segurança.")
+    changed = changer(account)
+    if changed is False:
+        raise RuntimeError(f"Não foi possível selecionar a conta {account}.")
+    state["auto_account"] = account
 
     action = "call" if direction == "CALL" else "put"
     expiry_minutes = max(1, int(round(iq_seconds(interval) / 60)))
@@ -26629,7 +26636,7 @@ def _iq_place_demo_order_blocking(state: Dict[str, Any], symbol: str, interval: 
             "action": action,
             "amount": round(float(amount), 2),
             "expiry_minutes": expiry_minutes,
-            "account": "PRACTICE",
+            "account": account,
             "order_type": order_type,
             "market_book": book_name,
         }
@@ -26725,7 +26732,7 @@ def _iq_place_demo_order_blocking(state: Dict[str, Any], symbol: str, interval: 
                     return placed
 
     detail = " | ".join(errors[-5:])[:520]
-    raise RuntimeError("IQ Option recusou a ordem DEMO. " + (detail or "Nenhum método de opções disponível para este ativo."))
+    raise RuntimeError(f"IQ Option recusou a ordem na conta {account}. " + (detail or "Nenhum método de opções disponível para este ativo."))
 
 
 @app.post("/iq-auto-order")
@@ -26738,6 +26745,7 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
     market = str(body.market or "OPEN").upper()
     amount = float(body.amount or 0)
     stage = str(body.stage or "ENTRADA").upper()
+    account = str(body.account or "PRACTICE").upper()
 
     if symbol not in SYMBOLS:
         raise HTTPException(400, "Ativo inválido para AUTO ENTRADA.")
@@ -26750,8 +26758,10 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
         raise HTTPException(400, "Direção inválida para AUTO ENTRADA.")
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado inválido para AUTO ENTRADA.")
+    if account not in ("PRACTICE", "REAL"):
+        raise HTTPException(400, "Conta inválida. Use PRACTICE ou REAL.")
     if amount < 1 or amount > 1000:
-        raise HTTPException(400, "No teste DEMO, use valor entre 1 e 1000 por entrada.")
+        raise HTTPException(400, "Use valor entre 1 e 1000 por entrada.")
     if stage not in ("ENTRADA", "G1", "G2"):
         raise HTTPException(400, "Etapa inválida para AUTO ENTRADA.")
 
@@ -26773,7 +26783,7 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
         direction,
         _canonical_time_key(body.entry_time),
         stage,
-        "PRACTICE",
+        account,
     ])
 
     order_lock = state.get("order_lock")
@@ -26797,20 +26807,21 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
             "ok": False,
             "status": "PLACING",
             "order_key": order_key,
-            "account": "PRACTICE",
+            "account": account,
             "created_at": iso(now()),
         }
 
         try:
             placed = await asyncio.wait_for(
                 asyncio.to_thread(
-                    _iq_place_demo_order_blocking,
+                    _iq_place_order_blocking,
                     state,
                     symbol,
                     interval,
                     direction,
                     amount,
                     market,
+                    account,
                 ),
                 timeout=24,
             )
@@ -26821,7 +26832,7 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
                 "ok": False,
                 "status": "UNKNOWN_TIMEOUT",
                 "order_key": order_key,
-                "account": "PRACTICE",
+                "account": account,
                 "created_at": iso(now()),
                 "message": "Tempo excedido. A ordem não será reenviada automaticamente para evitar duplicidade.",
             }
@@ -26831,7 +26842,7 @@ async def iq_auto_order(body: IQAutoOrderBody, request: Request):
                 "ok": False,
                 "status": "REJECTED",
                 "order_key": order_key,
-                "account": "PRACTICE",
+                "account": account,
                 "created_at": iso(now()),
                 "message": str(exc)[:350],
             }
@@ -26931,7 +26942,7 @@ async def iq_auto_status(request: Request):
     orders = list(state.get("auto_orders", {}).values())[-20:]
     return {
         "connected": _iq_connected(state),
-        "account": "PRACTICE",
+        "account": str(state.get("auto_account") or "PRACTICE"),
         "orders": orders,
     }
 
@@ -35035,12 +35046,19 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       </div>
 
       <div class="card" style="margin-top:14px;border-color:#19d27c">
-        <div style="font-weight:1000">🤖 AUTO ENTRADA • TESTE DEMO</div>
+        <div style="font-weight:1000">🤖 AUTO ENTRADA • IQ OPTION</div>
         <div class="label" style="margin-top:6px;line-height:1.5">
-          Executa na IQ Option apenas em PRACTICE/DEMO quando o horário do sinal chegar.
+          Escolha PRACTICE/DEMO ou CONTA REAL. PRACTICE é o padrão e a conta REAL só é usada quando você selecionar explicitamente.
           Fica OFF sempre que a página é aberta.
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;align-items:end">
+          <div>
+            <div class="label">CONTA PARA AUTOENTRADA</div>
+            <select id="autoTradeAccount" style="width:100%;margin-top:5px">
+              <option value="PRACTICE">🧪 TREINO / PRACTICE</option>
+              <option value="REAL">💰 CONTA REAL</option>
+            </select>
+          </div>
           <div>
             <div class="label">VALOR BASE</div>
             <input id="autoTradeAmount" type="number" min="1" max="1000" step="1" value="1"
@@ -36215,6 +36233,7 @@ const binomoPublicTestBtn=document.getElementById('binomoPublicTestBtn');
 const binomoLogoutBtn=document.getElementById('binomoLogoutBtn');
 const binomoAccountStatus=document.getElementById('binomoAccountStatus');
 let binomoFeedAuthenticated=false;
+const autoTradeAccount=document.getElementById('autoTradeAccount');
 const autoTradeAmount=document.getElementById('autoTradeAmount');
 const autoTradeGale=document.getElementById('autoTradeGale');
 const autoTradeGaleMultiplier=document.getElementById('autoTradeGaleMultiplier');
@@ -38243,19 +38262,22 @@ function autoTradeSettings(){
   if(!Number.isFinite(amount)) amount=1;
   amount=Math.max(1,Math.min(1000,amount));
   // MEGA IA 3.96.7: Gale bloqueado globalmente.
-  return {amount,gale:0,multiplier:2};
+  const account=String((autoTradeAccount&&autoTradeAccount.value)||'PRACTICE').toUpperCase()==='REAL'?'REAL':'PRACTICE';
+  return {amount,gale:0,multiplier:2,account};
 }
 
 function updateAutoTradePreview(){
   if(!autoTradePreview) return;
   const cfg=autoTradeSettings();
   const next=nextSignalRecoveryAmount(cfg.amount);
-  autoTradePreview.textContent='Entrada atual: '+Number(next).toFixed(2)+' • SEM GALE • LOSS recupera somente no próximo sinal';
+  const acc=cfg.account==='REAL'?'💰 CONTA REAL':'🧪 TREINO/PRACTICE';
+  autoTradePreview.textContent=acc+' • Entrada atual: '+Number(next).toFixed(2)+' • SEM GALE • LOSS recupera somente no próximo sinal';
 }
 
 function renderAutoTradeState(message=''){
   if(autoTradeToggle){
-    autoTradeToggle.textContent=autoTradeEnabled?'🟢 AUTO DEMO ON':'🔴 AUTO DEMO OFF';
+    const real=autoTradeSettings().account==='REAL';
+    autoTradeToggle.textContent=autoTradeEnabled?(real?'🟢 AUTO REAL ON':'🟢 AUTO DEMO ON'):(real?'🔴 AUTO REAL OFF':'🔴 AUTO DEMO OFF');
     autoTradeToggle.style.borderColor=autoTradeEnabled?'#19d27c':'#ff5252';
   }
   if(autoTradeStatus && message){
@@ -38269,6 +38291,17 @@ function renderAutoTradeState(message=''){
 function disableAutoTrade(message='⚪ AUTO ENTRADA desligada.'){
   autoTradeEnabled=false;
   renderAutoTradeState(message);
+}
+
+
+if(autoTradeAccount){
+  autoTradeAccount.value='PRACTICE';
+  autoTradeAccount.onchange=()=>{
+    disableAutoTrade(autoTradeAccount.value==='REAL'
+      ? '🔴 CONTA REAL selecionada • confirme ativando a AUTO ENTRADA manualmente.'
+      : '⚪ TREINO/PRACTICE selecionado • ative a AUTO ENTRADA quando quiser.');
+    updateAutoTradePreview();
+  };
 }
 
 if(autoTradeAmount){
@@ -38337,15 +38370,20 @@ if(autoTradeToggle){
           '&interval='+encodeURIComponent(interval.value)+
           '&market='+encodeURIComponent(market.value||'OPEN'));
         if(cap && cap.available===false){
-          renderAutoTradeState('🟠 AUTO DEMO não armada • '+String(cap.reason||'ativo indisponível na IQ Option.'));
+          renderAutoTradeState('🟠 AUTO ENTRADA não armada • '+String(cap.reason||'ativo indisponível na IQ Option.'));
           return;
         }
         const cfg=autoTradeSettings();
+        if(cfg.account==='REAL'){
+          const ok=window.confirm('ATENÇÃO: você selecionou CONTA REAL. As próximas entradas automáticas usarão dinheiro real da sua conta IQ Option. Deseja ativar?');
+          if(!ok){ renderAutoTradeState('🔴 CONTA REAL não autorizada • AUTO ENTRADA continua OFF.'); return; }
+        }
         autoTradeEnabled=true;
         const galeTxt='sem Gale • recuperação no próximo sinal';
         const route=(cap&&Array.isArray(cap.methods)&&cap.methods.length)?(' • '+cap.methods.join('/')):'';
-        renderAutoTradeState('🟢 AUTO DEMO armada'+route+' • '+galeTxt+' • aguardando o próximo sinal confirmado.');
-        if(voiceEnabled) speak('Auto entrada demo ativada.');
+        const accTxt=cfg.account==='REAL'?'💰 CONTA REAL':'🧪 DEMO/PRACTICE';
+        renderAutoTradeState('🟢 '+accTxt+' armada'+route+' • '+galeTxt+' • aguardando o próximo sinal confirmado.');
+        if(voiceEnabled) speak(cfg.account==='REAL'?'Auto entrada em conta real ativada.':'Auto entrada demo ativada.');
       }catch(e){
         renderAutoTradeState('🟠 Não foi possível validar a IQ agora: '+String((e&&e.message)||e));
       }finally{
@@ -38424,10 +38462,11 @@ async function monitorNextSignalRecovery(sig, baseOrder, usedAmount, baseAmount,
 
 async function executeAutoTrade(sig){
   if(!autoTradeEnabled || autoOrderBusy) return;
-  if(!brokerConnected.IQ_OPTION) return disableAutoTrade('🔴 IQ Option desconectada • AUTO DEMO desligada.');
+  if(!brokerConnected.IQ_OPTION) return disableAutoTrade('🔴 IQ Option desconectada • AUTO ENTRADA desligada.');
   if(!sig || (sig.direction!=='CALL' && sig.direction!=='PUT') || !sig.entry_time) return;
 
-  const key=[sig.market||market.value,S.value,interval.value,sig.direction,sig.entry_time,'ENTRADA','PRACTICE'].join('|');
+  const cfg=autoTradeSettings();
+  const key=[sig.market||market.value,S.value,interval.value,sig.direction,sig.entry_time,'ENTRADA',cfg.account].join('|');
   if(autoExecutedKeys.has(key)) return;
 
   const entryMs=new Date(sig.entry_time).getTime();
@@ -38436,10 +38475,9 @@ async function executeAutoTrade(sig){
 
   autoExecutedKeys.add(key);
   autoOrderBusy=true;
-  renderAutoTradeState('🟡 ENTRADA • enviando ordem DEMO para IQ Option...');
+  renderAutoTradeState('🟡 ENTRADA • enviando ordem '+(cfg.account==='REAL'?'REAL':'DEMO')+' para IQ Option...');
 
   try{
-    const cfg=autoTradeSettings();
     const engineKey=String(sig.selected_engine||sig.engine||sig.mode||'').toUpperCase();
     const amount=nextSignalRecoveryAmount(cfg.amount);
     const d=await post('/iq-auto-order',{
@@ -38449,14 +38487,15 @@ async function executeAutoTrade(sig){
       entry_time:sig.entry_time,
       market:sig.market||market.value||'OPEN',
       amount:amount,
-      stage:'ENTRADA'
+      stage:'ENTRADA',
+      account:cfg.account
     });
     if(!d || d.ok!==true || d.status!=='PLACED') throw Error((d&&d.message)||'A IQ não confirmou a ordem.');
     const ativo=d.active||sig.symbol||S.value;
     const route=d.order_type?(' • '+d.order_type):'';
     const galeTxt='sem Gale • recuperação somente no próximo sinal';
-    renderAutoTradeState('✅ ENTRADA DEMO ENVIADA'+route+' • '+ativo+' • '+sig.direction+' • valor '+amount.toFixed(2)+' • '+galeTxt);
-    if(voiceEnabled) speak('Ordem demo enviada. '+(sig.direction==='CALL'?'Compra':'Venda')+'.');
+    renderAutoTradeState('✅ ENTRADA '+(cfg.account==='REAL'?'REAL':'DEMO')+' ENVIADA'+route+' • '+ativo+' • '+sig.direction+' • valor '+amount.toFixed(2)+' • '+galeTxt);
+    if(voiceEnabled) speak('Ordem '+(cfg.account==='REAL'?'real':'demo')+' enviada. '+(sig.direction==='CALL'?'Compra':'Venda')+'.');
 
     // Todos os motores: nunca abre G1/G2 na mesma operação.
     // LOSS apenas prepara a recuperação para o PRÓXIMO sinal confirmado.
@@ -38465,7 +38504,7 @@ async function executeAutoTrade(sig){
       monitorNextSignalRecovery(sig,d,amount,cfg.amount,key);
     }
   }catch(e){
-    renderAutoTradeState('🔴 AUTO DEMO: '+String((e&&e.message)||e));
+    renderAutoTradeState('🔴 AUTO ENTRADA: '+String((e&&e.message)||e));
     if(voiceEnabled) speak('A ordem demo não foi executada.');
   }finally{
     autoOrderBusy=false;
@@ -39815,7 +39854,7 @@ iqLogoutBtn.onclick=async()=>{
     localStorage.removeItem('mega_iq_session');
   }catch(_){}
   brokerConnected[b]=false;
-  disableAutoTrade('🔴 IQ Option desconectada • AUTO DEMO desligada.');
+  disableAutoTrade('🔴 IQ Option desconectada • AUTO ENTRADA desligada.');
   iqPassword.value='';
   syncBroker(b);
   iqAccountStatus.textContent='⚪ IQ Option desconectada.';
