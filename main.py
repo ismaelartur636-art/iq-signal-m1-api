@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.09"
+APP_VERSION = "3.98.10"
+# MEGA IA 3.98.10 — filtro de classe de ativos: PARIDADES e CRIPTO separam seletor, radar e varredura automática sem alterar estratégias.
 # MEGA IA 3.97.98 — painel: CALL/PUT promovido pelo radar fica travado até a expiração mesmo se o polling seguinte der NEUTRO/erro; resultado BTC/Binance é apurado direto na mesma fonte com retry rápido.
 # MEGA IA 3.97.95 — BTC/USD OPEN: cTrader continua prioritária, mas falha/atraso cai imediatamente para Binance pública; painel e radar usam o mesmo fallback.
 # MEGA IA 3.97.97 — corrige MEGA MONEY EA preso em FONTE EM ESPERA: o ramo agora carrega candles e BTC/USD OPEN usa Binance diretamente.
@@ -31809,11 +31810,26 @@ async def chart_pre_signal(
             "message": str(exc)[:220],
         }
 
+def _radar_asset_class_allowed(sym: str, asset_class: str) -> bool:
+    raw = str(sym or "").strip().upper()
+    cls = str(asset_class or "ALL").strip().upper()
+    crypto = {"BTC/USD","BTC_IQ","ETH/USD","LTC/USD","SOL/USD","XRP/USD","DOGE/USD","ADA/USD","BNB/USD","CRYPTO IDX"}
+    if cls == "CRYPTO":
+        return raw in crypto
+    if cls == "FOREX":
+        compact = re.sub(r"[^A-Z]", "", raw)
+        fx = {"USD","EUR","GBP","JPY","AUD","CAD","CHF","NZD"}
+        return len(compact) == 6 and compact[:3] in fx and compact[3:] in fx
+    return True
+
 @app.get("/radar")
-async def radar(request: Request, interval="1min", market="OPEN", engine: str = "SCALPERPRO", symbol: str = "", robofibo_poc: bool = False):
+async def radar(request: Request, interval="1min", market="OPEN", engine: str = "SCALPERPRO", symbol: str = "", asset_class: str = "ALL", robofibo_poc: bool = False):
     market = (market or "OPEN").upper()
     engine = (engine or "SCALPERPRO").upper()
     symbol = str(symbol or "").strip().upper()
+    asset_class = str(asset_class or "ALL").strip().upper()
+    if asset_class not in ("ALL", "FOREX", "CRYPTO"):
+        asset_class = "ALL"
 
     if interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Intervalo ou mercado inválido.")
@@ -31825,7 +31841,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     if engine == "RTM":
         # Radar exclusivo: BTC/USD + pares JPY. Um símbolo manual fora da regra
         # aparece bloqueado pelo próprio signal(), mas nunca entra na varredura automática.
-        scan = [symbol] if symbol else _rtm_scan_symbols(market)
+        scan = [symbol] if symbol else [x for x in _rtm_scan_symbols(market) if _radar_asset_class_allowed(x, asset_class)]
         out = []
         iq_rtm = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
         for sym in scan:
@@ -31851,7 +31867,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     if fallback_twelve:
         market = "OPEN"
 
-    rkey = f"{market}|{interval}|{engine}|{symbol or 'ALL'}|FIBO_POC={int(bool(robofibo_poc)) if engine == 'FIBORSI' else 0}"
+    rkey = f"{market}|{interval}|{engine}|{symbol or 'ALL'}|CLASS={asset_class}|FIBO_POC={int(bool(robofibo_poc)) if engine == 'FIBORSI' else 0}"
     previous = radar_cache.get(rkey)
     # Snapshot curto: evita chamadas duplicadas quando a tela dispara o radar
     # várias vezes quase ao mesmo tempo, mas permite que o índice avance de
@@ -31873,7 +31889,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             "clickable": False,
             "updated_at": None,
         }
-        for sym in ([symbol] if symbol else (SYMBOLS if market == "OPEN" else OTC_SYMBOLS))
+        for sym in ([symbol] if symbol else [x for x in (SYMBOLS if market == "OPEN" else OTC_SYMBOLS) if _radar_asset_class_allowed(x, asset_class)])
     ]
 
     # RADAR AUTOMÁTICO: todos os ativos entram na fila de análise, mesmo quando
@@ -31881,7 +31897,9 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
     # Para os símbolos sem stream fresco, candles_open usa cache/REST com o
     # limitador global já existente. Assim nenhum cartão depende de toque para
     # começar a ser analisado e evitamos estourar a cota da fonte de dados.
-    scan_symbols = [symbol] if symbol else list(SYMBOLS if market == "OPEN" else OTC_SYMBOLS)
+    scan_symbols = [symbol] if symbol else [x for x in (SYMBOLS if market == "OPEN" else OTC_SYMBOLS) if _radar_asset_class_allowed(x, asset_class)]
+    if not scan_symbols:
+        return []
     if market == "OPEN":
         # 3.97.69 — em fim de semana o Forex OPEN não forma candles. Prioriza os
         # cripto 24/7 para o radar não parecer parado enquanto BTC/ETH/LTC estão vivos.
@@ -34240,6 +34258,11 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </select>
     <input id="market" type="hidden" value="OPEN">
 
+    <select id="assetClassMode" title="Escolha o tipo de ativo" style="font-weight:1000">
+      <option value="FOREX">💱 PARIDADES</option>
+      <option value="CRYPTO">₿ CRIPTO</option>
+    </select>
+
     <select id="symbol"></select>
 
     <select id="cryptoQuickSelect" title="Escolha rápida de criptomoeda" style="font-weight:1000">
@@ -36377,6 +36400,8 @@ try{
   const savedEntryMode=localStorage.getItem('mega_entry_mode')||'BIRTH';
   if(entryMode) entryMode.value=['BIRTH','MIDDLE','CLOSE'].includes(savedEntryMode)?savedEntryMode:'BIRTH';
   if(marketMode) marketMode.value=(savedMode==='OTC'?'OTC':'OPEN');
+  const savedAssetClass=String(localStorage.getItem('mega_asset_class')||'FOREX').toUpperCase();
+  if(assetClassMode) assetClassMode.value=(savedAssetClass==='CRYPTO'?'CRYPTO':'FOREX');
   setTimeout(()=>syncBroker(savedBroker),0);
 }catch(_){}
 
@@ -36404,7 +36429,24 @@ const syms=[
 const rtmSeedSyms=['BTC/USD','USD/JPY','EUR/JPY','GBP/JPY','AUD/JPY','CAD/JPY','CHF/JPY','NZD/JPY'];
 
 const S=document.getElementById('symbol');
+const assetClassMode=document.getElementById('assetClassMode');
 const cryptoQuickSelect=document.getElementById('cryptoQuickSelect');
+const CRYPTO_ASSETS=new Set(['BTC/USD','BTC_IQ','ETH/USD','LTC/USD','SOL/USD','XRP/USD','DOGE/USD','ADA/USD','BNB/USD','CRYPTO IDX']);
+const FX_CURRENCIES=new Set(['USD','EUR','GBP','JPY','AUD','CAD','CHF','NZD']);
+function isCryptoAsset(sym){ return CRYPTO_ASSETS.has(String(sym||'').toUpperCase()); }
+function isForexPair(sym){
+  const raw=String(sym||'').toUpperCase().replace(/[^A-Z]/g,'');
+  if(raw.length!==6) return false;
+  return FX_CURRENCIES.has(raw.slice(0,3)) && FX_CURRENCIES.has(raw.slice(3,6));
+}
+function activeAssetClass(){ return assetClassMode && assetClassMode.value==='CRYPTO' ? 'CRYPTO' : 'FOREX'; }
+function assetAllowedByTab(sym){ return activeAssetClass()==='CRYPTO' ? isCryptoAsset(sym) : isForexPair(sym); }
+function syncAssetClassUi(){
+  const crypto=activeAssetClass()==='CRYPTO';
+  if(cryptoQuickSelect) cryptoQuickSelect.style.display=crypto?'':'none';
+  if(btcOnlyBtn) btcOnlyBtn.style.display=crypto?'':'none';
+  try{localStorage.setItem('mega_asset_class',crypto?'CRYPTO':'FOREX');}catch(_){}
+}
 if(cryptoQuickSelect){
   cryptoQuickSelect.addEventListener('change',async()=>{
     const chosen=String(cryptoQuickSelect.value||'').trim();
@@ -37889,12 +37931,12 @@ function fillSymbols(){
   const openSymbols=[...syms.filter(x=>x!=='CRYPTO IDX'),...ctraderExtra,'CRYPTO IDX'];
   const engineNow=(typeof selectedRobotEngine==='function'?selectedRobotEngine():'');
   // 3.97.85: mantém todos os ativos visíveis; btcOnlyEnabled bloqueia apenas a troca automática.
-  let visibleSymbols=(isOtc ? syms : openSymbols);
+  let visibleSymbols=(isOtc ? syms : openSymbols).filter(assetAllowedByTab);
   if(engineNow==='RTM'){
     const source=isOtc ? syms : [...rtmSeedSyms,...ctraderExtra];
     visibleSymbols=[...new Set(source)].filter(x=>{
       const c=String(x||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
-      return c==='BTCUSD' || c.includes('JPY');
+      return assetAllowedByTab(x) && (c==='BTCUSD' || c.includes('JPY'));
     });
   }
 
@@ -37915,7 +37957,21 @@ function fillSymbols(){
     S.value=previous;
   }
 
+  if(!S.value && S.options.length) S.selectedIndex=0;
+  syncAssetClassUi();
   renderBtcOnlyState();
+}
+
+if(assetClassMode){
+  assetClassMode.addEventListener('change',async()=>{
+    syncAssetClassUi();
+    cur=null; panelSignalLock=null; lastSignalVoice=''; lastRadarAutoKey='';
+    fillSymbols();
+    if(S && S.value){ try{localStorage.setItem('mega_symbol',S.value);}catch(_){} }
+    if(radar) radar.innerHTML='<div>📡 Atualizando radar para '+(activeAssetClass()==='CRYPTO'?'CRIPTO':'PARIDADES')+'...</div>';
+    if(statusBox) statusBox.textContent=(activeAssetClass()==='CRYPTO'?'₿ CRIPTO':'💱 PARIDADES')+' • analisando somente este grupo';
+    try{ await Promise.allSettled([sig(false),rad(),loadPreSignals()]); }catch(_){}
+  });
 }
 
 function showRobot(){
@@ -43143,10 +43199,11 @@ async function rad(){
     const engine=selectedRobotEngine();
     if(engine==='OFF'){ radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>'; return; }
     const onlySymbol=(engine==='RTM')?'':(btcOnlyEnabled?'&symbol='+encodeURIComponent('BTC/USD'):'');
-    const items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}${onlySymbol}`);
+    const assetClass=activeAssetClass();
+    const items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&asset_class=${encodeURIComponent(assetClass)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}${onlySymbol}`);
     // Uma resposta antiga do motor anterior não pode reaparecer após trocar ONLINE/OFFLINE.
     if(engine!==selectedRobotEngine()) return;
-    const list=Array.isArray(items)?items:[];
+    const list=(Array.isArray(items)?items:[]).filter(item=>assetAllowedByTab(radarBaseSymbol(item)));
     if(!list.length){
       radar.innerHTML='<div>📡 Radar ativo • aguardando leitura</div>';
       return;
