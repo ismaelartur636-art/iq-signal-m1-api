@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.22"
+APP_VERSION = "3.98.23"
+# MEGA IA 3.98.23 — AUTO IQ: executa somente OPÇÕES BINÁRIAS/TURBO; DIGITAL removido da autoentrada e da validação de disponibilidade.
 # MEGA IA 3.98.22 — IQ 401: para reconexão automática após rejeição de autorização e exige login novo, evitando loop de WebSocket 401.\n# MEGA IA 3.98.21 — AUTO IQ: valida DIGITAL imediatamente antes da ordem, invalida catálogo após recusa e evita tentar instrumento digital indisponível.
 # MEGA IA 3.98.20 — corrige gatilho MEGA HFT que estava praticamente impossível; valida boot do app.
 # MEGA IA 3.98.19 — corrige JS dos botões, remove Dragon Fire/Pro e trava varredura por PARIDADES/CRIPTO.
@@ -26630,15 +26631,6 @@ def _iq_auto_capability_blocking(state: Dict[str, Any], symbol: str, interval: s
                 actives.append(matched)
                 break
 
-    if expiry_minutes in (1, 5):
-        book = books.get("digital") or {}
-        for candidate in candidates:
-            matched = book.get(_iq_active_norm(candidate))
-            if matched:
-                methods.append("DIGITAL")
-                actives.append(matched)
-                break
-
     methods = list(dict.fromkeys(methods))
     actives = list(dict.fromkeys(actives))
     if snap.get("exact"):
@@ -26844,36 +26836,20 @@ def _iq_place_order_blocking(state: Dict[str, Any], symbol: str, interval: str, 
                         return placed
                     break
 
-        if expiry_minutes in (1, 5):
-            digital_book = books.get("digital") or {}
-            for candidate in candidates:
-                active = digital_book.get(_iq_active_norm(candidate))
-                if active:
-                    placed = try_digital(active)
-                    if placed:
-                        return placed
-                    break
-
         if not attempted:
             raise RuntimeError(
-                f"{symbol} não está aberto agora em TURBO/BINARY/DIGITAL na IQ Option para {interval}."
+                f"{symbol} não está aberto agora em OPÇÕES BINÁRIAS/TURBO na IQ Option para {interval}."
             )
 
     # 2) Se o catálogo do fork falhou, mantém compatibilidade: tenta os nomes conhecidos,
-    #    primeiro binária/turbo e depois digital (M1/M5).
+    #    somente opções binárias/turbo.
     else:
         for active in candidates:
             placed = try_binary(active, "fallback")
             if placed:
                 return placed
-        if expiry_minutes in (1, 5):
-            for active in candidates:
-                placed = try_digital(active)
-                if placed:
-                    return placed
-
     detail = " | ".join(errors[-5:])[:520]
-    raise RuntimeError(f"IQ Option recusou a ordem na conta {account}. " + (detail or "Nenhum método de opções disponível para este ativo."))
+    raise RuntimeError(f"IQ Option recusou a ordem na conta {account}. " + (detail or "Opções BINÁRIAS/TURBO indisponíveis para este ativo."))
 
 
 @app.post("/iq-auto-order")
