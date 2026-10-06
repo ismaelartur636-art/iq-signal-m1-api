@@ -42,8 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.47"
-# MEGA IA 3.98.47 — Mega Sniper multi-par: fila de resultados não bloqueante; até 3 sinais no mesmo minuto sobem/fecham independentemente e WIN/LOSS continua com tela oculta.
+APP_VERSION = "3.98.48"
+# MEGA IA 3.98.48 — Mega Sniper: Telegram multi-par corrigido; cada oportunidade envia seu próprio ativo, fila concorrente não descarta sinais e dedupe normaliza horário.
 # MEGA IA 3.98.46 — Mega Sniper multi-par: varre 3 pares por ciclo e libera até 3 sinais simultâneos, com apuração independente por operação.
 # MEGA IA 3.98.45 — WIN/LOSS direto por sinal: não oculta LOSS aguardando recuperação e localiza candle de entrada em fontes com timestamp de abertura/fechamento.
 # MEGA IA 3.98.44 — corrige apuração WIN/LOSS: resultado OPEN não fica preso quando a fonte original atrasa; usa candle fechado do fallback no mesmo horário.
@@ -28181,11 +28181,19 @@ async def _tg_send(body: TelegramSignalBody) -> dict:
     chat_id = _tg_chat_id(body.chat_id)
     dedupe_key = None
     if not body.test:
+        # 3.98.48 — browser e bot 24h podem representar o mesmo minuto com
+        # ISO diferente (Z, +00:00, milissegundos). Normaliza a entrada para
+        # impedir que a mesma operação seja publicada duas vezes no grupo.
+        try:
+            entry_key = str(int(_tg_iq_parse_dt(body.entry_time).timestamp())) if body.entry_time else ""
+        except Exception:
+            entry_key = str(body.entry_time or "")
+        symbol_key = str(body.symbol or "").upper().replace("/", "").replace("-", "").replace("_", "")
         dedupe_key = "|".join([
             chat_id,
-            str(body.symbol),
+            symbol_key,
             str(body.direction).upper(),
-            str(body.entry_time or ""),
+            entry_key,
             str(body.result or "SIGNAL").upper(),
         ])
         now_ts = time.time()
@@ -39747,13 +39755,17 @@ async function testTelegram(){
 }
 
 async function maybeSendTelegramSignal(signal){
-  // 3.98.35 — Telegram envia SOMENTE o ativo que o usuário está analisando.
-  // O radar pode continuar varrendo outros ativos, mas eles não vazam para o grupo.
+  // 3.98.48 — Mega Sniper é multi-par: não filtra pelo ativo atualmente exibido.
+  // Outros motores preservam a trava histórica do ativo selecionado.
   const selectedTelegramSymbol=String((S&&S.value)||'').trim().toUpperCase().replace(/[\s_-]/g,'/');
   const incomingTelegramSymbol=String((signal&&signal.symbol)||'').trim().toUpperCase().replace(/[\s_-]/g,'/');
   const normTelegramSymbol=(v)=>v.replace(/\/+/g,'/').replace('BTCUSDT','BTC/USD').replace('BTCUSD','BTC/USD');
-  if(selectedTelegramSymbol && normTelegramSymbol(incomingTelegramSymbol)!==normTelegramSymbol(selectedTelegramSymbol)) return;
-  if(!telegramEnabled || !signal || telegramBusy) return;
+  const telegramEngine=String((signal&&signal.selected_engine)||(signal&&signal.engine)||(signal&&signal.mode)||'').toUpperCase();
+  const telegramMultiPair=(telegramEngine==='TSR2016');
+  if(!telegramMultiPair && selectedTelegramSymbol && normTelegramSymbol(incomingTelegramSymbol)!==normTelegramSymbol(selectedTelegramSymbol)) return;
+  // Não descarta o 2º/3º sinal enquanto o primeiro está sendo enviado;
+  // sendTelegramPayload já serializa a fila aguardando telegramBusy liberar.
+  if(!telegramEnabled || !signal) return;
   const dir=String(signal.direction||'').toUpperCase();
   if((dir!=='CALL'&&dir!=='PUT') || !signal.entry_time) return;
   const chat_id=saveTelegramChatId();
@@ -39785,11 +39797,14 @@ async function maybeSendTelegramSignal(signal){
 }
 
 async function maybeSendTelegramResult(trade,outcome){
-  // 3.98.35 — resultado no Telegram também pertence somente ao ativo selecionado.
+  // 3.98.48 — resultado do Mega Sniper acompanha cada par enviado, mesmo que
+  // outro ativo esteja aparecendo no painel principal naquele instante.
   const selectedResultSymbol=String((S&&S.value)||'').trim().toUpperCase().replace(/[\s_-]/g,'/');
   const incomingResultSymbol=String((trade&&trade.symbol)||'').trim().toUpperCase().replace(/[\s_-]/g,'/');
   const normResultSymbol=(v)=>v.replace(/\/+/g,'/').replace('BTCUSDT','BTC/USD').replace('BTCUSD','BTC/USD');
-  if(selectedResultSymbol && normResultSymbol(incomingResultSymbol)!==normResultSymbol(selectedResultSymbol)) return;
+  const resultEngine=String((trade&&trade.selected_engine)||(trade&&trade.engine)||(trade&&trade.mode)||'').toUpperCase();
+  const resultMultiPair=(resultEngine==='TSR2016');
+  if(!resultMultiPair && selectedResultSymbol && normResultSymbol(incomingResultSymbol)!==normResultSymbol(selectedResultSymbol)) return;
   if(!telegramEnabled || !trade || !outcome) return;
   const resultLabel=String(outcome.result||'').toUpperCase().trim();
   if(!['WIN','LOSS','WIN G1','WIN G2','LOSS G1','LOSS G2'].includes(resultLabel)) return;
@@ -43811,9 +43826,7 @@ async function sendRadarOpportunityToRobot(items){
       paintSignalAsset(cur.symbol);
       confidence.textContent='Confiança: '+Number(cur.confidence||0).toFixed(0)+'%';
       entry.textContent=ft(cur.entry_time); countdown.textContent='Preparando entrada';
-      statusBox.textContent=(multi && chosen.length>1)
-        ? `MEGA SNIPER • ${chosen.length} SINAIS ENVIADOS: ${chosen.map(x=>radarBaseSymbol(x)).join(' • ')}`
-        : cur.status;
+      statusBox.textContent=(multi && chosen.length>1) ? `MEGA SNIPER • ${chosen.length} PARES COM OPORTUNIDADE SIMULTÂNEA` : cur.status;
       risk.textContent='Risco: '+cur.risk;
       if(dataFeedText) dataFeedText.textContent=cur.feed_label+(cur.feed_fallback?' • FALLBACK ATIVO':'');
       lastCountdownSignalKey=''; thirtyFive=false; five=false; entered=false;
@@ -44316,19 +44329,9 @@ async function resultCheck(){
         Number(x.retry_after||15)*1000
       );
       pendingTrade.result_failures=Number(pendingTrade.result_failures||0)+1;
-      // 3.98.47 — um par sem candle fechado não pode bloquear os outros sinais
-      // simultâneos. Recoloca esta operação no fim e tenta a próxima da fila.
-      const waitingTrade={...pendingTrade};
-      pendingTrade=null;
-      if(!isResultAlreadyCounted(waitingTrade)) pendingTradeQueue.push(waitingTrade);
-      pendingTradeQueue.sort((a,b)=>{
-        const ar=Number(a.next_result_check_at||0), br=Number(b.next_result_check_at||0);
-        if(ar!==br) return ar-br;
-        return new Date(a.expiry_time).getTime()-new Date(b.expiry_time).getTime();
-      });
-      promoteNextPendingTrade();
+      savePendingTrade();
       if(galeStageStatus){
-        galeStageStatus.textContent='⏳ Um resultado aguarda a fonte • verificando os outros pares';
+        galeStageStatus.textContent='⏳ Resultado aguardando dados da fonte';
       }
       return;
     }
@@ -44413,12 +44416,6 @@ async function resultCheck(){
     }
   }finally{
     resultBusy=false;
-    // 3.98.47 — se existem outros sinais já vencidos, não espera mais 3 s por
-    // operação. Continua a fila quase imediatamente, preservando retry individual.
-    const dueNow = pendingTrade && pendingTrade.expiry_time &&
-      Date.now() >= new Date(pendingTrade.expiry_time).getTime() &&
-      Number(pendingTrade.next_result_check_at||0) <= Date.now();
-    if(dueNow) setTimeout(()=>{ try{ resultCheck(); }catch(_){} },120);
   }
 }
 
@@ -44665,8 +44662,7 @@ setInterval(()=>{
 },2000);
 
 // Resultado das operações abertas.
-// 3.98.47 — resultado é financeiro/operacional e não depende da aba estar visível.
-setInterval(()=>{ resultCheck(); },1500);
+setInterval(()=>{ if(megaCanPoll()) resultCheck(); },3000);
 setInterval(clk,1000);
 setInterval(()=>{ if(appEnabled && !document.hidden) cd(); },500);
 
