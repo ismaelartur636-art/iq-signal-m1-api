@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.56"
+APP_VERSION = "3.98.57"
+# MEGA IA 3.98.57 — corrige botão 1 BAR REVERSAL: remove chamada JS inexistente e sincroniza painel/radar/backtest ao ligar/desligar.
 # MEGA IA 3.98.56 — integra 1 BAR REVERSAL original: padrão Out/In causal, próxima M1, motor separado, radar e Backtest 48H.
 # MEGA IA 3.98.56 — adiciona MEGA PREMIUM + POC: gatilho MY 911 original só libera quando Volume POC confirma a mesma direção; Premium original e Protegido preservados.
 # MEGA IA 3.98.55 — SÓ CALL/SÓ PUT agora filtra também Backtest 48H, placar e Histórico 15 dias; troca do seletor atualiza tudo imediatamente.
@@ -41981,8 +41982,10 @@ async function setBarReversalPower(enabled){
   if(barReversalEnabled) setExclusiveVisibleEngine('BARREVERSAL');
   try{localStorage.setItem('mega_bar_reversal_power',barReversalEnabled?'ONLINE':'OFFLINE');}catch(_){}
   if(barReversalEnabled){ if(entryMode) entryMode.value='BIRTH'; if(interval) interval.value='1min'; }
-  updateModeButtons();
+  resetEngineVisualState(); applyRobotPowerState();
   await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'BARREVERSAL'});
+  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]); else await Promise.allSettled([perf()]);
+  scheduleBacktest48(true,200);
   if(voiceEnabled) speak(barReversalEnabled?'1 Bar Reversal online.':'1 Bar Reversal offline.');
 }
 
