@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.49"
+APP_VERSION = "3.98.50"
+# MEGA IA 3.98.50 — Telegram: LOSS direto e placar final robustos; apuração continua com tela em segundo plano e sessão registra todo resultado enviado enquanto estiver aberta.
 # MEGA IA 3.98.48 — Mega Sniper: Telegram multi-par corrigido; cada oportunidade envia seu próprio ativo, fila concorrente não descarta sinais e dedupe normaliza horário.
 # MEGA IA 3.98.49 — LOSS direto entra no placar/histórico/Telegram por operação; corrige filtro que aceitava WIN mas excluía LOSS final direto.
 # MEGA IA 3.98.46 — Mega Sniper multi-par: varre 3 pares por ciclo e libera até 3 sinais simultâneos, com apuração independente por operação.
@@ -27978,7 +27979,9 @@ def _tg_session_start() -> None:
 
 
 def _tg_session_record(body: TelegramSignalBody) -> None:
-    if body.test or not bool(background_bot_state.get("telegram_enabled")):
+    # 3.98.50 — a sessão é definida pelo horário de início, não pelo flag transitório
+    # do worker. Assim WIN/LOSS enviados pelo painel também entram no placar final.
+    if body.test or not background_bot_state.get("telegram_session_started_at"):
         return
     result = str(body.result or "").upper().strip()
     # 3.98.07 — resultados finais da recuperação também entram na sessão.
@@ -28966,6 +28969,9 @@ async def background_bot_set_state(body: BackgroundBotStateBody):
                 except Exception as exc:
                     # O OFF continua funcionando mesmo se o Telegram estiver temporariamente indisponível.
                     background_bot_state["last_error"] = f"placar Telegram: {str(exc)[:160]}"
+                finally:
+                    # Fecha formalmente a sessão somente DEPOIS de montar/enviar o placar.
+                    background_bot_state["telegram_session_started_at"] = None
             background_bot_state["telegram_enabled"] = tg_on
             if tg_on and not was_on:
                 _tg_session_start()
@@ -44663,7 +44669,18 @@ setInterval(()=>{
 },2000);
 
 // Resultado das operações abertas.
-setInterval(()=>{ if(megaCanPoll()) resultCheck(); },3000);
+// 3.98.50 — WIN/LOSS não depende do polling visual do app. No Android,
+// trocar de aba/ocultar a página não pode cancelar a apuração das operações abertas.
+setInterval(()=>{ if(!iqLoginInProgress) resultCheck(); },3000);
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden && !iqLoginInProgress){
+    setTimeout(()=>resultCheck(),150);
+    setTimeout(()=>perf(),500);
+  }
+});
+window.addEventListener('focus',()=>{
+  if(!iqLoginInProgress) setTimeout(()=>resultCheck(),100);
+});
 setInterval(clk,1000);
 setInterval(()=>{ if(appEnabled && !document.hidden) cd(); },500);
 
