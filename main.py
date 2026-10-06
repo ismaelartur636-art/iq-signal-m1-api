@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.43"
+APP_VERSION = "3.98.44"
+# MEGA IA 3.98.44 — corrige apuração WIN/LOSS: resultado OPEN não fica preso quando a fonte original atrasa; usa candle fechado do fallback no mesmo horário.
 # MEGA IA 3.98.43 — histórico migra somente a exibição TSR 2016/TSR2016 para 🎯 Mega Sniper; IDs internos preservados.
 # MEGA IA 3.98.37 — trava total por ativo selecionado: painel/radar/bot 24h/Telegram/histórico operacional não misturam outros pares.
 # MEGA IA 3.98.36 — TSR2016: evento único/rearme; impede repetir CALL/PUT em velas consecutivas enquanto a mesma condição permanecer ativa.
@@ -34310,11 +34311,17 @@ async def result(
             }
 
     def candle_near(target_dt):
-        if market == "OPEN" and expected_result_feed and not _result_feed_compatible(expected_result_feed, _feed_source_from_rows(cs)):
+        # 3.98.44 — o RESULTADO não pode ficar preso só porque a fonte que gerou
+        # o sinal (ex.: cTrader) atrasou e o roteador entregou um fallback.
+        # A direção continua sendo apurada EXCLUSIVAMENTE pela vela fechada do
+        # mesmo ativo/timeframe/horário da entrada; nenhuma estratégia é alterada.
+        target, _, distance = _nearest_candle_for_time(cs, target_dt, INTERVALS[interval])
+        if not target or not _verified_closed_candles([target], interval):
             return None
-        target, _, _ = _nearest_candle_for_time(cs, target_dt, INTERVALS[interval])
-        # Não finalizar com uma barra ainda em formação, mesmo quando o horário bate.
-        return target if target and _verified_closed_candles([target], interval) else None
+        # Impede aceitar uma vela distante como se fosse a vela da operação.
+        if distance is not None and float(distance) > max(5.0, INTERVALS[interval] * 0.55):
+            return None
+        return target
 
     def candle_result(candle):
         if candle is None:
@@ -34403,7 +34410,9 @@ async def result(
                 exact = await _fetch_open_result_window(symbol, interval, target_dt)
             except Exception:
                 exact = []
-            if exact and (not expected_result_feed or _result_feed_compatible(expected_result_feed, "TWELVE_DATA")):
+            if exact:
+                # 3.98.44 — fallback de apuração: se a fonte original estiver
+                # atrasada, Twelve Data pode fechar o resultado pela mesma vela.
                 cs = exact
                 found = candle_near(target_dt)
                 if found:
