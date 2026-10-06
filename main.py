@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.45"
+APP_VERSION = "3.98.46"
+# MEGA IA 3.98.46 — resultado independente do polling do indicador: WIN/LOSS continua sendo apurado após a expiração mesmo com tela em segundo plano/robô pausado; reforça checagem ao voltar ao app.
 # MEGA IA 3.98.45 — WIN/LOSS direto por sinal: não oculta LOSS aguardando recuperação e localiza candle de entrada em fontes com timestamp de abertura/fechamento.
 # MEGA IA 3.98.44 — corrige apuração WIN/LOSS: resultado OPEN não fica preso quando a fonte original atrasa; usa candle fechado do fallback no mesmo horário.
 # MEGA IA 3.98.43 — histórico migra somente a exibição TSR 2016/TSR2016 para 🎯 Mega Sniper; IDs internos preservados.
@@ -44639,7 +44640,23 @@ setInterval(()=>{
 },2000);
 
 // Resultado das operações abertas.
-setInterval(()=>{ if(megaCanPoll()) resultCheck(); },3000);
+// 3.98.46 — WIN/LOSS não pode depender do polling do indicador.
+// Se a tela for para segundo plano ou o robô for pausado depois que a entrada
+// já foi registrada, a operação continua existindo e precisa ser encerrada.
+// O navegador pode reduzir timers em background, mas ao receber CPU novamente
+// esta rotina consulta imediatamente qualquer operação já expirada.
+setInterval(()=>{
+  if(!iqLoginInProgress) resultCheck();
+},3000);
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden && !iqLoginInProgress){
+    setTimeout(()=>resultCheck(),150);
+    setTimeout(()=>perf(),500);
+  }
+});
+window.addEventListener('focus',()=>{
+  if(!iqLoginInProgress) setTimeout(()=>resultCheck(),100);
+});
 setInterval(clk,1000);
 setInterval(()=>{ if(appEnabled && !document.hidden) cd(); },500);
 
