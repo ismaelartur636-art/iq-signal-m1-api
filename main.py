@@ -42,8 +42,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.48"
+APP_VERSION = "3.98.49"
 # MEGA IA 3.98.48 — Mega Sniper: Telegram multi-par corrigido; cada oportunidade envia seu próprio ativo, fila concorrente não descarta sinais e dedupe normaliza horário.
+# MEGA IA 3.98.49 — LOSS direto entra no placar/histórico/Telegram por operação; corrige filtro que aceitava WIN mas excluía LOSS final direto.
 # MEGA IA 3.98.46 — Mega Sniper multi-par: varre 3 pares por ciclo e libera até 3 sinais simultâneos, com apuração independente por operação.
 # MEGA IA 3.98.45 — WIN/LOSS direto por sinal: não oculta LOSS aguardando recuperação e localiza candle de entrada em fontes com timestamp de abertura/fechamento.
 # MEGA IA 3.98.44 — corrige apuração WIN/LOSS: resultado OPEN não fica preso quando a fonte original atrasa; usa candle fechado do fallback no mesmo horário.
@@ -37736,7 +37737,7 @@ function registerPersistentResult(t,x){
   }
 
   const r=String(x.result||'').toUpperCase();
-  const finalAllowed=['WIN','WIN G1','WIN G2','LOSS G1','LOSS G2'].includes(r);
+  const finalAllowed=['WIN','LOSS','WIN G1','WIN G2','LOSS G1','LOSS G2'].includes(r);
   if(finalAllowed){
     b.final_ops=b.final_ops||{};
     let newFinal=false;
