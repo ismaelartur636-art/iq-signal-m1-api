@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.44"
+APP_VERSION = "3.98.45"
+# MEGA IA 3.98.45 — WIN/LOSS direto por sinal: não oculta LOSS aguardando recuperação e localiza candle de entrada em fontes com timestamp de abertura/fechamento.
 # MEGA IA 3.98.44 — corrige apuração WIN/LOSS: resultado OPEN não fica preso quando a fonte original atrasa; usa candle fechado do fallback no mesmo horário.
 # MEGA IA 3.98.43 — histórico migra somente a exibição TSR 2016/TSR2016 para 🎯 Mega Sniper; IDs internos preservados.
 # MEGA IA 3.98.37 — trava total por ativo selecionado: painel/radar/bot 24h/Telegram/histórico operacional não misturam outros pares.
@@ -34311,15 +34312,33 @@ async def result(
             }
 
     def candle_near(target_dt):
-        # 3.98.44 — o RESULTADO não pode ficar preso só porque a fonte que gerou
-        # o sinal (ex.: cTrader) atrasou e o roteador entregou um fallback.
-        # A direção continua sendo apurada EXCLUSIVAMENTE pela vela fechada do
-        # mesmo ativo/timeframe/horário da entrada; nenhuma estratégia é alterada.
+        # 3.98.45 — apuração robusta pelo candle da ENTRADA.
+        # As fontes do app não usam todas a mesma convenção no campo datetime
+        # (algumas marcam abertura, outras fechamento). Primeiro aceitamos a vela
+        # cujo timestamp cai no intervalo [entrada, expiração); depois usamos o
+        # localizador legado. A vela ainda precisa estar fechada.
+        step_seconds = float(INTERVALS[interval])
+        target_ts = float(target_dt.timestamp())
+        for row in reversed(list(cs or [])):
+            try:
+                raw_dt = row.get("datetime") or row.get("time") or row.get("timestamp")
+                row_dt = parse_dt(str(raw_dt))
+                row_ts = float(row_dt.timestamp())
+                # timestamp de abertura
+                if abs(row_ts - target_ts) <= max(2.0, step_seconds * 0.12):
+                    if _verified_closed_candles([row], interval):
+                        return row
+                # timestamp de fechamento: target + 1 candle
+                if abs(row_ts - (target_ts + step_seconds)) <= max(2.0, step_seconds * 0.12):
+                    if _verified_closed_candles([row], interval):
+                        return row
+            except Exception:
+                continue
+
         target, _, distance = _nearest_candle_for_time(cs, target_dt, INTERVALS[interval])
         if not target or not _verified_closed_candles([target], interval):
             return None
-        # Impede aceitar uma vela distante como se fosse a vela da operação.
-        if distance is not None and float(distance) > max(5.0, INTERVALS[interval] * 0.55):
+        if distance is not None and float(distance) > max(8.0, step_seconds * 1.10):
             return None
         return target
 
@@ -44278,7 +44297,7 @@ async function resultCheck(){
     pendingTrade=t;
 
     const x=await get(
-      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=${currentManagementMode()==='RECOVERY'?'true':'false'}&gale_levels=${currentManagementMode()==='G2'?2:(currentManagementMode()==='G1'?1:0)}&engine=${encodeURIComponent(t.engine||'')}&feed_source=${encodeURIComponent(t.feed_source||'')}`
+      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=true&gale_levels=0&engine=${encodeURIComponent(t.engine||'')}&feed_source=${encodeURIComponent(t.feed_source||'')}`
     );
 
     if(x && !x.result && (x.status==='AGUARDANDO_FONTE' || String(x.status||'').startsWith('AGUARDANDO'))){
@@ -44296,7 +44315,12 @@ async function resultCheck(){
 
     // 3.98.00 — decide o desfecho da SEQUÊNCIA antes de mexer no placar/Telegram.
     // LOSS normal e LOSS da REC 1 ficam ocultos; o próximo sinal real assume a recuperação.
-    const recovery=resolveRecoveryOutcome(t,x);
+    // 3.98.45 — cada sinal físico mostra seu próprio WIN/LOSS no painel.
+    // Recuperação financeira não pode esconder o resultado da entrada.
+    const directResult=String(x&&x.result||'').toUpperCase();
+    const recovery=(directResult==='WIN' || directResult==='LOSS')
+      ? {final:true,label:directResult,accounting:directResult,stage:0}
+      : resolveRecoveryOutcome(t,x);
 
     if(galeStageStatus && !x.result){
       galeStageStatus.textContent='⏳ Aguardando resultado da entrada';
