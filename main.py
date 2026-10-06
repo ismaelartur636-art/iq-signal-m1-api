@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.38"
+APP_VERSION = "3.98.39"
 # MEGA IA 3.98.37 — trava total por ativo selecionado: painel/radar/bot 24h/Telegram/histórico operacional não misturam outros pares.
 # MEGA IA 3.98.36 — Mega Sniper: evento único/rearme; impede repetir CALL/PUT em velas consecutivas enquanto a mesma condição permanecer ativa.
 # MEGA IA 3.98.35 — Telegram/autoexec seguem exclusivamente o ativo selecionado no painel; scanner não mistura Forex com BTC/cripto.
@@ -34975,7 +34975,11 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
   
   <div class="robot-mode-card" id="tsr2016ModeCard">
-    <div><b>🎯 Mega Sniper</b><div class="robot-mode-desc" id="tsr2016ModeDesc">LWMA 25 + Stochastic 32/12/12 • próxima M1 • sem grid/Martingale/Gale.</div></div>
+    <img src="__MEGA_IMAGE__" alt="Mega Sniper">
+    <div class="robot-mode-copy">
+      <div class="robot-mode-title">🎯 MEGA SNIPER</div>
+      <div class="robot-mode-desc" id="tsr2016ModeDesc">LWMA 25 + Stochastic 32/12/12 • próxima M1 • sem grid/Martingale/Gale.</div>
+    </div>
     <button id="tsr2016PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
   <div class="robot-mode-card" id="megaPremiumModeCard">
