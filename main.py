@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.50"
+APP_VERSION = "3.98.51"
+# MEGA IA 3.98.51 — Mega Sniper: sinal promovido pelo radar fica travado no painel até a expiração mesmo quando o par é diferente do seletor atual; NEUTRO do polling não apaga.
 # MEGA IA 3.98.50 — Telegram: LOSS direto e placar final robustos; apuração continua com tela em segundo plano e sessão registra todo resultado enviado enquanto estiver aberta.
 # MEGA IA 3.98.48 — Mega Sniper: Telegram multi-par corrigido; cada oportunidade envia seu próprio ativo, fila concorrente não descarta sinais e dedupe normaliza horário.
 # MEGA IA 3.98.49 — LOSS direto entra no placar/histórico/Telegram por operação; corrige filtro que aceitava WIN mas excluía LOSS final direto.
@@ -43502,7 +43503,7 @@ async function sig(announce=false){
     // ainda responder NEUTRO. Sem esta retenção, o painel piscava e apagava o sinal.
     const lockExpiryMs=Date.parse(String((panelSignalLock&&panelSignalLock.expiry_time)||''));
     const lockEngine=String((panelSignalLock&&(panelSignalLock.selected_engine||panelSignalLock.engine))||'').toUpperCase();
-    const lockSameSymbol=String((panelSignalLock&&panelSignalLock.symbol)||'')===String((S&&S.value)||'');
+    const lockSameSymbol=(String(engine||'').toUpperCase()==='TSR2016') || String((panelSignalLock&&panelSignalLock.symbol)||'')===String((S&&S.value)||'');
     const lockSameEngine=!lockEngine||lockEngine===String(engine||'').toUpperCase();
     const lockAlive=panelSignalLock && Number.isFinite(lockExpiryMs) && lockExpiryMs>Date.now() && lockSameSymbol && lockSameEngine;
     if(panelSignalLock && !lockAlive) panelSignalLock=null;
@@ -43516,7 +43517,7 @@ async function sig(announce=false){
     const previousDirection=String((previousPanelSignal&&previousPanelSignal.direction)||'NEUTRO').toUpperCase();
     const previousExpiryMs=Date.parse(String((previousPanelSignal&&previousPanelSignal.expiry_time)||''));
     const previousStillAlive=Number.isFinite(previousExpiryMs)&&previousExpiryMs>Date.now();
-    const previousSameSymbol=String((previousPanelSignal&&previousPanelSignal.symbol)||'')===String((S&&S.value)||'');
+    const previousSameSymbol=(String(engine||'').toUpperCase()==='TSR2016') || String((previousPanelSignal&&previousPanelSignal.symbol)||'')===String((S&&S.value)||'');
     const previousSameInterval=String((previousPanelSignal&&previousPanelSignal.interval)||'')===String((interval&&interval.value)||'');
     const previousEngine=String((previousPanelSignal&&(previousPanelSignal.selected_engine||previousPanelSignal.engine))||'').toUpperCase();
     const previousSameEngine=!previousEngine||previousEngine===String(engine||'').toUpperCase();
@@ -43654,7 +43655,7 @@ async function sig(announce=false){
     const catchExpiryMs=Date.parse(String((panelSignalLock&&panelSignalLock.expiry_time)||''));
     const catchEngine=String((panelSignalLock&&(panelSignalLock.selected_engine||panelSignalLock.engine))||'').toUpperCase();
     const catchLockAlive=panelSignalLock && Number.isFinite(catchExpiryMs) && catchExpiryMs>Date.now()
-      && String(panelSignalLock.symbol||'')===String((S&&S.value)||'')
+      && (String(selectedRobotEngine()||'').toUpperCase()==='TSR2016' || String(panelSignalLock.symbol||'')===String((S&&S.value)||''))
       && (!catchEngine||catchEngine===String(selectedRobotEngine()||'').toUpperCase());
     if(catchLockAlive){
       cur={...panelSignalLock,signal_held_until_expiry:true};
