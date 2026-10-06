@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.39"
+APP_VERSION = "3.98.40"
 # MEGA IA 3.98.37 — trava total por ativo selecionado: painel/radar/bot 24h/Telegram/histórico operacional não misturam outros pares.
 # MEGA IA 3.98.36 — Mega Sniper: evento único/rearme; impede repetir CALL/PUT em velas consecutivas enquanto a mesma condição permanecer ativa.
 # MEGA IA 3.98.35 — Telegram/autoexec seguem exclusivamente o ativo selecionado no painel; scanner não mistura Forex com BTC/cripto.
@@ -34746,6 +34746,20 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
     /* 3.98.18 — motores removidos */
     #dragonFireModeCard,#dragonFireProModeCard{display:none !important;}
+
+/* 3.98.40 — avatar do Mega Sniper sem alterar a estrutura DOM/JS dos botões */
+#tsr2016ModeCard::before{
+  content:"";
+  display:block;
+  width:64px;
+  height:64px;
+  flex:0 0 64px;
+  border-radius:12px;
+  background-image:url("__MEGA_IMAGE__");
+  background-size:cover;
+  background-position:center;
+  background-repeat:no-repeat;
+}
 </style>
 </head>
 
@@ -34975,11 +34989,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
   
   <div class="robot-mode-card" id="tsr2016ModeCard">
-    <img src="__MEGA_IMAGE__" alt="Mega Sniper">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🎯 MEGA SNIPER</div>
-      <div class="robot-mode-desc" id="tsr2016ModeDesc">LWMA 25 + Stochastic 32/12/12 • próxima M1 • sem grid/Martingale/Gale.</div>
-    </div>
+    <div><b>🎯 MEGA SNIPER</b><div class="robot-mode-desc" id="tsr2016ModeDesc">LWMA 25 + Stochastic 32/12/12 • próxima M1 • sem grid/Martingale/Gale.</div></div>
     <button id="tsr2016PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
   <div class="robot-mode-card" id="megaPremiumModeCard">
