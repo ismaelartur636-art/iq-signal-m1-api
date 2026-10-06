@@ -42,9 +42,11 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.57"
+APP_VERSION = "3.98.59"
+# MEGA IA 3.98.59 — scanner por aba: FOREX percorre 28 pares principais e CRIPTO percorre todas as criptos cadastradas; Mega Sniper + POC não fica preso ao ativo selecionado.
 # MEGA IA 3.98.57 — corrige botão 1 BAR REVERSAL: remove chamada JS inexistente e sincroniza painel/radar/backtest ao ligar/desligar.
 # MEGA IA 3.98.56 — integra 1 BAR REVERSAL original: padrão Out/In causal, próxima M1, motor separado, radar e Backtest 48H.
+# MEGA IA 3.98.58 — Mega Sniper agora exige confluência obrigatória com Volume POC na mesma direção; POC neutro/contrário bloqueia o sinal.
 # MEGA IA 3.98.56 — adiciona MEGA PREMIUM + POC: gatilho MY 911 original só libera quando Volume POC confirma a mesma direção; Premium original e Protegido preservados.
 # MEGA IA 3.98.55 — SÓ CALL/SÓ PUT agora filtra também Backtest 48H, placar e Histórico 15 dias; troca do seletor atualiza tudo imediatamente.
 # MEGA IA 3.98.54 — painel libera CALL/PUT imediatamente ao atingir expiry_time; trava anti-pisca vale só até a expiração e a apuração WIN/LOSS continua pela fila independente.
@@ -1670,12 +1672,21 @@ LEGACY_TECHNICAL_STRATEGIES_ENABLED = False
 SELECTABLE_ENGINES_ENABLED = True
 
 INTERVALS = {"1min": 60, "5min": 300, "15min": 900, "30min": 1800, "1h": 3600, "4h": 14400}
-SYMBOLS = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF",
-    "NZD/USD", "EUR/JPY", "GBP/JPY", "EUR/GBP", "BTC/USD", "BTC", "BTC_IQ", "ETH/USD", "LTC/USD",
-    "SOL/USD", "XRP/USD", "DOGE/USD", "ADA/USD", "BNB/USD",
-    BINOMO_CRYPTO_IDX_SYMBOL,
+# 3.98.59 — universo completo das 8 moedas principais: 28 cruzamentos Forex.
+# A aba FOREX percorre todos eles automaticamente; a aba CRIPTO percorre todo o
+# universo cripto abaixo. A disponibilidade real continua sendo validada pela fonte.
+FOREX_SYMBOLS = [
+    "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF", "NZD/USD",
+    "EUR/GBP", "EUR/JPY", "EUR/AUD", "EUR/CAD", "EUR/CHF", "EUR/NZD",
+    "GBP/JPY", "GBP/AUD", "GBP/CAD", "GBP/CHF", "GBP/NZD",
+    "AUD/JPY", "AUD/CAD", "AUD/CHF", "AUD/NZD",
+    "CAD/JPY", "CAD/CHF", "NZD/JPY", "NZD/CAD", "NZD/CHF", "CHF/JPY",
 ]
+CRYPTO_SYMBOLS = [
+    "BTC/USD", "BTC", "BTC_IQ", "ETH/USD", "LTC/USD", "SOL/USD",
+    "XRP/USD", "DOGE/USD", "ADA/USD", "BNB/USD", BINOMO_CRYPTO_IDX_SYMBOL,
+]
+SYMBOLS = FOREX_SYMBOLS + CRYPTO_SYMBOLS
 OTC_SYMBOLS = [s for s in SYMBOLS if s not in (BINOMO_CRYPTO_IDX_SYMBOL, "BTC", "BTC_IQ")]
 
 def _market_data_symbol(symbol: str) -> str:
@@ -29611,12 +29622,28 @@ def tsr2016_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", curr
         put=bool(put_condition and not prev_put_condition)
         direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
         diag={"lwma25":round(ma,10),"lwma25_prev":round(ma_prev,10),"stoch_32_12_12":round(k,2),"stoch_prev":round(kp,2)}
-        if direction=="NEUTRO": return {**base,"reason":"Mega Sniper monitorando LWMA25 + Stochastic 32/12/12.","diagnostics":diag}
+        if direction=="NEUTRO": return {**base,"reason":"Mega Sniper monitorando LWMA25 + Stochastic 32/12/12; aguardando gatilho para validar com Volume POC.","diagnostics":diag}
+
+        # 3.98.58 — confluência obrigatória: o gatilho nativo do Mega Sniper só é
+        # liberado quando o Volume POC confirma EXATAMENTE a mesma direção.
+        # POC neutro ou contrário bloqueia; nunca inverte o sinal do Sniper.
+        poc=_volume_poc_snapshot(rows, early_signal=False, use_ai=False, mtf=None)
+        poc_direction=str(poc.get("direction") or "NEUTRO").upper()
+        diag["volume_poc_direction"]=poc_direction
+        diag["volume_poc_confirmed"]=bool(poc.get("confirmed"))
+        diag["volume_poc_score_call"]=poc.get("call_score")
+        diag["volume_poc_score_put"]=poc.get("put_score")
+        diag["volume_poc_reason"]=str(poc.get("reason") or "")[:180]
+        if not poc.get("confirmed") or poc_direction != direction:
+            state="NEUTRO" if poc_direction not in ("CALL","PUT") else f"{poc_direction} (CONTRÁRIO)"
+            return {**base,"reason":f"Mega Sniper deu {direction}, mas Volume POC está {state}; sinal bloqueado até os dois concordarem.","diagnostics":diag}
+
         stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
-        conf=round(min(90.0,80.0+min(6.0,abs(k-kp)*0.35)+min(4.0,abs(closes[-1]-ma)/max(abs(ma),1e-12)*10000)),1)
+        conf=round(min(94.0,82.0+min(6.0,abs(k-kp)*0.35)+min(4.0,abs(closes[-1]-ma)/max(abs(ma),1e-12)*10000)+min(2.0,float(poc.get("confidence") or 0)/50.0)),1)
         return {**base,"direction":direction,"confidence":conf,"confirmed":True,"risk":"MEDIUM",
-                "reason":f"{direction} Mega Sniper • LWMA25 + Stochastic confirmados • próxima M1 • sem Martingale/Gale.",
-                "event_key":f"TSR2016:{direction}:{stamp}","diagnostics":diag}
+                "provider":"TSR_2016_LWMA_STOCH_PLUS_VOLUME_POC_V1",
+                "reason":f"{direction} Mega Sniper + Volume POC • os dois confirmaram a mesma direção • próxima M1 • sem Martingale/Gale.",
+                "event_key":f"TSR2016_POC:{direction}:{stamp}","diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"Mega Sniper aguardando leitura válida: {str(exc)[:100]}"}
 
@@ -37191,8 +37218,12 @@ try{
 }catch(_){}
 
 const syms=[
-  'EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF',
-  'NZD/USD','EUR/JPY','GBP/JPY','EUR/GBP','BTC/USD','BTC_IQ','ETH/USD','LTC/USD','SOL/USD','XRP/USD','DOGE/USD','ADA/USD','BNB/USD','CRYPTO IDX'
+  'EUR/USD','GBP/USD','USD/JPY','AUD/USD','USD/CAD','USD/CHF','NZD/USD',
+  'EUR/GBP','EUR/JPY','EUR/AUD','EUR/CAD','EUR/CHF','EUR/NZD',
+  'GBP/JPY','GBP/AUD','GBP/CAD','GBP/CHF','GBP/NZD',
+  'AUD/JPY','AUD/CAD','AUD/CHF','AUD/NZD',
+  'CAD/JPY','CAD/CHF','NZD/JPY','NZD/CAD','NZD/CHF','CHF/JPY',
+  'BTC/USD','BTC_IQ','ETH/USD','LTC/USD','SOL/USD','XRP/USD','DOGE/USD','ADA/USD','BNB/USD','CRYPTO IDX'
 ];
 const rtmSeedSyms=['BTC/USD','USD/JPY','EUR/JPY','GBP/JPY','AUD/JPY','CAD/JPY','CHF/JPY','NZD/JPY'];
 
@@ -44128,12 +44159,13 @@ async function rad(){
     const assetClass=activeAssetClass();
     let items=[];
     if(engine==='TSR2016'){
-      // Mega Sniper: 3 pares por ciclo, em paralelo. Assim não fica preso ao
-      // ativo selecionado e pode detectar/liberar até 3 oportunidades juntas.
+      // Mega Sniper + POC: percorre TODOS os ativos da aba ativa em fila rotativa.
+      // Analisa 6 por ciclo em paralelo para cobrir o universo mais rápido sem
+      // sobrecarregar a fonte; após cada ciclo avança até passar por todos.
       const candidates=[...S.options].map(o=>String(o.value||'').trim()).filter(sym=>sym && assetAllowedByTab(sym));
       const batch=[];
       if(candidates.length){
-        for(let n=0;n<Math.min(3,candidates.length);n++) batch.push(candidates[(megaSniperScanIndex+n)%candidates.length]);
+        for(let n=0;n<Math.min(6,candidates.length);n++) batch.push(candidates[(megaSniperScanIndex+n)%candidates.length]);
         megaSniperScanIndex=(megaSniperScanIndex+batch.length)%candidates.length;
       }
       const base=`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&asset_class=${encodeURIComponent(assetClass)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`;
