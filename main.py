@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.54"
+APP_VERSION = "3.98.55"
+# MEGA IA 3.98.55 — SÓ CALL/SÓ PUT agora filtra também Backtest 48H, placar e Histórico 15 dias; troca do seletor atualiza tudo imediatamente.
 # MEGA IA 3.98.54 — painel libera CALL/PUT imediatamente ao atingir expiry_time; trava anti-pisca vale só até a expiração e a apuração WIN/LOSS continua pela fila independente.
 # MEGA IA 3.98.53 — seletor TIPO DE SINAL movido para os controles principais no topo: MISTO / SÓ CALL / SÓ PUT, mantendo filtro existente.
 # MEGA IA 3.98.51 — Mega Sniper: sinal promovido pelo radar fica travado no painel até a expiração mesmo quando o par é diferente do seletor atual; NEUTRO do polling não apaga.
@@ -30374,9 +30375,13 @@ async def backtest48h_endpoint(
     market: str = "OPEN",
     engine: str = "LOCALANALYST",
     refresh: bool = False,
+    direction_mode: str = "MIXED",
 ):
     market = str(market or "OPEN").upper()
     engine = str(engine or "").upper()
+    direction_mode = str(direction_mode or "MIXED").upper()
+    if direction_mode not in ("MIXED", "CALL", "PUT"):
+        direction_mode = "MIXED"
     if not _symbol_allowed(symbol, market) or interval not in INTERVALS or market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido para o Backtest 48H.")
     if engine == "STREAKREV" or engine in RETIRED_ENGINES:
@@ -30395,7 +30400,7 @@ async def backtest48h_endpoint(
             "message": "Este motor ainda não possui adaptador causal no Backtest 48H.",
         }
 
-    result_key = f"{market}|{symbol}|{interval}|{engine}"
+    result_key = f"{market}|{symbol}|{interval}|{engine}|{direction_mode}"
     cached = _backtest48_result_cache.get(result_key)
     if not refresh and cached and time.time() - float(cached[0]) < _BACKTEST48_CACHE_TTL:
         return dict(cached[1])
@@ -30435,6 +30440,8 @@ async def backtest48h_endpoint(
             continue
         direction = str(analysis.get("direction") or "NEUTRO").upper()
         if not bool(analysis.get("confirmed")) or direction not in ("CALL", "PUT"):
+            continue
+        if direction_mode != "MIXED" and direction != direction_mode:
             continue
         event_key = str(analysis.get("event_key") or "").strip()
         if event_key:
@@ -35734,8 +35741,11 @@ if(signalDirectionMode){
   try{ signalDirectionMode.value=localStorage.getItem('mega_signal_direction_mode')||'MIXED'; }catch(_){ signalDirectionMode.value='MIXED'; }
   signalDirectionMode.onchange=()=>{
     try{localStorage.setItem('mega_signal_direction_mode',selectedSignalDirectionMode());}catch(_){}
-    // Atualiza imediatamente o radar; sinais já confirmados permanecem até a expiração.
+    // Atualiza imediatamente todas as áreas conforme CALL / PUT / MISTO.
     try{rad();}catch(_){}
+    try{paintPersistentResults();}catch(_){}
+    try{renderHistory();}catch(_){}
+    try{scheduleBacktest48(true,80);}catch(_){}
   };
 }
 
@@ -36634,7 +36644,7 @@ function scheduleBacktest48(force=false,delay=260){
 async function loadBacktest48(force=false){
   if(backtest48Busy){ scheduleBacktest48(force,700); return; }
   const engine=selectedRobotEngine();
-  const requestKey=`${engine}|${market.value}|${S.value}|${interval.value}`;
+  const requestKey=`${engine}|${market.value}|${S.value}|${interval.value}|${selectedSignalDirectionMode()}`;
   if(!backtest48Engine) return;
   if(engine==='OFF'){
     backtest48Engine.textContent='Nenhum motor ativo';
@@ -36651,7 +36661,7 @@ async function loadBacktest48(force=false){
   if(backtest48Note) backtest48Note.textContent='🧪 SIMULAÇÃO HISTÓRICA: calculando replay candle a candle. Estes registros NÃO significam sinais enviados ao app.';
   if(backtest48RefreshBtn){backtest48RefreshBtn.disabled=true;backtest48RefreshBtn.textContent='⏳ CALCULANDO';}
   try{
-    const d=await get(`/backtest48h?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&refresh=${force?'true':'false'}`);
+    const d=await get(`/backtest48h?market=${encodeURIComponent(market.value)}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&direction_mode=${encodeURIComponent(selectedSignalDirectionMode())}&refresh=${force?'true':'false'}`);
     if(!d || d.supported===false){
       if(backtest48Signals) backtest48Signals.textContent='N/D';
       if(backtest48Wins) backtest48Wins.textContent='--';
@@ -36672,7 +36682,7 @@ async function loadBacktest48(force=false){
     // 3.97.03: se o usuário trocou de motor enquanto o cálculo estava em andamento,
     // descarta esta resposta antiga para não exibir WIN/LOSS de outro indicador.
     const liveEngine=selectedRobotEngine();
-    const liveKey=`${liveEngine}|${market.value}|${S.value}|${interval.value}`;
+    const liveKey=`${liveEngine}|${market.value}|${S.value}|${interval.value}|${selectedSignalDirectionMode()}`;
     if(liveKey!==requestKey){
       scheduleBacktest48(false,120);
       return;
@@ -36704,7 +36714,7 @@ async function loadBacktest48(force=false){
   }finally{
     backtest48Busy=false;
     if(backtest48RefreshBtn){backtest48RefreshBtn.disabled=false;backtest48RefreshBtn.textContent='🔄 ATUALIZAR';}
-    const currentKey=`${selectedRobotEngine()}|${market.value}|${S.value}|${interval.value}`;
+    const currentKey=`${selectedRobotEngine()}|${market.value}|${S.value}|${interval.value}|${selectedSignalDirectionMode()}`;
     if(currentKey!==requestKey) scheduleBacktest48(false,120);
   }
 }
@@ -37677,7 +37687,11 @@ function renderHistory(){
   if(!historyList || !historySummary) return;
   const m=activeResultMarket();
   const b=persistentResults[m]||emptyResultBucket();
-  const items=pruneHistory(b);
+  const allItems=pruneHistory(b);
+  const dirMode=selectedSignalDirectionMode();
+  const items=dirMode==='MIXED'
+    ? allItems
+    : allItems.filter(x=>String((x&&x.direction)||'').toUpperCase()===dirMode);
   savePersistentResults();
 
   if(!items.length){
@@ -38241,19 +38255,26 @@ function paintPersistentResults(){
   const m=activeResultMarket();
   const b=persistentResults[m]||emptyResultBucket();
   if(Object.keys(b.final_ops||{}).length) recountFinalBucket(b);
-  // Placar principal = desfecho FINAL da sequência. Recuperações vencedoras também são WIN.
-  const totalWins=Number(b.win_direct||0)+Number(b.win_g1||0)+Number(b.win_g2||0);
-  const totalLosses=Number(b.loss_g2||0);
+  // Placar principal respeita MISTO / SÓ CALL / SÓ PUT.
+  const dirMode=selectedSignalDirectionMode();
+  const dirItems=(dirMode==='MIXED') ? null : pruneHistory(b).filter(x=>String((x&&x.direction)||'').toUpperCase()===dirMode);
+  const countResult=(name)=>dirItems ? dirItems.filter(x=>String((x&&x.result)||'').toUpperCase()===name).length : null;
+  const shownDirect=dirItems ? countResult('WIN') : Number(b.win_direct||0);
+  const shownG1=dirItems ? countResult('WIN G1') : Number(b.win_g1||0);
+  const shownG2=dirItems ? countResult('WIN G2') : Number(b.win_g2||0);
+  const shownLoss=dirItems ? dirItems.filter(x=>String((x&&x.result)||'').toUpperCase().startsWith('LOSS')).length : Number(b.loss_g2||0);
+  const totalWins=shownDirect+shownG1+shownG2;
+  const totalLosses=shownLoss;
   const total=totalWins+totalLosses;
   const acc=total?((totalWins/total)*100):0;
 
   if(wins) wins.textContent=String(totalWins);
   if(losses) losses.textContent=String(totalLosses);
   if(accuracy) accuracy.textContent=acc.toFixed(2)+'%';
-  if(winDirect) winDirect.textContent=String(b.win_direct);
-  if(winG1) winG1.textContent=String(b.win_g1);
-  if(winG2) winG2.textContent=String(b.win_g2);
-  if(lossG2) lossG2.textContent=String(b.loss_g2);
+  if(winDirect) winDirect.textContent=String(shownDirect);
+  if(winG1) winG1.textContent=String(shownG1);
+  if(winG2) winG2.textContent=String(shownG2);
+  if(lossG2) lossG2.textContent=String(shownLoss);
   renderEngineScoreBoard(b);
   renderMomentStudy();
   if(historyTab && historyTab.classList.contains('active')) renderHistory();
