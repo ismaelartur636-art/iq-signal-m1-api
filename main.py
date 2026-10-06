@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.53"
+APP_VERSION = "3.98.54"
+# MEGA IA 3.98.54 — painel libera CALL/PUT imediatamente ao atingir expiry_time; trava anti-pisca vale só até a expiração e a apuração WIN/LOSS continua pela fila independente.
 # MEGA IA 3.98.53 — seletor TIPO DE SINAL movido para os controles principais no topo: MISTO / SÓ CALL / SÓ PUT, mantendo filtro existente.
 # MEGA IA 3.98.51 — Mega Sniper: sinal promovido pelo radar fica travado no painel até a expiração mesmo quando o par é diferente do seletor atual; NEUTRO do polling não apaga.
 # MEGA IA 3.98.52 — filtro de direção no app: MISTO / SÓ CALL / SÓ PUT aplicado ao painel, radar e Telegram; estratégia dos motores preservada.
@@ -44196,6 +44197,28 @@ function cd(){
     expiryCountdown.textContent='⏱ EXPIRAÇÃO: '+mm+':'+ss;
   }else{
     expiryCountdown.textContent='⏱ EXPIRAÇÃO: --:--';
+  }
+
+  // 3.98.54 — a trava do painel existe somente enquanto a operação está viva.
+  // Ao vencer expiry_time, a operação continua na fila de apuração (pendingTrade),
+  // mas o painel é liberado imediatamente para procurar a próxima oportunidade.
+  if(xt && nowMs>=xt){
+    panelSignalLock=null;
+    cur={direction:'NEUTRO',confidence:0,status:'OPERAÇÃO EXPIRADA • APURANDO RESULTADO • MONITORANDO PRÓXIMO SINAL',risk:'--',source_state:'READY'};
+    direction.textContent='NEUTRO';
+    direction.className='big neutral';
+    paintSignalAsset((S&&S.value)||'');
+    confidence.textContent='Confiança: 0%';
+    entry.textContent='AGUARDANDO SINAL';
+    countdown.textContent='Monitorando próxima oportunidade';
+    expiryCountdown.textContent='⏱ EXPIRAÇÃO: --:--';
+    statusBox.textContent=cur.status;
+    risk.textContent='Risco: --';
+    lastCountdownSignalKey='';
+    thirtyFive=false; five=false; entered=false;
+    // Não espera o próximo ciclo longo do radar/polling.
+    setTimeout(()=>{ if(appEnabled){ Promise.allSettled([sig(false),rad()]); } },50);
+    return;
   }
 
   if(n<=30 && n>0 && !thirtyFive){
