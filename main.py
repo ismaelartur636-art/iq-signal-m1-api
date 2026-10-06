@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.46"
+APP_VERSION = "3.98.47"
+# MEGA IA 3.98.47 — Mega Sniper multi-par: fila de resultados não bloqueante; até 3 sinais no mesmo minuto sobem/fecham independentemente e WIN/LOSS continua com tela oculta.
 # MEGA IA 3.98.46 — Mega Sniper multi-par: varre 3 pares por ciclo e libera até 3 sinais simultâneos, com apuração independente por operação.
 # MEGA IA 3.98.45 — WIN/LOSS direto por sinal: não oculta LOSS aguardando recuperação e localiza candle de entrada em fontes com timestamp de abertura/fechamento.
 # MEGA IA 3.98.44 — corrige apuração WIN/LOSS: resultado OPEN não fica preso quando a fonte original atrasa; usa candle fechado do fallback no mesmo horário.
@@ -43810,7 +43811,9 @@ async function sendRadarOpportunityToRobot(items){
       paintSignalAsset(cur.symbol);
       confidence.textContent='Confiança: '+Number(cur.confidence||0).toFixed(0)+'%';
       entry.textContent=ft(cur.entry_time); countdown.textContent='Preparando entrada';
-      statusBox.textContent=(multi && chosen.length>1) ? `MEGA SNIPER • ${chosen.length} PARES COM OPORTUNIDADE SIMULTÂNEA` : cur.status;
+      statusBox.textContent=(multi && chosen.length>1)
+        ? `MEGA SNIPER • ${chosen.length} SINAIS ENVIADOS: ${chosen.map(x=>radarBaseSymbol(x)).join(' • ')}`
+        : cur.status;
       risk.textContent='Risco: '+cur.risk;
       if(dataFeedText) dataFeedText.textContent=cur.feed_label+(cur.feed_fallback?' • FALLBACK ATIVO':'');
       lastCountdownSignalKey=''; thirtyFive=false; five=false; entered=false;
@@ -44313,9 +44316,19 @@ async function resultCheck(){
         Number(x.retry_after||15)*1000
       );
       pendingTrade.result_failures=Number(pendingTrade.result_failures||0)+1;
-      savePendingTrade();
+      // 3.98.47 — um par sem candle fechado não pode bloquear os outros sinais
+      // simultâneos. Recoloca esta operação no fim e tenta a próxima da fila.
+      const waitingTrade={...pendingTrade};
+      pendingTrade=null;
+      if(!isResultAlreadyCounted(waitingTrade)) pendingTradeQueue.push(waitingTrade);
+      pendingTradeQueue.sort((a,b)=>{
+        const ar=Number(a.next_result_check_at||0), br=Number(b.next_result_check_at||0);
+        if(ar!==br) return ar-br;
+        return new Date(a.expiry_time).getTime()-new Date(b.expiry_time).getTime();
+      });
+      promoteNextPendingTrade();
       if(galeStageStatus){
-        galeStageStatus.textContent='⏳ Resultado aguardando dados da fonte';
+        galeStageStatus.textContent='⏳ Um resultado aguarda a fonte • verificando os outros pares';
       }
       return;
     }
@@ -44400,6 +44413,12 @@ async function resultCheck(){
     }
   }finally{
     resultBusy=false;
+    // 3.98.47 — se existem outros sinais já vencidos, não espera mais 3 s por
+    // operação. Continua a fila quase imediatamente, preservando retry individual.
+    const dueNow = pendingTrade && pendingTrade.expiry_time &&
+      Date.now() >= new Date(pendingTrade.expiry_time).getTime() &&
+      Number(pendingTrade.next_result_check_at||0) <= Date.now();
+    if(dueNow) setTimeout(()=>{ try{ resultCheck(); }catch(_){} },120);
   }
 }
 
@@ -44646,7 +44665,8 @@ setInterval(()=>{
 },2000);
 
 // Resultado das operações abertas.
-setInterval(()=>{ if(megaCanPoll()) resultCheck(); },3000);
+// 3.98.47 — resultado é financeiro/operacional e não depende da aba estar visível.
+setInterval(()=>{ resultCheck(); },1500);
 setInterval(clk,1000);
 setInterval(()=>{ if(appEnabled && !document.hidden) cd(); },500);
 
