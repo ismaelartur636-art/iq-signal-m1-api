@@ -42,8 +42,10 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.51"
+APP_VERSION = "3.98.53"
+# MEGA IA 3.98.53 — seletor TIPO DE SINAL movido para os controles principais no topo: MISTO / SÓ CALL / SÓ PUT, mantendo filtro existente.
 # MEGA IA 3.98.51 — Mega Sniper: sinal promovido pelo radar fica travado no painel até a expiração mesmo quando o par é diferente do seletor atual; NEUTRO do polling não apaga.
+# MEGA IA 3.98.52 — filtro de direção no app: MISTO / SÓ CALL / SÓ PUT aplicado ao painel, radar e Telegram; estratégia dos motores preservada.
 # MEGA IA 3.98.50 — Telegram: LOSS direto e placar final robustos; apuração continua com tela em segundo plano e sessão registra todo resultado enviado enquanto estiver aberta.
 # MEGA IA 3.98.48 — Mega Sniper: Telegram multi-par corrigido; cada oportunidade envia seu próprio ativo, fila concorrente não descarta sinais e dedupe normaliza horário.
 # MEGA IA 3.98.49 — LOSS direto entra no placar/histórico/Telegram por operação; corrige filtro que aceitava WIN mas excluía LOSS final direto.
@@ -34830,6 +34832,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
     <select id="symbol"></select>
 
+    <select id="signalDirectionMode" title="Escolha o tipo de sinal" style="font-weight:1000">
+      <option value="MIXED">🎯 MISTO</option>
+      <option value="CALL">🟢 SÓ CALL</option>
+      <option value="PUT">🔴 SÓ PUT</option>
+    </select>
+
     <select id="cryptoQuickSelect" title="Escolha rápida de criptomoeda" style="font-weight:1000">
       <option value="">🪙 ESCOLHER CRIPTO</option>
       <option value="BTC/USD">₿ Bitcoin • Binance</option>
@@ -35711,6 +35719,24 @@ const market=document.getElementById('market');
 const marketMode=document.getElementById('marketMode');
 const broker=document.getElementById('broker');
 const brokerAccount=document.getElementById('brokerAccount');
+const signalDirectionMode=document.getElementById('signalDirectionMode');
+function selectedSignalDirectionMode(){
+  const v=String((signalDirectionMode&&signalDirectionMode.value)||'MIXED').toUpperCase();
+  return (v==='CALL'||v==='PUT')?v:'MIXED';
+}
+function signalDirectionAllowed(dir){
+  const d=String(dir||'').toUpperCase();
+  const mode=selectedSignalDirectionMode();
+  return mode==='MIXED' || d===mode;
+}
+if(signalDirectionMode){
+  try{ signalDirectionMode.value=localStorage.getItem('mega_signal_direction_mode')||'MIXED'; }catch(_){ signalDirectionMode.value='MIXED'; }
+  signalDirectionMode.onchange=()=>{
+    try{localStorage.setItem('mega_signal_direction_mode',selectedSignalDirectionMode());}catch(_){}
+    // Atualiza imediatamente o radar; sinais já confirmados permanecem até a expiração.
+    try{rad();}catch(_){}
+  };
+}
 
 function brokerName(){
   const v=broker ? broker.value : 'IQ_OPTION';
@@ -39775,7 +39801,7 @@ async function maybeSendTelegramSignal(signal){
   // sendTelegramPayload já serializa a fila aguardando telegramBusy liberar.
   if(!telegramEnabled || !signal) return;
   const dir=String(signal.direction||'').toUpperCase();
-  if((dir!=='CALL'&&dir!=='PUT') || !signal.entry_time) return;
+  if((dir!=='CALL'&&dir!=='PUT') || !signal.entry_time || !signalDirectionAllowed(dir)) return;
   const chat_id=saveTelegramChatId();
   if(!chat_id){
     if(telegramSendStatus) telegramSendStatus.textContent='⚠️ Telegram ON, mas nenhum grupo foi selecionado.';
@@ -43513,6 +43539,13 @@ async function sig(announce=false){
     );
     cur=serverSignal;
 
+    // 3.98.52 — filtro escolhido pelo usuário. Bloqueia somente NOVOS sinais;
+    // um sinal já confirmado continua travado até a expiração.
+    const rawServerDirection=String((serverSignal&&serverSignal.direction)||'NEUTRO').toUpperCase();
+    if((rawServerDirection==='CALL'||rawServerDirection==='PUT') && !signalDirectionAllowed(rawServerDirection)){
+      serverSignal={...serverSignal,direction:'NEUTRO',confirmed:false,status:'FILTRO DE DIREÇÃO • '+rawServerDirection+' BLOQUEADO • '+selectedSignalDirectionMode()};
+      cur=serverSignal;
+    }
     const serverDirection=String((serverSignal&&serverSignal.direction)||'NEUTRO').toUpperCase();
     const previousDirection=String((previousPanelSignal&&previousPanelSignal.direction)||'NEUTRO').toUpperCase();
     const previousExpiryMs=Date.parse(String((previousPanelSignal&&previousPanelSignal.expiry_time)||''));
@@ -43768,7 +43801,7 @@ async function sendRadarOpportunityToRobot(items){
   const list=(Array.isArray(items)?items:[])
     .filter(item=>{
       const dir=String((item&&item.direction)||'').toUpperCase();
-      return (dir==='CALL'||dir==='PUT') && radarOpportunityIsFresh(item);
+      return (dir==='CALL'||dir==='PUT') && signalDirectionAllowed(dir) && radarOpportunityIsFresh(item);
     })
     .sort((a,b)=>Number(b.confidence||0)-Number(a.confidence||0));
   if(!list.length) return;
