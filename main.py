@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.42"
+APP_VERSION = "3.98.43"
+# MEGA IA 3.98.43 — histórico migra somente a exibição TSR 2016/TSR2016 para 🎯 Mega Sniper; IDs internos preservados.
 # MEGA IA 3.98.37 — trava total por ativo selecionado: painel/radar/bot 24h/Telegram/histórico operacional não misturam outros pares.
 # MEGA IA 3.98.36 — TSR2016: evento único/rearme; impede repetir CALL/PUT em velas consecutivas enquanto a mesma condição permanecer ativa.
 # MEGA IA 3.98.35 — Telegram/autoexec seguem exclusivamente o ativo selecionado no painel; scanner não mistura Forex com BTC/cripto.
@@ -37643,7 +37644,8 @@ function renderHistory(){
     };
     const savedStrategy=String(h.strategy||'').trim();
     const rawEngine=String(h.engine||'').trim();
-    const engineLabel=savedStrategy || engineLabels[ek] || engineLabels[rawEngine.toUpperCase()] || rawEngine || '🗂️ OUTRO/ANTIGO';
+    const legacyMegaSniper=/TSR\s*2016|TSR2016/i.test(savedStrategy)||/TSR\s*2016|TSR2016/i.test(rawEngine)||String(ek||'').toUpperCase()==='TSR2016';
+    const engineLabel=legacyMegaSniper ? '🎯 Mega Sniper' : (savedStrategy || engineLabels[ek] || engineLabels[rawEngine.toUpperCase()] || rawEngine || '🗂️ OUTRO/ANTIGO');
     const engineLine=`<div class="label" style="margin-top:6px">Indicador: <b>${engineLabel}</b></div>`;
     return `<div class="card" style="padding:12px">
       <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap">
