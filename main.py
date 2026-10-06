@@ -43,7 +43,7 @@ from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
 APP_VERSION = "3.98.46"
-# MEGA IA 3.98.46 — resultado independente do polling do indicador: WIN/LOSS continua sendo apurado após a expiração mesmo com tela em segundo plano/robô pausado; reforça checagem ao voltar ao app.
+# MEGA IA 3.98.46 — Mega Sniper multi-par: varre 3 pares por ciclo e libera até 3 sinais simultâneos, com apuração independente por operação.
 # MEGA IA 3.98.45 — WIN/LOSS direto por sinal: não oculta LOSS aguardando recuperação e localiza candle de entrada em fontes com timestamp de abertura/fechamento.
 # MEGA IA 3.98.44 — corrige apuração WIN/LOSS: resultado OPEN não fica preso quando a fonte original atrasa; usa candle fechado do fallback no mesmo horário.
 # MEGA IA 3.98.43 — histórico migra somente a exibição TSR 2016/TSR2016 para 🎯 Mega Sniper; IDs internos preservados.
@@ -37100,6 +37100,8 @@ let chartBusy=false;
 let radBusy=false;
 let otcRadarBusy=false;
 let lastRadarAutoKey='';
+let radarAutoKeys={};
+let megaSniperScanIndex=0;
 let radarAutoBusy=false;
 let perfBusy=false;
 let robotTimer=null;
@@ -43737,90 +43739,80 @@ function robotHasActiveSignal(){
 
 async function sendRadarOpportunityToRobot(items){
   if(radarAutoBusy || !appEnabled || selectedRobotEngine()==='OFF' || !S) return;
-  // 3.97.86: BTC/USD manual continua travado contra TROCA automática de ativo,
-  // mas o próprio BTC/USD pode ser promovido normalmente do radar para o painel.
-  // A validação do símbolo é feita depois de escolher a melhor oportunidade fresca.
-  // O radar OPEN é separado do OTC. Não troca o mercado do usuário automaticamente.
   if(market.value!=='OPEN') return;
+  const engine=selectedRobotEngine();
   const list=(Array.isArray(items)?items:[])
     .filter(item=>{
       const dir=String((item&&item.direction)||'').toUpperCase();
       return (dir==='CALL'||dir==='PUT') && radarOpportunityIsFresh(item);
     })
     .sort((a,b)=>Number(b.confidence||0)-Number(a.confidence||0));
-
   if(!list.length) return;
-  const best=list[0];
-  const sym=radarBaseSymbol(best);
-  const dir=String(best.direction||'').toUpperCase();
-  if(!sym) return;
 
-  // 3.98.37 — o radar nunca troca o ativo escolhido pelo usuário.
-  // Só promove uma oportunidade se ela pertencer exatamente ao ativo em análise.
+  // Mega Sniper pode liberar até 3 pares distintos no mesmo ciclo.
+  // Demais motores preservam o comportamento antigo de 1 ativo selecionado.
+  const multi=(engine==='TSR2016');
   const selectedPanelSymbol=String((S&&S.value)||'').trim().toUpperCase();
-  if(selectedPanelSymbol && String(sym||'').trim().toUpperCase()!==selectedPanelSymbol) return;
-
-  // Não abandona uma operação que já foi liberada e ainda não expirou.
-  if(robotHasActiveSignal() && cur && cur.symbol!==sym) return;
-
-  const key=[selectedRobotEngine(),'OPEN',interval.value,sym,dir,best.updated_at||''].join('|');
-  if(key===lastRadarAutoKey) return;
-  lastRadarAutoKey=key;
-
-  const exists=[...S.options].some(o=>o.value===sym);
-  if(!exists) return;
+  const chosen=[];
+  const seen=new Set();
+  for(const item of list){
+    const sym=radarBaseSymbol(item);
+    const dir=String(item.direction||'').toUpperCase();
+    if(!sym || seen.has(String(sym).toUpperCase())) continue;
+    if(!multi && selectedPanelSymbol && String(sym).toUpperCase()!==selectedPanelSymbol) continue;
+    seen.add(String(sym).toUpperCase());
+    chosen.push(item);
+    if(chosen.length >= (multi?3:1)) break;
+  }
+  if(!chosen.length) return;
 
   radarAutoBusy=true;
   try{
-    S.value=sym;
-    try{ localStorage.setItem('mega_symbol',sym); }catch(_){}
-    lastSignalVoice='';
-    lastCountdownSignalKey='';
-    if(mainTab && typeof mainTab.click==='function') mainTab.click();
-    if(statusBox){ const ek=selectedRobotEngine(); const en=ek==='TRIPRSI'?'RSI TRIPLO 7/14/28':ek==='FIGURES'?'FIGURES CANDLE':ek==='MILLIONEA'?'💰 EA MILIONÁRIO':ek==='MONEYPILE'?'💵 MEGA MONEY EA':ek==='PAULMACD'?'📈 PAUL MACD M1 + M5':ek==='SIDUS320'?'🎯 SIDUS EA V3.20':ek==='PREDATORPIPS'?'🐆 PREDATOR PIPS':ek==='PYRAMID7'?'🔺 PYRAMID 7 PRO':ek==='MEGAHFT'?'⚡ MEGA HFT':ek==='FIBORSI'?'ROBO FIBO + RSI + EMA':ek==='TLBRSI'?'3 LINE BREAK + RSI':ek==='TMARSI'?'EXTREME TMA + RSI + TREND FILTER':ek==='RSIDIVBB'?'RSI DIVERGENCE + BOLLINGER':ek==='ALPHAX'?'ALPHAX RELAY':ek==='RTM'?'RTM MULTI + TAURUS':ek==='COMBINER'?'COMBINER FLOW + RSI':ek==='TAURUSEA'?'TAURUS EA':ek==='TAURUSRSIDIV'?'TAURUS + RSI DIV':ek==='FOREXMISSION'?'FOREX MISSION':ek==='MONEYARROW'?'BINARY MONEYARROW':ek==='LIQUIDEX'?'LIQUIDEX':ek==='EUROFX2'?'EURO FX2':ek==='EUROFX2TAURUS'?'EURO FX2 + TAURUS':ek==='ATE'?'ATE':ek==='FOREXSTAY'?'FOREXSTAY SIGHT':ek==='FOREXSTAYTAURUS'?'FOREXSTAY SIGHT + TAURUS':ek==='FOREXSTAYPRO'?'FOREXSTAY PRO':ek==='FOREXFLEX'?'FOREX FLEX':ek==='SENEGALPRO'?'SUPER SENEGAL PRO':ek==='VALUEMACD'?'VALUE CHART + MACD':ek==='HOLYGRAIL'?'HOLY GRAIL ORIGINAL':ek==='TRENDLINES'?'TRENDLINES MTF':ek==='BBSTOCH'?'BB STOCHRSI X REVERSAL':ek==='UTBOT'?'UT BOT ALERTS':ek==='ONEMINRSI'?'ONE MINUTE + RSI':ek==='WPRADAPT'?'WPR ADAPTIVE':ek==='SHKHA'?'SHK PRO HA + MACD':ek==='SESSIONBREAKOUT'?'SMART SESSION BREAKOUT':ek==='ELCODEX'?'ELCODEX SCALPER':ek==='SUPERNOVA'?'SUPER NOVA':ek==='TINGATINGA'?'TINGA TINGA':ek==='BROOKYC3'?'CONFLUÊNCIA 3 • BROOKY FLEX':ek==='MEGABOT'?'MEGA BOT':ek==='BROOKYVERTEX'?'BROOKY + VERTEX FLEX 30/70':ek==='FOREXMEGA'?'FOREX MEGA LLC':ek==='KAMIKAZE'?'KAMIKAZE TREND SNIPER':ek==='BOBSENEGAL'?'BOB 05 + SUPER SENEGAL':ek==='TAURUSSENEGAL'?'TAURUS + SUPER SENEGAL':ek==='SNIPER'?'SUPER SIGNALS CHANNEL NR':ek==='RSI5'?'RSI + ADX AFIADO':ek==='DRAGONFIREPRO'?'🔥 DRAGON FIRE PRO':ek==='DRAGONFIRE'?'🔥 DRAGON FIRE':ek==='SCALPERPRO'?'SCALPER PRO':ek==='SCALPINGASIA'?'🌏 SCALPER FLEX':ek==='MINSCALPER'?'M-SNIPER':ek==='RSICHANNEL2'?'MEMORY FUSION':ek==='RSICHANNEL'?'MOTOR REMOVIDO':ek==='ISMAELTRADER'?'ISMAEL TRADER':ek==='STREAKREV'?'STREAK REVERSAL':ek==='RSIXOVER'?'RSI XOVER':ek==='RSICROSS'?'RSI EA MTF':ek==='MOMENTUM'?'MOMENTUM CHART':ek==='RSI4PERIOD'?'4 PERIOD RSI PRO':ek==='TSI'?'MEGA ULTRA':ek==='MONSTERSMC'?'MONSTER SMC':ek==='MEGAMASTER'?'MEGA MASTER':ek==='LOCALANALYSTFLEX'?'MEGA BOT FLEX':ek==='LOCALANALYST'?'MEGA BOT':ek==='SMART'?'MOTOR REMOVIDO':ek==='VELOCITY'?'VELOCITY FLOW':ek==='LARRY'?'LARRY BREAKOUT + TAURUS':ek==='RANGE'?'RANGE COMPRESSION':ek==='FORCE'?'EA FORÇA DO MOVIMENTO':ek==='BIGRISE'?'BTC FORCE':'SEM MOTOR'; statusBox.textContent=`RADAR → ${en} • ${sym} ${dir} • CONFIRMANDO OPORTUNIDADE`; }
-    await sig(true);
+    const stepMs=intervalSecondsValue((interval&&interval.value)||'1min')*1000;
+    const nowMs=Date.now();
+    const entryMs=Math.ceil(nowMs/stepMs)*stepMs;
+    const expiryMs=entryMs+stepMs;
+    let firstPromoted=null;
 
-    // 3.97.77 — O radar e o painel usam o mesmo motor, mas a segunda consulta
-    // de /signal-ai pode chegar alguns ms depois da virada e devolver NEUTRO.
-    // Nesse caso não apagamos uma oportunidade FRESCA que o próprio radar acabou
-    // de confirmar. Promovemos o snapshot do radar para a próxima abertura M1.
-    const afterDir=String((cur&&cur.direction)||'NEUTRO').toUpperCase();
-    if(afterDir==='NEUTRO' && radarOpportunityIsFresh(best) && selectedRobotEngine()!=='OFF'){
-      const stepMs=intervalSecondsValue((interval&&interval.value)||'1min')*1000;
-      const nowMs=Date.now();
-      const entryMs=Math.ceil(nowMs/stepMs)*stepMs;
-      const expiryMs=entryMs+stepMs;
-      cur={
-        source:'RADAR_CONFIRMED_PROMOTED',
-        selected_engine:selectedRobotEngine(),
-        engine:selectedRobotEngine(),
-        strategy:String(best.strategy||selectedRobotEngine()),
-        symbol:sym, interval:String((interval&&interval.value)||'1min'),
-        requested_market:'OPEN', market:'OPEN', direction:dir,
-        confidence:Number(best.confidence||0), confirmed:true,
-        entry_time:new Date(entryMs).toISOString(),
-        announce_time:String(best.updated_at||new Date().toISOString()),
-        expiry_time:new Date(expiryMs).toISOString(),
-        entry_mode:'BIRTH', risk:'MEDIUM',
-        status:String(best.status||'OPORTUNIDADE ENCONTRADA')+' • SINAL ENVIADO AO PAINEL',
-        reason:'Oportunidade fresca confirmada pelo radar do mesmo motor; snapshot preservado até a expiração.',
+    for(const best of chosen){
+      const sym=radarBaseSymbol(best);
+      const dir=String(best.direction||'').toUpperCase();
+      const key=[engine,'OPEN',interval.value,sym,dir,best.updated_at||''].join('|');
+      if(radarAutoKeys[key]) continue;
+      radarAutoKeys[key]=Date.now();
+      // limpa chaves antigas para não crescer indefinidamente
+      for(const k of Object.keys(radarAutoKeys)) if(Date.now()-Number(radarAutoKeys[k]||0)>180000) delete radarAutoKeys[k];
+
+      const promoted={
+        source:'RADAR_CONFIRMED_PROMOTED', selected_engine:engine, engine:engine,
+        strategy:String(best.strategy||engine), symbol:sym,
+        interval:String((interval&&interval.value)||'1min'), requested_market:'OPEN', market:'OPEN',
+        direction:dir, confidence:Number(best.confidence||0), confirmed:true,
+        entry_time:new Date(entryMs).toISOString(), announce_time:String(best.updated_at||new Date().toISOString()),
+        expiry_time:new Date(expiryMs).toISOString(), entry_mode:'BIRTH', risk:'MEDIUM',
+        status:String(best.status||'OPORTUNIDADE ENCONTRADA')+' • SINAL ENVIADO',
+        reason:'Oportunidade fresca confirmada pelo radar; Mega Sniper multi-par.',
         feed_source:String(best.feed_source||'MULTIFEED'),
         feed_label:String(best.feed_source||'MULTIFEED').replaceAll('_',' '),
-        feed_fallback:best.feed_fallback===true,
-        promoted_from_radar:true
+        feed_fallback:best.feed_fallback===true, promoted_from_radar:true
       };
-      panelSignalLock={...cur};
-      direction.textContent=dir;
-      direction.className='big '+(dir==='CALL'?'call':'put');
-      paintSignalAsset(sym);
+      rememberPendingTrade(promoted);
+      maybeSendTelegramSignal(promoted);
+      if(!firstPromoted) firstPromoted=promoted;
+    }
+
+    // O painel principal mostra o primeiro dos sinais simultâneos; os demais
+    // seguem registrados/Telegram e têm WIN/LOSS independentes na fila.
+    if(firstPromoted){
+      cur=firstPromoted; panelSignalLock={...firstPromoted};
+      direction.textContent=cur.direction;
+      direction.className='big '+(cur.direction==='CALL'?'call':'put');
+      paintSignalAsset(cur.symbol);
       confidence.textContent='Confiança: '+Number(cur.confidence||0).toFixed(0)+'%';
-      entry.textContent=ft(cur.entry_time);
-      countdown.textContent='Preparando entrada';
-      statusBox.textContent=cur.status;
+      entry.textContent=ft(cur.entry_time); countdown.textContent='Preparando entrada';
+      statusBox.textContent=(multi && chosen.length>1) ? `MEGA SNIPER • ${chosen.length} PARES COM OPORTUNIDADE SIMULTÂNEA` : cur.status;
       risk.textContent='Risco: '+cur.risk;
       if(dataFeedText) dataFeedText.textContent=cur.feed_label+(cur.feed_fallback?' • FALLBACK ATIVO':'');
-      rememberPendingTrade(cur);
-      maybeSendTelegramSignal(cur);
       lastCountdownSignalKey=''; thirtyFive=false; five=false; entered=false;
     }
   }finally{
@@ -43898,17 +43890,31 @@ async function rad(){
   try{
     const engine=selectedRobotEngine();
     if(engine==='OFF'){ radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>'; return; }
-    // 3.98.37 — radar trabalha somente no ativo escolhido no seletor.
-    const selectedRadarSymbol=String((S&&S.value)||'').trim();
-    const onlySymbol=selectedRadarSymbol?'&symbol='+encodeURIComponent(selectedRadarSymbol):'';
     const assetClass=activeAssetClass();
-    const items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&asset_class=${encodeURIComponent(assetClass)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}${onlySymbol}`);
+    let items=[];
+    if(engine==='TSR2016'){
+      // Mega Sniper: 3 pares por ciclo, em paralelo. Assim não fica preso ao
+      // ativo selecionado e pode detectar/liberar até 3 oportunidades juntas.
+      const candidates=[...S.options].map(o=>String(o.value||'').trim()).filter(sym=>sym && assetAllowedByTab(sym));
+      const batch=[];
+      if(candidates.length){
+        for(let n=0;n<Math.min(3,candidates.length);n++) batch.push(candidates[(megaSniperScanIndex+n)%candidates.length]);
+        megaSniperScanIndex=(megaSniperScanIndex+batch.length)%candidates.length;
+      }
+      const base=`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&asset_class=${encodeURIComponent(assetClass)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`;
+      const packs=await Promise.all(batch.map(sym=>get(base+'&symbol='+encodeURIComponent(sym)).catch(()=>[])));
+      items=packs.flat();
+    }else{
+      const selectedRadarSymbol=String((S&&S.value)||'').trim();
+      const onlySymbol=selectedRadarSymbol?'&symbol='+encodeURIComponent(selectedRadarSymbol):'';
+      items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&asset_class=${encodeURIComponent(assetClass)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}${onlySymbol}`);
+    }
     // Uma resposta antiga do motor anterior não pode reaparecer após trocar ONLINE/OFFLINE.
     if(engine!==selectedRobotEngine()) return;
     const list=(Array.isArray(items)?items:[]).filter(item=>{
       const rs=String(radarBaseSymbol(item)||'').trim().toUpperCase();
       const selected=String((S&&S.value)||'').trim().toUpperCase();
-      return assetAllowedByTab(radarBaseSymbol(item)) && (!selected || rs===selected);
+      return assetAllowedByTab(radarBaseSymbol(item)) && (engine==='TSR2016' || !selected || rs===selected);
     });
     if(!list.length){
       radar.innerHTML='<div>📡 Radar ativo • aguardando leitura</div>';
@@ -44640,23 +44646,7 @@ setInterval(()=>{
 },2000);
 
 // Resultado das operações abertas.
-// 3.98.46 — WIN/LOSS não pode depender do polling do indicador.
-// Se a tela for para segundo plano ou o robô for pausado depois que a entrada
-// já foi registrada, a operação continua existindo e precisa ser encerrada.
-// O navegador pode reduzir timers em background, mas ao receber CPU novamente
-// esta rotina consulta imediatamente qualquer operação já expirada.
-setInterval(()=>{
-  if(!iqLoginInProgress) resultCheck();
-},3000);
-document.addEventListener('visibilitychange',()=>{
-  if(!document.hidden && !iqLoginInProgress){
-    setTimeout(()=>resultCheck(),150);
-    setTimeout(()=>perf(),500);
-  }
-});
-window.addEventListener('focus',()=>{
-  if(!iqLoginInProgress) setTimeout(()=>resultCheck(),100);
-});
+setInterval(()=>{ if(megaCanPoll()) resultCheck(); },3000);
 setInterval(clk,1000);
 setInterval(()=>{ if(appEnabled && !document.hidden) cd(); },500);
 
