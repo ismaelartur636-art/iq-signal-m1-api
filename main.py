@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.62"
+APP_VERSION = "3.98.63"
+# MEGA IA 3.98.63 — corrige placar WIN/LOSS do RN Follow Trend: identifica RNFOLLOW no histórico e exibe placar próprio.
 # MEGA IA 3.98.62 — integra RN Follow Trend: adaptação segura do gatilho virtual do EA MT5 para CALL/PUT, sem Grid/Martingale/lotes; evento único, próxima M1 e Backtest 48H.
 # MEGA IA 3.98.61 — MEGA MONEY EA: evento único/rearme; impede repetir CALL/PUT em velas consecutivas enquanto a mesma confluência 4/4 permanecer ativa.
 # MEGA IA 3.98.60 — integra AA+ original (Alligator 13/8/5 SMMA Median): pré-alerta 20s antes da seta, trava anti-repaint, próxima M1, radar e Backtest 48H.
@@ -38500,6 +38501,7 @@ function currentScoreEngineKey(item){
   if(normalized==='PAULMACDM1' || raw==='PAULMACDM1' || strategy.includes('PAUL MACD M1 •')) return 'PAULMACDM1';
   if(normalized==='PAULMACD' || raw==='PAULMACD' || strategy.includes('PAUL MACD')) return 'PAULMACD';
   if(normalized==='SIDUS320' || raw==='SIDUS320' || strategy.includes('SIDUS EA')) return 'SIDUS320';
+  if(normalized==='RNFOLLOW' || raw==='RNFOLLOW' || strategy.includes('RN FOLLOW TREND')) return 'RNFOLLOW';
   if(normalized==='PYRAMID7' || raw==='PYRAMID7' || strategy.includes('PYRAMID 7')) return 'PYRAMID7';
   if(normalized==='MINSCALPER' || raw==='MINSCALPER' || strategy.includes('1 MINUTE SCALPER')) return 'MINSCALPER';
   if(normalized==='RSICHANNEL' || raw==='RSICHANNEL' || strategy.includes('RSI CHANNELS')) return 'RSICHANNEL';
@@ -38530,6 +38532,7 @@ function engineScoreSnapshot(bucket){
     MILLIONEA:{key:'MILLIONEA',name:'💰 EA MILIONÁRIO',wins:0,losses:0},
     MONEYPILE:{key:'MONEYPILE',name:'💵 MEGA MONEY EA',wins:0,losses:0},
     SIDUS320:{key:'SIDUS320',name:'🎯 SIDUS EA V3.20',wins:0,losses:0},
+    RNFOLLOW:{key:'RNFOLLOW',name:'📈 RN Follow Trend',wins:0,losses:0},
     PYRAMID7:{key:'PYRAMID7',name:'🔺 PYRAMID 7 PRO',wins:0,losses:0},
     OTHER:{key:'OTHER',name:'🗂️ OUTROS / ANTIGOS',wins:0,losses:0}
   };
@@ -38556,7 +38559,7 @@ function engineScoreSnapshot(bucket){
 function renderEngineScoreBoard(bucket){
   if(!engineScoreGrid) return;
   const st=engineScoreSnapshot(bucket||emptyResultBucket());
-  const order=['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER','PYRAMID7'];
+  const order=['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER','RNFOLLOW','PYRAMID7'];
   if(st.OTHER.total>0) order.push('OTHER');
   engineScoreGrid.innerHTML=order.map(k=>{
     const x=st[k];
