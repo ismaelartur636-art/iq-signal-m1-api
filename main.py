@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.78"
+APP_VERSION = "3.98.79"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -319,16 +319,17 @@ def ydiv_original_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
             pts=[x for x in piv if x[0]==kind]
             if len(pts)<2:continue
             old,new=pts[-2:]; a,b=old[1],new[1]
-            if b!=len(rows)-3 or rsis[a] is None or rsis[b] is None:continue
-            if kind=='H' and new[2]>old[2] and rsis[b]<rsis[a] and rsis[a]>70:direction='PUT';key=b
-            if kind=='L' and new[2]<old[2] and rsis[b]>rsis[a] and rsis[a]<30:direction='CALL';key=b
+            # Mantém por até 3 candles após a confirmação (sem olhar candles futuros).
+            if not (len(rows)-6 <= b <= len(rows)-3) or rsis[a] is None or rsis[b] is None:continue
+            if kind=='H' and new[2]>old[2] and rsis[b]<rsis[a] and rsis[a]>=65:direction='PUT';key=b
+            if kind=='L' and new[2]<old[2] and rsis[b]>rsis[a] and rsis[a]<=35:direction='CALL';key=b
         if direction!='NEUTRO':
             stamp=str(rows[key].get('datetime') or rows[key].get('timestamp') or key)
-            return {**base,"direction":direction,"confirmed":True,"confidence":75.0,"risk":"HIGH","event_key":f"YDIVORIG:{symbol}:{direction}:{stamp}","reason":f"yDiv divergência RSI/ZigZag confirmada: {direction} próxima vela."}
+            return {**base,"direction":direction,"confirmed":True,"confidence":75.0,"risk":"HIGH","event_key":f"YDIVORIG:{symbol}:{direction}:{stamp}","reason":f"yDiv divergência RSI/ZigZag confirmada: {direction} próxima vela (janela de até 3 candles)."}
         return base
     except Exception as exc:return {**base,"reason":f"yDiv dados indisponíveis: {str(exc)[:90]}"}
 
-PWA_VERSION = "v220"
+PWA_VERSION = "v221"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
