@@ -42,7 +42,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.72"
+APP_VERSION = "3.98.74"
+# MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
+# MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
 # MEGA IA 3.98.72 — adiciona RN Follow Trend 03: ATR14 + rejeição + proteção EMA50 + Volume POC; sem S/R obrigatório; placar próprio.
 # MEGA IA 3.98.66 — integra MEGA Guide M5-M1: leitura M5 causal, entrada/expiração M1, evento único, radar e placar direto.
 # MEGA IA 3.98.67 — corrige WIN/LOSS de RN Follow Trend + MEGA Guide: normalização no painel e apuração M1 não fica presa por alias/troca de feed.
@@ -29835,22 +29837,24 @@ def rn_follow_trend_03_strategy(cs, symbol="EUR/USD", timeframe="1min", market="
         strong_up=closes[-1]>e50 and slope>.20
         poc=volume_poc_strategy(rows,timeframe=timeframe,market=market,early_signal=False,use_ai=False)
         poc_dir=str(poc.get('direction') or 'NEUTRO').upper() if poc.get('confirmed') else 'NEUTRO'
-        rn_call=move<=-threshold and bull_reject and not strong_down
-        rn_put=move>=threshold and bear_reject and not strong_up
-        # POC concordando confirma. POC contrário bloqueia. Neutro só passa se o RN estiver mais forte.
-        call=rn_call and poc_dir!='PUT' and (poc_dir=='CALL' or (ratio>=.85 and lower_wick>=.30))
-        put=rn_put and poc_dir!='CALL' and (poc_dir=='PUT' or (ratio>=.85 and upper_wick>=.30))
+        # 3.98.74 FLEX: somente o deslocamento RN 0.70 ATR + proteção de tendência forte
+        # são obrigatórios. Rejeição e Volume POC passam a reforçar a qualidade/confiança,
+        # mas não seguram o sinal quando estão neutros ou em direção oposta.
+        rn_call=move<=-threshold and not strong_down
+        rn_put=move>=threshold and not strong_up
+        call=rn_call
+        put=rn_put
         direction='CALL' if call and not put else ('PUT' if put and not call else 'NEUTRO')
         diag={"move_atr":round(ratio,3),"trigger_atr":.70,"atr14":round(atr14,8),"ema50":round(e50,8),
               "ema50_slope_atr":round(slope,3),"lower_wick":round(lower_wick,3),"upper_wick":round(upper_wick,3),
               "bull_rejection":bull_reject,"bear_rejection":bear_reject,"poc_direction":poc_dir,
               "poc_confirmed":bool(poc.get('confirmed')),"strong_down_block":strong_down,"strong_up_block":strong_up}
         if direction=='NEUTRO':
-            return {**base,"reason":f"RN Follow 03 monitorando • {ratio:.2f} ATR • rejeição + EMA50 + Volume POC.","diagnostics":diag}
+            return {**base,"reason":f"RN Follow 03 FLEX monitorando • {ratio:.2f} ATR • POC/rejeição são reforços; EMA50 só bloqueia tendência forte.","diagnostics":diag}
         stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or '')
-        conf=78.0+min(8.0,max(0.0,ratio-.70)*10.0)+(7.0 if poc_dir==direction else 2.0)+(3.0 if max(lower_wick,upper_wick)>=.35 else 0.0)
+        conf=76.0+min(10.0,max(0.0,ratio-.70)*12.0)+(6.0 if poc_dir==direction else (1.0 if poc_dir=='NEUTRO' else 0.0))+(3.0 if ((direction=='CALL' and bull_reject) or (direction=='PUT' and bear_reject)) else 0.0)
         return {**base,"direction":direction,"confidence":round(min(95.0,conf),1),"confirmed":True,
-                "reason":f"{direction} RN Follow Trend 03 • RN + rejeição + EMA50 + Volume POC validados • próxima vela; sem Gale.",
+                "reason":f"{direction} RN Follow Trend 03 FLEX • 0.70 ATR confirmado; POC/rejeição como reforço; próxima vela; sem Gale.",
                 "event_key":f"RNFOLLOW03:{direction}:{stamp}","diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"RN Follow Trend 03 aguardando leitura válida: {str(exc)[:100]}"}
@@ -35479,12 +35483,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     .mega-ea-folder{display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;min-height:92px;margin:10px 0 12px;padding:16px;border:1px solid #2f86ff;border-radius:16px;background:linear-gradient(180deg,rgba(15,45,76,.96),rgba(6,25,44,.96));box-shadow:0 0 20px rgba(47,134,255,.18);cursor:pointer;user-select:none}
     .mega-ea-folder-title{font-size:30px;font-weight:1000;letter-spacing:1.2px;color:#7fd3ff;text-shadow:0 0 14px rgba(66,190,255,.45)}
     .mega-ea-folder-hint{font-size:12px;font-weight:800;opacity:.78}
-    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #rnFollowModeCard,body:not(.mega-ea-open) #rnFollow02ModeCard,body:not(.mega-ea-open) #megaGuideModeCard,body:not(.mega-ea-open) #tsr2016ModeCard,body:not(.mega-ea-open) #barReversalModeCard,body:not(.mega-ea-open) #aaPlusModeCard,body:not(.mega-ea-open) #megaPremiumModeCard,body:not(.mega-ea-open) #megaPremiumProtectedModeCard,body:not(.mega-ea-open) #megaHftModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
+    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #rnFollowModeCard,body:not(.mega-ea-open) #rnFollow02ModeCard,body:not(.mega-ea-open) #rnFollow03ModeCard,body:not(.mega-ea-open) #megaGuideModeCard,body:not(.mega-ea-open) #tsr2016ModeCard,body:not(.mega-ea-open) #barReversalModeCard,body:not(.mega-ea-open) #aaPlusModeCard,body:not(.mega-ea-open) #megaPremiumModeCard,body:not(.mega-ea-open) #megaPremiumProtectedModeCard,body:not(.mega-ea-open) #megaHftModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
 
     /* 3.97.11 — painel de motores enxuto: MOTOR REMOVIDO + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
     #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#paulMacdModeCard,#paulMacdM1ModeCard,#sidus320ModeCard,#rnFollowModeCard,#rnFollow02ModeCard,#rnFollow03ModeCard,#megaGuideModeCard,#tsr2016ModeCard,#barReversalModeCard,#aaPlusModeCard,#megaPremiumModeCard,#megaPremiumProtectedModeCard,#megaHftModeCard,#pyramid7ModeCard,#predatorPipsModeCard,#millionEaModeCard,#moneyPileModeCard{display:flex !important}
-    #scalperProModeCard .robot-mode-desc,#dragonFireModeCard .robot-mode-desc,#dragonFireProModeCard .robot-mode-desc,#roboFiboModeCard .robot-mode-desc,#paulMacdModeCard .robot-mode-desc,#paulMacdM1ModeCard .robot-mode-desc,#sidus320ModeCard .robot-mode-desc,#tsr2016ModeCard .robot-mode-desc,#megaPremiumModeCard .robot-mode-desc,#megaPremiumProtectedModeCard .robot-mode-desc,#megaHftModeCard .robot-mode-desc,#pyramid7ModeCard .robot-mode-desc,#predatorPipsModeCard .robot-mode-desc,#millionEaModeCard .robot-mode-desc,#moneyPileModeCard .robot-mode-desc{display:none !important}
+    #scalperProModeCard .robot-mode-desc,#dragonFireModeCard .robot-mode-desc,#dragonFireProModeCard .robot-mode-desc,#roboFiboModeCard .robot-mode-desc,#paulMacdModeCard .robot-mode-desc,#paulMacdM1ModeCard .robot-mode-desc,#sidus320ModeCard .robot-mode-desc,#rnFollowModeCard .robot-mode-desc,#rnFollow02ModeCard .robot-mode-desc,#rnFollow03ModeCard .robot-mode-desc,#tsr2016ModeCard .robot-mode-desc,#megaPremiumModeCard .robot-mode-desc,#megaPremiumProtectedModeCard .robot-mode-desc,#megaHftModeCard .robot-mode-desc,#pyramid7ModeCard .robot-mode-desc,#predatorPipsModeCard .robot-mode-desc,#millionEaModeCard .robot-mode-desc,#moneyPileModeCard .robot-mode-desc{display:none !important}
     #scalpingAsiaModeCard{display:none !important}
   </style>
 
