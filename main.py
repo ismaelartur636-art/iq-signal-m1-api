@@ -42,10 +42,11 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.66"
+APP_VERSION = "3.98.69"
 # MEGA IA 3.98.66 — integra MEGA Guide M5-M1: leitura M5 causal, entrada/expiração M1, evento único, radar e placar direto.
 # MEGA IA 3.98.67 — corrige WIN/LOSS de RN Follow Trend + MEGA Guide: normalização no painel e apuração M1 não fica presa por alias/troca de feed.
 # MEGA IA 3.98.68 — destrava MEGA Guide: remove falso rearme que bloqueava sinais, reduz aquecimento e usa tendência M5 10/20/50 com filtros flexíveis.
+# MEGA IA 3.98.69 — MEGA Guide segue o timeframe selecionado: M1/M5/M15/M30; análise, próxima vela e expiração usam o mesmo timeframe.
 # MEGA IA 3.98.65 — corrige RN Follow Trend no radar: direção/status próprios + registro servidor com entry/expiry para apuração WIN/LOSS.
 # MEGA IA 3.98.64 — RN Follow Trend usa apuração DIRETA: WIN/LOSS da primeira vela ignora Recuperação/G1/G2 global e sobe imediatamente ao placar.
 # MEGA IA 3.98.63 — corrige placar WIN/LOSS do RN Follow Trend: identifica RNFOLLOW no histórico e exibe placar próprio.
@@ -23743,13 +23744,16 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "RNFOLLOW":
                 analysis=rn_follow_trend_strategy(engine_closed[-160:],symbol=symbol,timeframe=interval,market=market)
             elif engine == "MEGAGUIDE":
+                # 3.98.69 — o MEGA Guide respeita o timeframe escolhido no painel.
+                # M1 analisa/entra/expira M1; M5 faz o mesmo em M5; idem M15/M30.
+                _mg_tf=interval if interval in ("1min","5min","15min","30min") else "1min"
                 if market == "IQ_OTC":
-                    _mg_raw=await iq_ea_candles(iq_state,symbol,"5min",320,regular_market=False)
+                    _mg_raw=await iq_ea_candles(iq_state,symbol,_mg_tf,320,regular_market=False)
                 else:
-                    _mg_raw=await candles(symbol,"5min",320,"OPEN",None,request=request)
-                _mg_closed=_verified_closed_candles(_mg_raw,"5min")
-                analysis=mega_guide_strategy(_mg_closed[-320:],symbol=symbol,timeframe="5min",market=market)
-                analysis["entry_timeframe"]="1min"; analysis["expiry_timeframe"]="1min"
+                    _mg_raw=await candles(symbol,_mg_tf,320,"OPEN",None,request=request)
+                _mg_closed=_verified_closed_candles(_mg_raw,_mg_tf)
+                analysis=mega_guide_strategy(_mg_closed[-320:],symbol=symbol,timeframe=_mg_tf,market=market)
+                analysis["entry_timeframe"]=_mg_tf; analysis["expiry_timeframe"]=_mg_tf
             elif engine == "BARREVERSAL":
                 analysis=one_bar_reversal_strategy(engine_closed[-40:],symbol=symbol,timeframe=interval,market=market)
             elif engine == "AAPLUS":
@@ -29688,15 +29692,16 @@ def one_bar_reversal_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
         return {**base,"reason":f"1 BAR REVERSAL aguardando leitura válida: {str(exc)[:100]}"}
 
 
-def mega_guide_strategy(cs, symbol="EUR/USD", timeframe="5min", market="OPEN", current_candle_closed=True, allow_prealert=False):
-    """MEGA Guide M5-M1: adaptação causal do SensibleGuide MTF para opções binárias."""
+def mega_guide_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
+    """MEGA Guide causal: análise e operação seguem o timeframe selecionado."""
     rows=list(cs or [])[-320:]
+    tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30"}.get(timeframe,timeframe)
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
-          "strategy":"MEGA GUIDE M5-M1","engine":"MEGAGUIDE","provider":"SENSIBLE_GUIDE_M5_M1_CAUSAL_V1",
+          "strategy":f"MEGA GUIDE {tf_label}","engine":"MEGAGUIDE","provider":"SENSIBLE_GUIDE_DYNAMIC_TF_CAUSAL_V2",
           "risk":"MEDIUM","closed_candles_only":True,"non_repaint":True,"non_repaint_after_release":True,
           "prealert_seconds":20,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,
-          "gale_signal":False,"martingale":False,"grid":False,"analysis_timeframe":"5min","expiry_timeframe":"1min"}
-    if len(rows)<80: return {**base,"reason":f"MEGA Guide coletando M5 ({len(rows)}/80)."}
+          "gale_signal":False,"martingale":False,"grid":False,"analysis_timeframe":timeframe,"entry_timeframe":timeframe,"expiry_timeframe":timeframe}
+    if len(rows)<80: return {**base,"reason":f"MEGA Guide coletando {tf_label} ({len(rows)}/80)."}
     try:
         closes=[float(x['close']) for x in rows]; opens=[float(x['open']) for x in rows]
         highs=[float(x['high']) for x in rows]; lows=[float(x['low']) for x in rows]
@@ -29726,12 +29731,12 @@ def mega_guide_strategy(cs, symbol="EUR/USD", timeframe="5min", market="OPEN", c
               "ema100":round(e100,8) if e100 is not None else None,"ema200":round(e200,8) if e200 is not None else None,
               "rsi14":round(r,2),"atr14":round(atr,8),"body_ratio":round(body,3),"bb_mid":round(mid,8),
               "trend_up":trend_up,"trend_dn":trend_dn,"bull_trigger":bull,"bear_trigger":bear}
-        if direction=='NEUTRO': return {**base,"reason":"MEGA Guide FLEX monitorando tendência M5 + força + RSI + Bollinger + espaço S/R.","diagnostics":diag}
+        if direction=='NEUTRO': return {**base,"reason":f"MEGA Guide FLEX monitorando {tf_label}: tendência + força + RSI + Bollinger + espaço S/R.","diagnostics":diag}
         stamp=str(cur.get('datetime') or cur.get('timestamp') or '')
         conf=round(min(92.0,76.0+body*10+min(6.0,abs(e10-e20)/max(atr,1e-12)*5)),1)
-        return {**base,"direction":direction,"confidence":conf,"confirmed":True,"reason":f"{direction} MEGA Guide • M5 confirmado; entrada na próxima M1; expiração M1.","event_key":f"MEGAGUIDE:{direction}:{stamp}","diagnostics":diag}
+        return {**base,"direction":direction,"confidence":conf,"confirmed":True,"reason":f"{direction} MEGA Guide • {tf_label} confirmado; entrada na próxima vela {tf_label}; expiração 1 vela {tf_label}.","event_key":f"MEGAGUIDE:{direction}:{stamp}","diagnostics":diag}
     except Exception as exc:
-        return {**base,"reason":f"MEGA Guide aguardando leitura M5 válida: {str(exc)[:100]}"}
+        return {**base,"reason":f"MEGA Guide aguardando leitura {tf_label} válida: {str(exc)[:100]}"}
 
 
 def rn_follow_trend_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
@@ -33501,15 +33506,17 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             elif engine == "TSR2016":
                 tech=tsr2016_strategy(closed[-180:],symbol=sym,timeframe=interval,market=market)
             elif engine == "MEGAGUIDE":
+                _mg_tf=interval if interval in ("1min","5min","15min","30min") else "1min"
                 if market == "IQ_OTC":
-                    _mg_raw=await iq_ea_candles(iq_state,sym,"5min",320,regular_market=False)
+                    _mg_raw=await iq_ea_candles(iq_state,sym,_mg_tf,320,regular_market=False)
                 else:
-                    _mg_raw=await candles(sym,"5min",320,"OPEN",None,request=request)
-                _mg_closed=_verified_closed_candles(_mg_raw,"5min")
-                tech=mega_guide_strategy(_mg_closed[-320:],symbol=sym,timeframe="5min",market=market)
-                engine_label="🧭 MEGA Guide M5-M1"
+                    _mg_raw=await candles(sym,_mg_tf,320,"OPEN",None,request=request)
+                _mg_closed=_verified_closed_candles(_mg_raw,_mg_tf)
+                tech=mega_guide_strategy(_mg_closed[-320:],symbol=sym,timeframe=_mg_tf,market=market)
+                _mg_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30"}.get(_mg_tf,_mg_tf)
+                engine_label=f"🧭 MEGA Guide {_mg_label}"
                 direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why=str(tech.get("reason") or "MEGA Guide monitorando M5.").replace("\n"," ")[:120]
+                why=str(tech.get("reason") or f"MEGA Guide monitorando {_mg_label}.").replace("\n"," ")[:120]
                 status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "RNFOLLOW":
                 tech=rn_follow_trend_strategy(closed[-160:],symbol=sym,timeframe=interval,market=market)
