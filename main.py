@@ -35544,11 +35544,11 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     .mega-ea-folder{display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;min-height:92px;margin:10px 0 12px;padding:16px;border:1px solid #2f86ff;border-radius:16px;background:linear-gradient(180deg,rgba(15,45,76,.96),rgba(6,25,44,.96));box-shadow:0 0 20px rgba(47,134,255,.18);cursor:pointer;user-select:none}
     .mega-ea-folder-title{font-size:30px;font-weight:1000;letter-spacing:1.2px;color:#7fd3ff;text-shadow:0 0 14px rgba(66,190,255,.45)}
     .mega-ea-folder-hint{font-size:12px;font-weight:800;opacity:.78}
-    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #rnFollowModeCard,body:not(.mega-ea-open) #rnFollow02ModeCard,body:not(.mega-ea-open) #rnFollow03ModeCard,body:not(.mega-ea-open) #megaGuideModeCard,body:not(.mega-ea-open) #tsr2016ModeCard,body:not(.mega-ea-open) #barReversalModeCard,body:not(.mega-ea-open) #aaPlusModeCard,body:not(.mega-ea-open) #megaPremiumModeCard,body:not(.mega-ea-open) #megaPremiumProtectedModeCard,body:not(.mega-ea-open) #megaHftModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
+    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #rnFollowModeCard,body:not(.mega-ea-open) #rnFollow02ModeCard,body:not(.mega-ea-open) #rnFollow03ModeCard,#stepmaOrigModeCard,#stepmaProModeCard,body:not(.mega-ea-open) #megaGuideModeCard,body:not(.mega-ea-open) #tsr2016ModeCard,body:not(.mega-ea-open) #barReversalModeCard,body:not(.mega-ea-open) #aaPlusModeCard,body:not(.mega-ea-open) #megaPremiumModeCard,body:not(.mega-ea-open) #megaPremiumProtectedModeCard,body:not(.mega-ea-open) #megaHftModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
 
     /* 3.97.11 — painel de motores enxuto: MOTOR REMOVIDO + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
-    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#paulMacdModeCard,#paulMacdM1ModeCard,#sidus320ModeCard,#rnFollowModeCard,#rnFollow02ModeCard,#rnFollow03ModeCard,#megaGuideModeCard,#tsr2016ModeCard,#barReversalModeCard,#aaPlusModeCard,#megaPremiumModeCard,#megaPremiumProtectedModeCard,#megaHftModeCard,#pyramid7ModeCard,#predatorPipsModeCard,#millionEaModeCard,#moneyPileModeCard{display:flex !important}
+    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#paulMacdModeCard,#paulMacdM1ModeCard,#sidus320ModeCard,#rnFollowModeCard,#rnFollow02ModeCard,#rnFollow03ModeCard,#stepmaOrigModeCard,#stepmaProModeCard,#megaGuideModeCard,#tsr2016ModeCard,#barReversalModeCard,#aaPlusModeCard,#megaPremiumModeCard,#megaPremiumProtectedModeCard,#megaHftModeCard,#pyramid7ModeCard,#predatorPipsModeCard,#millionEaModeCard,#moneyPileModeCard{display:flex !important}
     #scalperProModeCard .robot-mode-desc,#dragonFireModeCard .robot-mode-desc,#dragonFireProModeCard .robot-mode-desc,#roboFiboModeCard .robot-mode-desc,#paulMacdModeCard .robot-mode-desc,#paulMacdM1ModeCard .robot-mode-desc,#sidus320ModeCard .robot-mode-desc,#rnFollowModeCard .robot-mode-desc,#rnFollow02ModeCard .robot-mode-desc,#rnFollow03ModeCard .robot-mode-desc,#tsr2016ModeCard .robot-mode-desc,#megaPremiumModeCard .robot-mode-desc,#megaPremiumProtectedModeCard .robot-mode-desc,#megaHftModeCard .robot-mode-desc,#pyramid7ModeCard .robot-mode-desc,#predatorPipsModeCard .robot-mode-desc,#millionEaModeCard .robot-mode-desc,#moneyPileModeCard .robot-mode-desc{display:none !important}
     #scalpingAsiaModeCard{display:none !important}
   </style>
@@ -35637,6 +35637,8 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </div>
     <button id="rnFollow03PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
+  <div class="robot-mode-card" id="stepmaOrigModeCard"><div><div class="robot-mode-title">📈 StepMA Original</div><div class="robot-mode-desc">StepMA sem confluência • próxima vela M1.</div></div><button id="stepmaOrigPowerBtn" type="button">🔴 OFFLINE</button></div>
+  <div class="robot-mode-card" id="stepmaProModeCard"><div><div class="robot-mode-title">📈 StepMA Pro</div><div class="robot-mode-desc">StepMA + Brooky StochRSI • próxima vela M1.</div></div><button id="stepmaProPowerBtn" type="button">🔴 OFFLINE</button></div>
   <div class="robot-mode-card" id="tsr2016ModeCard">
     <img src="__MEGA_IMAGE__" alt="Mega Sniper">
     <div class="robot-mode-copy">
@@ -36551,6 +36553,9 @@ const sidus320ModeDesc=document.getElementById('sidus320ModeDesc');
 const rnFollowPowerBtn=document.getElementById('rnFollowPowerBtn');
 const rnFollow02PowerBtn=document.getElementById('rnFollow02PowerBtn');
 const rnFollow03PowerBtn=document.getElementById('rnFollow03PowerBtn');
+const stepmaOrigPowerBtn=document.getElementById('stepmaOrigPowerBtn');
+const stepmaProPowerBtn=document.getElementById('stepmaProPowerBtn');
+let stepmaOrigEnabled=false,stepmaProEnabled=false;
 const megaGuidePowerBtn=document.getElementById('megaGuidePowerBtn');
 const tsr2016PowerBtn=document.getElementById('tsr2016PowerBtn');
 const barReversalPowerBtn=document.getElementById('barReversalPowerBtn');
@@ -37186,6 +37191,8 @@ function setExclusiveVisibleEngine(engine){
   rnFollowEnabled=(e==='RNFOLLOW');
   rnFollow02Enabled=(e==='RNFOLLOW02');
   rnFollow03Enabled=(e==='RNFOLLOW03');
+  stepmaOrigEnabled=(e==='STEPMAORIG');
+  stepmaProEnabled=(e==='STEPMAPRO');
   megaGuideEnabled=(e==='MEGAGUIDE');
   tsr2016Enabled=(e==='TSR2016');
   barReversalEnabled=(e==='BARREVERSAL');
@@ -37239,6 +37246,8 @@ function selectedRobotEngine(){
   if(rnFollowEnabled) return 'RNFOLLOW';
   if(rnFollow02Enabled) return 'RNFOLLOW02';
   if(rnFollow03Enabled) return 'RNFOLLOW03';
+  if(stepmaOrigEnabled) return 'STEPMAORIG';
+  if(stepmaProEnabled) return 'STEPMAPRO';
   if(megaGuideEnabled) return 'MEGAGUIDE';
   if(tsr2016Enabled) return 'TSR2016';
   if(megaPremiumEnabled) return 'MEGAPREMIUM';
@@ -37257,7 +37266,7 @@ function adoptBackgroundEngineState(d){
   if(typeof d.telegram_enabled==='boolean'){ telegramEnabled=!!d.telegram_enabled; }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(e!=='PAULMACD' && e!=='PAULMACDM1' && e!=='MILLIONEA' && e!=='MONEYPILE' && e!=='SIDUS320' && e!=='MEGAPREMIUM' && e!=='MEGAPREMIUMPOC' && e!=='MEGAPREMIUMPRO' && e!=='TSR2016' && e!=='RNFOLLOW' && e!=='RNFOLLOW02' && e!=='RNFOLLOW03' && e!=='MEGAGUIDE' && e!=='BARREVERSAL' && e!=='AAPLUS' && e!=='SCALPERPRO' && e!=='FIBORSI' && e!=='MEGAHFT' && e!=='PYRAMID7' && e!=='PREDATORPIPS') return;
+  if(e!=='PAULMACD' && e!=='PAULMACDM1' && e!=='MILLIONEA' && e!=='MONEYPILE' && e!=='SIDUS320' && e!=='MEGAPREMIUM' && e!=='MEGAPREMIUMPOC' && e!=='MEGAPREMIUMPRO' && e!=='TSR2016' && e!=='RNFOLLOW' && e!=='RNFOLLOW02' && e!=='RNFOLLOW03' && e!=='STEPMAORIG' && e!=='STEPMAPRO' && e!=='MEGAGUIDE' && e!=='BARREVERSAL' && e!=='AAPLUS' && e!=='SCALPERPRO' && e!=='FIBORSI' && e!=='MEGAHFT' && e!=='PYRAMID7' && e!=='PREDATORPIPS') return;
   paulMacdEnabled=(e==='PAULMACD');
   paulMacdM1Enabled=(e==='PAULMACDM1');
   millionEaEnabled=(e==='MILLIONEA');
@@ -37266,6 +37275,8 @@ function adoptBackgroundEngineState(d){
   rnFollowEnabled=(e==='RNFOLLOW');
   rnFollow02Enabled=(e==='RNFOLLOW02');
   rnFollow03Enabled=(e==='RNFOLLOW03');
+  stepmaOrigEnabled=(e==='STEPMAORIG');
+  stepmaProEnabled=(e==='STEPMAPRO');
   megaGuideEnabled=(e==='MEGAGUIDE');
   tsr2016Enabled=(e==='TSR2016');
   barReversalEnabled=(e==='BARREVERSAL');
@@ -37311,7 +37322,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',SIDUS320:'🎯 SIDUS EA V3.20',TSR2016:'🎯 Mega Sniper',RNFOLLOW:'📈 RN Follow Trend',RNFOLLOW02:'📈 RN Follow Trend 02',RNFOLLOW03:'📈 RN Follow Trend 03',MEGAGUIDE:'🧭 MEGA Guide M5-M1',BARREVERSAL:'🔄 1 BAR REVERSAL',AAPLUS:'🐊 AA+',MEGAPREMIUM:'💎 MEGA PREMIUM',MEGAPREMIUMPOC:'💎 MEGA PREMIUM + POC',MEGAPREMIUMPRO:'🛡️ MEGA PREMIUM PROTEGIDO',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MEGAHFT:'⚡ MEGA HFT',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO'})[e]||'SEM MOTOR';
+  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',SIDUS320:'🎯 SIDUS EA V3.20',TSR2016:'🎯 Mega Sniper',RNFOLLOW:'📈 RN Follow Trend',RNFOLLOW02:'📈 RN Follow Trend 02',RNFOLLOW03:'📈 RN Follow Trend 03',STEPMAORIG:'📈 StepMA Original',STEPMAPRO:'📈 StepMA Pro',MEGAGUIDE:'🧭 MEGA Guide M5-M1',BARREVERSAL:'🔄 1 BAR REVERSAL',AAPLUS:'🐊 AA+',MEGAPREMIUM:'💎 MEGA PREMIUM',MEGAPREMIUMPOC:'💎 MEGA PREMIUM + POC',MEGAPREMIUMPRO:'🛡️ MEGA PREMIUM PROTEGIDO',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MEGAHFT:'⚡ MEGA HFT',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO'})[e]||'SEM MOTOR';
 }
 
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
@@ -37403,7 +37414,7 @@ async function syncBackgroundBotState(opts={}){
   // 3.97.64 — preserva o motor realmente escolhido ao sincronizar/recarregar.
   // Antes, PYRAMID7/PREDATORPIPS/MEGAHFT/FIBORSI eram convertidos para SCALPERPRO
   // no servidor; no refresh o estado do servidor voltava e trocava o motor na tela.
-  const backgroundEngines=new Set(['TSR2016','RNFOLLOW','RNFOLLOW02','RNFOLLOW03','MEGAGUIDE','BARREVERSAL','AAPLUS','PAULMACD','PAULMACDM1','MILLIONEA','MONEYPILE','SIDUS320','MEGAPREMIUM','MEGAPREMIUMPOC','MEGAPREMIUMPRO','SCALPERPRO','FIBORSI','MEGAHFT','PYRAMID7','PREDATORPIPS']);
+  const backgroundEngines=new Set(['TSR2016','RNFOLLOW','RNFOLLOW02','RNFOLLOW03','STEPMAORIG','STEPMAPRO','MEGAGUIDE','BARREVERSAL','AAPLUS','PAULMACD','PAULMACDM1','MILLIONEA','MONEYPILE','SIDUS320','MEGAPREMIUM','MEGAPREMIUMPOC','MEGAPREMIUMPRO','SCALPERPRO','FIBORSI','MEGAHFT','PYRAMID7','PREDATORPIPS']);
   if(!backgroundEngines.has(explicitEngine)) explicitEngine='SCALPERPRO';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
@@ -38920,7 +38931,7 @@ function engineScoreSnapshot(bucket){
 function renderEngineScoreBoard(bucket){
   if(!engineScoreGrid) return;
   const st=engineScoreSnapshot(bucket||emptyResultBucket());
-  const order=['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER','RNFOLLOW','RNFOLLOW02','RNFOLLOW03','MEGAGUIDE','PYRAMID7'];
+  const order=['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER','RNFOLLOW','RNFOLLOW02','RNFOLLOW03','STEPMAORIG','STEPMAPRO','MEGAGUIDE','PYRAMID7'];
   if(st.OTHER.total>0) order.push('OTHER');
   engineScoreGrid.innerHTML=order.map(k=>{
     const x=st[k];
@@ -41405,6 +41416,7 @@ function applyRobotPowerState(){
   if(rnFollowPowerBtn){ rnFollowPowerBtn.textContent=rnFollowEnabled?'🟢 ONLINE':'🔴 OFFLINE'; rnFollowPowerBtn.style.background=rnFollowEnabled?'#0b7a3d':'#7d1d1d'; rnFollowPowerBtn.style.color='#fff'; }
   if(rnFollow02PowerBtn){ rnFollow02PowerBtn.textContent=rnFollow02Enabled?'🟢 ONLINE':'🔴 OFFLINE'; rnFollow02PowerBtn.style.background=rnFollow02Enabled?'#0b7a3d':'#7d1d1d'; rnFollow02PowerBtn.style.color='#fff'; }
   if(rnFollow03PowerBtn){ rnFollow03PowerBtn.textContent=rnFollow03Enabled?'🟢 ONLINE':'🔴 OFFLINE'; rnFollow03PowerBtn.style.background=rnFollow03Enabled?'#0b7a3d':'#7d1d1d'; rnFollow03PowerBtn.style.color='#fff'; }
+  for(const [btn,on] of [[stepmaOrigPowerBtn,stepmaOrigEnabled],[stepmaProPowerBtn,stepmaProEnabled]]){if(btn){btn.textContent=on?'🟢 ONLINE':'🔴 OFFLINE';btn.style.background=on?'#0b7a3d':'#7d1d1d';btn.style.color='#fff';}}
 
   if(megaGuidePowerBtn){ megaGuidePowerBtn.textContent=megaGuideEnabled?'🟢 ONLINE':'🔴 OFFLINE'; megaGuidePowerBtn.style.background=megaGuideEnabled?'#0b7a3d':'#7d1d1d'; megaGuidePowerBtn.style.color='#fff'; }
   if(tsr2016PowerBtn){ tsr2016PowerBtn.textContent=tsr2016Enabled?'🟢 ONLINE':'🔴 OFFLINE'; tsr2016PowerBtn.style.background=tsr2016Enabled?'#0b7a3d':'#7d1d1d'; tsr2016PowerBtn.style.color='#fff'; }
@@ -44057,6 +44069,17 @@ if(sidus320PowerBtn) sidus320PowerBtn.onclick=()=>setSidus320Power(!sidus320Enab
 if(rnFollowPowerBtn) rnFollowPowerBtn.addEventListener('click',()=>setRnFollowPower(!rnFollowEnabled));
 if(rnFollow02PowerBtn) rnFollow02PowerBtn.addEventListener('click',()=>setRnFollow02Power(!rnFollow02Enabled));
 if(rnFollow03PowerBtn) rnFollow03PowerBtn.addEventListener('click',()=>setRnFollow03Power(!rnFollow03Enabled));
+async function setStepmaPower(engine){
+ const active=selectedRobotEngine()===engine;
+ setExclusiveVisibleEngine(active?'OFF':engine);
+ resetEngineVisualState();applyRobotPowerState();
+ await syncBackgroundBotState({action:active?'DEACTIVATE_ENGINE':'ACTIVATE_ENGINE',engine});
+ if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]);else await Promise.allSettled([perf()]);
+ scheduleBacktest48(true,200);
+}
+if(stepmaOrigPowerBtn)stepmaOrigPowerBtn.addEventListener('click',()=>setStepmaPower('STEPMAORIG'));
+if(stepmaProPowerBtn)stepmaProPowerBtn.addEventListener('click',()=>setStepmaPower('STEPMAPRO'));
+
 if(megaGuidePowerBtn) megaGuidePowerBtn.addEventListener('click',()=>setMegaGuidePower(!megaGuideEnabled));
 if(tsr2016PowerBtn) tsr2016PowerBtn.addEventListener('click',()=>setTsr2016Power(!tsr2016Enabled));
 if(barReversalPowerBtn) barReversalPowerBtn.addEventListener('click',()=>setBarReversalPower(!barReversalEnabled));
