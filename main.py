@@ -45,6 +45,7 @@ from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 APP_VERSION = "3.98.66"
 # MEGA IA 3.98.66 — integra MEGA Guide M5-M1: leitura M5 causal, entrada/expiração M1, evento único, radar e placar direto.
 # MEGA IA 3.98.67 — corrige WIN/LOSS de RN Follow Trend + MEGA Guide: normalização no painel e apuração M1 não fica presa por alias/troca de feed.
+# MEGA IA 3.98.68 — destrava MEGA Guide: remove falso rearme que bloqueava sinais, reduz aquecimento e usa tendência M5 10/20/50 com filtros flexíveis.
 # MEGA IA 3.98.65 — corrige RN Follow Trend no radar: direção/status próprios + registro servidor com entry/expiry para apuração WIN/LOSS.
 # MEGA IA 3.98.64 — RN Follow Trend usa apuração DIRETA: WIN/LOSS da primeira vela ignora Recuperação/G1/G2 global e sobe imediatamente ao placar.
 # MEGA IA 3.98.63 — corrige placar WIN/LOSS do RN Follow Trend: identifica RNFOLLOW no histórico e exibe placar próprio.
@@ -29695,11 +29696,13 @@ def mega_guide_strategy(cs, symbol="EUR/USD", timeframe="5min", market="OPEN", c
           "risk":"MEDIUM","closed_candles_only":True,"non_repaint":True,"non_repaint_after_release":True,
           "prealert_seconds":20,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,
           "gale_signal":False,"martingale":False,"grid":False,"analysis_timeframe":"5min","expiry_timeframe":"1min"}
-    if len(rows)<220: return {**base,"reason":f"MEGA Guide coletando M5 ({len(rows)}/220)."}
+    if len(rows)<80: return {**base,"reason":f"MEGA Guide coletando M5 ({len(rows)}/80)."}
     try:
         closes=[float(x['close']) for x in rows]; opens=[float(x['open']) for x in rows]
         highs=[float(x['high']) for x in rows]; lows=[float(x['low']) for x in rows]
-        e10,e20,e50,e100,e200=[ema(closes,n) for n in (10,20,50,100,200)]
+        e10,e20,e50=[ema(closes,n) for n in (10,20,50)]
+        e100=ema(closes,100) if len(closes)>=100 else None
+        e200=ema(closes,200) if len(closes)>=200 else None
         pe10,pe20=[ema(closes[:-1],n) for n in (10,20)]
         r=rsi(closes,14)
         tr=[max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1])) for i in range(1,len(rows))]
@@ -29707,19 +29710,23 @@ def mega_guide_strategy(cs, symbol="EUR/USD", timeframe="5min", market="OPEN", c
         mid=sum(closes[-20:])/20.0; sd=(sum((x-mid)**2 for x in closes[-20:])/20.0)**0.5
         upper=mid+2*sd; lower=mid-2*sd
         prev=rows[-2]; cur=rows[-1]; rng=max(1e-12,highs[-1]-lows[-1]); body=abs(closes[-1]-opens[-1])/rng
-        trend_up=e10>e20>e50 and e50>e100>e200 and e10>=pe10 and e20>=pe20
-        trend_dn=e10<e20<e50 and e50<e100<e200 and e10<=pe10 and e20<=pe20
+        # Perfil FLEX M5: 10/20/50 define a tendência. EMA100/200 ficam só como contexto,
+        # pois exigir o empilhamento completo 10/20/50/100/200 deixava o motor quase sem eventos.
+        trend_up=e10>e20>e50 and e10>=pe10
+        trend_dn=e10<e20<e50 and e10<=pe10
         recent_hi=max(highs[-21:-1]); recent_lo=min(lows[-21:-1])
         room_up=(recent_hi-closes[-1])/max(atr,1e-12); room_dn=(closes[-1]-recent_lo)/max(atr,1e-12)
-        bull=closes[-1]>opens[-1] and body>=0.38 and closes[-1]>mid and 48<=r<=72 and closes[-1]<upper+0.35*atr and room_up>=0.20
-        bear=closes[-1]<opens[-1] and body>=0.38 and closes[-1]<mid and 28<=r<=52 and closes[-1]>lower-0.35*atr and room_dn>=0.20
+        bull=closes[-1]>opens[-1] and body>=0.24 and closes[-1]>=mid-0.10*atr and 45<=r<=76 and closes[-1]<upper+0.55*atr and room_up>=0.08
+        bear=closes[-1]<opens[-1] and body>=0.24 and closes[-1]<=mid+0.10*atr and 24<=r<=55 and closes[-1]>lower-0.55*atr and room_dn>=0.08
         call=trend_up and bull; put=trend_dn and bear
-        # evento único: não repete enquanto a mesma condição persistir
-        prev_call=(float(prev['close'])>float(prev['open']) and pe10>pe20)
-        prev_put=(float(prev['close'])<float(prev['open']) and pe10<pe20)
-        direction='CALL' if call and not prev_call else ('PUT' if put and not prev_put else 'NEUTRO')
-        diag={"ema10":round(e10,8),"ema20":round(e20,8),"ema50":round(e50,8),"ema100":round(e100,8),"ema200":round(e200,8),"rsi14":round(r,2),"atr14":round(atr,8),"body_ratio":round(body,3),"bb_mid":round(mid,8)}
-        if direction=='NEUTRO': return {**base,"reason":"MEGA Guide monitorando tendência M5 + força + RSI + Bollinger + espaço S/R.","diagnostics":diag}
+        # O event_key do candle M5 + dedupe global já impedem duplicar a MESMA oportunidade.
+        # Não use a cor da vela anterior como rearme: isso bloqueava quase todos os sinais em tendência.
+        direction='CALL' if call and not put else ('PUT' if put and not call else 'NEUTRO')
+        diag={"ema10":round(e10,8),"ema20":round(e20,8),"ema50":round(e50,8),
+              "ema100":round(e100,8) if e100 is not None else None,"ema200":round(e200,8) if e200 is not None else None,
+              "rsi14":round(r,2),"atr14":round(atr,8),"body_ratio":round(body,3),"bb_mid":round(mid,8),
+              "trend_up":trend_up,"trend_dn":trend_dn,"bull_trigger":bull,"bear_trigger":bear}
+        if direction=='NEUTRO': return {**base,"reason":"MEGA Guide FLEX monitorando tendência M5 + força + RSI + Bollinger + espaço S/R.","diagnostics":diag}
         stamp=str(cur.get('datetime') or cur.get('timestamp') or '')
         conf=round(min(92.0,76.0+body*10+min(6.0,abs(e10-e20)/max(atr,1e-12)*5)),1)
         return {**base,"direction":direction,"confidence":conf,"confirmed":True,"reason":f"{direction} MEGA Guide • M5 confirmado; entrada na próxima M1; expiração M1.","event_key":f"MEGAGUIDE:{direction}:{stamp}","diagnostics":diag}
