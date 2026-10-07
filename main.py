@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.77"
+APP_VERSION = "3.98.78"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -23825,7 +23825,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis=rn_follow_trend_strategy(engine_closed[-160:],symbol=symbol,timeframe=interval,market=market)
             elif engine == "RNFOLLOW02":
                 analysis=rn_follow_trend_02_strategy(engine_closed[-180:],symbol=symbol,timeframe=interval,market=market)
-            elif engine in ("STEPMAORIG", "STEPMAPRO", "YDIVORIG"):
+            elif engine == "YDIVORIG":
+                analysis=ydiv_original_strategy(engine_closed[-350:],symbol=symbol,timeframe=interval,market=market)
+            elif engine in ("STEPMAORIG", "STEPMAPRO"):
                 analysis=stepma_strategy(engine_closed[-500:],symbol=symbol,timeframe=interval,market=market,pro=(engine=="STEPMAPRO"))
             elif engine == "RNFOLLOW03":
                 analysis=rn_follow_trend_03_strategy(engine_closed[-180:],symbol=symbol,timeframe=interval,market=market)
@@ -33716,7 +33718,12 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 why=str(tech.get("reason") or "RN Follow 02 monitorando ATR + S/R + rejeição + EMA50.").replace("\n"," ")[:120]
                 status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
-            elif engine in ("STEPMAORIG", "STEPMAPRO", "YDIVORIG"):
+            elif engine == "YDIVORIG":
+                tech=ydiv_original_strategy(closed[-350:],symbol=sym,timeframe=interval,market=market)
+                engine_label="📉 yDiv Original"
+                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                status_text=f"{engine_label} • {direction if direction != 'NEUTRO' else 'MONITORANDO'}"
+            elif engine in ("STEPMAORIG", "STEPMAPRO"):
                 tech=stepma_strategy(closed[-500:],symbol=sym,timeframe=interval,market=market,pro=(engine=="STEPMAPRO"))
                 engine_label="StepMA Pro" if engine=="STEPMAPRO" else "StepMA Original"
                 direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
@@ -35581,7 +35588,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     .mega-ea-folder{display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;min-height:92px;margin:10px 0 12px;padding:16px;border:1px solid #2f86ff;border-radius:16px;background:linear-gradient(180deg,rgba(15,45,76,.96),rgba(6,25,44,.96));box-shadow:0 0 20px rgba(47,134,255,.18);cursor:pointer;user-select:none}
     .mega-ea-folder-title{font-size:30px;font-weight:1000;letter-spacing:1.2px;color:#7fd3ff;text-shadow:0 0 14px rgba(66,190,255,.45)}
     .mega-ea-folder-hint{font-size:12px;font-weight:800;opacity:.78}
-    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #rnFollowModeCard,body:not(.mega-ea-open) #rnFollow02ModeCard,body:not(.mega-ea-open) #rnFollow03ModeCard,#ydivOrigModeCard,#stepmaOrigModeCard,#stepmaProModeCard,body:not(.mega-ea-open) #megaGuideModeCard,body:not(.mega-ea-open) #tsr2016ModeCard,body:not(.mega-ea-open) #barReversalModeCard,body:not(.mega-ea-open) #aaPlusModeCard,body:not(.mega-ea-open) #megaPremiumModeCard,body:not(.mega-ea-open) #megaPremiumProtectedModeCard,body:not(.mega-ea-open) #megaHftModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
+    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #rnFollowModeCard,body:not(.mega-ea-open) #rnFollow02ModeCard,body:not(.mega-ea-open) #rnFollow03ModeCard,body:not(.mega-ea-open) #ydivOrigModeCard,body:not(.mega-ea-open) #stepmaOrigModeCard,body:not(.mega-ea-open) #stepmaProModeCard,body:not(.mega-ea-open) #megaGuideModeCard,body:not(.mega-ea-open) #tsr2016ModeCard,body:not(.mega-ea-open) #barReversalModeCard,body:not(.mega-ea-open) #aaPlusModeCard,body:not(.mega-ea-open) #megaPremiumModeCard,body:not(.mega-ea-open) #megaPremiumProtectedModeCard,body:not(.mega-ea-open) #megaHftModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
 
     /* 3.97.11 — painel de motores enxuto: MOTOR REMOVIDO + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
@@ -36594,7 +36601,6 @@ const rnFollow03PowerBtn=document.getElementById('rnFollow03PowerBtn');
 const ydivOrigPowerBtn=document.getElementById('ydivOrigPowerBtn');
 const stepmaOrigPowerBtn=document.getElementById('stepmaOrigPowerBtn');
 const stepmaProPowerBtn=document.getElementById('stepmaProPowerBtn');
-let ydivOrigEnabled=false;
 let ydivOrigEnabled=false,stepmaOrigEnabled=false,stepmaProEnabled=false;
 const megaGuidePowerBtn=document.getElementById('megaGuidePowerBtn');
 const tsr2016PowerBtn=document.getElementById('tsr2016PowerBtn');
