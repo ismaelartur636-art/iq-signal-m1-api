@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.60"
+APP_VERSION = "3.98.61"
+# MEGA IA 3.98.61 — MEGA MONEY EA: evento único/rearme; impede repetir CALL/PUT em velas consecutivas enquanto a mesma confluência 4/4 permanecer ativa.
 # MEGA IA 3.98.60 — integra AA+ original (Alligator 13/8/5 SMMA Median): pré-alerta 20s antes da seta, trava anti-repaint, próxima M1, radar e Backtest 48H.
 # MEGA IA 3.98.59 — scanner por aba: FOREX percorre 28 pares principais e CRIPTO percorre todas as criptos cadastradas; Mega Sniper + POC não fica preso ao ativo selecionado.
 # MEGA IA 3.98.57 — corrige botão 1 BAR REVERSAL: remove chamada JS inexistente e sincroniza painel/radar/backtest ao ligar/desligar.
@@ -29496,11 +29497,37 @@ def money_pile_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         for i in range(max(4,len(rows)-20),len(rows)):
             lo=min(lows[i-4:i+1]); hi=max(highs[i-4:i+1]); k_raw.append(50.0 if hi<=lo else 100.0*(closes[i]-lo)/(hi-lo))
         k_smooth=sum(k_raw[-3:])/min(3,len(k_raw)); d_smooth=sum(k_raw[-5:-2])/min(3,len(k_raw[-5:-2])) if len(k_raw)>=5 else k_smooth
-        call=(r9>=50.0 and cci13>=0.0 and k_smooth>=d_smooth and ma5>ma9)
-        put=(r9<=50.0 and cci13<=0.0 and k_smooth<=d_smooth and ma5<ma9)
+        call_condition=(r9>=50.0 and cci13>=0.0 and k_smooth>=d_smooth and ma5>ma9)
+        put_condition=(r9<=50.0 and cci13<=0.0 and k_smooth<=d_smooth and ma5<ma9)
+
+        # 3.98.61 — evento único/rearme do MEGA MONEY EA.
+        # A estratégia 4/4 continua idêntica; apenas exigimos que a condição tenha
+        # NASCIDO nesta vela fechada. Se já estava ativa na vela anterior, não repete.
+        prev_closes=closes[:-1]; prev_highs=highs[:-1]; prev_lows=lows[:-1]
+        prev_ma5=sum(prev_closes[-5:])/5.0; prev_ma9=sum(prev_closes[-9:])/9.0
+        prev_r9=rsi(prev_closes,9)
+        prev_tp=[(prev_highs[i]+prev_lows[i]+prev_closes[i])/3.0 for i in range(len(prev_closes))]
+        prev_ma_tp=sum(prev_tp[-13:])/13.0
+        prev_md=sum(abs(x-prev_ma_tp) for x in prev_tp[-13:])/13.0
+        prev_cci13=0.0 if prev_md<=1e-12 else (prev_tp[-1]-prev_ma_tp)/(0.015*prev_md)
+        prev_k_raw=[]
+        for i in range(max(4,len(prev_closes)-20),len(prev_closes)):
+            lo=min(prev_lows[i-4:i+1]); hi=max(prev_highs[i-4:i+1])
+            prev_k_raw.append(50.0 if hi<=lo else 100.0*(prev_closes[i]-lo)/(hi-lo))
+        prev_k_smooth=sum(prev_k_raw[-3:])/min(3,len(prev_k_raw))
+        prev_d_slice=prev_k_raw[-5:-2]
+        prev_d_smooth=sum(prev_d_slice)/min(3,len(prev_d_slice)) if prev_d_slice else prev_k_smooth
+        prev_call_condition=(prev_r9>=50.0 and prev_cci13>=0.0 and prev_k_smooth>=prev_d_smooth and prev_ma5>prev_ma9)
+        prev_put_condition=(prev_r9<=50.0 and prev_cci13<=0.0 and prev_k_smooth<=prev_d_smooth and prev_ma5<prev_ma9)
+
+        call=bool(call_condition and not prev_call_condition)
+        put=bool(put_condition and not prev_put_condition)
         direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
-        diag={"rsi9":round(r9,2),"cci13":round(cci13,2),"stoch_k_5_3_3":round(k_smooth,2),"stoch_d_5_3_3":round(d_smooth,2),"ma5":round(ma5,8),"ma9":round(ma9,8)}
-        if direction=="NEUTRO": return {**base,"reason":"MEGA MONEY aguardando confluência RSI9 + CCI13 + Stoch 5/3/3 + MA5/9.","diagnostics":diag}
+        diag={"rsi9":round(r9,2),"cci13":round(cci13,2),"stoch_k_5_3_3":round(k_smooth,2),"stoch_d_5_3_3":round(d_smooth,2),"ma5":round(ma5,8),"ma9":round(ma9,8),
+              "condition_call":bool(call_condition),"condition_put":bool(put_condition),
+              "previous_call_condition":bool(prev_call_condition),"previous_put_condition":bool(prev_put_condition),
+              "new_event":bool(direction!="NEUTRO")}
+        if direction=="NEUTRO": return {**base,"reason":"MEGA MONEY monitorando confluência 4/4; condição mantida não repete sinal, aguardando rearme/novo evento.","diagnostics":diag}
         stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
         return {**base,"direction":direction,"confidence":86.0,"confirmed":True,"risk":"LOW",
                 "reason":f"{direction} MEGA MONEY • 4 confluências alinhadas • próxima M1 • sem Gale.",
