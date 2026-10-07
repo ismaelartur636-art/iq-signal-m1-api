@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.64"
+APP_VERSION = "3.98.65"
+# MEGA IA 3.98.65 — corrige RN Follow Trend no radar: direção/status próprios + registro servidor com entry/expiry para apuração WIN/LOSS.
 # MEGA IA 3.98.64 — RN Follow Trend usa apuração DIRETA: WIN/LOSS da primeira vela ignora Recuperação/G1/G2 global e sobe imediatamente ao placar.
 # MEGA IA 3.98.63 — corrige placar WIN/LOSS do RN Follow Trend: identifica RNFOLLOW no histórico e exibe placar próprio.
 # MEGA IA 3.98.62 — integra RN Follow Trend: adaptação segura do gatilho virtual do EA MT5 para CALL/PUT, sem Grid/Martingale/lotes; evento único, próxima M1 e Backtest 48H.
@@ -283,7 +284,7 @@ def ismael98_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", cur
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # MOTOR REMOVIDO permanece separado e continua com decisão nativa do modelo.
-PWA_VERSION = "v218"
+PWA_VERSION = "v219"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -33444,6 +33445,10 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 tech=tsr2016_strategy(closed[-180:],symbol=sym,timeframe=interval,market=market)
             elif engine == "RNFOLLOW":
                 tech=rn_follow_trend_strategy(closed[-160:],symbol=sym,timeframe=interval,market=market)
+                engine_label="📈 RN Follow Trend"
+                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
+                why=str(tech.get("reason") or "RN Follow Trend monitorando deslocamento.").replace("\n"," ")[:120]
+                status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "BARREVERSAL":
                 tech=one_bar_reversal_strategy(closed[-40:],symbol=sym,timeframe=interval,market=market)
                 engine_label="🔄 1 BAR REVERSAL"
@@ -33942,6 +33947,24 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "engine": engine,
                 "strategy": str(tech.get("strategy") or ""),
             }
+            # 3.98.65 — RN Follow Trend: o radar também registra a operação no servidor.
+            # Assim o WIN/LOSS é fechado mesmo se o polling do painel mudar logo após o sinal.
+            # _accounting_key impede duplicação quando /signal-ai registrar a mesma entrada.
+            if engine == "RNFOLLOW" and item.get("direction") in ("CALL", "PUT"):
+                rn_entry_dt = next_boundary(interval)
+                rn_payload = {
+                    **item,
+                    "symbol": sym,
+                    "market": market,
+                    "interval": interval,
+                    "entry_time": iso(rn_entry_dt),
+                    "expiry_time": iso(rn_entry_dt + timedelta(seconds=INTERVALS[interval])),
+                    "selected_engine": "RNFOLLOW",
+                    "engine": "RNFOLLOW",
+                    "direct_only": True,
+                }
+                _remember_accounting_signal(request, rn_payload)
+
             if item.get("direction") in ("CALL", "PUT") and engine not in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
                 radar_probe = {
                     "symbol": sym, "market": market, "interval": interval,
