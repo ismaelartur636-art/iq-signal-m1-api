@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.63"
+APP_VERSION = "3.98.64"
+# MEGA IA 3.98.64 — RN Follow Trend usa apuração DIRETA: WIN/LOSS da primeira vela ignora Recuperação/G1/G2 global e sobe imediatamente ao placar.
 # MEGA IA 3.98.63 — corrige placar WIN/LOSS do RN Follow Trend: identifica RNFOLLOW no histórico e exibe placar próprio.
 # MEGA IA 3.98.62 — integra RN Follow Trend: adaptação segura do gatilho virtual do EA MT5 para CALL/PUT, sem Grid/Martingale/lotes; evento único, próxima M1 e Backtest 48H.
 # MEGA IA 3.98.61 — MEGA MONEY EA: evento único/rearme; impede repetir CALL/PUT em velas consecutivas enquanto a mesma confluência 4/4 permanecer ativa.
@@ -38201,7 +38202,10 @@ function mergeServerPerformance(p,m){
     if(r!=='WIN' && r!=='LOSS') return;
     // 3.98.09 — LOSS direto do servidor não é LOSS FINAL quando a gestão
     // possui recuperação/Gale. O /result do navegador decide o desfecho final.
-    if(r==='LOSS' && ['RECOVERY','G1','G2'].includes(currentManagementMode())) return;
+    // 3.98.64 — RN Follow Trend é motor sem Gale/recuperação: o LOSS da primeira vela é final.
+    // Os demais motores continuam respeitando a Gestão global selecionada no app.
+    const serverEngine=normalizeEngineKey(String(x.engine||''));
+    if(r==='LOSS' && serverEngine!=='RNFOLLOW' && ['RECOVERY','G1','G2'].includes(currentManagementMode())) return;
     const t={
       market:m,
       symbol:String(x.symbol||''),
