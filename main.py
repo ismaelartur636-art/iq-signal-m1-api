@@ -42,7 +42,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.74"
+APP_VERSION = "3.98.75"
+# MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
 # MEGA IA 3.98.72 — adiciona RN Follow Trend 03: ATR14 + rejeição + proteção EMA50 + Volume POC; sem S/R obrigatório; placar próprio.
@@ -29855,7 +29856,7 @@ def rn_follow_trend_03_strategy(cs, symbol="EUR/USD", timeframe="1min", market="
         conf=76.0+min(10.0,max(0.0,ratio-.70)*12.0)+(6.0 if poc_dir==direction else (1.0 if poc_dir=='NEUTRO' else 0.0))+(3.0 if ((direction=='CALL' and bull_reject) or (direction=='PUT' and bear_reject)) else 0.0)
         return {**base,"direction":direction,"confidence":round(min(95.0,conf),1),"confirmed":True,
                 "reason":f"{direction} RN Follow Trend 03 FLEX • 0.70 ATR confirmado; POC/rejeição como reforço; próxima vela; sem Gale.",
-                "event_key":f"RNFOLLOW03:{direction}:{stamp}","diagnostics":diag}
+                "event_key":f"RNFOLLOW03:{symbol}:{timeframe}:{stamp}","diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"RN Follow Trend 03 aguardando leitura válida: {str(exc)[:100]}"}
 
@@ -34416,6 +34417,17 @@ def _remember_accounting_signal(request: Request, payload: Dict[str, Any]):
         "trigger_score": payload.get("trigger_score") if payload.get("trigger_score") is not None else rtm_meta.get("trigger_score"),
     }
     key = _accounting_key(item)
+    # 3.98.75 — RN Follow 03: no máximo 1 operação por ativo/timeframe/entrada.
+    # A direção não cria uma segunda operação no mesmo candle.
+    if engine_name == "RNFOLLOW03":
+        entry_key = _canonical_time_key(item.get("entry_time"))
+        for bucket in (pending, done):
+            for existing in bucket.values():
+                if (str(existing.get("engine") or "").upper() == "RNFOLLOW03"
+                    and str(existing.get("symbol") or "") == str(item.get("symbol") or "")
+                    and str(existing.get("interval") or "") == str(item.get("interval") or "")
+                    and _canonical_time_key(existing.get("entry_time")) == entry_key):
+                    return
     if key and key not in done and key not in pending:
         pending[key] = item
 
