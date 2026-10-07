@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.70"
+APP_VERSION = "3.98.71"
 # MEGA IA 3.98.66 — integra MEGA Guide M5-M1: leitura M5 causal, entrada/expiração M1, evento único, radar e placar direto.
 # MEGA IA 3.98.67 — corrige WIN/LOSS de RN Follow Trend + MEGA Guide: normalização no painel e apuração M1 não fica presa por alias/troca de feed.
 # MEGA IA 3.98.68 — destrava MEGA Guide: remove falso rearme que bloqueava sinais, reduz aquecimento e usa tendência M5 10/20/50 com filtros flexíveis.
@@ -23746,7 +23746,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "RNFOLLOW02":
                 analysis=rn_follow_trend_02_strategy(engine_closed[-180:],symbol=symbol,timeframe=interval,market=market)
             elif engine == "MEGAGUIDE":
-                # 3.98.70 — o MEGA Guide respeita o timeframe escolhido no painel.
+                # 3.98.71 — RN Follow 02 flex: ATR 0.70 obrigatório + (S/R OU rejeição), EMA50 só bloqueia tendência contrária forte.
+# 3.98.70 — o MEGA Guide respeita o timeframe escolhido no painel.
                 # M1 analisa/entra/expira M1; M5 faz o mesmo em M5; idem M15/M30.
                 _mg_tf=interval if interval in ("1min","5min","15min","30min") else "1min"
                 if market == "IQ_OTC":
@@ -29745,7 +29746,7 @@ def rn_follow_trend_02_strategy(cs, symbol="EUR/USD", timeframe="1min", market="
     """RN Follow Trend 02 — RN original + S/R + rejeição + proteção EMA50."""
     rows=list(cs or [])[-180:]
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
-          "strategy":"RN FOLLOW TREND 02","engine":"RNFOLLOW02","provider":"RN_FOLLOW_TREND_02_FILTERED_V1",
+          "strategy":"RN FOLLOW TREND 02","engine":"RNFOLLOW02","provider":"RN_FOLLOW_TREND_02_FLEX_V2",
           "risk":"MEDIUM","closed_candles_only":True,"non_repaint":True,"non_repaint_after_release":True,
           "prealert_seconds":20,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,
           "gale_signal":False,"martingale":False,"grid":False}
@@ -29772,22 +29773,27 @@ def rn_follow_trend_02_strategy(cs, symbol="EUR/USD", timeframe="1min", market="
         bull_reject=(lower_wick>=.24 and closes[-1]>lows[-1]+.45*rng)
         bear_reject=(upper_wick>=.24 and closes[-1]<highs[-1]-.45*rng)
         slope=(e50-e50_prev)/max(atr14,1e-12)
-        strong_down=closes[-1]<e50 and slope<-.12
-        strong_up=closes[-1]>e50 and slope>.12
-        call=(move<=-threshold and near_support and bull_reject and not strong_down)
-        put=(move>=threshold and near_resistance and bear_reject and not strong_up)
+        # EMA50 é somente proteção: bloqueia apenas tendência contrária realmente forte.
+        strong_down=closes[-1]<e50 and slope<-.20
+        strong_up=closes[-1]>e50 and slope>.20
+        # FLEX 02: ATR 0,70 é obrigatório; depois basta S/R OU rejeição.
+        call_confirm=bool(near_support or bull_reject)
+        put_confirm=bool(near_resistance or bear_reject)
+        call=(move<=-threshold and call_confirm and not strong_down)
+        put=(move>=threshold and put_confirm and not strong_up)
         direction='CALL' if call and not put else ('PUT' if put and not call else 'NEUTRO')
         diag={"move_atr":round(ratio,3),"trigger_atr":.70,"atr14":round(atr14,8),"ema50":round(e50,8),
               "ema50_slope_atr":round(slope,3),"support":round(support,8),"resistance":round(resistance,8),
               "near_support":near_support,"near_resistance":near_resistance,"lower_wick":round(lower_wick,3),
               "upper_wick":round(upper_wick,3),"bull_rejection":bull_reject,"bear_rejection":bear_reject,
-              "strong_down_block":strong_down,"strong_up_block":strong_up}
+              "strong_down_block":strong_down,"strong_up_block":strong_up,
+              "call_sr_or_rejection":call_confirm,"put_sr_or_rejection":put_confirm}
         if direction=='NEUTRO':
-            return {**base,"reason":f"RN Follow 02 monitorando • movimento {ratio:.2f} ATR • exige S/R + rejeição + proteção EMA50.","diagnostics":diag}
+            return {**base,"reason":f"RN Follow 02 FLEX monitorando • movimento {ratio:.2f} ATR • após 0.70 ATR exige S/R OU rejeição; EMA50 só bloqueia tendência forte.","diagnostics":diag}
         stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or '')
         conf=min(94.0,78.0+min(8.0,max(0.0,ratio-.70)*10.0)+(4 if (lower_wick>=.35 or upper_wick>=.35) else 0)+(4 if abs(slope)<.06 else 0))
         return {**base,"direction":direction,"confidence":round(conf,1),"confirmed":True,
-                "reason":f"{direction} RN Follow Trend 02 • ATR + S/R + rejeição confirmados • EMA50 protegida • próxima vela; sem Gale.",
+                "reason":f"{direction} RN Follow Trend 02 • 0.70 ATR + (S/R OU rejeição) confirmados • EMA50 protegida • próxima vela; sem Gale.",
                 "event_key":f"RNFOLLOW02:{direction}:{stamp}","diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"RN Follow Trend 02 aguardando leitura válida: {str(exc)[:100]}"}
@@ -35491,7 +35497,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <div class="robot-mode-card" id="rnFollow02ModeCard">
     <div>
       <div class="robot-mode-title">📈 RN Follow Trend 02</div>
-      <div class="robot-mode-desc" id="rnFollow02ModeDesc">ATR14 + suporte/resistência + rejeição da vela + proteção EMA50 • próxima vela • sem Grid/Martingale/Gale.</div>
+      <div class="robot-mode-desc" id="rnFollow02ModeDesc">ATR14 0,70 obrigatório + suporte/resistência OU rejeição • EMA50 só bloqueia tendência contrária forte • próxima vela • sem Gale.</div>
     </div>
     <button id="rnFollow02PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
