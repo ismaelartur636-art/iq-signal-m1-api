@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.88"
+APP_VERSION = "3.98.91"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -353,6 +353,30 @@ def ydiv_original_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
 
 # Sniper Reversão: adaptação causal do canal HalfLength=2, DevPeriod=100,
 # Deviations=1 e MACD 12/26/9. Não reproduz objetos de tendência do MT4.
+# Bloqueio de emissão por ativo/timeframe, compartilhado entre radar e sinal oficial.
+# Um mesmo evento pode ser consultado novamente; eventos novos aguardam quatro velas.
+_SNIPER_RELEASE_LOCK = threading.RLock()
+_SNIPER_RELEASES = {}
+def _sniper_release_gate(result, symbol, interval, market, *, claim=False):
+    if not isinstance(result, dict) or result.get("direction") not in ("CALL", "PUT") or not result.get("confirmed"):
+        return result
+    try:
+        step = int(INTERVALS.get(interval, 60))
+        entry = int(next_boundary(interval).timestamp() // step)
+        key = (str(market).upper(), str(symbol).upper(), str(interval))
+        event = str(result.get("event_key") or "")
+        with _SNIPER_RELEASE_LOCK:
+            previous = _SNIPER_RELEASES.get(key)
+            if previous and entry - previous[0] < 4 and previous[1] != event:
+                return {**result, "direction":"NEUTRO", "confirmed":False, "confidence":0.0,
+                        "reason":"Sniper Reversão: intervalo de quatro velas entre entradas."}
+            if claim and (not previous or entry - previous[0] >= 4):
+                _SNIPER_RELEASES[key] = (entry, event)
+    except (ValueError, TypeError, AttributeError):
+        return {**result, "direction":"NEUTRO", "confirmed":False, "confidence":0.0,
+                "reason":"Sniper Reversão: horário de entrada indisponível."}
+    return result
+
 def sniper_reversal_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     base={"available":True,"engine":"SNIPERREV","strategy":"Sniper Reversão","provider":"LOCAL_SNIPER_REV_CAUSAL","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Sniper Reversão monitorando."}
     rows=list(cs or [])[-350:]
@@ -23958,6 +23982,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     except (TypeError,ValueError,OverflowError,AttributeError):
                         _sr_early=False
                 analysis=sniper_reversal_strategy(_sr_rows,symbol=symbol,timeframe=interval,market=market)
+                analysis=_sniper_release_gate(analysis,symbol,interval,market,claim=_sr_early)
                 analysis["early_signal_window"]=_sr_early
                 analysis["seconds_to_entry_snapshot"]=round(_sr_remaining,1)
                 if not _sr_early:
@@ -33872,6 +33897,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "SNIPERREV":
                 tech=sniper_reversal_strategy(closed[-350:],symbol=sym,timeframe=interval,market=market)
+                tech=_sniper_release_gate(tech,sym,interval,market,claim=False)
                 engine_label="🎯 Sniper Reversão"
                 direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 status_text=f"{engine_label} • {direction if direction != 'NEUTRO' else str(tech.get('reason'))[:110]}"
@@ -34672,6 +34698,23 @@ def _remember_accounting_signal(request: Request, payload: Dict[str, Any]):
         "trigger_score": payload.get("trigger_score") if payload.get("trigger_score") is not None else rtm_meta.get("trigger_score"),
     }
     key = _accounting_key(item)
+    # 3.98.90: cooldown REAL no registro de operações do Sniper, não só no padrão de velas.
+    # Abrange operações pendentes e encerradas; não permite direção oposta furar a trava.
+    if engine_name == "SNIPERREV":
+        try:
+            entry_dt = parse_dt(str(item["entry_time"]))
+            min_gap = 4 * int(INTERVALS.get(str(item.get("interval") or "1min"), 60))
+            for bucket in (pending, done):
+                for existing in bucket.values():
+                    if (str(existing.get("engine") or "").upper() != "SNIPERREV"
+                        or str(existing.get("symbol") or "") != str(item.get("symbol") or "")
+                        or str(existing.get("interval") or "") != str(item.get("interval") or "")):
+                        continue
+                    prior_dt = parse_dt(str(existing.get("entry_time")))
+                    if 0 <= (entry_dt - prior_dt).total_seconds() < min_gap:
+                        return
+        except (ValueError, TypeError, KeyError):
+            return  # Não registrar uma operação com horário inválido.
     # 3.98.75 — RN Follow 03: no máximo 1 operação por ativo/timeframe/entrada.
     # A direção não cria uma segunda operação no mesmo candle.
     if engine_name == "RNFOLLOW03":
