@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.91"
+APP_VERSION = "3.98.92"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -416,22 +416,9 @@ def sniper_reversal_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPE
         direction='CALL' if buy and not sell else 'PUT' if sell and not buy else 'NEUTRO'
         if direction=='NEUTRO':
             return {**base,"reason":"Aguardando virada de vela na metade adequada do canal, com rejeição ou MACD."}
-        # Trava causal: só um gatilho por janela de 4 candles, por ativo.
-        # Reavalia as 3 velas anteriores com dados disponíveis naquele instante.
-        # Evita que uma sequência de alternância gere CALL/PUT em toda vela.
-        for lag in (1, 2, 3):
-            j=len(c)-1-lag
-            if j<101:break
-            old_low,old_up=band(j-1)
-            old_mid=(old_low+old_up)/2.0
-            prior_buy=(c[j-1]<o[j-1] and c[j]>o[j]
-                       and min(l[j],l[j-1])<=old_mid
-                       and ((c[j]-l[j])>=max(h[j]-l[j],1e-12)*0.60 or mac[j]>mac[j-1]))
-            prior_sell=(c[j-1]>o[j-1] and c[j]<o[j]
-                        and max(h[j],h[j-1])>=old_mid
-                        and ((h[j]-c[j])>=max(h[j]-l[j],1e-12)*0.60 or mac[j]<mac[j-1]))
-            if prior_buy or prior_sell:
-                return {**base,"reason":"Sniper Reversão: aguardando rearme após sinal recente (4 velas)."}
+        # O intervalo entre entradas é controlado por _sniper_release_gate.
+        # Não bloquear por padrões hipotéticos nas três velas anteriores:
+        # em mercado alternado eles se repetem e impedem qualquer sinal.
         stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
         return {**base,"direction":direction,"confirmed":True,"confidence":70.0,"risk":"HIGH","event_key":f"SNIPERREV:{symbol}:{direction}:{stamp}","reason":f"Sniper Reversão {direction} confirmado no fechamento; próxima vela."}
     except Exception as exc:return {**base,"reason":f"Dados insuficientes: {str(exc)[:80]}"}
