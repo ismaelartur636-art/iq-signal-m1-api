@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.87"
+APP_VERSION = "3.98.88"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -392,6 +392,22 @@ def sniper_reversal_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPE
         direction='CALL' if buy and not sell else 'PUT' if sell and not buy else 'NEUTRO'
         if direction=='NEUTRO':
             return {**base,"reason":"Aguardando virada de vela na metade adequada do canal, com rejeição ou MACD."}
+        # Trava causal: só um gatilho por janela de 4 candles, por ativo.
+        # Reavalia as 3 velas anteriores com dados disponíveis naquele instante.
+        # Evita que uma sequência de alternância gere CALL/PUT em toda vela.
+        for lag in (1, 2, 3):
+            j=len(c)-1-lag
+            if j<101:break
+            old_low,old_up=band(j-1)
+            old_mid=(old_low+old_up)/2.0
+            prior_buy=(c[j-1]<o[j-1] and c[j]>o[j]
+                       and min(l[j],l[j-1])<=old_mid
+                       and ((c[j]-l[j])>=max(h[j]-l[j],1e-12)*0.60 or mac[j]>mac[j-1]))
+            prior_sell=(c[j-1]>o[j-1] and c[j]<o[j]
+                        and max(h[j],h[j-1])>=old_mid
+                        and ((h[j]-c[j])>=max(h[j]-l[j],1e-12)*0.60 or mac[j]<mac[j-1]))
+            if prior_buy or prior_sell:
+                return {**base,"reason":"Sniper Reversão: aguardando rearme após sinal recente (4 velas)."}
         stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
         return {**base,"direction":direction,"confirmed":True,"confidence":70.0,"risk":"HIGH","event_key":f"SNIPERREV:{symbol}:{direction}:{stamp}","reason":f"Sniper Reversão {direction} confirmado no fechamento; próxima vela."}
     except Exception as exc:return {**base,"reason":f"Dados insuficientes: {str(exc)[:80]}"}
@@ -23924,7 +23940,35 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "RNFOLLOW02":
                 analysis=rn_follow_trend_02_strategy(engine_closed[-180:],symbol=symbol,timeframe=interval,market=market)
             elif engine == "SNIPERREV":
-                analysis=sniper_reversal_strategy(engine_closed[-350:],symbol=symbol,timeframe=interval,market=market)
+                # Avalia o candle em formação apenas nos últimos 20s da vela.
+                # O pré-alerta é provisório: não afirma fechamento confirmado.
+                _sr_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                _sr_early=1.0 <= _sr_remaining <= 20.0
+                _sr_rows=engine_closed[-350:]
+                if _sr_early and raw:
+                    try:
+                        _sr_last=raw[-1]
+                        _sr_start=parse_dt(str(_sr_last.get("datetime") or "")).timestamp()
+                        _sr_step=int(INTERVALS[interval])
+                        _sr_now=now().timestamp()
+                        if _sr_start <= _sr_now < _sr_start + _sr_step:
+                            _sr_rows=raw[-350:]
+                        else:
+                            _sr_early=False
+                    except (TypeError,ValueError,OverflowError,AttributeError):
+                        _sr_early=False
+                analysis=sniper_reversal_strategy(_sr_rows,symbol=symbol,timeframe=interval,market=market)
+                analysis["early_signal_window"]=_sr_early
+                analysis["seconds_to_entry_snapshot"]=round(_sr_remaining,1)
+                if not _sr_early:
+                    if analysis.get("confirmed"):
+                        analysis["preview_direction"]=analysis.get("direction")
+                    analysis.update(direction="NEUTRO",confirmed=False,confidence=0.0,
+                        reason=f"Sniper Reversão aguardando pré-alerta nos últimos 20s (faltam {int(_sr_remaining)}s).")
+                elif analysis.get("confirmed"):
+                    analysis["forming_candle_snapshot"]=True
+                    analysis["non_repaint"]=False
+                    analysis["reason"]="PRÉ-ALERTA PROVISÓRIO Sniper Reversão: "+analysis.get("direction","NEUTRO")+" para a próxima vela; candle ainda em formação."
             elif engine == "MEGAREVYDIV":
                 analysis=mega_reversal_ydiv_strategy(engine_closed[-350:],symbol=symbol,timeframe=interval,market=market)
             elif engine == "YDIVORIG":
@@ -25040,6 +25084,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     entry = next_boundary(interval)
                     _lead = SUNTZU_EARLY_SIGNAL_SECONDS if engine == "SUNTZU" else VOLUME_POC_EARLY_SIGNAL_SECONDS
                     announce = entry - timedelta(seconds=_lead)
+                    expiry = entry + timedelta(seconds=INTERVALS[interval])
+                elif engine == "SNIPERREV":
+                    entry = next_boundary(interval)
+                    announce = now()
                     expiry = entry + timedelta(seconds=INTERVALS[interval])
                 elif engine == "ISMAEL98":
                     entry = next_boundary(interval)
