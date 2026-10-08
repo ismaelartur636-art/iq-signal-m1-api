@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.85"
+APP_VERSION = "3.98.87"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -34368,7 +34368,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
             # 3.98.65 — RN Follow Trend: o radar também registra a operação no servidor.
             # Assim o WIN/LOSS é fechado mesmo se o polling do painel mudar logo após o sinal.
             # _accounting_key impede duplicação quando /signal-ai registrar a mesma entrada.
-            if engine in ("RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE") and item.get("direction") in ("CALL", "PUT"):
+            if engine in ("RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "MEGAGUIDE") and item.get("direction") in ("CALL", "PUT"):
                 rn_entry_dt = next_boundary(interval)
                 rn_payload = {
                     **item,
