@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.79"
+APP_VERSION = "3.98.80"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -296,40 +296,61 @@ def ismael98_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", cur
 # yDiv v0.2 — adaptação de sinais RSI14 + pivôs ZigZag confirmados.
 # Não transporta ordens, neutralização, lotes ou trailing do EA MT4.
 def ydiv_original_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    base={"available":True,"engine":"YDIVORIG","strategy":"yDiv Original", "provider":"LOCAL_YDIV02", "direction":"NEUTRO", "confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"yDiv aguardando divergência confirmada."}
+    # yDiv 3.98.80: confirma pivôs apenas com candles fechados; a divergência
+    # permanece elegível por 8 candles após confirmação, com evento estável.
+    base={"available":True,"engine":"YDIVORIG","strategy":"yDiv Original", "provider":"LOCAL_YDIV02", "direction":"NEUTRO", "confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"yDiv monitorando divergência RSI e pivôs confirmados."}
     rows=list(cs or [])[-350:]
-    if len(rows)<45:return {**base,"reason":"yDiv aguardando 45 candles fechados."}
+    if len(rows)<45:
+        return {**base,"reason":f"yDiv aguardando candles fechados ({len(rows)}/45)."}
     try:
-        highs=[float(c['high']) for c in rows]; lows=[float(c['low']) for c in rows]; closes=[float(c['close']) for c in rows]
-        # RSI Wilder 14, apenas dados passados.
-        gains=[max(closes[i]-closes[i-1],0) for i in range(1,len(closes))]
-        losses=[max(closes[i-1]-closes[i],0) for i in range(1,len(closes))]
-        ag=sum(gains[:14])/14; al=sum(losses[:14])/14
+        highs=[float(c['high']) for c in rows]
+        lows=[float(c['low']) for c in rows]
+        closes=[float(c['close']) for c in rows]
+        gains=[max(closes[i]-closes[i-1],0.0) for i in range(1,len(closes))]
+        losses=[max(closes[i-1]-closes[i],0.0) for i in range(1,len(closes))]
+        ag=sum(gains[:14])/14.0
+        al=sum(losses[:14])/14.0
         rsis=[None]*len(closes)
         for i in range(14,len(closes)):
-            if i>14:ag=(ag*13+gains[i-1])/14;al=(al*13+losses[i-1])/14
-            rsis[i]=100 if al==0 else 100-100/(1+ag/al)
-        # Pivôs somente depois de 2 candles fechados à direita: não usa futuro.
-        piv=[]
-        for i in range(14,len(rows)-2):
-            if highs[i]>max(highs[i-2:i]) and highs[i]>=max(highs[i+1:i+3]):piv.append(('H',i,highs[i]))
-            if lows[i]<min(lows[i-2:i]) and lows[i]<=min(lows[i+1:i+3]):piv.append(('L',i,lows[i]))
-        direction='NEUTRO'; key=None
-        for kind in ('H','L'):
-            pts=[x for x in piv if x[0]==kind]
+            if i>14:
+                ag=(ag*13+gains[i-1])/14.0
+                al=(al*13+losses[i-1])/14.0
+            rsis[i]=100.0 if al==0 else 100.0-100.0/(1.0+ag/al)
+        pivots={"H":[],"L":[]}
+        for i in range(16,len(rows)-2):
+            if highs[i]>max(highs[i-2:i]) and highs[i]>=max(highs[i+1:i+3]):
+                pivots["H"].append(i)
+            if lows[i]<min(lows[i-2:i]) and lows[i]<=min(lows[i+1:i+3]):
+                pivots["L"].append(i)
+        candidates=[]
+        for kind in ("H","L"):
+            pts=pivots[kind]
             if len(pts)<2:continue
-            old,new=pts[-2:]; a,b=old[1],new[1]
-            # Mantém por até 3 candles após a confirmação (sem olhar candles futuros).
-            if not (len(rows)-6 <= b <= len(rows)-3) or rsis[a] is None or rsis[b] is None:continue
-            if kind=='H' and new[2]>old[2] and rsis[b]<rsis[a] and rsis[a]>=65:direction='PUT';key=b
-            if kind=='L' and new[2]<old[2] and rsis[b]>rsis[a] and rsis[a]<=35:direction='CALL';key=b
-        if direction!='NEUTRO':
-            stamp=str(rows[key].get('datetime') or rows[key].get('timestamp') or key)
-            return {**base,"direction":direction,"confirmed":True,"confidence":75.0,"risk":"HIGH","event_key":f"YDIVORIG:{symbol}:{direction}:{stamp}","reason":f"yDiv divergência RSI/ZigZag confirmada: {direction} próxima vela (janela de até 3 candles)."}
-        return base
-    except Exception as exc:return {**base,"reason":f"yDiv dados indisponíveis: {str(exc)[:90]}"}
+            # Testa somente o pivô mais recente; pivô já confirmado não repinta.
+            b=pts[-1]
+            age=len(rows)-3-b
+            if age<0 or age>8:continue
+            # Compara com até três pivôs anteriores, sem olhar candles futuros.
+            for a in reversed(pts[-4:-1]):
+                if rsis[a] is None or rsis[b] is None:continue
+                if kind=="H" and highs[b]>highs[a] and rsis[b]<rsis[a] and max(rsis[a],rsis[b])>=60:
+                    candidates.append((b,"PUT",a,age))
+                    break
+                if kind=="L" and lows[b]<lows[a] and rsis[b]>rsis[a] and min(rsis[a],rsis[b])<=40:
+                    candidates.append((b,"CALL",a,age))
+                    break
+        if not candidates:
+            return {**base,"reason":"yDiv monitorando: aguardando divergência RSI/pivôs confirmados (janela de 8 candles)."}
+        candidates.sort(key=lambda item:item[0],reverse=True)
+        b,direction,a,age=candidates[0]
+        if len(candidates)>1 and candidates[1][0]==b and candidates[1][1]!=direction:
+            return {**base,"reason":"yDiv aguardando: divergências opostas no mesmo pivô."}
+        stamp=str(rows[b].get('datetime') or rows[b].get('timestamp') or rows[b].get('time') or b)
+        return {**base,"direction":direction,"confirmed":True,"confidence":70.0,"risk":"HIGH","event_key":f"YDIVORIG:{symbol}:{direction}:{stamp}","reason":f"yDiv divergência RSI/pivôs confirmada ({age} candles após confirmação): {direction} próxima vela."}
+    except Exception as exc:
+        return {**base,"reason":f"yDiv dados indisponíveis: {str(exc)[:90]}"}
 
-PWA_VERSION = "v221"
+PWA_VERSION = "v222"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
