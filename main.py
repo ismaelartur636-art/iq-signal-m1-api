@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.80"
+APP_VERSION = "3.98.81"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -296,8 +296,8 @@ def ismael98_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", cur
 # yDiv v0.2 — adaptação de sinais RSI14 + pivôs ZigZag confirmados.
 # Não transporta ordens, neutralização, lotes ou trailing do EA MT4.
 def ydiv_original_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    # yDiv 3.98.80: confirma pivôs apenas com candles fechados; a divergência
-    # permanece elegível por 8 candles após confirmação, com evento estável.
+    # yDiv 3.98.81: confirma pivôs apenas com candles fechados; a divergência
+    # permanece elegível por 10 candles após confirmação, com evento estável.
     base={"available":True,"engine":"YDIVORIG","strategy":"yDiv Original", "provider":"LOCAL_YDIV02", "direction":"NEUTRO", "confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"yDiv monitorando divergência RSI e pivôs confirmados."}
     rows=list(cs or [])[-350:]
     if len(rows)<45:
@@ -329,18 +329,18 @@ def ydiv_original_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
             # Testa somente o pivô mais recente; pivô já confirmado não repinta.
             b=pts[-1]
             age=len(rows)-3-b
-            if age<0 or age>8:continue
+            if age<0 or age>10:continue
             # Compara com até três pivôs anteriores, sem olhar candles futuros.
-            for a in reversed(pts[-4:-1]):
+            for a in reversed(pts[-7:-1]):
                 if rsis[a] is None or rsis[b] is None:continue
-                if kind=="H" and highs[b]>highs[a] and rsis[b]<rsis[a] and max(rsis[a],rsis[b])>=60:
+                if kind=="H" and highs[b]>highs[a] and rsis[b]<rsis[a] and max(rsis[a],rsis[b])>=55:
                     candidates.append((b,"PUT",a,age))
                     break
-                if kind=="L" and lows[b]<lows[a] and rsis[b]>rsis[a] and min(rsis[a],rsis[b])<=40:
+                if kind=="L" and lows[b]<lows[a] and rsis[b]>rsis[a] and min(rsis[a],rsis[b])<=45:
                     candidates.append((b,"CALL",a,age))
                     break
         if not candidates:
-            return {**base,"reason":"yDiv monitorando: aguardando divergência RSI/pivôs confirmados (janela de 8 candles)."}
+            return {**base,"reason":"yDiv monitorando: aguardando divergência RSI/pivôs confirmados (janela de 10 candles)."}
         candidates.sort(key=lambda item:item[0],reverse=True)
         b,direction,a,age=candidates[0]
         if len(candidates)>1 and candidates[1][0]==b and candidates[1][1]!=direction:
@@ -33744,7 +33744,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 tech=ydiv_original_strategy(closed[-350:],symbol=sym,timeframe=interval,market=market)
                 engine_label="📉 yDiv Original"
                 direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                status_text=f"{engine_label} • {direction if direction != 'NEUTRO' else 'MONITORANDO'}"
+                status_text=f"{engine_label} • {direction if direction != 'NEUTRO' else str(tech.get('reason') or 'MONITORANDO')[:110]}"
             elif engine in ("STEPMAORIG", "STEPMAPRO"):
                 tech=stepma_strategy(closed[-500:],symbol=sym,timeframe=interval,market=market,pro=(engine=="STEPMAPRO"))
                 engine_label="StepMA Pro" if engine=="STEPMAPRO" else "StepMA Original"
