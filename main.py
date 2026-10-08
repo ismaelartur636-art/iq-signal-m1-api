@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.96"
+APP_VERSION = "3.98.97"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -458,7 +458,7 @@ def mega_reversal_ydiv_strategy(cs, symbol="EUR/USD", timeframe="1min", market="
 def mega_gold_scalper_strategy(cs, symbol="XAU/USD", timeframe="1min", market="OPEN"):
     base={"available":True,"engine":"MEGAGOLD","strategy":"Mega Gold Scalper","provider":"LOCAL_XAU_SCALPER_140_CAUSAL","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Mega Gold monitorando."}
     rows=list(cs or [])[-300:]
-    if len(rows)<80:return {**base,"reason":f"Aguardando candles fechados ({len(rows)}/80)."}
+    if len(rows)<60:return {**base,"reason":f"Aguardando candles fechados ({len(rows)}/60)."}
     try:
         closes=[float(x['close']) for x in rows]; highs=[float(x['high']) for x in rows]; lows=[float(x['low']) for x in rows]
         def es(values,period):
@@ -471,16 +471,16 @@ def mega_gold_scalper_strategy(cs, symbol="XAU/USD", timeframe="1min", market="O
         adx=float(adx_series[-1] or 0)
         tr=[max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1])) for i in range(1,len(rows))]
         atr=sum(tr[-14:])/14
-        if atr<=0 or r is None or adx<24:return {**base,"reason":"Aguardando ADX >=24 e ATR válido."}
-        call=fast[-1]>slow[-1] and closes[-2]<fast[-2] and closes[-1]>fast[-1] and closes[-1]-fast[-1]>atr*.4 and r<65
-        put=fast[-1]<slow[-1] and closes[-2]>fast[-2] and closes[-1]<fast[-1] and fast[-1]-closes[-1]>atr*.4 and r>35
+        if atr<=0 or r is None or adx<18:return {**base,"reason":"Aguardando ADX >=18 e ATR válido."}
+        call=fast[-1]>slow[-1] and closes[-2]<=fast[-2]+atr*.15 and closes[-1]>fast[-1] and closes[-1]-fast[-1]>atr*.18 and r<70
+        put=fast[-1]<slow[-1] and closes[-2]>=fast[-2]-atr*.15 and closes[-1]<fast[-1] and fast[-1]-closes[-1]>atr*.18 and r>30
         direction='CALL' if call else 'PUT' if put else 'NEUTRO'
         if direction=='NEUTRO':return {**base,"reason":"Aguardando retomada EMA8/21 + RSI + ADX + ATR."}
         stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
         return {**base,"direction":direction,"confirmed":True,"confidence":70.0,"risk":"HIGH","event_key":f"MEGAGOLD:{market}:{symbol}:{stamp}","reason":f"Mega Gold {direction}: retomada confirmada; próxima M1."}
     except Exception as exc:return {**base,"reason":f"Mega Gold aguardando dados: {str(exc)[:90]}"}
 
-PWA_VERSION = "v224"
+PWA_VERSION = "v225"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
