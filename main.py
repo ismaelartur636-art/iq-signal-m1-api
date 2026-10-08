@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.83"
+APP_VERSION = "3.98.84"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -356,7 +356,7 @@ def ydiv_original_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
 def sniper_reversal_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     base={"available":True,"engine":"SNIPERREV","strategy":"Sniper Reversão","provider":"LOCAL_SNIPER_REV_CAUSAL","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Sniper Reversão monitorando."}
     rows=list(cs or [])[-350:]
-    if len(rows)<115:return {**base,"reason":f"Aguardando candles fechados ({len(rows)}/115)."}
+    if len(rows)<105:return {**base,"reason":f"Aguardando candles fechados ({len(rows)}/105)."}
     try:
         c=[float(x['close']) for x in rows]; o=[float(x['open']) for x in rows]
         h=[float(x['high']) for x in rows]; l=[float(x['low']) for x in rows]
@@ -373,10 +373,14 @@ def sniper_reversal_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPE
             v=c[i-99:i+1]; avg=sum(v)/len(v)
             dev=(sum((x-avg)**2 for x in v)/len(v))**0.5
             return mid-dev,mid+dev
-        low,up=band(len(c)-1);old_low,old_up=band(len(c)-2)
-        # Rejeição da banda + confirmação de virada MACD e vela fechada.
-        buy=l[-1]<=low and c[-1]>low and c[-1]>o[-1] and mac[-1]>mac[-2] and mac[-1]<=sig[-1]
-        sell=h[-1]>=up and c[-1]<up and c[-1]<o[-1] and mac[-1]<mac[-2] and mac[-1]>=sig[-1]
+        # Banda anterior evita usar a própria vela para deslocar o gatilho.
+        low,up=band(len(c)-2)
+        width=max(up-low,1e-12)
+        tolerance=width*0.12
+        # Perfil FLEX: toque próximo à banda, rejeição no fechamento e
+        # MACD perdendo força na direção anterior (sem exigir cruzamento).
+        buy=l[-1]<=low+tolerance and c[-1]>low and c[-1]>o[-1] and mac[-1]>mac[-2]
+        sell=h[-1]>=up-tolerance and c[-1]<up and c[-1]<o[-1] and mac[-1]<mac[-2]
         direction='CALL' if buy and not sell else 'PUT' if sell and not buy else 'NEUTRO'
         if direction=='NEUTRO':return {**base,"reason":"Aguardando rejeição de canal e reversão MACD confirmadas."}
         stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
@@ -386,12 +390,24 @@ def sniper_reversal_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPE
 def mega_reversal_ydiv_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     base={"available":True,"engine":"MEGAREVYDIV","strategy":"Mega Reversão + yDiv","provider":"LOCAL_REV_YDIV","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Aguardando confluência."}
     rows=list(cs or [])[-350:]
-    a=sniper_reversal_strategy(rows,symbol,timeframe,market)
     b=ydiv_original_strategy(rows,symbol,timeframe,market)
-    if not a.get('confirmed') or not b.get('confirmed') or a.get('direction')!=b.get('direction'):
-        return {**base,"reason":"Aguardando Sniper Reversão e yDiv confirmarem a mesma direção."}
-    direction=a['direction']; stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
-    return {**base,"direction":direction,"confirmed":True,"confidence":75.0,"risk":"HIGH","event_key":f"MEGAREVYDIV:{symbol}:{direction}:{stamp}","reason":f"Sniper Reversão + yDiv confirmados: {direction} próxima vela."}
+    if not b.get('confirmed') or b.get('direction') not in ('CALL','PUT'):
+        return {**base,"reason":"Aguardando divergência confirmada do yDiv."}
+    # yDiv Original permanece intacto. A confluência aceita sinais do
+    # Sniper nos últimos cinco candles FECHADOS, sem olhar dados futuros.
+    # O evento combina as duas confirmações e não muda a cada polling.
+    direction=b['direction']
+    for offset in range(0,5):
+        sample=rows[:-offset] if offset else rows
+        if len(sample)<105:break
+        a=sniper_reversal_strategy(sample,symbol,timeframe,market)
+        if a.get('confirmed') and a.get('direction')==direction:
+            ykey=str(b.get('event_key',''))
+            skey=str(a.get('event_key',''))
+            return {**base,"direction":direction,"confirmed":True,"confidence":72.0,"risk":"HIGH",
+                    "event_key":f"MEGAREVYDIV:{symbol}:{direction}:{ykey}:{skey}",
+                    "reason":f"Sniper Reversão + yDiv: {direction} confirmado em até 5 velas; próxima vela."}
+    return {**base,"reason":"Aguardando confirmação do Sniper nos últimos cinco candles."}
 
 PWA_VERSION = "v222"
 
