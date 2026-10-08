@@ -373,16 +373,25 @@ def sniper_reversal_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPE
             v=c[i-99:i+1]; avg=sum(v)/len(v)
             dev=(sum((x-avg)**2 for x in v)/len(v))**0.5
             return mid-dev,mid+dev
-        # Banda anterior evita usar a própria vela para deslocar o gatilho.
+        # Reversão FLEX por evento: exige mudança de direção da vela,
+        # proximidade ao lado do canal e confirmação por rejeição OU MACD.
+        # Não emite a cada vela enquanto a mesma tendência persistir.
         low,up=band(len(c)-2)
         width=max(up-low,1e-12)
-        tolerance=width*0.30
-        # Perfil FLEX: toque próximo à banda, rejeição no fechamento e
-        # MACD perdendo força na direção anterior (sem exigir cruzamento).
-        buy=l[-1]<=low+tolerance and c[-1]>o[-1] and (mac[-1]>=mac[-2] or c[-1]>c[-2])
-        sell=h[-1]>=up-tolerance and c[-1]<o[-1] and (mac[-1]<=mac[-2] or c[-1]<c[-2])
+        mid=(low+up)/2.0
+        previous_down=c[-2]<o[-2]
+        previous_up=c[-2]>o[-2]
+        bullish=c[-1]>o[-1]
+        bearish=c[-1]<o[-1]
+        lower_zone=min(l[-1],l[-2])<=mid
+        upper_zone=max(h[-1],h[-2])>=mid
+        bullish_rejection=(c[-1]-l[-1])>=max(h[-1]-l[-1],1e-12)*0.60
+        bearish_rejection=(h[-1]-c[-1])>=max(h[-1]-l[-1],1e-12)*0.60
+        buy=previous_down and bullish and lower_zone and (bullish_rejection or mac[-1]>mac[-2])
+        sell=previous_up and bearish and upper_zone and (bearish_rejection or mac[-1]<mac[-2])
         direction='CALL' if buy and not sell else 'PUT' if sell and not buy else 'NEUTRO'
-        if direction=='NEUTRO':return {**base,"reason":"Aguardando rejeição de canal e reversão MACD confirmadas."}
+        if direction=='NEUTRO':
+            return {**base,"reason":"Aguardando virada de vela na metade adequada do canal, com rejeição ou MACD."}
         stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
         return {**base,"direction":direction,"confirmed":True,"confidence":70.0,"risk":"HIGH","event_key":f"SNIPERREV:{symbol}:{direction}:{stamp}","reason":f"Sniper Reversão {direction} confirmado no fechamento; próxima vela."}
     except Exception as exc:return {**base,"reason":f"Dados insuficientes: {str(exc)[:80]}"}
