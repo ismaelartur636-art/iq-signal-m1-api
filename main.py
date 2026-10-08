@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.93"
+APP_VERSION = "3.98.94"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -28839,6 +28839,10 @@ def _background_symbols_for_state() -> list[str]:
     configured = [x for x in configured if x in allowed and _symbol_allowed(x, market)]
     if configured:
         return configured
+    # Mega Gold: quando nenhum conjunto foi enviado pelo painel, varre todos
+    # os ativos cadastrados no mercado escolhido, sem limitar ao ouro.
+    if engine == "MEGAGOLD":
+        return [x for x in allowed if _symbol_allowed(x, market)]
     # 3.98.19 — nunca escolher BTC silenciosamente. O painel envia explicitamente
     # os ativos da aba PARIDADES ou CRIPTO; sem escopo configurado, não varre nada.
     return []
