@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.97"
+APP_VERSION = "3.98.98"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -480,7 +480,7 @@ def mega_gold_scalper_strategy(cs, symbol="XAU/USD", timeframe="1min", market="O
         return {**base,"direction":direction,"confirmed":True,"confidence":70.0,"risk":"HIGH","event_key":f"MEGAGOLD:{market}:{symbol}:{stamp}","reason":f"Mega Gold {direction}: retomada confirmada; próxima M1."}
     except Exception as exc:return {**base,"reason":f"Mega Gold aguardando dados: {str(exc)[:90]}"}
 
-PWA_VERSION = "v225"
+PWA_VERSION = "v226"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -36843,7 +36843,7 @@ const stepmaProPowerBtn=document.getElementById('stepmaProPowerBtn');
 let ydivOrigEnabled=false,sniperRevEnabled=false,megaRevYdivEnabled=false,stepmaOrigEnabled=false,stepmaProEnabled=false;
 const megaGuidePowerBtn=document.getElementById('megaGuidePowerBtn');
 const megaGoldPowerBtn=document.getElementById('megaGoldPowerBtn');
-let megaGoldEnabled=false;
+let megaGoldEnabled=localStorage.getItem('mega_gold_power')==='ONLINE';
 const tsr2016PowerBtn=document.getElementById('tsr2016PowerBtn');
 const barReversalPowerBtn=document.getElementById('barReversalPowerBtn');
 const aaPlusPowerBtn=document.getElementById('aaPlusPowerBtn');
@@ -37508,6 +37508,7 @@ function setExclusiveVisibleEngine(engine){
     localStorage.setItem('mega_rn_follow_power',rnFollowEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_rn_follow02_power',rnFollow02Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_rn_follow03_power',rnFollow03Enabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_gold_power',megaGoldEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_guide_power',megaGuideEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_tsr2016_power',tsr2016Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_bar_reversal_power',barReversalEnabled?'ONLINE':'OFFLINE');
@@ -37576,6 +37577,7 @@ function adoptBackgroundEngineState(d){
   stepmaOrigEnabled=(e==='STEPMAORIG');
   stepmaProEnabled=(e==='STEPMAPRO');
   megaGuideEnabled=(e==='MEGAGUIDE');
+  megaGoldEnabled=(e==='MEGAGOLD');
   tsr2016Enabled=(e==='TSR2016');
   barReversalEnabled=(e==='BARREVERSAL');
   aaPlusEnabled=(e==='AAPLUS');
@@ -37599,6 +37601,7 @@ function adoptBackgroundEngineState(d){
     localStorage.setItem('mega_rn_follow_power',rnFollowEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_rn_follow02_power',rnFollow02Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_rn_follow03_power',rnFollow03Enabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_gold_power',megaGoldEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_guide_power',megaGuideEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_tsr2016_power',tsr2016Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_bar_reversal_power',barReversalEnabled?'ONLINE':'OFFLINE');
