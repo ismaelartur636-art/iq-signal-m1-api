@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.115"
+APP_VERSION = "3.98.116"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -480,6 +480,33 @@ def mega_gold_scalper_strategy(cs, symbol="XAU/USD", timeframe="1min", market="O
         return {**base,"direction":direction,"confirmed":True,"confidence":70.0,"risk":"HIGH","event_key":f"MEGAGOLD:{market}:{symbol}:{stamp}","reason":f"Mega Gold {direction}: retomada confirmada; próxima M1."}
     except Exception as exc:return {**base,"reason":f"Mega Gold aguardando dados: {str(exc)[:90]}"}
 
+
+# Intervalo mínimo de 4 minutos entre sinais oficiais do RSI 2, global para todos os pares.
+# Consultas do radar não consomem o intervalo.
+_RSI2_SIGNAL_LOCK = threading.RLock()
+_RSI2_LAST_RELEASE = 0.0
+_RSI2_LAST_EVENT = ""
+
+def _rsi2_cooldown_gate(result, *, claim=False):
+    global _RSI2_LAST_RELEASE, _RSI2_LAST_EVENT
+    if not isinstance(result, dict) or result.get("direction") not in ("CALL", "PUT") or not result.get("confirmed"):
+        return result
+    with _RSI2_SIGNAL_LOCK:
+        elapsed = time.monotonic() - _RSI2_LAST_RELEASE if _RSI2_LAST_RELEASE else 240.0
+        event = str(result.get("event_key") or "")
+        # Mesmo evento nunca reinicia o relógio, nem deve gerar outro sinal.
+        if event and event == _RSI2_LAST_EVENT:
+            return {**result, "direction":"NEUTRO", "confirmed":False, "confidence":0.0,
+                    "reason":"RSI 2: sinal desta vela já liberado; aguardando nova oportunidade."}
+        if elapsed < 240.0:
+            remaining = int(240.0 - elapsed + 0.999)
+            return {**result, "direction":"NEUTRO", "confirmed":False, "confidence":0.0,
+                    "cooldown_remaining_seconds":remaining,
+                    "reason":f"RSI 2: próximo sinal permitido em {remaining}s (intervalo de 4 minutos)."}
+        if claim:
+            _RSI2_LAST_RELEASE = time.monotonic()
+            _RSI2_LAST_EVENT = event
+    return result
 
 # RSI 2 Deriv adaptado: RSI Wilder(2), extremos 20/80, somente M1.
 def rsi2_deriv_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
@@ -24169,6 +24196,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         analysis["reason"]="PRÉ-ALERTA PROVISÓRIO AutoHedge: "+analysis["direction"]+" para a próxima M1; vela em formação."
             elif engine == "RSI2DERIV":
                 analysis=rsi2_deriv_strategy(engine_closed[-100:],symbol=symbol,timeframe=interval,market=market)
+                analysis=_rsi2_cooldown_gate(analysis,claim=True)
             elif engine == "GOLDRUSH":
                 analysis=gold_rush_pro_strategy(engine_closed[-180:],symbol=symbol,timeframe=interval,market=market)
             elif engine == "MEGAGOLD":
@@ -34125,6 +34153,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 status_text=f"{engine_label} • {direction if direction!='NEUTRO' else 'MONITORANDO'}"
             elif engine == "RSI2DERIV":
                 tech=rsi2_deriv_strategy(closed[-100:],symbol=sym,timeframe=interval,market=market)
+                tech=_rsi2_cooldown_gate(tech,claim=False)
                 engine_label="RSI 2"
                 direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 status_text=f"{engine_label} • {direction if direction!='NEUTRO' else 'MONITORANDO'}"
