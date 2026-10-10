@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.109"
+APP_VERSION = "3.98.110"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -29926,14 +29926,24 @@ def money_pile_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         prev_call_condition=(prev_r9>=50.0 and prev_cci13>=0.0 and prev_k_smooth>=prev_d_smooth and prev_ma5>prev_ma9)
         prev_put_condition=(prev_r9<=50.0 and prev_cci13<=0.0 and prev_k_smooth<=prev_d_smooth and prev_ma5<prev_ma9)
 
+        # ATR14 adaptativo: filtro de volatilidade, sem alterar a confluencia 4/4.
+        trs=[max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1])) for i in range(1,len(rows))]
+        atr_series=[sum(trs[j-14:j])/14.0 for j in range(14,len(trs)+1)]
+        atr_now=atr_series[-1]
+        baseline=sorted(atr_series[-16:-1])
+        atr_ref=baseline[len(baseline)//2] if baseline else 0.0
+        atr_ratio=atr_now/atr_ref if atr_ref>0 else 0.0
+        atr_ok=bool(atr_now>0 and atr_ref>0 and 0.55<=atr_ratio<=2.20)
+
         call=bool(call_condition and not prev_call_condition)
         put=bool(put_condition and not prev_put_condition)
         direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
         diag={"rsi9":round(r9,2),"cci13":round(cci13,2),"stoch_k_5_3_3":round(k_smooth,2),"stoch_d_5_3_3":round(d_smooth,2),"ma5":round(ma5,8),"ma9":round(ma9,8),
               "condition_call":bool(call_condition),"condition_put":bool(put_condition),
               "previous_call_condition":bool(prev_call_condition),"previous_put_condition":bool(prev_put_condition),
-              "new_event":bool(direction!="NEUTRO")}
+              "new_event":bool(direction!="NEUTRO"),"atr14":round(atr_now,8),"atr_ratio":round(atr_ratio,3),"atr_filter_ok":atr_ok}
         if direction=="NEUTRO": return {**base,"reason":"MEGA MONEY monitorando confluência 4/4; condição mantida não repete sinal, aguardando rearme/novo evento.","diagnostics":diag}
+        if not atr_ok: return {**base,"reason":"MEGA MONEY: ATR14 bloqueou volatilidade fora da faixa adaptativa.","diagnostics":diag}
         stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
         return {**base,"direction":direction,"confidence":86.0,"confirmed":True,"risk":"LOW",
                 "reason":f"{direction} MEGA MONEY • 4 confluências alinhadas • próxima M1 • sem Gale.",
