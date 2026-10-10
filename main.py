@@ -518,7 +518,7 @@ def autohedge_m1_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN")
     except (ValueError,TypeError,KeyError,ZeroDivisionError) as exc:
         return {**base,"reason":f"Dados invalidos: {str(exc)[:80]}"}
 
-PWA_VERSION = "v227"
+PWA_VERSION = "v228"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -35863,11 +35863,11 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     .mega-ea-folder{display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;min-height:92px;margin:10px 0 12px;padding:16px;border:1px solid #2f86ff;border-radius:16px;background:linear-gradient(180deg,rgba(15,45,76,.96),rgba(6,25,44,.96));box-shadow:0 0 20px rgba(47,134,255,.18);cursor:pointer;user-select:none}
     .mega-ea-folder-title{font-size:30px;font-weight:1000;letter-spacing:1.2px;color:#7fd3ff;text-shadow:0 0 14px rgba(66,190,255,.45)}
     .mega-ea-folder-hint{font-size:12px;font-weight:800;opacity:.78}
-    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #rnFollowModeCard,body:not(.mega-ea-open) #rnFollow02ModeCard,body:not(.mega-ea-open) #rnFollow03ModeCard,body:not(.mega-ea-open) #sniperRevModeCard,body:not(.mega-ea-open) #megaRevYdivModeCard,body:not(.mega-ea-open) #ydivOrigModeCard,body:not(.mega-ea-open) #stepmaOrigModeCard,body:not(.mega-ea-open) #stepmaProModeCard,body:not(.mega-ea-open) #megaGuideModeCard,body:not(.mega-ea-open) #megaGoldModeCard,body:not(.mega-ea-open) #tsr2016ModeCard,body:not(.mega-ea-open) #barReversalModeCard,body:not(.mega-ea-open) #aaPlusModeCard,body:not(.mega-ea-open) #megaPremiumModeCard,body:not(.mega-ea-open) #megaPremiumProtectedModeCard,body:not(.mega-ea-open) #megaHftModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
+    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #rnFollowModeCard,body:not(.mega-ea-open) #rnFollow02ModeCard,body:not(.mega-ea-open) #rnFollow03ModeCard,body:not(.mega-ea-open) #sniperRevModeCard,body:not(.mega-ea-open) #megaRevYdivModeCard,body:not(.mega-ea-open) #ydivOrigModeCard,body:not(.mega-ea-open) #stepmaOrigModeCard,body:not(.mega-ea-open) #stepmaProModeCard,body:not(.mega-ea-open) #megaGuideModeCard,body:not(.mega-ea-open) #megaGoldModeCard,body:not(.mega-ea-open) #autoHedgeModeCard,body:not(.mega-ea-open) #tsr2016ModeCard,body:not(.mega-ea-open) #barReversalModeCard,body:not(.mega-ea-open) #aaPlusModeCard,body:not(.mega-ea-open) #megaPremiumModeCard,body:not(.mega-ea-open) #megaPremiumProtectedModeCard,body:not(.mega-ea-open) #megaHftModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
 
     /* 3.97.11 — painel de motores enxuto: MOTOR REMOVIDO + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
-    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#paulMacdModeCard,#paulMacdM1ModeCard,#sidus320ModeCard,#rnFollowModeCard,#rnFollow02ModeCard,#rnFollow03ModeCard,#sniperRevModeCard,#megaRevYdivModeCard,#ydivOrigModeCard,#stepmaOrigModeCard,#stepmaProModeCard,#megaGuideModeCard,#megaGoldModeCard,#tsr2016ModeCard,#barReversalModeCard,#aaPlusModeCard,#megaPremiumModeCard,#megaPremiumProtectedModeCard,#megaHftModeCard,#pyramid7ModeCard,#predatorPipsModeCard,#millionEaModeCard,#moneyPileModeCard{display:flex !important}
+    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#paulMacdModeCard,#paulMacdM1ModeCard,#sidus320ModeCard,#rnFollowModeCard,#rnFollow02ModeCard,#rnFollow03ModeCard,#sniperRevModeCard,#megaRevYdivModeCard,#ydivOrigModeCard,#stepmaOrigModeCard,#stepmaProModeCard,#megaGuideModeCard,#megaGoldModeCard,#autoHedgeModeCard,#tsr2016ModeCard,#barReversalModeCard,#aaPlusModeCard,#megaPremiumModeCard,#megaPremiumProtectedModeCard,#megaHftModeCard,#pyramid7ModeCard,#predatorPipsModeCard,#millionEaModeCard,#moneyPileModeCard{display:flex !important}
     #scalperProModeCard .robot-mode-desc,#dragonFireModeCard .robot-mode-desc,#dragonFireProModeCard .robot-mode-desc,#roboFiboModeCard .robot-mode-desc,#paulMacdModeCard .robot-mode-desc,#paulMacdM1ModeCard .robot-mode-desc,#sidus320ModeCard .robot-mode-desc,#rnFollowModeCard .robot-mode-desc,#rnFollow02ModeCard .robot-mode-desc,#rnFollow03ModeCard .robot-mode-desc,#tsr2016ModeCard .robot-mode-desc,#megaPremiumModeCard .robot-mode-desc,#megaPremiumProtectedModeCard .robot-mode-desc,#megaHftModeCard .robot-mode-desc,#pyramid7ModeCard .robot-mode-desc,#predatorPipsModeCard .robot-mode-desc,#millionEaModeCard .robot-mode-desc,#moneyPileModeCard .robot-mode-desc{display:none !important}
     #scalpingAsiaModeCard{display:none !important}
   </style>
@@ -35931,6 +35931,11 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="Mega Gold Scalper">
     <div class="robot-mode-copy"><div class="robot-mode-title">🏆 Mega Gold Scalper</div><div class="robot-mode-desc">EMA 8/21 + ADX 14 + RSI 14 + ATR 14 • M1 • pré-alerta 20s • sem Gale.</div></div>
     <button id="megaGoldPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+  <div class="robot-mode-card" id="autoHedgeModeCard">
+    <img src="__MEGA_IMAGE__" alt="AutoHedge M1">
+    <div class="robot-mode-copy"><div class="robot-mode-title">⚙️ AutoHedge M1</div><div class="robot-mode-desc">Impulso de preço experimental • próxima M1 • pré-alerta 20s • sem Grid ou Hedge.</div></div>
+    <button id="autoHedgePowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
   <div class="robot-mode-card" id="megaGuideModeCard">
     <img src="__MEGA_IMAGE__" alt="MEGA Guide M5-M1">
@@ -36889,6 +36894,8 @@ let ydivOrigEnabled=false,sniperRevEnabled=false,megaRevYdivEnabled=false,stepma
 const megaGuidePowerBtn=document.getElementById('megaGuidePowerBtn');
 const megaGoldPowerBtn=document.getElementById('megaGoldPowerBtn');
 let megaGoldEnabled=localStorage.getItem('mega_gold_power')==='ONLINE';
+const autoHedgePowerBtn=document.getElementById('autoHedgePowerBtn');
+let autoHedgeEnabled=false;
 const tsr2016PowerBtn=document.getElementById('tsr2016PowerBtn');
 const barReversalPowerBtn=document.getElementById('barReversalPowerBtn');
 const aaPlusPowerBtn=document.getElementById('aaPlusPowerBtn');
@@ -37530,6 +37537,7 @@ function setExclusiveVisibleEngine(engine){
   stepmaProEnabled=(e==='STEPMAPRO');
   megaGuideEnabled=(e==='MEGAGUIDE');
   megaGoldEnabled=(e==='MEGAGOLD');
+  autoHedgeEnabled=(e==='AUTOHEDGEM1');
   tsr2016Enabled=(e==='TSR2016');
   barReversalEnabled=(e==='BARREVERSAL');
   aaPlusEnabled=(e==='AAPLUS');
@@ -37589,6 +37597,7 @@ function selectedRobotEngine(){
   if(stepmaOrigEnabled) return 'STEPMAORIG';
   if(stepmaProEnabled) return 'STEPMAPRO';
   if(megaGoldEnabled) return 'MEGAGOLD';
+  if(autoHedgeEnabled) return 'AUTOHEDGEM1';
   if(megaGuideEnabled) return 'MEGAGUIDE';
   if(tsr2016Enabled) return 'TSR2016';
   if(megaPremiumEnabled) return 'MEGAPREMIUM';
@@ -37607,7 +37616,7 @@ function adoptBackgroundEngineState(d){
   if(typeof d.telegram_enabled==='boolean'){ telegramEnabled=!!d.telegram_enabled; }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(e!=='PAULMACD' && e!=='PAULMACDM1' && e!=='MILLIONEA' && e!=='MONEYPILE' && e!=='SIDUS320' && e!=='MEGAPREMIUM' && e!=='MEGAPREMIUMPOC' && e!=='MEGAPREMIUMPRO' && e!=='TSR2016' && e!=='RNFOLLOW' && e!=='RNFOLLOW02' && e!=='RNFOLLOW03' && e!=='STEPMAORIG' && e!=='YDIVORIG' && e!=='SNIPERREV' && e!=='MEGAREVYDIV' && e!=='STEPMAPRO' && e!=='MEGAGUIDE' && e!=='MEGAGOLD' && e!=='BARREVERSAL' && e!=='AAPLUS' && e!=='SCALPERPRO' && e!=='FIBORSI' && e!=='MEGAHFT' && e!=='PYRAMID7' && e!=='PREDATORPIPS') return;
+  if(e!=='PAULMACD' && e!=='PAULMACDM1' && e!=='MILLIONEA' && e!=='MONEYPILE' && e!=='SIDUS320' && e!=='MEGAPREMIUM' && e!=='MEGAPREMIUMPOC' && e!=='MEGAPREMIUMPRO' && e!=='TSR2016' && e!=='RNFOLLOW' && e!=='RNFOLLOW02' && e!=='RNFOLLOW03' && e!=='STEPMAORIG' && e!=='YDIVORIG' && e!=='SNIPERREV' && e!=='MEGAREVYDIV' && e!=='STEPMAPRO' && e!=='MEGAGUIDE' && e!=='MEGAGOLD' && e!=='AUTOHEDGEM1' && e!=='BARREVERSAL' && e!=='AAPLUS' && e!=='SCALPERPRO' && e!=='FIBORSI' && e!=='MEGAHFT' && e!=='PYRAMID7' && e!=='PREDATORPIPS') return;
   paulMacdEnabled=(e==='PAULMACD');
   paulMacdM1Enabled=(e==='PAULMACDM1');
   millionEaEnabled=(e==='MILLIONEA');
@@ -37623,6 +37632,7 @@ function adoptBackgroundEngineState(d){
   stepmaProEnabled=(e==='STEPMAPRO');
   megaGuideEnabled=(e==='MEGAGUIDE');
   megaGoldEnabled=(e==='MEGAGOLD');
+  autoHedgeEnabled=(e==='AUTOHEDGEM1');
   tsr2016Enabled=(e==='TSR2016');
   barReversalEnabled=(e==='BARREVERSAL');
   aaPlusEnabled=(e==='AAPLUS');
@@ -37668,7 +37678,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',SIDUS320:'🎯 SIDUS EA V3.20',TSR2016:'🎯 Mega Sniper',RNFOLLOW:'📈 RN Follow Trend',RNFOLLOW02:'📈 RN Follow Trend 02',RNFOLLOW03:'📈 RN Follow Trend 03',YDIVORIG:'📉 yDiv Original',SNIPERREV:'🎯 Sniper Reversão',MEGAREVYDIV:'🎯 Mega Reversão + yDiv',STEPMAORIG:'📈 StepMA Original',STEPMAPRO:'📈 StepMA Pro',MEGAGOLD:'🏆 Mega Gold Scalper',MEGAGUIDE:'🧭 MEGA Guide M5-M1',BARREVERSAL:'🔄 1 BAR REVERSAL',AAPLUS:'🐊 AA+',MEGAPREMIUM:'💎 MEGA PREMIUM',MEGAPREMIUMPOC:'💎 MEGA PREMIUM + POC',MEGAPREMIUMPRO:'🛡️ MEGA PREMIUM PROTEGIDO',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MEGAHFT:'⚡ MEGA HFT',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO'})[e]||'SEM MOTOR';
+  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',SIDUS320:'🎯 SIDUS EA V3.20',TSR2016:'🎯 Mega Sniper',RNFOLLOW:'📈 RN Follow Trend',RNFOLLOW02:'📈 RN Follow Trend 02',RNFOLLOW03:'📈 RN Follow Trend 03',YDIVORIG:'📉 yDiv Original',SNIPERREV:'🎯 Sniper Reversão',MEGAREVYDIV:'🎯 Mega Reversão + yDiv',STEPMAORIG:'📈 StepMA Original',STEPMAPRO:'📈 StepMA Pro',MEGAGOLD:'🏆 Mega Gold Scalper',AUTOHEDGEM1:'⚙️ AutoHedge M1',MEGAGUIDE:'🧭 MEGA Guide M5-M1',BARREVERSAL:'🔄 1 BAR REVERSAL',AAPLUS:'🐊 AA+',MEGAPREMIUM:'💎 MEGA PREMIUM',MEGAPREMIUMPOC:'💎 MEGA PREMIUM + POC',MEGAPREMIUMPRO:'🛡️ MEGA PREMIUM PROTEGIDO',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MEGAHFT:'⚡ MEGA HFT',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO'})[e]||'SEM MOTOR';
 }
 
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
@@ -39250,7 +39260,8 @@ function engineScoreSnapshot(bucket){
     RNFOLLOW:{key:'RNFOLLOW',name:'📈 RN Follow Trend',wins:0,losses:0},
     RNFOLLOW02:{key:'RNFOLLOW02',name:'📈 RN Follow Trend 02',wins:0,losses:0},
     RNFOLLOW03:{key:'RNFOLLOW03',name:'📈 RN Follow Trend 03',wins:0,losses:0},
-    MEGAGOLD:{key:'MEGAGOLD','AUTOHEDGEM1',name:'🏆 Mega Gold Scalper',wins:0,losses:0},
+    MEGAGOLD:{key:'MEGAGOLD',name:'🏆 Mega Gold Scalper',wins:0,losses:0},
+    AUTOHEDGEM1:{key:'AUTOHEDGEM1',name:'AutoHedge M1',wins:0,losses:0},
     MEGAGUIDE:{key:'MEGAGUIDE',name:'🧭 MEGA Guide M5-M1',wins:0,losses:0},
     PYRAMID7:{key:'PYRAMID7',name:'🔺 PYRAMID 7 PRO',wins:0,losses:0},
     OTHER:{key:'OTHER',name:'🗂️ OUTROS / ANTIGOS',wins:0,losses:0}
@@ -41766,6 +41777,7 @@ function applyRobotPowerState(){
   for(const [btn,on] of [[ydivOrigPowerBtn,ydivOrigEnabled],[sniperRevPowerBtn,sniperRevEnabled],[megaRevYdivPowerBtn,megaRevYdivEnabled],[stepmaOrigPowerBtn,stepmaOrigEnabled],[stepmaProPowerBtn,stepmaProEnabled]]){if(btn){btn.textContent=on?'🟢 ONLINE':'🔴 OFFLINE';btn.style.background=on?'#0b7a3d':'#7d1d1d';btn.style.color='#fff';}}
   for(const [btn,on] of [[ydivOrigPowerBtn,ydivOrigEnabled],[sniperRevPowerBtn,sniperRevEnabled],[megaRevYdivPowerBtn,megaRevYdivEnabled],[stepmaProPowerBtn,stepmaProEnabled]]){if(btn){btn.textContent=on?'🟢 ONLINE':'🔴 OFFLINE';btn.style.background=on?'#0b7a3d':'#7d1d1d';btn.style.color='#fff';}}
 
+  if(autoHedgePowerBtn){autoHedgePowerBtn.textContent=autoHedgeEnabled?'🟢 ONLINE':'🔴 OFFLINE';autoHedgePowerBtn.style.background=autoHedgeEnabled?'#0b7a3d':'#7d1d1d';autoHedgePowerBtn.style.color='#fff';}
   if(megaGoldPowerBtn){megaGoldPowerBtn.textContent=megaGoldEnabled?'🟢 ONLINE':'🔴 OFFLINE';megaGoldPowerBtn.style.background=megaGoldEnabled?'#0b7a3d':'#7d1d1d';megaGoldPowerBtn.style.color='#fff';}
   if(megaGuidePowerBtn){ megaGuidePowerBtn.textContent=megaGuideEnabled?'🟢 ONLINE':'🔴 OFFLINE'; megaGuidePowerBtn.style.background=megaGuideEnabled?'#0b7a3d':'#7d1d1d'; megaGuidePowerBtn.style.color='#fff'; }
   if(tsr2016PowerBtn){ tsr2016PowerBtn.textContent=tsr2016Enabled?'🟢 ONLINE':'🔴 OFFLINE'; tsr2016PowerBtn.style.background=tsr2016Enabled?'#0b7a3d':'#7d1d1d'; tsr2016PowerBtn.style.color='#fff'; }
@@ -44432,6 +44444,7 @@ if(megaRevYdivPowerBtn)megaRevYdivPowerBtn.addEventListener('click',()=>setStepm
 if(stepmaOrigPowerBtn)stepmaOrigPowerBtn.addEventListener('click',()=>setStepmaPower('STEPMAORIG'));
 if(stepmaProPowerBtn)stepmaProPowerBtn.addEventListener('click',()=>setStepmaPower('STEPMAPRO'));
 
+if(autoHedgePowerBtn) autoHedgePowerBtn.addEventListener('click',()=>setStepmaPower('AUTOHEDGEM1'));
 if(megaGoldPowerBtn) megaGoldPowerBtn.addEventListener('click',()=>setStepmaPower('MEGAGOLD'));
 if(megaGuidePowerBtn) megaGuidePowerBtn.addEventListener('click',()=>setMegaGuidePower(!megaGuideEnabled));
 if(tsr2016PowerBtn) tsr2016PowerBtn.addEventListener('click',()=>setTsr2016Power(!tsr2016Enabled));
