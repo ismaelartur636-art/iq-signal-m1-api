@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.103"
+APP_VERSION = "3.98.104"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -479,6 +479,31 @@ def mega_gold_scalper_strategy(cs, symbol="XAU/USD", timeframe="1min", market="O
         stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
         return {**base,"direction":direction,"confirmed":True,"confidence":70.0,"risk":"HIGH","event_key":f"MEGAGOLD:{market}:{symbol}:{stamp}","reason":f"Mega Gold {direction}: retomada confirmada; próxima M1."}
     except Exception as exc:return {**base,"reason":f"Mega Gold aguardando dados: {str(exc)[:90]}"}
+
+# Intervalo minimo entre novos pre-alertas AutoHedge (global entre ativos).
+_AUTOHEDGE_ALERT_LOCK = threading.RLock()
+_AUTOHEDGE_LAST_ALERT = {"at": 0.0, "event": ""}
+
+def _autohedge_alert_cooldown(analysis):
+    """Preserva consultas repetidas ao mesmo evento; bloqueia eventos novos por 120s."""
+    if not analysis.get("confirmed") or analysis.get("direction") not in ("CALL", "PUT"):
+        return analysis
+    event = str(analysis.get("event_key") or "")
+    if not event:
+        return {**analysis, "direction":"NEUTRO", "confirmed":False, "confidence":0.0,
+                "reason":"AutoHedge: evento sem identificador; sinal bloqueado."}
+    current = time.monotonic()
+    with _AUTOHEDGE_ALERT_LOCK:
+        previous = _AUTOHEDGE_LAST_ALERT
+        if previous["event"] == event:
+            return analysis
+        remaining = 120.0 - (current - previous["at"])
+        if remaining > 0:
+            return {**analysis, "direction":"NEUTRO", "confirmed":False, "confidence":0.0,
+                    "reason":f"AutoHedge: aguardando {int(remaining + 0.999)}s após o sinal anterior."}
+        previous["at"] = current
+        previous["event"] = event
+    return analysis
 
 # AutoHedge M1 — adaptacao experimental do conceito de movimento/grid do EA MT5.
 # Nao replica hedge, ordens pendentes, lotes ou trailing stop.
@@ -24054,6 +24079,8 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     analysis.update(direction="NEUTRO",confirmed=False,confidence=0.0,
                         reason=f"Sniper Reversão aguardando pré-alerta nos últimos 20s (faltam {int(_sr_remaining)}s).")
                 elif analysis.get("confirmed"):
+                    analysis=_autohedge_alert_cooldown(analysis)
+                if _ah_early and analysis.get("confirmed"):
                     analysis["forming_candle_snapshot"]=True
                     analysis["non_repaint"]=False
                     analysis["reason"]="PRÉ-ALERTA PROVISÓRIO Sniper Reversão: "+analysis.get("direction","NEUTRO")+" para a próxima vela; candle ainda em formação."
