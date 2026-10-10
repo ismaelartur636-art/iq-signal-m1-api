@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.108"
+APP_VERSION = "3.98.109"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -480,31 +480,6 @@ def mega_gold_scalper_strategy(cs, symbol="XAU/USD", timeframe="1min", market="O
         return {**base,"direction":direction,"confirmed":True,"confidence":70.0,"risk":"HIGH","event_key":f"MEGAGOLD:{market}:{symbol}:{stamp}","reason":f"Mega Gold {direction}: retomada confirmada; próxima M1."}
     except Exception as exc:return {**base,"reason":f"Mega Gold aguardando dados: {str(exc)[:90]}"}
 
-# Intervalo minimo entre novos pre-alertas AutoHedge (global entre ativos).
-_AUTOHEDGE_ALERT_LOCK = threading.RLock()
-_AUTOHEDGE_LAST_ALERT = {"at": 0.0, "event": ""}
-
-def _autohedge_alert_cooldown(analysis):
-    """Preserva consultas repetidas ao mesmo evento; bloqueia eventos novos por 60s."""
-    if not analysis.get("confirmed") or analysis.get("direction") not in ("CALL", "PUT"):
-        return analysis
-    event = str(analysis.get("event_key") or "")
-    if not event:
-        return {**analysis, "direction":"NEUTRO", "confirmed":False, "confidence":0.0,
-                "reason":"AutoHedge: evento sem identificador; sinal bloqueado."}
-    current = time.monotonic()
-    with _AUTOHEDGE_ALERT_LOCK:
-        previous = _AUTOHEDGE_LAST_ALERT
-        if previous["event"] == event:
-            return analysis
-        remaining = 60.0 - (current - previous["at"])
-        if remaining > 0:
-            return {**analysis, "direction":"NEUTRO", "confirmed":False, "confidence":0.0,
-                    "reason":f"AutoHedge: aguardando {int(remaining + 0.999)}s após o sinal anterior."}
-        previous["at"] = current
-        previous["event"] = event
-    return analysis
-
 # AutoHedge M1 — adaptacao experimental do conceito de movimento/grid do EA MT5.
 # Nao replica hedge, ordens pendentes, lotes ou trailing stop.
 def autohedge_m1_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
@@ -554,35 +529,39 @@ def autohedge_m1_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN")
     except (ValueError,TypeError,KeyError,ZeroDivisionError) as exc:
         return {**base,"reason":f"Dados invalidos: {str(exc)[:80]}"}
 
-# AutoHedge: limita apenas alertas efetivamente liberados pelo endpoint.
-# Consultas repetidas do mesmo evento nao reiniciam os 60 segundos.
+# AutoHedge: cooldown unico, aplicado somente no endpoint oficial de sinal.
+# Nunca reserva um evento durante analises do radar ou durante pre-visualizacoes.
 _AUTOHEDGE_ALERT_LOCK = threading.RLock()
-_AUTOHEDGE_LAST_ALERT = {"at": 0.0, "entry": None}
+_AUTOHEDGE_LAST_ALERT = {"at": 0.0, "entry": ""}
+_AUTOHEDGE_COOLDOWN_SECONDS = 60.0
 
 def _autohedge_delivery_cooldown(data):
     if not isinstance(data, dict) or data.get("direction") not in ("CALL", "PUT"):
+        return data
+    if not data.get("ai_confirmed", data.get("confirmed", True)):
         return data
     entry = str(data.get("entry_time") or "")
     if not entry:
         return data
     moment = time.monotonic()
     with _AUTOHEDGE_ALERT_LOCK:
-        if _AUTOHEDGE_LAST_ALERT["entry"] == entry:
-            return data  # Mesmo sinal, apenas uma nova consulta do painel.
-        elapsed = moment - _AUTOHEDGE_LAST_ALERT["at"]
-        if _AUTOHEDGE_LAST_ALERT["at"] and elapsed < 60:
-            remaining = int(60 - elapsed + 0.999)
+        last = _AUTOHEDGE_LAST_ALERT
+        # Consultas repetidas do mesmo sinal nao alteram a contagem.
+        if last["entry"] == entry:
+            return data
+        remaining = _AUTOHEDGE_COOLDOWN_SECONDS - (moment - last["at"])
+        if last["at"] and remaining > 0:
             blocked = dict(data)
             blocked.update(direction="NEUTRO", confidence=0.0,
-                           ai_confirmed=False, entry_time=None,
-                           announce_time=None, expiry_time=None,
+                           ai_confirmed=False, confirmed=False,
+                           entry_time=None, announce_time=None, expiry_time=None,
                            status="AutoHedge M1 • AGUARDANDO INTERVALO",
-                           reason=f"AutoHedge: aguarde {remaining}s para outro sinal.")
+                           reason=f"AutoHedge: aguarde {int(remaining + 0.999)}s para outro sinal.")
             return blocked
-        _AUTOHEDGE_LAST_ALERT.update(at=moment, entry=entry)
+        last.update(at=moment, entry=entry)
     return data
 
-PWA_VERSION = "v231"
+PWA_VERSION = "v232"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
