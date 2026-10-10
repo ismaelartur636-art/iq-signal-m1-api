@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.101"
+APP_VERSION = "3.98.102"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -502,6 +502,17 @@ def autohedge_m1_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN")
         tr=[max(h[i]-l[i],abs(h[i]-c[i-1]),abs(l[i]-c[i-1])) for i in range(1,len(rows))]
         atr=sum(tr[-14:])/14
         if atr<=0: return {**base,"reason":"ATR indisponivel."}
+        # Filtro ATR14 adaptativo: compara a volatilidade atual com a referencia
+        # dos 40 candles anteriores, sem valores absolutos por ativo.
+        atr_history=[sum(tr[i-13:i+1])/14.0 for i in range(13,len(tr))]
+        baseline=sum(atr_history[-41:-1])/len(atr_history[-41:-1]) if len(atr_history)>1 else atr
+        if baseline<=0:
+            return {**base,"reason":"AutoHedge: referencia ATR indisponivel."}
+        atr_ratio=atr/baseline
+        if atr_ratio<0.65:
+            return {**base,"reason":"AutoHedge: ATR bloqueou baixa volatilidade.","atr_filter":"LOW_VOLATILITY"}
+        if atr_ratio>2.10 or (h[-1]-l[-1])>2.8*atr:
+            return {**base,"reason":"AutoHedge: ATR bloqueou volatilidade excessiva.","atr_filter":"HIGH_VOLATILITY"}
         # O GridStepPrice do ouro e substituido por distancia relativa ao ATR,
         # para nao aplicar a mesma distancia nominal em FX e criptomoedas.
         impulse=c[-1]-c[-4]
@@ -518,7 +529,7 @@ def autohedge_m1_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN")
     except (ValueError,TypeError,KeyError,ZeroDivisionError) as exc:
         return {**base,"reason":f"Dados invalidos: {str(exc)[:80]}"}
 
-PWA_VERSION = "v228"
+PWA_VERSION = "v229"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
