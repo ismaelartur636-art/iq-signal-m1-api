@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.102"
+APP_VERSION = "3.98.103"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -529,7 +529,7 @@ def autohedge_m1_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN")
     except (ValueError,TypeError,KeyError,ZeroDivisionError) as exc:
         return {**base,"reason":f"Dados invalidos: {str(exc)[:80]}"}
 
-PWA_VERSION = "v229"
+PWA_VERSION = "v230"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -24066,7 +24066,23 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
             elif engine == "RNFOLLOW03":
                 analysis=rn_follow_trend_03_strategy(engine_closed[-180:],symbol=symbol,timeframe=interval,market=market)
             elif engine == "AUTOHEDGEM1":
-                analysis=autohedge_m1_strategy(engine_closed[-100:],symbol=symbol,timeframe=interval,market=market)
+                # Avalia a vela em formação somente nos 20 segundos finais.
+                # O alerta é provisório; não representa confirmação de candle fechado.
+                _ah_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
+                _ah_early=(1 <= _ah_remaining <= 20)
+                _ah_rows=raw[-100:] if _ah_early else engine_closed[-100:]
+                analysis=autohedge_m1_strategy(_ah_rows,symbol=symbol,timeframe=interval,market=market)
+                analysis["seconds_to_entry_snapshot"]=round(_ah_remaining,1)
+                analysis["early_signal_window"]=_ah_early
+                if not _ah_early:
+                    if analysis.get("confirmed"):
+                        analysis["preview_direction"]=analysis.get("direction")
+                    analysis.update(direction="NEUTRO",confirmed=False,confidence=0.0,
+                        reason=f"AutoHedge aguardando janela de pré-alerta de 20s (faltam {int(_ah_remaining)}s).")
+                elif analysis.get("confirmed"):
+                    analysis["forming_candle_snapshot"]=True
+                    analysis["non_repaint"]=False
+                    analysis["reason"]="PRÉ-ALERTA PROVISÓRIO AutoHedge: "+analysis["direction"]+" para a próxima M1; vela em formação."
             elif engine == "MEGAGOLD":
                 analysis=mega_gold_scalper_strategy(engine_closed[-300:],symbol=symbol,timeframe=interval,market=market)
             elif engine == "MEGAGUIDE":
