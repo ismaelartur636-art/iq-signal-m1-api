@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.110"
+APP_VERSION = "3.98.111"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -29926,24 +29926,33 @@ def money_pile_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
         prev_call_condition=(prev_r9>=50.0 and prev_cci13>=0.0 and prev_k_smooth>=prev_d_smooth and prev_ma5>prev_ma9)
         prev_put_condition=(prev_r9<=50.0 and prev_cci13<=0.0 and prev_k_smooth<=prev_d_smooth and prev_ma5<prev_ma9)
 
-        # ATR14 adaptativo: filtro de volatilidade, sem alterar a confluencia 4/4.
-        trs=[max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1])) for i in range(1,len(rows))]
-        atr_series=[sum(trs[j-14:j])/14.0 for j in range(14,len(trs)+1)]
-        atr_now=atr_series[-1]
-        baseline=sorted(atr_series[-16:-1])
-        atr_ref=baseline[len(baseline)//2] if baseline else 0.0
-        atr_ratio=atr_now/atr_ref if atr_ref>0 else 0.0
-        atr_ok=bool(atr_now>0 and atr_ref>0 and 0.55<=atr_ratio<=2.20)
-
+        # Rateio estimado de pressao compradora/vendedora nos ultimos 5 candles
+        # fechados. Usa a posicao do fechamento no range; nao e fluxo real de ordens.
+        buy_pressure=0.0; sell_pressure=0.0
+        for candle in rows[-5:]:
+            hi=float(candle.get("high",0) or 0)
+            lo=float(candle.get("low",0) or 0)
+            close=float(candle.get("close",0) or 0)
+            spread=hi-lo
+            if spread<=0: continue
+            weight=float(candle.get("volume",0) or 0)
+            if weight<=0: weight=1.0
+            buy_pressure+=weight*max(0.0,min(1.0,(close-lo)/spread))
+            sell_pressure+=weight*max(0.0,min(1.0,(hi-close)/spread))
+        pressure_total=buy_pressure+sell_pressure
+        buyer_pct=100.0*buy_pressure/pressure_total if pressure_total>0 else 50.0
+        seller_pct=100.0*sell_pressure/pressure_total if pressure_total>0 else 50.0
+        rateio_threshold=55.0
         call=bool(call_condition and not prev_call_condition)
         put=bool(put_condition and not prev_put_condition)
         direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
         diag={"rsi9":round(r9,2),"cci13":round(cci13,2),"stoch_k_5_3_3":round(k_smooth,2),"stoch_d_5_3_3":round(d_smooth,2),"ma5":round(ma5,8),"ma9":round(ma9,8),
               "condition_call":bool(call_condition),"condition_put":bool(put_condition),
               "previous_call_condition":bool(prev_call_condition),"previous_put_condition":bool(prev_put_condition),
-              "new_event":bool(direction!="NEUTRO"),"atr14":round(atr_now,8),"atr_ratio":round(atr_ratio,3),"atr_filter_ok":atr_ok}
+              "new_event":bool(direction!="NEUTRO"),"buyer_pressure_pct":round(buyer_pct,2),"seller_pressure_pct":round(seller_pct,2),"rateio_threshold":rateio_threshold,"rateio_estimated":True}
         if direction=="NEUTRO": return {**base,"reason":"MEGA MONEY monitorando confluência 4/4; condição mantida não repete sinal, aguardando rearme/novo evento.","diagnostics":diag}
-        if not atr_ok: return {**base,"reason":"MEGA MONEY: ATR14 bloqueou volatilidade fora da faixa adaptativa.","diagnostics":diag}
+        if (direction=="CALL" and buyer_pct<rateio_threshold) or (direction=="PUT" and seller_pct<rateio_threshold):
+            return {**base,"reason":"MEGA MONEY: rateio de pressao nao confirmou a direcao (minimo 55%).","diagnostics":diag}
         stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
         return {**base,"direction":direction,"confidence":86.0,"confirmed":True,"risk":"LOW",
                 "reason":f"{direction} MEGA MONEY • 4 confluências alinhadas • próxima M1 • sem Gale.",
@@ -41841,7 +41850,7 @@ function applyRobotPowerState(){
   if(millionEaPowerBtn){ millionEaPowerBtn.textContent=millionEaEnabled?'🟢 ONLINE':'🔴 OFFLINE'; millionEaPowerBtn.style.background=millionEaEnabled?'#0b7a3d':'#7d1d1d'; millionEaPowerBtn.style.color='#fff'; millionEaPowerBtn.style.borderColor=millionEaEnabled?'#16c56b':'#ff5252'; }
   if(millionEaModeDesc) millionEaModeDesc.textContent=millionEaEnabled?'ONLINE: RSI/MARSI + LWMA140 M5 + Bears Power50 • próxima M1 • sem Gale.':'OFFLINE: EA MILIONÁRIO pausado.';
   if(moneyPilePowerBtn){ moneyPilePowerBtn.textContent=moneyPileEnabled?'🟢 ONLINE':'🔴 OFFLINE'; moneyPilePowerBtn.style.background=moneyPileEnabled?'#0b7a3d':'#7d1d1d'; moneyPilePowerBtn.style.color='#fff'; moneyPilePowerBtn.style.borderColor=moneyPileEnabled?'#16c56b':'#ff5252'; }
-  if(moneyPileModeDesc) moneyPileModeDesc.textContent=moneyPileEnabled?'ONLINE: direção do candle + RSI14 H1 • próxima M1 • sem Grid/Martingale/Gale.':'OFFLINE: MEGA MONEY EA pausado.';
+  if(moneyPileModeDesc) moneyPileModeDesc.textContent=moneyPileEnabled?'ONLINE: confluência 4/4 + rateio comprador/vendedor • próxima M1 • sem Gale.':'OFFLINE: MEGA MONEY EA pausado.';
   if(megaPremiumPocPowerBtn){ megaPremiumPocPowerBtn.textContent=megaPremiumPocEnabled?'🟢 ONLINE':'🔴 OFFLINE'; megaPremiumPocPowerBtn.style.background=megaPremiumPocEnabled?'#0b7a3d':'#7d1d1d'; megaPremiumPocPowerBtn.style.color='#fff'; megaPremiumPocPowerBtn.style.borderColor=megaPremiumPocEnabled?'#16c56b':'#ff5252'; }
   if(megaPremiumProtectedPowerBtn){ megaPremiumProtectedPowerBtn.textContent=megaPremiumProtectedEnabled?'🟢 ONLINE':'🔴 OFFLINE'; megaPremiumProtectedPowerBtn.style.background=megaPremiumProtectedEnabled?'#0b7a3d':'#7d1d1d'; megaPremiumProtectedPowerBtn.style.color='#fff'; megaPremiumProtectedPowerBtn.style.borderColor=megaPremiumProtectedEnabled?'#16c56b':'#ff5252'; }
   if(rnFollowPowerBtn){ rnFollowPowerBtn.textContent=rnFollowEnabled?'🟢 ONLINE':'🔴 OFFLINE'; rnFollowPowerBtn.style.background=rnFollowEnabled?'#0b7a3d':'#7d1d1d'; rnFollowPowerBtn.style.color='#fff'; }
