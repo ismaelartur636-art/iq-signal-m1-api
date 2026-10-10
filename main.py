@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.104"
+APP_VERSION = "3.98.105"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -24078,9 +24078,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                         analysis["preview_direction"]=analysis.get("direction")
                     analysis.update(direction="NEUTRO",confirmed=False,confidence=0.0,
                         reason=f"Sniper Reversão aguardando pré-alerta nos últimos 20s (faltam {int(_sr_remaining)}s).")
-                elif analysis.get("confirmed"):
-                    analysis=_autohedge_alert_cooldown(analysis)
-                if _ah_early and analysis.get("confirmed"):
+                elif _sr_early and analysis.get("confirmed"):
                     analysis["forming_candle_snapshot"]=True
                     analysis["non_repaint"]=False
                     analysis["reason"]="PRÉ-ALERTA PROVISÓRIO Sniper Reversão: "+analysis.get("direction","NEUTRO")+" para a próxima vela; candle ainda em formação."
@@ -24107,9 +24105,11 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     analysis.update(direction="NEUTRO",confirmed=False,confidence=0.0,
                         reason=f"AutoHedge aguardando janela de pré-alerta de 20s (faltam {int(_ah_remaining)}s).")
                 elif analysis.get("confirmed"):
-                    analysis["forming_candle_snapshot"]=True
-                    analysis["non_repaint"]=False
-                    analysis["reason"]="PRÉ-ALERTA PROVISÓRIO AutoHedge: "+analysis["direction"]+" para a próxima M1; vela em formação."
+                    analysis=_autohedge_alert_cooldown(analysis)
+                    if analysis.get("confirmed"):
+                        analysis["forming_candle_snapshot"]=True
+                        analysis["non_repaint"]=False
+                        analysis["reason"]="PRÉ-ALERTA PROVISÓRIO AutoHedge: "+analysis["direction"]+" para a próxima M1; vela em formação."
             elif engine == "MEGAGOLD":
                 analysis=mega_gold_scalper_strategy(engine_closed[-300:],symbol=symbol,timeframe=interval,market=market)
             elif engine == "MEGAGUIDE":
