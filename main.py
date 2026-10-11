@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.125"
+APP_VERSION = "3.98.126"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -42878,9 +42878,14 @@ function applyRobotPowerState(){
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Gráfica selecionada.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar da IA Gráfica ativo • procurando oportunidades</div>';
     rad();
+  }else if(engine==='SCALPINGM1'){
+    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='SCALPING M1 FLEX ONLINE • MONITORANDO ROMPIMENTOS • PRÓXIMA M1';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Scalping M1 FLEX online • pré-alerta 20s • intervalo mínimo 4 minutos • sem Gale.</div>';
+    if(radar) radar.innerHTML='<div>📡 Radar Scalping M1 FLEX ativo • procurando CALL/PUT</div>';
+    rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ SCALPER PRO está offline. Ative o SCALPER PRO.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ Nenhum motor reconhecido como ativo.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
