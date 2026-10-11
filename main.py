@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.116"
+APP_VERSION = "3.98.118"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -510,21 +510,37 @@ def _rsi2_cooldown_gate(result, *, claim=False):
 
 # RSI 2 Deriv adaptado: RSI Wilder(2), extremos 20/80, somente M1.
 def rsi2_deriv_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    base={"available":True,"engine":"RSI2DERIV","strategy":"RSI 2","provider":"LOCAL_RSI2_DERIV","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"RSI 2 monitorando extremos."}
+    base={"available":True,"engine":"RSI2DERIV","strategy":"RSI 2","provider":"LOCAL_RSI2_DERIV","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"RSI 2 monitorando extremos + força da vela (corpo mínimo 50%)."}
     if timeframe not in ("1min","M1","60"):
         return {**base,"reason":"RSI 2 opera somente em M1."}
     rows=list(cs or [])[-100:]
     if len(rows)<12:return {**base,"reason":"RSI 2 aguardando candles M1."}
     try:
         closes=[float(x["close"]) for x in rows]
+        candle=rows[-1]
+        candle_open=float(candle["open"])
+        candle_close=float(candle["close"])
+        candle_high=float(candle["high"])
+        candle_low=float(candle["low"])
+        candle_range=candle_high-candle_low
+        candle_body=abs(candle_close-candle_open)
+        body_ratio=(candle_body/candle_range) if candle_range>0 else 0.0
         value=rsi(closes,2)
         previous=rsi(closes[:-1],2)
         if value is None or previous is None:return base
         # Dispara apenas na primeira entrada na zona, evitando sinais sucessivos.
         direction="PUT" if value>=80 and previous<80 else "CALL" if value<=20 and previous>20 else "NEUTRO"
         if direction=="NEUTRO":return {**base,"reason":f"RSI 2 = {value:.1f}; aguardando novo extremo 20/80."}
+        # Confirmação obrigatória: corpo ocupa >= 50% da amplitude e fecha
+        # na direção da operação. Apenas candles já fechados (fluxo causal).
+        candle_supports=(body_ratio>=0.50 and
+                         ((direction=="CALL" and candle_close>candle_open) or
+                          (direction=="PUT" and candle_close<candle_open)))
+        if not candle_supports:
+            return {**base,"reason":f"RSI 2 {value:.1f}: força da vela não confirmou {direction} (corpo {body_ratio:.0%}, mínimo 50% e direção alinhada).",
+                    "rsi2":round(value,2),"candle_body_ratio":round(body_ratio,3)}
         stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or rows[-1].get("time") or len(rows))
-        return {**base,"direction":direction,"confirmed":True,"confidence":60.0,"risk":"HIGH","event_key":f"RSI2DERIV:{market}:{symbol}:{stamp}","reason":f"RSI 2 {value:.1f}: {direction} na próxima M1.","rsi2":round(value,2)}
+        return {**base,"direction":direction,"confirmed":True,"confidence":60.0,"risk":"HIGH","event_key":f"RSI2DERIV:{market}:{symbol}:{stamp}","reason":f"RSI 2 {value:.1f} + força da vela {body_ratio:.0%}: {direction} na próxima M1.","rsi2":round(value,2),"candle_body_ratio":round(body_ratio,3)}
     except (ValueError,TypeError,KeyError,ZeroDivisionError) as exc:
         return {**base,"reason":f"RSI 2 dados inválidos: {str(exc)[:80]}"}
 
@@ -535,8 +551,8 @@ def gold_rush_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
     if timeframe not in ("1min","M1","60"):
         return {**base,"reason":"Gold Rush Pro: selecione M1."}
     rows=list(cs or [])[-180:]
-    if len(rows)<105:
-        return {**base,"reason":f"Gold Rush Pro coletando candles ({len(rows)}/105)."}
+    if len(rows)<35:
+        return {**base,"reason":f"Gold Rush Pro coletando candles ({len(rows)}/35)."}
     try:
         c=[float(x['close']) for x in rows]; o=[float(x['open']) for x in rows]
         h=[float(x['high']) for x in rows]; l=[float(x['low']) for x in rows]
@@ -546,14 +562,21 @@ def gold_rush_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
                 v+=k*(x-v); out.append(v)
             return out
         e5,e8,e13=(ema_series(n) for n in (5,8,13))
-        avg=sum(abs(c[i]-o[i]) for i in range(-101,-1))/100.0
-        body=abs(c[-1]-o[-1]); strength=body>=avg and avg>0
-        call=strength and c[-1]>o[-1] and e5[-1]>e8[-1]>e13[-1] and not (e5[-2]>e8[-2]>e13[-2])
-        put=strength and c[-1]<o[-1] and e5[-1]<e8[-1]<e13[-1] and not (e5[-2]<e8[-2]<e13[-2])
+        recent_bodies=[abs(c[i]-o[i]) for i in range(-21,-1)]
+        avg=sum(recent_bodies)/len(recent_bodies)
+        body=abs(c[-1]-o[-1]); strength=avg>0 and body>=avg*0.65
+        # Aceita retomada de tendência já formada, sem exigir alinhamento novo.
+        # Gatilho de retomada: candle anterior tocou/atravessou EMA5,
+        # candle atual fecha na direção da tendência e volta a afastar-se da EMA5.
+        up=e5[-1]>e8[-1]>e13[-1]
+        down=e5[-1]<e8[-1]<e13[-1]
+        call=strength and up and c[-1]>o[-1] and c[-1]>e5[-1] and l[-2]<=e5[-2]
+        put=strength and down and c[-1]<o[-1] and c[-1]<e5[-1] and h[-2]>=e5[-2]
         direction='CALL' if call else 'PUT' if put else 'NEUTRO'
-        if direction=='NEUTRO':return {**base,"reason":"Aguardando novo alinhamento EMA 5/8/13 e vela com força acima da média."}
+        if direction=='NEUTRO':
+            return {**base,"reason":"Aguardando retomada EMA 5/8/13 com vela direcional (força >=65% da média de 20 velas)."}
         stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
-        return {**base,"direction":direction,"confirmed":True,"confidence":65.0,"risk":"HIGH","event_key":f"GOLDRUSH:{market}:{symbol}:{stamp}","reason":f"Gold Rush Pro {direction}: novo alinhamento confirmado; próxima M1."}
+        return {**base,"direction":direction,"confirmed":True,"confidence":65.0,"risk":"HIGH","event_key":f"GOLDRUSH:{market}:{symbol}:{stamp}","reason":f"Gold Rush Pro {direction}: retomada confirmada; próxima M1."}
     except (ValueError,TypeError,KeyError,ZeroDivisionError) as exc:
         return {**base,"reason":f"Gold Rush Pro aguardando dados: {str(exc)[:80]}"}
 
