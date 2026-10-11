@@ -471,9 +471,9 @@ def mega_gold_scalper_strategy(cs, symbol="XAU/USD", timeframe="1min", market="O
         adx=float(adx_series[-1] or 0)
         tr=[max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1])) for i in range(1,len(rows))]
         atr=sum(tr[-14:])/14
-        if atr<=0 or r is None or adx<17:return {**base,"reason":"Aguardando ADX >=17 e ATR válido."}
-        call=fast[-1]>slow[-1] and closes[-2]<=fast[-2]+atr*.21 and closes[-1]>fast[-1] and closes[-1]-fast[-1]>atr*.13 and r<74
-        put=fast[-1]<slow[-1] and closes[-2]>=fast[-2]-atr*.21 and closes[-1]<fast[-1] and fast[-1]-closes[-1]>atr*.13 and r>26
+        if atr<=0 or r is None or adx<16:return {**base,"reason":"Aguardando ADX >=16 e ATR válido."}
+        call=fast[-1]>slow[-1] and closes[-2]<=fast[-2]+atr*.21 and closes[-1]>fast[-1] and closes[-1]-fast[-1]>atr*.11 and r<74
+        put=fast[-1]<slow[-1] and closes[-2]>=fast[-2]-atr*.21 and closes[-1]<fast[-1] and fast[-1]-closes[-1]>atr*.11 and r>26
         direction='CALL' if call else 'PUT' if put else 'NEUTRO'
         if direction=='NEUTRO':return {**base,"reason":"Aguardando retomada EMA8/21 + RSI + ADX + ATR."}
         stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
