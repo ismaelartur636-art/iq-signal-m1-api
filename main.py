@@ -44654,7 +44654,7 @@ if(rnFollowPowerBtn) rnFollowPowerBtn.addEventListener('click',()=>setRnFollowPo
 if(rnFollow02PowerBtn) rnFollow02PowerBtn.addEventListener('click',()=>setRnFollow02Power(!rnFollow02Enabled));
 if(rnFollow03PowerBtn) rnFollow03PowerBtn.addEventListener('click',()=>setRnFollow03Power(!rnFollow03Enabled));
 async function setStepmaPower(engine){
- const active=selectedRobotEngine()===engine;
+ const active=(engine==='SHKHA') ? !!shkFlexEnabled : selectedRobotEngine()===engine;
  setExclusiveVisibleEngine(active?'OFF':engine);
  resetEngineVisualState();applyRobotPowerState();
  await syncBackgroundBotState({action:active?'DEACTIVATE_ENGINE':'ACTIVATE_ENGINE',engine});
@@ -44669,7 +44669,7 @@ if(stepmaProPowerBtn)stepmaProPowerBtn.addEventListener('click',()=>setStepmaPow
 
 if(autoHedgePowerBtn) autoHedgePowerBtn.addEventListener('click',()=>setStepmaPower('AUTOHEDGEM1'));
 if(rsi2PowerBtn) rsi2PowerBtn.addEventListener('click',()=>setStepmaPower('RSI2DERIV'));
-if(shkFlexPowerBtn) shkFlexPowerBtn.addEventListener('click',()=>setStepmaPower('SHKHA'));
+if(shkFlexPowerBtn) shkFlexPowerBtn.onclick=()=>setStepmaPower('SHKHA');
 if(goldRushPowerBtn) goldRushPowerBtn.addEventListener('click',()=>setStepmaPower('GOLDRUSH'));
 if(megaGoldPowerBtn) megaGoldPowerBtn.addEventListener('click',()=>setStepmaPower('MEGAGOLD'));
 if(megaGuidePowerBtn) megaGuidePowerBtn.addEventListener('click',()=>setMegaGuidePower(!megaGuideEnabled));
