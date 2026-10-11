@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.124"
+APP_VERSION = "3.98.125"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -459,7 +459,7 @@ def mega_reversal_ydiv_strategy(cs, symbol="EUR/USD", timeframe="1min", market="
 _SCALPINGM1_LOCK = threading.RLock()
 _SCALPINGM1_LAST = {}
 def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    base={"available":True,"engine":"SCALPINGM1","strategy":"Scalping M1 FLEX","provider":"LOCAL_MTF_BREAK_RETEST","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Monitorando rompimento e reteste M15/M5/M1."}
+    base={"available":True,"engine":"SCALPINGM1","strategy":"Scalping M1 FLEX","provider":"LOCAL_MTF_BREAK_RETEST","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Monitorando rompimento M5 ou impulso M1."}
     if str(timeframe) not in ("1min","M1","60"):
         return {**base,"reason":"Scalping M1 FLEX funciona no timeframe M1."}
     rows=list(cs or [])[-600:]
@@ -490,31 +490,46 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
         if len(m15)<2 or len(m5)<3:return {**base,'reason':'Aguardando candles completos M15 e M5.'}
         now_bucket=ts(rows[-1])//60
         last=rows[-1];price=float(last['close']);rng=max(float(last['high'])-float(last['low']),1e-12)
-        # Busca referência forte recente e rompimento M5 confirmado após ela.
+        # FLEX: rompimento confirmado M5 OU impulso M1 após rompimento recente.
+        # Somente candles fechados; M15 serve de contexto, não bloqueio obrigatório.
+        recent_m5=m5[-4:]
         candidates=[]
-        for ref in m15[-8:]:
-            rr=max(ref['high']-ref['low'],1e-12)
-            if abs(ref['close']-ref['open'])/rr<.50:continue
-            for candle in m5:
-                if candle['bucket']*300 <= (ref['bucket']+1)*900-1:continue
-                cr=max(candle['high']-candle['low'],1e-12)
-                if abs(candle['close']-candle['open'])/cr<.25:continue
-                direction='CALL' if candle['close']>ref['high'] and candle['close']>candle['open'] else 'PUT' if candle['close']<ref['low'] and candle['close']<candle['open'] else None
-                if direction:candidates.append((candle['bucket'],direction,ref))
-        if not candidates:return {**base,'reason':'Aguardando rompimento M5 após vela forte M15.'}
-        breakout,direction,ref=max(candidates,key=lambda x:x[0]);level=ref['high'] if direction=='CALL' else ref['low']
-        if now_bucket <= (breakout+1)*5 or now_bucket>(breakout+1)*5+10:
-            return {**base,'reason':'Aguardando reteste M1 após rompimento M5 (até 10 velas).'}
-        tolerance=max(rng*.45,abs(level)*.00003)
-        touched=(float(last['low'])<=level+tolerance and price>=level-tolerance) if direction=='CALL' else (float(last['high'])>=level-tolerance and price<=level+tolerance)
-        if not touched:return {**base,'reason':'Aguardando aproximação ao nível rompido no M1.'}
+        for i in range(1,len(recent_m5)):
+            prev=recent_m5[i-1]; cur=recent_m5[i]
+            cr=max(cur['high']-cur['low'],1e-12)
+            body=abs(cur['close']-cur['open'])/cr
+            if body<0.22:continue
+            direction='CALL' if cur['close']>prev['high'] and cur['close']>cur['open'] else 'PUT' if cur['close']<prev['low'] and cur['close']<cur['open'] else None
+            if direction:candidates.append((cur['bucket'],direction,prev['high'] if direction=='CALL' else prev['low']))
+        last_open=float(last['open']);last_high=float(last['high']);last_low=float(last['low'])
+        body=abs(price-last_open)/rng
+        # Impulso de M1: rompe máxima/mínima das 5 velas anteriores.
+        prior5=rows[-6:-1]
+        high5=max(float(r['high']) for r in prior5)
+        low5=min(float(r['low']) for r in prior5)
+        impulse='CALL' if price>high5 and price>last_open and body>=0.42 else 'PUT' if price<low5 and price<last_open and body>=0.42 else None
+        breakout,direction,level=max(candidates,key=lambda x:x[0]) if candidates else (None,None,None)
+        m5_fresh=breakout is not None and 0<=now_bucket-(breakout+1)*5<=5
+        m5_ok=False
+        if m5_fresh:
+            tolerance=max(rng*.55,abs(level)*.00003)
+            touched=(last_low<=level+tolerance and price>=level-tolerance) if direction=='CALL' else (last_high>=level-tolerance and price<=level+tolerance)
+            continuation=(price>last_open and body>=.35) if direction=='CALL' else (price<last_open and body>=.35)
+            m5_ok=touched or continuation
+        if impulse:
+            direction=impulse
+            mode='impulso M1'
+        elif m5_ok:
+            mode='rompimento M5 com continuação/reteste M1'
+        else:
+            return {**base,'reason':'Monitorando rompimento M5 ou impulso M1 confirmado.'}
         key=(market,symbol)
         with _SCALPINGM1_LOCK:
             prior=_SCALPINGM1_LAST.get(key)
             if prior is not None and now_bucket-prior<4:
                 return {**base,'reason':f'Intervalo de 4 minutos entre sinais ({4-(now_bucket-prior)} min restantes).'}
         event=f'SCALPINGM1:{market}:{symbol}:{direction}:{breakout}:{now_bucket}'
-        return {**base,'direction':direction,'confirmed':True,'confidence':60.0,'risk':'HIGH','event_key':event,'reason':f'Scalping M1 FLEX {direction}: M15 força + M5 rompimento + M1 reteste.'}
+        return {**base,'direction':direction,'confirmed':True,'confidence':60.0,'risk':'HIGH','event_key':event,'reason':f'Scalping M1 FLEX {direction}: {mode}; próxima vela.'}
     except Exception as exc:return {**base,'reason':f'Scalping M1 aguardando dados M1 válidos: {str(exc)[:90]}'}
 
 def scalping_m1_claim(result, symbol, market):
