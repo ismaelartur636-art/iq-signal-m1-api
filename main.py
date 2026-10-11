@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.119"
+APP_VERSION = "3.98.121"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -28894,7 +28894,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 _BACKGROUND_ENGINES = {
     # 3.97.42 — servidor 24h isolado: somente os dois motores visíveis.
-    "SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "GOLDRUSH", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "MEGAPREMIUM",
+    "SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "GOLDRUSH", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "MEGAPREMIUM", "SHKHA",
 }
 
 
@@ -37988,7 +37988,7 @@ async function syncBackgroundBotState(opts={}){
   // 3.97.64 — preserva o motor realmente escolhido ao sincronizar/recarregar.
   // Antes, PYRAMID7/PREDATORPIPS/MEGAHFT/FIBORSI eram convertidos para SCALPERPRO
   // no servidor; no refresh o estado do servidor voltava e trocava o motor na tela.
-  const backgroundEngines=new Set(['TSR2016','RNFOLLOW','RNFOLLOW02','RNFOLLOW03','STEPMAORIG','STEPMAPRO','YDIVORIG','SNIPERREV','MEGAREVYDIV','MEGAGUIDE','MEGAGOLD','GOLDRUSH','RSI2DERIV','AUTOHEDGEM1','BARREVERSAL','AAPLUS','PAULMACD','PAULMACDM1','MILLIONEA','MONEYPILE','SIDUS320','MEGAPREMIUM','MEGAPREMIUMPOC','MEGAPREMIUMPRO','SCALPERPRO','FIBORSI','MEGAHFT','PYRAMID7','PREDATORPIPS']);
+  const backgroundEngines=new Set(['TSR2016','RNFOLLOW','RNFOLLOW02','RNFOLLOW03','STEPMAORIG','STEPMAPRO','YDIVORIG','SNIPERREV','MEGAREVYDIV','MEGAGUIDE','MEGAGOLD','GOLDRUSH','RSI2DERIV','AUTOHEDGEM1','BARREVERSAL','AAPLUS','PAULMACD','PAULMACDM1','MILLIONEA','MONEYPILE','SIDUS320','MEGAPREMIUM','MEGAPREMIUMPOC','MEGAPREMIUMPRO','SCALPERPRO','FIBORSI','MEGAHFT','PYRAMID7','PREDATORPIPS','SHKHA']);
   if(!backgroundEngines.has(explicitEngine)) explicitEngine='SCALPERPRO';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
@@ -44643,7 +44643,7 @@ if(wprAdaptivePowerBtn) wprAdaptivePowerBtn.onclick=()=>setImportedEnginePower('
 if(tingaTingaPowerBtn) tingaTingaPowerBtn.onclick=()=>setImportedEnginePower('TINGATINGA',!tingaTingaEnabled);
 if(superNovaPowerBtn) superNovaPowerBtn.onclick=()=>setImportedEnginePower('SUPERNOVA',!superNovaEnabled);
 if(elcodexPowerBtn) elcodexPowerBtn.onclick=()=>setImportedEnginePower('ELCODEX',!elcodexEnabled);
-if(shkHaPowerBtn) shkHaPowerBtn.onclick=()=>setImportedEnginePower('SHKHA',!shkHaEnabled);
+if(shkHaPowerBtn) shkHaPowerBtn.onclick=()=>setStepmaPower('SHKHA');
 if(minScalperPowerBtn) minScalperPowerBtn.onclick=()=>setMinScalperPower(!minScalperEnabled);
 if(paulMacdPowerBtn) paulMacdPowerBtn.onclick=()=>setPaulMacdPower(!paulMacdEnabled);
 if(paulMacdM1PowerBtn) paulMacdM1PowerBtn.onclick=()=>setPaulMacdM1Power(!paulMacdM1Enabled);
@@ -44654,7 +44654,7 @@ if(rnFollowPowerBtn) rnFollowPowerBtn.addEventListener('click',()=>setRnFollowPo
 if(rnFollow02PowerBtn) rnFollow02PowerBtn.addEventListener('click',()=>setRnFollow02Power(!rnFollow02Enabled));
 if(rnFollow03PowerBtn) rnFollow03PowerBtn.addEventListener('click',()=>setRnFollow03Power(!rnFollow03Enabled));
 async function setStepmaPower(engine){
- const active=(engine==='SHKHA') ? !!shkFlexEnabled : selectedRobotEngine()===engine;
+ const active=selectedRobotEngine()===engine;
  setExclusiveVisibleEngine(active?'OFF':engine);
  resetEngineVisualState();applyRobotPowerState();
  await syncBackgroundBotState({action:active?'DEACTIVATE_ENGINE':'ACTIVATE_ENGINE',engine});
