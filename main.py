@@ -544,12 +544,12 @@ def rsi2_deriv_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     except (ValueError,TypeError,KeyError,ZeroDivisionError) as exc:
         return {**base,"reason":f"RSI 2 dados inválidos: {str(exc)[:80]}"}
 
-# Gold Rush Pro — adaptação experimental do EA MT4 para alertas M1.
+# Gold Rush Pro — adaptação experimental do EA MT4 para alertas M1/M5/M15/M30.
 # O EA original opera ciclos/ordens; esta regra não é uma reprodução 1:1.
 def gold_rush_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     base={"available":True,"engine":"GOLDRUSH","strategy":"Gold Rush Pro","provider":"LOCAL_GOLD_RUSH_ADAPT","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Gold Rush Pro monitorando."}
-    if timeframe not in ("1min","M1","60"):
-        return {**base,"reason":"Gold Rush Pro: selecione M1."}
+    if str(timeframe) not in ("1min","5min","15min","30min","M1","M5","M15","M30","60","300","900","1800"):
+        return {**base,"reason":"Gold Rush Pro: selecione M1, M5, M15 ou M30."}
     rows=list(cs or [])[-180:]
     if len(rows)<35:
         return {**base,"reason":f"Gold Rush Pro coletando candles ({len(rows)}/35)."}
@@ -576,7 +576,7 @@ def gold_rush_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
         if direction=='NEUTRO':
             return {**base,"reason":"Aguardando retomada EMA 5/8/13 com vela direcional (força >=65% da média de 20 velas)."}
         stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
-        return {**base,"direction":direction,"confirmed":True,"confidence":65.0,"risk":"HIGH","event_key":f"GOLDRUSH:{market}:{symbol}:{stamp}","reason":f"Gold Rush Pro {direction}: retomada confirmada; próxima M1."}
+        return {**base,"direction":direction,"confirmed":True,"confidence":65.0,"risk":"HIGH","event_key":f"GOLDRUSH:{market}:{symbol}:{stamp}","reason":f"Gold Rush Pro {direction}: retomada confirmada; próxima vela {timeframe}."}
     except (ValueError,TypeError,KeyError,ZeroDivisionError) as exc:
         return {**base,"reason":f"Gold Rush Pro aguardando dados: {str(exc)[:80]}"}
 
@@ -36137,7 +36137,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
   <div class="robot-mode-card" id="goldRushModeCard">
     <img src="__MEGA_IMAGE__" alt="Gold Rush Pro">
-    <div class="robot-mode-copy"><div class="robot-mode-title">🏅 Gold Rush Pro</div><div class="robot-mode-desc">Adaptação experimental EMA 5/8/13 + força da vela • M1 • 20s • sem Gale.</div></div>
+    <div class="robot-mode-copy"><div class="robot-mode-title">🏅 Gold Rush Pro</div><div class="robot-mode-desc">Adaptação experimental EMA 5/8/13 + força da vela • M1/M5/M15/M30 • 20s • sem Gale.</div></div>
     <button id="goldRushPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
   <div class="robot-mode-card" id="autoHedgeModeCard">
