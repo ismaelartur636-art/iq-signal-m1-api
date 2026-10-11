@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 
-APP_VERSION = "3.98.118"
+APP_VERSION = "3.98.119"
 # MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
 # MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
 # MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
@@ -14725,83 +14725,64 @@ def _shk_macd_divergence(highs, lows, closes):
                 bear[i+p]=True
     return hist,bull,bear
 
+_SHK_FLEX_LOCK = threading.RLock()
+_SHK_FLEX_LAST = {}
+def _shk_flex_gate(result, symbol, timeframe, market, claim=False):
+    if result.get("direction") not in ("CALL", "PUT") or not result.get("confirmed"):
+        return result
+    key=(str(market),str(symbol),str(timeframe))
+    event=str(result.get("event_key") or "")
+    with _SHK_FLEX_LOCK:
+        previous=_SHK_FLEX_LAST.get(key)
+        now=time.monotonic()
+        if previous and (previous[1]==event or now-previous[0]<240):
+            return {**result,"direction":"NEUTRO","confirmed":False,"confidence":0.0,"reason":"SHK Heikin Ashi: aguardando nova oportunidade (intervalo mínimo 4 minutos)."}
+        if claim:
+            _SHK_FLEX_LAST[key]=(now,event)
+    return result
+
 def shk_ha_macd_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """SHK Professional Heikin Ashi Signals v1.03 convertido para o app.
-
-    Círculo/pré-sinal: primeira mudança de cor do Heikin Ashi em candle fechado.
-    CALL/PUT final: mesma mudança HA + divergência MACD 12/26/5 causal confirmada
-    por pivô 2, válida por até 10 candles. A entrada é somente na próxima vela.
-    """
-    rows=list(cs or [])
-    base={
-        "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
-        "strategy":"SHK PRO HA + MACD • HEIKIN ASHI + DIVERGÊNCIA MACD 12/26/5 • NEXT CANDLE",
-        "engine":"SHKHA","provider":"LOCAL_SHK_HA_MACD_V103_CLOSED_M1",
-        "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
-        "direct_win_only":True,"gale_signal":False,"martingale":False,"grid":False,
-        "expiry_candles":1,"trigger_timeframe":str(timeframe).upper(),"shift":1,
-        "divergence_window":int(SHK_DIV_WINDOW),"divergence_pivot":int(SHK_DIV_PIVOT),
-    }
-    if str(timeframe).lower() not in ("1min","m1","1m"):
-        return {**base,"reason":"SHK PRO HA + MACD está configurado para M1 no app. Selecione M1."}
-    need=max(80,int(SHK_DIV_SEARCH)+int(SHK_DIV_PIVOT)*2+8)
-    if len(rows)<need:
-        return {**base,"reason":f"SHK PRO HA + MACD coletando candles fechados ({len(rows)}/{need})."}
-    rows=rows[-max(260,need):]
-    opens=[]; highs=[]; lows=[]; closes=[]
-    for x in rows:
-        try:
-            opens.append(float(x.get("open") or 0.0)); highs.append(float(x.get("high") or 0.0))
-            lows.append(float(x.get("low") or 0.0)); closes.append(float(x.get("close") or 0.0))
-        except Exception:
-            opens.append(0.0); highs.append(0.0); lows.append(0.0); closes.append(0.0)
-    if len(closes)<3 or any(v<=0 for v in closes[-3:]) or any(v<=0 for v in highs[-3:]) or any(v<=0 for v in lows[-3:]):
-        return {**base,"reason":"SHK PRO HA + MACD aguardando candles válidos."}
-    hao,hah,hal,hac=_shk_heikin_ashi_series(opens,highs,lows,closes)
-    hist,bull_div,bear_div=_shk_macd_divergence(highs,lows,closes)
-    i=len(closes)-1
-    cur_bull=hac[i]>hao[i]; cur_bear=hac[i]<hao[i]
-    prev_bull=hac[i-1]>hao[i-1]; prev_bear=hac[i-1]<hao[i-1]
-    call_change=bool(prev_bear and cur_bull)
-    put_change=bool(prev_bull and cur_bear)
-    w=int(SHK_DIV_WINDOW); st=max(0,i-w)
-    recent_bull=any(bull_div[st:i+1]); recent_bear=any(bear_div[st:i+1])
-    bull_age=next((i-k for k in range(i,st-1,-1) if bull_div[k]),None)
-    bear_age=next((i-k for k in range(i,st-1,-1) if bear_div[k]),None)
-    pre_signal="CALL" if call_change else ("PUT" if put_change else None)
-    rng=max(hah[i]-hal[i],1e-12); body_pct=abs(hac[i]-hao[i])/rng*100.0
-    call=bool(call_change and recent_bull); put=bool(put_change and recent_bear)
-    diag={
-        "ha_open":round(hao[i],10),"ha_close":round(hac[i],10),"ha_body_pct":round(body_pct,2),
-        "ha_color":"BULL" if cur_bull else ("BEAR" if cur_bear else "NEUTRAL"),
-        "ha_color_change_call":call_change,"ha_color_change_put":put_change,
-        "macd_hist":round(hist[i],10) if hist else 0.0,
-        "recent_bull_divergence":recent_bull,"recent_bear_divergence":recent_bear,
-        "bull_divergence_bars_ago":bull_age,"bear_divergence_bars_ago":bear_age,
-        "divergence_confirm_window":w,"closed_candle":True,"future_leak":False,"shift":1,
-        "pre_signal":pre_signal,
-    }
-    if call==put:
-        if pre_signal:
-            conf=clamp(58.0+min(10.0,body_pct*0.10),58.0,68.0)
-            missing="divergência MACD altista" if pre_signal=="CALL" else "divergência MACD baixista"
-            return {**base,"confidence":round(conf,1),"pre_signal":pre_signal,"pre_signal_confirmed":True,
-                "reason":f"PRÉ-SINAL {pre_signal} SHK • Heikin Ashi mudou de cor no candle fechado • aguardando {missing} válida em até {w} candles para liberar a entrada.",
-                "diagnostics":diag}
-        div_side="altista" if recent_bull and not recent_bear else ("baixista" if recent_bear and not recent_bull else "sem divergência recente")
-        return {**base,"confidence":52.0,"pre_signal":None,"pre_signal_confirmed":False,
-            "reason":f"SHK PRO HA + MACD monitorando • HA sem nova mudança de cor • MACD {div_side} • aguardando confluência para a próxima vela.",
-            "diagnostics":diag}
-    direction="CALL" if call else "PUT"
-    age=bull_age if call else bear_age
-    recency=max(0,10-(age if isinstance(age,int) else 10))
-    conf=clamp(84.0+min(5.0,body_pct*0.05)+recency*0.5,84.0,95.0)
-    stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or i)
-    return {**base,"direction":direction,"confidence":round(conf,1),"confirmed":True,
-        "risk":"LOW" if conf>=91 else "MEDIUM","pre_signal":direction,"pre_signal_confirmed":True,
-        "reason":f"{direction} SHK PRO HA + MACD • mudança Heikin Ashi + divergência MACD 12/26/5 confirmada • candle M1 fechado • próxima vela • sem Gale.",
-        "event_key":f"SHKHA:{direction}:{stamp}","diagnostics":diag}
-
+    """Adaptação flexível: mudança Heikin Ashi + momentum MACD + força de vela."""
+    base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
+          "risk":"HIGH","strategy":"SHK Heikin Ashi • HA + MACD + força da vela",
+          "engine":"SHKHA","provider":"LOCAL_SHK_HA_FLEX_V1","non_repaint":True,
+          "closed_candles_only":True,"next_candle_entry":True,"direct_win_only":True,
+          "gale_signal":False,"martingale":False,"grid":False,"expiry_candles":1,
+          "prealert_seconds":20,"confidence_is_probability":False}
+    if str(timeframe).lower() not in ("1min","5min","m1","m5"):
+        return {**base,"reason":"SHK Heikin Ashi: selecione M1 ou M5."}
+    rows=list(cs or [])[-180:]
+    if len(rows)<40:
+        return {**base,"reason":f"SHK aguardando candles ({len(rows)}/40)."}
+    try:
+        o=[float(x['open']) for x in rows]; h=[float(x['high']) for x in rows]
+        l=[float(x['low']) for x in rows]; c=[float(x['close']) for x in rows]
+        hao,hah,hal,hac=_shk_heikin_ashi_series(o,h,l,c)
+        def es(v,n):
+            out=[v[0]]; k=2/(n+1)
+            for x in v[1:]:out.append(out[-1]+k*(x-out[-1]))
+            return out
+        fast=es(c,12); slow=es(c,26)
+        mac=[x-y for x,y in zip(fast,slow)]; signal=es(mac,5)
+        hist=[x-y for x,y in zip(mac,signal)]
+        rng=max(h[-1]-l[-1],1e-12)
+        strength=abs(c[-1]-o[-1])/rng
+        up=hac[-1]>hao[-1] and hac[-2]<=hao[-2]
+        down=hac[-1]<hao[-1] and hac[-2]>=hao[-2]
+        call=up and c[-1]>o[-1] and strength>=.35 and hist[-1]>hist[-2]
+        put=down and c[-1]<o[-1] and strength>=.35 and hist[-1]<hist[-2]
+        direction='CALL' if call else 'PUT' if put else 'NEUTRO'
+        diag={'ha_change_up':up,'ha_change_down':down,'body_ratio':round(strength,3),
+              'macd_hist':round(hist[-1],9),'macd_hist_prev':round(hist[-2],9)}
+        if direction=='NEUTRO':
+            return {**base,'reason':'SHK monitorando virada Heikin Ashi + impulso MACD + força da vela.','diagnostics':diag}
+        stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
+        return {**base,'direction':direction,'confirmed':True,'confidence':70.0,
+                'event_key':f'SHKHA:{market}:{symbol}:{timeframe}:{direction}:{stamp}',
+                'reason':f'SHK Heikin Ashi {direction}: virada HA + momentum MACD + vela de força; próxima vela.',
+                'diagnostics':diag}
+    except Exception as exc:
+        return {**base,'reason':f'SHK aguardando dados válidos: {str(exc)[:90]}'}
 
 
 # -----------------------------------------------------------------------------
@@ -24222,6 +24203,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis=_rsi2_cooldown_gate(analysis,claim=True)
             elif engine == "GOLDRUSH":
                 analysis=gold_rush_pro_strategy(engine_closed[-180:],symbol=symbol,timeframe=interval,market=market)
+            elif engine == "SHKHA":
+                analysis=shk_ha_macd_strategy(engine_closed[-180:],symbol=symbol,timeframe=interval,market=market)
+                analysis=_shk_flex_gate(analysis,symbol,interval,market,claim=True)
             elif engine == "MEGAGOLD":
                 analysis=mega_gold_scalper_strategy(engine_closed[-300:],symbol=symbol,timeframe=interval,market=market)
             elif engine == "MEGAGUIDE":
@@ -25366,7 +25350,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 else:
                     # CLOSED_PANEL_ENGINES jamais carregam sinal de uma barra antiga
                     # para a vela subsequente após a janela de nascimento.
-                    if ai_only and engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "GOLDRUSH", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
+                    if ai_only and engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "GOLDRUSH", "SHKHA", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
                         elapsed = max(0.0, (now() - current_boundary(interval)).total_seconds())
                         if elapsed > 10.0 or not _last_closed_matches_current_open(engine_closed, interval):
                             base.update({
@@ -31440,7 +31424,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
 
     if not _symbol_allowed(symbol, requested_market) or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
-    if engine not in ("SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "GOLDRUSH", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
+    if engine not in ("SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "GOLDRUSH", "SHKHA", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
         engine = "SCALPERPRO"
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
@@ -32210,7 +32194,7 @@ async def pre_signals(
     market = (market or "OPEN").upper()
     engine = str(engine or "SMART").upper()
     # 3.97.54 — somente SCALPER PRO e DRAGON FIRE são operacionais.
-    if engine not in ("SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "GOLDRUSH", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
+    if engine not in ("SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "GOLDRUSH", "SHKHA", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
         engine = "SCALPERPRO"
     limit = max(1, min(int(limit), 4))
 
@@ -33280,7 +33264,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Intervalo ou mercado inválido.")
     if symbol and not _symbol_allowed(symbol, market):
         raise HTTPException(400, "Ativo do radar inválido.")
-    if engine not in ("SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "GOLDRUSH", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
+    if engine not in ("SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "GOLDRUSH", "SHKHA", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
         engine = "SCALPERPRO"
 
     if engine == "RTM":
@@ -33749,7 +33733,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         elif len(raw) >= 25:
             # Os sinais STREAKREV trabalham com timestamps verificáveis para
             # usar a mesma última vela FECHADA do motor oficial /signal-ai.
-            closed = (_verified_closed_candles(raw, interval) if engine in ("STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "GOLDRUSH", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS")
+            closed = (_verified_closed_candles(raw, interval) if engine in ("STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "GOLDRUSH", "SHKHA", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS")
                       else (raw[:-1] if len(raw) > 1 else raw))
             if engine == "EA":
                 tech = await ea_xgboost_strategy(closed, sym, interval, market=market)
@@ -36061,11 +36045,11 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     .mega-ea-folder{display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;min-height:92px;margin:10px 0 12px;padding:16px;border:1px solid #2f86ff;border-radius:16px;background:linear-gradient(180deg,rgba(15,45,76,.96),rgba(6,25,44,.96));box-shadow:0 0 20px rgba(47,134,255,.18);cursor:pointer;user-select:none}
     .mega-ea-folder-title{font-size:30px;font-weight:1000;letter-spacing:1.2px;color:#7fd3ff;text-shadow:0 0 14px rgba(66,190,255,.45)}
     .mega-ea-folder-hint{font-size:12px;font-weight:800;opacity:.78}
-    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #rnFollowModeCard,body:not(.mega-ea-open) #rnFollow02ModeCard,body:not(.mega-ea-open) #rnFollow03ModeCard,body:not(.mega-ea-open) #sniperRevModeCard,body:not(.mega-ea-open) #megaRevYdivModeCard,body:not(.mega-ea-open) #ydivOrigModeCard,body:not(.mega-ea-open) #stepmaOrigModeCard,body:not(.mega-ea-open) #stepmaProModeCard,body:not(.mega-ea-open) #megaGuideModeCard,body:not(.mega-ea-open) #megaGoldModeCard,body:not(.mega-ea-open) #goldRushModeCard,body:not(.mega-ea-open) #rsi2ModeCard,body:not(.mega-ea-open) #autoHedgeModeCard,body:not(.mega-ea-open) #tsr2016ModeCard,body:not(.mega-ea-open) #barReversalModeCard,body:not(.mega-ea-open) #aaPlusModeCard,body:not(.mega-ea-open) #megaPremiumModeCard,body:not(.mega-ea-open) #megaPremiumProtectedModeCard,body:not(.mega-ea-open) #megaHftModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
+    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #rnFollowModeCard,body:not(.mega-ea-open) #rnFollow02ModeCard,body:not(.mega-ea-open) #rnFollow03ModeCard,body:not(.mega-ea-open) #sniperRevModeCard,body:not(.mega-ea-open) #megaRevYdivModeCard,body:not(.mega-ea-open) #ydivOrigModeCard,body:not(.mega-ea-open) #stepmaOrigModeCard,body:not(.mega-ea-open) #stepmaProModeCard,body:not(.mega-ea-open) #megaGuideModeCard,body:not(.mega-ea-open) #megaGoldModeCard,body:not(.mega-ea-open) #shkFlexModeCard,body:not(.mega-ea-open) #goldRushModeCard,body:not(.mega-ea-open) #rsi2ModeCard,body:not(.mega-ea-open) #autoHedgeModeCard,body:not(.mega-ea-open) #tsr2016ModeCard,body:not(.mega-ea-open) #barReversalModeCard,body:not(.mega-ea-open) #aaPlusModeCard,body:not(.mega-ea-open) #megaPremiumModeCard,body:not(.mega-ea-open) #megaPremiumProtectedModeCard,body:not(.mega-ea-open) #megaHftModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
 
     /* 3.97.11 — painel de motores enxuto: MOTOR REMOVIDO + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
-    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#paulMacdModeCard,#paulMacdM1ModeCard,#sidus320ModeCard,#rnFollowModeCard,#rnFollow02ModeCard,#rnFollow03ModeCard,#sniperRevModeCard,#megaRevYdivModeCard,#ydivOrigModeCard,#stepmaOrigModeCard,#stepmaProModeCard,#megaGuideModeCard,#megaGoldModeCard,#goldRushModeCard,#rsi2ModeCard,#autoHedgeModeCard,#tsr2016ModeCard,#barReversalModeCard,#aaPlusModeCard,#megaPremiumModeCard,#megaPremiumProtectedModeCard,#megaHftModeCard,#pyramid7ModeCard,#predatorPipsModeCard,#millionEaModeCard,#moneyPileModeCard{display:flex !important}
+    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#paulMacdModeCard,#paulMacdM1ModeCard,#sidus320ModeCard,#rnFollowModeCard,#rnFollow02ModeCard,#rnFollow03ModeCard,#sniperRevModeCard,#megaRevYdivModeCard,#ydivOrigModeCard,#stepmaOrigModeCard,#stepmaProModeCard,#megaGuideModeCard,#megaGoldModeCard,#shkFlexModeCard,#goldRushModeCard,#rsi2ModeCard,#autoHedgeModeCard,#tsr2016ModeCard,#barReversalModeCard,#aaPlusModeCard,#megaPremiumModeCard,#megaPremiumProtectedModeCard,#megaHftModeCard,#pyramid7ModeCard,#predatorPipsModeCard,#millionEaModeCard,#moneyPileModeCard{display:flex !important}
     #scalperProModeCard .robot-mode-desc,#dragonFireModeCard .robot-mode-desc,#dragonFireProModeCard .robot-mode-desc,#roboFiboModeCard .robot-mode-desc,#paulMacdModeCard .robot-mode-desc,#paulMacdM1ModeCard .robot-mode-desc,#sidus320ModeCard .robot-mode-desc,#rnFollowModeCard .robot-mode-desc,#rnFollow02ModeCard .robot-mode-desc,#rnFollow03ModeCard .robot-mode-desc,#tsr2016ModeCard .robot-mode-desc,#megaPremiumModeCard .robot-mode-desc,#megaPremiumProtectedModeCard .robot-mode-desc,#megaHftModeCard .robot-mode-desc,#pyramid7ModeCard .robot-mode-desc,#predatorPipsModeCard .robot-mode-desc,#millionEaModeCard .robot-mode-desc,#moneyPileModeCard .robot-mode-desc{display:none !important}
     #scalpingAsiaModeCard{display:none !important}
   </style>
@@ -36134,6 +36118,11 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <img src="__MEGA_IMAGE__" alt="RSI 2">
     <div class="robot-mode-copy"><div class="robot-mode-title">📉 RSI 2</div><div class="robot-mode-desc">RSI(2) • CALL ≤20 / PUT ≥80 • próxima M1 • 20s • sem Gale.</div></div>
     <button id="rsi2PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
+  </div>
+  <div class="robot-mode-card" id="shkFlexModeCard">
+    <img src="__MEGA_IMAGE__" alt="SHK Heikin Ashi">
+    <div class="robot-mode-copy"><div class="robot-mode-title">📊 SHK Heikin Ashi</div><div class="robot-mode-desc">Heikin Ashi + MACD momentum + força da vela • M1/M5 • 20s • intervalo 4min • sem Gale.</div></div>
+    <button id="shkFlexPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
   <div class="robot-mode-card" id="goldRushModeCard">
     <img src="__MEGA_IMAGE__" alt="Gold Rush Pro">
@@ -37102,8 +37091,10 @@ let ydivOrigEnabled=false,sniperRevEnabled=false,megaRevYdivEnabled=false,stepma
 const megaGuidePowerBtn=document.getElementById('megaGuidePowerBtn');
 const rsi2PowerBtn=document.getElementById('rsi2PowerBtn');
 let rsi2Enabled=localStorage.getItem('rsi2_power')==='ONLINE';
+const shkFlexPowerBtn=document.getElementById('shkFlexPowerBtn');
 const goldRushPowerBtn=document.getElementById('goldRushPowerBtn');
 const megaGoldPowerBtn=document.getElementById('megaGoldPowerBtn');
+let shkFlexEnabled=localStorage.getItem('shk_flex_power')==='ONLINE';
 let goldRushEnabled=localStorage.getItem('gold_rush_power')==='ONLINE';
 let megaGoldEnabled=localStorage.getItem('mega_gold_power')==='ONLINE';
 const autoHedgePowerBtn=document.getElementById('autoHedgePowerBtn');
@@ -37748,6 +37739,7 @@ function setExclusiveVisibleEngine(engine){
   stepmaOrigEnabled=(e==='STEPMAORIG');
   stepmaProEnabled=(e==='STEPMAPRO');
   megaGuideEnabled=(e==='MEGAGUIDE');
+  shkFlexEnabled=(e==='SHKHA');
   goldRushEnabled=(e==='GOLDRUSH');
   rsi2Enabled=(e==='RSI2DERIV');
   megaGoldEnabled=(e==='MEGAGOLD');
@@ -37776,6 +37768,7 @@ function setExclusiveVisibleEngine(engine){
     localStorage.setItem('mega_rn_follow02_power',rnFollow02Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_rn_follow03_power',rnFollow03Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('rsi2_power',rsi2Enabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('shk_flex_power',shkFlexEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('gold_rush_power',goldRushEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_gold_power',megaGoldEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_guide_power',megaGuideEnabled?'ONLINE':'OFFLINE');
@@ -37813,6 +37806,7 @@ function selectedRobotEngine(){
   if(stepmaOrigEnabled) return 'STEPMAORIG';
   if(stepmaProEnabled) return 'STEPMAPRO';
   if(rsi2Enabled) return 'RSI2DERIV';
+  if(shkFlexEnabled) return 'SHKHA';
   if(goldRushEnabled) return 'GOLDRUSH';
   if(megaGoldEnabled) return 'MEGAGOLD';
   if(autoHedgeEnabled) return 'AUTOHEDGEM1';
@@ -37834,7 +37828,7 @@ function adoptBackgroundEngineState(d){
   if(typeof d.telegram_enabled==='boolean'){ telegramEnabled=!!d.telegram_enabled; }
   if(!d.enabled) return;
   const e=String(d.engine||'').toUpperCase();
-  if(e!=='PAULMACD' && e!=='PAULMACDM1' && e!=='MILLIONEA' && e!=='MONEYPILE' && e!=='SIDUS320' && e!=='MEGAPREMIUM' && e!=='MEGAPREMIUMPOC' && e!=='MEGAPREMIUMPRO' && e!=='TSR2016' && e!=='RNFOLLOW' && e!=='RNFOLLOW02' && e!=='RNFOLLOW03' && e!=='STEPMAORIG' && e!=='YDIVORIG' && e!=='SNIPERREV' && e!=='MEGAREVYDIV' && e!=='STEPMAPRO' && e!=='MEGAGUIDE' && e!=='MEGAGOLD' && e!=='GOLDRUSH' && e!=='RSI2DERIV' && e!=='AUTOHEDGEM1' && e!=='BARREVERSAL' && e!=='AAPLUS' && e!=='SCALPERPRO' && e!=='FIBORSI' && e!=='MEGAHFT' && e!=='PYRAMID7' && e!=='PREDATORPIPS') return;
+  if(e!=='PAULMACD' && e!=='PAULMACDM1' && e!=='MILLIONEA' && e!=='MONEYPILE' && e!=='SIDUS320' && e!=='MEGAPREMIUM' && e!=='MEGAPREMIUMPOC' && e!=='MEGAPREMIUMPRO' && e!=='TSR2016' && e!=='RNFOLLOW' && e!=='RNFOLLOW02' && e!=='RNFOLLOW03' && e!=='STEPMAORIG' && e!=='YDIVORIG' && e!=='SNIPERREV' && e!=='MEGAREVYDIV' && e!=='STEPMAPRO' && e!=='MEGAGUIDE' && e!=='MEGAGOLD' && e!=='GOLDRUSH' && e!=='SHKHA' && e!=='RSI2DERIV' && e!=='AUTOHEDGEM1' && e!=='BARREVERSAL' && e!=='AAPLUS' && e!=='SCALPERPRO' && e!=='FIBORSI' && e!=='MEGAHFT' && e!=='PYRAMID7' && e!=='PREDATORPIPS') return;
   paulMacdEnabled=(e==='PAULMACD');
   paulMacdM1Enabled=(e==='PAULMACDM1');
   millionEaEnabled=(e==='MILLIONEA');
@@ -37849,6 +37843,7 @@ function adoptBackgroundEngineState(d){
   stepmaOrigEnabled=(e==='STEPMAORIG');
   stepmaProEnabled=(e==='STEPMAPRO');
   megaGuideEnabled=(e==='MEGAGUIDE');
+  shkFlexEnabled=(e==='SHKHA');
   goldRushEnabled=(e==='GOLDRUSH');
   rsi2Enabled=(e==='RSI2DERIV');
   megaGoldEnabled=(e==='MEGAGOLD');
@@ -37877,6 +37872,7 @@ function adoptBackgroundEngineState(d){
     localStorage.setItem('mega_rn_follow02_power',rnFollow02Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_rn_follow03_power',rnFollow03Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('rsi2_power',rsi2Enabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('shk_flex_power',shkFlexEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('gold_rush_power',goldRushEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_gold_power',megaGoldEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_guide_power',megaGuideEnabled?'ONLINE':'OFFLINE');
@@ -37900,7 +37896,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',SIDUS320:'🎯 SIDUS EA V3.20',TSR2016:'🎯 Mega Sniper',RNFOLLOW:'📈 RN Follow Trend',RNFOLLOW02:'📈 RN Follow Trend 02',RNFOLLOW03:'📈 RN Follow Trend 03',YDIVORIG:'📉 yDiv Original',SNIPERREV:'🎯 Sniper Reversão',MEGAREVYDIV:'🎯 Mega Reversão + yDiv',STEPMAORIG:'📈 StepMA Original',STEPMAPRO:'📈 StepMA Pro',RSI2DERIV:'📉 RSI 2',GOLDRUSH:'🏅 Gold Rush Pro',MEGAGOLD:'🏆 Mega Gold Scalper',AUTOHEDGEM1:'⚙️ AutoHedge M1',MEGAGUIDE:'🧭 MEGA Guide M5-M1',BARREVERSAL:'🔄 1 BAR REVERSAL',AAPLUS:'🐊 AA+',MEGAPREMIUM:'💎 MEGA PREMIUM',MEGAPREMIUMPOC:'💎 MEGA PREMIUM + POC',MEGAPREMIUMPRO:'🛡️ MEGA PREMIUM PROTEGIDO',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MEGAHFT:'⚡ MEGA HFT',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO'})[e]||'SEM MOTOR';
+  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',SIDUS320:'🎯 SIDUS EA V3.20',TSR2016:'🎯 Mega Sniper',RNFOLLOW:'📈 RN Follow Trend',RNFOLLOW02:'📈 RN Follow Trend 02',RNFOLLOW03:'📈 RN Follow Trend 03',YDIVORIG:'📉 yDiv Original',SNIPERREV:'🎯 Sniper Reversão',MEGAREVYDIV:'🎯 Mega Reversão + yDiv',STEPMAORIG:'📈 StepMA Original',STEPMAPRO:'📈 StepMA Pro',RSI2DERIV:'📉 RSI 2',SHKHA:'📊 SHK Heikin Ashi',GOLDRUSH:'🏅 Gold Rush Pro',MEGAGOLD:'🏆 Mega Gold Scalper',AUTOHEDGEM1:'⚙️ AutoHedge M1',MEGAGUIDE:'🧭 MEGA Guide M5-M1',BARREVERSAL:'🔄 1 BAR REVERSAL',AAPLUS:'🐊 AA+',MEGAPREMIUM:'💎 MEGA PREMIUM',MEGAPREMIUMPOC:'💎 MEGA PREMIUM + POC',MEGAPREMIUMPRO:'🛡️ MEGA PREMIUM PROTEGIDO',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MEGAHFT:'⚡ MEGA HFT',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO'})[e]||'SEM MOTOR';
 }
 
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
@@ -39145,7 +39141,7 @@ function mergeServerPerformance(p,m){
     // 3.98.64 — RN Follow Trend é motor sem Gale/recuperação: o LOSS da primeira vela é final.
     // Os demais motores continuam respeitando a Gestão global selecionada no app.
     const serverEngine=normalizeEngineKey(String(x.engine||''));
-    if(r==='LOSS' && serverEngine!=='RNFOLLOW' && serverEngine!=='RNFOLLOW02' && serverEngine!=='RNFOLLOW03' && serverEngine!=='MEGAGUIDE' && serverEngine!=='MEGAGOLD' && serverEngine!=='GOLDRUSH' && e!=='GOLDRUSH' && ['RECOVERY','G1','G2'].includes(currentManagementMode())) return;
+    if(r==='LOSS' && serverEngine!=='RNFOLLOW' && serverEngine!=='RNFOLLOW02' && serverEngine!=='RNFOLLOW03' && serverEngine!=='MEGAGUIDE' && serverEngine!=='MEGAGOLD' && serverEngine!=='GOLDRUSH' && e!=='SHKHA' && e!=='GOLDRUSH' && e!=='SHKHA' && ['RECOVERY','G1','G2'].includes(currentManagementMode())) return;
     const t={
       market:m,
       symbol:String(x.symbol||''),
@@ -42003,6 +41999,7 @@ function applyRobotPowerState(){
 
   if(autoHedgePowerBtn){autoHedgePowerBtn.textContent=autoHedgeEnabled?'🟢 ONLINE':'🔴 OFFLINE';autoHedgePowerBtn.style.background=autoHedgeEnabled?'#0b7a3d':'#7d1d1d';autoHedgePowerBtn.style.color='#fff';}
   if(rsi2PowerBtn){rsi2PowerBtn.textContent=rsi2Enabled?'🟢 ONLINE':'🔴 OFFLINE';rsi2PowerBtn.style.background=rsi2Enabled?'#0b7a3d':'#7d1d1d';rsi2PowerBtn.style.color='#fff';}
+  if(shkFlexPowerBtn){shkFlexPowerBtn.textContent=shkFlexEnabled?'🟢 ONLINE':'🔴 OFFLINE';shkFlexPowerBtn.style.background=shkFlexEnabled?'#0b7a3d':'#7d1d1d';shkFlexPowerBtn.style.color='#fff';}
   if(goldRushPowerBtn){goldRushPowerBtn.textContent=goldRushEnabled?'🟢 ONLINE':'🔴 OFFLINE';goldRushPowerBtn.style.background=goldRushEnabled?'#0b7a3d':'#7d1d1d';goldRushPowerBtn.style.color='#fff';}
   if(megaGoldPowerBtn){megaGoldPowerBtn.textContent=megaGoldEnabled?'🟢 ONLINE':'🔴 OFFLINE';megaGoldPowerBtn.style.background=megaGoldEnabled?'#0b7a3d':'#7d1d1d';megaGoldPowerBtn.style.color='#fff';}
   if(megaGuidePowerBtn){ megaGuidePowerBtn.textContent=megaGuideEnabled?'🟢 ONLINE':'🔴 OFFLINE'; megaGuidePowerBtn.style.background=megaGuideEnabled?'#0b7a3d':'#7d1d1d'; megaGuidePowerBtn.style.color='#fff'; }
@@ -44672,6 +44669,7 @@ if(stepmaProPowerBtn)stepmaProPowerBtn.addEventListener('click',()=>setStepmaPow
 
 if(autoHedgePowerBtn) autoHedgePowerBtn.addEventListener('click',()=>setStepmaPower('AUTOHEDGEM1'));
 if(rsi2PowerBtn) rsi2PowerBtn.addEventListener('click',()=>setStepmaPower('RSI2DERIV'));
+if(shkFlexPowerBtn) shkFlexPowerBtn.addEventListener('click',()=>setStepmaPower('SHKHA'));
 if(goldRushPowerBtn) goldRushPowerBtn.addEventListener('click',()=>setStepmaPower('GOLDRUSH'));
 if(megaGoldPowerBtn) megaGoldPowerBtn.addEventListener('click',()=>setStepmaPower('MEGAGOLD'));
 if(megaGuidePowerBtn) megaGuidePowerBtn.addEventListener('click',()=>setMegaGuidePower(!megaGuideEnabled));
