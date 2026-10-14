@@ -40,23 +40,29 @@ except Exception:
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
-from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, JSONResponse
 
-APP_VERSION = "3.98.130"
-# MEGA IA 3.98.75 — RN Follow 03: trava 1 sinal por ativo/candle; CALL e PUT não podem coexistir na mesma entrada.
-# MEGA IA 3.98.74 — solta somente RN Follow 03: POC/rejeição viram reforço; preserva RN Follow 02 intacto.
-# MEGA IA 3.98.73 — corrige visibilidade do card RN Follow Trend 03 dentro da pasta MEGA EA.
-# MEGA IA 3.98.72 — adiciona RN Follow Trend 03: ATR14 + rejeição + proteção EMA50 + Volume POC; sem S/R obrigatório; placar próprio.
-# MEGA IA 3.98.66 — integra MEGA Guide M5-M1: leitura M5 causal, entrada/expiração M1, evento único, radar e placar direto.
-# MEGA IA 3.98.67 — corrige WIN/LOSS de RN Follow Trend + MEGA Guide: normalização no painel e apuração M1 não fica presa por alias/troca de feed.
-# MEGA IA 3.98.68 — destrava MEGA Guide: remove falso rearme que bloqueava sinais, reduz aquecimento e usa tendência M5 10/20/50 com filtros flexíveis.
-# MEGA IA 3.98.70 — MEGA Guide segue o timeframe selecionado: M1/M5/M15/M30; análise, próxima vela e expiração usam o mesmo timeframe.
-# MEGA IA 3.98.65 — corrige RN Follow Trend no radar: direção/status próprios + registro servidor com entry/expiry para apuração WIN/LOSS.
-# MEGA IA 3.98.64 — RN Follow Trend usa apuração DIRETA: WIN/LOSS da primeira vela ignora Recuperação/G1/G2 global e sobe imediatamente ao placar.
-# MEGA IA 3.98.63 — corrige placar WIN/LOSS do RN Follow Trend: identifica RNFOLLOW no histórico e exibe placar próprio.
-# MEGA IA 3.98.62 — integra RN Follow Trend: adaptação segura do gatilho virtual do EA MT5 para CALL/PUT, sem Grid/Martingale/lotes; evento único, próxima M1 e Backtest 48H.
-# MEGA IA 3.98.61 — MEGA MONEY EA: evento único/rearme; impede repetir CALL/PUT em velas consecutivas enquanto a mesma confluência 4/4 permanecer ativa.
-# MEGA IA 3.98.60 — integra AA+ original (Alligator 13/8/5 SMMA Median): pré-alerta 20s antes da seta, trava anti-repaint, próxima M1, radar e Backtest 48H.
+APP_VERSION = "3.99.72"
+# 3.99.25 — MEGA MONEY: rearme estrito. Novo CALL/PUT só nasce depois de pelo menos 1 estado NEUTRO; painel/radar/backtest usam a mesma trava e não reciclam confluência vela após vela.
+# 3.99.24 — PROFESSOR: remove definitivamente o seletor legado de indicador, mostra os dois motores liberados e exibe a versão no painel para confirmar o deploy.
+# 3.99.22 — PROFESSOR: licença controla apenas acesso, bloqueio e vencimento; remove escolha de indicador do painel. PARCEIRO escolhe entre MEGA MONEY EA e MEGA PREMIUM PROTEGIDO.
+# 3.99.21 — PARCEIRO: força visibilidade real dos cards MEGA MONEY EA e MEGA PREMIUM PROTEGIDO via CSS/JS com prioridade máxima; demais motores continuam ocultos.
+# 3.99.22 — LICENÇA libera o app inteiro do Parceiro: Mega Money EA + Mega Premium Protegido ficam disponíveis para escolha local; Professor controla apenas acesso/vencimento.
+# 3.99.23 — PARCEIRO: pasta MEGA EA volta a recolher/abrir corretamente os dois motores permitidos.
+# 3.99.21 — PARCEIRO: força a pasta MEGA EA visível e mantém somente Mega Money/Mega Premium Protegido visíveis.
+# 3.99.20 — PARCEIRO: corrige CSS de visibilidade; MEGA MONEY EA e MEGA PREMIUM PROTEGIDO ficam visíveis mesmo com a pasta MEGA EA recolhida.
+# 3.99.19 — PARCEIRO: exibe somente MEGA MONEY EA e MEGA PREMIUM PROTEGIDO, ambos com ONLINE/OFFLINE; parceiro escolhe um por vez. MEGA MONEY ganha evento único/rearme para não repetir sinal em velas consecutivas.
+# 3.99.18 — MEGA MONEY do Professor/Parceiro varre 3 ativos por ciclo e pode promover sinais dos 3 pares; mantém RSI9 + CCI13 + Stoch 5/3/3 + MA5/9, próxima M1, sem Gale.
+# 3.99.17 — MEGA MONEY do Professor/Parceiro igual ao particular: RSI9 + CCI13 + Stoch 5/3/3 + MA5/9; próxima M1; sem Gale.
+# 3.99.14 — PARCEIRO: trava obrigatória na raiz por licença remota; painel privado somente em CLIENT; valida bloqueio/vencimento no Professor.
+# 3.99.12 — MEGA PREMIUM PROTEGIDO varre até 3 ativos por ciclo; remove BTC IQ Option e CRYPTO IDX Binomo da seleção/varredura do cliente.
+# 3.99.10 — cliente sem corretora: oculta cTrader/IQ/Binomo/Auto Entrada e radar OTC; usa fontes automáticas/fallback do servidor.
+# 3.99.08 — cliente: oculta IQ Option, Binomo e Auto Entrada; mantém somente cTrader visível na aba Corretora.
+# 3.99.04 — cliente privado: oculta motores/indicadores no app e adiciona imagem de robô embutida como fallback.
+# 3.99.03 — modo CLIENTE PRIVADO: oculta seleção/nomes dos indicadores no painel do cliente; Professor mantém controle completo.
+# 3.99.02 — licença obrigatória também no serviço Professor: /professor continua administrativo, mas o app principal exige chave válida.
+# 3.99.01 — corrige criação de licença no painel Professor: evita conflito do campo name com window.name e mostra erros da API corretamente.
+# 3.99.00 — arquitetura PROFESSOR/CLIENTE com licença remota, vencimento e bloqueio central.
 # MEGA IA 3.98.59 — scanner por aba: FOREX percorre 28 pares principais e CRIPTO percorre todas as criptos cadastradas; Mega Sniper + POC não fica preso ao ativo selecionado.
 # MEGA IA 3.98.57 — corrige botão 1 BAR REVERSAL: remove chamada JS inexistente e sincroniza painel/radar/backtest ao ligar/desligar.
 # MEGA IA 3.98.56 — integra 1 BAR REVERSAL original: padrão Out/In causal, próxima M1, motor separado, radar e Backtest 48H.
@@ -292,174 +298,11 @@ def ismael98_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", cur
 # price action, tendência, estrutura, impulso, exaustão, rejeição, rompimento, S/R,
 # volatilidade/lateralidade, Bollinger, RSI, MACD, ADX, EMA e volume.
 # MOTOR REMOVIDO permanece separado e continua com decisão nativa do modelo.
-
-# yDiv v0.2 — adaptação de sinais RSI14 + pivôs ZigZag confirmados.
-# Não transporta ordens, neutralização, lotes ou trailing do EA MT4.
-def ydiv_original_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    # yDiv 3.98.81: confirma pivôs apenas com candles fechados; a divergência
-    # permanece elegível por 10 candles após confirmação, com evento estável.
-    base={"available":True,"engine":"YDIVORIG","strategy":"yDiv Original", "provider":"LOCAL_YDIV02", "direction":"NEUTRO", "confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"yDiv monitorando divergência RSI e pivôs confirmados."}
-    rows=list(cs or [])[-350:]
-    if len(rows)<45:
-        return {**base,"reason":f"yDiv aguardando candles fechados ({len(rows)}/45)."}
-    try:
-        highs=[float(c['high']) for c in rows]
-        lows=[float(c['low']) for c in rows]
-        closes=[float(c['close']) for c in rows]
-        gains=[max(closes[i]-closes[i-1],0.0) for i in range(1,len(closes))]
-        losses=[max(closes[i-1]-closes[i],0.0) for i in range(1,len(closes))]
-        ag=sum(gains[:14])/14.0
-        al=sum(losses[:14])/14.0
-        rsis=[None]*len(closes)
-        for i in range(14,len(closes)):
-            if i>14:
-                ag=(ag*13+gains[i-1])/14.0
-                al=(al*13+losses[i-1])/14.0
-            rsis[i]=100.0 if al==0 else 100.0-100.0/(1.0+ag/al)
-        pivots={"H":[],"L":[]}
-        for i in range(16,len(rows)-2):
-            if highs[i]>max(highs[i-2:i]) and highs[i]>=max(highs[i+1:i+3]):
-                pivots["H"].append(i)
-            if lows[i]<min(lows[i-2:i]) and lows[i]<=min(lows[i+1:i+3]):
-                pivots["L"].append(i)
-        candidates=[]
-        for kind in ("H","L"):
-            pts=pivots[kind]
-            if len(pts)<2:continue
-            # Testa somente o pivô mais recente; pivô já confirmado não repinta.
-            b=pts[-1]
-            age=len(rows)-3-b
-            if age != 0:continue
-            # Compara com até três pivôs anteriores, sem olhar candles futuros.
-            for a in reversed(pts[-7:-1]):
-                if rsis[a] is None or rsis[b] is None:continue
-                if kind=="H" and highs[b]>highs[a] and rsis[b]<rsis[a] and max(rsis[a],rsis[b])>=55:
-                    candidates.append((b,"PUT",a,age))
-                    break
-                if kind=="L" and lows[b]<lows[a] and rsis[b]>rsis[a] and min(rsis[a],rsis[b])<=45:
-                    candidates.append((b,"CALL",a,age))
-                    break
-        if not candidates:
-            return {**base,"reason":"yDiv monitorando: aguardando divergência RSI/pivôs confirmados (janela de 10 candles)."}
-        candidates.sort(key=lambda item:item[0],reverse=True)
-        b,direction,a,age=candidates[0]
-        if len(candidates)>1 and candidates[1][0]==b and candidates[1][1]!=direction:
-            return {**base,"reason":"yDiv aguardando: divergências opostas no mesmo pivô."}
-        stamp=str(rows[b].get('datetime') or rows[b].get('timestamp') or rows[b].get('time') or b)
-        return {**base,"direction":direction,"confirmed":True,"confidence":70.0,"risk":"HIGH","event_key":f"YDIVORIG:{symbol}:{direction}:{stamp}","reason":f"yDiv divergência RSI/pivôs confirmada ({age} candles após confirmação): {direction} próxima vela."}
-    except Exception as exc:
-        return {**base,"reason":f"yDiv dados indisponíveis: {str(exc)[:90]}"}
-
-
-# Sniper Reversão: adaptação causal do canal HalfLength=2, DevPeriod=100,
-# Deviations=1 e MACD 12/26/9. Não reproduz objetos de tendência do MT4.
-# Bloqueio de emissão por ativo/timeframe, compartilhado entre radar e sinal oficial.
-# Um mesmo evento pode ser consultado novamente; eventos novos aguardam quatro velas.
-_SNIPER_RELEASE_LOCK = threading.RLock()
-_SNIPER_RELEASES = {}
-def _sniper_release_gate(result, symbol, interval, market, *, claim=False):
-    if not isinstance(result, dict) or result.get("direction") not in ("CALL", "PUT") or not result.get("confirmed"):
-        return result
-    try:
-        step = int(INTERVALS.get(interval, 60))
-        entry = int(next_boundary(interval).timestamp() // step)
-        key = (str(market).upper(), str(symbol).upper(), str(interval))
-        event = str(result.get("event_key") or "")
-        with _SNIPER_RELEASE_LOCK:
-            previous = _SNIPER_RELEASES.get(key)
-            if previous and entry - previous[0] < 4 and previous[1] != event:
-                return {**result, "direction":"NEUTRO", "confirmed":False, "confidence":0.0,
-                        "reason":"Sniper Reversão: intervalo de quatro velas entre entradas."}
-            if claim and (not previous or entry - previous[0] >= 4):
-                _SNIPER_RELEASES[key] = (entry, event)
-    except (ValueError, TypeError, AttributeError):
-        return {**result, "direction":"NEUTRO", "confirmed":False, "confidence":0.0,
-                "reason":"Sniper Reversão: horário de entrada indisponível."}
-    return result
-
-def sniper_reversal_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    base={"available":True,"engine":"SNIPERREV","strategy":"Sniper Reversão","provider":"LOCAL_SNIPER_REV_CAUSAL","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Sniper Reversão monitorando."}
-    rows=list(cs or [])[-350:]
-    if len(rows)<105:return {**base,"reason":f"Aguardando candles fechados ({len(rows)}/105)."}
-    try:
-        c=[float(x['close']) for x in rows]; o=[float(x['open']) for x in rows]
-        h=[float(x['high']) for x in rows]; l=[float(x['low']) for x in rows]
-        def ema_series(a,n):
-            v=a[0]; out=[]; k=2/(n+1)
-            for x in a:
-                v=v+(x-v)*k;out.append(v)
-            return out
-        fast=ema_series(c,12);slow=ema_series(c,26)
-        mac=[a-b for a,b in zip(fast,slow)];sig=ema_series(mac,9)
-        def band(i):
-            # Apenas preços conhecidos até o fechamento i (sem recálculo futuro).
-            mid=(3*c[i]+2*c[i-1]+c[i-2])/6
-            v=c[i-99:i+1]; avg=sum(v)/len(v)
-            dev=(sum((x-avg)**2 for x in v)/len(v))**0.5
-            return mid-dev,mid+dev
-        # Reversão FLEX por evento: exige mudança de direção da vela,
-        # proximidade ao lado do canal e confirmação por rejeição OU MACD.
-        # Não emite a cada vela enquanto a mesma tendência persistir.
-        low,up=band(len(c)-2)
-        width=max(up-low,1e-12)
-        mid=(low+up)/2.0
-        previous_down=c[-2]<o[-2]
-        previous_up=c[-2]>o[-2]
-        bullish=c[-1]>o[-1]
-        bearish=c[-1]<o[-1]
-        lower_zone=min(l[-1],l[-2])<=mid
-        upper_zone=max(h[-1],h[-2])>=mid
-        bullish_rejection=(c[-1]-l[-1])>=max(h[-1]-l[-1],1e-12)*0.60
-        bearish_rejection=(h[-1]-c[-1])>=max(h[-1]-l[-1],1e-12)*0.60
-        buy=previous_down and bullish and lower_zone and (bullish_rejection or mac[-1]>mac[-2])
-        sell=previous_up and bearish and upper_zone and (bearish_rejection or mac[-1]<mac[-2])
-        direction='CALL' if buy and not sell else 'PUT' if sell and not buy else 'NEUTRO'
-        if direction=='NEUTRO':
-            return {**base,"reason":"Aguardando virada de vela na metade adequada do canal, com rejeição ou MACD."}
-        # O intervalo entre entradas é controlado por _sniper_release_gate.
-        # Não bloquear por padrões hipotéticos nas três velas anteriores:
-        # em mercado alternado eles se repetem e impedem qualquer sinal.
-        stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
-        return {**base,"direction":direction,"confirmed":True,"confidence":70.0,"risk":"HIGH","event_key":f"SNIPERREV:{symbol}:{direction}:{stamp}","reason":f"Sniper Reversão {direction} confirmado no fechamento; próxima vela."}
-    except Exception as exc:return {**base,"reason":f"Dados insuficientes: {str(exc)[:80]}"}
-
-def mega_reversal_ydiv_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    base={"available":True,"engine":"MEGAREVYDIV","strategy":"Mega Reversão + yDiv","provider":"LOCAL_REV_YDIV","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Aguardando confluência."}
-    rows=list(cs or [])[-350:]
-    if len(rows)<105:
-        return {**base,"reason":f"Aguardando candles fechados ({len(rows)}/105)."}
-    # Aceita confirmação recente do yDiv e confirmação do Sniper em até 8 velas.
-    # Emissão somente quando surge confirmação NOVA na vela fechada mais recente.
-    y_recent=[]; sniper_recent=[]
-    for offset in range(8):
-        sample=rows[:-offset] if offset else rows
-        if len(sample)<105:break
-        y=ydiv_original_strategy(sample,symbol,timeframe,market)
-        sn=sniper_reversal_strategy(sample,symbol,timeframe,market)
-        if y.get('confirmed') and y.get('direction') in ('CALL','PUT'):
-            y_recent.append((offset,y))
-        if sn.get('confirmed') and sn.get('direction') in ('CALL','PUT'):
-            sniper_recent.append((offset,sn))
-    for offset,y in y_recent:
-        if offset>0 and not any(so==0 and sn['direction']==y['direction'] for so,sn in sniper_recent):
-            continue
-        for so,sn in sniper_recent:
-            if y['direction'] != sn['direction']:continue
-            if offset!=0 and so!=0:continue
-            direction=y['direction']
-            return {**base,"direction":direction,"confirmed":True,"confidence":72.0,"risk":"HIGH",
-                    "event_key":f"MEGAREVYDIV:{symbol}:{direction}:{y.get('event_key')}:{sn.get('event_key')}",
-                    "reason":f"Sniper + yDiv concordam em até 8 velas: {direction} próxima vela."}
-    return {**base,"reason":"Aguardando confirmação recente de yDiv e Sniper na mesma direção."}
-
-
-
-
 # Scalping M1 FLEX — M15 força / M5 rompimento / M1 reteste.
 _SCALPINGM1_LOCK = threading.RLock()
 _SCALPINGM1_LAST = {}
 def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    base={"available":True,"engine":"SCALPINGM1","strategy":"Scalping M1 FLEX","provider":"LOCAL_MTF_BREAK_RETEST","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Monitorando rompimento M5 ou impulso M1."}
+    base={"available":True,"engine":"SCALPINGM1","strategy":"Mega Bot","provider":"LOCAL_MTF_BREAK_RETEST","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Monitorando rompimento M5 ou impulso M1."}
     if str(timeframe) not in ("1min","M1","60"):
         return {**base,"reason":"Scalping M1 FLEX funciona no timeframe M1."}
     rows=list(cs or [])[-600:]
@@ -529,7 +372,7 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
             if prior is not None and now_bucket-prior<4:
                 return {**base,'reason':f'Intervalo de 4 minutos entre sinais ({4-(now_bucket-prior)} min restantes).'}
         event=f'SCALPINGM1:{market}:{symbol}:{direction}:{breakout}:{now_bucket}'
-        return {**base,'direction':direction,'confirmed':True,'confidence':60.0,'risk':'HIGH','event_key':event,'reason':f'Scalping M1 FLEX {direction}: {mode}; próxima vela.'}
+        return {**base,'direction':direction,'confirmed':True,'confidence':60.0,'risk':'HIGH','event_key':event,'reason':f'Mega Bot {direction}: {mode}; próxima vela.'}
     except Exception as exc:return {**base,'reason':f'Scalping M1 aguardando dados M1 válidos: {str(exc)[:90]}'}
 
 def scalping_m1_claim(result, symbol, market):
@@ -543,300 +386,100 @@ def scalping_m1_claim(result, symbol, market):
         except Exception:pass
     return result
 
-# MEGA GOLD SCALPER: adaptação causal do XAUUSD Scalper 1.40 para sinais M1.
+# Motor antigo Mega Gold removido: SCALPINGM1 utiliza somente scalping_m1_flex_strategy.
 
+PWA_VERSION = "v229"
 
-# LW Market Structure SMC v1.10 — confirmed M5 swings and structural breaks.
-_SMC_LOCK=threading.RLock()
-_SMC_LAST={}
-def smc_market_structure_strategy(cs,symbol="EUR/USD",timeframe="1min",market="OPEN",claim=False):
-    base={"available":True,"engine":"LWSMC","strategy":"SMC Market Structure","provider":"LOCAL_LW_SMC_M5","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"SMC monitorando estrutura M5."}
-    if timeframe not in ("1min","M1","60"):
-        return {**base,"reason":"SMC opera entradas no M1 com leitura M5."}
+# ===== MEGA IA PROFESSOR / CLIENTE =====
+APP_ROLE = os.getenv("MEGA_APP_ROLE", os.getenv("APP_ROLE", "PROFESSOR")).strip().upper()
+CLIENT_HIDE_ENGINES = os.getenv("MEGA_CLIENT_HIDE_ENGINES", "1").strip().lower() not in ("0", "false", "off", "no")
+MASTER_SERVER_URL = os.getenv("MEGA_MASTER_SERVER_URL", "https://mega-ia-professor.onrender.com").strip().rstrip("/")
+PARTNER_APP_URL = os.getenv("MEGA_PARTNER_APP_URL", "https://mega-ia-2-0.onrender.com").strip().rstrip("/")
+MASTER_ADMIN_TOKEN = os.getenv("MEGA_MASTER_ADMIN_TOKEN", "").strip()
+LICENSE_DB_PATH = os.getenv("MEGA_LICENSE_DB_PATH", os.path.join("/var/data", "mega_licenses.json") if os.path.isdir("/var/data") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "mega_licenses.json"))
+LICENSE_COOKIE = "mega_client_license"
+LICENSE_DEVICE_COOKIE = "mega_partner_device"
+LICENSE_CACHE_SECONDS = max(5, int(os.getenv("MEGA_LICENSE_CACHE_SECONDS", "30")))
+_license_cache: Dict[str, Dict[str, Any]] = {}
+_license_lock = threading.RLock()
+
+def _license_db_load():
+    with _license_lock:
+        try:
+            with open(LICENSE_DB_PATH, "r", encoding="utf-8") as f:
+                data=json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+def _license_db_save(data):
+    with _license_lock:
+        tmp=LICENSE_DB_PATH+".tmp"
+        os.makedirs(os.path.dirname(LICENSE_DB_PATH) or ".", exist_ok=True)
+        with open(tmp,"w",encoding="utf-8") as f:
+            json.dump(data,f,ensure_ascii=False,indent=2)
+        os.replace(tmp,LICENSE_DB_PATH)
+
+def _license_status(key: str):
+    key=(key or "").strip().upper()
+    row=_license_db_load().get(key)
+    if not row:
+        return {"valid":False,"reason":"Licença não encontrada."}
+    if not bool(row.get("enabled", True)):
+        return {"valid":False,"reason":"Licença bloqueada pelo Professor.",**row}
     try:
-        rows=list(cs or [])[-900:]
-        def timestamp(r):
-            t=r.get('timestamp',r.get('time',r.get('datetime')))
-            if isinstance(t,(int,float)):return int(t/1000 if t>1e11 else t)
-            if isinstance(t,str):
-                try:return int(float(t)/1000 if float(t)>1e11 else float(t))
-                except ValueError:return int(datetime.fromisoformat(t.replace('Z','+00:00')).timestamp())
-            raise ValueError('timestamp ausente')
-        groups={}
-        for r in rows:
-            t=timestamp(r);groups.setdefault(t//300,{})[t//60]=r
-        m5=[]
-        for bucket,minutes in sorted(groups.items()):
-            if len(minutes)!=5 or any(k not in minutes for k in range(bucket*5,bucket*5+5)):continue
-            v=[minutes[k] for k in range(bucket*5,bucket*5+5)]
-            m5.append({'bucket':bucket,'open':float(v[0]['open']),'high':max(float(x['high']) for x in v),'low':min(float(x['low']) for x in v),'close':float(v[-1]['close'])})
-        if len(m5)<15:return {**base,'reason':f'SMC coletando M5 fechado ({len(m5)}/15).'}
-        n=5;highs=[x['high'] for x in m5];lows=[x['low'] for x in m5]
-        refh=refl=None;trend=0;event=None
-        for i in range(n*2,len(m5)):
-            j=i-n
-            if highs[j]>max(highs[j-n:j]) and highs[j]>max(highs[j+1:i+1]):refh=highs[j]
-            if lows[j]<min(lows[j-n:j]) and lows[j]<min(lows[j+1:i+1]):refl=lows[j]
-            if refh is not None and m5[i]['close']>refh:
-                event=(i,'CALL','CHoCH' if trend==-1 else 'BOS');trend=1;refh=None
-            elif refl is not None and m5[i]['close']<refl:
-                event=(i,'PUT','CHoCH' if trend==1 else 'BOS');trend=-1;refl=None
-        if not event or event[0]!=len(m5)-1:return {**base,'reason':'SMC aguardando novo BOS/CHoCH M5 confirmado.'}
-        _,direction,kind=event
-        # Confirm only once at the next M1 opportunity following M5 close.
-        current_min=timestamp(rows[-1])//60
-        if current_min != (m5[-1]['bucket']+1)*5-1:
-            return {**base,'reason':'SMC aguardando janela da próxima vela M1 após rompimento M5.'}
-        key=(str(market),str(symbol));stamp=m5[-1]['bucket'];eventkey=f'LWSMC:{market}:{symbol}:{direction}:{stamp}'
-        with _SMC_LOCK:
-            prior=_SMC_LAST.get(key)
-            if prior and (current_min-prior[0]<4 or prior[1]==eventkey):return {**base,'reason':'SMC aguardando intervalo de 4 minutos.'}
-            if claim:_SMC_LAST[key]=(current_min,eventkey)
-        return {**base,'direction':direction,'confirmed':True,'confidence':65.0,'risk':'HIGH','event_key':eventkey,'reason':f'SMC {kind} M5 confirmado: {direction} próxima M1.'}
-    except Exception as exc:return {**base,'reason':f'SMC aguardando dados válidos: {str(exc)[:90]}'}
+        exp=datetime.fromisoformat(str(row.get("expires_at",""))[:10]).date()
+    except Exception:
+        return {"valid":False,"reason":"Vencimento inválido.",**row}
+    today=datetime.now(BR_TZ).date()
+    if today>exp:
+        return {"valid":False,"reason":f"Licença vencida em {exp.isoformat()}.",**row}
+    return {"valid":True,"reason":"LIBERADO","days_left":(exp-today).days,**row}
 
-# One Shoot AI V4 — adaptação causal de rompimento de pivôs para sinais M1.
-_ONESHOOT_LOCK = threading.RLock()
-_ONESHOOT_LAST = {}
-def one_shoot_ai_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", claim=False):
-    base={"available":True,"engine":"ONESHOOT","strategy":"One Shoot AI","provider":"LOCAL_ONESHOOT_BREAKOUT_M1","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Monitorando rompimento de pivôs M1."}
-    if timeframe not in ("1min","M1","60"):
-        return {**base,"reason":"One Shoot AI opera no M1."}
-    rows=list(cs or [])[-200:]
-    if len(rows)<42:return {**base,"reason":f"Aguardando candles M1 ({len(rows)}/42)."}
-    try:
-        highs=[float(x['high']) for x in rows];lows=[float(x['low']) for x in rows]
-        opens=[float(x['open']) for x in rows];closes=[float(x['close']) for x in rows]
-        # Pivôs com 2 velas à direita, sempre confirmados antes da vela de disparo.
-        pivh=[];pivl=[]
-        for i in range(max(2,len(rows)-38),len(rows)-3):
-            if highs[i]>max(highs[i-2:i]) and highs[i]>=max(highs[i+1:i+3]):pivh.append(highs[i])
-            if lows[i]<min(lows[i-2:i]) and lows[i]<=min(lows[i+1:i+3]):pivl.append(lows[i])
-        if not pivh and not pivl:return {**base,"reason":"Aguardando pivôs confirmados."}
-        resistance=pivh[-1] if pivh else float('inf');support=pivl[-1] if pivl else -float('inf')
-        rng=max(highs[-1]-lows[-1],1e-12);body=abs(closes[-1]-opens[-1])/rng
-        call=closes[-2]<=resistance and closes[-1]>resistance and closes[-1]>opens[-1] and body>=.32
-        put=closes[-2]>=support and closes[-1]<support and closes[-1]<opens[-1] and body>=.32
-        direction='CALL' if call and not put else 'PUT' if put and not call else 'NEUTRO'
-        if direction=='NEUTRO':return {**base,"reason":"Aguardando rompimento confirmado de pivô com vela de força."}
-        stamp=str(rows[-1].get('timestamp') or rows[-1].get('datetime') or rows[-1].get('time') or len(rows))
-        event=f"ONESHOOT:{market}:{symbol}:{direction}:{stamp}"
-        key=(market,symbol)
-        with _ONESHOOT_LOCK:
-            previous=_ONESHOOT_LAST.get(key)
-            if previous and (time.monotonic()-previous[0]<240 or previous[1]==event):
-                return {**base,"reason":"One Shoot AI: intervalo de 4 minutos ou evento já enviado."}
-            if claim:_ONESHOOT_LAST[key]=(time.monotonic(),event)
-        return {**base,"direction":direction,"confirmed":True,"confidence":67.0,"risk":"HIGH","event_key":event,"reason":f"One Shoot AI {direction}: rompimento M1 confirmado; entrada próxima vela."}
-    except Exception as exc:return {**base,"reason":f"One Shoot AI aguardando dados válidos: {str(exc)[:80]}"}
+def _license_device_status(key: str, device_id: str, claim: bool = False):
+    """One license per browser installation. Atomic first activation on Professor."""
+    key=(key or "").strip().upper()
+    device_id=(device_id or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", device_id):
+        return {"valid":False,"reason":"Identificação do aparelho ausente. Ative novamente neste navegador."}
+    with _license_lock:
+        status=_license_status(key)
+        if not status.get("valid"):
+            return status
+        db=_license_db_load()
+        row=db.get(key,{})
+        bound=str(row.get("device_hash") or "")
+        if bound and not secrets.compare_digest(bound, device_id):
+            return {"valid":False,"reason":"Chave já vinculada a outro aparelho. Solicite transferência ao Professor."}
+        if not bound:
+            if not claim:
+                return {"valid":False,"reason":"Ative a chave neste aparelho antes de entrar."}
+            row["device_hash"]=device_id
+            row["activated_at"]=datetime.now(BR_TZ).isoformat()
+            db[key]=row
+            _license_db_save(db)
+        return _license_status(key)
 
-def mega_gold_scalper_strategy(cs, symbol="XAU/USD", timeframe="1min", market="OPEN"):
-    base={"available":True,"engine":"MEGAGOLD","strategy":"Mega Gold Scalper","provider":"LOCAL_XAU_SCALPER_140_CAUSAL","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Mega Gold monitorando."}
-    rows=list(cs or [])[-300:]
-    if len(rows)<60:return {**base,"reason":f"Aguardando candles fechados ({len(rows)}/60)."}
-    try:
-        closes=[float(x['close']) for x in rows]; highs=[float(x['high']) for x in rows]; lows=[float(x['low']) for x in rows]
-        def es(values,period):
-            k=2/(period+1); v=values[0]; out=[]
-            for x in values:v+=k*(x-v);out.append(v)
-            return out
-        fast=es(closes,8);slow=es(closes,21)
-        r=rsi(closes,14)
-        _,_,_,adx_series,_,_=_ismael_trader_indicator_series(rows,fast=8,slow=21,rsi_period=14,adx_period=14)
-        adx=float(adx_series[-1] or 0)
-        tr=[max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1])) for i in range(1,len(rows))]
-        atr=sum(tr[-14:])/14
-        if atr<=0 or r is None or adx<16:return {**base,"reason":"Aguardando ADX >=16 e ATR válido."}
-        call=fast[-1]>slow[-1] and closes[-2]<=fast[-2]+atr*.21 and closes[-1]>fast[-1] and closes[-1]-fast[-1]>atr*.11 and r<74
-        put=fast[-1]<slow[-1] and closes[-2]>=fast[-2]-atr*.21 and closes[-1]<fast[-1] and fast[-1]-closes[-1]>atr*.11 and r>26
-        direction='CALL' if call else 'PUT' if put else 'NEUTRO'
-        if direction=='NEUTRO':return {**base,"reason":"Aguardando retomada EMA8/21 + RSI + ADX + ATR."}
-        stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
-        return {**base,"direction":direction,"confirmed":True,"confidence":70.0,"risk":"HIGH","event_key":f"MEGAGOLD:{market}:{symbol}:{stamp}","reason":f"Mega Gold {direction}: retomada confirmada; próxima M1."}
-    except Exception as exc:return {**base,"reason":f"Mega Gold aguardando dados: {str(exc)[:90]}"}
+class LicenseAdminBody(BaseModel):
+    name: str
+    expires_at: str
+    key: str | None = None
+    enabled: bool = True
+    engine: str = "SCALPINGM1"
 
+class LicenseEngineBody(BaseModel):
+    key: str
+    engine: str
 
-# Intervalo mínimo de 4 minutos entre sinais oficiais do RSI 2, global para todos os pares.
-# Consultas do radar não consomem o intervalo.
-_RSI2_SIGNAL_LOCK = threading.RLock()
-_RSI2_LAST_RELEASE = 0.0
-_RSI2_LAST_EVENT = ""
+class LicenseTransferBody(BaseModel):
+    key: str
 
-def _rsi2_cooldown_gate(result, *, claim=False):
-    global _RSI2_LAST_RELEASE, _RSI2_LAST_EVENT
-    if not isinstance(result, dict) or result.get("direction") not in ("CALL", "PUT") or not result.get("confirmed"):
-        return result
-    with _RSI2_SIGNAL_LOCK:
-        elapsed = time.monotonic() - _RSI2_LAST_RELEASE if _RSI2_LAST_RELEASE else 240.0
-        event = str(result.get("event_key") or "")
-        # Mesmo evento nunca reinicia o relógio, nem deve gerar outro sinal.
-        if event and event == _RSI2_LAST_EVENT:
-            return {**result, "direction":"NEUTRO", "confirmed":False, "confidence":0.0,
-                    "reason":"RSI 2: sinal desta vela já liberado; aguardando nova oportunidade."}
-        if elapsed < 240.0:
-            remaining = int(240.0 - elapsed + 0.999)
-            return {**result, "direction":"NEUTRO", "confirmed":False, "confidence":0.0,
-                    "cooldown_remaining_seconds":remaining,
-                    "reason":f"RSI 2: próximo sinal permitido em {remaining}s (intervalo de 4 minutos)."}
-        if claim:
-            _RSI2_LAST_RELEASE = time.monotonic()
-            _RSI2_LAST_EVENT = event
-    return result
+class LicenseToggleBody(BaseModel):
+    key: str
+    enabled: bool
 
-# RSI 2 Deriv adaptado: RSI Wilder(2), extremos 20/80, somente M1.
-def rsi2_deriv_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    base={"available":True,"engine":"RSI2DERIV","strategy":"RSI 2","provider":"LOCAL_RSI2_DERIV","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"RSI 2 monitorando extremos + força da vela (corpo mínimo 50%)."}
-    if timeframe not in ("1min","M1","60"):
-        return {**base,"reason":"RSI 2 opera somente em M1."}
-    rows=list(cs or [])[-100:]
-    if len(rows)<12:return {**base,"reason":"RSI 2 aguardando candles M1."}
-    try:
-        closes=[float(x["close"]) for x in rows]
-        candle=rows[-1]
-        candle_open=float(candle["open"])
-        candle_close=float(candle["close"])
-        candle_high=float(candle["high"])
-        candle_low=float(candle["low"])
-        candle_range=candle_high-candle_low
-        candle_body=abs(candle_close-candle_open)
-        body_ratio=(candle_body/candle_range) if candle_range>0 else 0.0
-        value=rsi(closes,2)
-        previous=rsi(closes[:-1],2)
-        if value is None or previous is None:return base
-        # Dispara apenas na primeira entrada na zona, evitando sinais sucessivos.
-        direction="PUT" if value>=80 and previous<80 else "CALL" if value<=20 and previous>20 else "NEUTRO"
-        if direction=="NEUTRO":return {**base,"reason":f"RSI 2 = {value:.1f}; aguardando novo extremo 20/80."}
-        # Confirmação obrigatória: corpo ocupa >= 50% da amplitude e fecha
-        # na direção da operação. Apenas candles já fechados (fluxo causal).
-        candle_supports=(body_ratio>=0.50 and
-                         ((direction=="CALL" and candle_close>candle_open) or
-                          (direction=="PUT" and candle_close<candle_open)))
-        if not candle_supports:
-            return {**base,"reason":f"RSI 2 {value:.1f}: força da vela não confirmou {direction} (corpo {body_ratio:.0%}, mínimo 50% e direção alinhada).",
-                    "rsi2":round(value,2),"candle_body_ratio":round(body_ratio,3)}
-        stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or rows[-1].get("time") or len(rows))
-        return {**base,"direction":direction,"confirmed":True,"confidence":60.0,"risk":"HIGH","event_key":f"RSI2DERIV:{market}:{symbol}:{stamp}","reason":f"RSI 2 {value:.1f} + força da vela {body_ratio:.0%}: {direction} na próxima M1.","rsi2":round(value,2),"candle_body_ratio":round(body_ratio,3)}
-    except (ValueError,TypeError,KeyError,ZeroDivisionError) as exc:
-        return {**base,"reason":f"RSI 2 dados inválidos: {str(exc)[:80]}"}
-
-# Gold Rush Pro — adaptação experimental do EA MT4 para alertas M1/M5/M15/M30.
-# O EA original opera ciclos/ordens; esta regra não é uma reprodução 1:1.
-def gold_rush_pro_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    base={"available":True,"engine":"GOLDRUSH","strategy":"Gold Rush Pro","provider":"LOCAL_GOLD_RUSH_ADAPT","direction":"NEUTRO","confirmed":False,"confidence":0.0,"confidence_is_probability":False,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"non_repaint":True,"prealert_seconds":20,"reason":"Gold Rush Pro monitorando."}
-    if str(timeframe) not in ("1min","5min","15min","30min","M1","M5","M15","M30","60","300","900","1800"):
-        return {**base,"reason":"Gold Rush Pro: selecione M1, M5, M15 ou M30."}
-    rows=list(cs or [])[-180:]
-    if len(rows)<35:
-        return {**base,"reason":f"Gold Rush Pro coletando candles ({len(rows)}/35)."}
-    try:
-        c=[float(x['close']) for x in rows]; o=[float(x['open']) for x in rows]
-        h=[float(x['high']) for x in rows]; l=[float(x['low']) for x in rows]
-        def ema_series(period):
-            v=c[0]; out=[]; k=2.0/(period+1)
-            for x in c:
-                v+=k*(x-v); out.append(v)
-            return out
-        e5,e8,e13=(ema_series(n) for n in (5,8,13))
-        recent_bodies=[abs(c[i]-o[i]) for i in range(-21,-1)]
-        avg=sum(recent_bodies)/len(recent_bodies)
-        body=abs(c[-1]-o[-1]); strength=avg>0 and body>=avg*0.65
-        # Aceita retomada de tendência já formada, sem exigir alinhamento novo.
-        # Gatilho de retomada: candle anterior tocou/atravessou EMA5,
-        # candle atual fecha na direção da tendência e volta a afastar-se da EMA5.
-        up=e5[-1]>e8[-1]>e13[-1]
-        down=e5[-1]<e8[-1]<e13[-1]
-        call=strength and up and c[-1]>o[-1] and c[-1]>e5[-1] and l[-2]<=e5[-2]
-        put=strength and down and c[-1]<o[-1] and c[-1]<e5[-1] and h[-2]>=e5[-2]
-        direction='CALL' if call else 'PUT' if put else 'NEUTRO'
-        if direction=='NEUTRO':
-            return {**base,"reason":"Aguardando retomada EMA 5/8/13 com vela direcional (força >=65% da média de 20 velas)."}
-        stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
-        return {**base,"direction":direction,"confirmed":True,"confidence":65.0,"risk":"HIGH","event_key":f"GOLDRUSH:{market}:{symbol}:{stamp}","reason":f"Gold Rush Pro {direction}: retomada confirmada; próxima vela {timeframe}."}
-    except (ValueError,TypeError,KeyError,ZeroDivisionError) as exc:
-        return {**base,"reason":f"Gold Rush Pro aguardando dados: {str(exc)[:80]}"}
-
-# AutoHedge M1 — adaptacao experimental do conceito de movimento/grid do EA MT5.
-# Nao replica hedge, ordens pendentes, lotes ou trailing stop.
-def autohedge_m1_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    base={"available":True,"engine":"AUTOHEDGEM1","strategy":"AutoHedge M1",
-          "provider":"LOCAL_AUTOHEDGE_M1_EXPERIMENTAL","direction":"NEUTRO",
-          "confirmed":False,"confidence":0.0,"confidence_is_probability":False,
-          "next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,
-          "gale_signal":False,"martingale":False,"non_repaint":True,
-          "prealert_seconds":20,"reason":"AutoHedge M1 monitorando movimento."}
-    if timeframe not in ("1min", "M1", "60"):
-        return {**base,"reason":"AutoHedge M1 opera somente no M1."}
-    rows=list(cs or [])[-100:]
-    if len(rows)<30:
-        return {**base,"reason":f"Aguardando candles M1 ({len(rows)}/30)."}
-    try:
-        c=[float(x["close"]) for x in rows]
-        o=[float(x["open"]) for x in rows]
-        h=[float(x["high"]) for x in rows]
-        l=[float(x["low"]) for x in rows]
-        tr=[max(h[i]-l[i],abs(h[i]-c[i-1]),abs(l[i]-c[i-1])) for i in range(1,len(rows))]
-        atr=sum(tr[-14:])/14
-        if atr<=0: return {**base,"reason":"ATR indisponivel."}
-        # Filtro ATR14 adaptativo: compara a volatilidade atual com a referencia
-        # dos 40 candles anteriores, sem valores absolutos por ativo.
-        atr_history=[sum(tr[i-13:i+1])/14.0 for i in range(13,len(tr))]
-        baseline=sum(atr_history[-41:-1])/len(atr_history[-41:-1]) if len(atr_history)>1 else atr
-        if baseline<=0:
-            return {**base,"reason":"AutoHedge: referencia ATR indisponivel."}
-        atr_ratio=atr/baseline
-        if atr_ratio<0.65:
-            return {**base,"reason":"AutoHedge: ATR bloqueou baixa volatilidade.","atr_filter":"LOW_VOLATILITY"}
-        if atr_ratio>2.10 or (h[-1]-l[-1])>2.8*atr:
-            return {**base,"reason":"AutoHedge: ATR bloqueou volatilidade excessiva.","atr_filter":"HIGH_VOLATILITY"}
-        # O GridStepPrice do ouro e substituido por distancia relativa ao ATR,
-        # para nao aplicar a mesma distancia nominal em FX e criptomoedas.
-        impulse=c[-1]-c[-4]
-        body=abs(c[-1]-o[-1])/max(h[-1]-l[-1],1e-12)
-        prev_impulse=c[-2]-c[-5]
-        buy=impulse>0.75*atr and prev_impulse<=0.75*atr and c[-1]>o[-1] and body>=0.48
-        sell=impulse< -0.75*atr and prev_impulse>= -0.75*atr and c[-1]<o[-1] and body>=0.48
-        direction="CALL" if buy and not sell else "PUT" if sell and not buy else "NEUTRO"
-        if direction=="NEUTRO": return {**base,"reason":"Aguardando novo impulso direcional M1."}
-        stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or rows[-1].get("time") or len(rows))
-        return {**base,"direction":direction,"confirmed":True,"confidence":65.0,
-                "risk":"HIGH","event_key":f"AUTOHEDGEM1:{market}:{symbol}:{stamp}",
-                "reason":f"AutoHedge M1 {direction}: impulso novo; entrada na proxima vela."}
-    except (ValueError,TypeError,KeyError,ZeroDivisionError) as exc:
-        return {**base,"reason":f"Dados invalidos: {str(exc)[:80]}"}
-
-# AutoHedge: cooldown unico, aplicado somente no endpoint oficial de sinal.
-# Nunca reserva um evento durante analises do radar ou durante pre-visualizacoes.
-_AUTOHEDGE_ALERT_LOCK = threading.RLock()
-_AUTOHEDGE_LAST_ALERT = {"at": 0.0, "entry": ""}
-_AUTOHEDGE_COOLDOWN_SECONDS = 60.0
-
-def _autohedge_delivery_cooldown(data):
-    if not isinstance(data, dict) or data.get("direction") not in ("CALL", "PUT"):
-        return data
-    if not data.get("ai_confirmed", data.get("confirmed", True)):
-        return data
-    entry = str(data.get("entry_time") or "")
-    if not entry:
-        return data
-    moment = time.monotonic()
-    with _AUTOHEDGE_ALERT_LOCK:
-        last = _AUTOHEDGE_LAST_ALERT
-        # Consultas repetidas do mesmo sinal nao alteram a contagem.
-        if last["entry"] == entry:
-            return data
-        remaining = _AUTOHEDGE_COOLDOWN_SECONDS - (moment - last["at"])
-        if last["at"] and remaining > 0:
-            blocked = dict(data)
-            blocked.update(direction="NEUTRO", confidence=0.0,
-                           ai_confirmed=False, confirmed=False,
-                           entry_time=None, announce_time=None, expiry_time=None,
-                           status="AutoHedge M1 • AGUARDANDO INTERVALO",
-                           reason=f"AutoHedge: aguarde {int(remaining + 0.999)}s para outro sinal.")
-            return blocked
-        last.update(at=moment, entry=entry)
-    return data
-
-PWA_VERSION = "v233"
+class LicenseActivateBody(BaseModel):
+    key: str
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
@@ -2140,6 +1783,17 @@ CTRADER_SESSION_TTL = max(300, int(os.getenv("CTRADER_SESSION_TTL", "2628000")))
 ctrader_sessions: Dict[str, Dict[str, Any]] = {}
 ctrader_oauth_states: Dict[str, float] = {}
 
+# Fonte cTrader compartilhada: autorização do proprietário, nunca do parceiro.
+# Configure apenas no Render; não coloque tokens no repositório ou no navegador.
+CTRADER_SHARED_REFRESH_TOKEN = os.getenv("CTRADER_SHARED_REFRESH_TOKEN", "").strip()
+_ctrader_shared_lock = threading.RLock()
+_ctrader_shared_session: Dict[str, Any] = {}
+_ctrader_admin_states: Dict[str, float] = {}
+# Aponte para um disco persistente PRIVADO no Render, por exemplo /var/data.
+CTRADER_SHARED_TOKEN_FILE = os.getenv("CTRADER_SHARED_TOKEN_FILE", "/var/data/ctrader_shared_token.json").strip()
+
+
+
 # MEGA IA 3.24 — cTrader como fonte principal do Mercado Aberto.
 # Usa o protocolo JSON oficial na porta 5036 e mantém o OAuth somente leitura.
 CTRADER_JSON_DEMO_URL = os.getenv("CTRADER_JSON_DEMO_URL", "wss://demo.ctraderapi.com:5036").strip()
@@ -2241,8 +1895,8 @@ FOREX_SYMBOLS = [
     "CAD/JPY", "CAD/CHF", "NZD/JPY", "NZD/CAD", "NZD/CHF", "CHF/JPY",
 ]
 CRYPTO_SYMBOLS = [
-    "BTC/USD", "BTC", "BTC_IQ", "ETH/USD", "LTC/USD", "SOL/USD",
-    "XRP/USD", "DOGE/USD", "ADA/USD", "BNB/USD", BINOMO_CRYPTO_IDX_SYMBOL,
+    "BTC/USD", "BTC", "ETH/USD", "LTC/USD", "SOL/USD",
+    "XRP/USD", "DOGE/USD", "ADA/USD", "BNB/USD",
 ]
 SYMBOLS = FOREX_SYMBOLS + CRYPTO_SYMBOLS
 OTC_SYMBOLS = [s for s in SYMBOLS if s not in (BINOMO_CRYPTO_IDX_SYMBOL, "BTC", "BTC_IQ")]
@@ -2274,8 +1928,8 @@ BACKGROUND_SCAN_SECONDS = max(1.0, min(60.0, float(os.getenv("BACKGROUND_SCAN_SE
 BACKGROUND_RESULT_SECONDS = max(3.0, min(30.0, float(os.getenv("BACKGROUND_RESULT_SECONDS", "5"))))
 BACKGROUND_DEFAULT_ENABLED = os.getenv("BACKGROUND_SIGNALS_ENABLED", "0").strip().lower() in ("1", "true", "on", "yes")
 BACKGROUND_DEFAULT_ENGINE = os.getenv("BACKGROUND_ENGINE", "SMART").strip().upper() or "SMART"
-if BACKGROUND_DEFAULT_ENGINE not in {"SCALPERPRO"}:
-    BACKGROUND_DEFAULT_ENGINE = "SCALPERPRO"
+if BACKGROUND_DEFAULT_ENGINE != "SCALPINGM1":
+    BACKGROUND_DEFAULT_ENGINE = "SCALPINGM1"
 BACKGROUND_DEFAULT_MARKET = os.getenv("BACKGROUND_MARKET", "OPEN").strip().upper() or "OPEN"
 BACKGROUND_DEFAULT_INTERVAL = os.getenv("BACKGROUND_INTERVAL", "1min").strip() or "1min"
 # Telegram do robô 24h é um estado do SERVIDOR. Por segurança começa OFF
@@ -3268,7 +2922,7 @@ iq_sessions: Dict[str, Dict[str, Any]] = {}
 BINOMO_SESSION_COOKIE = "mega_binomo_session"
 binomo_sessions: Dict[str, Dict[str, Any]] = {}
 
-VALID_MARKETS = ("OPEN", "IQ_OTC")
+VALID_MARKETS = ("OPEN",)
 
 
 class BinomoLoginBody(BaseModel):
@@ -6967,403 +6621,8 @@ def ea_movement_force_strategy(cs, timeframe="1min", m5=None, h1=None, market="O
 
 
 
-def ea_binary_strategy(cs, timeframe="1min", m5=None, h1=None, market="OPEN"):
-    """EA AUTÔNOMA IQ — leitura seletiva para a próxima vela.
-
-    Não depende da aba Gráfico e não usa Gale para decidir uma entrada.
-    A fonte esperada é a própria IQ Option:
-      - OPEN -> ativo normal da IQ Option;
-      - IQ_OTC -> ativo OTC da IQ Option.
-
-    O motor usa somente candles FECHADOS e exige contexto suficiente antes de
-    liberar CALL/PUT. A pontuação é um score interno de qualidade, não uma
-    probabilidade garantida de acerto.
-    """
-    rows = list(cs or [])
-    m5 = list(m5 or [])
-    h1 = list(h1 or [])
-    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"EA AUTÔNOMA IQ {tf_label}"
-
-    if len(rows) < 55:
-        return {
-            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "risk": "HIGH", "strategy": name, "engine": "EA_AUTONOMOUS_IQ",
-            "reason": f"Aguardando histórico suficiente da IQ Option em {tf_label}.",
-            "direct_win_only": True, "gale_signal": False,
-        }
-
-    if len(m5) < 35 or len(h1) < 25:
-        return {
-            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "risk": "HIGH", "strategy": name, "engine": "EA_AUTONOMOUS_IQ",
-            "reason": "Aguardando contexto M5/H1 da IQ Option antes de liberar uma entrada.",
-            "direct_win_only": True, "gale_signal": False,
-        }
-
-    closes = [float(x["close"]) for x in rows]
-    last = rows[-1]
-    prev = rows[-2]
-    price = float(last["close"])
-    o = float(last["open"])
-    h = float(last["high"])
-    l = float(last["low"])
-    rng = max(h - l, 1e-12)
-    body = abs(price - o)
-    body_ratio = body / rng
-
-    ranges = [max(float(x["high"]) - float(x["low"]), 1e-12) for x in rows[-20:]]
-    avg_range = sum(ranges) / max(1, len(ranges))
-
-    # Evita candle fraco, doji e explosão anormal.
-    if body_ratio < 0.28:
-        return {
-            "direction": "NEUTRO", "confidence": 35, "confirmed": False,
-            "risk": "HIGH", "strategy": name, "engine": "EA_AUTONOMOUS_IQ",
-            "reason": "Última vela fechada sem força suficiente; entrada direta bloqueada.",
-            "direct_win_only": True, "gale_signal": False,
-        }
-    if rng > avg_range * 2.35:
-        return {
-            "direction": "NEUTRO", "confidence": 38, "confirmed": False,
-            "risk": "HIGH", "strategy": name, "engine": "EA_AUTONOMOUS_IQ",
-            "reason": "Movimento muito esticado/explosivo; EA aguardando normalização.",
-            "direct_win_only": True, "gale_signal": False,
-        }
-
-    lateral, lateral_score = sideways_filter(closes)
-    if lateral:
-        return {
-            "direction": "NEUTRO", "confidence": 42, "confirmed": False,
-            "risk": "HIGH", "strategy": name, "engine": "EA_AUTONOMOUS_IQ",
-            "reason": f"Mercado lateral/ruidoso detectado ({lateral_score:.0f}); entrada direta bloqueada.",
-            "direct_win_only": True, "gale_signal": False,
-        }
-
-    call_score = 0.0
-    put_score = 0.0
-    call_reasons, put_reasons = [], []
-
-    # Tendência curta no timeframe de entrada.
-    e9, e21, e50 = ema(closes, 9), ema(closes, 21), ema(closes, 50)
-    if None not in (e9, e21, e50):
-        if e9 > e21 > e50 and price >= e9:
-            call_score += 23
-            call_reasons.append("tendência curta alinhada")
-        if e9 < e21 < e50 and price <= e9:
-            put_score += 23
-            put_reasons.append("tendência curta alinhada")
-
-    # Contexto M5.
-    m5c = [float(x["close"]) for x in m5]
-    m5e9, m5e21 = ema(m5c, 9), ema(m5c, 21)
-    if m5e9 is not None and m5e21 is not None:
-        if m5e9 > m5e21 and m5c[-1] >= m5e9:
-            call_score += 18
-            call_reasons.append("M5 comprador")
-        elif m5e9 < m5e21 and m5c[-1] <= m5e9:
-            put_score += 18
-            put_reasons.append("M5 vendedor")
-
-    # Contexto H1 por direção + estrutura simples.
-    h1c = [float(x["close"]) for x in h1]
-    h1e9, h1e21 = ema(h1c, 9), ema(h1c, 21)
-    if h1e9 is not None and h1e21 is not None:
-        if h1e9 > h1e21:
-            call_score += 17
-            call_reasons.append("H1 comprador")
-        elif h1e9 < h1e21:
-            put_score += 17
-            put_reasons.append("H1 vendedor")
-
-    # Padrões de vela fechados.
-    pattern = _pure_ai_candle_pattern_filter(rows, "NEUTRO")
-    if pattern.get("passed") and pattern.get("direction") == "CALL":
-        call_score += 22
-        call_reasons.append("padrão comprador")
-    elif pattern.get("passed") and pattern.get("direction") == "PUT":
-        put_score += 22
-        put_reasons.append("padrão vendedor")
-
-    # Rejeição por pavio.
-    wi = wick_info(last)
-    if price > o and float(wi.get("call_wick", 0)) >= 0.32:
-        call_score += 10
-        call_reasons.append("rejeição compradora")
-    if price < o and float(wi.get("put_wick", 0)) >= 0.32:
-        put_score += 10
-        put_reasons.append("rejeição vendedora")
-
-    # Continuidade da vela fechada, sem perseguir candle gigante.
-    if price > o and body_ratio >= 0.52 and rng <= avg_range * 1.75:
-        call_score += 9
-        call_reasons.append("vela de força")
-    elif price < o and body_ratio >= 0.52 and rng <= avg_range * 1.75:
-        put_score += 9
-        put_reasons.append("vela de força")
-
-    # Suporte/resistência H1: favorece reação e bloqueia entrada contra uma zona próxima.
-    levels = _support_resistance_levels(h1, "1h")
-    supports = [float(x["price"]) for x in levels.get("supports", [])]
-    resistances = [float(x["price"]) for x in levels.get("resistances", [])]
-    h1_ranges = [max(float(x["high"]) - float(x["low"]), 1e-12) for x in h1[-20:]]
-    h1_avg_range = sum(h1_ranges) / max(1, len(h1_ranges))
-    zone_radius = max(float(levels.get("tolerance", 0.0) or 0.0) * 1.8,
-                      h1_avg_range * 0.24,
-                      abs(price) * 0.00018)
-    ns = min(supports, key=lambda x: abs(price - x)) if supports else None
-    nr = min(resistances, key=lambda x: abs(price - x)) if resistances else None
-    near_support = ns is not None and abs(price - ns) <= zone_radius
-    near_resistance = nr is not None and abs(price - nr) <= zone_radius
-
-    if near_support and not near_resistance:
-        call_score += 17
-        call_reasons.append("reação em suporte H1")
-        put_score -= 12
-    elif near_resistance and not near_support:
-        put_score += 17
-        put_reasons.append("reação em resistência H1")
-        call_score -= 12
-
-    # Microestrutura: rompimento com fechamento consistente.
-    recent_high = max(float(x["high"]) for x in rows[-8:-1])
-    recent_low = min(float(x["low"]) for x in rows[-8:-1])
-    if price > recent_high and price > o and rng <= avg_range * 1.9:
-        call_score += 11
-        call_reasons.append("rompimento confirmado")
-    if price < recent_low and price < o and rng <= avg_range * 1.9:
-        put_score += 11
-        put_reasons.append("rompimento confirmado")
-
-    call_score = max(0.0, call_score)
-    put_score = max(0.0, put_score)
-
-    # Critério seletivo: exige score forte e diferença clara entre os lados.
-    best_dir = "CALL" if call_score > put_score else "PUT" if put_score > call_score else "NEUTRO"
-    best_score = max(call_score, put_score)
-    margin = abs(call_score - put_score)
-
-    min_score = 78.0 if timeframe != "1min" else 82.0
-    min_margin = 16.0
-
-    diagnostics = {
-        "call_score": round(call_score, 1),
-        "put_score": round(put_score, 1),
-        "min_score": min_score,
-        "min_margin": min_margin,
-        "body_ratio": round(body_ratio, 3),
-        "near_support_h1": near_support,
-        "near_resistance_h1": near_resistance,
-        "market": market,
-        "feed": "IQ_OPTION",
-    }
-
-    if best_dir == "NEUTRO" or best_score < min_score or margin < min_margin:
-        return {
-            "direction": "NEUTRO",
-            "confidence": round(min(79.0, best_score), 1),
-            "confirmed": False,
-            "risk": "HIGH",
-            "strategy": name,
-            "engine": "EA_AUTONOMOUS_IQ",
-            "reason": (
-                f"EA autônoma aguardando entrada direta mais limpa. "
-                f"Score CALL {call_score:.0f} x PUT {put_score:.0f}."
-            ),
-            "direct_win_only": True,
-            "gale_signal": False,
-            "diagnostics": diagnostics,
-            "non_repaint": True,
-        }
-
-    reasons = call_reasons if best_dir == "CALL" else put_reasons
-    # 'confidence' é força interna do setup, não taxa estatística garantida.
-    confidence = min(95.0, 80.0 + (best_score - min_score) * 0.55 + min(6.0, margin * 0.12))
-    risk = "LOW" if best_score >= min_score + 8 and margin >= 22 else "MEDIUM"
-
-    return {
-        "direction": best_dir,
-        "confidence": round(confidence, 1),
-        "confirmed": True,
-        "risk": risk,
-        "strategy": name,
-        "engine": "EA_AUTONOMOUS_IQ",
-        "reason": "Entrada direta selecionada: " + " + ".join(reasons[:4]) + ".",
-        "direct_win_only": True,
-        "gale_signal": False,
-        "diagnostics": diagnostics,
-        "non_repaint": True,
-    }
 
 
-def intelligent_artificial_strategy(cs, timeframe="1min"):
-    """
-    INTELIGÊNCIA ARTIFICIAL local por confluência enxuta.
-
-    O RSI 14 continua sendo o gatilho obrigatório (mesma regra do Robô RSI).
-    Depois do gatilho, a entrada precisa de pelo menos 2 das 4 confirmações:
-      1) tendência por EMA 9/21/50;
-      2) contexto de suporte/resistência + estrutura;
-      3) força/rejeição da vela;
-      4) volatilidade saudável pelo ATR 14.
-
-    Volume nunca é obrigatório. Quando a fonte disponibiliza volume confiável,
-    ele funciona apenas como bônus de confiança. Usa somente candles fechados.
-    """
-    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"INTELIGÊNCIA ARTIFICIAL {tf_label}"
-    if len(cs) < 55:
-        return {
-            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "strategy": name,
-            "reason": f"Aguardando pelo menos 55 candles {tf_label} fechados para a análise inteligente.",
-            "engine": "SMART_CONFLUENCE",
-        }
-
-    closes = [float(c["close"]) for c in cs]
-    last = cs[-1]
-    prev = cs[-2]
-    prev2 = cs[-3]
-    price = float(last["close"])
-
-    rsi_before = rsi(closes[:-1], 14)
-    rsi_now = rsi(closes, 14)
-    e9, e21, e50 = ema(closes, 9), ema(closes, 21), ema(closes, 50)
-    a14 = atr(cs, 14)
-    if None in (rsi_before, rsi_now, e9, e21, e50, a14):
-        return {
-            "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "strategy": name, "reason": "Indicadores ainda insuficientes para a análise inteligente.",
-            "engine": "SMART_CONFLUENCE",
-        }
-
-    # Gatilho obrigatório: exatamente o mesmo cruzamento do Robô RSI.
-    trigger = None
-    if rsi_now >= 30.0 and rsi_before <= 30.0:
-        trigger = "CALL"
-    elif rsi_before >= 70.0 and rsi_now <= 70.0:
-        trigger = "PUT"
-
-    # Suporte/resistência + estrutura formam UM único bloco de contexto.
-    levels = _support_resistance_levels(cs, timeframe)
-    tolerance = max(float(levels.get("tolerance", 0.0) or 0.0), float(a14) * 0.35)
-    supports = [float(x["price"]) for x in levels.get("supports", [])]
-    resistances = [float(x["price"]) for x in levels.get("resistances", [])]
-    nearest_support = min(supports, key=lambda x: abs(price-x)) if supports else None
-    nearest_resistance = min(resistances, key=lambda x: abs(price-x)) if resistances else None
-    near_support = nearest_support is not None and abs(price-nearest_support) <= tolerance * 1.5
-    near_resistance = nearest_resistance is not None and abs(price-nearest_resistance) <= tolerance * 1.5
-
-    call_structure = (
-        float(last["close"]) > float(prev["high"]) or
-        (float(last["low"]) > float(prev["low"]) and float(prev["low"]) > float(prev2["low"]))
-    )
-    put_structure = (
-        float(last["close"]) < float(prev["low"]) or
-        (float(last["high"]) < float(prev["high"]) and float(prev["high"]) < float(prev2["high"]))
-    )
-
-    wi = wick_info(last)
-    body_ratio = float(wi.get("body_ratio", 0.0) or 0.0)
-    bullish_candle = float(last["close"]) > float(last["open"])
-    bearish_candle = float(last["close"]) < float(last["open"])
-    range_now = max(float(last["high"]) - float(last["low"]), 1e-12)
-    atr_ratio = range_now / max(float(a14), 1e-12)
-    volatility_ok = 0.45 <= atr_ratio <= 1.85
-
-    # Volume é bônus; nunca bloqueia uma entrada.
-    volumes = [float(c.get("volume", 0) or 0) for c in cs[-21:]]
-    historical_volume = [v for v in volumes[:-1] if v > 0]
-    volume_available = len(historical_volume) >= 15 and volumes[-1] > 0
-    volume_ratio = None
-    volume_bonus = False
-    if volume_available:
-        avg_volume = sum(historical_volume[-20:]) / len(historical_volume[-20:])
-        volume_ratio = volumes[-1] / max(avg_volume, 1e-12)
-        volume_bonus = volume_ratio >= 1.10
-
-    snapshot = {
-        "strategy": name,
-        "engine": "SMART_CONFLUENCE",
-        "rsi_period": 14,
-        "rsi_before": round(float(rsi_before), 2),
-        "rsi_now": round(float(rsi_now), 2),
-        "ema9": round(float(e9), 8),
-        "ema21": round(float(e21), 8),
-        "ema50": round(float(e50), 8),
-        "atr14": round(float(a14), 8),
-        "atr_ratio": round(float(atr_ratio), 3),
-        "body_ratio": round(body_ratio, 3),
-        "nearest_support": round(nearest_support, 8) if nearest_support is not None else None,
-        "nearest_resistance": round(nearest_resistance, 8) if nearest_resistance is not None else None,
-        "volume_available": volume_available,
-        "volume_ratio": round(float(volume_ratio), 2) if volume_ratio is not None else None,
-        "volume_bonus": volume_bonus,
-        "non_repaint": True,
-    }
-
-    if trigger is None:
-        return {
-            **snapshot, "direction": "NEUTRO", "confidence": 0, "confirmed": False,
-            "reason": f"RSI 14 ainda não confirmou um novo gatilho em {tf_label}.",
-            "confirmations": 0, "confirmations_total": 4, "confirmations_required": 2,
-        }
-
-    if trigger == "CALL":
-        checks = {
-            "tendencia": bool(e9 > e21 and (e21 > e50 or price > e50)),
-            "contexto": bool((near_support or call_structure) and not near_resistance),
-            "forca_vela": bool(bullish_candle and (body_ratio >= 0.42 or float(wi.get("call_wick", 0) or 0) >= 0.35)),
-            "volatilidade": bool(volatility_ok),
-        }
-    else:
-        checks = {
-            "tendencia": bool(e9 < e21 and (e21 < e50 or price < e50)),
-            "contexto": bool((near_resistance or put_structure) and not near_support),
-            "forca_vela": bool(bearish_candle and (body_ratio >= 0.42 or float(wi.get("put_wick", 0) or 0) >= 0.35)),
-            "volatilidade": bool(volatility_ok),
-        }
-
-    passed = sum(1 for v in checks.values() if v)
-    required = 2
-    confirmed = passed >= required
-
-    labels = {
-        "tendencia": "tendência EMA",
-        "contexto": "S/R + estrutura",
-        "forca_vela": "força/rejeição da vela",
-        "volatilidade": "ATR/volatilidade",
-    }
-    approved = [labels[k] for k, v in checks.items() if v]
-    rejected = [labels[k] for k, v in checks.items() if not v]
-
-    # Score interno, não promessa de acerto. 2/4 já confirma; 3/4 e 4/4 elevam o score.
-    confidence = 65.0 + passed * 7.0 + (3.0 if volume_bonus else 0.0)
-    if confirmed:
-        confidence = min(96.0, confidence)
-    else:
-        confidence = min(74.0, confidence)
-
-    reason = (
-        f"RSI 14 confirmou {trigger}; {passed}/4 confirmações passaram: "
-        + (", ".join(approved) if approved else "nenhuma")
-        + (f". Não confirmaram: {', '.join(rejected)}" if rejected else "")
-        + (". Volume confirmou como bônus" if volume_bonus else (". Volume disponível sem bônus" if volume_available else ". Volume não exigido"))
-        + "."
-    )
-
-    return {
-        **snapshot,
-        "direction": trigger if confirmed else "NEUTRO",
-        "candidate_direction": trigger,
-        "confidence": round(confidence, 1),
-        "confirmed": confirmed,
-        "reason": reason,
-        "checks": checks,
-        "confirmations": passed,
-        "confirmations_total": 4,
-        "confirmations_required": required,
-    }
 
 def strategy_engine_for_market(cs, market="OPEN", context=None):
     # As estratégias técnicas anteriores continuam preservadas abaixo e nas
@@ -7802,6 +7061,8 @@ def _feed_source_label(source: str) -> str:
         "BINOMO_CRYPTO_IDX_WS": "BINOMO • CRYPTO IDX • AO VIVO",
         "IQ_OPTION_OPEN": "IQ OPTION • ABERTO",
         "IQ_OPTION_OTC": "IQ OPTION • OTC",
+        "OTCHARTS_IQ_OTC": "OTCHARTS • IQ OTC",
+        "UNAVAILABLE_OTC": "FONTE OTC INDISPONÍVEL",
     }
     return labels.get(src, src.replace("_", " "))
 
@@ -9233,6 +8494,164 @@ async def iq_ea_candles(
         return list(data)[-int(n):]
 
 
+# Fonte externa de candles IQ OTC: somente leitura, sem credenciais da corretora.
+# A chave OTCharts deve ficar no ambiente do SERVIDOR, nunca no HTML do parceiro.
+OTCHARTS_API_KEY = os.getenv("OTCHARTS_API_KEY", "").strip()
+_OTCHARTS_CANDLE_CACHE = {}
+_OTCHARTS_CACHE_LOCK = asyncio.Lock()
+_OTCHARTS_DIAGNOSTIC = {"state":"NOT_TESTED","last_error":"","http_status":None,"symbol":"","updated_at":None,"candles":0}
+_OTCHARTS_ACCESS_CACHE = {"checked_at": 0.0, "data": None}
+_OTCHARTS_ACCESS_LOCK = asyncio.Lock()
+_OTCHARTS_BLOCK_UNTIL = 0.0
+
+async def _otcharts_access_check(force=False):
+    """Consulta metadados sem expor a chave e sem testar candles em loop."""
+    if not OTCHARTS_API_KEY:
+        return {"configured": False, "status": "SEM_CHAVE", "message": "OTCHARTS_API_KEY ausente."}
+    async with _OTCHARTS_ACCESS_LOCK:
+        now = time.time()
+        if _OTCHARTS_ACCESS_CACHE["data"] is not None and now - _OTCHARTS_ACCESS_CACHE["checked_at"] < 3600:
+            return dict(_OTCHARTS_ACCESS_CACHE["data"])
+        result = {"configured": True, "status": "VERIFICANDO", "iq_open": None,
+                  "available_iq_symbols": [], "available_iq_count": 0, "usage": {}, "errors": []}
+        headers = {"Authorization": "Bearer " + OTCHARTS_API_KEY}
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            for name, path, params in (("venues", "/v1/venues", None), ("usage", "/v1/usage", None)):
+                try:
+                    response = await client.get("https://otcharts.com" + path, headers=headers, params=params)
+                    if response.status_code != 200:
+                        result["errors"].append({"endpoint": name, "http_status": response.status_code})
+                        continue
+                    payload = response.json()
+                    if name == "venues":
+                        venues = payload.get("venues", []) if isinstance(payload, dict) else []
+                        result["venues"] = [{"id": v.get("id"), "open": bool(v.get("open"))} for v in venues if isinstance(v, dict)]
+                        iq = next((v for v in venues if isinstance(v, dict) and v.get("id") == "iq"), None)
+                        result["iq_open"] = bool(iq.get("open")) if iq is not None else None
+                    else:
+                        result["usage"] = {k: payload.get(k) for k in ("plan", "planName", "books", "requests", "streams") if isinstance(payload, dict) and k in payload}
+                except Exception as exc:
+                    result["errors"].append({"endpoint": name, "error": type(exc).__name__})
+            # Consultar o catálogo apenas se /venues confirmar acesso à IQ.
+            if result["iq_open"] is True:
+                try:
+                    response = await client.get("https://otcharts.com/v1/symbols", headers=headers, params={"venue": "iq"})
+                    if response.status_code == 200:
+                        payload = response.json()
+                        symbols = payload.get("symbols", []) if isinstance(payload, dict) else []
+                        result["available_iq_symbols"] = [
+                            {"symbol": x.get("symbol"), "name": x.get("name"), "isOtc": x.get("isOtc")}
+                            for x in symbols if isinstance(x, dict) and x.get("symbol") and
+                            (x.get("isOtc") is True or str(x.get("symbol", "")).upper().endswith("-OTC"))
+                        ]
+                        result["available_iq_count"] = len(result["available_iq_symbols"])
+                    else:
+                        result["errors"].append({"endpoint": "symbols", "http_status": response.status_code})
+                except Exception as exc:
+                    result["errors"].append({"endpoint": "symbols", "error": type(exc).__name__})
+        if result["iq_open"] is False:
+            result["status"] = "IQ_NAO_LIBERADA"
+            result["message"] = "A chave não tem acesso à corretora IQ Option. Escolha IQ na conta OTCharts, se disponível."
+        elif result["available_iq_symbols"]:
+            result["status"] = "CATALOGO_IQ_DISPONIVEL"
+            result["message"] = "Catálogo IQ consultado; acesso individual a candles ainda depende do plano."
+        elif result["iq_open"] is True:
+            result["status"] = "IQ_ABERTA_SEM_CATALOGO"
+            result["message"] = "IQ liberada, mas catálogo não foi obtido; verifique os erros."
+        else:
+            result["status"] = "VERIFICACAO_INCONCLUSIVA"
+            result["message"] = "Não foi possível confirmar as corretoras liberadas."
+        _OTCHARTS_ACCESS_CACHE.update(checked_at=time.time(), data=result)
+        return dict(result)
+
+@app.get("/otcharts-access")
+async def otcharts_access():
+    """Diagnóstico seguro e em cache; não devolve segredo nem faz polling de candles."""
+    return await _otcharts_access_check()
+
+
+async def otcharts_iq_otc_candles(symbol, interval, n=80):
+    global _OTCHARTS_BLOCK_UNTIL
+    if not OTCHARTS_API_KEY:
+        raise HTTPException(503, "OTC sem login ainda não configurado: defina OTCHARTS_API_KEY no Render.")
+    seconds = INTERVALS.get(interval)
+    if not seconds:
+        raise HTTPException(400, "Intervalo OTC inválido.")
+    # IDs IQ OTC são distintos dos pares regulares; não usar Forex público como substituto.
+    raw_symbol = str(symbol).upper().replace("/", "").replace(" ", "")
+    if not re.fullmatch(r"[A-Z0-9#._-]{3,50}", raw_symbol):
+        raise HTTPException(400, "Ativo OTC inválido.")
+    if not raw_symbol.endswith("-OTC"):
+        raw_symbol += "-OTC"
+    count = max(20, min(int(n), 500))
+    cache_key = (raw_symbol, seconds)
+    now = time.time()
+    if now < _OTCHARTS_BLOCK_UNTIL:
+        raise HTTPException(503, "OTCharts bloqueou temporariamente a consulta; veja /otcharts-access.")
+    async with _OTCHARTS_CACHE_LOCK:
+        cached = _OTCHARTS_CANDLE_CACHE.get(cache_key)
+        if cached and now - cached[0] < 55 and len(cached[1]) >= count:
+            return cached[1][-count:]
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                response = await client.get(
+                    "https://otcharts.com/v1/candles",
+                    params={"venue": "iq", "symbol": raw_symbol, "tf": seconds, "limit": count},
+                    headers={"Authorization": "Bearer " + OTCHARTS_API_KEY},
+                )
+            _OTCHARTS_DIAGNOSTIC.update(state="HTTP_RESPONSE", http_status=response.status_code, symbol=raw_symbol, updated_at=datetime.now(timezone.utc).isoformat())
+            if response.status_code in (401, 403):
+                # Não tentar fontes de mercado aberto como se fossem candles OTC.
+                # A existência da variável no Render não prova autorização na API.
+                reason = ("OTCharts recusou a chave (HTTP 401). Verifique se a chave está válida "
+                          "e autorizada para o endpoint /v1/candles e para IQ OTC."
+                          if response.status_code == 401 else
+                          "OTCharts negou acesso (HTTP 403). Confira permissões/plano para candles IQ OTC.")
+                _OTCHARTS_DIAGNOSTIC.update(state="AUTH_ERROR", last_error=reason, candles=0)
+                print(f"[OTCHARTS] AUTH_ERROR symbol={raw_symbol} HTTP={response.status_code}", flush=True)
+                raise HTTPException(503, "Fonte IQ OTC indisponível: " + reason)
+            if response.status_code in (402, 403, 429):
+                _OTCHARTS_BLOCK_UNTIL = time.time() + (3600 if response.status_code == 402 else 600)
+                reason = ({402: "OTCharts HTTP 402: situação do plano exige contato com o suporte da OTCharts (não significa necessariamente cobrança).",
+                           403: "OTCharts HTTP 403: corretora ou instrumento não liberado no plano.",
+                           429: "OTCharts HTTP 429: limite de requisições atingido."})[response.status_code]
+                _OTCHARTS_DIAGNOSTIC.update(state="ACCESS_DENIED", last_error=reason, candles=0)
+                print(f"[OTCHARTS] ACCESS_DENIED symbol={raw_symbol} HTTP={response.status_code}", flush=True)
+                raise HTTPException(503, "Fonte IQ OTC indisponível: " + reason)
+            response.raise_for_status()
+            payload = response.json()
+            rows = payload.get("candles", []) if isinstance(payload, dict) else []
+            result = []
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                candle = _normalize_iq_candle(item)
+                if candle:
+                    candle["source"] = "OTCHARTS_IQ_OTC"
+                    candle["source_symbol"] = raw_symbol
+                    result.append(candle)
+            result.sort(key=lambda row: row["datetime"])
+            if len(result) < 20:
+                raise ValueError("Histórico OTC insuficiente para analisar com segurança.")
+            # Não aceitar dados de outro mercado ou candles antigos como se fossem ao vivo.
+            last_ts = datetime.fromisoformat(result[-1]["datetime"]).timestamp()
+            if time.time() - last_ts > max(180, seconds * 3):
+                raise ValueError("Candles OTC desatualizados; sinal bloqueado.")
+            _OTCHARTS_CANDLE_CACHE[cache_key] = (time.time(), result)
+            _OTCHARTS_DIAGNOSTIC.update(state="OK", last_error="", candles=len(result), updated_at=datetime.now(timezone.utc).isoformat())
+            print(f"[OTCHARTS] OK symbol={raw_symbol} candles={len(result)} HTTP={response.status_code}", flush=True)
+            return result[-count:]
+        except HTTPException:
+            raise
+        except Exception as exc:
+            # Nunca registrar a chave de API nem o cabeçalho Authorization.
+            reason = str(exc)[:180]
+            if OTCHARTS_API_KEY:
+                reason = reason.replace(OTCHARTS_API_KEY, "[REDACTED]")
+            _OTCHARTS_DIAGNOSTIC.update(state="ERROR", last_error=reason, symbol=raw_symbol, updated_at=datetime.now(timezone.utc).isoformat(), candles=0)
+            print(f"[OTCHARTS] ERROR symbol={raw_symbol} HTTP={_OTCHARTS_DIAGNOSTIC.get("http_status")} reason={reason}", flush=True)
+            raise HTTPException(503, "Fonte IQ OTC indisponível: " + reason)
+
 async def candles(
     symbol,
     interval,
@@ -9306,6 +8725,10 @@ async def candles(
         return await candles_open(symbol, interval, n, request=request)
 
     if market == "IQ_OTC":
+        # Sem login IQ: utilizar exclusivamente candles OTC reais do provedor configurado.
+        # Nunca converter OTC em candles de Yahoo/Binance/Twelve Data.
+        if OTCHARTS_API_KEY:
+            return await otcharts_iq_otc_candles(symbol, interval, n)
         if iq_state is None and request is not None:
             iq_state = _iq_session_state(
                 request,
@@ -12798,89 +12221,6 @@ def _sniper_snapshot(rows):
     }
 
 
-def sniper_pro_strategy(cs, timeframe="1min", market="OPEN"):
-    """Sniper Pro MEGA — EMA 9/21 + VWAP + RSI + MACD + ADX/DMI + volume + price action.
-
-    O motor só recebe candles já fechados. O cruzamento de EMA deixou de ser obrigatório;
-    a entrada nasce de confluência 5/8 com vantagem mínima de 2 pontos, mantendo cooldown.
-    """
-    rows = list(cs or [])
-    tf_label = {"1min":"M1", "5min":"M5", "15min":"M15", "30min":"M30"}.get(timeframe, timeframe)
-    name = f"SNIPER PRO MEGA {tf_label}"
-    need = max(45, SNIPER_EMA_SLOW + 22)
-    if len(rows) < need:
-        return {
-            "available": True, "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
-            "risk": "HIGH", "strategy": name, "engine": "SNIPER_PRO", "provider": "LOCAL_SNIPER_PRO_MEGA",
-            "reason": f"Coletando candles fechados para o Sniper Pro ({len(rows)}/{need}).",
-            "non_repaint": True, "gale_signal": False, "martingale": False,
-        }
-
-    # Simula somente a janela recente para respeitar cooldown entre sinais confirmados.
-    start = max(need - 1, len(rows) - 24)
-    last_fired = None
-    last_snap = None
-    for i in range(start, len(rows)):
-        snap = _sniper_snapshot(rows[:i+1])
-        if not snap:
-            continue
-        if i == len(rows) - 1:
-            last_snap = snap
-        if snap["direction"] in ("CALL", "PUT"):
-            if last_fired is None or (i - last_fired) > SNIPER_COOLDOWN_BARS:
-                last_fired = i
-
-    snap = last_snap or _sniper_snapshot(rows)
-    if not snap:
-        return {
-            "available": True, "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
-            "risk": "HIGH", "strategy": name, "engine": "SNIPER_PRO", "provider": "LOCAL_SNIPER_PRO_MEGA",
-            "reason": "Indicadores ainda sem histórico suficiente.", "non_repaint": True, "gale_signal": False,
-        }
-
-    direction = snap["direction"] if last_fired == len(rows) - 1 else "NEUTRO"
-    confirmed = direction in ("CALL", "PUT")
-    if confirmed:
-        reason = (
-            f"{direction} confirmado com score {snap['score']}/8 (CALL {snap['buy_score']} x PUT {snap['sell_score']}); "
-            f"EMA {SNIPER_EMA_FAST}/{SNIPER_EMA_SLOW}, ADX {snap['adx']:.1f}, RSI {snap['rsi']:.1f}, "
-            f"VWAP e volume alinhados" + (f"; padrão {snap['pattern']}." if snap.get('pattern') else ".")
-        )
-    else:
-        dominant = "CALL" if snap["buy_score"] >= snap["sell_score"] else "PUT"
-        reason = (
-            f"Sniper monitorando: melhor lado {dominant} {max(snap['buy_score'], snap['sell_score'])}/8; "
-            f"mínimo {SNIPER_MIN_SCORE}/8 e vantagem {SNIPER_SCORE_EDGE}. "
-            f"ADX {snap['adx']:.1f}, RSI {snap['rsi']:.1f}."
-        )
-        if snap["direction"] in ("CALL", "PUT") and last_fired != len(rows) - 1:
-            reason += f" Cooldown de {SNIPER_COOLDOWN_BARS} velas evitando sinal repetido."
-
-    return {
-        "available": True,
-        "direction": direction,
-        "confidence": round(float(snap["confidence"] if confirmed else 0.0), 1),
-        "confirmed": confirmed,
-        "risk": ("LOW" if confirmed and snap["confidence"] >= 82 else ("MEDIUM" if confirmed else "HIGH")),
-        "strategy": name,
-        "engine": "SNIPER_PRO",
-        "provider": "LOCAL_SNIPER_PRO_MEGA",
-        "reason": reason[:420],
-        "external_ai_disabled": True,
-        "gale_signal": False,
-        "martingale": False,
-        "non_repaint": True,
-        "direct_win_only": True,
-        "next_candle": True,
-        "cooldown_bars": SNIPER_COOLDOWN_BARS,
-        "diagnostics": {
-            "buy_score": snap["buy_score"], "sell_score": snap["sell_score"], "min_score": SNIPER_MIN_SCORE,
-            "score_edge": SNIPER_SCORE_EDGE, "ema_fast": round(snap["ema_fast"], 10), "ema_slow": round(snap["ema_slow"], 10),
-            "rsi": round(snap["rsi"], 2), "adx": round(snap["adx"], 2), "plus_di": round(snap["plus_di"], 2),
-            "minus_di": round(snap["minus_di"], 2), "vwap": round(snap["vwap"], 10), "body_atr": round(snap["body_atr"], 3),
-            "pattern": snap.get("pattern") or "", "checks": snap.get("checks") or [],
-        },
-    }
 
 
 
@@ -14900,64 +14240,83 @@ def _shk_macd_divergence(highs, lows, closes):
                 bear[i+p]=True
     return hist,bull,bear
 
-_SHK_FLEX_LOCK = threading.RLock()
-_SHK_FLEX_LAST = {}
-def _shk_flex_gate(result, symbol, timeframe, market, claim=False):
-    if result.get("direction") not in ("CALL", "PUT") or not result.get("confirmed"):
-        return result
-    key=(str(market),str(symbol),str(timeframe))
-    event=str(result.get("event_key") or "")
-    with _SHK_FLEX_LOCK:
-        previous=_SHK_FLEX_LAST.get(key)
-        now=time.monotonic()
-        if previous and (previous[1]==event or now-previous[0]<240):
-            return {**result,"direction":"NEUTRO","confirmed":False,"confidence":0.0,"reason":"SHK Heikin Ashi: aguardando nova oportunidade (intervalo mínimo 4 minutos)."}
-        if claim:
-            _SHK_FLEX_LAST[key]=(now,event)
-    return result
-
 def shk_ha_macd_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """Adaptação flexível: mudança Heikin Ashi + momentum MACD + força de vela."""
-    base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
-          "risk":"HIGH","strategy":"SHK Heikin Ashi • HA + MACD + força da vela",
-          "engine":"SHKHA","provider":"LOCAL_SHK_HA_FLEX_V1","non_repaint":True,
-          "closed_candles_only":True,"next_candle_entry":True,"direct_win_only":True,
-          "gale_signal":False,"martingale":False,"grid":False,"expiry_candles":1,
-          "prealert_seconds":20,"confidence_is_probability":False}
-    if str(timeframe).lower() not in ("1min","5min","m1","m5"):
-        return {**base,"reason":"SHK Heikin Ashi: selecione M1 ou M5."}
-    rows=list(cs or [])[-180:]
-    if len(rows)<40:
-        return {**base,"reason":f"SHK aguardando candles ({len(rows)}/40)."}
-    try:
-        o=[float(x['open']) for x in rows]; h=[float(x['high']) for x in rows]
-        l=[float(x['low']) for x in rows]; c=[float(x['close']) for x in rows]
-        hao,hah,hal,hac=_shk_heikin_ashi_series(o,h,l,c)
-        def es(v,n):
-            out=[v[0]]; k=2/(n+1)
-            for x in v[1:]:out.append(out[-1]+k*(x-out[-1]))
-            return out
-        fast=es(c,12); slow=es(c,26)
-        mac=[x-y for x,y in zip(fast,slow)]; signal=es(mac,5)
-        hist=[x-y for x,y in zip(mac,signal)]
-        rng=max(h[-1]-l[-1],1e-12)
-        strength=abs(c[-1]-o[-1])/rng
-        up=hac[-1]>hao[-1] and hac[-2]<=hao[-2]
-        down=hac[-1]<hao[-1] and hac[-2]>=hao[-2]
-        call=up and c[-1]>o[-1] and strength>=.35 and hist[-1]>hist[-2]
-        put=down and c[-1]<o[-1] and strength>=.35 and hist[-1]<hist[-2]
-        direction='CALL' if call else 'PUT' if put else 'NEUTRO'
-        diag={'ha_change_up':up,'ha_change_down':down,'body_ratio':round(strength,3),
-              'macd_hist':round(hist[-1],9),'macd_hist_prev':round(hist[-2],9)}
-        if direction=='NEUTRO':
-            return {**base,'reason':'SHK monitorando virada Heikin Ashi + impulso MACD + força da vela.','diagnostics':diag}
-        stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or rows[-1].get('time') or len(rows))
-        return {**base,'direction':direction,'confirmed':True,'confidence':70.0,
-                'event_key':f'SHKHA:{market}:{symbol}:{timeframe}:{direction}:{stamp}',
-                'reason':f'SHK Heikin Ashi {direction}: virada HA + momentum MACD + vela de força; próxima vela.',
-                'diagnostics':diag}
-    except Exception as exc:
-        return {**base,'reason':f'SHK aguardando dados válidos: {str(exc)[:90]}'}
+    """SHK Professional Heikin Ashi Signals v1.03 convertido para o app.
+
+    Círculo/pré-sinal: primeira mudança de cor do Heikin Ashi em candle fechado.
+    CALL/PUT final: mesma mudança HA + divergência MACD 12/26/5 causal confirmada
+    por pivô 2, válida por até 10 candles. A entrada é somente na próxima vela.
+    """
+    rows=list(cs or [])
+    base={
+        "available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
+        "strategy":"SHK PRO HA + MACD • HEIKIN ASHI + DIVERGÊNCIA MACD 12/26/5 • NEXT CANDLE",
+        "engine":"SHKHA","provider":"LOCAL_SHK_HA_MACD_V103_CLOSED_M1",
+        "non_repaint":True,"closed_candles_only":True,"next_candle_entry":True,
+        "direct_win_only":True,"gale_signal":False,"martingale":False,"grid":False,
+        "expiry_candles":1,"trigger_timeframe":str(timeframe).upper(),"shift":1,
+        "divergence_window":int(SHK_DIV_WINDOW),"divergence_pivot":int(SHK_DIV_PIVOT),
+    }
+    if str(timeframe).lower() not in ("1min","m1","1m"):
+        return {**base,"reason":"SHK PRO HA + MACD está configurado para M1 no app. Selecione M1."}
+    need=max(80,int(SHK_DIV_SEARCH)+int(SHK_DIV_PIVOT)*2+8)
+    if len(rows)<need:
+        return {**base,"reason":f"SHK PRO HA + MACD coletando candles fechados ({len(rows)}/{need})."}
+    rows=rows[-max(260,need):]
+    opens=[]; highs=[]; lows=[]; closes=[]
+    for x in rows:
+        try:
+            opens.append(float(x.get("open") or 0.0)); highs.append(float(x.get("high") or 0.0))
+            lows.append(float(x.get("low") or 0.0)); closes.append(float(x.get("close") or 0.0))
+        except Exception:
+            opens.append(0.0); highs.append(0.0); lows.append(0.0); closes.append(0.0)
+    if len(closes)<3 or any(v<=0 for v in closes[-3:]) or any(v<=0 for v in highs[-3:]) or any(v<=0 for v in lows[-3:]):
+        return {**base,"reason":"SHK PRO HA + MACD aguardando candles válidos."}
+    hao,hah,hal,hac=_shk_heikin_ashi_series(opens,highs,lows,closes)
+    hist,bull_div,bear_div=_shk_macd_divergence(highs,lows,closes)
+    i=len(closes)-1
+    cur_bull=hac[i]>hao[i]; cur_bear=hac[i]<hao[i]
+    prev_bull=hac[i-1]>hao[i-1]; prev_bear=hac[i-1]<hao[i-1]
+    call_change=bool(prev_bear and cur_bull)
+    put_change=bool(prev_bull and cur_bear)
+    w=int(SHK_DIV_WINDOW); st=max(0,i-w)
+    recent_bull=any(bull_div[st:i+1]); recent_bear=any(bear_div[st:i+1])
+    bull_age=next((i-k for k in range(i,st-1,-1) if bull_div[k]),None)
+    bear_age=next((i-k for k in range(i,st-1,-1) if bear_div[k]),None)
+    pre_signal="CALL" if call_change else ("PUT" if put_change else None)
+    rng=max(hah[i]-hal[i],1e-12); body_pct=abs(hac[i]-hao[i])/rng*100.0
+    call=bool(call_change and recent_bull); put=bool(put_change and recent_bear)
+    diag={
+        "ha_open":round(hao[i],10),"ha_close":round(hac[i],10),"ha_body_pct":round(body_pct,2),
+        "ha_color":"BULL" if cur_bull else ("BEAR" if cur_bear else "NEUTRAL"),
+        "ha_color_change_call":call_change,"ha_color_change_put":put_change,
+        "macd_hist":round(hist[i],10) if hist else 0.0,
+        "recent_bull_divergence":recent_bull,"recent_bear_divergence":recent_bear,
+        "bull_divergence_bars_ago":bull_age,"bear_divergence_bars_ago":bear_age,
+        "divergence_confirm_window":w,"closed_candle":True,"future_leak":False,"shift":1,
+        "pre_signal":pre_signal,
+    }
+    if call==put:
+        if pre_signal:
+            conf=clamp(58.0+min(10.0,body_pct*0.10),58.0,68.0)
+            missing="divergência MACD altista" if pre_signal=="CALL" else "divergência MACD baixista"
+            return {**base,"confidence":round(conf,1),"pre_signal":pre_signal,"pre_signal_confirmed":True,
+                "reason":f"PRÉ-SINAL {pre_signal} SHK • Heikin Ashi mudou de cor no candle fechado • aguardando {missing} válida em até {w} candles para liberar a entrada.",
+                "diagnostics":diag}
+        div_side="altista" if recent_bull and not recent_bear else ("baixista" if recent_bear and not recent_bull else "sem divergência recente")
+        return {**base,"confidence":52.0,"pre_signal":None,"pre_signal_confirmed":False,
+            "reason":f"SHK PRO HA + MACD monitorando • HA sem nova mudança de cor • MACD {div_side} • aguardando confluência para a próxima vela.",
+            "diagnostics":diag}
+    direction="CALL" if call else "PUT"
+    age=bull_age if call else bear_age
+    recency=max(0,10-(age if isinstance(age,int) else 10))
+    conf=clamp(84.0+min(5.0,body_pct*0.05)+recency*0.5,84.0,95.0)
+    stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or i)
+    return {**base,"direction":direction,"confidence":round(conf,1),"confirmed":True,
+        "risk":"LOW" if conf>=91 else "MEDIUM","pre_signal":direction,"pre_signal_confirmed":True,
+        "reason":f"{direction} SHK PRO HA + MACD • mudança Heikin Ashi + divergência MACD 12/26/5 confirmada • candle M1 fechado • próxima vela • sem Gale.",
+        "event_key":f"SHKHA:{direction}:{stamp}","diagnostics":diag}
+
 
 
 # -----------------------------------------------------------------------------
@@ -16388,46 +15747,6 @@ def mega_bot_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     }
 
 
-
-
-# StepMA 1.2: adaptação causal dos cálculos originais MQL4.
-def stepma_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", pro=False):
-    engine="STEP MAPRO" if pro else "STEPMAORIG"
-    engine="STEPMAPRO" if pro else "STEPMAORIG"
-    base={"available":True,"engine":engine,"strategy":"StepMA Pro" if pro else "StepMA Original", "direction":"NEUTRO","confirmed":False,"confidence":0.0,"closed_candles_only":True,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,"martingale":False,"risk":"HIGH"}
-    rows=list(cs or [])[-500:]
-    if len(rows)<30: return {**base,"reason":"StepMA aguardando candles."}
-    highs=[float(r['high']) for r in rows]; lows=[float(r['low']) for r in rows]; closes=[float(r['close']) for r in rows]
-    n=len(rows); watrmin=None; watrmax=0.; states=[0,0,0]; prevhi=[None]*3; prevlo=[None]*3; previous_position=0; signal="NEUTRO"
-    for j in range(n):
-        if j<6: continue
-        # No MQL4 o somatório pondera os ranges das 7 barras mais recentes.
-        watr=sum((1+(7-k)/7)*abs(highs[j-k]-lows[j-k]) for k in range(7))/7
-        watrmax=max(watrmax,watr); watrmin=watr if watrmin is None else min(watrmin,watr)
-        sizes=[watrmin,watrmax,(watrmin+watrmax)/2]
-        lines=[]
-        for q,step in enumerate(sizes):
-            c=closes[j]; upper=c+2*step; lower=c-2*step
-            if prevhi[q] is not None:
-                if c>prevhi[q]: states[q]=1
-                if c<prevlo[q]: states[q]=-1
-                if states[q]>0: lower=max(lower,prevlo[q])
-                if states[q]<0: upper=min(upper,prevhi[q])
-            lines.append(lower+step if states[q]>0 else upper-step)
-            prevhi[q]=upper; prevlo[q]=lower
-        if states[0]==0 or states[1]==0 or states[2]==0 or sizes[1]<=0: continue
-        minimum,maximum,middle=lines
-        st1=(minimum-(maximum-sizes[1]))/(2*sizes[1]); st2=(middle-(maximum-sizes[1]))/(2*sizes[1])
-        pos=1 if st1>st2 else -1
-        signal=("CALL" if pos==1 else "PUT") if previous_position==-pos else "NEUTRO"
-        previous_position=pos
-    if signal=="NEUTRO":return {**base,"reason":"StepMA aguardando cruzamento confirmado."}
-    if pro:
-        confirmation=brooky_c3_strategy(rows,symbol=symbol,timeframe=timeframe,market=market)
-        if confirmation.get("direction")!=signal or not confirmation.get("confirmed"):
-            return {**base,"reason":"StepMA Pro aguardando confirmação Brooky na mesma direção."}
-    stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or '')
-    return {**base,"direction":signal,"confirmed":True,"confidence":75.0,"risk":"MEDIUM","reason":f"{signal} StepMA {'Pro + Brooky' if pro else 'Original'} • próxima vela.","event_key":f"{engine}:{symbol}:{timeframe}:{stamp}:{signal}"}
 
 def brooky_c3_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
     """CONFLUÊNCIA 3 pura do MEGA BOT — Brooky FLEX 31/69.
@@ -22632,13 +21951,14 @@ def _ai_asset_cycle_block_signal(symbol: str, interval: str, market: str, engine
 scalper_pro_prealert_latch = {}
 
 async def signal(symbol, interval, market="OPEN", iq_state=None, request: Request | None = None, ai_only: bool = False, engine: str = "GRAPH_AI", entry_mode: str = "BIRTH", robofibo_poc: bool = False):
+    engine = "SCALPINGM1"  # Serviço Professor/Parceiro exclusivo, preservando estratégia.
     market = (market or "OPEN").upper()
     if not _symbol_allowed(symbol, market) or interval not in INTERVALS:
         raise HTTPException(400, "Ativo ou intervalo inválido.")
 
     engine = (engine or "GRAPH_AI").upper()
-    if engine in RETIRED_ENGINES:
-        engine = "GRAPH_AI"
+    # A validação anterior não pode reativar um motor legado.
+    engine = "SCALPINGM1"
     entry_mode = normalize_entry_mode(entry_mode)
 
     # 3.97.48 — se /pre-signals já confirmou o Scalper Pro, o painel usa a MESMA decisão.
@@ -22729,14 +22049,14 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
     elif engine == "ISMAEL98":
         # ISMAEL 98 faz snapshot seletivo nos 20s finais e entra na próxima abertura.
         entry_mode = "MIDDLE"
-    elif engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+    elif engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "SCALPINGM1", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
         # Motores importados: confirmação causal em candle fechado e entrada na próxima vela.
         entry_mode = "BIRTH"
     if engine == "RSI":
         engine = "GRAPH_AI"
     if engine in RETIRED_ENGINES:
         engine = "GRAPH_AI"
-    if engine not in ("GRAPH_AI", "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "MONSTERSMC", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+    if engine not in ("GRAPH_AI", "SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "MONSTERSMC", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "VOLUME_AI", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
         engine = "GRAPH_AI"
     if engine == "RTM" and not _rtm_symbol_allowed(symbol):
         out = neutral_signal(
@@ -23329,7 +22649,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 request_n = 1000
             elif engine in ("MEGAMASTER", "MONSTERSMC", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "MINSCALPER"):
                 request_n = 320
-            elif engine in ("KAMIKAZE", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+            elif engine in ("KAMIKAZE", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
                 request_n = 1300 if engine == "RSICROSS" else (1000 if engine == "SCALPINGASIA" else (260 if engine == "SCALPERPRO" else 260))
             elif engine == "SMART" and market == "OPEN":
                 request_n = 240
@@ -23442,7 +22762,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif market == "OPEN" and exc.status_code in (429, 503):
             status = "MOTOR MULTIFONTE • TENTANDO FALLBACK"
         else:
-            status = "IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL"
+            status = ("OTC SEM DADOS • OTCHARTS" if OTCHARTS_API_KEY else "IQ OPTION RECONECTANDO") if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL"
+        if engine == "SCALPINGM1" and market == "IQ_OTC" and OTCHARTS_API_KEY:
+            status = "OTC SEM DADOS • MEGA GOLD AGUARDANDO CANDLES VÁLIDOS"
         if engine == "BIGRISE":
             status = "BTC FORCE MULTIATIVOS • FONTE EM ESPERA"
         out = neutral_signal(symbol, interval, market, status, exc.detail, source_state="DEGRADED")
@@ -23547,7 +22869,9 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "FORCE" and market == "IQ_OTC":
             status = "EA FORÇA DO MOVIMENTO • IQ OPTION RECONECTANDO"
         else:
-            status = "IQ OPTION RECONECTANDO" if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL"
+            status = ("OTC SEM DADOS • OTCHARTS" if OTCHARTS_API_KEY else "IQ OPTION RECONECTANDO") if market == "IQ_OTC" else "MOTOR MULTIFONTE • INDISPONÍVEL"
+        if engine == "SCALPINGM1" and market == "IQ_OTC" and OTCHARTS_API_KEY:
+            status = "OTC SEM DADOS • OTCHARTS INDISPONÍVEL"
         if engine == "BIGRISE":
             status = "BTC FORCE MULTIATIVOS • FONTE RECONECTANDO"
         out = neutral_signal(symbol, interval, market, status, str(exc), source_state="DEGRADED")
@@ -23854,11 +23178,14 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         elif engine == "BIGRISE":
             engine_title = "BTC FORCE • MULTIATIVOS"
             engine_mode = "BTC_FORCE_STRUCTURE_NEXT_CANDLE"
+        elif engine == "SCALPINGM1":
+            engine_title = "MEGA BOT"
+            engine_mode = "LOCAL_MTF_BREAK_RETEST"
         else:
             engine_title = "MOTOR REMOVIDO"
             engine_mode = "GRAPH_AI_STRUCTURE"
 
-        if market != "OPEN" and engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+        if market != "OPEN" and engine not in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
             out = neutral_signal(
                 symbol, interval, market,
                 f"ONLINE • {engine_title} • SOMENTE MERCADO ABERTO",
@@ -24073,7 +23400,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 engine_closed = closed[-260:]
             elif engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "EA"):
                 engine_closed = closed[-220:]
-            elif engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "RSI5", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+            elif engine in ("RUBIK", "LARRY", "BIGRISE", "VELOCITY", "RSI5", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
                 engine_closed = closed[-120:]
             else:
                 engine_closed = closed[-90:] if len(closed) > 90 else closed
@@ -24310,109 +23637,10 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 analysis["seconds_to_entry_snapshot"]=round(_mp_remaining,1)
             elif engine == "TSR2016":
                 analysis=tsr2016_strategy(engine_closed[-180:],symbol=symbol,timeframe=interval,market=market)
-            elif engine == "RNFOLLOW":
-                analysis=rn_follow_trend_strategy(engine_closed[-160:],symbol=symbol,timeframe=interval,market=market)
-            elif engine == "RNFOLLOW02":
-                analysis=rn_follow_trend_02_strategy(engine_closed[-180:],symbol=symbol,timeframe=interval,market=market)
-            elif engine == "SNIPERREV":
-                # Avalia o candle em formação apenas nos últimos 20s da vela.
-                # O pré-alerta é provisório: não afirma fechamento confirmado.
-                _sr_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
-                _sr_early=1.0 <= _sr_remaining <= 20.0
-                _sr_rows=engine_closed[-350:]
-                if _sr_early and raw:
-                    try:
-                        _sr_last=raw[-1]
-                        _sr_start=parse_dt(str(_sr_last.get("datetime") or "")).timestamp()
-                        _sr_step=int(INTERVALS[interval])
-                        _sr_now=now().timestamp()
-                        if _sr_start <= _sr_now < _sr_start + _sr_step:
-                            _sr_rows=raw[-350:]
-                        else:
-                            _sr_early=False
-                    except (TypeError,ValueError,OverflowError,AttributeError):
-                        _sr_early=False
-                analysis=sniper_reversal_strategy(_sr_rows,symbol=symbol,timeframe=interval,market=market)
-                analysis=_sniper_release_gate(analysis,symbol,interval,market,claim=_sr_early)
-                analysis["early_signal_window"]=_sr_early
-                analysis["seconds_to_entry_snapshot"]=round(_sr_remaining,1)
-                if not _sr_early:
-                    if analysis.get("confirmed"):
-                        analysis["preview_direction"]=analysis.get("direction")
-                    analysis.update(direction="NEUTRO",confirmed=False,confidence=0.0,
-                        reason=f"Sniper Reversão aguardando pré-alerta nos últimos 20s (faltam {int(_sr_remaining)}s).")
-                elif _sr_early and analysis.get("confirmed"):
-                    analysis["forming_candle_snapshot"]=True
-                    analysis["non_repaint"]=False
-                    analysis["reason"]="PRÉ-ALERTA PROVISÓRIO Sniper Reversão: "+analysis.get("direction","NEUTRO")+" para a próxima vela; candle ainda em formação."
-            elif engine == "MEGAREVYDIV":
-                analysis=mega_reversal_ydiv_strategy(engine_closed[-350:],symbol=symbol,timeframe=interval,market=market)
-            elif engine == "YDIVORIG":
-                analysis=ydiv_original_strategy(engine_closed[-350:],symbol=symbol,timeframe=interval,market=market)
-            elif engine in ("STEPMAORIG", "STEPMAPRO"):
-                analysis=stepma_strategy(engine_closed[-500:],symbol=symbol,timeframe=interval,market=market,pro=(engine=="STEPMAPRO"))
-            elif engine == "RNFOLLOW03":
-                analysis=rn_follow_trend_03_strategy(engine_closed[-180:],symbol=symbol,timeframe=interval,market=market)
-            elif engine == "AUTOHEDGEM1":
-                # Avalia a vela em formação somente nos 20 segundos finais.
-                # O alerta é provisório; não representa confirmação de candle fechado.
-                _ah_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
-                _ah_early=(1 <= _ah_remaining <= 20)
-                _ah_rows=raw[-100:] if _ah_early else engine_closed[-100:]
-                analysis=autohedge_m1_strategy(_ah_rows,symbol=symbol,timeframe=interval,market=market)
-                analysis["seconds_to_entry_snapshot"]=round(_ah_remaining,1)
-                analysis["early_signal_window"]=_ah_early
-                if not _ah_early:
-                    if analysis.get("confirmed"):
-                        analysis["preview_direction"]=analysis.get("direction")
-                    analysis.update(direction="NEUTRO",confirmed=False,confidence=0.0,
-                        reason=f"AutoHedge aguardando janela de pré-alerta de 20s (faltam {int(_ah_remaining)}s).")
-                elif analysis.get("confirmed"):
-                    # Teste 3.98.106: cooldown desativado; não reservar sinal antes da entrega.
-                    if analysis.get("confirmed"):
-                        analysis["forming_candle_snapshot"]=True
-                        analysis["non_repaint"]=False
-                        analysis["reason"]="PRÉ-ALERTA PROVISÓRIO AutoHedge: "+analysis["direction"]+" para a próxima M1; vela em formação."
-            elif engine == "RSI2DERIV":
-                analysis=rsi2_deriv_strategy(engine_closed[-100:],symbol=symbol,timeframe=interval,market=market)
-                analysis=_rsi2_cooldown_gate(analysis,claim=True)
             elif engine == "SCALPINGM1":
                 analysis=scalping_m1_claim(scalping_m1_flex_strategy(engine_closed[-600:],symbol=symbol,timeframe=interval,market=market),symbol,market)
-            elif engine == "GOLDRUSH":
-                analysis=gold_rush_pro_strategy(engine_closed[-180:],symbol=symbol,timeframe=interval,market=market)
-            elif engine == "SHKHA":
-                analysis=shk_ha_macd_strategy(engine_closed[-180:],symbol=symbol,timeframe=interval,market=market)
-                analysis=_shk_flex_gate(analysis,symbol,interval,market,claim=True)
-            elif engine == "MEGAGOLD":
-                analysis=mega_gold_scalper_strategy(engine_closed[-300:],symbol=symbol,timeframe=interval,market=market)
-            elif engine == "LWSMC":
-                analysis=smc_market_structure_strategy(engine_closed[-900:],symbol=symbol,timeframe=interval,market=market,claim=True)
-            elif engine == "ONESHOOT":
-                analysis=one_shoot_ai_strategy(engine_closed[-200:],symbol=symbol,timeframe=interval,market=market,claim=True)
-            elif engine == "MEGAGUIDE":
-                # 3.98.71 — RN Follow 02 flex: ATR 0.70 obrigatório + (S/R OU rejeição), EMA50 só bloqueia tendência contrária forte.
-# 3.98.70 — o MEGA Guide respeita o timeframe escolhido no painel.
-                # M1 analisa/entra/expira M1; M5 faz o mesmo em M5; idem M15/M30.
-                _mg_tf=interval if interval in ("1min","5min","15min","30min") else "1min"
-                if market == "IQ_OTC":
-                    _mg_raw=await iq_ea_candles(iq_state,symbol,_mg_tf,320,regular_market=False)
-                else:
-                    _mg_raw=await candles(symbol,_mg_tf,320,"OPEN",None,request=request)
-                _mg_closed=_verified_closed_candles(_mg_raw,_mg_tf)
-                analysis=mega_guide_strategy(_mg_closed[-320:],symbol=symbol,timeframe=_mg_tf,market=market)
-                analysis["entry_timeframe"]=_mg_tf; analysis["expiry_timeframe"]=_mg_tf
             elif engine == "BARREVERSAL":
                 analysis=one_bar_reversal_strategy(engine_closed[-40:],symbol=symbol,timeframe=interval,market=market)
-            elif engine == "AAPLUS":
-                _aa_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
-                _aa_early=1 <= _aa_remaining <= 20
-                if _aa_early:
-                    analysis=aa_plus_strategy(raw[-160:],symbol=symbol,timeframe=interval,market=market,current_candle_closed=False,allow_prealert=True)
-                else:
-                    analysis=aa_plus_strategy(engine_closed[-160:],symbol=symbol,timeframe=interval,market=market,current_candle_closed=True,allow_prealert=False)
-                    if analysis.get("confirmed"):
-                        analysis={**analysis,"direction":"NEUTRO","confirmed":False,"confidence":0.0,"reason":f"AA+ confirmado; aguardando pré-alerta de 20s • faltam {int(_aa_remaining)}s.","early_signal_window":False}
-                analysis["seconds_to_entry_snapshot"]=round(_aa_remaining,1)
             elif engine == "PAULMACD":
                 analysis=paul_macd_strategy(engine_closed[-320:],symbol=symbol,timeframe=interval,market=market)
             elif engine == "PAULMACDM1":
@@ -24748,11 +23976,14 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
         ai_available = bool(analysis.get("available", True)) if engine == "SMART" else True
         base = {
             "symbol": symbol, "interval": interval, "market": market,
+            # Identificação de origem vem da estratégia executada, não do seletor.
+            "engine": str(analysis.get("engine") or "").upper(),
+            "origin_provider": str(analysis.get("provider") or ""),
             "direction": "NEUTRO",
             "confidence": round(float(analysis.get("confidence", 0) or 0), 1),
             "entry_time": None, "announce_time": None, "expiry_time": None,
             "status": (f"ONLINE • SCALPER PRO • MONITORANDO MERCADO" if engine == "SCALPERPRO" else f"ONLINE • {engine_title} {tf_label} MONITORANDO"),
-            "ai_confirmed": bool(engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC") and analysis.get("confirmed")),
+            "ai_confirmed": bool(engine in ("SMART", "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "GRAPH_AI", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC") and analysis.get("confirmed")),
             "ai_provider": ((analysis.get("provider") or "EXTERNAL_AI") if engine == "SMART" else {
                 "LOCALANALYST": "LOCAL_ANALYST_PRO",
                 "LOCALANALYSTFLEX": "LOCAL_ANALYST_FLEX",
@@ -25497,10 +24728,6 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                     _lead = SUNTZU_EARLY_SIGNAL_SECONDS if engine == "SUNTZU" else VOLUME_POC_EARLY_SIGNAL_SECONDS
                     announce = entry - timedelta(seconds=_lead)
                     expiry = entry + timedelta(seconds=INTERVALS[interval])
-                elif engine == "SNIPERREV":
-                    entry = next_boundary(interval)
-                    announce = now()
-                    expiry = entry + timedelta(seconds=INTERVALS[interval])
                 elif engine == "ISMAEL98":
                     entry = next_boundary(interval)
                     announce = entry - timedelta(seconds=ISMAEL98_EARLY_SIGNAL_SECONDS)
@@ -25531,7 +24758,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 else:
                     # CLOSED_PANEL_ENGINES jamais carregam sinal de uma barra antiga
                     # para a vela subsequente após a janela de nascimento.
-                    if ai_only and engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "SHKHA", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
+                    if ai_only and engine in CLOSED_PANEL_ENGINES and engine not in ("ISMAELTRADER", "MINSCALPER", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
                         elapsed = max(0.0, (now() - current_boundary(interval)).total_seconds())
                         if elapsed > 10.0 or not _last_closed_matches_current_open(engine_closed, interval):
                             base.update({
@@ -25751,7 +24978,7 @@ async def signal(symbol, interval, market="OPEN", iq_state=None, request: Reques
                 # Na EA RSI + Value Chart + XGBoost, somente o XGBoost decide a entrada.
                 # O aprendizado adaptativo permanece disponível para os outros motores.
                 adaptive_decision = {"blocked": False, "active": False}
-                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+                if engine not in ("SMART", "EA", "RUBIK", "BIGRISE", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
                     adaptive_decision = _apply_adaptive_gate(request, base, engine)
                     if adaptive_decision.get("blocked"):
                         release_state["active_signal"] = None
@@ -26184,9 +25411,96 @@ def _ctrader_prune_state() -> None:
             ctrader_sessions.pop(key, None)
 
 
+def _ctrader_shared_token_read():
+    try:
+        with open(CTRADER_SHARED_TOKEN_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return str(data.get("refresh_token") or "").strip()
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
+def _ctrader_shared_token_save(refresh_token: str):
+    """Escrita atômica em disco privado persistente; nunca expor em respostas."""
+    import tempfile
+    directory = os.path.dirname(CTRADER_SHARED_TOKEN_FILE)
+    if not directory or not os.path.isdir(directory):
+        raise RuntimeError("Disco persistente cTrader indisponível; monte /var/data no Render.")
+    fd, temp_path = tempfile.mkstemp(prefix=".ctrader_", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"refresh_token": refresh_token}, handle)
+        os.replace(temp_path, CTRADER_SHARED_TOKEN_FILE)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def _ctrader_shared_session_get():
+    """Sessão do proprietário; refresh rotacionado salvo em disco persistente."""
+    if not CTRADER_CLIENT_ID or not CTRADER_CLIENT_SECRET:
+        return None
+    with _ctrader_shared_lock:
+        now = time.time()
+        if _ctrader_shared_session.get("access_token") and float(_ctrader_shared_session.get("expires_at") or 0) > now + 90:
+            return _ctrader_shared_session
+        refresh = _ctrader_shared_token_read() or CTRADER_SHARED_REFRESH_TOKEN
+        if not refresh:
+            return None
+        try:
+            response = httpx.get(CTRADER_TOKEN_URL, params={
+                "grant_type": "refresh_token", "refresh_token": refresh,
+                "client_id": CTRADER_CLIENT_ID, "client_secret": CTRADER_CLIENT_SECRET,
+            }, timeout=12.0, headers={"Accept": "application/json"})
+            response.raise_for_status()
+            data = response.json()
+            if data.get("errorCode") or not data.get("accessToken"):
+                raise RuntimeError("A autorização cTrader precisa ser renovada pelo administrador.")
+            new_refresh = str(data.get("refreshToken") or refresh)
+            # Não aceitar token rotacionado sem conseguir guardá-lo de forma durável.
+            _ctrader_shared_token_save(new_refresh)
+            _ctrader_shared_session.update({
+                "access_token": str(data["accessToken"]),
+                "refresh_token": new_refresh,
+                "expires_at": now + max(60, int(data.get("expiresIn") or 3600)),
+                "scope": "accounts", "shared": True,
+            })
+            return _ctrader_shared_session
+        except Exception:
+            _ctrader_shared_session["last_candle_error"] = "Conexão compartilhada indisponível; verifique o disco e a autorização administrativa."
+            return None
+
+
+@app.get("/ctrader/admin/setup", response_class=HTMLResponse)
+async def ctrader_admin_setup():
+    return HTMLResponse("""<!doctype html><html lang="pt-BR"><meta name="viewport" content="width=device-width,initial-scale=1"><meta charset="utf-8"><title>Configurar cTrader</title><body style="font:16px system-ui;max-width:550px;margin:40px auto;padding:15px"><h2>Autorizar cTrader do parceiro</h2><p>Somente o administrador. O token administrativo não será salvo no navegador.</p><input id="secret" type="password" placeholder="MEGA_MASTER_ADMIN_TOKEN" style="width:100%;padding:12px;box-sizing:border-box"><p><button id="go" style="padding:12px">Autorizar minha conta cTrader</button></p><p id="msg"></p><script>document.getElementById('go').onclick=async()=>{const t=document.getElementById('secret').value;document.getElementById('secret').value='';try{const r=await fetch('/ctrader/admin/authorize',{method:'POST',headers:{'X-Mega-Admin':t}});const d=await r.json();if(!r.ok)throw Error(d.detail||'Acesso negado');location.assign(d.authorize_url)}catch(e){document.getElementById('msg').textContent=e.message}}</script></body></html>""")
+
+
+@app.post("/ctrader/admin/authorize")
+async def ctrader_admin_authorize(request: Request):
+    token = (request.headers.get("X-Mega-Admin") or "").strip()
+    if not MASTER_ADMIN_TOKEN or not secrets.compare_digest(token, MASTER_ADMIN_TOKEN):
+        raise HTTPException(403, "Acesso administrativo negado.")
+    if not _ctrader_configured():
+        raise HTTPException(503, "Configure as credenciais cTrader no Render.")
+    if not os.path.isdir(os.path.dirname(CTRADER_SHARED_TOKEN_FILE)):
+        raise HTTPException(503, "Monte disco persistente em /var/data antes de autorizar.")
+    state = secrets.token_urlsafe(32)
+    _ctrader_admin_states[state] = time.time() + 600
+    params = {"client_id": CTRADER_CLIENT_ID, "redirect_uri": CTRADER_REDIRECT_URI,
+              "scope": CTRADER_SCOPE, "product": "web", "state": state}
+    return {"authorize_url": CTRADER_AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)}
+
+
 def _ctrader_session_from_request(request: Request):
     _ctrader_prune_state()
-    session_id = str(request.cookies.get(CTRADER_SESSION_COOKIE) or "").strip()
+    # O feed do parceiro utiliza primeiro a sessão autorizada pelo proprietário.
+    # Não solicita autorização cTrader ao usuário final.
+    shared = _ctrader_shared_session_get()
+    if shared:
+        return "server-shared", shared
+    session_id = str(request.cookies.get(CTRADER_SESSION_COOKIE) or "").strip() if request else ""
     if not session_id:
         return None, None
     item = ctrader_sessions.get(session_id)
@@ -26783,6 +26097,29 @@ async def ctrader_callback(request: Request, code: str = "", state: str = "", er
     code = str(code or "").strip()
     if not code:
         return RedirectResponse(url="/?ctrader=error&message=code_nao_recebido", status_code=302)
+
+    # Fluxo administrativo: o state é emitido apenas após validar o token mestre.
+    # O callback recebe apenas o código OAuth, nunca o token administrativo.
+    admin_state = str(state or "").strip()
+    if admin_state and _ctrader_admin_states.get(admin_state, 0) > time.time():
+        _ctrader_admin_states.pop(admin_state, None)
+        try:
+            token_data = await _ctrader_exchange_authorization_code(code)
+            refresh_token = str(token_data.get("refreshToken") or "")
+            if not refresh_token:
+                raise RuntimeError("cTrader não retornou refresh token.")
+            with _ctrader_shared_lock:
+                _ctrader_shared_token_save(refresh_token)
+                _ctrader_shared_session.clear()
+                _ctrader_shared_session.update({
+                    "access_token": str(token_data["accessToken"]),
+                    "refresh_token": refresh_token,
+                    "expires_at": time.time() + max(60, int(token_data.get("expiresIn") or 3600)),
+                    "scope": "accounts", "shared": True,
+                })
+        except Exception:
+            return RedirectResponse(url="/ctrader/admin/setup?error=authorization_failed", status_code=302)
+        return HTMLResponse("<h2>cTrader autorizado para o servidor do parceiro.</h2><p>Você pode fechar esta página.</p>")
 
     cookie_state = str(request.cookies.get(CTRADER_OAUTH_STATE_COOKIE) or "").strip()
     returned_state = str(state or "").strip()
@@ -27874,8 +27211,38 @@ async def iq_logout(
 
 
 
+# Diagnóstico isolado TBT OTC: o executável Windows recebido NÃO é executado no Render.
+# Verifica se a integração IQ já existente consegue obter candles OTC autênticos.
+@app.get("/tbt-otc-test/data")
+async def tbt_otc_test_data(request: Request, symbol: str = "EUR/USD"):
+    if symbol not in OTC_BASE:
+        raise HTTPException(400, "Selecione um par OTC válido.")
+    state = _iq_session_state(request, required=False)
+    if state is None:
+        return {"ok": False, "source": "IQ_OPTION_EXISTENTE", "tbt_integrated": False,
+                "reason": "Conecte a IQ Option na aba Corretora; o TBT.exe não roda no Render."}
+    try:
+        rows = await asyncio.wait_for(iq_ea_candles(state, symbol, "1min", 80, regular_market=False), timeout=IQ_CANDLE_TIMEOUT + 8)
+        samples = [{k: r.get(k) for k in ("datetime", "timestamp", "open", "high", "low", "close") if k in r} for r in rows[-3:] if isinstance(r, dict)]
+        return {"ok": len(rows)>=20, "source": "IQ_OPTION_EXISTENTE", "tbt_integrated": False,
+                "symbol": symbol, "interval": "1min", "candles": len(rows), "samples": samples,
+                "reason": "Candles OTC recebidos da sessão IQ existente; não comprova funcionamento do TBT."}
+    except Exception as exc:
+        return {"ok": False, "source": "IQ_OPTION_EXISTENTE", "tbt_integrated": False,
+                "symbol": symbol, "reason": str(exc)[:220]}
+
+@app.get("/tbt-otc-test", response_class=HTMLResponse)
+async def tbt_otc_test_page():
+    return HTMLResponse("""<!doctype html><html lang=pt-br><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>MEGA IA • Teste OTC</title><style>body{font:16px Arial;background:#101827;color:white;max-width:640px;margin:35px auto;padding:20px}button,select{padding:13px;border-radius:9px;margin:8px;background:#243b60;color:white;border:1px solid #567}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#1b2940;padding:18px;border-radius:10px}</style><h2>MEGA IA • Teste de candles OTC</h2><p>Teste seguro da conexão IQ Option já existente. O executável TBT não foi integrado nem executado.</p><p>Faça login na IQ Option no app, neste mesmo navegador, antes de testar.</p><select id=par><option>EUR/USD</option><option>EUR/JPY</option><option>GBP/USD</option><option>USD/JPY</option></select><button onclick='testar()'>Testar candles M1</button><pre id=out>Aguardando teste.</pre><script>async function testar(){let o=document.getElementById('out');o.textContent='Consultando...';try{let r=await fetch('/tbt-otc-test/data?symbol='+encodeURIComponent(document.getElementById('par').value),{credentials:'same-origin'});o.textContent=JSON.stringify(await r.json(),null,2)}catch(e){o.textContent=String(e)}}</script></html>""")
+
 @app.get("/otc-status")
 async def otc_status(request: Request, broker: str = "IQ_OPTION"):
+    if OTCHARTS_API_KEY:
+        recent = any(time.time() - saved_at < 90 and rows for saved_at, rows in list(_OTCHARTS_CANDLE_CACHE.values()))
+        return {"broker": "IQ_OPTION", "provider": "OTCHARTS_IQ_OTC", "configured": True,
+                "connected": bool(recent), "reauth_required": False, "reconnecting": False,
+                "last_error": _OTCHARTS_DIAGNOSTIC.get("last_error", ""), "diagnostic": dict(_OTCHARTS_DIAGNOSTIC), "pairs": len(OTC_BASE),
+                "message": "OTCharts: candles OTC recentes recebidos." if recent else ("OTCharts falhou: " + str(_OTCHARTS_DIAGNOSTIC.get("last_error"))[:130] if _OTCHARTS_DIAGNOSTIC.get("last_error") else "OTCharts configurado; aguardando candles OTC válidos. Não exige login IQ.")}
     broker = (broker or "IQ_OPTION").upper()
 
     state = _iq_session_state(
@@ -27928,6 +27295,33 @@ async def otc_status(request: Request, broker: str = "IQ_OPTION"):
 @app.get("/otc-active-pairs")
 async def otc_active_pairs(request: Request):
     """Retorna somente os pares OTC que estão disponíveis na sessão IQ agora."""
+    # Sem login: somente ativos comprovados por candles recentes do OTCharts.
+    # Não afirmar que todos os pares estão abertos sem confirmação da fonte.
+    if OTCHARTS_API_KEY:
+        now = time.time()
+        recent = []
+        for (raw_symbol, tf_seconds), (saved_at, rows) in list(_OTCHARTS_CANDLE_CACHE.items()):
+            if tf_seconds != 60 or now - saved_at > 90 or not rows:
+                continue
+            try:
+                last_ts = datetime.fromisoformat(rows[-1]["datetime"]).timestamp()
+                if now - last_ts > 180:
+                    continue
+            except Exception:
+                continue
+            pair = str(raw_symbol).replace("-OTC", "")
+            for sym in OTC_SYMBOLS:
+                if sym.upper().replace("/", "").replace("-OTC", "") == pair:
+                    recent.append(sym)
+                    break
+        recent = list(dict.fromkeys(recent))
+        return {
+            "ok": True, "connected": bool(recent), "configured": True,
+            "pairs": recent, "count": len(recent),
+            "status": "OTCHARTS • CANDLES RECENTES" if recent else "OTCHARTS • AGUARDANDO DADOS",
+            "source": "OTCHARTS_IQ_OTC", "exact": False,
+            "message": "Pares com candles OTC recentes; não é catálogo oficial de ativos abertos." if recent else "Chave configurada. Aguardando primeira leitura OTC válida; disponibilidade não confirmada.",
+        }
     state = _iq_session_state(request, required=False)
     if not state or not _iq_connected(state):
         return {
@@ -28534,7 +27928,7 @@ async def candles_endpoint(
     state = _iq_session_state(request, required=False) if market in ("OPEN", "IQ_OTC") else None
 
     try:
-        if market == "IQ_OTC" and not state:
+        if market == "IQ_OTC" and not state and not OTCHARTS_API_KEY:
             return {
                 "ok": False,
                 "symbol": symbol,
@@ -28547,7 +27941,7 @@ async def candles_endpoint(
 
         values = await candles(symbol, interval, n, market, state, request=request)
 
-        feed_src = (_feed_source_from_rows(values) if market == "OPEN" else ("IQ_OPTION_OTC" if market == "IQ_OTC" else market))
+        feed_src = (_feed_source_from_rows(values) if market == "OPEN" else (("OTCHARTS_IQ_OTC" if OTCHARTS_API_KEY else "IQ_OPTION_OTC") if market == "IQ_OTC" else market))
         feed_info = _current_open_feed_info(symbol, interval) if market == "OPEN" else {}
         return {
             "ok": True,
@@ -28594,7 +27988,7 @@ async def candles_endpoint(
             "feed_label": (
                 _feed_source_label(_feed_source_from_rows(stale))
                 if stale else
-                ("BINOMO • CRYPTO IDX INDISPONÍVEL" if symbol == BINOMO_CRYPTO_IDX_SYMBOL else "MULTIFONTE INDISPONÍVEL")
+                ("FONTE OTC INDISPONÍVEL" if market == "IQ_OTC" else ("BINOMO • CRYPTO IDX INDISPONÍVEL" if symbol == BINOMO_CRYPTO_IDX_SYMBOL else "MULTIFONTE INDISPONÍVEL"))
             ),
         }
 
@@ -29073,10 +28467,7 @@ async def telegram_send(body: TelegramSignalBody):
 # -----------------------------------------------------------------------------
 # MEGA IA 3.72 — execução em segundo plano no servidor; motor só muda por clique explícito
 # -----------------------------------------------------------------------------
-_BACKGROUND_ENGINES = {
-    # 3.97.42 — servidor 24h isolado: somente os dois motores visíveis.
-    "SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "MEGAPREMIUM", "SHKHA",
-}
+_BACKGROUND_ENGINES = {"SCALPINGM1"}  # Apenas Mega Bot pode operar em segundo plano.
 
 
 def _background_state_snapshot() -> Dict[str, Any]:
@@ -29084,7 +28475,7 @@ def _background_state_snapshot() -> Dict[str, Any]:
     return {
         "enabled": bool(background_bot_state.get("enabled")),
         "telegram_enabled": bool(background_bot_state.get("telegram_enabled")),
-        "engine": str(background_bot_state.get("engine") or "SCALPERPRO"),
+        "engine": "SCALPINGM1",
         "market": str(background_bot_state.get("market") or "OPEN"),
         "interval": str(background_bot_state.get("interval") or "1min"),
         "robofibo_poc": bool(background_bot_state.get("robofibo_poc")),
@@ -29110,7 +28501,7 @@ def _background_save_state() -> None:
         data = {
             "enabled": bool(background_bot_state.get("enabled")),
             "telegram_enabled": bool(background_bot_state.get("telegram_enabled")),
-            "engine": str(background_bot_state.get("engine") or "SCALPERPRO"),
+            "engine": "SCALPINGM1",
             "market": str(background_bot_state.get("market") or "OPEN"),
             "interval": str(background_bot_state.get("interval") or "1min"),
             "robofibo_poc": bool(background_bot_state.get("robofibo_poc")),
@@ -29149,7 +28540,7 @@ def _background_load_state() -> None:
         interval = str(data.get("interval") or BACKGROUND_DEFAULT_INTERVAL)
         invalid_saved_engine = engine not in _BACKGROUND_ENGINES
         if invalid_saved_engine:
-            engine = "SCALPERPRO"
+            engine = "SCALPINGM1"
         if market not in VALID_MARKETS:
             market = "OPEN"
         if interval not in INTERVALS:
@@ -29161,10 +28552,10 @@ def _background_load_state() -> None:
             allowed = SYMBOLS if market == "OPEN" else OTC_SYMBOLS
             symbols = [str(x).upper() for x in raw_symbols if str(x).upper() in allowed]
         background_bot_state.update({
-            "enabled": False if invalid_saved_engine else bool(data.get("enabled", BACKGROUND_DEFAULT_ENABLED)),
+            "enabled": bool(data.get("enabled", BACKGROUND_DEFAULT_ENABLED)),
             # Arquivos de estado antigos não tinham essa chave: nesse caso OFF.
             "telegram_enabled": bool(data.get("telegram_enabled", BACKGROUND_DEFAULT_TELEGRAM_ENABLED)),
-            "engine": engine,
+            "engine": "SCALPINGM1",
             "market": market,
             "interval": interval,
             "robofibo_poc": bool(data.get("robofibo_poc", False)),
@@ -29175,7 +28566,7 @@ def _background_load_state() -> None:
             "last_symbol": data.get("last_symbol"),
             "last_signal": data.get("last_signal"),
             "last_result": data.get("last_result"),
-            "status": ("OFFLINE • MOTOR REMOVIDO" if invalid_saved_engine else str(data.get("status") or "CARREGADO")),
+            "status": ("CARREGADO • MEGA BOT" if invalid_saved_engine else str(data.get("status") or "CARREGADO")),
             "pending_trades": list(data.get("pending_trades") or [])[-80:],
             "sent_signal_keys": list(data.get("sent_signal_keys") or [])[-240:],
             "telegram_session_started_at": data.get("telegram_session_started_at"),
@@ -29204,16 +28595,12 @@ def _background_active_iq_state() -> Dict[str, Any] | None:
 
 def _background_symbols_for_state() -> list[str]:
     market = str(background_bot_state.get("market") or "OPEN").upper()
-    engine = str(background_bot_state.get("engine") or "SCALPERPRO").upper()
+    engine = str(background_bot_state.get("engine") or "SCALPINGM1").upper()
     configured = [str(x).upper() for x in (background_bot_state.get("symbols") or [])]
     allowed = SYMBOLS if market == "OPEN" else OTC_SYMBOLS
     configured = [x for x in configured if x in allowed and _symbol_allowed(x, market)]
     if configured:
         return configured
-    # Mega Gold: quando nenhum conjunto foi enviado pelo painel, varre todos
-    # os ativos cadastrados no mercado escolhido, sem limitar ao ouro.
-    if engine == "MEGAGOLD":
-        return [x for x in allowed if _symbol_allowed(x, market)]
     # 3.98.19 — nunca escolher BTC silenciosamente. O painel envia explicitamente
     # os ativos da aba PARIDADES ou CRIPTO; sem escopo configurado, não varre nada.
     return []
@@ -29263,7 +28650,19 @@ def _background_accounting_remember(payload: Dict[str, Any], iq_state: Dict[str,
     else:
         pending = accounting_pending.setdefault(market, {})
         done = accounting_results.setdefault(market, {})
-    if key not in pending and key not in done:
+    if key in pending:
+        old = pending[key]
+        if not str(old.get('engine') or '').strip() and str(item.get('engine') or '').strip():
+            old['engine'] = item['engine']
+            old['strategy'] = item['strategy']
+            old['source'] = item['source']
+    elif key in done:
+        old = done[key]
+        if not str(old.get('engine') or '').strip() and str(item.get('engine') or '').strip():
+            old['engine'] = item['engine']
+            old['strategy'] = item['strategy']
+            old['source'] = item['source']
+    else:
         pending[key] = item
 
 
@@ -29479,10 +28878,11 @@ async def _background_bot_loop() -> None:
             # Com Telegram OFF o servidor continua analisando/contabilizando; apenas
             # o envio das mensagens fica bloqueado em _background_send_signal/result.
             if not bool(background_bot_state.get("telegram_enabled")):
-                current_engine = str(background_bot_state.get("engine") or "SCALPERPRO").upper()
+                current_engine = str(background_bot_state.get("engine") or "SCALPINGM1").upper()
                 background_bot_state["status"] = f"ONLINE • {current_engine} • SERVIDOR 24H • TELEGRAM OFF"
 
-            engine = str(background_bot_state.get("engine") or "SCALPERPRO").upper()
+            engine = "SCALPINGM1"
+            background_bot_state["engine"] = engine
             market = str(background_bot_state.get("market") or "OPEN").upper()
             interval = str(background_bot_state.get("interval") or "1min")
             if engine not in _BACKGROUND_ENGINES or market not in VALID_MARKETS or interval not in INTERVALS:
@@ -29605,7 +29005,7 @@ async def background_bot_set_state(body: BackgroundBotStateBody):
     interval = str(body.interval or "1min")
 
     if requested_engine not in _BACKGROUND_ENGINES:
-        requested_engine = "SCALPERPRO"
+        requested_engine = "SCALPINGM1"
     if market not in VALID_MARKETS:
         raise HTTPException(400, "Mercado de segundo plano inválido.")
     if interval not in INTERVALS:
@@ -29696,7 +29096,7 @@ async def background_bot_set_state(body: BackgroundBotStateBody):
                 _tg_session_start()
             current_engine = str(background_bot_state.get("engine") or BACKGROUND_DEFAULT_ENGINE).upper()
             if current_engine not in _BACKGROUND_ENGINES:
-                current_engine = "SCALPERPRO"
+                current_engine = "SCALPINGM1"
                 background_bot_state["engine"] = current_engine
 
             if not tg_on:
@@ -30154,79 +29554,58 @@ def paul_macd_m1_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN")
         return {**base,"reason":f"PAUL MACD M1 aguardando leitura válida: {str(exc)[:100]}"}
 
 def money_pile_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"):
-    """MEGA MONEY EA — confluência restaurada do painel original: RSI9 + CCI13 + Stochastic 5/3/3 + médias 5/9."""
+    """MEGA MONEY EA — mesma confluência do particular, com evento único/rearme.
+    RSI9 + CCI13 + Stochastic 5/3/3 + médias 5/9, somente candles fechados.
+    Um sinal nasce apenas quando a confluência ENTRA no estado CALL/PUT; enquanto a
+    mesma condição permanecer ativa nas velas seguintes, não repete entrada.
+    Entrada na próxima M1, sem grid, Martingale ou Gale.
+    """
     rows=list(cs or [])[-1000:]
     base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
-          "strategy":"💵 MEGA MONEY EA","engine":"MONEYPILE","provider":"MEGA_MONEY_ORIGINAL_CONFLUENCE",
+          "strategy":"💵 MEGA MONEY EA","engine":"MONEYPILE","provider":"MEGA_MONEY_ORIGINAL_CONFLUENCE_REARM",
           "next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,
-          "grid":False,"martingale":False,"closed_candles_only":True,"non_repaint_after_release":True}
-    if len(rows)<30: return {**base,"reason":f"MEGA MONEY coletando candles ({len(rows)}/30)."}
+          "grid":False,"martingale":False,"closed_candles_only":True,"non_repaint_after_release":True,
+          "event_unique":True,"rearm_required":True}
+    if len(rows)<31: return {**base,"reason":f"MEGA MONEY coletando candles ({len(rows)}/31)."}
     try:
-        closes=[float(x.get("close",0) or 0) for x in rows]; highs=[float(x.get("high",0) or 0) for x in rows]; lows=[float(x.get("low",0) or 0) for x in rows]
-        def _sma(v,n): return sum(v[-n:])/n
-        ma5=_sma(closes,5); ma9=_sma(closes,9)
-        r9=rsi(closes,9)
-        tp=[(highs[i]+lows[i]+closes[i])/3.0 for i in range(len(rows))]
-        ma_tp=_sma(tp,13); md=sum(abs(x-ma_tp) for x in tp[-13:])/13.0
-        cci13=0.0 if md<=1e-12 else (tp[-1]-ma_tp)/(0.015*md)
-        k_raw=[]
-        for i in range(max(4,len(rows)-20),len(rows)):
-            lo=min(lows[i-4:i+1]); hi=max(highs[i-4:i+1]); k_raw.append(50.0 if hi<=lo else 100.0*(closes[i]-lo)/(hi-lo))
-        k_smooth=sum(k_raw[-3:])/min(3,len(k_raw)); d_smooth=sum(k_raw[-5:-2])/min(3,len(k_raw[-5:-2])) if len(k_raw)>=5 else k_smooth
-        call_condition=(r9>=50.0 and cci13>=0.0 and k_smooth>=d_smooth and ma5>ma9)
-        put_condition=(r9<=50.0 and cci13<=0.0 and k_smooth<=d_smooth and ma5<ma9)
-
-        # 3.98.61 — evento único/rearme do MEGA MONEY EA.
-        # A estratégia 4/4 continua idêntica; apenas exigimos que a condição tenha
-        # NASCIDO nesta vela fechada. Se já estava ativa na vela anterior, não repete.
-        prev_closes=closes[:-1]; prev_highs=highs[:-1]; prev_lows=lows[:-1]
-        prev_ma5=sum(prev_closes[-5:])/5.0; prev_ma9=sum(prev_closes[-9:])/9.0
-        prev_r9=rsi(prev_closes,9)
-        prev_tp=[(prev_highs[i]+prev_lows[i]+prev_closes[i])/3.0 for i in range(len(prev_closes))]
-        prev_ma_tp=sum(prev_tp[-13:])/13.0
-        prev_md=sum(abs(x-prev_ma_tp) for x in prev_tp[-13:])/13.0
-        prev_cci13=0.0 if prev_md<=1e-12 else (prev_tp[-1]-prev_ma_tp)/(0.015*prev_md)
-        prev_k_raw=[]
-        for i in range(max(4,len(prev_closes)-20),len(prev_closes)):
-            lo=min(prev_lows[i-4:i+1]); hi=max(prev_highs[i-4:i+1])
-            prev_k_raw.append(50.0 if hi<=lo else 100.0*(prev_closes[i]-lo)/(hi-lo))
-        prev_k_smooth=sum(prev_k_raw[-3:])/min(3,len(prev_k_raw))
-        prev_d_slice=prev_k_raw[-5:-2]
-        prev_d_smooth=sum(prev_d_slice)/min(3,len(prev_d_slice)) if prev_d_slice else prev_k_smooth
-        prev_call_condition=(prev_r9>=50.0 and prev_cci13>=0.0 and prev_k_smooth>=prev_d_smooth and prev_ma5>prev_ma9)
-        prev_put_condition=(prev_r9<=50.0 and prev_cci13<=0.0 and prev_k_smooth<=prev_d_smooth and prev_ma5<prev_ma9)
-
-        # Rateio estimado de pressao compradora/vendedora nos ultimos 5 candles
-        # fechados. Usa a posicao do fechamento no range; nao e fluxo real de ordens.
-        buy_pressure=0.0; sell_pressure=0.0
-        for candle in rows[-5:]:
-            hi=float(candle.get("high",0) or 0)
-            lo=float(candle.get("low",0) or 0)
-            close=float(candle.get("close",0) or 0)
-            spread=hi-lo
-            if spread<=0: continue
-            weight=float(candle.get("volume",0) or 0)
-            if weight<=0: weight=1.0
-            buy_pressure+=weight*max(0.0,min(1.0,(close-lo)/spread))
-            sell_pressure+=weight*max(0.0,min(1.0,(hi-close)/spread))
-        pressure_total=buy_pressure+sell_pressure
-        buyer_pct=100.0*buy_pressure/pressure_total if pressure_total>0 else 50.0
-        seller_pct=100.0*sell_pressure/pressure_total if pressure_total>0 else 50.0
-        rateio_threshold=55.0
-        call=bool(call_condition and not prev_call_condition)
-        put=bool(put_condition and not prev_put_condition)
-        direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
-        diag={"rsi9":round(r9,2),"cci13":round(cci13,2),"stoch_k_5_3_3":round(k_smooth,2),"stoch_d_5_3_3":round(d_smooth,2),"ma5":round(ma5,8),"ma9":round(ma9,8),
-              "condition_call":bool(call_condition),"condition_put":bool(put_condition),
-              "previous_call_condition":bool(prev_call_condition),"previous_put_condition":bool(prev_put_condition),
-              "new_event":bool(direction!="NEUTRO"),"buyer_pressure_pct":round(buyer_pct,2),"seller_pressure_pct":round(seller_pct,2),"rateio_threshold":rateio_threshold,"rateio_estimated":True}
-        if direction=="NEUTRO": return {**base,"reason":"MEGA MONEY monitorando confluência 4/4; condição mantida não repete sinal, aguardando rearme/novo evento.","diagnostics":diag}
-        if (direction=="CALL" and buyer_pct<rateio_threshold) or (direction=="PUT" and seller_pct<rateio_threshold):
-            return {**base,"reason":"MEGA MONEY: rateio de pressao nao confirmou a direcao (minimo 55%).","diagnostics":diag}
+        def _state(rr):
+            closes=[float(x.get("close",0) or 0) for x in rr]
+            highs=[float(x.get("high",0) or 0) for x in rr]
+            lows=[float(x.get("low",0) or 0) for x in rr]
+            def _sma(v,n): return sum(v[-n:])/n
+            ma5=_sma(closes,5); ma9=_sma(closes,9)
+            r9=rsi(closes,9)
+            tp=[(highs[i]+lows[i]+closes[i])/3.0 for i in range(len(rr))]
+            ma_tp=_sma(tp,13); md=sum(abs(x-ma_tp) for x in tp[-13:])/13.0
+            cci13=0.0 if md<=1e-12 else (tp[-1]-ma_tp)/(0.015*md)
+            k_raw=[]
+            for i in range(max(4,len(rr)-20),len(rr)):
+                lo=min(lows[i-4:i+1]); hi=max(highs[i-4:i+1])
+                k_raw.append(50.0 if hi<=lo else 100.0*(closes[i]-lo)/(hi-lo))
+            k_smooth=sum(k_raw[-3:])/min(3,len(k_raw))
+            d_window=k_raw[-5:-2]
+            d_smooth=sum(d_window)/min(3,len(d_window)) if d_window else k_smooth
+            call=(r9>=50.0 and cci13>=0.0 and k_smooth>=d_smooth and ma5>ma9)
+            put=(r9<=50.0 and cci13<=0.0 and k_smooth<=d_smooth and ma5<ma9)
+            direction="CALL" if call and not put else ("PUT" if put and not call else "NEUTRO")
+            return direction,{"rsi9":round(r9,2),"cci13":round(cci13,2),"stoch_k_5_3_3":round(k_smooth,2),
+                              "stoch_d_5_3_3":round(d_smooth,2),"ma5":round(ma5,8),"ma9":round(ma9,8)}
+        direction,diag=_state(rows)
+        prev_direction,_=_state(rows[:-1])
+        diag["previous_state"]=prev_direction
+        if direction=="NEUTRO":
+            return {**base,"reason":"MEGA MONEY aguardando confluência RSI9 + CCI13 + Stoch 5/3/3 + MA5/9.","diagnostics":diag}
+        # 3.99.25 — rearme ESTRITO: depois de qualquer CALL/PUT, a confluência
+        # precisa passar por NEUTRO antes de poder gerar um novo evento. Isso também
+        # bloqueia troca direta CALL->PUT / PUT->CALL sem rearme e impede que scanner,
+        # radar ou backtest reciclem uma condição persistente vela após vela.
+        if prev_direction != "NEUTRO":
+            return {**base,"reason":f"MEGA MONEY aguardando rearme NEUTRO antes de novo {direction}.","diagnostics":diag}
+        conf=86.0
         stamp=str(rows[-1].get("datetime") or rows[-1].get("timestamp") or "")
-        return {**base,"direction":direction,"confidence":86.0,"confirmed":True,"risk":"LOW",
-                "reason":f"{direction} MEGA MONEY • 4 confluências alinhadas • próxima M1 • sem Gale.",
-                "event_key":f"MONEYPILE:{direction}:{stamp}","diagnostics":diag}
+        return {**base,"direction":direction,"confidence":conf,"confirmed":True,"risk":"LOW",
+                "reason":f"{direction} MEGA MONEY • NOVA confluência RSI9 + CCI13 + Stoch 5/3/3 + MA5/9 • próxima M1 • sem Gale.",
+                "event_key":f"MONEYPILE:{symbol}:{direction}:{stamp}","diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"MEGA MONEY aguardando leitura válida: {str(exc)[:100]}"}
 
@@ -30283,60 +29662,6 @@ def millionaire_ea_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN
         return {**base,"reason":f"EA MILIONÁRIO aguardando leitura válida: {str(exc)[:100]}"}
 
 
-def aa_plus_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
-    """AA+.mq4: Alligator Jaw 13/8 + Lips 5/3 (SMMA, median price), com pré-alerta nos 20s finais.
-    O pré-alerta usa o candle em formação; após liberado, event_key trava o sinal para a próxima M1.
-    """
-    rows=list(cs or [])[-160:]
-    live_snapshot=bool(allow_prealert and not current_candle_closed)
-    base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,"risk":"MEDIUM",
-          "strategy":"🐊 AA+","engine":"AAPLUS","provider":"AA_PLUS_MQ4_ALLIGATOR_CAUSAL_V1",
-          "next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,"gale_signal":False,
-          "grid":False,"martingale":False,"closed_candles_only":not live_snapshot,"non_repaint_after_release":True,
-          "prealert_seconds":20,"early_signal_window":live_snapshot,"confidence_is_probability":False}
-    if len(rows)<35:
-        return {**base,"reason":f"AA+ coletando candles ({len(rows)}/35)."}
-    try:
-        median=[(float(x['high'])+float(x['low']))/2.0 for x in rows]
-        def smma(vals, period):
-            out=[]; prev=None
-            for i,v in enumerate(vals):
-                if i+1<period: out.append(None); continue
-                if prev is None: prev=sum(vals[i-period+1:i+1])/period
-                else: prev=(prev*(period-1)+v)/period
-                out.append(prev)
-            return out
-        jaw_s=smma(median,13); lips_s=smma(median,5)
-        jaw=jaw_s[-1-8]; lips=lips_s[-1-3]
-        if jaw is None or lips is None: return {**base,"reason":"AA+ aquecendo Alligator."}
-        cur,prev=rows[-1],rows[-2]
-        close0=float(cur['close']); high1=float(prev['high']); low1=float(prev['low']); close1=float(prev['close'])
-        trend=1 if lips>jaw else (-1 if lips<jaw else 0)
-        mid1=(high1+low1)/2.0
-        reversal=1 if close1>mid1 else (-1 if close1<mid1 else 0)
-        delta=(close0-lips) if trend==1 else ((lips-close0) if trend==-1 else 0.0)
-        compact=''.join(ch for ch in str(symbol).upper() if ch.isalnum())
-        if 'JPY' in compact: point=0.001
-        elif compact.startswith(('BTC','ETH','SOL','BNB','XRP','ADA','DOGE','LTC')): point=0.01
-        else: point=0.00001
-        level=20.0*point
-        call=(close0<lips and trend==-1 and reversal==1 and close0>high1 and delta>level)
-        put=(close0>lips and trend==1 and reversal==-1 and close0<low1 and delta>level)
-        direction='CALL' if call and not put else ('PUT' if put and not call else 'NEUTRO')
-        diag={"jaw13_shift8":round(float(jaw),10),"lips5_shift3":round(float(lips),10),"trend":trend,
-              "reversal":reversal,"delta":round(float(delta),10),"min_delta":level,"prev_high":high1,"prev_low":low1,
-              "snapshot":("FORMING_20S" if live_snapshot else "CLOSED")}
-        if direction=='NEUTRO':
-            return {**base,"reason":"AA+ monitorando Alligator + reversão + rompimento da máxima/mínima anterior.","diagnostics":diag}
-        stamp=str(cur.get('datetime') or cur.get('timestamp') or '')
-        conf=82.0 if live_snapshot else 80.0
-        return {**base,"direction":direction,"confidence":conf,"confirmed":True,"risk":"MEDIUM",
-                "reason":f"{direction} AA+ • condição da seta original detectada" + (" no pré-alerta de 20s" if live_snapshot else " no candle") + "; entrada na próxima M1.",
-                "event_key":f"AAPLUS:{direction}:{stamp}","early_signal_locked":live_snapshot,"diagnostics":diag}
-    except Exception as exc:
-        return {**base,"reason":f"AA+ aguardando leitura válida: {str(exc)[:100]}"}
-
-
 def one_bar_reversal_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
     """Adaptação causal do 1barreversal.mq4: usa somente o último candle fechado e o anterior."""
     rows=list(cs or [])[-40:]
@@ -30364,207 +29689,6 @@ def one_bar_reversal_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
                 "event_key":f"BARREVERSAL:{direction}:{stamp}","diagnostics":diag}
     except Exception as exc:
         return {**base,"reason":f"1 BAR REVERSAL aguardando leitura válida: {str(exc)[:100]}"}
-
-
-def mega_guide_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
-    """MEGA Guide causal: análise e operação seguem o timeframe selecionado."""
-    rows=list(cs or [])[-320:]
-    tf_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30"}.get(timeframe,timeframe)
-    base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
-          "strategy":f"MEGA GUIDE {tf_label}","engine":"MEGAGUIDE","provider":"SENSIBLE_GUIDE_DYNAMIC_TF_CAUSAL_V2",
-          "risk":"MEDIUM","closed_candles_only":True,"non_repaint":True,"non_repaint_after_release":True,
-          "prealert_seconds":20,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,
-          "gale_signal":False,"martingale":False,"grid":False,"analysis_timeframe":timeframe,"entry_timeframe":timeframe,"expiry_timeframe":timeframe}
-    if len(rows)<80: return {**base,"reason":f"MEGA Guide coletando {tf_label} ({len(rows)}/80)."}
-    try:
-        closes=[float(x['close']) for x in rows]; opens=[float(x['open']) for x in rows]
-        highs=[float(x['high']) for x in rows]; lows=[float(x['low']) for x in rows]
-        e10,e20,e50=[ema(closes,n) for n in (10,20,50)]
-        e100=ema(closes,100) if len(closes)>=100 else None
-        e200=ema(closes,200) if len(closes)>=200 else None
-        pe10,pe20=[ema(closes[:-1],n) for n in (10,20)]
-        r=rsi(closes,14)
-        tr=[max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1])) for i in range(1,len(rows))]
-        atr=sum(tr[-14:])/14.0
-        mid=sum(closes[-20:])/20.0; sd=(sum((x-mid)**2 for x in closes[-20:])/20.0)**0.5
-        upper=mid+2*sd; lower=mid-2*sd
-        prev=rows[-2]; cur=rows[-1]; rng=max(1e-12,highs[-1]-lows[-1]); body=abs(closes[-1]-opens[-1])/rng
-        # Perfil FLEX M5: 10/20/50 define a tendência. EMA100/200 ficam só como contexto,
-        # pois exigir o empilhamento completo 10/20/50/100/200 deixava o motor quase sem eventos.
-        trend_up=e10>e20>e50 and e10>=pe10
-        trend_dn=e10<e20<e50 and e10<=pe10
-        recent_hi=max(highs[-21:-1]); recent_lo=min(lows[-21:-1])
-        room_up=(recent_hi-closes[-1])/max(atr,1e-12); room_dn=(closes[-1]-recent_lo)/max(atr,1e-12)
-        bull=closes[-1]>opens[-1] and body>=0.24 and closes[-1]>=mid-0.10*atr and 45<=r<=76 and closes[-1]<upper+0.55*atr and room_up>=0.08
-        bear=closes[-1]<opens[-1] and body>=0.24 and closes[-1]<=mid+0.10*atr and 24<=r<=55 and closes[-1]>lower-0.55*atr and room_dn>=0.08
-        call=trend_up and bull; put=trend_dn and bear
-        # O event_key do candle M5 + dedupe global já impedem duplicar a MESMA oportunidade.
-        # Não use a cor da vela anterior como rearme: isso bloqueava quase todos os sinais em tendência.
-        direction='CALL' if call and not put else ('PUT' if put and not call else 'NEUTRO')
-        diag={"ema10":round(e10,8),"ema20":round(e20,8),"ema50":round(e50,8),
-              "ema100":round(e100,8) if e100 is not None else None,"ema200":round(e200,8) if e200 is not None else None,
-              "rsi14":round(r,2),"atr14":round(atr,8),"body_ratio":round(body,3),"bb_mid":round(mid,8),
-              "trend_up":trend_up,"trend_dn":trend_dn,"bull_trigger":bull,"bear_trigger":bear}
-        if direction=='NEUTRO': return {**base,"reason":f"MEGA Guide FLEX monitorando {tf_label}: tendência + força + RSI + Bollinger + espaço S/R.","diagnostics":diag}
-        stamp=str(cur.get('datetime') or cur.get('timestamp') or '')
-        conf=round(min(92.0,76.0+body*10+min(6.0,abs(e10-e20)/max(atr,1e-12)*5)),1)
-        return {**base,"direction":direction,"confidence":conf,"confirmed":True,"reason":f"{direction} MEGA Guide • {tf_label} confirmado; entrada na próxima vela {tf_label}; expiração 1 vela {tf_label}.","event_key":f"MEGAGUIDE:{direction}:{stamp}","diagnostics":diag}
-    except Exception as exc:
-        return {**base,"reason":f"MEGA Guide aguardando leitura {tf_label} válida: {str(exc)[:100]}"}
-
-
-def rn_follow_trend_02_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
-    """RN Follow Trend 02 — RN original + S/R + rejeição + proteção EMA50."""
-    rows=list(cs or [])[-180:]
-    base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
-          "strategy":"RN FOLLOW TREND 02","engine":"RNFOLLOW02","provider":"RN_FOLLOW_TREND_02_FLEX_V2",
-          "risk":"MEDIUM","closed_candles_only":True,"non_repaint":True,"non_repaint_after_release":True,
-          "prealert_seconds":20,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,
-          "gale_signal":False,"martingale":False,"grid":False}
-    if len(rows)<60:
-        return {**base,"reason":f"RN Follow Trend 02 coletando candles ({len(rows)}/60)."}
-    try:
-        closes=[float(x['close']) for x in rows]; opens=[float(x['open']) for x in rows]
-        highs=[float(x['high']) for x in rows]; lows=[float(x['low']) for x in rows]
-        tr=[max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1])) for i in range(1,len(rows))]
-        atr14=sum(tr[-14:])/14.0
-        if atr14<=0: return {**base,"reason":"RN Follow Trend 02 aguardando volatilidade válida."}
-        move=closes[-1]-closes[-2]; ratio=abs(move)/atr14; threshold=.70*atr14
-        e50=ema(closes,50); e50_prev=ema(closes[:-3],50)
-        if e50 is None or e50_prev is None: return {**base,"reason":"RN Follow Trend 02 aquecendo EMA50."}
-        # S/R causal: região formada somente pelos 20 candles anteriores ao candle de decisão.
-        support=min(lows[-21:-1]); resistance=max(highs[-21:-1])
-        sr_tol=.40*atr14
-        near_support=lows[-1] <= support+sr_tol
-        near_resistance=highs[-1] >= resistance-sr_tol
-        rng=max(highs[-1]-lows[-1],1e-12)
-        lower_wick=(min(opens[-1],closes[-1])-lows[-1])/rng
-        upper_wick=(highs[-1]-max(opens[-1],closes[-1]))/rng
-        # Rejeição aceita pavio claro OU recuperação do fechamento após o impulso.
-        bull_reject=(lower_wick>=.24 and closes[-1]>lows[-1]+.45*rng)
-        bear_reject=(upper_wick>=.24 and closes[-1]<highs[-1]-.45*rng)
-        slope=(e50-e50_prev)/max(atr14,1e-12)
-        # EMA50 é somente proteção: bloqueia apenas tendência contrária realmente forte.
-        strong_down=closes[-1]<e50 and slope<-.20
-        strong_up=closes[-1]>e50 and slope>.20
-        # FLEX 02: ATR 0,70 é obrigatório; depois basta S/R OU rejeição.
-        call_confirm=bool(near_support or bull_reject)
-        put_confirm=bool(near_resistance or bear_reject)
-        call=(move<=-threshold and call_confirm and not strong_down)
-        put=(move>=threshold and put_confirm and not strong_up)
-        direction='CALL' if call and not put else ('PUT' if put and not call else 'NEUTRO')
-        diag={"move_atr":round(ratio,3),"trigger_atr":.70,"atr14":round(atr14,8),"ema50":round(e50,8),
-              "ema50_slope_atr":round(slope,3),"support":round(support,8),"resistance":round(resistance,8),
-              "near_support":near_support,"near_resistance":near_resistance,"lower_wick":round(lower_wick,3),
-              "upper_wick":round(upper_wick,3),"bull_rejection":bull_reject,"bear_rejection":bear_reject,
-              "strong_down_block":strong_down,"strong_up_block":strong_up,
-              "call_sr_or_rejection":call_confirm,"put_sr_or_rejection":put_confirm}
-        if direction=='NEUTRO':
-            return {**base,"reason":f"RN Follow 02 FLEX monitorando • movimento {ratio:.2f} ATR • após 0.70 ATR exige S/R OU rejeição; EMA50 só bloqueia tendência forte.","diagnostics":diag}
-        stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or '')
-        conf=min(94.0,78.0+min(8.0,max(0.0,ratio-.70)*10.0)+(4 if (lower_wick>=.35 or upper_wick>=.35) else 0)+(4 if abs(slope)<.06 else 0))
-        return {**base,"direction":direction,"confidence":round(conf,1),"confirmed":True,
-                "reason":f"{direction} RN Follow Trend 02 • 0.70 ATR + (S/R OU rejeição) confirmados • EMA50 protegida • próxima vela; sem Gale.",
-                "event_key":f"RNFOLLOW02:{direction}:{stamp}","diagnostics":diag}
-    except Exception as exc:
-        return {**base,"reason":f"RN Follow Trend 02 aguardando leitura válida: {str(exc)[:100]}"}
-
-
-
-def rn_follow_trend_03_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
-    """RN Follow Trend 03 — gatilho RN + rejeição + proteção EMA50 + Volume POC.
-    Sem suporte/resistência obrigatório. POC contrário bloqueia; POC neutro permite
-    somente uma reversão RN mais forte, evitando prender demais o motor.
-    """
-    rows=list(cs or [])[-180:]
-    base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
-          "strategy":"RN FOLLOW TREND 03","engine":"RNFOLLOW03","provider":"RN_FOLLOW_03_POC_FLEX_V1",
-          "risk":"MEDIUM","closed_candles_only":True,"non_repaint":True,"non_repaint_after_release":True,
-          "prealert_seconds":20,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,
-          "gale_signal":False,"martingale":False,"grid":False}
-    if len(rows)<60:
-        return {**base,"reason":f"RN Follow Trend 03 coletando candles ({len(rows)}/60)."}
-    try:
-        closes=[float(x['close']) for x in rows]; opens=[float(x['open']) for x in rows]
-        highs=[float(x['high']) for x in rows]; lows=[float(x['low']) for x in rows]
-        tr=[max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1])) for i in range(1,len(rows))]
-        atr14=sum(tr[-14:])/14.0
-        if atr14<=0: return {**base,"reason":"RN Follow Trend 03 aguardando volatilidade válida."}
-        move=closes[-1]-closes[-2]; ratio=abs(move)/atr14; threshold=.70*atr14
-        e50=ema(closes,50); e50_prev=ema(closes[:-3],50)
-        if e50 is None or e50_prev is None: return {**base,"reason":"RN Follow Trend 03 aquecendo EMA50."}
-        rng=max(highs[-1]-lows[-1],1e-12)
-        lower_wick=(min(opens[-1],closes[-1])-lows[-1])/rng
-        upper_wick=(highs[-1]-max(opens[-1],closes[-1]))/rng
-        bull_reject=(lower_wick>=.22 and closes[-1]>lows[-1]+.45*rng)
-        bear_reject=(upper_wick>=.22 and closes[-1]<highs[-1]-.45*rng)
-        slope=(e50-e50_prev)/max(atr14,1e-12)
-        strong_down=closes[-1]<e50 and slope<-.20
-        strong_up=closes[-1]>e50 and slope>.20
-        poc=volume_poc_strategy(rows,timeframe=timeframe,market=market,early_signal=False,use_ai=False)
-        poc_dir=str(poc.get('direction') or 'NEUTRO').upper() if poc.get('confirmed') else 'NEUTRO'
-        # 3.98.74 FLEX: somente o deslocamento RN 0.70 ATR + proteção de tendência forte
-        # são obrigatórios. Rejeição e Volume POC passam a reforçar a qualidade/confiança,
-        # mas não seguram o sinal quando estão neutros ou em direção oposta.
-        rn_call=move<=-threshold and not strong_down
-        rn_put=move>=threshold and not strong_up
-        call=rn_call
-        put=rn_put
-        direction='CALL' if call and not put else ('PUT' if put and not call else 'NEUTRO')
-        diag={"move_atr":round(ratio,3),"trigger_atr":.70,"atr14":round(atr14,8),"ema50":round(e50,8),
-              "ema50_slope_atr":round(slope,3),"lower_wick":round(lower_wick,3),"upper_wick":round(upper_wick,3),
-              "bull_rejection":bull_reject,"bear_rejection":bear_reject,"poc_direction":poc_dir,
-              "poc_confirmed":bool(poc.get('confirmed')),"strong_down_block":strong_down,"strong_up_block":strong_up}
-        if direction=='NEUTRO':
-            return {**base,"reason":f"RN Follow 03 FLEX monitorando • {ratio:.2f} ATR • POC/rejeição são reforços; EMA50 só bloqueia tendência forte.","diagnostics":diag}
-        stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or '')
-        conf=76.0+min(10.0,max(0.0,ratio-.70)*12.0)+(6.0 if poc_dir==direction else (1.0 if poc_dir=='NEUTRO' else 0.0))+(3.0 if ((direction=='CALL' and bull_reject) or (direction=='PUT' and bear_reject)) else 0.0)
-        return {**base,"direction":direction,"confidence":round(min(95.0,conf),1),"confirmed":True,
-                "reason":f"{direction} RN Follow Trend 03 FLEX • 0.70 ATR confirmado; POC/rejeição como reforço; próxima vela; sem Gale.",
-                "event_key":f"RNFOLLOW03:{symbol}:{timeframe}:{stamp}","diagnostics":diag}
-    except Exception as exc:
-        return {**base,"reason":f"RN Follow Trend 03 aguardando leitura válida: {str(exc)[:100]}"}
-
-
-def rn_follow_trend_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
-    """Adaptação causal do EA RN_New_FollowTrend para opções binárias.
-    O EA original arma BUY após deslocamento para baixo e SELL após deslocamento para cima.
-    Grid, Martingale, lotes, TP/SL monetário e múltiplas ordens não são transportados.
-    """
-    rows=list(cs or [])[-160:]
-    base={"available":True,"direction":"NEUTRO","confidence":0.0,"confirmed":False,
-          "strategy":"RN FOLLOW TREND","engine":"RNFOLLOW","provider":"RN_FOLLOW_TREND_SAFE_ADAPTER_V1",
-          "risk":"MEDIUM","closed_candles_only":True,"non_repaint":True,"non_repaint_after_release":True,
-          "prealert_seconds":20,"next_candle_entry":True,"expiry_candles":1,"direct_win_only":True,
-          "gale_signal":False,"martingale":False,"grid":False}
-    if len(rows)<22:
-        return {**base,"reason":f"RN Follow Trend coletando candles ({len(rows)}/22)."}
-    try:
-        closes=[float(x['close']) for x in rows]
-        highs=[float(x['high']) for x in rows]; lows=[float(x['low']) for x in rows]
-        # Converte o PipStep fixo do EA em deslocamento normalizado pela volatilidade do ativo.
-        tr=[]
-        for i in range(1,len(rows)):
-            tr.append(max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1])))
-        atr=sum(tr[-14:])/14.0 if len(tr)>=14 else 0.0
-        if atr<=0: return {**base,"reason":"RN Follow Trend aguardando volatilidade válida."}
-        move=closes[-1]-closes[-2]
-        threshold=0.70*atr
-        # Mesma orientação do gatilho virtual original: queda arma BUY/CALL; alta arma SELL/PUT.
-        call=move<=-threshold
-        put=move>=threshold
-        direction='CALL' if call and not put else ('PUT' if put and not call else 'NEUTRO')
-        ratio=abs(move)/atr
-        diag={"move_atr":round(ratio,3),"trigger_atr":0.70,"original_order_level":1,"original_pipstep":2700}
-        if direction=='NEUTRO':
-            return {**base,"reason":f"RN Follow Trend monitorando deslocamento • {ratio:.2f} ATR / gatilho 0.70 ATR.","diagnostics":diag}
-        stamp=str(rows[-1].get('datetime') or rows[-1].get('timestamp') or '')
-        conf=round(min(92.0,72.0+min(20.0,max(0.0,ratio-0.70)*18.0)),1)
-        return {**base,"direction":direction,"confidence":conf,"confirmed":True,
-                "reason":f"{direction} RN Follow Trend • deslocamento {ratio:.2f} ATR; próxima M1; sem Grid/Martingale/Gale.",
-                "event_key":f"RNFOLLOW:{direction}:{stamp}","diagnostics":diag}
-    except Exception as exc:
-        return {**base,"reason":f"RN Follow Trend aguardando leitura válida: {str(exc)[:100]}"}
 
 
 def tsr2016_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN", current_candle_closed=True, allow_prealert=False):
@@ -31090,7 +30214,7 @@ def scalping_asia_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OPEN"
 # -----------------------------------------------------------------------------
 _BACKTEST48_SUPPORTED = {
     "LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER",
-    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS",
+    "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "MOMENTUM", "RSI4PERIOD", "SCALPINGASIA", "SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS",
 }
 _BACKTEST48_NAMES = {
     "SMART": "MOTOR REMOVIDO",
@@ -31113,20 +30237,12 @@ _BACKTEST48_NAMES = {
     "MEGAPREMIUMPOC": "💎 MEGA PREMIUM + POC",
     "MEGAPREMIUMPRO": "🛡️ MEGA PREMIUM PROTEGIDO",
     "TSR2016": "🎯 Mega Sniper",
-    "RNFOLLOW": "📈 RN Follow Trend",
-    "RNFOLLOW02": "📈 RN Follow Trend 02",
-    "RNFOLLOW03": "📈 RN Follow Trend 03",
-    "STEPMAORIG": "StepMA Original",
-    "YDIVORIG": "yDiv Original",
-    "SNIPERREV": "Sniper Reversão",
-    "MEGAREVYDIV": "Mega Reversão + yDiv",
-    "STEPMAPRO": "StepMA Pro",
     "BARREVERSAL": "🔄 1 BAR REVERSAL",
-    "AAPLUS": "🐊 AA+",
     "PAULMACD": "📈 PAUL MACD M1 + M5",
     "PAULMACDM1": "📈 PAUL MACD M1",
     "MILLIONEA": "💰 EA MILIONÁRIO",
     "MONEYPILE": "💵 MEGA MONEY EA",
+    "SCALPINGM1": "🤖 Mega Bot",
     "MEGAHFT": "⚡ MEGA HFT",
     "PYRAMID7": "🔺 PYRAMID 7 PRO",
 }
@@ -31433,12 +30549,8 @@ def _backtest48_eval(engine: str, hist: list, symbol: str, interval: str, market
         return mega_premium_protected_strategy(hist[-180:], symbol=symbol, timeframe=interval, market=market)
     if engine == "TSR2016":
         return tsr2016_strategy(hist[-180:], symbol=symbol, timeframe=interval, market=market)
-    if engine == "RNFOLLOW":
-        return rn_follow_trend_strategy(hist[-160:], symbol=symbol, timeframe=interval, market=market)
     if engine == "BARREVERSAL":
         return one_bar_reversal_strategy(hist[-40:], symbol=symbol, timeframe=interval, market=market)
-    if engine == "AAPLUS":
-        return aa_plus_strategy(hist[-160:], symbol=symbol, timeframe=interval, market=market)
     if engine == "PAULMACD":
         return paul_macd_strategy(hist[-320:], symbol=symbol, timeframe=interval, market=market)
     if engine == "PAULMACDM1":
@@ -31473,7 +30585,7 @@ async def backtest48h_endpoint(
     direction_mode: str = "MIXED",
 ):
     market = str(market or "OPEN").upper()
-    engine = str(engine or "").upper()
+    engine = "SCALPINGM1"  # Backtest exclusivo do único motor autorizado.
     direction_mode = str(direction_mode or "MIXED").upper()
     if direction_mode not in ("MIXED", "CALL", "PUT"):
         direction_mode = "MIXED"
@@ -31600,21 +30712,34 @@ async def backtest48h_endpoint(
 @app.get("/signal-ai")
 async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market="OPEN", ai_only: bool = False, engine: str = "SCALPERPRO", entry_mode: str = "BIRTH", robofibo_poc: bool = False):
     requested_market = (market or "OPEN").upper()
-    engine = (engine or "SCALPERPRO").upper()
+    engine = "SCALPINGM1"  # Exclusividade também na rota de sinais da interface.
     entry_mode = normalize_entry_mode(entry_mode)
 
     if not _symbol_allowed(symbol, requested_market) or interval not in INTERVALS or requested_market not in VALID_MARKETS:
         raise HTTPException(400, "Ativo, intervalo ou mercado inválido.")
-    if engine not in ("SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "SHKHA", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
-        engine = "SCALPERPRO"
+    if engine not in ("SCALPINGM1", "SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
+        engine = "SCALPINGM1"
 
     state = _iq_session_state(request, required=False) if requested_market in ("OPEN", "IQ_OTC") else None
-    if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+    if engine in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "VELOCITY", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "RTM", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
         fallback_twelve = False
         effective_market = requested_market
     else:
-        fallback_twelve = requested_market == "IQ_OTC" and not state
-        effective_market = "OPEN" if fallback_twelve else requested_market
+        # OTC jamais deve cair para mercado aberto quando a sessão não existe.
+        fallback_twelve = False
+        effective_market = requested_market
+
+    # Fail closed: não processar nem sinalizar OTC sem uma fonte OTC disponível.
+    if requested_market == "IQ_OTC" and not OTCHARTS_API_KEY and (not state or not _iq_connected(state)):
+        return {
+            "symbol": symbol, "interval": interval, "market": "IQ_OTC",
+            "requested_market": "IQ_OTC", "engine": "SCALPINGM1",
+            "direction": "NEUTRO", "confidence": 0.0, "confirmed": False,
+            "status": "FONTE OTC INDISPONÍVEL • CONECTE A IQ OPTION",
+            "reason": "Candles OTC não disponíveis. Mercado aberto não será usado.",
+            "feed_source": "UNAVAILABLE_OTC", "feed_label": "FONTE OTC INDISPONÍVEL",
+            "feed_fallback": False, "origin_verified": False,
+        }
 
     try:
         data = await signal(
@@ -31632,6 +30757,40 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
             # Sempre informa ao frontend qual mercado foi pedido e qual fonte
             # realmente gerou o sinal. Isto evita fechar um sinal IQ_OTC como OPEN.
             data["requested_market"] = requested_market
+            if requested_market == "IQ_OTC":
+                # A fonte mostrada no painel deve refletir o mercado realmente analisado.
+                if str(data.get("market") or "IQ_OTC").upper() != "IQ_OTC":
+                    data.update(direction="NEUTRO", confirmed=False, confidence=0.0,
+                                status="FONTE OTC INDISPONÍVEL • MERCADO DIVERGENTE",
+                                origin_blocked=True)
+                data["market"] = "IQ_OTC"
+                data["feed_source"] = "OTCHARTS_IQ_OTC" if OTCHARTS_API_KEY else "IQ_OPTION_OTC"
+                data["feed_label"] = "OTCHARTS • IQ OTC" if OTCHARTS_API_KEY else "IQ OPTION • OTC"
+                data["feed_fallback"] = False
+            # Auditoria de origem: não relabelar uma decisão de outro motor.
+            actual_engine = str(data.get("engine") or "").upper()
+            actual_provider = str(data.get("origin_provider") or "")
+            technical = data.get("technical")
+            if not actual_engine and isinstance(technical, dict):
+                actual_engine = str(technical.get("engine") or "").upper()
+            valid_mega_origin = (actual_engine == "SCALPINGM1" and
+                                 (actual_provider == "LOCAL_MTF_BREAK_RETEST" or
+                                  (isinstance(technical, dict) and
+                                   str(technical.get("provider") or "") == "LOCAL_MTF_BREAK_RETEST")))
+            if str(data.get("direction") or "").upper() in ("CALL", "PUT") and not valid_mega_origin:
+                data["direction"] = "NEUTRO"
+                data["confirmed"] = False
+                data["status"] = "SINAL BLOQUEADO • ORIGEM NÃO COMPROVADA"
+                data["reason"] = "O sinal não apresentou identificação SCALPINGM1 válida."
+                data["origin_blocked"] = True
+            data["origin_engine"] = actual_engine or "UNKNOWN"
+            data["origin_verified"] = bool(valid_mega_origin)
+            # Estado neutro não carrega confiança de um setup não liberado.
+            if str(data.get("direction") or "").upper() not in ("CALL", "PUT"):
+                data["confidence"] = 0.0
+                data["confirmed"] = False
+                if valid_mega_origin and not data.get("origin_blocked"):
+                    data["status"] = "MEGA BOT • ONLINE • ANALISANDO O MERCADO"
             if engine == "RTM":
                 if data.get("external_ea"):
                     data["feed_source"] = "MT4_EA"
@@ -31644,7 +30803,7 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_label"] = _feed_source_label(_fs) if _fs != "MULTIFEED" else "Multifuente • RTM interno"
                     data["feed_fallback"] = bool(data.get("feed_fallback", False))
                     data["feed_message"] = "RTM MULTI + TAURUS analisado dentro do app por gatilhos individuais confirmados pelo Taurus; o bridge MT4 ficou opcional."
-            elif engine in ("INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+            elif engine in ("INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
                 if requested_market == "OPEN":
                     feed_info = _current_open_feed_info(symbol, interval)
                     feed_src = str(feed_info.get("source") or "MULTIFEED")
@@ -31944,8 +31103,6 @@ async def signal_ai(request: Request, symbol="EUR/USD", interval="1min", market=
                     data["feed_source"] = effective_market
                     data["feed_label"] = _feed_source_label(effective_market)
                     data["feed_fallback"] = False
-        if engine == "AUTOHEDGEM1":
-            data = _autohedge_delivery_cooldown(data)
         _remember_accounting_signal(request, data)
         return data
     except Exception as exc:
@@ -32373,10 +31530,8 @@ async def pre_signals(
     robofibo_poc: bool = False,
 ):
     market = (market or "OPEN").upper()
-    engine = str(engine or "SMART").upper()
-    # 3.97.54 — somente SCALPER PRO e DRAGON FIRE são operacionais.
-    if engine not in ("SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "SHKHA", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
-        engine = "SCALPERPRO"
+    # Exclusividade: ignorar qualquer motor solicitado pelo navegador ou cliente.
+    engine = "SCALPINGM1"
     limit = max(1, min(int(limit), 4))
 
     if interval not in INTERVALS or market not in VALID_MARKETS:
@@ -32385,6 +31540,38 @@ async def pre_signals(
         symbol = str(symbol).strip().upper()
         if not _symbol_allowed(symbol, market):
             raise HTTPException(400, "Ativo inválido para pré-alerta.")
+
+    if engine == "SCALPINGM1":
+        entry_dt = next_boundary(interval)
+        remain = int(max(0, (entry_dt - now()).total_seconds()))
+        if not (1 <= remain <= 20):
+            return {"ok": True, "engine": "SCALPINGM1", "items": [],
+                    "seconds_to_entry": remain, "message": "Mega Bot monitorando janela de pré-alerta de 20s."}
+        target = symbol or "BTC/USD"
+        try:
+            state = _iq_session_state(request, required=False) if market == "IQ_OTC" else None
+            if market == "IQ_OTC" and not state:
+                return {"ok": True, "engine": "SCALPINGM1", "items": [],
+                        "seconds_to_entry": remain, "message": "Mega Bot OTC aguardando conexão IQ Option."}
+            raw = (await iq_ea_candles(state, target, interval, 300, regular_market=False)
+                   if market == "IQ_OTC"
+                   else await candles(target, interval, 300, "OPEN", None, request=request))
+            closed = _verified_closed_candles(raw, interval)
+            tech = scalping_m1_flex_strategy(closed[-300:], symbol=target, timeframe=interval, market=market)
+            direction = str(tech.get("direction") or "NEUTRO").upper()
+            items = []
+            if tech.get("confirmed") and direction in ("CALL", "PUT"):
+                items.append({"symbol": target, "direction": direction,
+                              "confidence": float(tech.get("confidence") or 0),
+                              "strategy": "Mega Bot", "engine": "SCALPINGM1",
+                              "reason": str(tech.get("reason") or ""),
+                              "entry_time": iso(entry_dt), "seconds_to_entry": remain,
+                              "prealert_only": False, "early_signal_locked": True})
+            return {"ok": True, "engine": "SCALPINGM1", "items": items,
+                    "seconds_to_entry": remain, "message": str(tech.get("reason") or "Mega Bot monitorando.")}
+        except Exception as exc:
+            return {"ok": True, "engine": "SCALPINGM1", "items": [],
+                    "seconds_to_entry": remain, "message": f"Mega Bot: falha na leitura de candles: {str(exc)[:120]}"}
 
     if engine == "RTM":
         return {
@@ -33433,9 +32620,12 @@ def _radar_asset_class_allowed(sym: str, asset_class: str) -> bool:
     return True
 
 @app.get("/radar")
-async def radar(request: Request, interval="1min", market="OPEN", engine: str = "SCALPERPRO", symbol: str = "", asset_class: str = "ALL", robofibo_poc: bool = False):
+async def radar(request: Request, interval="1min", market="OPEN", engine: str = "SCALPINGM1", symbol: str = "", asset_class: str = "ALL", robofibo_poc: bool = False):
     market = (market or "OPEN").upper()
-    engine = (engine or "SCALPERPRO").upper()
+    engine = "SCALPINGM1"  # Instalação exclusiva: radar sempre analisa com Mega Bot.
+    if APP_ROLE in ("CLIENT", "PARTNER"):
+        engine = "SCALPINGM1"
+        market = "OPEN"
     symbol = str(symbol or "").strip().upper()
     asset_class = str(asset_class or "ALL").strip().upper()
     if asset_class not in ("ALL", "FOREX", "CRYPTO"):
@@ -33445,8 +32635,8 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         raise HTTPException(400, "Intervalo ou mercado inválido.")
     if symbol and not _symbol_allowed(symbol, market):
         raise HTTPException(400, "Ativo do radar inválido.")
-    if engine not in ("SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "SHKHA", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
-        engine = "SCALPERPRO"
+    if engine not in ("SCALPINGM1", "SCALPERPRO", "FIBORSI", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS"):
+        engine = "SCALPINGM1"
 
     if engine == "RTM":
         # Radar exclusivo: BTC/USD + pares JPY. Um símbolo manual fora da regra
@@ -33914,7 +33104,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
         elif len(raw) >= 25:
             # Os sinais STREAKREV trabalham com timestamps verificáveis para
             # usar a mesma última vela FECHADA do motor oficial /signal-ai.
-            closed = (_verified_closed_candles(raw, interval) if engine in ("STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "SHKHA", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS")
+            closed = (_verified_closed_candles(raw, interval) if engine in ("STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "SCALPINGASIA", "SCALPERPRO", "SCALPINGM1", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS")
                       else (raw[:-1] if len(raw) > 1 else raw))
             if engine == "EA":
                 tech = await ea_xgboost_strategy(closed, sym, interval, market=market)
@@ -34301,108 +33491,17 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "TSR2016":
                 tech=tsr2016_strategy(closed[-180:],symbol=sym,timeframe=interval,market=market)
-            elif engine == "RNFOLLOW02":
-                tech=rn_follow_trend_02_strategy(closed[-180:],symbol=sym,timeframe=interval,market=market)
-                engine_label="📈 RN Follow Trend 02"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why=str(tech.get("reason") or "RN Follow 02 monitorando ATR + S/R + rejeição + EMA50.").replace("\n"," ")[:120]
-                status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
-            elif engine == "SNIPERREV":
-                tech=sniper_reversal_strategy(closed[-350:],symbol=sym,timeframe=interval,market=market)
-                tech=_sniper_release_gate(tech,sym,interval,market,claim=False)
-                engine_label="🎯 Sniper Reversão"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                status_text=f"{engine_label} • {direction if direction != 'NEUTRO' else str(tech.get('reason'))[:110]}"
-            elif engine == "MEGAREVYDIV":
-                tech=mega_reversal_ydiv_strategy(closed[-350:],symbol=sym,timeframe=interval,market=market)
-                engine_label="🎯 Mega Reversão + yDiv"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                status_text=f"{engine_label} • {direction if direction != 'NEUTRO' else str(tech.get('reason'))[:110]}"
-            elif engine == "YDIVORIG":
-                tech=ydiv_original_strategy(closed[-350:],symbol=sym,timeframe=interval,market=market)
-                engine_label="📉 yDiv Original"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                status_text=f"{engine_label} • {direction if direction != 'NEUTRO' else str(tech.get('reason') or 'MONITORANDO')[:110]}"
-            elif engine in ("STEPMAORIG", "STEPMAPRO"):
-                tech=stepma_strategy(closed[-500:],symbol=sym,timeframe=interval,market=market,pro=(engine=="STEPMAPRO"))
-                engine_label="StepMA Pro" if engine=="STEPMAPRO" else "StepMA Original"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                status_text=f"{engine_label} • {direction if direction != 'NEUTRO' else 'MONITORANDO'}"
-            elif engine == "RNFOLLOW03":
-                tech=rn_follow_trend_03_strategy(closed[-180:],symbol=sym,timeframe=interval,market=market)
-                engine_label="📈 RN Follow Trend 03"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why=str(tech.get("reason") or "RN Follow 03 monitorando confluência com Volume POC.").replace("\n"," ")[:120]
-                status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
-            elif engine == "AUTOHEDGEM1":
-                tech=autohedge_m1_strategy(closed[-100:],symbol=sym,timeframe=interval,market=market)
-                engine_label="AutoHedge M1"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                status_text=f"{engine_label} • {direction if direction!='NEUTRO' else 'MONITORANDO'}"
-            elif engine == "RSI2DERIV":
-                tech=rsi2_deriv_strategy(closed[-100:],symbol=sym,timeframe=interval,market=market)
-                tech=_rsi2_cooldown_gate(tech,claim=False)
-                engine_label="RSI 2"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                status_text=f"{engine_label} • {direction if direction!='NEUTRO' else 'MONITORANDO'}"
             elif engine == "SCALPINGM1":
-                tech=scalping_m1_flex_strategy(closed[-600:],symbol=sym,timeframe=interval,market=market)
-                engine_label="Scalping M1 FLEX"
+                tech=scalping_m1_flex_strategy(closed[-300:],symbol=sym,timeframe=interval,market=market)
+                engine_label="🤖 Mega Bot"
                 direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
                 status_text=f"{engine_label} • {direction if direction!='NEUTRO' else 'MONITORANDO'}"
-            elif engine == "GOLDRUSH":
-                tech=gold_rush_pro_strategy(closed[-180:],symbol=sym,timeframe=interval,market=market)
-                engine_label="Gold Rush Pro"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                status_text=f"{engine_label} • {direction if direction!='NEUTRO' else 'MONITORANDO'}"
-            elif engine == "MEGAGOLD":
-                tech=mega_gold_scalper_strategy(closed[-300:],symbol=sym,timeframe=interval,market=market)
-                engine_label="🏆 Mega Gold Scalper"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                status_text=f"{engine_label} • {direction if direction!='NEUTRO' else 'MONITORANDO'}"
-            elif engine == "LWSMC":
-                tech=smc_market_structure_strategy(closed[-900:],symbol=sym,timeframe=interval,market=market,claim=False)
-                engine_label="SMC Market Structure"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                status_text=f"{engine_label} • {direction if direction!='NEUTRO' else 'MONITORANDO'}"
-            elif engine == "ONESHOOT":
-                tech=one_shoot_ai_strategy(closed[-200:],symbol=sym,timeframe=interval,market=market,claim=True)
-                engine_label="🎯 One Shoot AI"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                status_text=f"{engine_label} • {direction if direction!='NEUTRO' else 'MONITORANDO'}"
-            elif engine == "MEGAGUIDE":
-                _mg_tf=interval if interval in ("1min","5min","15min","30min") else "1min"
-                if market == "IQ_OTC":
-                    _mg_raw=await iq_ea_candles(iq_state,sym,_mg_tf,320,regular_market=False)
-                else:
-                    _mg_raw=await candles(sym,_mg_tf,320,"OPEN",None,request=request)
-                _mg_closed=_verified_closed_candles(_mg_raw,_mg_tf)
-                tech=mega_guide_strategy(_mg_closed[-320:],symbol=sym,timeframe=_mg_tf,market=market)
-                _mg_label={"1min":"M1","5min":"M5","15min":"M15","30min":"M30"}.get(_mg_tf,_mg_tf)
-                engine_label=f"🧭 MEGA Guide {_mg_label}"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why=str(tech.get("reason") or f"MEGA Guide monitorando {_mg_label}.").replace("\n"," ")[:120]
-                status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
-            elif engine == "RNFOLLOW":
-                tech=rn_follow_trend_strategy(closed[-160:],symbol=sym,timeframe=interval,market=market)
-                engine_label="📈 RN Follow Trend"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why=str(tech.get("reason") or "RN Follow Trend monitorando deslocamento.").replace("\n"," ")[:120]
-                status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "BARREVERSAL":
                 tech=one_bar_reversal_strategy(closed[-40:],symbol=sym,timeframe=interval,market=market)
-                engine_label="🔄 1 BAR REVERSAL"
+                engine_label="🎯 Mega Sniper"
                 direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why=str(tech.get("reason") or "1 BAR REVERSAL monitorando padrão Out/In.").replace("\n"," ")[:120]
+                why=str(tech.get("reason") or "Mega Sniper monitorando LWMA25 + Stochastic.").replace("\n"," ")[:120]
                 status_text=(f"{engine_label} • OPORTUNIDADE ENCONTRADA" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
-            elif engine == "AAPLUS":
-                _aa_remaining=max(0.0,(next_boundary(interval)-now()).total_seconds())
-                _aa_early=1 <= _aa_remaining <= 20
-                tech=aa_plus_strategy((raw[-160:] if _aa_early else closed[-160:]),symbol=sym,timeframe=interval,market=market,current_candle_closed=not _aa_early,allow_prealert=_aa_early)
-                engine_label="🐊 AA+"
-                direction=tech.get("direction","NEUTRO") if tech.get("confirmed") else "NEUTRO"
-                why=str(tech.get("reason") or "AA+ monitorando Alligator + reversão.").replace("\n"," ")[:120]
-                status_text=(f"{engine_label} • PRÉ-ALERTA 20s" if direction != "NEUTRO" else f"{engine_label} • MONITORANDO • {why}")
             elif engine == "MEGAHFT":
                 tech=mega_hft_strategy(closed[-120:],symbol=sym,timeframe=interval,market=market)
                 engine_label="⚡ MEGA HFT"
@@ -34887,25 +33986,7 @@ async def radar(request: Request, interval="1min", market="OPEN", engine: str = 
                 "engine": engine,
                 "strategy": str(tech.get("strategy") or ""),
             }
-            # 3.98.65 — RN Follow Trend: o radar também registra a operação no servidor.
-            # Assim o WIN/LOSS é fechado mesmo se o polling do painel mudar logo após o sinal.
-            # _accounting_key impede duplicação quando /signal-ai registrar a mesma entrada.
-            if engine in ("RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "MEGAGUIDE", "MEGAGOLD") and item.get("direction") in ("CALL", "PUT"):
-                rn_entry_dt = next_boundary(interval)
-                rn_payload = {
-                    **item,
-                    "symbol": sym,
-                    "market": market,
-                    "interval": interval,
-                    "entry_time": iso(rn_entry_dt),
-                    "expiry_time": iso(rn_entry_dt + timedelta(seconds=INTERVALS[interval])),
-                    "selected_engine": engine,
-                    "engine": engine,
-                    "direct_only": True,
-                }
-                _remember_accounting_signal(request, rn_payload)
-
-            if item.get("direction") in ("CALL", "PUT") and engine not in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD", "ONESHOOT", "LWSMC", "GOLDRUSH", "SCALPINGM1", "RSI2DERIV", "AUTOHEDGEM1", "BARREVERSAL", "AAPLUS", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
+            if item.get("direction") in ("CALL", "PUT") and engine not in ("LOCALANALYST", "LOCALANALYSTFLEX", "MEGAMASTER", "EA", "RUBIK", "LARRY", "RANGE", "VELOCITY", "RSI5", "SNIPER", "TAURUSSENEGAL", "BOBSENEGAL", "TAURUSEA", "TAURUSRSIDIV", "COMBINER", "RSIDIVBB", "TMARSI", "TLBRSI", "FIBORSI", "TRIPRSI", "ALPHAX", "PRESIDEN", "RAPID", "VOLUME", "VOLUME_AI", "SUNTZU", "BLACKBOOK", "INDICEMENT", "GOLDINV", "TTMSCALPER", "FOREXMISSION", "MONEYARROW", "LIQUIDEX", "EUROFX2", "EUROFX2TAURUS", "ATE", "FOREXSTAY", "FOREXSTAYTAURUS", "FOREXSTAYPRO", "FOREXFLEX", "SENEGALPRO", "VALUEMACD", "HOLYGRAIL", "TRENDLINES", "BBSTOCH", "KAMIKAZE", "FOREXMEGA", "BROOKYVERTEX", "MEGABOT", "BROOKYC3", "UTBOT", "ONEMINRSI", "WPRADAPT", "TINGATINGA", "SUPERNOVA", "ELCODEX", "SHKHA", "TSI", "MOMENTUM", "FIGURES", "VASILY", "PLATINUM", "STREAKREV", "ISMAELTRADER", "ISMAEL98", "RSICHANNEL", "RSICHANNEL2", "MINSCALPER", "RSI4PERIOD", "RSICROSS", "NINJAHFT", "SCALPINGASIA", "SCALPERPRO", "DRAGONFIRE", "DRAGONFIREPRO", "SIDUS320", "MEGAPREMIUM", "MEGAPREMIUMPOC", "MEGAPREMIUMPRO", "TSR2016", "BARREVERSAL", "PAULMACD", "PAULMACDM1", "MILLIONEA", "MONEYPILE", "MEGAHFT", "PYRAMID7", "PREDATORPIPS", "SESSIONBREAKOUT", "MONSTERSMC"):
                 radar_probe = {
                     "symbol": sym, "market": market, "interval": interval,
                     "direction": item.get("direction"), "confidence": item.get("confidence"),
@@ -35146,34 +34227,6 @@ def _remember_accounting_signal(request: Request, payload: Dict[str, Any]):
         "trigger_score": payload.get("trigger_score") if payload.get("trigger_score") is not None else rtm_meta.get("trigger_score"),
     }
     key = _accounting_key(item)
-    # 3.98.90: cooldown REAL no registro de operações do Sniper, não só no padrão de velas.
-    # Abrange operações pendentes e encerradas; não permite direção oposta furar a trava.
-    if engine_name == "SNIPERREV":
-        try:
-            entry_dt = parse_dt(str(item["entry_time"]))
-            min_gap = 4 * int(INTERVALS.get(str(item.get("interval") or "1min"), 60))
-            for bucket in (pending, done):
-                for existing in bucket.values():
-                    if (str(existing.get("engine") or "").upper() != "SNIPERREV"
-                        or str(existing.get("symbol") or "") != str(item.get("symbol") or "")
-                        or str(existing.get("interval") or "") != str(item.get("interval") or "")):
-                        continue
-                    prior_dt = parse_dt(str(existing.get("entry_time")))
-                    if 0 <= (entry_dt - prior_dt).total_seconds() < min_gap:
-                        return
-        except (ValueError, TypeError, KeyError):
-            return  # Não registrar uma operação com horário inválido.
-    # 3.98.75 — RN Follow 03: no máximo 1 operação por ativo/timeframe/entrada.
-    # A direção não cria uma segunda operação no mesmo candle.
-    if engine_name == "RNFOLLOW03":
-        entry_key = _canonical_time_key(item.get("entry_time"))
-        for bucket in (pending, done):
-            for existing in bucket.values():
-                if (str(existing.get("engine") or "").upper() == "RNFOLLOW03"
-                    and str(existing.get("symbol") or "") == str(item.get("symbol") or "")
-                    and str(existing.get("interval") or "") == str(item.get("interval") or "")
-                    and _canonical_time_key(existing.get("entry_time")) == entry_key):
-                    return
     if key and key not in done and key not in pending:
         pending[key] = item
 
@@ -35201,22 +34254,9 @@ async def _settle_accounting_pending(request: Request, market: str):
             cs = await candles(symbol, interval, 50, market, iq_state, request=request)
             expected_feed = str(t.get("feed_source") or "").upper()
             # Não inventa WIN/LOSS com outra corretora ou cotação pública.
-            # 3.98.67 — RN Follow Trend e MEGA Guide são sinais diretos M1.
-            # O feed OPEN pode trocar de alias/fallback entre o disparo e a apuração
-            # (ex.: cTrader -> Twelve/Binance). Isso não pode deixar WIN/LOSS preso
-            # para sempre. Para estes dois motores, a identidade é a vela M1 da
-            # entrada; os demais continuam exigindo compatibilidade estrita de feed.
-            result_engine = str(t.get("engine") or "").upper()
             if market == "OPEN" and expected_feed and expected_feed != "UNKNOWN":
                 if not _result_feed_compatible(expected_feed, _feed_source_from_rows(cs)):
-                    if result_engine not in ("RNFOLLOW", "RNFOLLOW02", "RNFOLLOW03", "STEPMAORIG", "STEPMAPRO", "YDIVORIG", "SNIPERREV", "MEGAREVYDIV", "MEGAGUIDE", "MEGAGOLD"):
-                        continue
-                    try:
-                        exact = await _fetch_open_result_window(symbol, interval, entry_dt)
-                        if exact:
-                            cs = exact
-                    except Exception:
-                        pass
+                    continue
 
             target, best_delta, matched_dt = _nearest_candle_for_time(
                 cs, entry_dt, INTERVALS[interval]
@@ -35341,6 +34381,7 @@ async def performance(request: Request, interval="1min", market="OPEN"):
         "draws": draws,
         "pending": len(pending or {}),
         "win_g1": win_g1,
+        "loss_g1": None,  # Etapa intermediária não contabilizada de modo confiável
         "win_g2": win_g2,
         "loss_g2": loss_g2,
         "loss_direct_final": loss_direct_final,
@@ -35527,6 +34568,9 @@ async def result(
     # Um LOSS encerra a entrada atual. A recuperação de valor, quando usada,
     # é preparada exclusivamente para o próximo sinal confirmado.
     gale_levels = max(0, min(2, int(gale_levels or 0)))
+    if engine == 'SCALPINGM1' and not direct_only:
+        # Somente apuração virtual das duas velas seguintes; não gera ordens.
+        gale_levels = 2
     if gale_levels <= 0:
         direct_only = True
 
@@ -35905,6 +34949,224 @@ async def result(
 
 
 
+
+
+def _admin_ok(request: Request):
+    token=(request.headers.get("X-Mega-Admin") or request.query_params.get("token") or "").strip()
+    return bool(MASTER_ADMIN_TOKEN and secrets.compare_digest(token, MASTER_ADMIN_TOKEN))
+
+@app.get("/license/validate")
+async def license_validate(key: str = "", device: str = ""):
+    if APP_ROLE != "PROFESSOR":
+        raise HTTPException(status_code=404, detail="Disponível no Professor.")
+    return _license_device_status(key,device,False)
+
+@app.post("/license/claim")
+async def license_claim(body: dict):
+    if APP_ROLE != "PROFESSOR":
+        raise HTTPException(status_code=404, detail="Disponível no Professor.")
+    return _license_device_status(str(body.get("key", "")), str(body.get("device", "")), True)
+
+@app.get("/professor/licenses")
+async def professor_licenses(request: Request):
+    if APP_ROLE != "PROFESSOR" or not _admin_ok(request):
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+    rows=[]
+    for key,row in _license_db_load().items():
+        st=_license_status(key)
+        rows.append({"key":key,**row,"valid":bool(st.get("valid")),"reason":st.get("reason"),"days_left":st.get("days_left")})
+    rows.sort(key=lambda x:(str(x.get("name",""))).lower())
+    return {"licenses":rows}
+
+@app.post("/professor/licenses")
+async def professor_license_save(body: LicenseAdminBody, request: Request):
+    if APP_ROLE != "PROFESSOR" or not _admin_ok(request):
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+    try:
+        datetime.fromisoformat(body.expires_at[:10])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Use a data AAAA-MM-DD.")
+    key=(body.key or "").strip().upper()
+    if not key:
+        key="MEGA-"+secrets.token_hex(3).upper()+"-"+secrets.token_hex(3).upper()
+    db=_license_db_load()
+    created=(db.get(key) or {}).get("created_at") or datetime.now(BR_TZ).isoformat()
+    engine=(body.engine or (db.get(key) or {}).get("engine") or "SCALPINGM1").strip().upper()
+    allowed={"SCALPINGM1"}
+    engine="SCALPINGM1"
+    db[key]={"name":body.name.strip() or "Cliente","expires_at":body.expires_at[:10],"enabled":bool(body.enabled),"engine":engine,"created_at":created,"updated_at":datetime.now(BR_TZ).isoformat(),**({"device_hash":db[key]["device_hash"],"activated_at":db[key].get("activated_at")} if key in db and db[key].get("device_hash") else {})}
+    _license_db_save(db)
+    return {"ok":True,"key":key,"license":_license_status(key)}
+
+@app.post("/professor/licenses/engine")
+async def professor_license_engine(body: LicenseEngineBody, request: Request):
+    if APP_ROLE != "PROFESSOR" or not _admin_ok(request):
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+    allowed={"SCALPINGM1"}
+    key=body.key.strip().upper(); engine=body.engine.strip().upper()
+    db=_license_db_load()
+    if key not in db: raise HTTPException(status_code=404, detail="Licença não encontrada.")
+    if engine not in allowed: raise HTTPException(status_code=400, detail="Somente Mega Bot está disponível.")
+    db[key]["engine"]=engine
+    db[key]["updated_at"]=datetime.now(BR_TZ).isoformat()
+    _license_db_save(db)
+    _license_cache.pop(key,None)
+    return {"ok":True,"license":_license_status(key)}
+
+@app.post("/professor/licenses/toggle")
+async def professor_license_toggle(body: LicenseToggleBody, request: Request):
+    if APP_ROLE != "PROFESSOR" or not _admin_ok(request):
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+    db=_license_db_load(); key=body.key.strip().upper()
+    if key not in db: raise HTTPException(status_code=404, detail="Licença não encontrada.")
+    db[key]["enabled"]=bool(body.enabled); db[key]["updated_at"]=datetime.now(BR_TZ).isoformat(); _license_db_save(db)
+    return {"ok":True,"license":_license_status(key)}
+
+@app.post("/professor/licenses/transfer")
+async def professor_license_transfer(body: LicenseTransferBody, request: Request):
+    if APP_ROLE != "PROFESSOR" or not _admin_ok(request):
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+    with _license_lock:
+        db=_license_db_load(); key=body.key.strip().upper()
+        if key not in db: raise HTTPException(status_code=404,detail="Licença não encontrada.")
+        db[key].pop("device_hash",None); db[key].pop("activated_at",None)
+        _license_db_save(db)
+    _license_cache.clear()
+    return {"ok":True}
+
+async def _client_remote_status(key: str, device: str = "", claim: bool = False):
+    key=(key or "").strip().upper()
+    if not key: return {"valid":False,"reason":"Informe sua licença."}
+    # No próprio serviço PROFESSOR, valida diretamente no banco local.
+    # Isso permite usar um único Render: /professor administra e / exige licença.
+    if APP_ROLE == "PROFESSOR":
+        return _license_device_status(key,device,claim)
+    cached=_license_cache.get(key+":"+device)
+    if not claim and cached and time.time()-float(cached.get("_ts",0)) < LICENSE_CACHE_SECONDS:
+        return {k:v for k,v in cached.items() if k!="_ts"}
+    if not MASTER_SERVER_URL:
+        return {"valid":False,"reason":"Servidor Professor não configurado."}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r=(await client.post(MASTER_SERVER_URL+"/license/claim",json={"key":key,"device":device})) if claim else (await client.get(MASTER_SERVER_URL+"/license/validate",params={"key":key,"device":device}))
+            data=r.json() if r.status_code==200 else {"valid":False,"reason":f"Professor recusou a validação (HTTP {r.status_code})."}
+    except Exception as exc:
+        print(f"[LICENCA] Falha de comunicação com Professor: {type(exc).__name__}", flush=True)
+        return {"valid":False,"reason":"Não foi possível validar com o Professor."}
+    data["_ts"]=time.time(); _license_cache[key+":"+device]=data
+    return {k:v for k,v in data.items() if k!="_ts"}
+
+LICENSE_PAGE=r"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEGA IA • Licença</title><style>
+body{margin:0;background:#030812;color:#eef5ff;font-family:Arial;display:grid;place-items:center;min-height:100vh}.box{width:min(92vw,430px);background:#0b192a;border:1px solid #168cff;border-radius:22px;padding:24px;box-shadow:0 0 30px #168cff33}h1{margin:0 0 8px;color:#31c8ff}p{color:#9fb2ca;line-height:1.45}input,button{box-sizing:border-box;width:100%;padding:14px;border-radius:13px;border:1px solid #22689d;background:#0d2035;color:white;font-size:16px;margin-top:10px}button{background:#0d7d49;border-color:#35e889;font-weight:900}.err{color:#ff6673;margin-top:12px}</style></head><body><div class="box"><h1>🤖 MEGA IA</h1><h3>Liberação do Professor</h3><p>Digite a chave fornecida pelo Professor para liberar este aplicativo.</p><form method="post" action="/license/activate"><input name="key" placeholder="MEGA-XXXXXX-XXXXXX" autocomplete="off" required><button>LIBERAR APP</button></form>__ERROR__</div></body></html>"""
+
+@app.post("/license/activate")
+async def license_activate(request: Request):
+    # Formulário HTML usa application/x-www-form-urlencoded; não exige python-multipart.
+    raw_body = await request.body()
+    if len(raw_body) > 8192:
+        raise HTTPException(413, "Formulário muito grande.")
+    form = urllib.parse.parse_qs(raw_body.decode("utf-8", errors="replace"), keep_blank_values=True)
+    key=str((form.get("key") or [""])[0]).strip().upper()
+    device=request.cookies.get(LICENSE_DEVICE_COOKIE, "")
+    if not re.fullmatch(r"[0-9a-f]{64}",device): device=secrets.token_hex(32)
+    st=await _client_remote_status(key,device,True)
+    if not st.get("valid"):
+        return HTMLResponse(LICENSE_PAGE.replace("__ERROR__",f'<div class="err">{st.get("reason","Licença inválida.")}</div>'),status_code=403)
+    resp=RedirectResponse("/",status_code=303)
+    resp.set_cookie(LICENSE_COOKIE,key,max_age=60*60*24*370,httponly=True,samesite="lax",secure=request.url.scheme=="https")
+    resp.set_cookie(LICENSE_DEVICE_COOKIE,device,max_age=60*60*24*370,httponly=True,samesite="lax",secure=request.url.scheme=="https")
+    return resp
+
+@app.get("/license/status")
+async def client_license_status(request: Request):
+    st=await _client_remote_status(request.cookies.get(LICENSE_COOKIE,""),request.cookies.get(LICENSE_DEVICE_COOKIE,""))
+    st["role"]=APP_ROLE
+    return st
+
+@app.middleware("http")
+async def mega_license_guard(request: Request, call_next):
+    path=request.url.path
+    # Administração do Professor continua separada e protegida pelo MASTER_ADMIN_TOKEN.
+    professor_public = path == "/professor" or path.startswith("/professor/") or path in ("/license/validate","/license/claim")
+    public=("/license/activate","/license/status","/manifest.webmanifest","/sw.js","/mega-ia.png","/mega-ia-icon.png","/mega-ia-icon-192.png")
+    if professor_public or path in public or path.startswith("/docs") or path.startswith("/openapi"):
+        return await call_next(request)
+    key=request.cookies.get(LICENSE_COOKIE,"")
+    st=await _client_remote_status(key,request.cookies.get(LICENSE_DEVICE_COOKIE,""))
+    if not st.get("valid"):
+        if request.method in ("GET","HEAD") and path=="/":
+            return HTMLResponse(LICENSE_PAGE.replace("__ERROR__",f'<div class="err">{st.get("reason","")}</div>'),status_code=200)
+        return JSONResponse({"detail":"APP BLOQUEADO","license":st},status_code=403)
+    return await call_next(request)
+
+PROFESSOR_PAGE=r"""<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MEGA IA • Professor</title>
+<style>
+body{margin:0;background:#030812;color:#eef5ff;font-family:Arial}.w{max-width:900px;margin:auto;padding:18px}
+.c{background:#0b192a;border:1px solid #17679d;border-radius:18px;padding:16px;margin:12px 0}
+input,button,select{padding:12px;border-radius:12px;border:1px solid #22689d;background:#0d2035;color:white;margin:5px;box-sizing:border-box}
+button{cursor:pointer;font-weight:800}.go{background:#0d7d49}.stop{background:#8b2630}.row{display:flex;gap:8px;flex-wrap:wrap}
+.lic{border-top:1px solid #173c5e;padding:14px 0}.key{color:#ffd166;font-weight:900;word-break:break-all}
+.ok{color:#45ff9b}.bad{color:#ff6673}.eng{width:min(100%,330px)}
+</style></head><body><div class="w">
+<h1>👨‍🏫 MEGA IA • PROFESSOR</h1><div style="margin:-6px 0 14px;color:#7f9bb8;font-size:12px">Versão __APP_VERSION__ • licenças do Parceiro • Mega Bot</div>
+<div class="c"><h3>Acesso administrativo</h3><input id="tok" type="password" placeholder="MASTER_ADMIN_TOKEN" style="width:min(100%,430px)"><button id="btnEnter" type="button">ENTRAR</button><div id="adminStatus" role="status" aria-live="polite"></div></div>
+<div class="c"><h3>Liberar Parceiro</h3><div class="row"><input id="clientName" placeholder="Nome do parceiro"><input id="exp" type="date"><button id="btnCreate" type="button" class="go">CRIAR LICENÇA</button></div><div id="newkey"></div></div>
+<div class="c"><h3>Parceiros / Licenças</h3><div id="licenseList">Informe o token acima.</div></div>
+<div class="c"><a href="__PARTNER_APP_URL__/" style="color:#43c8ff">← Abrir o app Mega IA 2.0 atualizado</a></div></div>
+<script>
+(function(){
+"use strict";
+function el(id){return document.getElementById(id)}
+function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(m){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]})}
+function headers(){return {"Content-Type":"application/json","X-Mega-Admin":el("tok").value}}
+async function loadLicenses(){
+ var list=el("licenseList"), status=el("adminStatus");
+ if(!el("tok").value.trim()){status.textContent="Digite o token administrativo.";return}
+ status.textContent="Validando acesso..."; list.textContent="Carregando...";
+ try{
+  var r=await fetch("/professor/licenses",{headers:headers(),cache:"no-store"});
+  if(!r.ok){status.textContent="Acesso negado (HTTP "+r.status+"). Confira MEGA_MASTER_ADMIN_TOKEN no Render.";list.innerHTML='<span class="bad">Acesso negado. Confira o token.</span>';return}
+  status.textContent="Acesso autorizado.";
+  var d=await r.json(); list.innerHTML="";
+  if(!d.licenses || !d.licenses.length){list.textContent="Nenhum cliente.";return}
+  d.licenses.forEach(function(x){
+   var box=document.createElement("div"); box.className="lic";
+   var title=document.createElement("div");
+   title.innerHTML="<b>"+esc(x.name)+"</b> • <span class='"+(x.valid?"ok":"bad")+"'>"+(x.valid?"LIBERADO":"BLOQUEADO")+"</span><br><span class='key'>"+esc(x.key)+"</span><br>Vence: "+esc(x.expires_at)+" • "+esc(x.reason);
+   box.appendChild(title);
+   var lab=document.createElement("div"); lab.innerHTML="<br><b>Motor disponível no Parceiro:</b> Mega Bot<br><small>O parceiro escolhe qual usar pelos botões ONLINE/OFFLINE no próprio app.</small><br>"; box.appendChild(lab);
+   var transfer=document.createElement("button");transfer.type="button";transfer.textContent="TRANSFERIR APARELHO";
+   transfer.addEventListener("click",async function(){if(!confirm("Desvincular o aparelho atual deste parceiro?"))return;var r=await fetch("/professor/licenses/transfer",{method:"POST",headers:headers(),body:JSON.stringify({key:x.key})});if(!r.ok){alert("Falha na transferência");return}loadLicenses()});box.appendChild(transfer);
+   var tog=document.createElement("button");tog.type="button";tog.className=x.enabled?"stop":"go";tog.textContent=x.enabled?"BLOQUEAR":"LIBERAR";
+   tog.addEventListener("click",async function(){await fetch("/professor/licenses/toggle",{method:"POST",headers:headers(),body:JSON.stringify({key:x.key,enabled:!x.enabled})});loadLicenses()});
+   box.appendChild(tog); list.appendChild(box);
+  });
+ }catch(e){status.textContent="Falha de conexão com o Professor.";list.innerHTML='<span class="bad">Erro ao carregar clientes.</span>'}
+}
+async function createLicense(){
+ var out=el("newkey"), name=el("clientName").value.trim(), exp=el("exp").value.trim();
+ if(!el("tok").value.trim()){out.textContent="Digite o token administrativo e clique em ENTRAR.";return}
+ if(!name){out.innerHTML='<span class="bad">Informe o nome do cliente.</span>';return}
+ if(!exp){out.innerHTML='<span class="bad">Informe a data de vencimento.</span>';return}
+ try{
+  var r=await fetch("/professor/licenses",{method:"POST",headers:headers(),body:JSON.stringify({name:name,expires_at:exp,enabled:true,engine:"SCALPINGM1"})});
+  var d=await r.json();
+  if(!r.ok){out.innerHTML='<span class="bad">'+esc(d.detail||"Erro ao criar licença")+"</span>";return}
+  out.innerHTML='<p>Chave criada: <span class="key">'+esc(d.key)+"</span></p>"; await loadLicenses();
+ }catch(e){out.innerHTML='<span class="bad">Erro ao criar licença.</span>'}
+}
+el("btnEnter").addEventListener("click",loadLicenses);
+el("btnCreate").addEventListener("click",createLicense);
+})();
+</script></body></html>"""
+
+@app.get("/professor",response_class=HTMLResponse)
+async def professor_panel():
+    if APP_ROLE!="PROFESSOR": raise HTTPException(status_code=404,detail="Disponível no Professor.")
+    return HTMLResponse(PROFESSOR_PAGE.replace("__APP_VERSION__", APP_VERSION).replace("__PARTNER_APP_URL__", PARTNER_APP_URL), headers={"Cache-Control": "no-store, max-age=0"})
+
 HTML_PAGE = r"""
 <!doctype html>
 <html lang="pt-BR">
@@ -35972,7 +35234,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 .chartbox canvas{width:100%!important;height:100%!important;display:block}
 .chartmeta{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
 .chartbadge{padding:7px 10px;border-radius:10px;background:#101b2b;color:#b8c7dd;font-size:12px}
-.hero{display:none;position:relative;width:100%;max-width:760px;margin:26px auto 18px;border-radius:20px;overflow:hidden;border:1px solid #0bbcff;box-shadow:0 0 30px #00aaff55;background:#05111f}
+.hero{display:block;position:relative;width:100%;max-width:760px;margin:26px auto 18px;border-radius:20px;overflow:hidden;border:1px solid #0bbcff;box-shadow:0 0 30px #00aaff55;background:#05111f}
 .hero img{display:block;width:100%;height:300px;object-fit:contain;object-position:center;background:#05111f}
 .entry-arrow{display:none;position:absolute;inset:0;align-items:center;justify-content:center;flex-direction:column;background:#02081488;backdrop-filter:blur(1px);font-weight:900;text-shadow:0 0 18px currentColor}
 .entry-arrow .arrow{font-size:110px;line-height:.8}
@@ -36093,9 +35355,9 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <option value="IQ_OPTION">🏦 IQ Option</option>
     </select>
 
-    <select id="marketMode">
+    <select id="marketMode" title="Escolha Mercado Aberto ou IQ OTC sem login">
       <option value="OPEN">🌐 Mercado Aberto</option>
-      <option value="OTC">🟣 OTC da corretora</option>
+      <option value="OTC">📊 IQ OTC — Sem Login</option>
     </select>
     <input id="market" type="hidden" value="OPEN">
 
@@ -36115,7 +35377,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <select id="cryptoQuickSelect" title="Escolha rápida de criptomoeda" style="font-weight:1000">
       <option value="">🪙 ESCOLHER CRIPTO</option>
       <option value="BTC/USD">₿ Bitcoin • Binance</option>
-      <option value="BTC_IQ">₿ Bitcoin • IQ Option</option>
       <option value="ETH/USD">◆ Ethereum</option>
       <option value="LTC/USD">Ł Litecoin</option>
       <option value="SOL/USD">◎ Solana</option>
@@ -36148,7 +35409,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <div id="otcNote" class="label" style="display:none"></div>
   </div>
 
-
+  <div id="ismaelDeveloperCredit" style="text-align:center;font-size:18px;font-weight:900;letter-spacing:.3px;margin:16px 0 18px;color:#eef5ff;text-shadow:0 0 10px rgba(49,200,255,.28)">App criado e desenvolvido por Ismael Trader</div>
 
   <div class="robot-mode-card" id="localAnalystModeCard">
     <img src="__MEGA_IMAGE__" alt="Mega Bot">
@@ -36231,25 +35492,19 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     <button id="millionEaPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
 
-  <div id="megaEaFolder" class="mega-ea-folder" role="button" tabindex="0" aria-expanded="false">
-    <div class="mega-ea-folder-title">⚡ MEGA EA</div>
-    <div class="mega-ea-folder-hint" id="megaEaFolderHint">Toque para escolher o indicador</div>
-  </div>
 
   <style>
     /* 3.97.96 — indicadores recolhidos dentro da pasta MEGA EA. */
     .mega-ea-folder{display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;min-height:92px;margin:10px 0 12px;padding:16px;border:1px solid #2f86ff;border-radius:16px;background:linear-gradient(180deg,rgba(15,45,76,.96),rgba(6,25,44,.96));box-shadow:0 0 20px rgba(47,134,255,.18);cursor:pointer;user-select:none}
     .mega-ea-folder-title{font-size:30px;font-weight:1000;letter-spacing:1.2px;color:#7fd3ff;text-shadow:0 0 14px rgba(66,190,255,.45)}
     .mega-ea-folder-hint{font-size:12px;font-weight:800;opacity:.78}
-    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #rnFollowModeCard,body:not(.mega-ea-open) #rnFollow02ModeCard,body:not(.mega-ea-open) #rnFollow03ModeCard,body:not(.mega-ea-open) #sniperRevModeCard,body:not(.mega-ea-open) #megaRevYdivModeCard,body:not(.mega-ea-open) #ydivOrigModeCard,body:not(.mega-ea-open) #stepmaOrigModeCard,body:not(.mega-ea-open) #stepmaProModeCard,body:not(.mega-ea-open) #megaGuideModeCard,body:not(.mega-ea-open) #megaGoldModeCard,body:not(.mega-ea-open) #lwSmcModeCard,body:not(.mega-ea-open) #oneShootModeCard,body:not(.mega-ea-open) #shkFlexModeCard,body:not(.mega-ea-open) #goldRushModeCard,#scalpingM1ModeCard,body:not(.mega-ea-open) #rsi2ModeCard,body:not(.mega-ea-open) #autoHedgeModeCard,body:not(.mega-ea-open) #tsr2016ModeCard,body:not(.mega-ea-open) #barReversalModeCard,body:not(.mega-ea-open) #aaPlusModeCard,body:not(.mega-ea-open) #megaPremiumModeCard,body:not(.mega-ea-open) #megaPremiumProtectedModeCard,body:not(.mega-ea-open) #megaHftModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
+    body:not(.mega-ea-open) #scalperProModeCard,body:not(.mega-ea-open) #dragonFireModeCard,body:not(.mega-ea-open) #dragonFireProModeCard,body:not(.mega-ea-open) #roboFiboModeCard,body:not(.mega-ea-open) #paulMacdModeCard,body:not(.mega-ea-open) #paulMacdM1ModeCard,body:not(.mega-ea-open) #sidus320ModeCard,body:not(.mega-ea-open) #tsr2016ModeCard,body:not(.mega-ea-open) #barReversalModeCard,body:not(.mega-ea-open) #megaPremiumModeCard,body:not(.mega-ea-open) #megaPremiumProtectedModeCard,body:not(.mega-ea-open) #megaHftModeCard,body:not(.mega-ea-open) #pyramid7ModeCard,body:not(.mega-ea-open) #predatorPipsModeCard,body:not(.mega-ea-open) #millionEaModeCard,body:not(.mega-ea-open) #moneyPileModeCard{display:none !important}
 
     /* 3.97.11 — painel de motores enxuto: MOTOR REMOVIDO + MEMORY FUSION visíveis */
     .robot-mode-card{display:none !important}
-    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#paulMacdModeCard,#paulMacdM1ModeCard,#sidus320ModeCard,#rnFollowModeCard,#rnFollow02ModeCard,#rnFollow03ModeCard,#sniperRevModeCard,#megaRevYdivModeCard,#ydivOrigModeCard,#stepmaOrigModeCard,#stepmaProModeCard,#megaGuideModeCard,#megaGoldModeCard,#lwSmcModeCard,#oneShootModeCard,#shkFlexModeCard,#goldRushModeCard,#scalpingM1ModeCard,#rsi2ModeCard,#autoHedgeModeCard,#tsr2016ModeCard,#barReversalModeCard,#aaPlusModeCard,#megaPremiumModeCard,#megaPremiumProtectedModeCard,#megaHftModeCard,#pyramid7ModeCard,#predatorPipsModeCard,#millionEaModeCard,#moneyPileModeCard{display:flex !important}
-    #scalperProModeCard .robot-mode-desc,#dragonFireModeCard .robot-mode-desc,#dragonFireProModeCard .robot-mode-desc,#roboFiboModeCard .robot-mode-desc,#paulMacdModeCard .robot-mode-desc,#paulMacdM1ModeCard .robot-mode-desc,#sidus320ModeCard .robot-mode-desc,#rnFollowModeCard .robot-mode-desc,#rnFollow02ModeCard .robot-mode-desc,#rnFollow03ModeCard .robot-mode-desc,#tsr2016ModeCard .robot-mode-desc,#megaPremiumModeCard .robot-mode-desc,#megaPremiumProtectedModeCard .robot-mode-desc,#megaHftModeCard .robot-mode-desc,#pyramid7ModeCard .robot-mode-desc,#predatorPipsModeCard .robot-mode-desc,#millionEaModeCard .robot-mode-desc,#moneyPileModeCard .robot-mode-desc{display:none !important}
+    #scalperProModeCard,#dragonFireModeCard,#dragonFireProModeCard,#roboFiboModeCard,#paulMacdModeCard,#paulMacdM1ModeCard,#sidus320ModeCard,#tsr2016ModeCard,#barReversalModeCard,#megaPremiumModeCard,#megaPremiumProtectedModeCard,#megaHftModeCard,#pyramid7ModeCard,#predatorPipsModeCard,#millionEaModeCard,#moneyPileModeCard{display:flex !important}
+    #scalperProModeCard .robot-mode-desc,#dragonFireModeCard .robot-mode-desc,#dragonFireProModeCard .robot-mode-desc,#roboFiboModeCard .robot-mode-desc,#paulMacdModeCard .robot-mode-desc,#paulMacdM1ModeCard .robot-mode-desc,#sidus320ModeCard .robot-mode-desc,#tsr2016ModeCard .robot-mode-desc,#megaPremiumModeCard .robot-mode-desc,#megaPremiumProtectedModeCard .robot-mode-desc,#megaHftModeCard .robot-mode-desc,#pyramid7ModeCard .robot-mode-desc,#predatorPipsModeCard .robot-mode-desc,#millionEaModeCard .robot-mode-desc,#moneyPileModeCard .robot-mode-desc{display:none !important}
     #scalpingAsiaModeCard{display:none !important}
-    /* SMC always visible, including when MEGA EA folder is closed. */
-    body #lwSmcModeCard{display:flex !important;visibility:visible !important;opacity:1 !important}
   </style>
 
 
@@ -36288,11 +35543,16 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   
+  <div class="robot-mode-card" id="megaGoldModeCard">
+    <img src="__MEGA_IMAGE__" alt="Mega Bot">
+    <div class="robot-mode-copy"><div class="robot-mode-title">🤖 Mega Bot</div><div class="robot-mode-desc">Analisando o mercado • M1 • pré-alerta 20s.</div></div>
+    <span id="megaGoldAutoStatus" style="color:#70eaa5;font-weight:900;font-size:13px">🟢 AUTOMÁTICO</span>
+  </div>
   <div class="robot-mode-card" id="moneyPileModeCard">
     <img src="__MEGA_IMAGE__" alt="Mega Money EA">
     <div class="robot-mode-info">
       <div class="robot-mode-title">💵 MEGA MONEY EA</div>
-      <div class="robot-mode-desc" id="moneyPileModeDesc">Direção do candle + RSI14 H1 • próxima M1 • expiração M1 • sem Grid • sem Martingale • sem Gale.</div>
+      <div class="robot-mode-desc" id="moneyPileModeDesc">RSI9 + CCI13 + Stoch 5/3/3 + MA5/9 • evento único/rearme • próxima M1 • expiração M1 • sem Gale.</div>
     </div>
     <button id="moneyPilePowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
@@ -36306,80 +35566,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   </div>
 
   
-
-  <div class="robot-mode-card" id="lwSmcModeCard">
-    <div class="robot-mode-copy"><div class="robot-mode-title">🧩 SMC Market Structure</div><div class="robot-mode-desc">BOS / CHoCH M5 • entrada M1 • pré-alerta 20s • intervalo 4 min • sem Gale.</div></div>
-    <button id="lwSmcPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-  <div class="robot-mode-card" id="oneShootModeCard">
-    <img src="__MEGA_IMAGE__" alt="One Shoot AI">
-    <div class="robot-mode-copy"><div class="robot-mode-title">🎯 One Shoot AI</div><div class="robot-mode-desc">Rompimento de pivôs M1 • pré-alerta 20s • intervalo 4 min • sem Gale.</div></div>
-    <button id="oneShootPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-  <div class="robot-mode-card" id="megaGoldModeCard">
-    <img src="__MEGA_IMAGE__" alt="Mega Gold Scalper">
-    <div class="robot-mode-copy"><div class="robot-mode-title">🏆 Mega Gold Scalper</div><div class="robot-mode-desc">EMA 8/21 + ADX 14 + RSI 14 + ATR 14 • M1 • pré-alerta 20s • sem Gale.</div></div>
-    <button id="megaGoldPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-  <div class="robot-mode-card" id="rsi2ModeCard">
-    <img src="__MEGA_IMAGE__" alt="RSI 2">
-    <div class="robot-mode-copy"><div class="robot-mode-title">📉 RSI 2</div><div class="robot-mode-desc">RSI(2) • CALL ≤20 / PUT ≥80 • próxima M1 • 20s • sem Gale.</div></div>
-    <button id="rsi2PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-  <div class="robot-mode-card" id="shkFlexModeCard">
-    <img src="__MEGA_IMAGE__" alt="SHK Heikin Ashi">
-    <div class="robot-mode-copy"><div class="robot-mode-title">📊 SHK Heikin Ashi</div><div class="robot-mode-desc">Heikin Ashi + MACD momentum + força da vela • M1/M5 • 20s • intervalo 4min • sem Gale.</div></div>
-    <button id="shkFlexPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-  <div class="robot-mode-card" id="scalpingM1ModeCard">
-    <img src="__MEGA_IMAGE__" alt="Scalping M1 FLEX">
-    <div class="robot-mode-copy"><div class="robot-mode-title">⚡ Scalping M1 FLEX</div><div class="robot-mode-desc">M15 50% + M5 25% + reteste M1 flexível • 20s • intervalo 4min • sem Gale.</div></div>
-    <button id="scalpingM1PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-  <div class="robot-mode-card" id="goldRushModeCard">
-    <img src="__MEGA_IMAGE__" alt="Gold Rush Pro">
-    <div class="robot-mode-copy"><div class="robot-mode-title">🏅 Gold Rush Pro</div><div class="robot-mode-desc">Adaptação experimental EMA 5/8/13 + força da vela • M1/M5/M15/M30 • 20s • sem Gale.</div></div>
-    <button id="goldRushPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-  <div class="robot-mode-card" id="autoHedgeModeCard">
-    <img src="__MEGA_IMAGE__" alt="AutoHedge M1">
-    <div class="robot-mode-copy"><div class="robot-mode-title">⚙️ AutoHedge M1</div><div class="robot-mode-desc">Impulso de preço experimental • próxima M1 • pré-alerta 20s • sem Grid ou Hedge.</div></div>
-    <button id="autoHedgePowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-  <div class="robot-mode-card" id="megaGuideModeCard">
-    <img src="__MEGA_IMAGE__" alt="MEGA Guide M5-M1">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🧭 MEGA Guide M5-M1</div>
-      <div class="robot-mode-desc">Leitura M5 causal • EMA/RSI/ATR/Bollinger/S-R • próxima M1 • expiração M1 • sem Gale.</div>
-    </div>
-    <button id="megaGuidePowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-  <div class="robot-mode-card" id="rnFollowModeCard">
-    <div>
-      <div class="robot-mode-title">📈 RN Follow Trend</div>
-      <div class="robot-mode-desc" id="rnFollowModeDesc">Gatilho de deslocamento do EA original • próxima M1 • sem Grid/Martingale/Gale • evento único.</div>
-    </div>
-    <button id="rnFollowPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-  <div class="robot-mode-card" id="rnFollow02ModeCard">
-    <div>
-      <div class="robot-mode-title">📈 RN Follow Trend 02</div>
-      <div class="robot-mode-desc" id="rnFollow02ModeDesc">ATR14 0,70 obrigatório + suporte/resistência OU rejeição • EMA50 só bloqueia tendência contrária forte • próxima vela • sem Gale.</div>
-    </div>
-    <button id="rnFollow02PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-  <div class="robot-mode-card" id="rnFollow03ModeCard">
-    <div>
-      <div class="robot-mode-title">📈 RN Follow Trend 03</div>
-      <div class="robot-mode-desc" id="rnFollow03ModeDesc">RN Follow + rejeição + proteção EMA50 + Volume POC • sem S/R obrigatório • próxima vela • sem Gale.</div>
-    </div>
-    <button id="rnFollow03PowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-  <div class="robot-mode-card" id="sniperRevModeCard"><div><div class="robot-mode-title">🎯 Sniper Reversão</div><div class="robot-mode-desc">Canal + MACD • próxima vela • sem Gale.</div></div><button id="sniperRevPowerBtn" type="button">🔴 OFFLINE</button></div>
-  <div class="robot-mode-card" id="megaRevYdivModeCard"><div><div class="robot-mode-title">🎯 Mega Reversão + yDiv</div><div class="robot-mode-desc">Confluência Sniper + yDiv • próxima vela • sem Gale.</div></div><button id="megaRevYdivPowerBtn" type="button">🔴 OFFLINE</button></div>
-  <div class="robot-mode-card" id="ydivOrigModeCard"><div><div class="robot-mode-title">📉 yDiv Original</div><div class="robot-mode-desc">Divergência RSI14 + ZigZag confirmado • próxima M1 • sem Gale.</div></div><button id="ydivOrigPowerBtn" type="button">🔴 OFFLINE</button></div>
-  <div class="robot-mode-card" id="stepmaOrigModeCard"><div><div class="robot-mode-title">📈 StepMA Original</div><div class="robot-mode-desc">StepMA sem confluência • próxima vela M1.</div></div><button id="stepmaOrigPowerBtn" type="button">🔴 OFFLINE</button></div>
-  <div class="robot-mode-card" id="stepmaProModeCard"><div><div class="robot-mode-title">📈 StepMA Pro</div><div class="robot-mode-desc">StepMA + Brooky StochRSI • próxima vela M1.</div></div><button id="stepmaProPowerBtn" type="button">🔴 OFFLINE</button></div>
   <div class="robot-mode-card" id="tsr2016ModeCard">
     <img src="__MEGA_IMAGE__" alt="Mega Sniper">
     <div class="robot-mode-copy">
@@ -36395,14 +35581,6 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <div class="robot-mode-desc">Price Action original • padrão Out/In • candle fechado • próxima M1 • sem Gale.</div>
     </div>
     <button id="barReversalPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
-  </div>
-  <div class="robot-mode-card" id="aaPlusModeCard">
-    <img src="__MEGA_IMAGE__" alt="AA+">
-    <div class="robot-mode-copy">
-      <div class="robot-mode-title">🐊 AA+</div>
-      <div class="robot-mode-desc">Alligator 13/8/5 SMMA Median • pré-alerta 20s antes da seta • próxima M1 • sinal travado • sem Gale.</div>
-    </div>
-    <button id="aaPlusPowerBtn" type="button" style="font-weight:900">🔴 OFFLINE</button>
   </div>
   <div class="robot-mode-card" id="megaPremiumModeCard">
     <img src="__MEGA_IMAGE__" alt="Mega Premium">
@@ -36475,6 +35653,11 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   <script>
   // 3.97.96 — MEGA EA funciona como pasta: fechada por padrão e abre/fecha os indicadores.
   document.addEventListener('DOMContentLoaded',()=>{
+    document.querySelectorAll('select').forEach(sel=>{
+      if(!/engine|motor|indicador/i.test((sel.id||'')+' '+(sel.name||'')))return;
+      [...sel.options].forEach(opt=>{if(opt.value && opt.value.toUpperCase()!=='SCALPINGM1')opt.remove();});
+      if([...sel.options].some(opt=>opt.value.toUpperCase()==='SCALPINGM1'))sel.value='SCALPINGM1';
+    });
     const folder=document.getElementById('megaEaFolder');
     const hint=document.getElementById('megaEaFolderHint');
     if(!folder) return;
@@ -36488,7 +35671,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
   });
   </script>
 
-  <div class="card" id="backtest48Card" style="margin-top:14px;border-color:#2f86ff">
+  <div class="card" id="backtest48Card" style="display:none!important;margin-top:14px;border-color:#2f86ff">
     <div style="display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap">
       <div>
         <div class="label">🧪 BACKTEST 48H • SIMULAÇÃO HISTÓRICA • NÃO É SINAL ENVIADO</div>
@@ -36511,13 +35694,13 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
 
 <div class="tabs">
     <button class="tabbtn active" id="tabMain">📊 Painel</button>
-    <button class="tabbtn" id="tabChart">📈 Gráfico</button>
+    <button class="tabbtn" id="tabChart" style="display:none">📈 Gráfico</button>
     <button class="tabbtn" id="tabResults">🎯 Resultados</button>
     <button class="tabbtn" id="tabValues">💰 Valores</button>
     <button class="tabbtn" id="tabHistory">🗓️ Histórico 15 dias</button>
     <button class="tabbtn" id="tabManagement">⚙️ Gestão</button>
     <button class="tabbtn" id="tabCompatibility">🧪 Compatibilidade</button>
-    <button class="tabbtn" id="tabTelegram">✈️ Telegram</button>
+    <button class="tabbtn" id="tabTelegram" style="display:none">✈️ Telegram</button>
     <button class="tabbtn" id="tabAccount">🏦 Corretora</button>
   </div>
 
@@ -36534,59 +35717,185 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       🧠 ESTOU ANALISANDO O MERCADO, AGUARDE...
     </div>
 
-    <div class="grid">
-      <div class="card signal" id="signalCard">
-        <div id="moneyFx" class="money-fx" aria-hidden="true"></div>
-        <div class="label">SINAL ATUAL</div>
-        <div id="direction" class="big neutral">AGUARDANDO</div>
-        <div id="signalAsset" class="signal-asset"></div>
-        <div id="confidence">Confiança: --</div>
-      </div>
-
-      <div class="card schedule-card">
-        <div class="label" id="entryScheduleLabel">⏱ CRONOGRAMA • ENTRADA</div>
-        <div id="entry" class="big">--:--:--</div>
-        <div id="countdown">--</div>
-        <div id="expiryCountdown" style="margin-top:8px;font-weight:800">⏱ EXPIRAÇÃO: --:--</div>
-      </div>
-
-      <div class="card">
-        <div class="label">STATUS</div>
-        <div id="status" class="big" style="font-size:18px">MONITORANDO</div>
-        <div id="risk">Risco: --</div>
-        <div id="megaBotConfluences" style="display:none;margin-top:16px;padding-top:12px;border-top:1px solid rgba(148,163,184,.22);gap:8px">
-          <div id="megaConf1" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf1Icon">○</span><span>Confluência 1 • EMA 9/21 + Estrutura</span><span id="megaConf1State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
-          <div id="megaConf2" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf2Icon">○</span><span>Confluência 2 • Combo 3/5</span><span id="megaConf2State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
-          <div id="megaConf3" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf3Icon">○</span><span>Confluência 3 • Brooky FLEX</span><span id="megaConf3State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
-          <div id="megaConfReady" style="margin-top:3px;font-size:13px;font-weight:900;letter-spacing:.03em;opacity:.82">Confluências: 0/3</div>
+    <style>
+/* 3.99.56 — Central de Sinais Mega Bot; apenas interface, sem mudanças de estratégia. */
+.mega-command{margin-top:14px;min-width:0}
+.mega-command-head{display:flex;align-items:center;gap:13px;padding:15px 18px;border:1.5px solid #f3b92c;border-radius:19px;background:linear-gradient(110deg,#211a0c,#06192d 62%,#071e35);box-shadow:0 0 20px #f6bb2533,inset 0 0 25px #03bfff12}
+.mega-command-trophy{font-size:33px;filter:drop-shadow(0 0 9px #ffcd35)}
+.mega-command-title{font-size:clamp(18px,2.5vw,30px);font-weight:1000;letter-spacing:.035em;color:#ffe26d;text-shadow:0 0 14px #f6b82888}
+.mega-command-sub{font-size:clamp(9px,1.3vw,12px);color:#70d7ff;font-weight:800;margin-top:3px}
+.mega-command-bars{margin-left:auto;color:#1fd4ff;font-size:24px;letter-spacing:2px;text-shadow:0 0 13px #00c8ff}
+.mega-command-grid{display:grid!important;grid-template-columns:repeat(3,minmax(0,1fr))!important;gap:12px;margin-top:12px}
+.mega-command-grid>.card{grid-column:auto!important;min-width:0;min-height:235px;box-sizing:border-box;margin-top:0!important;padding:16px 12px!important;border-radius:20px;text-align:center;overflow:hidden}
+.mega-command-label{font-size:clamp(11px,1.6vw,15px);font-weight:1000;letter-spacing:.025em;color:#dceeff;margin-bottom:14px}
+.mega-command-direction{border:1.5px solid #0bf2a5!important;background:linear-gradient(160deg,#042b27,#041523 72%)!important;box-shadow:0 0 17px #00ff9950,inset 0 0 22px #00ff9910!important}
+.mega-command-direction #direction{font-size:clamp(24px,4vw,48px);line-height:1.12;overflow-wrap:anywhere;margin:23px 2px 16px}
+.mega-command-direction #direction.call{color:#21ff96;text-shadow:0 0 16px #0fef8c}
+.mega-command-direction #direction.put{color:#ff557b;text-shadow:0 0 16px #ff345b}
+.mega-command-direction #direction.neutral{color:#ffe16c;text-shadow:0 0 12px #e4b33c55}
+.mega-command-direction #confidence{font-size:clamp(11px,1.7vw,16px);font-weight:900;color:#bcefe5}
+.mega-command-meter{height:9px;border-radius:30px;overflow:hidden;background:#103a39;margin:15px 4px 12px;border:1px solid #1d716c}
+.mega-command-meter-fill{height:100%;width:0%;background:linear-gradient(90deg,#00c9ee,#13ff91);box-shadow:0 0 12px #00f5bd;transition:width .4s ease}
+.mega-command-clock{border:1.5px solid #19bdff!important;background:linear-gradient(160deg,#08284b,#051123 75%)!important;box-shadow:0 0 20px #06bfff50,inset 0 0 20px #008fff14!important}
+.mega-command-clock .mega-command-label{color:#75d9ff!important}
+.mega-command-dial{width:min(100%,190px);aspect-ratio:1;margin:0 auto 12px;padding:10px;box-sizing:border-box;border-radius:50%;background:conic-gradient(#06d9ff,#157bff 70%,#082a4b 70%);box-shadow:0 0 22px #00bfff55;display:grid;place-items:center}
+.mega-command-dial-inner{background:radial-gradient(circle,#08233e,#041022);border-radius:50%;width:100%;height:100%;display:flex;align-items:center;justify-content:center;flex-direction:column;padding:9px;box-sizing:border-box;min-width:0}
+.mega-command-clock #entry{font-size:clamp(18px,2.8vw,30px)!important;line-height:1.2;overflow-wrap:anywhere;margin:2px!important;color:#fff!important;text-shadow:0 0 12px #30cfff!important}
+.mega-command-clock #countdown{font-size:clamp(10px,1.6vw,14px)!important;overflow-wrap:anywhere}
+.mega-command-expiry{font-size:clamp(11px,1.6vw,16px)!important;font-weight:900;color:#ff6987}
+.mega-command-status{border:1.5px solid #b44dff!important;background:linear-gradient(160deg,#201136,#071329 75%)!important;box-shadow:0 0 19px #ac40ff55,inset 0 0 23px #a43dff12!important;text-align:left!important}
+.mega-command-status .mega-command-label{text-align:center;color:#e6a4ff}
+.mega-command-engine{padding:11px 7px;margin:0 0 12px;border-radius:12px;background:#09243a;border:1px solid #235575;color:#35ff9e;font-size:clamp(10px,1.5vw,13px);font-weight:900;text-align:center}
+.mega-command-status #status{font-size:clamp(13px,1.7vw,18px)!important;line-height:1.5;overflow-wrap:anywhere;color:#dcecff;margin:7px 0 13px}
+.mega-command-status #risk{border-top:1px solid #8755ae66;padding-top:12px;font-size:clamp(11px,1.5vw,14px);color:#f2d6ff}
+/* 3.99.58 — Robô neon integrado ao card de sinal, sem alterar lógica operacional. */
+.mega-command-direction{position:relative;isolation:isolate}
+.mega-robot-scene{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:130px;margin:-4px -6px 8px;overflow:hidden;border-radius:15px;background:radial-gradient(ellipse at 50% 40%,#065e5366,transparent 70%),repeating-linear-gradient(90deg,transparent 0 26px,#08ff9d09 27px 28px)}
+.mega-robot-svg{width:min(90%,200px);height:145px;filter:drop-shadow(0 0 12px #09bfff77);animation:megaRobotFloat 3s ease-in-out infinite}
+.mega-robot-rays{position:absolute;top:18%;font-size:38px;color:#21ff95;text-shadow:0 0 15px #00ff8c;opacity:.35;letter-spacing:25px}
+.mega-robot-signal{font-size:clamp(9px,1.2vw,12px);font-weight:900;letter-spacing:.035em;color:#76dfff;text-shadow:0 0 10px #10b9ff;padding-bottom:4px}
+.mega-command-direction.mega-robot-call .mega-robot-scene{background:radial-gradient(ellipse at center,#00ef7c33,transparent 72%)}
+.mega-command-direction.mega-robot-call .mega-robot-signal{color:#28ff9e}
+.mega-command-direction.mega-robot-put{border-color:#ff3b71!important;box-shadow:0 0 22px #ff255655!important}
+.mega-command-direction.mega-robot-put .mega-robot-scene{background:radial-gradient(ellipse at center,#ff184633,transparent 72%)}
+.mega-command-direction.mega-robot-put .mega-robot-signal,.mega-command-direction.mega-robot-put .mega-robot-rays{color:#ff527c;text-shadow:0 0 12px #ff346e}
+.mega-command-direction.mega-robot-put .mega-robot-svg{filter:drop-shadow(0 0 12px #ff285a88) hue-rotate(145deg)}
+.mega-command-direction .mega-command-label{margin-top:2px}
+@keyframes megaRobotFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
+@media(max-width:700px){.mega-robot-svg{height:105px}.mega-robot-scene{min-height:110px}.mega-robot-rays{font-size:25px;letter-spacing:6px}.mega-robot-signal{font-size:9px}}
+@media(max-width:420px){.mega-robot-svg{height:94px}.mega-robot-scene{min-height:100px}}
+@media(prefers-reduced-motion:reduce){.mega-robot-svg{animation:none}}
+@media(max-width:700px){.mega-command-head{padding:11px}.mega-command-bars{display:none}.mega-command-grid{gap:7px}.mega-command-grid>.card{padding:12px 7px!important;min-height:205px}.mega-command-dial{padding:6px}.mega-command-label{margin-bottom:8px}.mega-command-direction #direction{margin:18px 0 12px}}
+@media(max-width:420px){.mega-command-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.mega-command-direction{grid-column:1!important}.mega-command-clock{grid-column:2!important}.mega-command-status{grid-column:1/-1!important;min-height:120px!important}.mega-command-status #status{margin:6px 0}.mega-command-dial{max-width:140px}.mega-command-direction #direction{font-size:clamp(19px,7vw,30px)}.mega-command-head{gap:7px}.mega-command-trophy{font-size:23px}.mega-command-title{font-size:17px}}
+    </style>
+    <!-- Central de Sinais: somente apresentação; IDs originais preservados para o JS existente. -->
+    <section class="mega-command" aria-label="Central de Sinais Mega Bot">
+      <div class="mega-command-head"><span class="mega-command-trophy">🏆</span><div><div class="mega-command-title">MEGA BOT</div><div class="mega-command-sub">ANÁLISE EM TEMPO REAL • ENTRADA NA PRÓXIMA VELA</div></div><div class="mega-command-bars" aria-hidden="true">▂▅▃▇▆▃▇</div></div>
+      <div class="grid mega-command-grid">
+        <div class="card signal mega-command-direction" id="signalCard">
+          <div id="moneyFx" class="money-fx" aria-hidden="true"></div>
+          <div class="mega-robot-scene" id="megaRobotScene" aria-hidden="true">
+            <div class="mega-robot-rays">↗ &nbsp; ↗</div>
+            <svg class="mega-robot-svg" viewBox="0 0 240 205" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Robô Mega Bot">
+              <defs><linearGradient id="mrMetal" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#e2faff"/><stop offset=".42" stop-color="#3987b8"/><stop offset="1" stop-color="#092443"/></linearGradient><radialGradient id="mrFace"><stop stop-color="#123958"/><stop offset="1" stop-color="#03101f"/></radialGradient><filter id="mrGlow"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+              <path d="M52 198 Q58 161 91 157 L148 157 Q185 161 190 198" fill="url(#mrMetal)" stroke="#5adfff" stroke-width="4"/>
+              <path d="M115 29 V15" stroke="#65eaff" stroke-width="6" stroke-linecap="round"/><circle cx="115" cy="11" r="8" fill="#42f5bd" filter="url(#mrGlow)"/>
+              <rect x="40" y="31" width="153" height="133" rx="48" fill="url(#mrMetal)" stroke="#4bd9ff" stroke-width="5"/>
+              <rect x="51" y="44" width="131" height="105" rx="36" fill="url(#mrFace)" stroke="#0a8bd5" stroke-width="3"/>
+              <rect x="28" y="76" width="20" height="47" rx="10" fill="url(#mrMetal)" stroke="#55dcff" stroke-width="3"/><rect x="185" y="76" width="20" height="47" rx="10" fill="url(#mrMetal)" stroke="#55dcff" stroke-width="3"/>
+              <path d="M72 90 Q87 68 103 91 M131 91 Q147 68 162 90" fill="none" stroke="#44eaff" stroke-width="9" stroke-linecap="round" filter="url(#mrGlow)"/>
+              <path d="M92 118 Q118 140 145 118" fill="none" stroke="#48ffb6" stroke-width="6" stroke-linecap="round" filter="url(#mrGlow)"/>
+              <path d="M49 183 L26 158 L13 168 L42 201" fill="url(#mrMetal)" stroke="#5adfff" stroke-width="4"/><path d="M189 181 L215 155 L226 166 L201 200" fill="url(#mrMetal)" stroke="#5adfff" stroke-width="4"/>
+              <circle cx="119" cy="181" r="10" fill="#14e6ff" filter="url(#mrGlow)"/>
+            </svg>
+            <div class="mega-robot-signal" id="megaRobotSignal">ANALISANDO O MERCADO</div>
+          </div>
+          <div class="mega-command-label">↗ DIREÇÃO DO SINAL</div>
+          <div id="direction" class="big neutral">AGUARDANDO</div>
+          <div id="signalAsset" class="signal-asset"></div>
+          <div class="mega-command-meter"><div class="mega-command-meter-fill" id="megaGoldConfidenceBar"></div></div>
+          <div id="confidence">Confiança: --</div>
+        </div>
+        <div class="card schedule-card mega-command-clock">
+          <div class="mega-command-label" id="entryScheduleLabel">⏱ CRONOGRAMA • ENTRADA</div>
+          <div class="mega-command-dial"><div class="mega-command-dial-inner"><div id="entry" class="big">--:--:--</div><div id="countdown">--</div></div></div>
+          <div id="expiryCountdown" class="mega-command-expiry">⏱ EXPIRAÇÃO: --:--</div>
+        </div>
+        <div class="card mega-command-status">
+          <div class="mega-command-label">⚡ STATUS DO MOTOR</div>
+          <div class="mega-command-engine">🟢 MEGA BOT</div>
+          <div id="status" class="big" style="font-size:18px">MONITORANDO</div>
+          <div id="risk">Risco: --</div>
+          <div id="megaBotConfluences" style="display:none;margin-top:16px;padding-top:12px;border-top:1px solid rgba(148,163,184,.22);gap:8px">
+            <div id="megaConf1" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf1Icon">○</span><span>Confluência 1 • EMA 9/21 + Estrutura</span><span id="megaConf1State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
+            <div id="megaConf2" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf2Icon">○</span><span>Confluência 2 • Combo 3/5</span><span id="megaConf2State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
+            <div id="megaConf3" style="display:flex;align-items:center;gap:9px;font-weight:800"><span id="megaConf3Icon">○</span><span>Confluência 3 • Brooky FLEX</span><span id="megaConf3State" style="margin-left:auto;opacity:.72">AGUARDANDO</span></div>
+            <div id="megaConfReady" style="margin-top:3px;font-size:13px;font-weight:900;letter-spacing:.03em;opacity:.82">Confluências: 0/3</div>
+          </div>
         </div>
       </div>
-    </div>
+    </section>
 
+<script>
+(function(){
+  function ready(){
+    const source=document.getElementById('confidence'), bar=document.getElementById('megaGoldConfidenceBar');
+    if(!source||!bar)return;
+    const update=()=>{const m=(source.textContent||'').match(/([0-9]+(?:[.,][0-9]+)?)\s*%/);bar.style.width=m?Math.max(0,Math.min(100,Number(m[1].replace(',','.'))))+'%':'0%';};
+    new MutationObserver(update).observe(source,{childList:true,characterData:true,subtree:true});update();
+    const card=document.getElementById('signalCard'), direction=document.getElementById('direction'), robotLabel=document.getElementById('megaRobotSignal');
+    if(card&&direction&&robotLabel){
+      const refreshRobot=()=>{const d=(direction.textContent||'').trim().toUpperCase();const call=d==='CALL',put=d==='PUT';card.classList.toggle('mega-robot-call',call);card.classList.toggle('mega-robot-put',put);robotLabel.textContent=call?'SINAL DETECTADO • CALL':put?'SINAL DETECTADO • PUT':'ANALISANDO O MERCADO';};
+      new MutationObserver(refreshRobot).observe(direction,{childList:true,characterData:true,subtree:true,attributes:true,attributeFilter:['class']});refreshRobot();
+    }
+
+  }
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',ready);else ready();
+})();
+</script>
     <div class="card" id="dataFeedCard" style="margin-top:10px">
       <div class="label">🌐 FONTE DE DADOS • AUTOMÁTICA</div>
       <div id="dataFeedText" style="font-weight:900;margin-top:5px">Aguardando leitura do mercado...</div>
       <div style="font-size:12px;opacity:.75;margin-top:4px">Mercado Aberto usa fallback automático; Crypto IDX usa somente o feed Binomo real; OTC permanece na IQ Option.</div>
     </div>
 
-    <div class="grid">
-      <div class="card score-card score-win">
-        <div class="label">🏆 WIN</div>
-        <div id="wins" class="big call">0</div>
-      </div>
-      <div class="card score-card score-loss">
-        <div class="label">✖ LOSS</div>
-        <div id="losses" class="big put">0</div>
-      </div>
-      <div class="card score-card score-accuracy">
-        <div class="label">🎯 ASSERTIVIDADE</div>
-        <div id="accuracy" class="big">0%</div>
-      </div>
-      <div class="card score-card score-result">
-        <div class="label">★ RESULTADO</div>
-        <div id="result" class="big">--</div>
-      </div>
+    <style>
+      .mega-neon-board{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:18px}
+      .mega-neon-card{--glow:#ffd447;--glow2:#fff0a0;position:relative;min-width:0;padding:18px 14px;border:1.5px solid var(--glow);border-radius:22px;background:linear-gradient(155deg,rgba(18,28,47,.98),rgba(2,9,24,.99));box-shadow:0 0 15px color-mix(in srgb,var(--glow) 30%,transparent),inset 0 0 22px rgba(0,0,0,.4);color:#e9f2ff}
+      .mega-neon-card.gale-one{--glow:#08caff;--glow2:#5f9dff}.mega-neon-card.gale-two{--glow:#b54cff;--glow2:#e2a0ff}
+      .mega-neon-head{text-align:center;font-size:clamp(19px,2vw,28px);font-weight:1000;color:var(--glow2);text-shadow:0 0 14px var(--glow);letter-spacing:.025em}
+      .mega-neon-sub{text-align:center;color:#b5c8df;font-size:11px;letter-spacing:.05em;margin:3px 0 16px}
+      .mega-neon-duo{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+      .mega-neon-stat{min-width:0;text-align:center;border:1px solid rgba(103,164,233,.35);border-radius:16px;padding:12px 5px;background:linear-gradient(145deg,rgba(2,23,44,.85),rgba(3,10,27,.92))}
+      .mega-neon-stat .label{font-weight:900;color:#a7c6e8;font-size:12px}.mega-neon-stat .big{font-size:clamp(22px,3vw,40px);font-weight:1000;line-height:1.35}
+      .mega-neon-stat.score-win .big{color:#00ed91;text-shadow:0 0 14px #00d582}.mega-neon-stat.score-loss .big{color:#ff5979;text-shadow:0 0 14px #ff375f}
+      .mega-neon-bottom{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px;align-items:stretch}
+      .mega-neon-ring{--pct:0%;width:min(100%,145px);aspect-ratio:1;border-radius:50%;margin:auto;display:grid;place-items:center;background:conic-gradient(var(--glow) var(--pct),rgba(43,72,112,.7) 0);padding:12px;box-shadow:0 0 17px color-mix(in srgb,var(--glow) 25%,transparent)}
+      .mega-neon-ring-inner{display:grid;place-items:center;text-align:center;background:#07172c;border-radius:50%;width:100%;height:100%;padding:4px}
+      .mega-neon-ring .big{font-size:clamp(15px,2vw,25px);font-weight:1000}.mega-neon-ring .label{font-size:9px;color:#9bd5ff}
+      .mega-neon-total{display:flex;flex-direction:column;justify-content:center}
+      .mega-neon-result{margin-top:12px;border:1px solid var(--glow);border-radius:13px;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px;box-shadow:inset 0 0 14px color-mix(in srgb,var(--glow) 14%,transparent);font-weight:900}
+      .mega-neon-result .big{color:#00ed91;font-size:clamp(17px,2vw,27px)}
+      .mega-neon-summary{grid-column:1/-1;border:1.5px solid #00baff;border-radius:20px;background:linear-gradient(130deg,#071b34,#040c20);box-shadow:0 0 15px #009fff44;padding:16px;display:grid;grid-template-columns:1.4fr repeat(4,1fr);gap:8px;align-items:center}
+      .mega-neon-summary-title{font-weight:1000;color:#42bfff;font-size:19px}.mega-neon-summary-item{text-align:center;border-left:1px solid #2488bc77;padding:5px;font-size:11px;color:#9fc5e6;font-weight:800}
+      .mega-neon-summary-item strong{display:block;font-size:clamp(20px,2.6vw,34px);color:#f2f7ff}.mega-neon-summary-item.win strong{color:#00e992}.mega-neon-summary-item.loss strong{color:#ff607c}.mega-neon-summary-item.accuracy strong{color:#15d6ff}
+      .mega-neon-note{grid-column:1/-1;font-size:11px;opacity:.75;margin:0}
+      @media(max-width:850px){.mega-neon-board{grid-template-columns:1fr}.mega-neon-summary{grid-template-columns:repeat(2,1fr)}.mega-neon-summary-title{grid-column:1/-1}.mega-neon-summary-item:nth-child(2n){border-left:0}.mega-neon-card{max-width:none}}
+    </style>
+    <div class="mega-neon-board" id="megaNeonScoreBoard">
+      <section class="mega-neon-card " id="megaDirectScoreCards">
+        <div class="mega-neon-head">🏆 WIN DIRETO</div><div class="mega-neon-sub">OPERAÇÃO PRINCIPAL</div>
+        <div class="mega-neon-duo"><div class="mega-neon-stat score-win"><div class="label">📈 WIN</div><div id="wins" class="big">0</div></div><div class="mega-neon-stat score-loss"><div class="label">📉 LOSS</div><div id="losses" class="big">0</div></div></div>
+        <div class="mega-neon-bottom"><div class="mega-neon-ring"><div class="mega-neon-ring-inner"><div><div id="accuracy" class="big">—</div><div class="label">TAXA DE ACERTO</div></div></div></div><div class="mega-neon-stat mega-neon-total"><div class="label">🎯 TOTAL</div><div class="big" data-total-for="wins,losses">—</div><div class="label">OPERAÇÕES</div></div></div>
+        <div class="mega-neon-result"><span>⭐ RESULTADO</span><span id="result" class="big">—</span></div>
+      </section>
+      <section class="mega-neon-card gale-one" id="megaGaleScoreCards">
+        <div class="mega-neon-head">↻ GALE 1</div><div class="mega-neon-sub">1ª RECUPERAÇÃO</div>
+        <div class="mega-neon-duo"><div class="mega-neon-stat score-win"><div class="label">📈 WIN</div><div id="megaGale1Win" class="big">0</div></div><div class="mega-neon-stat score-loss"><div class="label">📉 LOSS</div><div id="megaGale1Loss" class="big">0</div></div></div>
+        <div class="mega-neon-bottom"><div class="mega-neon-ring"><div class="mega-neon-ring-inner"><div><div id="megaGale1Accuracy" class="big">—</div><div class="label">TAXA DE ACERTO</div></div></div></div><div class="mega-neon-stat mega-neon-total"><div class="label">🎯 TOTAL</div><div class="big" data-total-for="megaGale1Win,megaGale1Loss">—</div><div class="label">OPERAÇÕES</div></div></div>
+        <div class="mega-neon-result"><span>⭐ RESULTADO</span><span id="megaGale1Result" class="big">—</span></div>
+      </section>
+      <section class="mega-neon-card gale-two" id="megaGale2ScoreCards">
+        <div class="mega-neon-head">↻ GALE 2</div><div class="mega-neon-sub">2ª RECUPERAÇÃO</div>
+        <div class="mega-neon-duo"><div class="mega-neon-stat score-win"><div class="label">📈 WIN</div><div id="megaGale2Win" class="big">0</div></div><div class="mega-neon-stat score-loss"><div class="label">📉 LOSS</div><div id="megaGale2Loss" class="big">0</div></div></div>
+        <div class="mega-neon-bottom"><div class="mega-neon-ring"><div class="mega-neon-ring-inner"><div><div id="megaGale2Accuracy" class="big">—</div><div class="label">TAXA DE ACERTO</div></div></div></div><div class="mega-neon-stat mega-neon-total"><div class="label">🎯 TOTAL</div><div class="big" data-total-for="megaGale2Win,megaGale2Loss">—</div><div class="label">OPERAÇÕES</div></div></div>
+        <div class="mega-neon-result"><span>⭐ RESULTADO</span><span id="megaGale2Result" class="big">—</span></div>
+      </section>
+      <div class="mega-neon-summary"><div class="mega-neon-summary-title">📊 RESUMO GERAL<div style="font-size:11px;color:#9fc5e6">TODAS AS OPERAÇÕES APURADAS</div></div><div class="mega-neon-summary-item win">WIN TOTAL<strong id="megaNeonWins">—</strong></div><div class="mega-neon-summary-item loss">LOSS TOTAL<strong id="megaNeonLosses">—</strong></div><div class="mega-neon-summary-item accuracy">ACERTO GERAL<strong id="megaNeonAccuracy">—</strong></div><div class="mega-neon-summary-item">TOTAL<strong id="megaNeonTotal">—</strong></div></div>
+      <div id="megaGaleScoreNote" class="mega-neon-note">— indica dado ainda não apurado. Gale apenas informativo, sem entradas automáticas.</div>
     </div>
+    <script>
+    (function(){
+      const pairs=[['wins','losses'],['megaGale1Win','megaGale1Loss'],['megaGale2Win','megaGale2Loss']];
+      function num(id){const e=document.getElementById(id);if(!e)return null;const s=e.textContent.trim();return /^\d+$/.test(s)?Number(s):null;}
+      function render(){let w=0,l=0,known=0;for(const [wi,lo] of pairs){const a=num(wi),b=num(lo);const el=document.querySelector('[data-total-for="'+wi+','+lo+'"]');if(el)el.textContent=a===null&&b===null?'—':String((a||0)+(b||0));if(a!==null){w+=a;known++;}if(b!==null){l+=b;known++;}}
+        const set=(id,v)=>{const e=document.getElementById(id);if(e&&e.textContent!==v)e.textContent=v;};
+        set('megaNeonWins',known?w.toString():'—');set('megaNeonLosses',known?l.toString():'—');set('megaNeonTotal',known?(w+l).toString():'—');set('megaNeonAccuracy',known&&w+l?((w/(w+l))*100).toFixed(1)+'%':'—');
+        for(const ring of document.querySelectorAll('.mega-neon-ring')){const t=ring.querySelector('.big')?.textContent||'';const p=parseFloat(t.replace(',','.'));ring.style.setProperty('--pct',Number.isFinite(p)?Math.min(100,Math.max(0,p))+'%':'0%');}
+      }
+      document.addEventListener('DOMContentLoaded',()=>{const board=document.getElementById('megaNeonScoreBoard');if(!board)return;render();const observer=new MutationObserver(render);for(const id of ['wins','losses','accuracy','megaGale1Win','megaGale1Loss','megaGale1Accuracy','megaGale2Win','megaGale2Loss','megaGale2Accuracy']){const el=document.getElementById(id);if(el)observer.observe(el,{childList:true,characterData:true,subtree:true});}});
+    })();
+    </script>
 
     <div class="card" id="engineScoreBoard" style="display:none !important;margin-top:10px">
       <div style="font-weight:1000">📊 PLACAR POR MOTOR</div>
@@ -36914,6 +36223,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
       <h2 style="margin-top:0">🏦 Corretora</h2>
       <div class="label">ESCOLHA ONDE VOCÊ VAI EXECUTAR A ENTRADA</div>
 
+      <div id="clientHiddenIq">
       <select id="brokerAccount" style="width:100%;margin-top:10px">
         <option value="IQ_OPTION">IQ Option</option>
       </select>
@@ -36944,7 +36254,9 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         A senha não é salva no navegador.
       </div>
 
-      <div class="card" style="margin-top:14px;border-color:#38bdf8">
+      </div>
+
+      <div id="partnerCtraderBlock" class="card" style="margin-top:14px;border-color:#38bdf8">
         <div style="font-weight:1000">📡 cTrader OPEN API • FONTE AUTORIZADA</div>
         <div class="label" style="margin-top:6px;line-height:1.5">
           Conexão oficial em modo <b>somente leitura</b> (scope accounts). Quando conectada, a cTrader vira a
@@ -36962,7 +36274,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         </div>
       </div>
 
-      <div class="card" style="margin-top:14px;border-color:#f0b90b">
+      <div class="card" style="margin-top:14px;border-color:#f0b90b;display:none">
         <div style="font-weight:1000">📊 BINOMO • FONTE CRYPTO IDX</div>
         <div class="label" style="margin-top:6px;line-height:1.5">
           Conexão somente para leitura do gráfico <b>CRYPTO IDX (Z-CRY/IDX)</b>. Não executa ordens na Binomo.
@@ -36994,7 +36306,7 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
         </div>
       </div>
 
-      <div class="card" style="margin-top:14px;border-color:#19d27c">
+      <div class="card" style="margin-top:14px;border-color:#19d27c;display:none">
         <div style="font-weight:1000">🤖 AUTO ENTRADA • IQ OPTION</div>
         <div class="label" style="margin-top:6px;line-height:1.5">
           Escolha TREINO ou REAL. A conta REAL só é usada após seleção e confirmação explícitas.
@@ -37060,12 +36372,12 @@ input{box-sizing:border-box;width:100%;margin-top:6px}
     </div>
 
 <div style="margin-top:12px;border-top:1px solid #173c5e;padding-top:12px">
-      <div class="label">🌐 RADAR MERCADO ABERTO • MOTOR SELECIONADO</div>
-      <small style="opacity:.72">Oportunidades do mercado aberto • continua usando o motor selecionado</small>
+      <div class="label">🌐 RADAR MERCADO ABERTO (NÃO OTC) • MOTOR SELECIONADO</div>
+      <small style="opacity:.72">Somente mercado aberto • não representa candles da IQ OTC</small>
       <div id="radar" class="radar" style="margin-top:8px"></div>
     </div>
 
-    <div style="margin-top:14px;border-top:1px solid #173c5e;padding-top:12px">
+    <div id="megaOtcRadarSection" style="margin-top:14px;border-top:1px solid #173c5e;padding-top:12px">
       <div class="label">🟣 RADAR OTC • IQ OPTION</div>
       <small style="opacity:.72">Mostra somente os pares OTC disponíveis na IQ Option neste momento</small>
       <div id="radarOtcStatus" style="margin-top:8px;font-size:12px;opacity:.82">⚪ Aguardando conexão da IQ Option...</div>
@@ -37291,35 +36603,9 @@ const moneyPilePowerBtn=document.getElementById('moneyPilePowerBtn');
 const moneyPileModeDesc=document.getElementById('moneyPileModeDesc');
 const sidus320PowerBtn=document.getElementById('sidus320PowerBtn');
 const sidus320ModeDesc=document.getElementById('sidus320ModeDesc');
-const rnFollowPowerBtn=document.getElementById('rnFollowPowerBtn');
-const rnFollow02PowerBtn=document.getElementById('rnFollow02PowerBtn');
-const rnFollow03PowerBtn=document.getElementById('rnFollow03PowerBtn');
-const ydivOrigPowerBtn=document.getElementById('ydivOrigPowerBtn');
-const sniperRevPowerBtn=document.getElementById('sniperRevPowerBtn');
-const megaRevYdivPowerBtn=document.getElementById('megaRevYdivPowerBtn');
-const stepmaOrigPowerBtn=document.getElementById('stepmaOrigPowerBtn');
-const stepmaProPowerBtn=document.getElementById('stepmaProPowerBtn');
-let ydivOrigEnabled=false,sniperRevEnabled=false,megaRevYdivEnabled=false,stepmaOrigEnabled=false,stepmaProEnabled=false;
-const megaGuidePowerBtn=document.getElementById('megaGuidePowerBtn');
-const rsi2PowerBtn=document.getElementById('rsi2PowerBtn');
-let rsi2Enabled=localStorage.getItem('rsi2_power')==='ONLINE';
-const shkFlexPowerBtn=document.getElementById('shkFlexPowerBtn');
-const scalpingM1PowerBtn=document.getElementById('scalpingM1PowerBtn');
-let scalpingM1Enabled=false;
-const goldRushPowerBtn=document.getElementById('goldRushPowerBtn');
-const megaGoldPowerBtn=document.getElementById('megaGoldPowerBtn');
-const lwSmcPowerBtn=document.getElementById('lwSmcPowerBtn');
-let lwSmcEnabled=false;
-const oneShootPowerBtn=document.getElementById('oneShootPowerBtn');
-let shkFlexEnabled=localStorage.getItem('shk_flex_power')==='ONLINE';
-let goldRushEnabled=localStorage.getItem('gold_rush_power')==='ONLINE';
-let megaGoldEnabled=localStorage.getItem('mega_gold_power')==='ONLINE';
-let oneShootEnabled=localStorage.getItem('one_shoot_power')==='ONLINE';
-const autoHedgePowerBtn=document.getElementById('autoHedgePowerBtn');
-let autoHedgeEnabled=false;
 const tsr2016PowerBtn=document.getElementById('tsr2016PowerBtn');
 const barReversalPowerBtn=document.getElementById('barReversalPowerBtn');
-const aaPlusPowerBtn=document.getElementById('aaPlusPowerBtn');
+const megaGoldPowerBtn=document.getElementById('megaGoldPowerBtn');
 const megaPremiumPowerBtn=document.getElementById('megaPremiumPowerBtn');
 const megaPremiumModeDesc=document.getElementById('megaPremiumModeDesc');
 const megaPremiumPocPowerBtn=document.getElementById('megaPremiumPocPowerBtn');
@@ -37906,13 +37192,9 @@ paulMacdM1Enabled=localStorage.getItem('mega_paul_macd_m1_power')==='ONLINE';
 millionEaEnabled=localStorage.getItem('mega_million_ea_power')==='ONLINE';
 let moneyPileEnabled=localStorage.getItem('mega_money_pile_power')==='ONLINE';
 sidus320Enabled=localStorage.getItem('mega_sidus320_power')==='ONLINE';
-let rnFollowEnabled=localStorage.getItem('mega_rn_follow_power')==='ONLINE';
-let rnFollow02Enabled=localStorage.getItem('mega_rn_follow02_power')==='ONLINE';
-let rnFollow03Enabled=localStorage.getItem('mega_rn_follow03_power')==='ONLINE';
-let megaGuideEnabled=localStorage.getItem('mega_guide_power')==='ONLINE';
 let tsr2016Enabled=localStorage.getItem('mega_tsr2016_power')==='ONLINE';
 let barReversalEnabled=localStorage.getItem('mega_bar_reversal_power')==='ONLINE';
-let aaPlusEnabled=localStorage.getItem('mega_aa_plus_power')==='ONLINE';
+let megaGoldEnabled=localStorage.getItem('mega_gold_power')!=='OFFLINE';
 megaPremiumEnabled=localStorage.getItem('mega_premium_power')==='ONLINE';
 let megaPremiumPocEnabled=localStorage.getItem('mega_premium_poc_power')==='ONLINE';
 let megaPremiumProtectedEnabled=localStorage.getItem('mega_premium_protected_power')==='ONLINE';
@@ -37948,26 +37230,8 @@ function setExclusiveVisibleEngine(engine){
   millionEaEnabled=(e==='MILLIONEA');
   moneyPileEnabled=(e==='MONEYPILE');
   sidus320Enabled=(e==='SIDUS320');
-  rnFollowEnabled=(e==='RNFOLLOW');
-  rnFollow02Enabled=(e==='RNFOLLOW02');
-  rnFollow03Enabled=(e==='RNFOLLOW03');
-  ydivOrigEnabled=(e==='YDIVORIG');
-  sniperRevEnabled=(e==='SNIPERREV');
-  megaRevYdivEnabled=(e==='MEGAREVYDIV');
-  stepmaOrigEnabled=(e==='STEPMAORIG');
-  stepmaProEnabled=(e==='STEPMAPRO');
-  megaGuideEnabled=(e==='MEGAGUIDE');
-  shkFlexEnabled=(e==='SHKHA');
-  goldRushEnabled=(e==='GOLDRUSH');
-  scalpingM1Enabled=(e==='SCALPINGM1');
-  rsi2Enabled=(e==='RSI2DERIV');
-  megaGoldEnabled=(e==='MEGAGOLD');
-  lwSmcEnabled=(e==='LWSMC');
-  oneShootEnabled=(e==='ONESHOOT');
-  autoHedgeEnabled=(e==='AUTOHEDGEM1');
-  tsr2016Enabled=(e==='TSR2016');
   barReversalEnabled=(e==='BARREVERSAL');
-  aaPlusEnabled=(e==='AAPLUS');
+  megaGoldEnabled=(e==='SCALPINGM1');
   megaPremiumEnabled=(e==='MEGAPREMIUM');
   megaPremiumPocEnabled=(e==='MEGAPREMIUMPOC');
   megaPremiumProtectedEnabled=(e==='MEGAPREMIUMPRO');
@@ -37985,19 +37249,8 @@ function setExclusiveVisibleEngine(engine){
     localStorage.setItem('mega_million_ea_power',millionEaEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_money_pile_power',moneyPileEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_sidus320_power',sidus320Enabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_rn_follow_power',rnFollowEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_rn_follow02_power',rnFollow02Enabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_rn_follow03_power',rnFollow03Enabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('rsi2_power',rsi2Enabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('shk_flex_power',shkFlexEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('scalping_m1_power',scalpingM1Enabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('gold_rush_power',goldRushEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_gold_power',megaGoldEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('one_shoot_power',oneShootEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_guide_power',megaGuideEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_tsr2016_power',tsr2016Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_bar_reversal_power',barReversalEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_aa_plus_power',aaPlusEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_gold_power',megaGoldEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_premium_power',megaPremiumEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_premium_poc_power',megaPremiumPocEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_premium_protected_power',megaPremiumProtectedEnabled?'ONLINE':'OFFLINE');
@@ -38013,73 +37266,23 @@ function setExclusiveVisibleEngine(engine){
 }
 
 function selectedRobotEngine(){
-  if(paulMacdEnabled) return 'PAULMACD';
-  if(paulMacdM1Enabled) return 'PAULMACDM1';
-  if(millionEaEnabled) return 'MILLIONEA';
-  if(moneyPileEnabled) return 'MONEYPILE';
-  if(sidus320Enabled) return 'SIDUS320';
-  if(barReversalEnabled) return 'BARREVERSAL';
-  if(aaPlusEnabled) return 'AAPLUS';
-  if(rnFollowEnabled) return 'RNFOLLOW';
-  if(rnFollow02Enabled) return 'RNFOLLOW02';
-  if(rnFollow03Enabled) return 'RNFOLLOW03';
-  if(sniperRevEnabled) return 'SNIPERREV';
-  if(megaRevYdivEnabled) return 'MEGAREVYDIV';
-  if(ydivOrigEnabled) return 'YDIVORIG';
-  if(stepmaOrigEnabled) return 'STEPMAORIG';
-  if(stepmaProEnabled) return 'STEPMAPRO';
-  if(rsi2Enabled) return 'RSI2DERIV';
-  if(shkFlexEnabled) return 'SHKHA';
-  if(scalpingM1Enabled) return 'SCALPINGM1';
-  if(goldRushEnabled) return 'GOLDRUSH';
-  if(lwSmcEnabled) return 'LWSMC';
-  if(oneShootEnabled) return 'ONESHOOT';
-  if(megaGoldEnabled) return 'MEGAGOLD';
-  if(autoHedgeEnabled) return 'AUTOHEDGEM1';
-  if(megaGuideEnabled) return 'MEGAGUIDE';
-  if(tsr2016Enabled) return 'TSR2016';
-  if(megaPremiumEnabled) return 'MEGAPREMIUM';
-  if(megaPremiumPocEnabled) return 'MEGAPREMIUMPOC';
-  if(megaPremiumProtectedEnabled) return 'MEGAPREMIUMPRO';
-  if(predatorPipsEnabled) return 'PREDATORPIPS';
-  if(pyramid7Enabled) return 'PYRAMID7';
-  if(megaHftEnabled) return 'MEGAHFT';
-  if(roboFiboEnabled) return 'FIBORSI';
-  if(scalperProEnabled) return 'SCALPERPRO';
-  return 'OFF';
+  // Único motor operacional. Não ressuscitar preferências antigas do navegador.
+  return megaGoldEnabled ? 'SCALPINGM1' : 'OFF';
 }
 
 function adoptBackgroundEngineState(d){
   if(!d || !d.server_side) return;
   if(typeof d.telegram_enabled==='boolean'){ telegramEnabled=!!d.telegram_enabled; }
   if(!d.enabled) return;
-  const e=String(d.engine||'').toUpperCase();
-  if(e!=='PAULMACD' && e!=='PAULMACDM1' && e!=='MILLIONEA' && e!=='MONEYPILE' && e!=='SIDUS320' && e!=='MEGAPREMIUM' && e!=='MEGAPREMIUMPOC' && e!=='MEGAPREMIUMPRO' && e!=='TSR2016' && e!=='RNFOLLOW' && e!=='RNFOLLOW02' && e!=='RNFOLLOW03' && e!=='STEPMAORIG' && e!=='YDIVORIG' && e!=='SNIPERREV' && e!=='MEGAREVYDIV' && e!=='STEPMAPRO' && e!=='MEGAGUIDE' && e!=='MEGAGOLD' && e!=='ONESHOOT' && e!=='GOLDRUSH' && e!=='SCALPINGM1' && e!=='SHKHA' && e!=='RSI2DERIV' && e!=='AUTOHEDGEM1' && e!=='BARREVERSAL' && e!=='AAPLUS' && e!=='SCALPERPRO' && e!=='FIBORSI' && e!=='MEGAHFT' && e!=='PYRAMID7' && e!=='PREDATORPIPS') return;
+  const e='SCALPINGM1'; // Ignorar estados antigos de motores removidos.
+  if(e!=='PAULMACD' && e!=='PAULMACDM1' && e!=='MILLIONEA' && e!=='MONEYPILE' && e!=='SIDUS320' && e!=='MEGAPREMIUM' && e!=='MEGAPREMIUMPOC' && e!=='MEGAPREMIUMPRO' && e!=='TSR2016' && e!=='BARREVERSAL' && e!=='SCALPINGM1' && e!=='SCALPERPRO' && e!=='FIBORSI' && e!=='MEGAHFT' && e!=='PYRAMID7' && e!=='PREDATORPIPS') return;
   paulMacdEnabled=(e==='PAULMACD');
   paulMacdM1Enabled=(e==='PAULMACDM1');
   millionEaEnabled=(e==='MILLIONEA');
   moneyPileEnabled=(e==='MONEYPILE');
   sidus320Enabled=(e==='SIDUS320');
-  rnFollowEnabled=(e==='RNFOLLOW');
-  rnFollow02Enabled=(e==='RNFOLLOW02');
-  rnFollow03Enabled=(e==='RNFOLLOW03');
-  ydivOrigEnabled=(e==='YDIVORIG');
-  sniperRevEnabled=(e==='SNIPERREV');
-  megaRevYdivEnabled=(e==='MEGAREVYDIV');
-  stepmaOrigEnabled=(e==='STEPMAORIG');
-  stepmaProEnabled=(e==='STEPMAPRO');
-  megaGuideEnabled=(e==='MEGAGUIDE');
-  shkFlexEnabled=(e==='SHKHA');
-  goldRushEnabled=(e==='GOLDRUSH');
-  scalpingM1Enabled=(e==='SCALPINGM1');
-  rsi2Enabled=(e==='RSI2DERIV');
-  megaGoldEnabled=(e==='MEGAGOLD');
-  lwSmcEnabled=(e==='LWSMC');
-  oneShootEnabled=(e==='ONESHOOT');
-  autoHedgeEnabled=(e==='AUTOHEDGEM1');
-  tsr2016Enabled=(e==='TSR2016');
   barReversalEnabled=(e==='BARREVERSAL');
-  aaPlusEnabled=(e==='AAPLUS');
+  megaGoldEnabled=(e==='SCALPINGM1');
   megaPremiumEnabled=(e==='MEGAPREMIUM');
   megaPremiumPocEnabled=(e==='MEGAPREMIUMPOC');
   megaPremiumProtectedEnabled=(e==='MEGAPREMIUMPRO');
@@ -38097,19 +37300,8 @@ function adoptBackgroundEngineState(d){
     localStorage.setItem('mega_million_ea_power',millionEaEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_money_pile_power',moneyPileEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_sidus320_power',sidus320Enabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_rn_follow_power',rnFollowEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_rn_follow02_power',rnFollow02Enabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_rn_follow03_power',rnFollow03Enabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('rsi2_power',rsi2Enabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('shk_flex_power',shkFlexEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('scalping_m1_power',scalpingM1Enabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('gold_rush_power',goldRushEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_gold_power',megaGoldEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('one_shoot_power',oneShootEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_guide_power',megaGuideEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_tsr2016_power',tsr2016Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_bar_reversal_power',barReversalEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_aa_plus_power',aaPlusEnabled?'ONLINE':'OFFLINE');
+    localStorage.setItem('mega_gold_power',megaGoldEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_premium_power',megaPremiumEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_premium_poc_power',megaPremiumPocEnabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_premium_protected_power',megaPremiumProtectedEnabled?'ONLINE':'OFFLINE');
@@ -38127,7 +37319,7 @@ function adoptBackgroundEngineState(d){
 }
 
 function backtest48Name(e){
-  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',SIDUS320:'🎯 SIDUS EA V3.20',TSR2016:'🎯 Mega Sniper',RNFOLLOW:'📈 RN Follow Trend',RNFOLLOW02:'📈 RN Follow Trend 02',RNFOLLOW03:'📈 RN Follow Trend 03',YDIVORIG:'📉 yDiv Original',SNIPERREV:'🎯 Sniper Reversão',MEGAREVYDIV:'🎯 Mega Reversão + yDiv',STEPMAORIG:'📈 StepMA Original',STEPMAPRO:'📈 StepMA Pro',RSI2DERIV:'📉 RSI 2',SHKHA:'📊 SHK Heikin Ashi',SCALPINGM1:'⚡ Scalping M1 FLEX',GOLDRUSH:'🏅 Gold Rush Pro',MEGAGOLD:'🏆 Mega Gold Scalper',LWSMC:'🧩 SMC Market Structure',ONESHOOT:'🎯 One Shoot AI',AUTOHEDGEM1:'⚙️ AutoHedge M1',MEGAGUIDE:'🧭 MEGA Guide M5-M1',BARREVERSAL:'🔄 1 BAR REVERSAL',AAPLUS:'🐊 AA+',MEGAPREMIUM:'💎 MEGA PREMIUM',MEGAPREMIUMPOC:'💎 MEGA PREMIUM + POC',MEGAPREMIUMPRO:'🛡️ MEGA PREMIUM PROTEGIDO',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MEGAHFT:'⚡ MEGA HFT',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO'})[e]||'SEM MOTOR';
+  return ({PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',MILLIONEA:'💰 EA MILIONÁRIO',SCALPINGM1:'🤖 Mega Bot',MONEYPILE:'💵 MEGA MONEY EA',SIDUS320:'🎯 SIDUS EA V3.20',TSR2016:'🎯 Mega Sniper',BARREVERSAL:'🔄 1 BAR REVERSAL',MEGAPREMIUM:'💎 MEGA PREMIUM',MEGAPREMIUMPOC:'💎 MEGA PREMIUM + POC',MEGAPREMIUMPRO:'🛡️ MEGA PREMIUM PROTEGIDO',PREDATORPIPS:'🐆 PREDATOR PIPS',PYRAMID7:'🔺 PYRAMID 7 PRO',MEGAHFT:'⚡ MEGA HFT',FIBORSI:'🌀 ROBO FIBO',SCALPERPRO:'SCALPER PRO'})[e]||'SEM MOTOR';
 }
 
 function backtest48Escape(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);}
@@ -38181,7 +37373,7 @@ async function loadBacktest48(force=false){
       scheduleBacktest48(false,120);
       return;
     }
-    backtest48Engine.textContent=`${d.engine_name||backtest48Name(engine)} • ${d.symbol} • ${d.interval}`;
+    backtest48Engine.textContent=`${engine==='SCALPINGM1'?'Mega Bot':(d.engine_name||backtest48Name(engine))} • ${d.symbol} • ${d.interval}`;
     if(backtest48Signals) backtest48Signals.textContent=String(d.signals??0);
     if(backtest48Wins) backtest48Wins.textContent=String(d.wins??0);
     if(backtest48Losses) backtest48Losses.textContent=String(d.losses??0);
@@ -38215,12 +37407,12 @@ async function loadBacktest48(force=false){
 
 async function syncBackgroundBotState(opts={}){
   const selected=selectedRobotEngine();
-  let explicitEngine=String(opts.engine||selected||'SCALPERPRO').toUpperCase();
+  let explicitEngine=String(opts.engine||selected||'SCALPINGM1').toUpperCase();
   // 3.97.64 — preserva o motor realmente escolhido ao sincronizar/recarregar.
   // Antes, PYRAMID7/PREDATORPIPS/MEGAHFT/FIBORSI eram convertidos para SCALPERPRO
   // no servidor; no refresh o estado do servidor voltava e trocava o motor na tela.
-  const backgroundEngines=new Set(['TSR2016','RNFOLLOW','RNFOLLOW02','RNFOLLOW03','STEPMAORIG','STEPMAPRO','YDIVORIG','SNIPERREV','MEGAREVYDIV','MEGAGUIDE','MEGAGOLD','ONESHOOT','LWSMC','GOLDRUSH','SCALPINGM1','RSI2DERIV','AUTOHEDGEM1','BARREVERSAL','AAPLUS','PAULMACD','PAULMACDM1','MILLIONEA','MONEYPILE','SIDUS320','MEGAPREMIUM','MEGAPREMIUMPOC','MEGAPREMIUMPRO','SCALPERPRO','FIBORSI','MEGAHFT','PYRAMID7','PREDATORPIPS','SHKHA']);
-  if(!backgroundEngines.has(explicitEngine)) explicitEngine='SCALPERPRO';
+  const backgroundEngines=new Set(['SCALPINGM1']);
+  if(!backgroundEngines.has(explicitEngine)) explicitEngine='SCALPINGM1';
   const action=String(opts.action||'PASSIVE').toUpperCase();
   const chat=((telegramChatSelect && telegramChatSelect.value) || (telegramChatId && telegramChatId.value) || '').trim();
   const payload={
@@ -39181,6 +38373,49 @@ function renderHistoryAnalysis(items){
     <div class="label" style="margin-top:9px;line-height:1.45">${enough?'O aprendizado usa somente padrões estatísticos recentes e filtros conservadores; isso não garante resultado futuro.':'Amostra ainda pequena. O aprendizado continua coletando dados sem alterar sinais até atingir o mínimo necessário.'}</div>`;
 }
 
+// Identificação conservadora: nunca atribui motor por padrão ao histórico antigo.
+function identifyResultEngine(item){
+  const raw=String((item&&item.engine)||'').trim().toUpperCase();
+  if(raw && !['UNKNOWN','SMART','BACKGROUND','SIGNAL','OTHER','NONE','NULL'].includes(raw)) return raw;
+  const details=[item&&item.strategy,item&&item.source,item&&item.provider].map(x=>String(x||'')).join(' ');
+  if(/MEGA\s*GOLD|LOCAL_XAU_SCALPER_140|SCALPINGM1/i.test(details)) return 'SCALPINGM1';
+  if(/SCALPER\s*PRO|SCALPING\s*ASIA|SCALPERPRO/i.test(details)) return 'SCALPERPRO';
+  return '';
+}
+// Registro imutável da origem por operação, independente da fila de apuração.
+const MEGA_ORIGIN_KEY='mega_gold_trade_origins_v1';
+function originMap(){try{return JSON.parse(localStorage.getItem(MEGA_ORIGIN_KEY)||'{}')||{};}catch(_){return {};}}
+function rememberTradeOrigin(t){
+  const engine=identifyResultEngine(t), key=resultOperationKey(t);
+  if(!engine||!key) return;
+  const map=originMap();
+  if(map[key] && map[key].engine && map[key].engine!==engine) return;
+  map[key]={engine,strategy:String(t.strategy||''),created:Date.now()};
+  const keys=Object.keys(map);
+  if(keys.length>1800) keys.sort((a,b)=>(map[a].created||0)-(map[b].created||0)).slice(0,keys.length-1500).forEach(k=>delete map[k]);
+  try{localStorage.setItem(MEGA_ORIGIN_KEY,JSON.stringify(map));}catch(_){}
+}
+function recoverTradeOrigin(t){
+  const direct=identifyResultEngine(t);
+  if(direct) return direct;
+  const key=resultOperationKey(t);
+  if(!key) return '';
+  const map=originMap();
+  if(map[key] && map[key].engine) return map[key].engine;
+  const pending=[...(pendingTrade?[pendingTrade]:[]),...(Array.isArray(pendingTradeQueue)?pendingTradeQueue:[])];
+  const matched=pending.find(x=>resultOperationKey(x)===key);
+  return matched ? identifyResultEngine(matched) : '';
+}
+function enrichResultIdentity(existing,incoming){
+  if(!existing || !incoming) return false;
+  const current=identifyResultEngine(existing);
+  const candidate=recoverTradeOrigin(incoming);
+  if(current || !candidate) return false;
+  existing.engine=candidate;
+  if(!existing.strategy && incoming.strategy) existing.strategy=String(incoming.strategy);
+  return true;
+}
+
 function renderHistory(){
   if(!historyList || !historySummary) return;
   const m=activeResultMarket();
@@ -39226,13 +38461,15 @@ function renderHistory(){
       ISMAELTRADER:'🎯 ISMAEL TRADER',ISMAEL98:'💎 ISMAEL 98',RSICHANNEL:'📈 RSI CHANNELS',MINSCALPER:'⚡ 1 MINUTE SCALPER',
       SCALPERPRO:'🌏 SCALPER PRO',DRAGONFIRE:'🐉 DRAGON FIRE',DRAGONFIREPRO:'🐉 DRAGON FIRE PRO',
       SIDUS320:'🎯 SIDUS EA V3.20',PAULMACD:'📈 PAUL MACD M1 + M5',PAULMACDM1:'📈 PAUL MACD M1',
-      MILLIONEA:'💰 EA MILIONÁRIO',MONEYPILE:'💵 MEGA MONEY EA',MEGAHFT:'⚡ MEGA HFT',
+      MILLIONEA:'💰 EA MILIONÁRIO',SCALPINGM1:'🤖 Mega Bot',MONEYPILE:'💵 MEGA MONEY EA',MEGAHFT:'⚡ MEGA HFT',
       PYRAMID7:'🔺 PYRAMID 7 PRO',PREDATORPIPS:'🐆 PREDATOR PIPS',FIBORSI:'📐 ROBO FIBO'
     };
     const savedStrategy=String(h.strategy||'').trim();
     const rawEngine=String(h.engine||'').trim();
     const legacyMegaSniper=/TSR\s*2016|TSR2016/i.test(savedStrategy)||/TSR\s*2016|TSR2016/i.test(rawEngine)||String(ek||'').toUpperCase()==='TSR2016';
-    const engineLabel=legacyMegaSniper ? '🎯 Mega Sniper' : (savedStrategy || engineLabels[ek] || engineLabels[rawEngine.toUpperCase()] || rawEngine || '🗂️ OUTRO/ANTIGO');
+    const inferredEngine = /MEGA\s*GOLD|LOCAL_XAU_SCALPER_140/i.test(savedStrategy) ? 'SCALPINGM1'
+      : /SCALPER\s*PRO|SCALPING\s*ASIA/i.test(savedStrategy) ? 'SCALPERPRO' : '';
+    const engineLabel=legacyMegaSniper ? '🎯 Mega Sniper' : (engineLabels[recoverTradeOrigin(h)] || engineLabels[rawEngine.toUpperCase()] || engineLabels[inferredEngine] || ((rawEngine.toUpperCase()==='UNKNOWN'||rawEngine.toUpperCase()==='SMART'||!rawEngine) ? '⚠️ MOTOR NÃO IDENTIFICADO' : null) || ((savedStrategy.toUpperCase()==='MOTOR REMOVIDO') ? '⚠️ MOTOR NÃO IDENTIFICADO' : savedStrategy) || engineLabels[ek] || rawEngine || '⚠️ MOTOR NÃO IDENTIFICADO');
     const engineLine=`<div class="label" style="margin-top:6px">Indicador: <b>${engineLabel}</b></div>`;
     return `<div class="card" style="padding:12px">
       <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap">
@@ -39253,12 +38490,13 @@ function isResultAlreadyCounted(t){
   const saved=String((b.final_ops&&b.final_ops[key])||'').toUpperCase();
   // 3.98.09 — LOSS da primeira vela é apenas diagnóstico quando há
   // Recuperação/Gale. Ele não pode fazer a fila considerar a operação encerrada.
-  if(saved==='LOSS' && ['RECOVERY','G1','G2'].includes(currentManagementMode())) return false;
+  if(saved==='LOSS' && !b.processed_keys.includes(key) && ['G1','G2'].includes(currentManagementMode())) return false;
   return !!saved || b.processed_keys.includes(key);
 }
 
 function registerPersistentResult(t,x){
   if(!t || !x) return false;
+  rememberTradeOrigin(t);
   const m=resultMarket(t.market);
   const b=persistentResults[m]||emptyResultBucket();
   persistentResults[m]=b;
@@ -39301,7 +38539,8 @@ function registerPersistentResult(t,x){
     // Histórico detalhado: exatamente uma linha para a mesma operação.
     const historyRow=(b.history||[]).find(h=>h && (h.op_key===opKey || h.key===key));
     if(!historyRow){
-      const stamp=t.entry_time||t.expiry_time||new Date().toISOString();
+      const rawStamp=t.entry_time||t.expiry_time;
+      const stamp=Number.isFinite(Date.parse(String(rawStamp||'')))?rawStamp:new Date().toISOString();
       b.history=(b.history||[]);
       b.history.push({
         key:key,
@@ -39316,7 +38555,7 @@ function registerPersistentResult(t,x){
         confidence:Number(t.confidence||0),
         risk:String(t.risk||''),
         strategy:String(t.strategy||''),
-        engine:String(t.engine||''),
+        engine:recoverTradeOrigin(t)||'UNKNOWN',
         trigger_indicator:String(t.trigger_indicator||''),
         trigger_score:Number(t.trigger_score||0),
         entry_mode:String(t.entry_mode||'')
@@ -39324,10 +38563,12 @@ function registerPersistentResult(t,x){
       pruneHistory(b);
       changed=true;
     }else if(String(historyRow.result||'').toUpperCase()!==r){
+      if(enrichResultIdentity(historyRow,t)) changed=true;
       historyRow.result=r;
       historyRow.entry_result=entryResult||historyRow.entry_result||'';
       changed=true;
     }
+    if(historyRow && enrichResultIdentity(historyRow,t)) changed=true;
 
     if(!b.processed_keys.includes(opKey)){
       b.processed_keys.push(opKey);
@@ -39339,6 +38580,8 @@ function registerPersistentResult(t,x){
   if(changed){
     savePersistentResults();
     paintPersistentResults();
+    if(typeof renderHistory==='function') renderHistory();
+    if(typeof refreshGaleScores==='function') refreshGaleScores();
     // Recalcula o perfil logo após cada operação finalizada.
     setTimeout(()=>{ syncAdaptiveLearning(false); },80);
   }
@@ -39357,11 +38600,8 @@ function mergeServerPerformance(p,m){
   // resultados de outros motores. operation_key impede contagem duplicada.
   const recent=Array.isArray(p.recent_results)?p.recent_results:[];
   const latestServerDirect=recent.find(x=>x && x.direct_only && ['WIN','LOSS'].includes(String(x.result||'').toUpperCase()));
-  if(latestServerDirect && result){
-    const rr=String(latestServerDirect.result||'').toUpperCase();
-    result.textContent=rr;
-    result.className='big '+(rr==='WIN'?'call':'put');
-  }
+  // Não sobrescrever o resultado da operação atual com outro trade do servidor.
+
   let imported=false;
   recent.forEach(x=>{
     if(!x || !x.direct_only) return;
@@ -39369,10 +38609,7 @@ function mergeServerPerformance(p,m){
     if(r!=='WIN' && r!=='LOSS') return;
     // 3.98.09 — LOSS direto do servidor não é LOSS FINAL quando a gestão
     // possui recuperação/Gale. O /result do navegador decide o desfecho final.
-    // 3.98.64 — RN Follow Trend é motor sem Gale/recuperação: o LOSS da primeira vela é final.
-    // Os demais motores continuam respeitando a Gestão global selecionada no app.
-    const serverEngine=normalizeEngineKey(String(x.engine||''));
-    if(r==='LOSS' && serverEngine!=='RNFOLLOW' && serverEngine!=='RNFOLLOW02' && serverEngine!=='RNFOLLOW03' && serverEngine!=='MEGAGUIDE' && serverEngine!=='MEGAGOLD' && e!=='ONESHOOT' && serverEngine!=='GOLDRUSH' && e!=='SCALPINGM1' && e!=='SHKHA' && e!=='GOLDRUSH' && e!=='SCALPINGM1' && e!=='SHKHA' && ['RECOVERY','G1','G2'].includes(currentManagementMode())) return;
+    if(r==='LOSS' && (['RECOVERY','G1','G2'].includes(currentManagementMode()) || String(x.engine||'').toUpperCase()==='SCALPINGM1')) return;
     const t={
       market:m,
       symbol:String(x.symbol||''),
@@ -39383,12 +38620,13 @@ function mergeServerPerformance(p,m){
       confidence:Number(x.confidence||0),
       risk:String(x.risk||''),
       strategy:String(x.strategy||x.source||''),
-      engine:String(x.engine||''),
+      engine:String(x.engine||(/MEGA\s*GOLD|LOCAL_XAU_SCALPER_140/i.test(String(x.strategy||x.source||''))?'SCALPINGM1':(/SCALPER\s*PRO|SCALPING\s*ASIA/i.test(String(x.strategy||x.source||''))?'SCALPERPRO':''))),
       trigger_indicator:String(x.trigger_indicator||''),
       trigger_score:Number(x.trigger_score||0),
       direct_only:true
     };
     const opKey=String(x.operation_key||resultOperationKey(t));
+    if(identifyResultEngine(t)) rememberTradeOrigin(t);
     if(!opKey) return;
     b.final_ops=b.final_ops||{};
     if(!b.final_ops[opKey]){
@@ -39396,6 +38634,10 @@ function mergeServerPerformance(p,m){
       imported=true;
     }
     const exists=(b.history||[]).some(h=>h && (h.op_key===opKey));
+    if(exists){
+      const old=(b.history||[]).find(h=>h && h.op_key===opKey);
+      if(enrichResultIdentity(old,t)) imported=true;
+    }
     if(!exists){
       b.history=b.history||[];
       b.history.push({
@@ -39403,7 +38645,7 @@ function mergeServerPerformance(p,m){
         timestamp:x.entry_time||x.settled_at||new Date().toISOString(),
         symbol:t.symbol,interval:t.interval,direction:t.direction,market:m,
         result:r,entry_result:r,confidence:t.confidence,risk:t.risk,
-        strategy:t.strategy,engine:t.engine,trigger_indicator:t.trigger_indicator,trigger_score:t.trigger_score,entry_mode:'BIRTH',external_ai:!!x.external_ai
+        strategy:t.strategy,engine:recoverTradeOrigin(t)||'UNKNOWN',trigger_indicator:t.trigger_indicator,trigger_score:t.trigger_score,entry_mode:'BIRTH',external_ai:!!x.external_ai
       });
       imported=true;
     }
@@ -39672,10 +38914,6 @@ function currentScoreEngineKey(item){
   if(normalized==='PAULMACDM1' || raw==='PAULMACDM1' || strategy.includes('PAUL MACD M1 •')) return 'PAULMACDM1';
   if(normalized==='PAULMACD' || raw==='PAULMACD' || strategy.includes('PAUL MACD')) return 'PAULMACD';
   if(normalized==='SIDUS320' || raw==='SIDUS320' || strategy.includes('SIDUS EA')) return 'SIDUS320';
-  if(normalized==='RNFOLLOW03' || raw==='RNFOLLOW03' || strategy.includes('RN FOLLOW TREND 03')) return 'RNFOLLOW03';
-  if(normalized==='RNFOLLOW02' || raw==='RNFOLLOW02' || strategy.includes('RN FOLLOW TREND 02')) return 'RNFOLLOW02';
-  if(normalized==='RNFOLLOW' || raw==='RNFOLLOW' || strategy.includes('RN FOLLOW TREND')) return 'RNFOLLOW';
-  if(normalized==='MEGAGUIDE' || raw==='MEGAGUIDE' || strategy.includes('MEGA GUIDE')) return 'MEGAGUIDE';
   if(normalized==='PYRAMID7' || raw==='PYRAMID7' || strategy.includes('PYRAMID 7')) return 'PYRAMID7';
   if(normalized==='MINSCALPER' || raw==='MINSCALPER' || strategy.includes('1 MINUTE SCALPER')) return 'MINSCALPER';
   if(normalized==='RSICHANNEL' || raw==='RSICHANNEL' || strategy.includes('RSI CHANNELS')) return 'RSICHANNEL';
@@ -39706,17 +38944,6 @@ function engineScoreSnapshot(bucket){
     MILLIONEA:{key:'MILLIONEA',name:'💰 EA MILIONÁRIO',wins:0,losses:0},
     MONEYPILE:{key:'MONEYPILE',name:'💵 MEGA MONEY EA',wins:0,losses:0},
     SIDUS320:{key:'SIDUS320',name:'🎯 SIDUS EA V3.20',wins:0,losses:0},
-    RNFOLLOW:{key:'RNFOLLOW',name:'📈 RN Follow Trend',wins:0,losses:0},
-    RNFOLLOW02:{key:'RNFOLLOW02',name:'📈 RN Follow Trend 02',wins:0,losses:0},
-    RNFOLLOW03:{key:'RNFOLLOW03',name:'📈 RN Follow Trend 03',wins:0,losses:0},
-    MEGAGOLD:{key:'MEGAGOLD',name:'🏆 Mega Gold Scalper',wins:0,losses:0},
-    LWSMC:{key:'LWSMC',name:'🧩 SMC Market Structure',wins:0,losses:0},
-    ONESHOOT:{key:'ONESHOOT',name:'🎯 One Shoot AI',wins:0,losses:0},
-    RSI2DERIV:{key:'RSI2DERIV',name:'📉 RSI 2',wins:0,losses:0},
-    SCALPINGM1:{key:'SCALPINGM1',name:'⚡ Scalping M1 FLEX',wins:0,losses:0},
-    GOLDRUSH:{key:'GOLDRUSH',name:'🏆 Gold Rush Pro',wins:0,losses:0},
-    AUTOHEDGEM1:{key:'AUTOHEDGEM1',name:'AutoHedge M1',wins:0,losses:0},
-    MEGAGUIDE:{key:'MEGAGUIDE',name:'🧭 MEGA Guide M5-M1',wins:0,losses:0},
     PYRAMID7:{key:'PYRAMID7',name:'🔺 PYRAMID 7 PRO',wins:0,losses:0},
     OTHER:{key:'OTHER',name:'🗂️ OUTROS / ANTIGOS',wins:0,losses:0}
   };
@@ -39743,7 +38970,7 @@ function engineScoreSnapshot(bucket){
 function renderEngineScoreBoard(bucket){
   if(!engineScoreGrid) return;
   const st=engineScoreSnapshot(bucket||emptyResultBucket());
-  const order=['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER','RNFOLLOW','RNFOLLOW02','RNFOLLOW03','STEPMAORIG','STEPMAPRO','YDIVORIG','SNIPERREV','MEGAREVYDIV','MEGAGUIDE','MEGAGOLD','ONESHOOT','LWSMC','GOLDRUSH','SCALPINGM1','RSI2DERIV','AUTOHEDGEM1','PYRAMID7'];
+  const order=['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER','PYRAMID7'];
   if(st.OTHER.total>0) order.push('OTHER');
   engineScoreGrid.innerHTML=order.map(k=>{
     const x=st[k];
@@ -39834,7 +39061,30 @@ async function resetResultsNow(){
 
 if(resetResultsBtn) resetResultsBtn.onclick=resetResultsNow;
 
+// 3.99.36: inicia placar novo exclusivamente para o Mega Bot.
+// A limpeza remota usa o endpoint oficial e é feita uma única vez por navegador.
+async function initializeMegaGoldScore(){
+  const key='mega_gold_score_initialized_39936';
+  if(localStorage.getItem(key)==='done')return;
+  const markets=['OPEN','IQ_OTC'];
+  try{
+    for(const m of markets){
+      const r=await fetch('/performance/reset?market='+encodeURIComponent(m),{method:'POST',cache:'no-store'});
+      if(!r.ok)throw new Error('Falha ao zerar '+m);
+    }
+    persistentResults.OPEN=emptyResultBucket();
+    persistentResults.IQ_OTC=emptyResultBucket();
+    pendingTrade=null;
+    pendingTradeQueue=[];
+    localStorage.removeItem('mega_pending_trade_v33450');
+    localStorage.setItem(PENDING_QUEUE_KEY,'[]');
+    savePersistentResults();
+    localStorage.setItem(key,'done');
+    paintPersistentResults();
+  }catch(err){console.warn('Mega Bot: reinicialização do placar pendente',err);}
+}
 loadPersistentResults();
+initializeMegaGoldScore();
 loadValueScore();
 renderValueScore();
 if(valueCustomStake) valueCustomStake.value=currentValueBaseStake().toFixed(2);
@@ -39982,16 +39232,35 @@ function normalizePendingTradeMarket(t){
 }
 
 function enqueuePendingTrade(t){
-  if(!t || !t.expiry_time || !t.entry_time) return;
+  if(!t || !t.expiry_time) return;
   if(t.direction!=='CALL' && t.direction!=='PUT') return;
+  // O backend pode enviar apenas expiry_time. A entrada é a vela anterior.
+  // Sem essa normalização, o sinal aparece mas nunca entra na fila de resultado.
+  if(!t.entry_time){
+    const end=Date.parse(String(t.expiry_time));
+    const duration=intervalSecondsValue(t.interval||'1min')*1000;
+    if(!Number.isFinite(end)) return;
+    t.entry_time=new Date(end-duration).toISOString();
+  }
+  rememberTradeOrigin(t);
   if(isResultAlreadyCounted(t)) return;
 
   // 3.98.34 — trava anti-duplicação pela entrada física.
   // Não usa expiry_time na identidade porque o mesmo sinal pode chegar por
   // radar/painel com pequenas diferenças de serialização da expiração.
   const key=resultOperationKey(t);
-  if(pendingTrade && resultOperationKey(pendingTrade)===key) return;
-  if(pendingTradeQueue.some(x=>resultOperationKey(x)===key)) return;
+  const existing=(pendingTrade && resultOperationKey(pendingTrade)===key)
+    ? pendingTrade : pendingTradeQueue.find(x=>resultOperationKey(x)===key);
+  if(existing){
+    const newer=identifyResultEngine(t);
+    if(newer && !identifyResultEngine(existing)){
+      existing.engine=newer;
+      existing.strategy=String(t.strategy||existing.strategy||'');
+      existing.source=String(t.source||existing.source||'');
+      savePendingTrade();
+    }
+    return;
+  }
 
   if(!pendingTrade){
     pendingTrade=t;
@@ -40018,11 +39287,11 @@ function promoteNextPendingTrade(){
 function rememberPendingTrade(sig){
   if(!sig) return;
   if(sig.direction!=='CALL' && sig.direction!=='PUT') return;
-  if(!sig.expiry_time || !sig.entry_time) return;
+  if(!sig.expiry_time) return;
 
-  const engineKey=String(sig.selected_engine||sig.mode||'').toUpperCase();
-  const canonicalResultEngine=(()=>{ if(engineKey==='RNFOLLOW03'||engineKey.includes('RN FOLLOW TREND 03')) return 'RNFOLLOW03'; if(engineKey==='RNFOLLOW02'||engineKey.includes('RN FOLLOW TREND 02')) return 'RNFOLLOW02'; if(engineKey==='RNFOLLOW'||engineKey.includes('RN FOLLOW TREND')||engineKey.includes('RN FOLLOW')) return 'RNFOLLOW'; if(engineKey==='MEGAGUIDE'||engineKey.includes('MEGA GUIDE')) return 'MEGAGUIDE'; if(engineKey==='MINSCALPER'||engineKey.includes('1 MINUTE SCALPER')||engineKey.includes('LOCAL_1_MINUTE_SCALPER')) return 'MINSCALPER'; if(engineKey==='RSICHANNEL'||engineKey.includes('RSI CHANNELS')||engineKey.includes('LOCAL_RSI_CHANNELS')) return 'RSICHANNEL'; if(engineKey==='ISMAELTRADER'||engineKey.includes('ISMAEL TRADER')||engineKey.includes('LOCAL_ISMAEL_EMA_RSI_ADX')) return 'ISMAELTRADER'; if(engineKey==='STREAKREV'||engineKey.includes('STREAK REVERSAL')||engineKey.includes('LOCAL_STREAK_REVERSAL')) return 'STREAKREV'; if(engineKey==='RSIXOVER'||engineKey.includes('RSI XOVER')||engineKey.includes('LOCAL_RSI_XOVER')) return 'OTHER'; if(engineKey==='RSICROSS'||engineKey.includes('RSI EA MTF')||engineKey.includes('LOCAL_RSI_EA_MTF')) return 'RSICROSS'; if(engineKey==='PLATINUM'||engineKey.includes('LOCAL_PLATINUM')||engineKey.includes('PLATINUM_WPR')) return 'PLATINUM'; if(engineKey==='VASILY'||engineKey.includes('VASILY PIP SNIPER')||engineKey.includes('LOCAL_VASILY')) return 'VASILY'; if(engineKey==='SESSIONBREAKOUT'||engineKey.includes('SMART SESSION BREAKOUT')||engineKey.includes('SESSION_BREAKOUT')) return 'SESSIONBREAKOUT'; if(engineKey.includes('FIGURES')||engineKey.includes('FIGURES CANDLE')||engineKey.includes('LOCAL_FIGURES_CANDLE')) return 'FIGURES'; if(engineKey.includes('SHKHA')||engineKey.includes('SHK PRO HA')||engineKey.includes('SHK_HA')) return 'SHKHA'; if(engineKey.includes('ELCODEX')||engineKey.includes('ELCODEX SCALPER')||engineKey.includes('ELCODEX_SCALPER')) return 'ELCODEX'; if(engineKey.includes('SUPERNOVA')||engineKey.includes('SUPER NOVA')||engineKey.includes('SUPER_NOVA')) return 'SUPERNOVA'; if(engineKey.includes('TINGATINGA')||engineKey.includes('TINGA TINGA')||engineKey.includes('TINGA_TINGA')) return 'TINGATINGA'; if(engineKey.includes('TRIPRSI')||engineKey.includes('TRIPLE_RSI')||engineKey.includes('RSI TRIPLO')) return 'TRIPRSI'; if(engineKey.includes('FIBORSI')||engineKey.includes('ROBO_FIBO')||engineKey.includes('ROBOFIBO')) return 'FIBORSI'; if(engineKey.includes('TLBRSI')||engineKey.includes('THREE_LINE_BREAK_RSI')||engineKey.includes('3 LINE BREAK + RSI')) return 'TLBRSI'; if(engineKey.includes('TMARSI')||engineKey.includes('EXTREME_TMA_RSI_TREND')||engineKey.includes('EXTREME TMA')) return 'TMARSI'; if(engineKey.includes('RSIDIVBB')||engineKey.includes('RSI_DIV_BB')||engineKey.includes('DIVERGENCE + BOLLINGER')) return 'RSIDIVBB'; if(engineKey.includes('COMBINER')) return 'COMBINER'; if(engineKey.includes('AI_VOLUME_POC_CONSENSUS')||engineKey==='VOLUME_AI') return 'VOLUME_AI'; if(engineKey.includes('EA_XGBOOST')) return 'EA'; if(engineKey.includes('EA_FORCE')) return 'FORCE'; if(engineKey.includes('BIGRISE')) return 'BIGRISE'; if(engineKey.includes('LARRY')) return 'LARRY'; if(engineKey.includes('RANGE')) return 'RANGE'; if(engineKey.includes('VELOCITY')) return 'VELOCITY'; if(engineKey.includes('TAURUS_EA_GRAAL')||engineKey.includes('TAURUSEA')||engineKey==='TAURUS EA') return 'TAURUSEA'; if(engineKey.includes('TAURUS_RSI_DIV')||engineKey.includes('TAURUSRSIDIV')) return 'TAURUSRSIDIV'; if(engineKey.includes('INDICEMENT')) return 'INDICEMENT'; if(engineKey.includes('GOLDINV')||engineKey.includes('FOREX GOLD INVESTOR')) return 'GOLDINV'; if(engineKey.includes('TTMSCALPER')||engineKey.includes('TTM SCALPER')) return 'TTMSCALPER'; if(engineKey.includes('FOREXMISSION')||engineKey.includes('FOREX MISSION')) return 'FOREXMISSION'; if(engineKey.includes('MONEYARROW')||engineKey.includes('BINARY MONEYARROW')) return 'MONEYARROW'; if(engineKey.includes('LIQUIDEX')) return 'LIQUIDEX'; if(engineKey.includes('EUROFX2TAURUS')||engineKey.includes('EURO FX2 + TAURUS')||engineKey.includes('EUROFX2_TAURUS')) return 'EUROFX2TAURUS'; if(engineKey.includes('EUROFX2')||engineKey.includes('EURO_FX2')||engineKey.includes('EURO FX2')) return 'EUROFX2'; if(engineKey==='ATE'||engineKey.includes('ATE_HARVESTER')||engineKey.includes('HARVESTER + ZEROLAG')) return 'ATE'; if(engineKey==='FOREXSTAYPRO'||engineKey.includes('FOREXSTAY PRO')||engineKey.includes('FOREXSTAY_PRO')) return 'FOREXSTAYPRO'; if(engineKey==='FOREXSTAYTAURUS'||engineKey.includes('FOREXSTAY SIGHT + TAURUS')||engineKey.includes('FOREXSTAY_TAURUS')) return 'FOREXSTAYTAURUS'; if(engineKey==='FOREXSTAYTAURUS'||engineKey.includes('FOREXSTAY_TAURUS')||engineKey.includes('FOREXSTAY SIGHT + TAURUS')||engineKey==='FOREXSTAY'||engineKey.includes('FOREXSTAY')||engineKey.includes('FOREXSTAY_ZEROLAG')) return 'FOREXSTAY'; if(engineKey==='SENEGALPRO'||engineKey.includes('SUPER SENEGAL PRO')||engineKey.includes('SUPER_SENEGAL_PRO')) return 'SENEGALPRO'; if(engineKey==='VALUEMACD'||engineKey.includes('VALUE CHART + MACD')||engineKey.includes('VALUE_CHART_ZEROLAG_MACD')) return 'VALUEMACD'; if(engineKey==='HOLYGRAIL'||engineKey.includes('HOLY GRAIL')||engineKey.includes('HOLY_GRAIL')) return 'HOLYGRAIL'; if(engineKey==='TRENDLINES'||engineKey.includes('TRENDLINES MTF')||engineKey.includes('TRENDLINES_MTF')) return 'TRENDLINES'; if(engineKey==='UTBOT'||engineKey.includes('UT BOT')||engineKey.includes('UT_BOT')) return 'UTBOT'; if(engineKey==='ONEMINRSI'||engineKey.includes('ONE MINUTE + RSI')||engineKey.includes('ONE_MINUTE_RSI')) return 'ONEMINRSI'; if(engineKey==='WPRADAPT'||engineKey.includes('WPR ADAPTIVE')||engineKey.includes('WPR_ADAPTIVE')) return 'WPRADAPT'; if(engineKey==='BROOKYC3'||engineKey.includes('CONFLUÊNCIA 3')||engineKey.includes('BROOKY_C3')) return 'BROOKYC3'; if(engineKey==='MEGABOT'||engineKey.includes('MEGA BOT')||engineKey.includes('MEGA_BOT')) return 'MEGABOT'; if(engineKey==='BROOKYVERTEX'||engineKey.includes('BROOKY + VERTEX')||engineKey.includes('BROOKY_VERTEX')) return 'BROOKYVERTEX'; if(engineKey==='FOREXMEGA'||engineKey.includes('FOREX MEGA LLC')||engineKey.includes('FOREX_MEGA_LLC')) return 'FOREXMEGA'; if(engineKey==='KAMIKAZE'||engineKey.includes('KAMIKAZE TREND SNIPER')||engineKey.includes('KAMIKAZE_TRUE_CROSS')) return 'KAMIKAZE'; if(engineKey==='BBSTOCH'||engineKey.includes('BB STOCHRSI')||engineKey.includes('BB_STOCHRSI')) return 'BBSTOCH'; if(engineKey==='FOREXFLEX'||engineKey.includes('FOREX FLEX')||engineKey.includes('FOREX_FLEX_FRACTAL')) return 'FOREXFLEX'; if(engineKey.includes('BOB05_SUPER_SENEGAL')||engineKey.includes('BOBSENEGAL')||engineKey.includes('BOB 05 + SUPER SENEGAL')) return 'BOBSENEGAL'; if(engineKey.includes('TAURUS_SUPER_SENEGAL')||engineKey.includes('TAURUSSENEGAL')) return 'TAURUSSENEGAL'; if(engineKey==='TSR2016'||engineKey.includes('TSR2016')) return 'TSR2016'; if(engineKey.includes('SNIPER')) return 'SNIPER'; if(engineKey.includes('ALPHAX')) return 'ALPHAX'; if(engineKey.includes('RAPID')) return 'RAPID'; if(engineKey.includes('SAMURAI')) return 'SAMURAI'; if(engineKey.includes('VOLUME')) return 'VOLUME'; if(engineKey.includes('RSI5')) return 'RSI5'; return String(sig.selected_engine||sig.mode||''); })();
-  const isDirectEa=(engineKey==='MEGAGUIDE'||engineKey.includes('MEGA GUIDE')||engineKey==='MINSCALPER'||engineKey.includes('1 MINUTE SCALPER')||engineKey.includes('LOCAL_1_MINUTE_SCALPER')||engineKey==='RSICHANNEL'||engineKey==='ISMAELTRADER'||engineKey==='STREAKREV'||engineKey.includes('STREAK REVERSAL')||engineKey.includes('LOCAL_STREAK_REVERSAL')||engineKey==='PLATINUM'||engineKey.includes('LOCAL_PLATINUM')||engineKey.includes('PLATINUM_WPR')||engineKey==='VASILY'||engineKey.includes('VASILY PIP SNIPER')||engineKey.includes('LOCAL_VASILY')||engineKey==='FIGURES'||engineKey.includes('FIGURES CANDLE')||engineKey.includes('LOCAL_FIGURES_CANDLE')||engineKey==='SESSIONBREAKOUT'||engineKey.includes('SMART SESSION BREAKOUT')||engineKey.includes('SESSION_BREAKOUT')||engineKey==='SHKHA'||engineKey.includes('SHKHA')||engineKey.includes('SHK PRO HA')||engineKey.includes('SHK_HA')||engineKey==='ELCODEX'||engineKey.includes('ELCODEX')||engineKey.includes('ELCODEX SCALPER')||engineKey==='SUPERNOVA'||engineKey.includes('SUPERNOVA')||engineKey.includes('SUPER NOVA')||engineKey==='TINGATINGA'||engineKey.includes('TINGATINGA')||engineKey.includes('TINGA TINGA')||engineKey==='TRIPRSI'||engineKey.includes('TRIPRSI')||engineKey.includes('TRIPLE_RSI')||engineKey==='PAULMACD'||engineKey==='PAULMACDM1'||engineKey.includes('PAUL MACD')||engineKey==='SIDUS320'||engineKey.includes('SIDUS320')||engineKey.includes('SIDUS EA')||engineKey==='PYRAMID7'||engineKey.includes('PYRAMID7')||engineKey==='PREDATORPIPS'||engineKey.includes('PREDATORPIPS')||engineKey.includes('PREDATOR PIPS')||engineKey==='MEGAHFT'||engineKey.includes('MEGAHFT')||engineKey==='FIBORSI'||engineKey.includes('FIBORSI')||engineKey.includes('ROBO_FIBO')||engineKey==='TLBRSI'||engineKey.includes('TLBRSI')||engineKey.includes('THREE_LINE_BREAK_RSI')||engineKey==='TMARSI'||engineKey.includes('TMARSI')||engineKey.includes('EXTREME_TMA')||engineKey==='RSIDIVBB'||engineKey.includes('RSIDIVBB')||engineKey.includes('RSI_DIV_BB')||engineKey==='COMBINER'||engineKey.includes('COMBINER')||engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='RANGE'||engineKey==='VELOCITY'||engineKey==='TAURUSEA'||engineKey.includes('TAURUS_EA_GRAAL')||engineKey==='TAURUSRSIDIV'||engineKey.includes('TAURUS_RSI_DIV')||engineKey==='INDICEMENT'||engineKey.includes('INDICEMENT')||engineKey==='GOLDINV'||engineKey.includes('GOLDINV')||engineKey.includes('FOREX GOLD INVESTOR')||engineKey==='TTMSCALPER'||engineKey.includes('TTMSCALPER')||engineKey.includes('TTM SCALPER')||engineKey==='FOREXMISSION'||engineKey.includes('FOREX MISSION')||engineKey==='MONEYARROW'||engineKey.includes('MONEYARROW')||engineKey==='LIQUIDEX'||engineKey.includes('LIQUIDEX')||engineKey==='EUROFX2TAURUS'||engineKey.includes('EUROFX2TAURUS')||engineKey.includes('EURO FX2 + TAURUS')||engineKey==='EUROFX2'||engineKey.includes('EUROFX2')||engineKey.includes('EURO FX2')||engineKey==='ATE'||engineKey.includes('ATE_HARVESTER')||engineKey.includes('HARVESTER + ZEROLAG')||engineKey==='FOREXSTAYPRO'||engineKey.includes('FOREXSTAY_PRO')||engineKey.includes('FOREXSTAY PRO')||engineKey==='FOREXSTAY'||engineKey.includes('FOREXSTAY')||engineKey==='SENEGALPRO'||engineKey.includes('SUPER SENEGAL PRO')||engineKey==='VALUEMACD'||engineKey.includes('VALUE CHART + MACD')||engineKey==='HOLYGRAIL'||engineKey.includes('HOLY GRAIL')||engineKey==='TRENDLINES'||engineKey.includes('TRENDLINES')||engineKey==='FOREXMEGA'||engineKey.includes('FOREX MEGA LLC')||engineKey.includes('FOREX_MEGA_LLC')||engineKey==='UTBOT'||engineKey.includes('UT BOT')||engineKey.includes('UT_BOT')||engineKey==='ONEMINRSI'||engineKey.includes('ONE MINUTE + RSI')||engineKey.includes('ONE_MINUTE_RSI')||engineKey==='WPRADAPT'||engineKey.includes('WPR ADAPTIVE')||engineKey.includes('WPR_ADAPTIVE')||engineKey==='BROOKYC3'||engineKey.includes('CONFLUÊNCIA 3')||engineKey.includes('BROOKY_C3')||engineKey==='MEGABOT'||engineKey.includes('MEGA BOT')||engineKey.includes('MEGA_BOT')||engineKey==='BROOKYVERTEX'||engineKey.includes('BROOKY + VERTEX')||engineKey.includes('BROOKY_VERTEX')||engineKey==='KAMIKAZE'||engineKey.includes('KAMIKAZE TREND SNIPER')||engineKey.includes('KAMIKAZE_TRUE_CROSS')||engineKey==='BBSTOCH'||engineKey.includes('BB STOCHRSI')||engineKey.includes('BB_STOCHRSI')||engineKey==='FOREXFLEX'||engineKey.includes('FOREX FLEX')||engineKey.includes('FOREX_FLEX_FRACTAL')||engineKey==='BOBSENEGAL'||engineKey.includes('BOB05_SUPER_SENEGAL')||engineKey==='TAURUSSENEGAL'||engineKey.includes('TAURUS_SUPER_SENEGAL')||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='SUNTZU'||engineKey==='RSI5'||engineKey==='RTM'||engineKey.includes('RTM')||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('RANGE')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('SUNTZU')||engineKey.includes('RSI5'));
+  const engineKey=String(sig.selected_engine||sig.engine||sig.mode||'').toUpperCase();
+  const canonicalResultEngine=(()=>{ if(engineKey==='SCALPINGM1'||engineKey==='MEGA BOT') return 'SCALPINGM1'; if(engineKey==='MINSCALPER'||engineKey.includes('1 MINUTE SCALPER')||engineKey.includes('LOCAL_1_MINUTE_SCALPER')) return 'MINSCALPER'; if(engineKey==='RSICHANNEL'||engineKey.includes('RSI CHANNELS')||engineKey.includes('LOCAL_RSI_CHANNELS')) return 'RSICHANNEL'; if(engineKey==='ISMAELTRADER'||engineKey.includes('ISMAEL TRADER')||engineKey.includes('LOCAL_ISMAEL_EMA_RSI_ADX')) return 'ISMAELTRADER'; if(engineKey==='STREAKREV'||engineKey.includes('STREAK REVERSAL')||engineKey.includes('LOCAL_STREAK_REVERSAL')) return 'STREAKREV'; if(engineKey==='RSIXOVER'||engineKey.includes('RSI XOVER')||engineKey.includes('LOCAL_RSI_XOVER')) return 'OTHER'; if(engineKey==='RSICROSS'||engineKey.includes('RSI EA MTF')||engineKey.includes('LOCAL_RSI_EA_MTF')) return 'RSICROSS'; if(engineKey==='PLATINUM'||engineKey.includes('LOCAL_PLATINUM')||engineKey.includes('PLATINUM_WPR')) return 'PLATINUM'; if(engineKey==='VASILY'||engineKey.includes('VASILY PIP SNIPER')||engineKey.includes('LOCAL_VASILY')) return 'VASILY'; if(engineKey==='SESSIONBREAKOUT'||engineKey.includes('SMART SESSION BREAKOUT')||engineKey.includes('SESSION_BREAKOUT')) return 'SESSIONBREAKOUT'; if(engineKey.includes('FIGURES')||engineKey.includes('FIGURES CANDLE')||engineKey.includes('LOCAL_FIGURES_CANDLE')) return 'FIGURES'; if(engineKey.includes('SHKHA')||engineKey.includes('SHK PRO HA')||engineKey.includes('SHK_HA')) return 'SHKHA'; if(engineKey.includes('ELCODEX')||engineKey.includes('ELCODEX SCALPER')||engineKey.includes('ELCODEX_SCALPER')) return 'ELCODEX'; if(engineKey.includes('SUPERNOVA')||engineKey.includes('SUPER NOVA')||engineKey.includes('SUPER_NOVA')) return 'SUPERNOVA'; if(engineKey.includes('TINGATINGA')||engineKey.includes('TINGA TINGA')||engineKey.includes('TINGA_TINGA')) return 'TINGATINGA'; if(engineKey.includes('TRIPRSI')||engineKey.includes('TRIPLE_RSI')||engineKey.includes('RSI TRIPLO')) return 'TRIPRSI'; if(engineKey.includes('FIBORSI')||engineKey.includes('ROBO_FIBO')||engineKey.includes('ROBOFIBO')) return 'FIBORSI'; if(engineKey.includes('TLBRSI')||engineKey.includes('THREE_LINE_BREAK_RSI')||engineKey.includes('3 LINE BREAK + RSI')) return 'TLBRSI'; if(engineKey.includes('TMARSI')||engineKey.includes('EXTREME_TMA_RSI_TREND')||engineKey.includes('EXTREME TMA')) return 'TMARSI'; if(engineKey.includes('RSIDIVBB')||engineKey.includes('RSI_DIV_BB')||engineKey.includes('DIVERGENCE + BOLLINGER')) return 'RSIDIVBB'; if(engineKey.includes('COMBINER')) return 'COMBINER'; if(engineKey.includes('AI_VOLUME_POC_CONSENSUS')||engineKey==='VOLUME_AI') return 'VOLUME_AI'; if(engineKey.includes('EA_XGBOOST')) return 'EA'; if(engineKey.includes('EA_FORCE')) return 'FORCE'; if(engineKey.includes('BIGRISE')) return 'BIGRISE'; if(engineKey.includes('LARRY')) return 'LARRY'; if(engineKey.includes('RANGE')) return 'RANGE'; if(engineKey.includes('VELOCITY')) return 'VELOCITY'; if(engineKey.includes('TAURUS_EA_GRAAL')||engineKey.includes('TAURUSEA')||engineKey==='TAURUS EA') return 'TAURUSEA'; if(engineKey.includes('TAURUS_RSI_DIV')||engineKey.includes('TAURUSRSIDIV')) return 'TAURUSRSIDIV'; if(engineKey.includes('INDICEMENT')) return 'INDICEMENT'; if(engineKey.includes('GOLDINV')||engineKey.includes('FOREX GOLD INVESTOR')) return 'GOLDINV'; if(engineKey.includes('TTMSCALPER')||engineKey.includes('TTM SCALPER')) return 'TTMSCALPER'; if(engineKey.includes('FOREXMISSION')||engineKey.includes('FOREX MISSION')) return 'FOREXMISSION'; if(engineKey.includes('MONEYARROW')||engineKey.includes('BINARY MONEYARROW')) return 'MONEYARROW'; if(engineKey.includes('LIQUIDEX')) return 'LIQUIDEX'; if(engineKey.includes('EUROFX2TAURUS')||engineKey.includes('EURO FX2 + TAURUS')||engineKey.includes('EUROFX2_TAURUS')) return 'EUROFX2TAURUS'; if(engineKey.includes('EUROFX2')||engineKey.includes('EURO_FX2')||engineKey.includes('EURO FX2')) return 'EUROFX2'; if(engineKey==='ATE'||engineKey.includes('ATE_HARVESTER')||engineKey.includes('HARVESTER + ZEROLAG')) return 'ATE'; if(engineKey==='FOREXSTAYPRO'||engineKey.includes('FOREXSTAY PRO')||engineKey.includes('FOREXSTAY_PRO')) return 'FOREXSTAYPRO'; if(engineKey==='FOREXSTAYTAURUS'||engineKey.includes('FOREXSTAY SIGHT + TAURUS')||engineKey.includes('FOREXSTAY_TAURUS')) return 'FOREXSTAYTAURUS'; if(engineKey==='FOREXSTAYTAURUS'||engineKey.includes('FOREXSTAY_TAURUS')||engineKey.includes('FOREXSTAY SIGHT + TAURUS')||engineKey==='FOREXSTAY'||engineKey.includes('FOREXSTAY')||engineKey.includes('FOREXSTAY_ZEROLAG')) return 'FOREXSTAY'; if(engineKey==='SENEGALPRO'||engineKey.includes('SUPER SENEGAL PRO')||engineKey.includes('SUPER_SENEGAL_PRO')) return 'SENEGALPRO'; if(engineKey==='VALUEMACD'||engineKey.includes('VALUE CHART + MACD')||engineKey.includes('VALUE_CHART_ZEROLAG_MACD')) return 'VALUEMACD'; if(engineKey==='HOLYGRAIL'||engineKey.includes('HOLY GRAIL')||engineKey.includes('HOLY_GRAIL')) return 'HOLYGRAIL'; if(engineKey==='TRENDLINES'||engineKey.includes('TRENDLINES MTF')||engineKey.includes('TRENDLINES_MTF')) return 'TRENDLINES'; if(engineKey==='UTBOT'||engineKey.includes('UT BOT')||engineKey.includes('UT_BOT')) return 'UTBOT'; if(engineKey==='ONEMINRSI'||engineKey.includes('ONE MINUTE + RSI')||engineKey.includes('ONE_MINUTE_RSI')) return 'ONEMINRSI'; if(engineKey==='WPRADAPT'||engineKey.includes('WPR ADAPTIVE')||engineKey.includes('WPR_ADAPTIVE')) return 'WPRADAPT'; if(engineKey==='BROOKYC3'||engineKey.includes('CONFLUÊNCIA 3')||engineKey.includes('BROOKY_C3')) return 'BROOKYC3'; if(engineKey==='MEGABOT'||engineKey.includes('MEGA BOT')||engineKey.includes('MEGA_BOT')) return 'MEGABOT'; if(engineKey==='BROOKYVERTEX'||engineKey.includes('BROOKY + VERTEX')||engineKey.includes('BROOKY_VERTEX')) return 'BROOKYVERTEX'; if(engineKey==='FOREXMEGA'||engineKey.includes('FOREX MEGA LLC')||engineKey.includes('FOREX_MEGA_LLC')) return 'FOREXMEGA'; if(engineKey==='KAMIKAZE'||engineKey.includes('KAMIKAZE TREND SNIPER')||engineKey.includes('KAMIKAZE_TRUE_CROSS')) return 'KAMIKAZE'; if(engineKey==='BBSTOCH'||engineKey.includes('BB STOCHRSI')||engineKey.includes('BB_STOCHRSI')) return 'BBSTOCH'; if(engineKey==='FOREXFLEX'||engineKey.includes('FOREX FLEX')||engineKey.includes('FOREX_FLEX_FRACTAL')) return 'FOREXFLEX'; if(engineKey.includes('BOB05_SUPER_SENEGAL')||engineKey.includes('BOBSENEGAL')||engineKey.includes('BOB 05 + SUPER SENEGAL')) return 'BOBSENEGAL'; if(engineKey.includes('TAURUS_SUPER_SENEGAL')||engineKey.includes('TAURUSSENEGAL')) return 'TAURUSSENEGAL'; if(engineKey==='TSR2016'||engineKey.includes('TSR2016')) return 'TSR2016'; if(engineKey.includes('SNIPER')) return 'SNIPER'; if(engineKey.includes('ALPHAX')) return 'ALPHAX'; if(engineKey.includes('RAPID')) return 'RAPID'; if(engineKey.includes('SAMURAI')) return 'SAMURAI'; if(engineKey.includes('VOLUME')) return 'VOLUME'; if(engineKey.includes('RSI5')) return 'RSI5'; return String(sig.selected_engine||sig.engine||sig.mode||'UNKNOWN'); })();
+  const isDirectEa=(engineKey==='MINSCALPER'||engineKey.includes('1 MINUTE SCALPER')||engineKey.includes('LOCAL_1_MINUTE_SCALPER')||engineKey==='RSICHANNEL'||engineKey==='ISMAELTRADER'||engineKey==='STREAKREV'||engineKey.includes('STREAK REVERSAL')||engineKey.includes('LOCAL_STREAK_REVERSAL')||engineKey==='PLATINUM'||engineKey.includes('LOCAL_PLATINUM')||engineKey.includes('PLATINUM_WPR')||engineKey==='VASILY'||engineKey.includes('VASILY PIP SNIPER')||engineKey.includes('LOCAL_VASILY')||engineKey==='FIGURES'||engineKey.includes('FIGURES CANDLE')||engineKey.includes('LOCAL_FIGURES_CANDLE')||engineKey==='SESSIONBREAKOUT'||engineKey.includes('SMART SESSION BREAKOUT')||engineKey.includes('SESSION_BREAKOUT')||engineKey==='SHKHA'||engineKey.includes('SHKHA')||engineKey.includes('SHK PRO HA')||engineKey.includes('SHK_HA')||engineKey==='ELCODEX'||engineKey.includes('ELCODEX')||engineKey.includes('ELCODEX SCALPER')||engineKey==='SUPERNOVA'||engineKey.includes('SUPERNOVA')||engineKey.includes('SUPER NOVA')||engineKey==='TINGATINGA'||engineKey.includes('TINGATINGA')||engineKey.includes('TINGA TINGA')||engineKey==='TRIPRSI'||engineKey.includes('TRIPRSI')||engineKey.includes('TRIPLE_RSI')||engineKey==='PAULMACD'||engineKey==='PAULMACDM1'||engineKey.includes('PAUL MACD')||engineKey==='SIDUS320'||engineKey.includes('SIDUS320')||engineKey.includes('SIDUS EA')||engineKey==='PYRAMID7'||engineKey.includes('PYRAMID7')||engineKey==='PREDATORPIPS'||engineKey.includes('PREDATORPIPS')||engineKey.includes('PREDATOR PIPS')||engineKey==='MEGAHFT'||engineKey.includes('MEGAHFT')||engineKey==='FIBORSI'||engineKey.includes('FIBORSI')||engineKey.includes('ROBO_FIBO')||engineKey==='TLBRSI'||engineKey.includes('TLBRSI')||engineKey.includes('THREE_LINE_BREAK_RSI')||engineKey==='TMARSI'||engineKey.includes('TMARSI')||engineKey.includes('EXTREME_TMA')||engineKey==='RSIDIVBB'||engineKey.includes('RSIDIVBB')||engineKey.includes('RSI_DIV_BB')||engineKey==='COMBINER'||engineKey.includes('COMBINER')||engineKey==='EA'||engineKey==='FORCE'||engineKey==='BIGRISE'||engineKey==='LARRY'||engineKey==='RANGE'||engineKey==='VELOCITY'||engineKey==='TAURUSEA'||engineKey.includes('TAURUS_EA_GRAAL')||engineKey==='TAURUSRSIDIV'||engineKey.includes('TAURUS_RSI_DIV')||engineKey==='INDICEMENT'||engineKey.includes('INDICEMENT')||engineKey==='GOLDINV'||engineKey.includes('GOLDINV')||engineKey.includes('FOREX GOLD INVESTOR')||engineKey==='TTMSCALPER'||engineKey.includes('TTMSCALPER')||engineKey.includes('TTM SCALPER')||engineKey==='FOREXMISSION'||engineKey.includes('FOREX MISSION')||engineKey==='MONEYARROW'||engineKey.includes('MONEYARROW')||engineKey==='LIQUIDEX'||engineKey.includes('LIQUIDEX')||engineKey==='EUROFX2TAURUS'||engineKey.includes('EUROFX2TAURUS')||engineKey.includes('EURO FX2 + TAURUS')||engineKey==='EUROFX2'||engineKey.includes('EUROFX2')||engineKey.includes('EURO FX2')||engineKey==='ATE'||engineKey.includes('ATE_HARVESTER')||engineKey.includes('HARVESTER + ZEROLAG')||engineKey==='FOREXSTAYPRO'||engineKey.includes('FOREXSTAY_PRO')||engineKey.includes('FOREXSTAY PRO')||engineKey==='FOREXSTAY'||engineKey.includes('FOREXSTAY')||engineKey==='SENEGALPRO'||engineKey.includes('SUPER SENEGAL PRO')||engineKey==='VALUEMACD'||engineKey.includes('VALUE CHART + MACD')||engineKey==='HOLYGRAIL'||engineKey.includes('HOLY GRAIL')||engineKey==='TRENDLINES'||engineKey.includes('TRENDLINES')||engineKey==='FOREXMEGA'||engineKey.includes('FOREX MEGA LLC')||engineKey.includes('FOREX_MEGA_LLC')||engineKey==='UTBOT'||engineKey.includes('UT BOT')||engineKey.includes('UT_BOT')||engineKey==='ONEMINRSI'||engineKey.includes('ONE MINUTE + RSI')||engineKey.includes('ONE_MINUTE_RSI')||engineKey==='WPRADAPT'||engineKey.includes('WPR ADAPTIVE')||engineKey.includes('WPR_ADAPTIVE')||engineKey==='BROOKYC3'||engineKey.includes('CONFLUÊNCIA 3')||engineKey.includes('BROOKY_C3')||engineKey==='MEGABOT'||engineKey.includes('MEGA BOT')||engineKey.includes('MEGA_BOT')||engineKey==='BROOKYVERTEX'||engineKey.includes('BROOKY + VERTEX')||engineKey.includes('BROOKY_VERTEX')||engineKey==='KAMIKAZE'||engineKey.includes('KAMIKAZE TREND SNIPER')||engineKey.includes('KAMIKAZE_TRUE_CROSS')||engineKey==='BBSTOCH'||engineKey.includes('BB STOCHRSI')||engineKey.includes('BB_STOCHRSI')||engineKey==='FOREXFLEX'||engineKey.includes('FOREX FLEX')||engineKey.includes('FOREX_FLEX_FRACTAL')||engineKey==='BOBSENEGAL'||engineKey.includes('BOB05_SUPER_SENEGAL')||engineKey==='TAURUSSENEGAL'||engineKey.includes('TAURUS_SUPER_SENEGAL')||engineKey==='SNIPER'||engineKey==='ALPHAX'||engineKey==='RAPID'||engineKey==='SAMURAI'||engineKey==='VOLUME'||engineKey==='SUNTZU'||engineKey==='RSI5'||engineKey==='RTM'||engineKey.includes('RTM')||engineKey.includes('EA_XGBOOST')||engineKey.includes('EA_FORCE')||engineKey.includes('BIGRISE')||engineKey.includes('LARRY')||engineKey.includes('RANGE')||engineKey.includes('SNIPER')||engineKey.includes('ALPHAX')||engineKey.includes('RAPID')||engineKey.includes('SAMURAI')||engineKey.includes('VOLUME')||engineKey.includes('SUNTZU')||engineKey.includes('RSI5'));
   enqueuePendingTrade({
     source:sig.source||'SIGNAL',
     // Motores de entrada direta (AlphaX/Núcleo Rápido/Samurai/Sniper/RSI+ADX/Larry/Range/EA/Força/BigRise/Velocity) são apurados na primeira vela; outros preservam G1/G2.
@@ -40034,7 +39303,7 @@ function rememberPendingTrade(sig){
     symbol:sig.symbol,
     interval:sig.interval,
     direction:sig.direction,
-    entry_time:sig.entry_time,
+    entry_time:sig.entry_time || (Number.isFinite(Date.parse(String(sig.expiry_time))) ? new Date(Date.parse(String(sig.expiry_time))-intervalSecondsValue(sig.interval||'1min')*1000).toISOString() : ''),
     expiry_time:sig.expiry_time,
     confidence:Number(sig.confidence||0),
     risk:String(sig.risk||''),
@@ -40089,8 +39358,11 @@ function rememberChartSignal(pre){
   const expiryMs=entryMs+(intervalSecondsValue(interval.value)*1000);
   const expiryIso=new Date(expiryMs).toISOString();
 
+  if(selectedRobotEngine()!=='SCALPINGM1') return;
   enqueuePendingTrade({
     source:'CHART_20S',
+    strategy: selectedRobotEngine()==='SCALPINGM1' ? 'Mega Bot' : '',
+    engine: selectedRobotEngine()==='SCALPINGM1' ? 'SCALPINGM1' : '',
     direct_only:true,
     market:chartTradeMarket,
     feed_source:pre.feed_source||'',
@@ -40185,7 +39457,7 @@ function showRobot(){
   clearTimeout(robotTimer);
   robotTimer=setTimeout(()=>{
     if(!entryArrow.classList.contains('call') && !entryArrow.classList.contains('put')){
-      heroBox.style.display='none';
+      heroBox.style.display='block';
       analysisText.style.display='none';
     }
   },10000);
@@ -40200,8 +39472,8 @@ function showEntryArrow(dir){
   clearTimeout(arrowTimer);
   arrowTimer=setTimeout(()=>{
     entryArrow.className='entry-arrow';
-    heroBox.style.display='none';
-  },6000);
+    heroBox.style.display='block';
+  },60000);
 }
 
 function playMoneyRain(kind){
@@ -40283,7 +39555,7 @@ function speak(t){
     clearTimeout(robotTimer);
     robotTimer=setTimeout(()=>{
       if(!entryArrow.classList.contains('call') && !entryArrow.classList.contains('put')){
-        heroBox.style.display='none';
+        heroBox.style.display='block';
         analysisText.style.display='none';
       }
     },10000);
@@ -40293,7 +39565,7 @@ function speak(t){
     clearTimeout(robotTimer);
     robotTimer=setTimeout(()=>{
       if(!entryArrow.classList.contains('call') && !entryArrow.classList.contains('put')){
-        heroBox.style.display='none';
+        heroBox.style.display='block';
       }
     },10000);
   };
@@ -40726,7 +39998,7 @@ async function updateMarketNote(){
 
   try{
     const d=await get('/otc-status?broker='+encodeURIComponent(broker.value));
-    otcNote.textContent=(d.configured?'🟢 ':'🟠 ')+brokerName()+' OTC • '+(d.message||'');
+    otcNote.textContent=(d.connected?'🟢 ':d.configured?'🟠 ':'🔴 ')+brokerName()+' OTC • '+(d.message||'');
   }catch(e){
     otcNote.textContent='🔴 '+brokerName()+' OTC indisponível';
   }
@@ -42222,27 +41494,12 @@ function applyRobotPowerState(){
   if(millionEaPowerBtn){ millionEaPowerBtn.textContent=millionEaEnabled?'🟢 ONLINE':'🔴 OFFLINE'; millionEaPowerBtn.style.background=millionEaEnabled?'#0b7a3d':'#7d1d1d'; millionEaPowerBtn.style.color='#fff'; millionEaPowerBtn.style.borderColor=millionEaEnabled?'#16c56b':'#ff5252'; }
   if(millionEaModeDesc) millionEaModeDesc.textContent=millionEaEnabled?'ONLINE: RSI/MARSI + LWMA140 M5 + Bears Power50 • próxima M1 • sem Gale.':'OFFLINE: EA MILIONÁRIO pausado.';
   if(moneyPilePowerBtn){ moneyPilePowerBtn.textContent=moneyPileEnabled?'🟢 ONLINE':'🔴 OFFLINE'; moneyPilePowerBtn.style.background=moneyPileEnabled?'#0b7a3d':'#7d1d1d'; moneyPilePowerBtn.style.color='#fff'; moneyPilePowerBtn.style.borderColor=moneyPileEnabled?'#16c56b':'#ff5252'; }
-  if(moneyPileModeDesc) moneyPileModeDesc.textContent=moneyPileEnabled?'ONLINE: confluência 4/4 + rateio comprador/vendedor • próxima M1 • sem Gale.':'OFFLINE: MEGA MONEY EA pausado.';
+  if(moneyPileModeDesc) moneyPileModeDesc.textContent=moneyPileEnabled?'ONLINE: RSI9 + CCI13 + Stoch 5/3/3 + MA5/9 • varredura 3 ativos • próxima M1 • sem Gale.':'OFFLINE: MEGA MONEY EA pausado.';
   if(megaPremiumPocPowerBtn){ megaPremiumPocPowerBtn.textContent=megaPremiumPocEnabled?'🟢 ONLINE':'🔴 OFFLINE'; megaPremiumPocPowerBtn.style.background=megaPremiumPocEnabled?'#0b7a3d':'#7d1d1d'; megaPremiumPocPowerBtn.style.color='#fff'; megaPremiumPocPowerBtn.style.borderColor=megaPremiumPocEnabled?'#16c56b':'#ff5252'; }
   if(megaPremiumProtectedPowerBtn){ megaPremiumProtectedPowerBtn.textContent=megaPremiumProtectedEnabled?'🟢 ONLINE':'🔴 OFFLINE'; megaPremiumProtectedPowerBtn.style.background=megaPremiumProtectedEnabled?'#0b7a3d':'#7d1d1d'; megaPremiumProtectedPowerBtn.style.color='#fff'; megaPremiumProtectedPowerBtn.style.borderColor=megaPremiumProtectedEnabled?'#16c56b':'#ff5252'; }
-  if(rnFollowPowerBtn){ rnFollowPowerBtn.textContent=rnFollowEnabled?'🟢 ONLINE':'🔴 OFFLINE'; rnFollowPowerBtn.style.background=rnFollowEnabled?'#0b7a3d':'#7d1d1d'; rnFollowPowerBtn.style.color='#fff'; }
-  if(rnFollow02PowerBtn){ rnFollow02PowerBtn.textContent=rnFollow02Enabled?'🟢 ONLINE':'🔴 OFFLINE'; rnFollow02PowerBtn.style.background=rnFollow02Enabled?'#0b7a3d':'#7d1d1d'; rnFollow02PowerBtn.style.color='#fff'; }
-  if(rnFollow03PowerBtn){ rnFollow03PowerBtn.textContent=rnFollow03Enabled?'🟢 ONLINE':'🔴 OFFLINE'; rnFollow03PowerBtn.style.background=rnFollow03Enabled?'#0b7a3d':'#7d1d1d'; rnFollow03PowerBtn.style.color='#fff'; }
-  for(const [btn,on] of [[ydivOrigPowerBtn,ydivOrigEnabled],[sniperRevPowerBtn,sniperRevEnabled],[megaRevYdivPowerBtn,megaRevYdivEnabled],[stepmaOrigPowerBtn,stepmaOrigEnabled],[stepmaProPowerBtn,stepmaProEnabled]]){if(btn){btn.textContent=on?'🟢 ONLINE':'🔴 OFFLINE';btn.style.background=on?'#0b7a3d':'#7d1d1d';btn.style.color='#fff';}}
-  for(const [btn,on] of [[ydivOrigPowerBtn,ydivOrigEnabled],[sniperRevPowerBtn,sniperRevEnabled],[megaRevYdivPowerBtn,megaRevYdivEnabled],[stepmaProPowerBtn,stepmaProEnabled]]){if(btn){btn.textContent=on?'🟢 ONLINE':'🔴 OFFLINE';btn.style.background=on?'#0b7a3d':'#7d1d1d';btn.style.color='#fff';}}
-
-  if(autoHedgePowerBtn){autoHedgePowerBtn.textContent=autoHedgeEnabled?'🟢 ONLINE':'🔴 OFFLINE';autoHedgePowerBtn.style.background=autoHedgeEnabled?'#0b7a3d':'#7d1d1d';autoHedgePowerBtn.style.color='#fff';}
-  if(rsi2PowerBtn){rsi2PowerBtn.textContent=rsi2Enabled?'🟢 ONLINE':'🔴 OFFLINE';rsi2PowerBtn.style.background=rsi2Enabled?'#0b7a3d':'#7d1d1d';rsi2PowerBtn.style.color='#fff';}
-  if(shkFlexPowerBtn){shkFlexPowerBtn.textContent=shkFlexEnabled?'🟢 ONLINE':'🔴 OFFLINE';shkFlexPowerBtn.style.background=shkFlexEnabled?'#0b7a3d':'#7d1d1d';shkFlexPowerBtn.style.color='#fff';}
-  if(scalpingM1PowerBtn){scalpingM1PowerBtn.textContent=scalpingM1Enabled?'🟢 ONLINE':'🔴 OFFLINE';scalpingM1PowerBtn.style.background=scalpingM1Enabled?'#0b7a3d':'#7d1d1d';scalpingM1PowerBtn.style.color='#fff';}
-  if(goldRushPowerBtn){goldRushPowerBtn.textContent=goldRushEnabled?'🟢 ONLINE':'🔴 OFFLINE';goldRushPowerBtn.style.background=goldRushEnabled?'#0b7a3d':'#7d1d1d';goldRushPowerBtn.style.color='#fff';}
-  if(megaGoldPowerBtn){megaGoldPowerBtn.textContent=megaGoldEnabled?'🟢 ONLINE':'🔴 OFFLINE';megaGoldPowerBtn.style.background=megaGoldEnabled?'#0b7a3d':'#7d1d1d';megaGoldPowerBtn.style.color='#fff';}
-  if(lwSmcPowerBtn){lwSmcPowerBtn.textContent=lwSmcEnabled?'🟢 ONLINE':'🔴 OFFLINE';lwSmcPowerBtn.style.background=lwSmcEnabled?'#0b7a3d':'#7d1d1d';lwSmcPowerBtn.style.color='#fff';}
-  if(oneShootPowerBtn){oneShootPowerBtn.textContent=oneShootEnabled?'🟢 ONLINE':'🔴 OFFLINE';oneShootPowerBtn.style.background=oneShootEnabled?'#0b7a3d':'#7d1d1d';oneShootPowerBtn.style.color='#fff';}
-  if(megaGuidePowerBtn){ megaGuidePowerBtn.textContent=megaGuideEnabled?'🟢 ONLINE':'🔴 OFFLINE'; megaGuidePowerBtn.style.background=megaGuideEnabled?'#0b7a3d':'#7d1d1d'; megaGuidePowerBtn.style.color='#fff'; }
   if(tsr2016PowerBtn){ tsr2016PowerBtn.textContent=tsr2016Enabled?'🟢 ONLINE':'🔴 OFFLINE'; tsr2016PowerBtn.style.background=tsr2016Enabled?'#0b7a3d':'#7d1d1d'; tsr2016PowerBtn.style.color='#fff'; }
+  if(megaGoldPowerBtn){megaGoldPowerBtn.textContent=megaGoldEnabled?'🟢 ONLINE':'🔴 OFFLINE';}
   if(barReversalPowerBtn){ barReversalPowerBtn.textContent=barReversalEnabled?'🟢 ONLINE':'🔴 OFFLINE'; barReversalPowerBtn.style.background=barReversalEnabled?'#0b7a3d':'#7d1d1d'; barReversalPowerBtn.style.color='#fff'; }
-  if(aaPlusPowerBtn){ aaPlusPowerBtn.textContent=aaPlusEnabled?'🟢 ONLINE':'🔴 OFFLINE'; aaPlusPowerBtn.style.background=aaPlusEnabled?'#0b7a3d':'#7d1d1d'; aaPlusPowerBtn.style.color='#fff'; }
   if(megaPremiumPowerBtn){ megaPremiumPowerBtn.textContent=megaPremiumEnabled?'🟢 ONLINE':'🔴 OFFLINE'; megaPremiumPowerBtn.style.background=megaPremiumEnabled?'#0b7a3d':'#7d1d1d'; megaPremiumPowerBtn.style.color='#fff'; megaPremiumPowerBtn.style.borderColor=megaPremiumEnabled?'#16c56b':'#ff5252'; }
   if(sidus320PowerBtn){ sidus320PowerBtn.textContent=sidus320Enabled?'🟢 ONLINE':'🔴 OFFLINE'; sidus320PowerBtn.style.background=sidus320Enabled?'#0b7a3d':'#7d1d1d'; sidus320PowerBtn.style.color='#fff'; sidus320PowerBtn.style.borderColor=sidus320Enabled?'#16c56b':'#ff5252'; }
   if(sidus320ModeDesc) sidus320ModeDesc.textContent=sidus320Enabled?'ONLINE: Sidus FLEX • crossover até 3 candles + túnel EMA • próxima M1 • sem Gale.':'OFFLINE: SIDUS EA V3.20 pausado.';
@@ -42948,14 +42205,9 @@ function applyRobotPowerState(){
     if(preSignals) preSignals.innerHTML='<div style="opacity:.75">🧠 IA Gráfica selecionada.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar da IA Gráfica ativo • procurando oportunidades</div>';
     rad();
-  }else if(engine==='SCALPINGM1'){
-    if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='SCALPING M1 FLEX ONLINE • MONITORANDO ROMPIMENTOS • PRÓXIMA M1';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⚡ Scalping M1 FLEX online • pré-alerta 20s • intervalo mínimo 4 minutos • sem Gale.</div>';
-    if(radar) radar.innerHTML='<div>📡 Radar Scalping M1 FLEX ativo • procurando CALL/PUT</div>';
-    rad();
   }else{
     if(statusBox && (!cur || cur.direction==='NEUTRO')) statusBox.textContent='MOTORES OFFLINE • SINAIS PAUSADOS';
-    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ Nenhum motor reconhecido como ativo.</div>';
+    if(preSignals) preSignals.innerHTML='<div style="opacity:.75">⛔ SCALPER PRO está offline. Ative o SCALPER PRO.</div>';
     if(radar) radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>';
   }
 }
@@ -43389,23 +42641,20 @@ async function setMoneyPilePower(enabled){
 
 
 
-
-async function setAaPlusPower(enabled){
-  aaPlusEnabled=!!enabled;
-  if(aaPlusEnabled) setExclusiveVisibleEngine('AAPLUS');
-  try{localStorage.setItem('mega_aa_plus_power',aaPlusEnabled?'ONLINE':'OFFLINE');}catch(_){}
-  if(aaPlusEnabled){ if(entryMode) entryMode.value='BIRTH'; if(interval) interval.value='1min'; }
-  resetEngineVisualState(); applyRobotPowerState();
-  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'AAPLUS'});
-  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]); else await Promise.allSettled([perf()]);
-  scheduleBacktest48(true,200);
-  if(voiceEnabled) speak(aaPlusEnabled?'AA Plus online.':'AA Plus offline.');
+async function setMegaGoldPower(enabled){
+  megaGoldEnabled=!!enabled;
+  if(megaGoldEnabled)setExclusiveVisibleEngine('SCALPINGM1');
+  try{localStorage.setItem('mega_gold_power',megaGoldEnabled?'ONLINE':'OFFLINE');}catch(_){}
+  if(megaGoldEnabled){if(entryMode)entryMode.value='BIRTH';if(interval)interval.value='1min';}
+  resetEngineVisualState();applyRobotPowerState();
+  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'SCALPINGM1'});
+  if(selectedRobotEngine()!=='OFF')await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]);
+  if(voiceEnabled && megaGoldEnabled)speak('Mega Bot analisando o mercado, aguarde.');
 }
 
 async function setBarReversalPower(enabled){
   barReversalEnabled=!!enabled;
   if(barReversalEnabled) setExclusiveVisibleEngine('BARREVERSAL');
-  if(aaPlusEnabled) setExclusiveVisibleEngine('AAPLUS');
   try{localStorage.setItem('mega_bar_reversal_power',barReversalEnabled?'ONLINE':'OFFLINE');}catch(_){}
   if(barReversalEnabled){ if(entryMode) entryMode.value='BIRTH'; if(interval) interval.value='1min'; }
   resetEngineVisualState(); applyRobotPowerState();
@@ -43415,62 +42664,12 @@ async function setBarReversalPower(enabled){
   if(voiceEnabled) speak(barReversalEnabled?'1 Bar Reversal online.':'1 Bar Reversal offline.');
 }
 
-async function setMegaGuidePower(enabled){
-  megaGuideEnabled=!!enabled;
-  if(megaGuideEnabled) setExclusiveVisibleEngine('MEGAGUIDE');
-  try{localStorage.setItem('mega_guide_power',megaGuideEnabled?'ONLINE':'OFFLINE');}catch(_){}
-  if(megaGuideEnabled){ if(entryMode) entryMode.value='BIRTH'; if(interval) interval.value='1min'; }
-  resetEngineVisualState(); applyRobotPowerState();
-  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'MEGAGUIDE'});
-  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]); else await Promise.allSettled([perf()]);
-  scheduleBacktest48(true,200);
-  if(voiceEnabled) speak(megaGuideEnabled?'MEGA Guide online.':'MEGA Guide offline.');
-}
-
-async function setRnFollowPower(enabled){
-  rnFollowEnabled=!!enabled;
-  if(rnFollowEnabled) setExclusiveVisibleEngine('RNFOLLOW');
-  try{localStorage.setItem('mega_rn_follow_power',rnFollowEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_guide_power',megaGuideEnabled?'ONLINE':'OFFLINE');}catch(_){}
-  if(rnFollowEnabled){ if(entryMode) entryMode.value='BIRTH'; if(interval) interval.value='1min'; }
-  resetEngineVisualState(); applyRobotPowerState();
-  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'RNFOLLOW'});
-  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]); else await Promise.allSettled([perf()]);
-  scheduleBacktest48(true,200);
-  if(voiceEnabled) speak(rnFollowEnabled?'RN Follow Trend online.':'RN Follow Trend offline.');
-}
-
-async function setRnFollow03Power(enabled){
-  rnFollow03Enabled=!!enabled;
-  if(rnFollow03Enabled) setExclusiveVisibleEngine('RNFOLLOW03');
-  try{localStorage.setItem('mega_rn_follow03_power',rnFollow03Enabled?'ONLINE':'OFFLINE');}catch(_){}
-  if(rnFollow03Enabled){ if(entryMode) entryMode.value='BIRTH'; }
-  resetEngineVisualState(); applyRobotPowerState();
-  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'RNFOLLOW03'});
-  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]); else await Promise.allSettled([perf()]);
-  scheduleBacktest48(true,200);
-  if(voiceEnabled) speak(rnFollow03Enabled?'RN Follow Trend 03 online.':'RN Follow Trend 03 offline.');
-}
-
-async function setRnFollow02Power(enabled){
-  rnFollow02Enabled=!!enabled;
-  if(rnFollow02Enabled) setExclusiveVisibleEngine('RNFOLLOW02');
-  try{localStorage.setItem('mega_rn_follow02_power',rnFollow02Enabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_rn_follow03_power',rnFollow03Enabled?'ONLINE':'OFFLINE');}catch(_){}
-  if(rnFollow02Enabled){ if(entryMode) entryMode.value='BIRTH'; }
-  resetEngineVisualState(); applyRobotPowerState();
-  await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'RNFOLLOW02'});
-  if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]); else await Promise.allSettled([perf()]);
-  scheduleBacktest48(true,200);
-  if(voiceEnabled) speak(rnFollow02Enabled?'RN Follow Trend 02 online.':'RN Follow Trend 02 offline.');
-}
-
 async function setTsr2016Power(enabled){
   tsr2016Enabled=!!enabled;
   if(tsr2016Enabled) setExclusiveVisibleEngine('TSR2016');
   try{localStorage.setItem('mega_tsr2016_power',tsr2016Enabled?'ONLINE':'OFFLINE');
     localStorage.setItem('mega_bar_reversal_power',barReversalEnabled?'ONLINE':'OFFLINE');
-    localStorage.setItem('mega_aa_plus_power',aaPlusEnabled?'ONLINE':'OFFLINE');}catch(_){}
+    localStorage.setItem('mega_gold_power',megaGoldEnabled?'ONLINE':'OFFLINE');}catch(_){}
   if(tsr2016Enabled){ if(entryMode) entryMode.value='BIRTH'; if(interval) interval.value='1min'; }
   resetEngineVisualState(); applyRobotPowerState();
   await syncBackgroundBotState({action:(enabled?'ACTIVATE_ENGINE':'DEACTIVATE_ENGINE'),engine:'TSR2016'});
@@ -44885,42 +44084,16 @@ if(wprAdaptivePowerBtn) wprAdaptivePowerBtn.onclick=()=>setImportedEnginePower('
 if(tingaTingaPowerBtn) tingaTingaPowerBtn.onclick=()=>setImportedEnginePower('TINGATINGA',!tingaTingaEnabled);
 if(superNovaPowerBtn) superNovaPowerBtn.onclick=()=>setImportedEnginePower('SUPERNOVA',!superNovaEnabled);
 if(elcodexPowerBtn) elcodexPowerBtn.onclick=()=>setImportedEnginePower('ELCODEX',!elcodexEnabled);
-if(shkHaPowerBtn) shkHaPowerBtn.onclick=()=>setStepmaPower('SHKHA');
+if(shkHaPowerBtn) shkHaPowerBtn.onclick=()=>setImportedEnginePower('SHKHA',!shkHaEnabled);
 if(minScalperPowerBtn) minScalperPowerBtn.onclick=()=>setMinScalperPower(!minScalperEnabled);
 if(paulMacdPowerBtn) paulMacdPowerBtn.onclick=()=>setPaulMacdPower(!paulMacdEnabled);
 if(paulMacdM1PowerBtn) paulMacdM1PowerBtn.onclick=()=>setPaulMacdM1Power(!paulMacdM1Enabled);
 if(millionEaPowerBtn) millionEaPowerBtn.onclick=()=>setMillionEaPower(!millionEaEnabled);
 if(moneyPilePowerBtn) moneyPilePowerBtn.onclick=()=>setMoneyPilePower(!moneyPileEnabled);
 if(sidus320PowerBtn) sidus320PowerBtn.onclick=()=>setSidus320Power(!sidus320Enabled);
-if(rnFollowPowerBtn) rnFollowPowerBtn.addEventListener('click',()=>setRnFollowPower(!rnFollowEnabled));
-if(rnFollow02PowerBtn) rnFollow02PowerBtn.addEventListener('click',()=>setRnFollow02Power(!rnFollow02Enabled));
-if(rnFollow03PowerBtn) rnFollow03PowerBtn.addEventListener('click',()=>setRnFollow03Power(!rnFollow03Enabled));
-async function setStepmaPower(engine){
- const active=selectedRobotEngine()===engine;
- setExclusiveVisibleEngine(active?'OFF':engine);
- resetEngineVisualState();applyRobotPowerState();
- await syncBackgroundBotState({action:active?'DEACTIVATE_ENGINE':'ACTIVATE_ENGINE',engine});
- if(selectedRobotEngine()!=='OFF') await Promise.allSettled([sig(true),perf(),rad(),loadPreSignals()]);else await Promise.allSettled([perf()]);
- scheduleBacktest48(true,200);
-}
-if(ydivOrigPowerBtn)ydivOrigPowerBtn.addEventListener('click',()=>setStepmaPower('YDIVORIG'));
-if(sniperRevPowerBtn)sniperRevPowerBtn.addEventListener('click',()=>setStepmaPower('SNIPERREV'));
-if(megaRevYdivPowerBtn)megaRevYdivPowerBtn.addEventListener('click',()=>setStepmaPower('MEGAREVYDIV'));
-if(stepmaOrigPowerBtn)stepmaOrigPowerBtn.addEventListener('click',()=>setStepmaPower('STEPMAORIG'));
-if(stepmaProPowerBtn)stepmaProPowerBtn.addEventListener('click',()=>setStepmaPower('STEPMAPRO'));
-
-if(autoHedgePowerBtn) autoHedgePowerBtn.addEventListener('click',()=>setStepmaPower('AUTOHEDGEM1'));
-if(rsi2PowerBtn) rsi2PowerBtn.addEventListener('click',()=>setStepmaPower('RSI2DERIV'));
-if(shkFlexPowerBtn) shkFlexPowerBtn.onclick=()=>setStepmaPower('SHKHA');
-if(scalpingM1PowerBtn) scalpingM1PowerBtn.addEventListener('click',()=>setStepmaPower('SCALPINGM1'));
-if(goldRushPowerBtn) goldRushPowerBtn.addEventListener('click',()=>setStepmaPower('GOLDRUSH'));
-if(megaGoldPowerBtn) megaGoldPowerBtn.addEventListener('click',()=>setStepmaPower('MEGAGOLD'));
-if(lwSmcPowerBtn) lwSmcPowerBtn.addEventListener('click',()=>setStepmaPower('LWSMC'));
-if(oneShootPowerBtn) oneShootPowerBtn.addEventListener('click',()=>setStepmaPower('ONESHOOT'));
-if(megaGuidePowerBtn) megaGuidePowerBtn.addEventListener('click',()=>setMegaGuidePower(!megaGuideEnabled));
 if(tsr2016PowerBtn) tsr2016PowerBtn.addEventListener('click',()=>setTsr2016Power(!tsr2016Enabled));
+if(megaGoldPowerBtn)megaGoldPowerBtn.onclick=async()=>{megaGoldPowerBtn.disabled=true;try{await setMegaGoldPower(!megaGoldEnabled);}finally{megaGoldPowerBtn.disabled=false;applyRobotPowerState();}};
 if(barReversalPowerBtn) barReversalPowerBtn.addEventListener('click',()=>setBarReversalPower(!barReversalEnabled));
-if(aaPlusPowerBtn) aaPlusPowerBtn.addEventListener('click',()=>setAaPlusPower(!aaPlusEnabled));
 if(megaPremiumPowerBtn) megaPremiumPowerBtn.onclick=()=>setMegaPremiumPower(!megaPremiumEnabled);
 if(megaPremiumPocPowerBtn) megaPremiumPocPowerBtn.onclick=()=>setMegaPremiumPocPower(!megaPremiumPocEnabled);
 if(megaPremiumProtectedPowerBtn) megaPremiumProtectedPowerBtn.onclick=()=>setMegaPremiumProtectedPower(!megaPremiumProtectedEnabled);
@@ -45212,14 +44385,21 @@ async function sig(announce=false){
     const lockExpiryMs=Date.parse(String((panelSignalLock&&panelSignalLock.expiry_time)||''));
     const lockEngine=String((panelSignalLock&&(panelSignalLock.selected_engine||panelSignalLock.engine))||'').toUpperCase();
     const lockSameSymbol=(String(engine||'').toUpperCase()==='TSR2016') || String((panelSignalLock&&panelSignalLock.symbol)||'')===String((S&&S.value)||'');
-    const lockSameEngine=!lockEngine||lockEngine===String(engine||'').toUpperCase();
+    const lockSameEngine=lockEngine==='SCALPINGM1' && String(engine||'').toUpperCase()==='SCALPINGM1';
     const lockAlive=panelSignalLock && Number.isFinite(lockExpiryMs) && lockExpiryMs>Date.now() && lockSameSymbol && lockSameEngine;
     if(panelSignalLock && !lockAlive) panelSignalLock=null;
     const previousPanelSignal=lockAlive?{...panelSignalLock}:((cur&&typeof cur==='object')?{...cur}:null);
     const serverSignal=await get(
       `/signal-ai?market=${encodeURIComponent(market.value)}&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&symbol=${encodeURIComponent(S.value)}&interval=${encodeURIComponent(interval.value)}&ai_only=true&engine=${encodeURIComponent(engine)}&entry_mode=${encodeURIComponent(['LOCALANALYST','LOCALANALYSTFLEX','MEGAMASTER','ISMAELTRADER','RSICHANNEL','MINSCALPER'].includes(engine)?'BIRTH':((entryMode&&entryMode.value)||'BIRTH'))}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`
     );
+    // Um CALL/PUT só pode ser apresentado com origem comprovada pelo servidor.
+    if(serverSignal && ['CALL','PUT'].includes(String(serverSignal.direction||'').toUpperCase()) &&
+       !(serverSignal.origin_verified===true && String(serverSignal.origin_engine||'').toUpperCase()==='SCALPINGM1')){
+      serverSignal={...serverSignal,direction:'NEUTRO',confidence:0,confirmed:false,
+        status:'MEGA BOT • AGUARDANDO SINAL VALIDADO'};
+    }
     cur=serverSignal;
+    if(cur && String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO') cur.confidence=0;
 
     // 3.98.52 — filtro escolhido pelo usuário. Bloqueia somente NOVOS sinais;
     // um sinal já confirmado continua travado até a expiração.
@@ -45235,7 +44415,7 @@ async function sig(announce=false){
     const previousSameSymbol=(String(engine||'').toUpperCase()==='TSR2016') || String((previousPanelSignal&&previousPanelSignal.symbol)||'')===String((S&&S.value)||'');
     const previousSameInterval=String((previousPanelSignal&&previousPanelSignal.interval)||'')===String((interval&&interval.value)||'');
     const previousEngine=String((previousPanelSignal&&(previousPanelSignal.selected_engine||previousPanelSignal.engine))||'').toUpperCase();
-    const previousSameEngine=!previousEngine||previousEngine===String(engine||'').toUpperCase();
+    const previousSameEngine=previousEngine==='SCALPINGM1' && String(engine||'').toUpperCase()==='SCALPINGM1';
     if(serverDirection==='NEUTRO' && (previousDirection==='CALL'||previousDirection==='PUT') && previousStillAlive && previousSameSymbol && (previousSameInterval||!previousPanelSignal.interval) && previousSameEngine){
       const heldBaseStatus=String(previousPanelSignal.status||'SINAL CONFIRMADO')
         .replace(/(?:\s*•\s*MANTIDO ATÉ A EXPIRAÇÃO)+/gi,'')
@@ -45283,7 +44463,7 @@ async function sig(announce=false){
     );
     paintSignalAsset(cur.symbol||((S&&S.value)||''));
 
-    confidence.textContent='Confiança: '+Number(cur.confidence||0).toFixed(0)+'%';
+    confidence.textContent='Confiança: '+(String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO'?0:Number(cur.confidence||0)).toFixed(0)+'%';
 
     entry.textContent=
       cur.direction==='NEUTRO'||!cur.entry_time
@@ -45304,9 +44484,14 @@ async function sig(announce=false){
       }
       return txt;
     };
-    statusBox.textContent=(engine==='SCALPERPRO' && String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO')
-      ? 'ONLINE • SCALPER PRO • MONITORANDO MERCADO'
-      : cleanPanelStatus(cur.status);
+    // Status legado não deve identificar SCALPINGM1 como motor removido.
+    // A identidade do sinal continua sendo validada no backend.
+    const panelStatus=cleanPanelStatus(cur.status);
+    statusBox.textContent=(engine==='SCALPINGM1' && /MOTOR REMOVIDO/i.test(panelStatus))
+      ? 'ONLINE • MEGA BOT • ANALISANDO O MERCADO'
+      : ((engine==='SCALPERPRO' && String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO')
+        ? 'ONLINE • SCALPER PRO • MONITORANDO MERCADO'
+        : panelStatus);
     const learn=cur&&cur.adaptive_learning;
     if(learn && learn.enabled){
       const learnTxt=learn.active
@@ -45376,7 +44561,7 @@ async function sig(announce=false){
       cur={...panelSignalLock,signal_held_until_expiry:true};
       direction.textContent=cur.direction;
       direction.className='big '+(cur.direction==='CALL'?'call':'put');
-      confidence.textContent='Confiança: '+Number(cur.confidence||0).toFixed(0)+'%';
+      confidence.textContent='Confiança: '+(String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO'?0:Number(cur.confidence||0)).toFixed(0)+'%';
       entry.textContent=ft(cur.entry_time);
       countdown.textContent='Sinal mantido até a expiração';
       statusBox.textContent=String(cur.status||'SINAL CONFIRMADO').replace(/(?:\s*•\s*MANTIDO ATÉ A EXPIRAÇÃO)+/gi,'')+' • MANTIDO ATÉ A EXPIRAÇÃO';
@@ -45488,9 +44673,9 @@ async function sendRadarOpportunityToRobot(items){
     .sort((a,b)=>Number(b.confidence||0)-Number(a.confidence||0));
   if(!list.length) return;
 
-  // Mega Sniper pode liberar até 3 pares distintos no mesmo ciclo.
+  // Mega Sniper e Mega Premium Protegido podem liberar até 3 ativos distintos no mesmo ciclo.
   // Demais motores preservam o comportamento antigo de 1 ativo selecionado.
-  const multi=(engine==='TSR2016');
+  const multi=(engine==='TSR2016'||engine==='MEGAPREMIUMPRO'||engine==='MONEYPILE');
   const selectedPanelSymbol=String((S&&S.value)||'').trim().toUpperCase();
   const chosen=[];
   const seen=new Set();
@@ -45530,7 +44715,7 @@ async function sendRadarOpportunityToRobot(items){
         entry_time:new Date(entryMs).toISOString(), announce_time:String(best.updated_at||new Date().toISOString()),
         expiry_time:new Date(expiryMs).toISOString(), entry_mode:'BIRTH', risk:'MEDIUM',
         status:String(best.status||'OPORTUNIDADE ENCONTRADA')+' • SINAL ENVIADO',
-        reason:'Oportunidade fresca confirmada pelo radar; Mega Sniper multi-par.',
+        reason:'Oportunidade fresca confirmada pelo radar; varredura multi-ativo.',
         feed_source:String(best.feed_source||'MULTIFEED'),
         feed_label:String(best.feed_source||'MULTIFEED').replaceAll('_',' '),
         feed_fallback:best.feed_fallback===true, promoted_from_radar:true
@@ -45547,7 +44732,7 @@ async function sendRadarOpportunityToRobot(items){
       direction.textContent=cur.direction;
       direction.className='big '+(cur.direction==='CALL'?'call':'put');
       paintSignalAsset(cur.symbol);
-      confidence.textContent='Confiança: '+Number(cur.confidence||0).toFixed(0)+'%';
+      confidence.textContent='Confiança: '+(String(cur.direction||'NEUTRO').toUpperCase()==='NEUTRO'?0:Number(cur.confidence||0)).toFixed(0)+'%';
       entry.textContent=ft(cur.entry_time); countdown.textContent='Preparando entrada';
       statusBox.textContent=(multi && chosen.length>1) ? `MEGA SNIPER • ${chosen.length} PARES COM OPORTUNIDADE SIMULTÂNEA` : cur.status;
       risk.textContent='Risco: '+cur.risk;
@@ -45624,37 +44809,47 @@ async function rad(){
   if(!appEnabled || !radar || radBusy) return;
   // O radar OTC é independente do motor OPEN e continua mostrando os ativos
   // disponíveis mesmo quando nenhum robô de sinais está selecionado.
-  loadOtcRadar();
+  if(window.MEGA_APP_ROLE!=='CLIENT' && window.MEGA_APP_ROLE!=='PARTNER')loadOtcRadar();
   radBusy=true;
   try{
-    const engine=selectedRobotEngine();
+    const engine='SCALPINGM1'; // Radar exclusivo: ignora seleção antiga salva no navegador.
     if(engine==='OFF'){ radar.innerHTML='<div>📡 Radar aguardando um motor ser colocado online</div>'; return; }
     const assetClass=activeAssetClass();
     let items=[];
-    if(engine==='TSR2016'){
-      // Mega Sniper + POC: percorre TODOS os ativos da aba ativa em fila rotativa.
-      // Analisa 6 por ciclo em paralelo para cobrir o universo mais rápido sem
-      // sobrecarregar a fonte; após cada ciclo avança até passar por todos.
-      const candidates=[...S.options].map(o=>String(o.value||'').trim()).filter(sym=>sym && assetAllowedByTab(sym));
+    if(engine==='TSR2016' || engine==='MEGAPREMIUMPRO' || engine==='MONEYPILE'){
+      // Varredura multi-ativo: Mega Sniper usa até 6 leituras por ciclo e
+      // Mega Premium Protegido usa exatamente até 3, conforme a aba FOREX/CRIPTO.
+      // BTC_IQ e CRYPTO IDX/Binomo ficam fora da lista do cliente.
+      const candidates=[...S.options].map(o=>String(o.value||'').trim()).filter(sym=>sym && assetAllowedByTab(sym) && sym!=='BTC_IQ' && sym!=='CRYPTO IDX');
       const batch=[];
+      const batchSize=((engine==='MEGAPREMIUMPRO'||engine==='MONEYPILE')?3:6);
       if(candidates.length){
-        for(let n=0;n<Math.min(6,candidates.length);n++) batch.push(candidates[(megaSniperScanIndex+n)%candidates.length]);
+        for(let n=0;n<Math.min(batchSize,candidates.length);n++) batch.push(candidates[(megaSniperScanIndex+n)%candidates.length]);
         megaSniperScanIndex=(megaSniperScanIndex+batch.length)%candidates.length;
       }
       const base=`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&asset_class=${encodeURIComponent(assetClass)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}`;
       const packs=await Promise.all(batch.map(sym=>get(base+'&symbol='+encodeURIComponent(sym)).catch(()=>[])));
-      items=packs.flat();
+      // Mantém os 3 pares da rodada visíveis mesmo quando a API ainda não devolveu
+      // oportunidade para um deles. Assim o Parceiro enxerga exatamente quais ativos
+      // estão sendo analisados neste ciclo.
+      items=[];
+      batch.forEach((sym,idx)=>{
+        const pack=Array.isArray(packs[idx])?packs[idx]:[];
+        const matching=pack.filter(it=>String(radarBaseSymbol(it)||'').trim().toUpperCase()===String(sym).trim().toUpperCase());
+        if(matching.length) items.push(...matching);
+        else items.push({symbol:sym,base_symbol:sym,direction:'NEUTRO',confidence:0,status:'ANALISANDO ESTE PAR • aguardando oportunidade',updated_at:new Date().toISOString()});
+      });
     }else{
       const selectedRadarSymbol=String((S&&S.value)||'').trim();
       const onlySymbol=selectedRadarSymbol?'&symbol='+encodeURIComponent(selectedRadarSymbol):'';
       items=await get(`/radar?market=OPEN&broker=${encodeURIComponent((broker&&broker.value)||'IQ_OPTION')}&interval=${encodeURIComponent(interval.value)}&engine=${encodeURIComponent(engine)}&asset_class=${encodeURIComponent(assetClass)}&robofibo_poc=${roboFiboPocEnabled?'true':'false'}${onlySymbol}`);
     }
     // Uma resposta antiga do motor anterior não pode reaparecer após trocar ONLINE/OFFLINE.
-    if(engine!==selectedRobotEngine()) return;
+    if(engine!=='SCALPINGM1') return;
     const list=(Array.isArray(items)?items:[]).filter(item=>{
       const rs=String(radarBaseSymbol(item)||'').trim().toUpperCase();
       const selected=String((S&&S.value)||'').trim().toUpperCase();
-      return assetAllowedByTab(radarBaseSymbol(item)) && (engine==='TSR2016' || !selected || rs===selected);
+      return assetAllowedByTab(radarBaseSymbol(item)) && ((engine==='TSR2016'||engine==='MEGAPREMIUMPRO'||engine==='MONEYPILE') || !selected || rs===selected);
     });
     if(!list.length){
       radar.innerHTML='<div>📡 Radar ativo • aguardando leitura</div>';
@@ -46053,9 +45248,10 @@ async function resultCheck(){
   const expiryMs=new Date(pendingTrade.expiry_time).getTime();
   if(Number.isFinite(expiryMs) && Date.now()-expiryMs > RESULT_MAX_PENDING_AGE_MS){
     if(galeStageStatus){
-      galeStageStatus.textContent='⚠️ Resultado antigo descartado após 30 min sem dados';
+      galeStageStatus.textContent='⚠️ Resultado pendente: fonte atrasada; aguardando conferência';
     }
-    promoteNextPendingTrade();
+    pendingTrade.next_result_check_at=Date.now()+60000;
+    savePendingTrade();
     return;
   }
 
@@ -46066,7 +45262,7 @@ async function resultCheck(){
     pendingTrade=t;
 
     const x=await get(
-      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=true&gale_levels=0&engine=${encodeURIComponent(t.engine||'')}&feed_source=${encodeURIComponent(t.feed_source||'')}`
+      `/result?market=${encodeURIComponent(t.market||'OPEN')}&symbol=${encodeURIComponent(t.symbol)}&interval=${encodeURIComponent(t.interval)}&direction=${encodeURIComponent(t.direction)}&expiry_time=${encodeURIComponent(t.expiry_time)}&direct_only=${currentManagementMode()==='RECOVERY'?'true':'false'}&gale_levels=${currentManagementMode()==='G2'?'2':(currentManagementMode()==='G1'?'1':'0')}&engine=${encodeURIComponent(t.engine||'')}&feed_source=${encodeURIComponent(t.feed_source||'')}`
     );
 
     if(x && !x.result && (x.status==='AGUARDANDO_FONTE' || String(x.status||'').startsWith('AGUARDANDO'))){
@@ -46087,8 +45283,18 @@ async function resultCheck(){
     // 3.98.45 — cada sinal físico mostra seu próprio WIN/LOSS no painel.
     // Recuperação financeira não pode esconder o resultado da entrada.
     const directResult=String(x&&x.result||'').toUpperCase();
-    const recovery=(directResult==='WIN' || directResult==='LOSS')
-      ? {final:true,label:directResult,accounting:directResult,stage:0}
+    const megaVirtual=String(t.engine||'').toUpperCase()==='SCALPINGM1';
+    // Para o Mega Bot, o backend apura as três velas sem novas entradas.
+    // PENDENTE/AGUARDANDO não podem encerrar nem sumir com a operação.
+    if(megaVirtual && !x.result){
+      pendingTrade.next_result_check_at=Date.now()+Math.max(3000,Number(x.retry_after||5)*1000);
+      savePendingTrade();
+      if(galeStageStatus) galeStageStatus.textContent=x.stage==='G1'?'⏳ LOSS direto • verificando GALE 1 virtual':(x.stage==='G2'?'⏳ GALE 1 perdeu • verificando GALE 2 virtual':'⏳ Aguardando vela fechada');
+      return;
+    }
+    const management=currentManagementMode();
+    const recovery=(megaVirtual && management!=='RECOVERY')
+      ? {final:['WIN','WIN G1','WIN G2','LOSS G1','LOSS G2','DRAW'].includes(directResult),label:directResult,accounting:directResult.startsWith('WIN')?'WIN':(directResult==='DRAW'?'DRAW':'LOSS'),stage:directResult.includes('G2')?2:(directResult.includes('G1')?1:0),draw:directResult==='DRAW'}
       : resolveRecoveryOutcome(t,x);
 
     if(galeStageStatus && !x.result){
@@ -46125,6 +45331,8 @@ async function resultCheck(){
       const accountingChanged=registerPersistentResult(t,finalX);
       if(accountingChanged){
         paintPersistentResults();
+        if(typeof renderHistory==='function') renderHistory();
+        if(typeof refreshGaleScores==='function') refreshGaleScores();
         await perf();
       }
 
@@ -46149,7 +45357,6 @@ async function resultCheck(){
 
       // Telegram recebe SOMENTE o desfecho final da sequência.
       await maybeSendTelegramResult(t,{...x,result:recovery.label});
-      await perf();
       promoteNextPendingTrade();
     }
 
@@ -46447,12 +45654,166 @@ function openCTraderLogin(ev){
 </html>
 """
 
-HTML_PAGE = HTML_PAGE.replace("__MEGA_IMAGE__", "/mega-ia.png")
+ROBOT_IMAGE_SRC = "/mega-ia.png" if os.path.exists(IMAGE_PATH) else 'data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%22512%22%20height%3D%22512%22%20viewBox%3D%220%200%20512%20512%22%3E%0A%3Crect%20width%3D%22512%22%20height%3D%22512%22%20rx%3D%22110%22%20fill%3D%22%23071525%22%2F%3E%0A%3Crect%20x%3D%22112%22%20y%3D%22130%22%20width%3D%22288%22%20height%3D%22245%22%20rx%3D%2270%22%20fill%3D%22%23163652%22%20stroke%3D%22%2355c8ff%22%20stroke-width%3D%2212%22%2F%3E%0A%3Crect%20x%3D%22150%22%20y%3D%22182%22%20width%3D%22212%22%20height%3D%22110%22%20rx%3D%2245%22%20fill%3D%22%2306111e%22%2F%3E%0A%3Ccircle%20cx%3D%22205%22%20cy%3D%22237%22%20r%3D%2224%22%20fill%3D%22%2355e6ff%22%2F%3E%3Ccircle%20cx%3D%22307%22%20cy%3D%22237%22%20r%3D%2224%22%20fill%3D%22%2355e6ff%22%2F%3E%0A%3Cpath%20d%3D%22M196%20326%20Q256%20360%20316%20326%22%20fill%3D%22none%22%20stroke%3D%22%2372f2a7%22%20stroke-width%3D%2214%22%20stroke-linecap%3D%22round%22%2F%3E%0A%3Cpath%20d%3D%22M256%20130%20V82%22%20stroke%3D%22%2355c8ff%22%20stroke-width%3D%2214%22%20stroke-linecap%3D%22round%22%2F%3E%3Ccircle%20cx%3D%22256%22%20cy%3D%2265%22%20r%3D%2220%22%20fill%3D%22%2372f2a7%22%2F%3E%0A%3Crect%20x%3D%2272%22%20y%3D%22205%22%20width%3D%2245%22%20height%3D%22105%22%20rx%3D%2222%22%20fill%3D%22%23163652%22%20stroke%3D%22%2355c8ff%22%20stroke-width%3D%229%22%2F%3E%0A%3Crect%20x%3D%22395%22%20y%3D%22205%22%20width%3D%2245%22%20height%3D%22105%22%20rx%3D%2222%22%20fill%3D%22%23163652%22%20stroke%3D%22%2355c8ff%22%20stroke-width%3D%229%22%2F%3E%0A%3C%2Fsvg%3E'
+ROBOT_IMAGE_SRC = "data:image/png;base64,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"
+HTML_PAGE = HTML_PAGE.replace("__MEGA_IMAGE__", ROBOT_IMAGE_SRC)
 HTML_PAGE = HTML_PAGE.replace("__APP_VERSION__", APP_VERSION)
 
+# 3.99.03 — apresentação privada para clientes. O motor continua funcionando no backend,
+# mas a interface do CLIENTE não oferece seleção nem revela os nomes/estratégias.
+# 3.99.26 — interface única Mega Bot no app, preservando /professor e licenças.
+GOLD_ONLY_UI = r"""
+<style id="megaGoldOnlyUI">
+.robot-mode-card,[id$="ModeCard"]{display:none!important}
+#megaGoldModeCard{display:flex!important;visibility:visible!important;opacity:1!important}
+#megaEaFolder{display:block!important;visibility:visible!important;opacity:1!important;height:auto!important;max-height:none!important}
+#tabChart,#tabTelegram{display:none!important}
+#broker,#megaOtcRadarSection{display:none!important}
+#megaGoldModeCard .robot-mode-desc{font-size:13px}
+</style>
+<script id="megaGoldOnlyBoot">
+document.addEventListener('DOMContentLoaded',()=>{
+  const apply=()=>{
+    document.querySelectorAll('.robot-mode-card,[id$="ModeCard"]').forEach(el=>{
+      if(el.id==='megaGoldModeCard'){
+        el.style.setProperty('display','flex','important');
+        el.style.setProperty('visibility','visible','important');
+      }else el.style.setProperty('display','none','important');
+    });
+    const folder=document.getElementById('megaEaFolder');
+    if(folder){folder.style.setProperty('display','block','important');folder.style.setProperty('height','auto','important');}
+    for(const id of ['tabChart','tabTelegram']){
+      const el=document.getElementById(id);if(el)el.style.setProperty('display','none','important');
+    }
+  };
+  apply();setTimeout(apply,400);setTimeout(apply,1500);
+  try{
+    if(!localStorage.getItem('mega_gold_power'))localStorage.setItem('mega_gold_power','OFFLINE');
+    localStorage.setItem('selected_engine','SCALPINGM1');
+    localStorage.setItem('mega_scalper_pro_power','OFFLINE');
+  }catch(_){}
+  if(typeof setExclusiveVisibleEngine==='function')setExclusiveVisibleEngine('SCALPINGM1');
+  if(typeof applyRobotPowerState==='function')applyRobotPowerState();
+  if(typeof scheduleBacktest48==='function')scheduleBacktest48(true,500);
+  // O Mega Bot acompanha automaticamente o estado do aplicativo.
+  const startGold=async()=>{
+    try{localStorage.setItem('mega_gold_power','ONLINE');localStorage.setItem('selected_engine','SCALPINGM1');localStorage.setItem('mega_scalper_pro_power','OFFLINE');}catch(_){}
+    if(typeof setMegaGoldPower==='function')await setMegaGoldPower(true);
+    else if(typeof setExclusiveVisibleEngine==='function')setExclusiveVisibleEngine('SCALPINGM1');
+  };
+  // Não reativa automaticamente: respeita o botão OFFLINE escolhido pelo usuário.
+  // Atualiza somente a apresentação, sem disparar solicitações de rede em loop.
+
+});
+</script>
+"""
+# A raiz do Professor também exibe o painel atualizado; /professor continua administrativo.
+HTML_PAGE = HTML_PAGE.replace('</body>', GOLD_ONLY_UI + r"""
+<script id="megaGaleScoreFix">
+document.addEventListener('DOMContentLoaded',()=>{
+  const show=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value===undefined||value===null?'—':String(value);};
+  const percent=(win,loss)=>Number.isFinite(win)&&Number.isFinite(loss)&&(win+loss)>0?(100*win/(win+loss)).toFixed(2)+'%':'—';
+  const outcome=(win,loss)=>Number.isFinite(win)&&Number.isFinite(loss)?(win+loss?win+' WIN / '+loss+' LOSS':'SEM OPERAÇÕES'):'—';
+  function refreshGaleScores(){
+    // Nunca sobrescrever WIN/LOSS principal com contadores do servidor.
+    // O histórico persistente é a fonte de verdade para operações registradas.
+    if(typeof persistentResults==='undefined' || typeof activeResultMarket!=='function') return;
+    const m=activeResultMarket();
+    const b=persistentResults[m];
+    if(!b) return;
+    const rows=(typeof pruneHistory==='function'?pruneHistory(b):b.history||[]);
+    const directWin=rows.filter(x=>String(x.result||'').toUpperCase()==='WIN').length;
+    const directLoss=rows.filter(x=>String(x.result||'').toUpperCase()==='LOSS').length;
+    const w1=rows.filter(x=>String(x.result||'').toUpperCase()==='WIN G1').length;
+    const l1=rows.filter(x=>String(x.result||'').toUpperCase()==='LOSS G1').length;
+    const w2=rows.filter(x=>String(x.result||'').toUpperCase()==='WIN G2').length;
+    const l2=rows.filter(x=>String(x.result||'').toUpperCase()==='LOSS G2').length;
+    // Placar principal pertence exclusivamente a paintPersistentResults().
+    show('megaGale1Win',w1);show('megaGale1Loss',l1);
+    show('megaGale1Accuracy',percent(w1,l1));show('megaGale1Result',outcome(w1,l1));
+    show('megaGale2Win',w2);show('megaGale2Loss',l2);
+    show('megaGale2Accuracy',percent(w2,l2));show('megaGale2Result',outcome(w2,l2));
+    const note=document.getElementById('megaGaleScoreNote');
+    if(note)note.textContent='Gestão: '+(typeof currentManagementMode==='function' ? ({RECOVERY:'recuperação no próximo sinal',G1:'Gale 1 na próxima vela',G2:'Gale 1 e Gale 2 nas próximas velas'}[currentManagementMode()]||'recuperação') : 'recuperação')+' • resultados apurados em velas reais, sem ordens Gale.';
+  }
+  refreshGaleScores();setInterval(refreshGaleScores,15000);
+});
+</script>
+""" + '</body>', 1)
+
+
+HTML_PAGE = HTML_PAGE.replace('</body>', '\n<style id="megaBigSignalEntryV2">\n/* Mega IA 2.0: seta neon grande, paridade e horário de entrada em destaque. */\n#signalCard .mega-robot-scene,#signalCard .mega-command-label,#signalCard .mega-command-meter,#signalCard #confidence{display:none!important}\n#signalCard{grid-column:span 1;background:radial-gradient(ellipse at 50% 18%,#0a503c 0%,#061a20 48%,#030b13 100%)!important;border:2px solid #00ff9d!important;box-shadow:0 0 30px #00ff9d55,inset 0 0 30px #00ff9d12!important;padding:18px 10px!important;min-height:280px!important;text-align:center!important}\n#signalCard #direction{font-size:clamp(30px,5vw,54px)!important;font-weight:1000!important;line-height:1!important;margin:6px 0 10px!important;display:flex;flex-direction:column;align-items:center;gap:4px;overflow:visible!important;letter-spacing:.04em}\n#signalCard #direction::before{content:\'⬆\';display:block;font-size:clamp(76px,15vw,124px);line-height:.95;font-weight:1000;transform:scaleX(1.08);filter:drop-shadow(0 0 9px currentColor) drop-shadow(0 0 24px currentColor);animation:megaArrowPulseV2 1.15s ease-in-out infinite}\n#signalCard #direction.put::before{content:\'⬇\'}\n#signalCard #direction.call{color:#00ff9d!important;text-shadow:0 0 10px #00ff9d,0 0 25px #00ff9d!important}\n#signalCard #direction.put{color:#ff315d!important;text-shadow:0 0 10px #ff315d,0 0 25px #ff315d!important}\n#signalCard #direction.neutral::before{content:\'◆\';font-size:70px;animation:none;color:#ffd95c}\n#signalCard .signal-asset{display:block!important;font-size:clamp(22px,4vw,34px)!important;font-weight:1000!important;line-height:1.15!important;letter-spacing:.025em!important;margin:12px 2px 4px!important;color:#fff!important;text-shadow:0 0 10px #7adfff,0 0 20px #278dff!important;overflow-wrap:anywhere}\n#signalCard .signal-asset.put{color:#fff!important;text-shadow:0 0 10px #ff315d,0 0 20px #ff315d!important}\n#signalCard .signal-asset.call{color:#fff!important;text-shadow:0 0 10px #00ff9d,0 0 20px #00ff9d!important}\n.mega-command-clock{border:2px solid #14cfff!important;background:radial-gradient(ellipse at 50% 10%,#103c68,#04101e 75%)!important;box-shadow:0 0 28px #08cfff55,inset 0 0 22px #08cfff15!important;padding:18px 10px!important;min-height:280px!important}\n#entryScheduleLabel{font-size:clamp(15px,2.5vw,22px)!important;font-weight:1000!important;letter-spacing:.04em!important;color:#fff!important;text-shadow:0 0 12px #13cfff!important;margin:5px 0 18px!important}\n.mega-command-dial{width:100%!important;max-width:none!important;aspect-ratio:auto!important;height:auto!important;margin:0 auto!important;padding:0!important;border-radius:0!important;background:none!important;box-shadow:none!important;display:block!important}\n.mega-command-dial-inner{background:none!important;border-radius:0!important;width:100%!important;height:auto!important;padding:0!important;display:flex!important;gap:12px!important}\n.mega-command-clock #entry{font-size:clamp(38px,7vw,64px)!important;font-weight:1000!important;line-height:1.05!important;letter-spacing:.035em!important;color:#fff!important;text-shadow:0 0 12px #13cfff,0 0 28px #13cfff!important;margin:12px 0!important;white-space:nowrap!important;overflow:visible!important}\n.mega-command-clock #countdown,.mega-command-expiry{display:none!important}\n@keyframes megaArrowPulseV2{0%,100%{transform:translateY(0) scale(1.04);filter:drop-shadow(0 0 7px currentColor) drop-shadow(0 0 16px currentColor)}50%{transform:translateY(-5px) scale(1.12);filter:drop-shadow(0 0 15px currentColor) drop-shadow(0 0 32px currentColor)}}\n@media(max-width:420px){#signalCard,.mega-command-clock{min-height:245px!important;padding:14px 7px!important}#signalCard #direction::before{font-size:clamp(66px,18vw,94px)}#signalCard .signal-asset{font-size:clamp(19px,5vw,25px)!important}.mega-command-clock #entry{font-size:clamp(30px,8vw,43px)!important}#entryScheduleLabel{font-size:14px!important}}\n@media(prefers-reduced-motion:reduce){#signalCard #direction::before{animation:none}}\n</style>\n<script id="megaBigSignalEntryV2Boot">\ndocument.addEventListener(\'DOMContentLoaded\',function(){\n  var label=document.getElementById(\'entryScheduleLabel\');\n  if(label)label.textContent=\'HORÁRIO DE ENTRADA\';\n  var entry=document.getElementById(\'entry\');\n  if(entry)entry.setAttribute(\'aria-label\',\'Horário de entrada\');\n});\n</script>\n' + '</body>', 1)
+
+HTML_PAGE = HTML_PAGE.replace("</body>", '\n<style id="openMarketOnlyStyle">\n#megaOtcRadarSection,#radarOtc,#radarOtcStatus,[id*="otcRadar"],[id*="OtcRadar"],\n[data-market="OTC"],[data-market="IQ_OTC"],[value="OTC"],[value="IQ_OTC"],\n[data-mode="OTC"]{display:none!important}\n</style>\n<script id="openMarketOnlyBoot">\n(function(){\n  function openOnly(){\n    try{localStorage.setItem(\'mega_market_mode\',\'OPEN\');localStorage.setItem(\'selected_market\',\'OPEN\');}catch(_e){}\n    document.querySelectorAll(\'select\').forEach(function(sel){\n      Array.from(sel.options||[]).forEach(function(opt){\n        if(/OTC/i.test(String(opt.value||\'\'))||/OTC/i.test(String(opt.textContent||\'\')))opt.remove();\n      });\n      if(/OTC/i.test(String(sel.value||\'\'))){\n        var op=Array.from(sel.options||[]).find(function(o){return /OPEN/i.test(o.value)||/Mercado Aberto/i.test(o.textContent)});\n        if(op){sel.value=op.value;sel.dispatchEvent(new Event(\'change\',{bubbles:true}));}\n      }\n    });\n    document.querySelectorAll(\'button,a,label,[role="option"]\').forEach(function(el){\n      if(el.children.length===0 && /\\bOTC\\b/i.test(el.textContent||\'\'))el.style.setProperty(\'display\',\'none\',\'important\');\n    });\n    for(var id of [\'megaOtcRadarSection\',\'radarOtc\',\'radarOtcStatus\',\'otcMarketButton\',\'otcTab\']){\n      var el=document.getElementById(id);if(el)el.remove();\n    }\n  }\n  document.addEventListener(\'DOMContentLoaded\',function(){openOnly();new MutationObserver(openOnly).observe(document.body,{childList:true,subtree:true});});\n})();\n</script>\n' + "</body>", 1)
+
+# Parceiro: conexão IQ individual para leitura de candles, sem envio de ordens.
+PARTNER_IQ_READONLY_UI = r"""
+<style id="partnerIqReadOnly">
+#tabAccount,#accountTab,#clientHiddenIq{display:block!important;visibility:visible!important}
+#partnerCtraderBlock{display:none!important}
+#autoTradeToggle,#autoTradeAmount,#autoTradeAccount,#autoTradeGale,#autoTradeGaleMultiplier,#autoTradePreview,#autoTradeStatus{display:none!important}
+</style>
+<script id="partnerIqReadOnlyBoot">
+document.addEventListener('DOMContentLoaded',function(){
+  try{if(typeof disableAutoTrade==='function')disableAutoTrade('IQ Option: somente sinais.');}catch(_e){}
+  const b=document.getElementById('iqConnectBtn');if(b)b.textContent='🔐 CONECTAR IQ OPTION • SOMENTE SINAIS';
+  const help=document.getElementById('accountAuthHelp');if(help)help.textContent='Conexão individual para leitura dos candles. Nenhuma ordem será enviada pelo aplicativo.';
+});
+</script>
+"""
+if APP_ROLE in ("CLIENT", "PARTNER"):
+    HTML_PAGE = HTML_PAGE.replace('</body>', PARTNER_IQ_READONLY_UI + '</body>', 1)
+
+@app.middleware("http")
+async def partner_no_trading_middleware(request: Request, call_next):
+    if APP_ROLE in ("CLIENT", "PARTNER") and request.url.path.lower() in ("/iq-auto-order", "/iq-auto-order-result"):
+        return JSONResponse({"detail":"Parceiro configurado apenas para sinais: execução automática desativada."}, status_code=403)
+    return await call_next(request)
+
+# Mercado Aberto exclusivo: bloqueio central de endpoints e parametros OTC.
+@app.middleware("http")
+async def open_market_only_middleware(request: Request, call_next):
+    from fastapi.responses import JSONResponse
+    path=request.url.path.lower()
+    if ("otc" in path or "otcharts" in path or "tbt-" in path):
+        return JSONResponse({"detail":"OTC removido. Use mercado OPEN."}, status_code=404)
+    for key,value in request.query_params.multi_items():
+        if key.lower() in ("market", "market_mode", "marketmode", "regular_market", "mode") and "OTC" in str(value).upper():
+            return JSONResponse({"detail":"Apenas mercado OPEN é permitido."}, status_code=400)
+    if request.method in ("POST", "PUT", "PATCH") and path not in ("/", "/professor"):
+        try:
+            body=await request.body()
+            if body and len(body)<1024*1024:
+                import json as _json
+                payload=_json.loads(body)
+                def has_otc(obj):
+                    if isinstance(obj,dict):
+                        return any((str(k).lower() in ("market","market_mode","marketmode","mode") and "OTC" in str(v).upper()) or has_otc(v) for k,v in obj.items())
+                    if isinstance(obj,list): return any(has_otc(x) for x in obj)
+                    return False
+                if has_otc(payload):
+                    return JSONResponse({"detail":"Apenas mercado OPEN é permitido."}, status_code=400)
+        except (ValueError, UnicodeDecodeError):
+            pass
+    return await call_next(request)
 
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
-async def home():
+async def home(request: Request):
+    # No Professor, encaminha o atalho do app para o parceiro atualizado.
+    # O painel administrativo continua disponível em /professor.
+    if APP_ROLE == "PROFESSOR":
+        return RedirectResponse(url=PARTNER_APP_URL + "/", status_code=302)
+    # Defesa em profundidade: no PARCEIRO a raiz nunca abre sem licença válida,
+    # mesmo se outro middleware/roteamento for alterado no futuro.
+    if APP_ROLE in ("CLIENT", "PARTNER"):
+        key = request.cookies.get(LICENSE_COOKIE, "")
+        st = await _client_remote_status(key)
+        if not st.get("valid"):
+            return HTMLResponse(
+                LICENSE_PAGE.replace("__ERROR__", f'<div class="err">{st.get("reason", "")}</div>'),
+                status_code=200,
+                headers={"Cache-Control":"no-store, no-cache, must-revalidate, max-age=0"},
+            )
     return HTMLResponse(
         HTML_PAGE,
         headers={
