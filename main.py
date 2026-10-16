@@ -460,25 +460,6 @@ def mega_reversal_ydiv_strategy(cs, symbol="EUR/USD", timeframe="1min", market="
 _SCALPINGM1_CONFLUENCE_LOCK = threading.RLock()
 _SCALPINGM1_CONFLUENCES = {"quantum": True, "mfi": True, "regression": True}
 
-@app.get("/scalping-m1-flex/confluences")
-def get_scalping_m1_confluences():
-    with _SCALPINGM1_CONFLUENCE_LOCK:
-        return {"ok": True, "confluences": dict(_SCALPINGM1_CONFLUENCES)}
-
-@app.post("/scalping-m1-flex/confluences")
-async def set_scalping_m1_confluences(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(400, "Configuração inválida.")
-    if not isinstance(payload, dict):
-        raise HTTPException(400, "Configuração inválida.")
-    with _SCALPINGM1_CONFLUENCE_LOCK:
-        for key in ("quantum", "mfi", "regression"):
-            if key in payload:
-                _SCALPINGM1_CONFLUENCES[key] = bool(payload[key])
-        return {"ok": True, "confluences": dict(_SCALPINGM1_CONFLUENCES)}
-
 # Scalping M1 FLEX — M15 força / M5 rompimento / M1 reteste.
 _SCALPINGM1_LOCK = threading.RLock()
 _SCALPINGM1_LAST = {}
@@ -951,6 +932,26 @@ def _autohedge_delivery_cooldown(data):
 PWA_VERSION = "v233"
 
 app = FastAPI(title="MEGA IA", version=APP_VERSION)
+
+@app.get("/scalping-m1-flex/confluences")
+def get_scalping_m1_confluences():
+    with _SCALPINGM1_CONFLUENCE_LOCK:
+        return {"ok": True, "confluences": dict(_SCALPINGM1_CONFLUENCES)}
+
+@app.post("/scalping-m1-flex/confluences")
+async def set_scalping_m1_confluences(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "Configuração inválida.")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Configuração inválida.")
+    with _SCALPINGM1_CONFLUENCE_LOCK:
+        for key in ("quantum", "mfi", "regression"):
+            if key in payload:
+                _SCALPINGM1_CONFLUENCES[key] = bool(payload[key])
+        return {"ok": True, "confluences": dict(_SCALPINGM1_CONFLUENCES)}
+
 print(f"[MEGA IA] versão {APP_VERSION} • IQ OPTION carregada", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
