@@ -495,15 +495,15 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
         if len(m15)<2 or len(m5)<3:return {**base,'reason':'Aguardando candles completos M15 e M5.'}
         now_bucket=ts(rows[-1])//60
         last=rows[-1];price=float(last['close']);rng=max(float(last['high'])-float(last['low']),1e-12)
-        # MODO FORTE: somente candles fechados; exigir impulso/rompimento mais claro.
-        # M15 serve de contexto, e as três confluências abaixo são obrigatórias.
+        # FLEX: rompimento confirmado M5 OU impulso M1 após rompimento recente.
+        # Somente candles fechados; M15 serve de contexto, não bloqueio obrigatório.
         recent_m5=m5[-4:]
         candidates=[]
         for i in range(1,len(recent_m5)):
             prev=recent_m5[i-1]; cur=recent_m5[i]
             cr=max(cur['high']-cur['low'],1e-12)
             body=abs(cur['close']-cur['open'])/cr
-            if body<0.45:continue
+            if body<0.28:continue
             direction='CALL' if cur['close']>prev['high'] and cur['close']>cur['open'] else 'PUT' if cur['close']<prev['low'] and cur['close']<cur['open'] else None
             if direction:candidates.append((cur['bucket'],direction,prev['high'] if direction=='CALL' else prev['low']))
         last_open=float(last['open']);last_high=float(last['high']);last_low=float(last['low'])
@@ -512,14 +512,14 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
         prior5=rows[-6:-1]
         high5=max(float(r['high']) for r in prior5)
         low5=min(float(r['low']) for r in prior5)
-        impulse='CALL' if price>high5 and price>last_open and body>=0.60 else 'PUT' if price<low5 and price<last_open and body>=0.60 else None
+        impulse='CALL' if price>high5 and price>last_open and body>=0.48 else 'PUT' if price<low5 and price<last_open and body>=0.48 else None
         breakout,direction,level=max(candidates,key=lambda x:x[0]) if candidates else (None,None,None)
         m5_fresh=breakout is not None and 0<=now_bucket-(breakout+1)*5<=5
         m5_ok=False
         if m5_fresh:
             tolerance=max(rng*.45,abs(level)*.00003)
             touched=(last_low<=level+tolerance and price>=level-tolerance) if direction=='CALL' else (last_high>=level-tolerance and price<=level+tolerance)
-            continuation=(price>last_open and body>=.55) if direction=='CALL' else (price<last_open and body>=.55)
+            continuation=(price>last_open and body>=.42) if direction=='CALL' else (price<last_open and body>=.42)
             m5_ok=touched or continuation
         if impulse:
             direction=impulse
@@ -532,12 +532,7 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
         # As três confluências podem ser ligadas/desligadas no painel sem editar o código.
         with _SCALPINGM1_CONFLUENCE_LOCK:
             confluences = dict(_SCALPINGM1_CONFLUENCES)
-        # No perfil FORTE, os três filtros são obrigatórios. Se algum botão
-        # estiver desligado, o motor não emite sinal até todos serem reativados.
-        missing = [name for name in ("quantum", "mfi", "regression") if not confluences.get(name, False)]
-        if missing:
-            return {**base, 'reason':'Modo Forte exige as três confluências ligadas: Quantum, MFI e regressão linear.'}
-        # Bloco 1: HMA(14) + volatilidade adaptativa. Bloco 2: MFI obrigatório.
+        # Bloco 1: HMA(14) + volatilidade adaptativa. Bloco 2: MFI disponível.
         # Bloco 3: regressão linear para detectar preço muito esticado.
         closes=[float(r['close']) for r in rows if r.get('close') is not None]
         highs=[float(r['high']) for r in rows if r.get('high') is not None]
@@ -578,7 +573,7 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
         std14=(sum((x-mean14)**2 for x in window)/len(window))**0.5
         avg_range5=sum((highs[i]-lows[i]) for i in range(len(lows)-5,len(lows)))/5
         avg_range20=sum((highs[i]-lows[i]) for i in range(len(lows)-20,len(lows)))/20
-        if avg_range20<=0 or avg_range5 < avg_range20*0.60:
+        if confluences['quantum'] and (avg_range20<=0 or avg_range5 < avg_range20*0.45):
             return {**base,'reason':'Confluência 1/3 (HMA + volatilidade): mercado parado/sem amplitude suficiente.'}
         upper_band=hma_now+2.0*std14
         lower_band=hma_now-2.0*std14
@@ -590,7 +585,8 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
             try: volumes.append(float(v) if v is not None else 0.0)
             except (TypeError,ValueError): volumes.append(0.0)
         mfi_value=None
-        if len(volumes)==15 and all(v>0 for v in volumes):
+        volume_available = len(volumes)==15 and all(v>0 for v in volumes)
+        if volume_available:
             positive=negative=0.0
             for i in range(1,15):
                 tp=(highs[-15+i]+lows[-15+i]+closes[-15+i])/3
@@ -601,14 +597,13 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
             mfi_value=100.0 if negative==0 and positive>0 else (0.0 if positive==0 and negative>0 else (50.0 if positive==negative==0 else 100-(100/(1+positive/negative))))
             if confluences['mfi'] and direction=='CALL' and mfi_value<35:
                 return {**base,'reason':'Confluência 2/3 (MFI): fluxo disponível não confirma pressão compradora.'}
-            if direction=='PUT' and mfi_value>45:
-                return {**base,'reason':'Confluência 2/3 (MFI): fluxo comprador ainda não cedeu o suficiente para PUT.'}
-        else:
-            return {**base,'reason':'Confluência 2/3 (MFI): volume ausente/inválido; modo Forte bloqueia a entrada.'}
-        if direction=='CALL' and mfi_value<55:
-            return {**base,'reason':'Confluência 2/3 (MFI): pressão compradora insuficiente para CALL.'}
+            if confluences['mfi'] and direction=='PUT' and mfi_value>65:
+                return {**base,'reason':'Confluência 2/3 (MFI): fluxo disponível não confirma pressão vendedora.'}
+        elif confluences['mfi']:
+            # Se o usuário ativou MFI, ausência de volume não pode ser tratada como aprovação.
+            return {**base,'reason':'Confluência 2/3 (MFI) ligada, mas sem volume positivo válido; sinal bloqueado até haver dados de fluxo.'}
 
-        # Regressão linear de 20 fechamentos: exigir direção alinhada e evitar preço esticado.
+        # Regressão linear de 20 fechamentos: medir extensão, não chamar isso de probabilidade.
         reg=closes[-20:]; n=len(reg); xm=(n-1)/2; ym=sum(reg)/n
         denom=sum((i-xm)**2 for i in range(n))
         slope=sum((i-xm)*(v-ym) for i,v in enumerate(reg))/denom if denom else 0.0
@@ -616,12 +611,9 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
         residuals=[v-(intercept+slope*i) for i,v in enumerate(reg)]
         residual_std=(sum(x*x for x in residuals)/n)**0.5
         regression_z=(closes[-1]-(intercept+slope*(n-1)))/residual_std if residual_std>0 else 0.0
-        # Exigir que a inclinação da regressão confirme a direção do sinal.
-        if (direction=='CALL' and slope<=0) or (direction=='PUT' and slope>=0):
-            return {**base,'reason':f'Confluência 3/3 (regressão): inclinação não confirma {direction}.'}
-        # Limite mais restrito contra perseguir preço muito esticado.
-        if (direction=='CALL' and regression_z>=1.5) or (direction=='PUT' and regression_z<=-1.5):
-            return {**base,'reason':f'Confluência 3/3 (regressão): preço muito esticado (z={regression_z:.2f}); entrada bloqueada.'}
+        # Evita perseguir preço muito esticado na mesma direção do sinal.
+        if confluences['regression'] and ((direction=='CALL' and regression_z>=1.8) or (direction=='PUT' and regression_z<=-1.8)):
+            return {**base,'reason':f'Confluência 3/3 (regressão): preço muito esticado (z={regression_z:.2f}); sinal em observação.'}
         metrics={'hma14_slope':round(hma_slope,8),'std14':round(std14,8),'band_upper':round(upper_band,8),'band_lower':round(lower_band,8),'mfi14':round(mfi_value,2) if mfi_value is not None else None,'regression_stretch_z':round(regression_z,3),'mfi_available':mfi_value is not None,'confluences_enabled':confluences}
         key=(market,symbol)
         with _SCALPINGM1_LOCK:
@@ -631,7 +623,7 @@ def scalping_m1_flex_strategy(cs, symbol="EUR/USD", timeframe="1min", market="OP
         event=f'SCALPINGM1:{market}:{symbol}:{direction}:{breakout}:{now_bucket}'
         enabled_names=[]
         if confluences['quantum']: enabled_names.append('HMA + volatilidade')
-        if confluences['mfi']: enabled_names.append('MFI confirmado')
+        if confluences['mfi']: enabled_names.append('MFI' if mfi_value is not None else 'MFI ligado, sem volume disponível')
         if confluences['regression']: enabled_names.append('regressão linear')
         active_text=' + '.join(enabled_names) if enabled_names else 'somente motor original (filtros extras desligados)'
         return {**base,'direction':direction,'confirmed':True,'confidence':60.0,'confidence_is_probability':False,'risk':'HIGH','event_key':event,'filter_metrics':metrics,'reason':f'Scalping M1 FLEX {direction}: {mode}; confluências ativas: {active_text}; próxima vela.'}
